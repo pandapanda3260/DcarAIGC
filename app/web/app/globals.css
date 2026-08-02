@@ -159,6 +159,10 @@ textarea:focus, input:focus { border-color: var(--teal); box-shadow: 0 0 0 3px r
 
 .report-intro { align-items: center; margin-bottom: 0; padding: 4px 0; }
 .report-grid { grid-template-columns: repeat(4, 1fr); margin-top: 20px; }
+.vertical-grid { grid-template-columns: repeat(3, 1fr); }
+.metric-section { margin-top: 26px; padding-top: 20px; border-top: 1px solid var(--line); }
+.metric-section h4 { margin: 0 0 2px; color: #42565d; font-size: 12px; }
+.target-line { margin-top: 18px; padding: 11px 14px; border-radius: 8px; background: #fff8eb; color: #8a5d18; font-size: 11px; font-weight: 750; }
 .denominator { color: var(--navy); font-size: 30px; text-align: right; }
 .denominator span { display: block; color: #8a969a; font-size: 9px; font-weight: 500; }
 .channel-kicker { color: var(--teal); font-size: 10px; font-weight: 850; }
@@ -185,6 +189,7 @@ textarea:focus, input:focus { border-color: var(--teal); box-shadow: 0 0 0 3px r
 .table-panel { padding: 0; overflow: hidden; }
 .table-scroll { overflow: auto; }
 table { width: 100%; border-collapse: collapse; min-width: 1100px; table-layout: fixed; }
+table:has(th:nth-child(7)) { min-width: 1480px; }
 th { padding: 13px 14px; background: #edf2f3; color: #54676e; text-align: left; font-size: 9px; letter-spacing: .25px; }
 th:first-child { width: 260px; }
 th:nth-child(2) { width: 110px; }
@@ -195,6 +200,7 @@ td:first-child a:hover { color: var(--teal); }
 td:first-child span { margin-top: 5px; color: #8b989c; }
 .scene-tag { display: inline-block; padding: 4px 7px; border-radius: 5px; background: var(--teal-soft); color: #23796e; font-weight: 750; }
 .load-more { width: 100%; padding: 13px; border: 0; border-top: 1px solid var(--line); background: #fbfcfc; color: var(--teal); font-size: 10px; font-weight: 800; }
+.promote-button { margin-top: 14px; }
 
 .asset-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 13px; }
 .asset-card { padding: 20px; border: 1px solid var(--line); border-radius: 12px; background: #fff; }
@@ -210,6 +216,10 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
 .export-list strong { font-size: 10px; }
 .export-list div span { margin-top: 4px; color: #859297; font-size: 9px; }
 .export-list em { color: var(--teal); font-size: 9px; font-style: normal; font-weight: 800; }
+.offline-export { padding: 13px 4px; border-bottom: 1px solid #edf1f2; display: grid; grid-template-columns: 34px 1fr; gap: 10px; align-items: center; color: #869397; }
+.offline-export strong, .offline-export span { display: block; font-size: 10px; }
+.offline-export div span { margin-top: 4px; font-size: 9px; }
+.image-preview img { display: block; width: min(100%, 880px); margin: 18px auto 0; border-radius: 13px; border: 1px solid var(--line); }
 .guardrail { display: flex; gap: 14px; align-items: center; background: #fff9f5; border-color: #f0d6c7; }
 .guardrail-icon { width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center; background: var(--orange-soft); color: var(--orange); font-weight: 900; }
 .guardrail h3 { margin: 0 0 5px; font-size: 12px; }
@@ -217,6 +227,16 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
 .loading-screen { min-height: 100vh; display: grid; place-content: center; gap: 12px; text-align: center; color: #728187; }
 .loading-mark { width: 44px; height: 44px; margin: auto; border-radius: 13px; display: grid; place-items: center; background: var(--navy); color: #d9ff57; font-weight: 900; }
 .loading-screen p { font-size: 12px; }
+
+.modal-backdrop { position: fixed; inset: 0; z-index: 50; padding: 24px; display: grid; place-items: center; background: rgba(9, 26, 32, .62); backdrop-filter: blur(4px); }
+.review-modal { width: min(680px, 100%); max-height: calc(100vh - 48px); overflow: auto; padding: 26px; border-radius: 16px; background: #fff; box-shadow: 0 28px 80px rgba(4, 19, 24, .35); }
+.modal-close { width: 34px; height: 34px; border: 0; border-radius: 50%; background: #eef2f3; color: #52656b; font-size: 19px; }
+.review-fields { margin-top: 22px; display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.review-fields label, .review-reason { display: grid; gap: 7px; color: #566970; font-size: 10px; font-weight: 750; }
+.review-fields input { height: 40px; padding: 0 11px; border: 1px solid #cad5d8; border-radius: 8px; outline: none; }
+.review-reason { margin-top: 15px; }
+.review-reason textarea { min-height: 110px; }
+.modal-actions { margin-top: 18px; display: flex; justify-content: flex-end; gap: 10px; }
 
 @media (max-width: 1050px) {
   .app-shell { grid-template-columns: 78px minmax(0, 1fr); }
@@ -227,7 +247,7 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
   .sidebar nav button span { font-size: 17px; }
   .sidebar-foot div { display: none; }
   .sidebar-foot { justify-content: center; }
-  .metric-grid, .report-grid, .asset-grid { grid-template-columns: repeat(2, 1fr); }
+  .metric-grid, .report-grid, .vertical-grid, .asset-grid { grid-template-columns: repeat(2, 1fr); }
   .hero-panel { grid-template-columns: 1fr; }
   .hero-summary { grid-template-columns: repeat(3, 1fr); border: 0; border-top: 1px solid rgba(255,255,255,.14); padding: 24px 0 0; }
   .two-column { grid-template-columns: 1fr; }
@@ -251,7 +271,7 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
   .hero-summary { grid-template-columns: 1fr; }
   .hero-summary div { display: grid; grid-template-columns: 1fr auto; align-items: center; }
   .hero-summary small { grid-column: 1/-1; }
-  .metric-grid, .report-grid, .asset-grid, .scene-grid, .conclusion-grid { grid-template-columns: 1fr; }
+  .metric-grid, .report-grid, .vertical-grid, .asset-grid, .scene-grid, .conclusion-grid { grid-template-columns: 1fr; }
   .section-heading, .report-intro, .detail-toolbar { align-items: flex-start; flex-direction: column; }
   .detail-toolbar > div:last-child { width: 100%; flex-direction: column; align-items: stretch; }
   .detail-toolbar input { width: 100%; }
@@ -260,4 +280,5 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
   .cache-run-panel { grid-template-columns: 1fr; }
   .cache-run-panel .secondary { width: 100%; }
   .validation-numbers div { padding-inline: 12px; }
+  .review-fields { grid-template-columns: 1fr; }
 }

@@ -62,7 +62,14 @@ def _relative(path: Path) -> str:
         return str(path.resolve())
 
 
-def create_report_run(db_path: Path = DEFAULT_DB, run_id: str | None = None) -> str:
+def create_report_run(
+    db_path: Path = DEFAULT_DB,
+    run_id: str | None = None,
+    *,
+    initial_status: str = "running",
+) -> str:
+    if initial_status not in {"queued", "running"}:
+        raise ValueError("initial_status must be queued or running")
     run_id = run_id or f"run-{uuid.uuid4().hex[:12]}"
     timestamp = now_iso()
     with connect(db_path) as connection:
@@ -82,11 +89,12 @@ def create_report_run(db_path: Path = DEFAULT_DB, run_id: str | None = None) -> 
                     id, created_at, updated_at, mode, channel, status, progress,
                     input_count, message, run_kind, scope, rule_version, report_version,
                     corpus_snapshot_id, report_revision, report_stale
-                ) VALUES (?, ?, ?, 'report', 'dual', 'running', 0, ?, ?,
+                ) VALUES (?, ?, ?, 'report', 'dual', ?, 0, ?, ?,
                           'full_corpus', 'dual_channel', ?, ?, ?, 0, 0)
                 """,
                 (
-                    run_id, timestamp, timestamp, len(evaluations), "正在生成动态报告",
+                    run_id, timestamp, timestamp, initial_status, len(evaluations),
+                    "任务已进入本地队列" if initial_status == "queued" else "正在生成动态报告",
                     CURRENT_RULE_VERSION, CURRENT_REPORT_VERSION, str(snapshot["id"]),
                 ),
             )

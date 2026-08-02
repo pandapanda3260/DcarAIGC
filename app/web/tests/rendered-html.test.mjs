@@ -20,7 +20,7 @@ test("server-renders the DCar product shell", async () => {
   const html = await response.text();
   assert.match(html, /<html lang="zh-CN">/i);
   assert.match(html, /<title>DCar Insight · 内容评估工作台<\/title>/i);
-  assert.match(html, /正在读取本地评估结果/);
+  assert.match(html, /正在读取 v7 正式报告/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape|Starter Project/i);
 });
 
@@ -33,19 +33,23 @@ test("contains the requested workflow surfaces and no starter dependency", async
   for (const label of ["运行总览", "新建评估", "结果报告", "内容明细", "数据资产"]) {
     assert.match(dashboard, new RegExp(label));
   }
-  assert.match(dashboard, /\/api\/runs\/cache-regression/);
-  assert.match(dashboard, /付费 API 刷新关闭/);
+  assert.match(dashboard, /\/api\/runs\/full/);
+  assert.match(dashboard, /人工复核/);
+  assert.match(dashboard, /证据不足不补 0/);
   assert.match(layout, /DCar Insight · 内容评估工作台/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
   await assert.rejects(access(new URL("../app/_sites-preview", import.meta.url)));
 });
 
-test("bundles the frozen v6.2 dual-channel report", async () => {
+test("bundles the current v7 formal dual-channel report", async () => {
   const report = JSON.parse(await readFile(new URL("../public/data/latest-report.json", import.meta.url), "utf8"));
-  assert.equal(report.report_version, "channel-structured-conclusions-v6.2-tikhub");
+  assert.equal(report.report_version, "channel-structured-conclusions-v7.0");
+  assert.equal(report.rule_version, "dcar-evaluation-v5.0");
   assert.equal(report.channels.douyin.denominator, 438);
   assert.equal(report.channels.xiaohongshu.denominator, 338);
-  assert.equal(report.channels.douyin.summary.core_selling_point_count_share.value, 42.24);
-  assert.equal(report.channels.douyin.summary.acquisition_effect_estimate.value, 34);
+  assert.equal(report.channels.douyin.count_distribution.core_selling_point.percentage, 42.24);
+  assert.equal(report.channels.douyin.verticality.acquisition_potential.score, 33);
+  assert.equal(report.channels.xiaohongshu.exposure_distribution.core_selling_point.status, "unavailable");
   assert.deepEqual(Object.keys(report.channels.douyin.scenes), ["二手车", "新车", "媒体-AI小懂"]);
+  assert.doesNotMatch(JSON.stringify(report), /actual_acquisition/);
 });

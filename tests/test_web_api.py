@@ -28,12 +28,21 @@ class WebApiTest(unittest.TestCase):
         self.assertEqual(result["valid_count"], 0)
         self.assertEqual(result["invalid_count"], 1)
 
-    def test_overview_uses_frozen_dual_channel_report(self):
+    def test_overview_uses_formal_v7_dual_channel_report(self):
         result = WEB_API.overview()
-        self.assertEqual(result["report_version"], "channel-structured-conclusions-v6.2-tikhub")
+        self.assertEqual(result["report_version"], "channel-structured-conclusions-v7.0")
+        self.assertEqual(result["rule_version"], "dcar-evaluation-v5.0")
         self.assertEqual(result["channels"]["douyin"]["denominator"], 438)
         self.assertEqual(result["channels"]["xiaohongshu"]["denominator"], 338)
         self.assertFalse(result["workflow"]["provider_refresh_enabled"])
+        self.assertGreaterEqual(result["revision"], 1)
+
+    def test_preflight_is_read_only_and_reports_no_provider_calls(self):
+        with WEB_API.connect() as connection:
+            value = WEB_API.preflight(connection)
+        self.assertEqual(value["provider_calls"], 0)
+        self.assertEqual(value["channels"]["douyin"]["content_items"], 438)
+        self.assertEqual(value["channels"]["xiaohongshu"]["content_items"], 338)
 
     def test_export_allowlist_contains_no_raw_comment_evidence(self):
         self.assertNotIn("comment-users", WEB_API.EXPORTS)
@@ -42,4 +51,3 @@ class WebApiTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
