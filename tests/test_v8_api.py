@@ -417,6 +417,141 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         self.assertEqual(evidence_count, 1)
         self.assertEqual(status, "resolved")
 
+    def test_review_api_reopens_with_audit_event_and_appends_new_version(self) -> None:
+        started = self.client.post(f"/api/v8/reviews/{self.queue_id}/start")
+        self.assertEqual(started.status_code, 200)
+        first = self.client.post(
+            f"/api/v8/reviews/{self.queue_id}/resolve",
+            json={
+                "base_evaluation_id": started.json()["base_evaluation_id"],
+                "decision": "override",
+                "reason": "第一次代理复核",
+                "reviewer": "Codex代理",
+                "evidence_type": "visual_summary",
+                "evidence_text": "第一次人工证据摘要",
+                "primary_selling_point_code": "C1",
+                "selling_point_score": 82,
+                "selling_point_included": True,
+                "content_automotive_score": 86,
+                "content_direction": "media",
+            },
+        )
+        self.assertEqual(first.status_code, 200)
+        first_evaluation_id = int(first.json()["evaluation_id"])
+        with connect(self.db) as connection:
+            first_review_id = int(
+                connection.execute(
+                    "SELECT id FROM evaluation_reviews WHERE queue_id=?",
+                    (self.queue_id,),
+                ).fetchone()[0]
+            )
+
+        reopened = self.client.post(
+            f"/api/v8/reviews/{self.queue_id}/reopen",
+            json={
+                "reason": "业务负责人要求重新核验代理判定",
+                "reopened_by": "运营复核员",
+            },
+        )
+        self.assertEqual(reopened.status_code, 200)
+        self.assertEqual(reopened.json()["status"], "in_review")
+        self.assertEqual(reopened.json()["base_evaluation_id"], first_evaluation_id)
+
+        duplicate_reopen = self.client.post(
+            f"/api/v8/reviews/{self.queue_id}/reopen",
+            json={"reason": "重复重开", "reopened_by": "运营复核员"},
+        )
+        self.assertEqual(duplicate_reopen.status_code, 409)
+
+        second = self.client.post(
+            f"/api/v8/reviews/{self.queue_id}/resolve",
+            json={
+                "base_evaluation_id": reopened.json()["base_evaluation_id"],
+                "decision": "override",
+                "reason": "业务负责人完成二次核验",
+                "reviewer": "运营复核员",
+                "evidence_type": "visual_summary",
+                "evidence_text": "业务人员重新查看画面后形成的新证据摘要",
+                "primary_selling_point_code": "C1",
+                "selling_point_score": 94,
+                "selling_point_included": True,
+                "content_automotive_score": 96,
+                "content_direction": "media",
+            },
+        )
+        self.assertEqual(second.status_code, 200)
+        self.assertNotEqual(second.json()["evaluation_id"], first_evaluation_id)
+
+        with connect(self.db) as connection:
+            reopen_event = connection.execute(
+                "SELECT * FROM review_reopen_events WHERE queue_id=?",
+                (self.queue_id,),
+            ).fetchone()
+            sources = connection.execute(
+                "SELECT evaluation_source FROM evaluation_versions ORDER BY id"
+            ).fetchall()
+            review_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM evaluation_reviews WHERE queue_id=?",
+                    (self.queue_id,),
+                ).fetchone()[0]
+            )
+            evidence_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM manual_evidence WHERE content_id=?",
+                    (self.content_id,),
+                ).fetchone()[0]
+            )
+            queue_status = str(
+                connection.execute(
+                    "SELECT status FROM review_queue WHERE id=?", (self.queue_id,)
+                ).fetchone()[0]
+            )
+        self.assertEqual(reopen_event["previous_review_id"], first_review_id)
+        self.assertEqual(reopen_event["base_evaluation_id"], first_evaluation_id)
+        self.assertEqual(reopen_event["reopened_by"], "运营复核员")
+        self.assertEqual(reopen_event["reason"], "业务负责人要求重新核验代理判定")
+        self.assertEqual(
+            [row[0] for row in sources],
+            ["automatic", "manual_review", "manual_review"],
+        )
+        self.assertEqual(review_count, 2)
+        self.assertEqual(evidence_count, 2)
+        self.assertEqual(queue_status, "resolved")
+
+    def test_review_api_rejects_selling_point_scene_conflict(self) -> None:
+        started = self.client.post(f"/api/v8/reviews/{self.queue_id}/start")
+        self.assertEqual(started.status_code, 200)
+        rejected = self.client.post(
+            f"/api/v8/reviews/{self.queue_id}/resolve",
+            json={
+                "base_evaluation_id": started.json()["base_evaluation_id"],
+                "decision": "override",
+                "reason": "尝试提交冲突场景",
+                "reviewer": "测试复核员",
+                "evidence_type": "visual_summary",
+                "evidence_text": "画面证据摘要",
+                "primary_selling_point_code": "C1",
+                "selling_point_score": 90,
+                "selling_point_included": True,
+                "content_automotive_score": 90,
+                "content_direction": "new_car",
+            },
+        )
+        self.assertEqual(rejected.status_code, 409)
+        self.assertIn("does not allow content direction", rejected.json()["detail"])
+        with connect(self.db) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM evaluation_reviews").fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT status FROM review_queue WHERE id=?", (self.queue_id,)
+                ).fetchone()[0],
+                "in_review",
+            )
+
     def test_review_api_rejects_stale_evaluation_cursor(self) -> None:
         started = self.client.post(f"/api/v8/reviews/{self.queue_id}/start")
         self.assertEqual(started.status_code, 200)
@@ -453,7 +588,18 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
             encoding="utf-8",
         )
         ocr_path.write_text(
-            json.dumps({"status": "success", "ocr_observation_count": 2, "combined_text": "关键帧文字证据"}),
+            json.dumps(
+                {
+                    "status": "success",
+                    "ocr_observation_count": 3,
+                    "combined_text": "",
+                    "observations": [
+                        {"status": "success", "text": "关键帧文字证据"},
+                        {"status": "success", "text": "车辆保养流程"},
+                        {"status": "success", "text": "关键帧文字证据"},
+                    ],
+                }
+            ),
             encoding="utf-8",
         )
         with connect(self.db) as connection:
@@ -501,7 +647,7 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         value = evidence.json()
         self.assertEqual(value["base_evaluation_id"], self.evaluation_id)
         self.assertEqual(value["asr"]["text"], "完整的本地语音证据")
-        self.assertEqual(value["ocr"]["text"], "关键帧文字证据")
+        self.assertEqual(value["ocr"]["text"], "关键帧文字证据\n车辆保养流程")
         self.assertEqual(value["comments"]["stored_count"], 1)
         self.assertEqual(len(value["media"]), 1)
         media = self.client.get(value["media"][0]["url"])

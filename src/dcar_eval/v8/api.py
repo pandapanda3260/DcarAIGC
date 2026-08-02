@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 from .capture import BudgetBlocked, CaptureError, SlotUnavailable
 from .contracts import CURRENT_REPORT_VERSION, quantity_metric, ratio_metric
 from .duplicates import FINGERPRINT_VERSION, THRESHOLDS
-from .evaluation import RULE_VERSION, EvaluationError, resolve_review
+from .evaluation import RULE_VERSION, EvaluationError, reopen_review, resolve_review
 from .insights import build_channel_conclusions
 from .media import MediaProcessingError
 from .operations import (
@@ -123,6 +123,11 @@ class ReviewResolveRequest(BaseModel):
     selling_point_included: Optional[bool] = None
     content_automotive_score: Optional[int] = Field(default=None, ge=0, le=100)
     content_direction: Optional[str] = Field(default=None, max_length=32)
+
+
+class ReviewReopenRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=2000)
+    reopened_by: str = Field(min_length=1, max_length=100)
 
 
 class SellingPointMutationRequest(BaseModel):
@@ -835,6 +840,23 @@ def _artifact_media_paths(row: sqlite3.Row) -> List[Path]:
     return paths
 
 
+def _ocr_payload_text(payload: Dict[str, Any]) -> str:
+    combined = str(payload.get("combined_text") or "").strip()
+    if combined:
+        return combined
+    texts: List[str] = []
+    observations = payload.get("observations")
+    if not isinstance(observations, list):
+        return ""
+    for item in observations:
+        if not isinstance(item, dict):
+            continue
+        text = "\n".join(str(item.get("text") or "").splitlines()).strip()
+        if text and text not in texts:
+            texts.append(text)
+    return "\n".join(texts)
+
+
 def _content_evidence(content_id: int) -> Dict[str, Any]:
     with connect(API_DB_PATH) as connection:
         content = connection.execute(
@@ -954,7 +976,7 @@ def _content_evidence(content_id: int) -> Dict[str, Any]:
             "status": ocr_payload.get("status") or ("missing" if ocr_row is None else "available"),
             "observation_count": ocr_payload.get("ocr_observation_count")
             or ocr_payload.get("source_count") or 0,
-            "text": ocr_payload.get("combined_text") or "",
+            "text": _ocr_payload_text(ocr_payload),
         },
         "comments": {
             "status": str(comment_version["status"]) if comment_version else "missing",
@@ -1428,6 +1450,25 @@ def start_v8_review(queue_id: int) -> Dict[str, Any]:
         "id": queue_id,
         "status": "in_review",
         "base_evaluation_id": int(evaluation["id"]) if evaluation is not None else None,
+    }
+
+
+@app.post("/api/v8/reviews/{queue_id}/reopen")
+def reopen_v8_review(queue_id: int, payload: ReviewReopenRequest) -> Dict[str, Any]:
+    try:
+        result = reopen_review(
+            queue_id,
+            reason=payload.reason,
+            reopened_by=payload.reopened_by,
+            db_path=API_DB_PATH,
+        )
+    except EvaluationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "id": result.queue_id,
+        "status": "in_review",
+        "reopen_event_id": result.event_id,
+        "base_evaluation_id": result.base_evaluation_id,
     }
 
 

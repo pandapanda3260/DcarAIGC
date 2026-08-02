@@ -88,7 +88,9 @@ test("routes preserve operations and expose evidence-backed review controls", as
   assert.match(contents, /\/api\/v8\/contents\/import/);
   assert.match(contents, /\/update-data/);
   assert.match(contents, /查看证据/);
+  assert.match(contents, /再次复核/);
   assert.match(evidence, /base_evaluation_id/);
+  assert.match(evidence, /当前评估摘要/);
   assert.match(evidence, /ASR 全文/);
   assert.match(evidence, /OCR 全文/);
   assert.match(evidence, /评论摘要/);
@@ -96,6 +98,10 @@ test("routes preserve operations and expose evidence-backed review controls", as
   assert.match(evidence, /allow_paid_refresh/);
   assert.match(evidence, /\/evidence/);
   assert.match(evidence, /\/media\/retry/);
+  assert.match(evidence, /\/api\/v8\/reviews\/\$\{item\.review_queue_id\}\/reopen/);
+  assert.match(evidence, /不会改写当前结论，也不会生成新评估/);
+  assert.match(evidence, /提交人工复核表单，才会追加新的评估版本/);
+  assert.match(evidence, /再次复核发起失败/);
   assert.match(tasks, /新建自定义报告/);
   assert.match(taskDetail, /\/cancel/);
   assert.match(taskDetail, /\/resume/);

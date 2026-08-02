@@ -11,7 +11,7 @@ from typing import Iterator
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_DB = PROJECT_ROOT / "app" / "data" / "dcar_insight.sqlite3"
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 def now_utc() -> str:
@@ -473,6 +473,17 @@ CREATE TABLE IF NOT EXISTS evaluation_reviews (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS review_reopen_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    queue_id INTEGER NOT NULL REFERENCES review_queue(id) ON DELETE CASCADE,
+    content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
+    previous_review_id INTEGER REFERENCES evaluation_reviews(id) ON DELETE SET NULL,
+    base_evaluation_id INTEGER REFERENCES evaluation_versions(id) ON DELETE SET NULL,
+    reopened_by TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS manual_evidence (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     review_id INTEGER NOT NULL REFERENCES evaluation_reviews(id) ON DELETE CASCADE,
@@ -847,5 +858,13 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             VALUES (?, ?, ?)
             ON CONFLICT(version) DO NOTHING
             """,
-            (SCHEMA_VERSION, "perceptual-duplicate-fingerprints-and-calibration", now_utc()),
+            (7, "perceptual-duplicate-fingerprints-and-calibration", now_utc()),
+        )
+        connection.execute(
+            """
+            INSERT INTO schema_migrations(version, name, applied_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(version) DO NOTHING
+            """,
+            (SCHEMA_VERSION, "append-only-review-reopen-audit", now_utc()),
         )

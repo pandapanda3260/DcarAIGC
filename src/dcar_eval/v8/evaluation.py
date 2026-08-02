@@ -35,6 +35,14 @@ class EvaluationResult:
     created: bool
 
 
+@dataclass(frozen=True)
+class ReviewReopenResult:
+    event_id: int
+    queue_id: int
+    content_id: int
+    base_evaluation_id: int
+
+
 def canonical_json(value: Any) -> str:
     return json.dumps(
         value,
@@ -672,6 +680,82 @@ def evaluate_incremental(*, db_path: Path = DEFAULT_DB, limit: Optional[int] = N
     }
 
 
+def reopen_review(
+    queue_id: int,
+    *,
+    reason: str,
+    reopened_by: str,
+    db_path: Path = DEFAULT_DB,
+) -> ReviewReopenResult:
+    """Reopen a resolved queue with an explicit append-only audit event."""
+
+    if not reason.strip() or not reopened_by.strip():
+        raise EvaluationError("reopen reason and operator are required")
+    with connect(db_path) as connection, transaction(connection):
+        queue = connection.execute(
+            "SELECT * FROM review_queue WHERE id=?", (queue_id,)
+        ).fetchone()
+        if queue is None:
+            raise EvaluationError(f"review queue {queue_id} does not exist")
+        if queue["status"] != "resolved":
+            raise EvaluationError(
+                f"review queue {queue_id} must be resolved before reopening"
+            )
+        current = connection.execute(
+            """
+            SELECT id FROM evaluation_versions
+            WHERE content_id=? AND invalidated_at IS NULL
+            ORDER BY evaluated_at DESC, id DESC LIMIT 1
+            """,
+            (queue["content_id"],),
+        ).fetchone()
+        if current is None:
+            raise EvaluationError("review content has no current evaluation")
+        previous_review = connection.execute(
+            """
+            SELECT id FROM evaluation_reviews
+            WHERE queue_id=? AND resulting_evaluation_id IS NOT NULL
+            ORDER BY id DESC LIMIT 1
+            """,
+            (queue_id,),
+        ).fetchone()
+        created_at = now_utc()
+        cursor = connection.execute(
+            """
+            INSERT INTO review_reopen_events(
+                queue_id, content_id, previous_review_id, base_evaluation_id,
+                reopened_by, reason, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                queue_id,
+                queue["content_id"],
+                previous_review["id"] if previous_review is not None else None,
+                current["id"],
+                reopened_by.strip(),
+                reason.strip(),
+                created_at,
+            ),
+        )
+        if cursor.lastrowid is None:
+            raise RuntimeError("review reopen insert returned no id")
+        connection.execute(
+            """
+            UPDATE review_queue
+            SET evaluation_id=?, status='in_review', assigned_to=?,
+                resolved_at=NULL, updated_at=?
+            WHERE id=?
+            """,
+            (current["id"], reopened_by.strip(), created_at, queue_id),
+        )
+        return ReviewReopenResult(
+            event_id=int(cursor.lastrowid),
+            queue_id=queue_id,
+            content_id=int(queue["content_id"]),
+            base_evaluation_id=int(current["id"]),
+        )
+
+
 def resolve_review(
     queue_id: int,
     *,
@@ -710,6 +794,34 @@ def resolve_review(
             raise EvaluationError(f"review queue {queue_id} does not exist")
         if queue["status"] in {"resolved", "terminal_failed"}:
             raise EvaluationError(f"review queue {queue_id} is already {queue['status']}")
+        if decision == "override":
+            primary_code = override_values.get("primary_selling_point_code")
+            direction = override_values.get("content_direction")
+            if primary_code and direction:
+                allowed_scenes = {
+                    str(row["scene"])
+                    for row in connection.execute(
+                        """
+                        SELECT sps.scene
+                        FROM taxonomy_versions tv
+                        JOIN selling_points sp ON sp.taxonomy_id=tv.id
+                        JOIN selling_point_scenes sps
+                          ON sps.selling_point_id=sp.id
+                        WHERE tv.id=(
+                            SELECT id FROM taxonomy_versions
+                            WHERE status='published'
+                            ORDER BY published_at DESC, created_at DESC LIMIT 1
+                        ) AND sp.code=?
+                        """,
+                        (primary_code,),
+                    ).fetchall()
+                }
+                if allowed_scenes and direction not in allowed_scenes:
+                    allowed_scene_text = ", ".join(sorted(allowed_scenes))
+                    raise EvaluationError(
+                        f"selling point {primary_code} does not allow content "
+                        f"direction {direction}; allowed: {allowed_scene_text}"
+                    )
         previous = connection.execute(
             """
             SELECT id FROM evaluation_versions WHERE content_id=?
