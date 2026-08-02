@@ -1,14 +1,47 @@
 export type Section = "overview" | "tasks" | "accounts" | "contents" | "selling-points";
 export type WindowKey = "yesterday" | "this_week" | "last_week";
+export type OverviewChannelKey = "douyin" | "xiaohongshu";
+export type BusinessSceneKey = "used_car" | "new_car" | "media";
+export type ConclusionMetricKey =
+  | "selling_point_count_share"
+  | "core_selling_point_count_share"
+  | "selling_point_exposure_share"
+  | "core_selling_point_exposure_share"
+  | "content_verticality"
+  | "audience_verticality"
+  | "acquisition_potential";
 
 export type Metric = {
   kind: "quantity" | "ratio" | "score";
   value?: number | null;
+  numerator?: number | null;
+  denominator?: number;
   percentage?: number | null;
   unit: string;
   status: string;
+  eligible_count?: number | null;
+  scale?: number;
+  scorable_items?: number;
+  total_items?: number;
   coverage_percentage?: number | null;
   reason: string;
+};
+
+export type ConclusionGroup = {
+  label: string;
+  publication_count: number;
+  metrics: Record<ConclusionMetricKey, Metric>;
+};
+
+export type OverviewChannel = {
+  platform: OverviewChannelKey;
+  label: string;
+  publication_count: number;
+  evidence_coverage_percentage: number | null;
+  valid_exposure_items: number;
+  exposure_coverage_percentage: number | null;
+  summary: ConclusionGroup;
+  scenes: Record<BusinessSceneKey, ConclusionGroup>;
 };
 
 export type OverviewWindow = {
@@ -17,6 +50,7 @@ export type OverviewWindow = {
   eligible_count: number;
   unassociated_content_count: number;
   metrics: Record<string, Metric>;
+  channels: Record<OverviewChannelKey, OverviewChannel>;
   empty_explanation: string;
 };
 

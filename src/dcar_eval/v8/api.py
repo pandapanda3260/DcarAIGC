@@ -23,7 +23,8 @@ from pydantic import BaseModel, Field
 from .capture import BudgetBlocked, CaptureError, SlotUnavailable
 from .contracts import CURRENT_REPORT_VERSION, quantity_metric, ratio_metric
 from .duplicates import FINGERPRINT_VERSION, THRESHOLDS
-from .evaluation import EvaluationError, resolve_review
+from .evaluation import RULE_VERSION, EvaluationError, resolve_review
+from .insights import build_channel_conclusions
 from .media import MediaProcessingError
 from .operations import (
     OperationError,
@@ -327,9 +328,11 @@ def _window_summary(connection: sqlite3.Connection, start: datetime, end: dateti
     start_utc, end_utc = _utc_text(start), _utc_text(end)
     content_rows = connection.execute(
         """
-        SELECT id, account_id
-        FROM content_items
-        WHERE published_at >= ? AND published_at < ?
+        SELECT c.id, c.account_id, c.platform, c.manual_content_direction,
+               c.evaluation_content_direction, a.content_direction account_content_direction
+        FROM content_items c
+        LEFT JOIN accounts a ON a.id=c.account_id
+        WHERE c.published_at >= ? AND c.published_at < ?
         """,
         (start_utc, end_utc),
     ).fetchall()
@@ -340,25 +343,34 @@ def _window_summary(connection: sqlite3.Connection, start: datetime, end: dateti
         placeholders = ",".join("?" for _ in content_ids)
         evaluations = connection.execute(
             f"""
-            SELECT ev.* FROM evaluation_versions ev
+            SELECT ev.*, sp.tier primary_tier FROM evaluation_versions ev
             JOIN (
                 SELECT content_id, MAX(id) id
                 FROM evaluation_versions
                 WHERE content_id IN ({placeholders}) AND invalidated_at IS NULL
+                  AND rule_version=?
+                  AND taxonomy_version=(
+                      SELECT version FROM taxonomy_versions
+                      WHERE status='published'
+                      ORDER BY published_at DESC, created_at DESC LIMIT 1
+                  )
                 GROUP BY content_id
             ) latest ON latest.id=ev.id
+            LEFT JOIN taxonomy_versions tv ON tv.version=ev.taxonomy_version
+            LEFT JOIN selling_points sp
+              ON sp.taxonomy_id=tv.id AND sp.code=ev.primary_selling_point_code
             """,
-            content_ids,
+            [*content_ids, RULE_VERSION],
         ).fetchall()
         metrics = connection.execute(
             f"""
             SELECT ms.* FROM content_metric_snapshots ms
-            JOIN (
-                SELECT content_id, MAX(captured_at) captured_at
-                FROM content_metric_snapshots
-                WHERE content_id IN ({placeholders})
-                GROUP BY content_id
-            ) latest ON latest.content_id=ms.content_id AND latest.captured_at=ms.captured_at
+            WHERE ms.content_id IN ({placeholders})
+              AND ms.id=(
+                  SELECT ms2.id FROM content_metric_snapshots ms2
+                  WHERE ms2.content_id=ms.content_id
+                  ORDER BY ms2.captured_at DESC, ms2.id DESC LIMIT 1
+              )
             """,
             content_ids,
         ).fetchall()
@@ -394,17 +406,49 @@ def _window_summary(connection: sqlite3.Connection, start: datetime, end: dateti
         evaluations, metrics = [], []
         duplicate_count = fingerprint_count = 0
         duplicate_calibrated = False
-    eligible = sum(1 for row in evaluations if row["evidence_level"] in {"V2", "V3"})
+    evaluation_values = [dict(row) for row in evaluations]
+    metric_values = [dict(row) for row in metrics]
+    evaluation_by_content = {
+        int(row["content_id"]): row for row in evaluation_values
+    }
+    metric_by_content = {int(row["content_id"]): row for row in metric_values}
+    conclusion_rows: List[Dict[str, Any]] = []
+    for content_row in content_rows:
+        content = dict(content_row)
+        content_id = int(content["id"])
+        evaluation = evaluation_by_content.get(content_id, {})
+        metric = metric_by_content.get(content_id, {})
+        conclusion_rows.append(
+            {
+                "content_id": content_id,
+                "platform": str(content["platform"]),
+                "content_direction": str(
+                    content.get("manual_content_direction")
+                    or evaluation.get("content_direction")
+                    or content.get("evaluation_content_direction")
+                    or content.get("account_content_direction")
+                    or "unknown"
+                ),
+                "evidence_level": evaluation.get("evidence_level"),
+                "selling_point_included": bool(evaluation.get("selling_point_included")),
+                "primary_tier": evaluation.get("primary_tier"),
+                "content_automotive_score": evaluation.get("content_automotive_score"),
+                "audience_automotive_score": evaluation.get("audience_automotive_score"),
+                "acquisition_potential_score": evaluation.get("acquisition_potential_score"),
+                "view_count": metric.get("view_count"),
+            }
+        )
+    eligible = sum(1 for row in evaluation_values if row["evidence_level"] in {"V2", "V3"})
     vertical = sum(
-        1 for row in evaluations
+        1 for row in evaluation_values
         if row["evidence_level"] in {"V2", "V3"}
         and row["content_automotive_score"] is not None
         and int(row["content_automotive_score"]) >= 60
     )
-    selling = sum(1 for row in evaluations if int(row["selling_point_included"]) == 1)
-    metric_coverage = round(len(metrics) * 100 / total, 2) if total else None
-    views = sum(int(row["view_count"] or 0) for row in metrics)
-    comments = sum(int(row["comment_count"] or 0) for row in metrics if row["comment_count"] is not None)
+    selling = sum(1 for row in evaluation_values if int(row["selling_point_included"]) == 1)
+    metric_coverage = round(len(metric_values) * 100 / total, 2) if total else None
+    views = sum(int(row["view_count"] or 0) for row in metric_values)
+    comments = sum(int(row["comment_count"] or 0) for row in metric_values if row["comment_count"] is not None)
     ratio_status = "not_applicable" if total == 0 else "available" if eligible * 100 / total >= 95 else "below_threshold"
     duplicate_coverage = round(fingerprint_count * 100 / total, 2) if total else None
     duplicate_status = (
@@ -420,13 +464,13 @@ def _window_summary(connection: sqlite3.Connection, start: datetime, end: dateti
             "publication_count": quantity_metric(total, unit="content", status="available"),
             "active_account_count": quantity_metric(active_accounts, unit="account", status="available"),
             "view_count": quantity_metric(
-                views if metrics else None,
+                views if metric_values else None,
                 unit="view",
-                status="not_applicable" if total == 0 else "missing" if not metrics else "available",
+                status="not_applicable" if total == 0 else "missing" if not metric_values else "available",
                 coverage_percentage=metric_coverage,
             ),
             "comment_count": quantity_metric(
-                comments if metrics and any(row["comment_count"] is not None for row in metrics) else None,
+                comments if metric_values and any(row["comment_count"] is not None for row in metric_values) else None,
                 unit="comment",
                 status="not_applicable" if total == 0 else "missing",
                 coverage_percentage=metric_coverage,
@@ -457,6 +501,7 @@ def _window_summary(connection: sqlite3.Connection, start: datetime, end: dateti
             "estimated_reactivated_users": quantity_metric(None, unit="person", status="not_applicable" if total == 0 else "not_calculable", reason="首版没有已验证模型"),
             "estimated_leads": quantity_metric(None, unit="lead", status="not_applicable" if total == 0 else "not_calculable", reason="首版没有已验证模型"),
         },
+        "channels": build_channel_conclusions(conclusion_rows),
         "empty_explanation": (
             "所选窗口没有进入有效监控范围的已发布内容，并非抓取故障。"
             if total == 0 else ""

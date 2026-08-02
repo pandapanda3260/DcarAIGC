@@ -5,6 +5,7 @@ import json
 import logging
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -49,8 +50,161 @@ class V8ApiTest(unittest.TestCase):
             self.assertEqual(metrics["estimated_new_users"]["unit"], "person")
             self.assertNotEqual(metrics["estimated_new_users"]["status"], "partial")
             self.assertIn("duplicate_rate", metrics)
+            self.assertEqual(list(window["channels"]), ["douyin", "xiaohongshu"])
+            for channel in window["channels"].values():
+                self.assertEqual(
+                    list(channel["summary"]["metrics"]),
+                    [
+                        "selling_point_count_share",
+                        "core_selling_point_count_share",
+                        "selling_point_exposure_share",
+                        "core_selling_point_exposure_share",
+                        "content_verticality",
+                        "audience_verticality",
+                        "acquisition_potential",
+                    ],
+                )
+                self.assertEqual(list(channel["scenes"]), ["used_car", "new_car", "media"])
+                for scene in channel["scenes"].values():
+                    self.assertEqual(
+                        list(scene["metrics"]), list(channel["summary"]["metrics"])
+                    )
         self.assertIn("duplicate_fingerprint_coverage", value["data_quality"])
         self.assertIn("duplicate_calibration_ready", value["data_quality"])
+
+    def test_overview_channel_conclusions_restore_v7_denominators_and_scores(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            db_path = Path(temporary) / "overview.sqlite3"
+            created_at = "2026-08-02T08:00:00Z"
+            with connect(db_path) as connection:
+                initialize_database(connection)
+                connection.execute(
+                    """
+                    INSERT INTO taxonomy_versions(
+                        id,version,status,definition,created_at,published_at
+                    ) VALUES ('tax-current','selling-points-test','published','{}',?,?)
+                    """,
+                    (created_at, created_at),
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO selling_points(
+                        taxonomy_id,code,tier,label,definition
+                    ) VALUES ('tax-current',?,?,?,'')
+                    """,
+                    [("E1", "core", "核心卖点"), ("C1", "other", "其他卖点")],
+                )
+                content_rows = [
+                    ("TST1A2", "content-a", "new_car", "2026-08-02T10:00:00Z"),
+                    ("TST2B3", "content-b", "used_car", "2026-08-02T11:00:00Z"),
+                    ("TST3C4", "content-c", "other", "2026-08-02T12:00:00Z"),
+                ]
+                for link_id, platform_id, direction, published_at in content_rows:
+                    connection.execute(
+                        """
+                        INSERT INTO content_items(
+                            link_id,platform,platform_content_id,canonical_url,title,
+                            content_type,published_at,evaluation_content_direction,
+                            imported_at,created_at,updated_at
+                        ) VALUES (?,'douyin',?,?,?,'video',?,?,?, ?,?)
+                        """,
+                        (
+                            link_id, platform_id, f"https://example.com/{platform_id}",
+                            platform_id, published_at, direction,
+                            created_at, created_at, created_at,
+                        ),
+                    )
+                ids = {
+                    row["platform_content_id"]: int(row["id"])
+                    for row in connection.execute(
+                        "SELECT id,platform_content_id FROM content_items"
+                    )
+                }
+                evaluations = [
+                    (ids["content-a"], "a" * 64, "E1", 1, "new_car", 80, 60, 55),
+                    (ids["content-b"], "b" * 64, "C1", 1, "used_car", 60, None, None),
+                    (ids["content-c"], "c" * 64, None, 0, "other", 40, None, None),
+                ]
+                for content_id, evidence_sha, code, included, direction, content_score, audience_score, acquisition_score in evaluations:
+                    connection.execute(
+                        """
+                        INSERT INTO evaluation_versions(
+                            content_id,rule_version,taxonomy_version,evidence_sha256,
+                            evaluation_source,evaluation_status,evidence_level,
+                            primary_selling_point_code,selling_point_score,
+                            selling_point_included,content_direction,
+                            content_automotive_score,audience_automotive_score,
+                            acquisition_potential_score,pending_review,payload_json,evaluated_at
+                        ) VALUES (?,?,?,?,'automatic','evaluated','V3',?,90,?,?,?,?,?,0,'{}',?)
+                        """,
+                        (
+                            content_id, api_module.RULE_VERSION, "selling-points-test",
+                            evidence_sha, code, included, direction, content_score,
+                            audience_score, acquisition_score, created_at,
+                        ),
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO evaluation_versions(
+                        content_id,rule_version,taxonomy_version,evidence_sha256,
+                        evaluation_source,evaluation_status,evidence_level,
+                        selling_point_included,content_direction,pending_review,
+                        payload_json,evaluated_at
+                    ) VALUES (?,'old-rule','selling-points-test',?,'automatic',
+                              'evaluated','V3',0,'new_car',0,'{}','2026-08-02T13:00:00Z')
+                    """,
+                    (ids["content-a"], "d" * 64),
+                )
+                for content_id, view_count in (
+                    (ids["content-a"], 100),
+                    (ids["content-b"], 300),
+                    (ids["content-c"], 100),
+                ):
+                    connection.execute(
+                        """
+                        INSERT INTO content_metric_snapshots(
+                            content_id,captured_at,window_key,view_count,status,source
+                        ) VALUES (?,'2026-08-02T14:00:00Z','2026-08-02',?,'available','test')
+                        """,
+                        (content_id, view_count),
+                    )
+                connection.commit()
+                window = api_module._window_summary(
+                    connection,
+                    datetime(2026, 8, 2, tzinfo=timezone.utc),
+                    datetime(2026, 8, 3, tzinfo=timezone.utc),
+                )
+
+            douyin = window["channels"]["douyin"]
+            summary = douyin["summary"]["metrics"]
+            self.assertEqual(douyin["publication_count"], 3)
+            self.assertEqual(summary["selling_point_count_share"]["percentage"], 66.67)
+            self.assertEqual(summary["core_selling_point_count_share"]["percentage"], 33.33)
+            self.assertEqual(summary["selling_point_exposure_share"]["percentage"], 80.0)
+            self.assertEqual(summary["core_selling_point_exposure_share"]["percentage"], 20.0)
+            self.assertEqual(summary["content_verticality"]["value"], 60)
+            self.assertEqual(summary["audience_verticality"]["value"], 60)
+            self.assertEqual(summary["audience_verticality"]["status"], "sample_only")
+            self.assertEqual(summary["acquisition_potential"]["value"], 55)
+
+            new_car = douyin["scenes"]["new_car"]["metrics"]
+            used_car = douyin["scenes"]["used_car"]["metrics"]
+            media = douyin["scenes"]["media"]["metrics"]
+            self.assertEqual(new_car["selling_point_count_share"]["denominator"], 3)
+            self.assertEqual(new_car["selling_point_exposure_share"]["denominator"], 500)
+            self.assertEqual(new_car["selling_point_exposure_share"]["percentage"], 20.0)
+            self.assertEqual(used_car["selling_point_exposure_share"]["percentage"], 60.0)
+            self.assertEqual(media["selling_point_count_share"]["percentage"], 0.0)
+            self.assertEqual(media["content_verticality"]["status"], "not_applicable")
+
+            xiaohongshu = window["channels"]["xiaohongshu"]
+            self.assertEqual(xiaohongshu["publication_count"], 0)
+            self.assertTrue(
+                all(
+                    metric["status"] == "not_applicable"
+                    for metric in xiaohongshu["summary"]["metrics"].values()
+                )
+            )
 
     def test_five_page_read_models_use_migrated_v8_data(self) -> None:
         tasks = self.client.get("/api/v8/tasks")

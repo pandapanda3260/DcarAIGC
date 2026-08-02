@@ -41,6 +41,31 @@ test("root redirects to overview instead of keeping hidden client-side view stat
   assert.match(response.headers.get("location") ?? "", /\/overview$/);
 });
 
+test("overview keeps time windows outside the fixed channel conclusion structure", async () => {
+  const source = await readFile(new URL("../app/overview/OverviewPage.tsx", import.meta.url), "utf8");
+  assert.match(source, /yesterday:\s*"昨天"/);
+  assert.match(source, /this_week:\s*"本周"/);
+  assert.match(source, /last_week:\s*"上周"/);
+  assert.match(source, /channelOrder[^=]*=\s*\["douyin",\s*"xiaohongshu"\]/);
+  assert.match(source, /sceneOrder[^=]*=\s*\["used_car",\s*"new_car",\s*"media"\]/);
+  const labels = [
+    "卖点条数占比", "核心卖点条数占比", "卖点曝光占比", "核心卖点曝光占比",
+    "内容垂直度", "互动用户垂直度", "内容拉新效果预估",
+  ];
+  let previous = -1;
+  for (const label of labels) {
+    const position = source.indexOf(label);
+    assert.ok(position > previous, `${label} should exist in the fixed metric order`);
+    previous = position;
+  }
+  assert.match(source, /<h3>【\{channel\.label\}渠道】<\/h3>/);
+  assert.match(source, /<h4>汇总<\/h4>/);
+  assert.match(source, /<h4>三个业务场景<\/h4>/);
+  assert.match(source, /activeWindow\.channels\[key\]/);
+  assert.match(source, /以下仍保留完整渠道与场景结构/);
+  assert.match(source, /运营补充指标（不属于上述七项结论）/);
+});
+
 test("routes preserve operations and expose evidence-backed review controls", async () => {
   const [shell, accounts, contents, evidence, tasks, taskDetail, sellingPoints, apiSource, layout, packageJson] = await Promise.all([
     readFile(new URL("../app/components/AppShell.tsx", import.meta.url), "utf8"),
