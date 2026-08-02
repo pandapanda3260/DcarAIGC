@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Iterator
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def now_iso() -> str:
@@ -121,6 +121,48 @@ CREATE TABLE IF NOT EXISTS corpus_snapshots (
 """
 
 
+MIGRATION_2_TABLES = """
+CREATE TABLE IF NOT EXISTS run_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    message TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_events_run
+ON run_events(run_id, id);
+
+CREATE TABLE IF NOT EXISTS formal_baseline (
+    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    selected_at TEXT NOT NULL
+);
+"""
+
+
+RUN_V2_COLUMNS = {
+    "run_kind": "TEXT NOT NULL DEFAULT 'temporary'",
+    "scope": "TEXT NOT NULL DEFAULT 'single_channel'",
+    "rule_version": "TEXT NOT NULL DEFAULT ''",
+    "report_version": "TEXT NOT NULL DEFAULT ''",
+    "is_formal_baseline": "INTEGER NOT NULL DEFAULT 0",
+    "cancel_requested": "INTEGER NOT NULL DEFAULT 0",
+    "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+    "max_attempts": "INTEGER NOT NULL DEFAULT 2",
+    "last_error_code": "TEXT NOT NULL DEFAULT ''",
+    "report_revision": "INTEGER NOT NULL DEFAULT 0",
+    "report_stale": "INTEGER NOT NULL DEFAULT 0",
+    "corpus_snapshot_id": "TEXT NOT NULL DEFAULT ''",
+    "provider_calls": "INTEGER NOT NULL DEFAULT 0",
+}
+
+
+def _column_names(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row["name"]) for row in connection.execute(f"PRAGMA table_info({table})")}
+
+
 def migrate(connection: sqlite3.Connection) -> int:
     connection.execute(
         "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
@@ -135,7 +177,18 @@ def migrate(connection: sqlite3.Connection) -> int:
                 (1, now_iso()),
             )
         current = 1
+    if current < 2:
+        with transaction(connection):
+            existing = _column_names(connection, "runs")
+            for name, definition in RUN_V2_COLUMNS.items():
+                if name not in existing:
+                    connection.execute(f"ALTER TABLE runs ADD COLUMN {name} {definition}")
+            connection.executescript(MIGRATION_2_TABLES)
+            connection.execute(
+                "INSERT OR REPLACE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                (2, now_iso()),
+            )
+        current = 2
     if current != SCHEMA_VERSION:
         raise RuntimeError(f"unsupported schema version {current}; expected {SCHEMA_VERSION}")
     return current
-

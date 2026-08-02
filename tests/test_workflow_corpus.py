@@ -17,8 +17,8 @@ class WorkflowCorpusTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             db = Path(temporary) / "test.sqlite3"
             with connect(db) as connection:
-                self.assertEqual(migrate(connection), 1)
-                self.assertEqual(migrate(connection), 1)
+                self.assertEqual(migrate(connection), 2)
+                self.assertEqual(migrate(connection), 2)
                 tables = {
                     row[0] for row in connection.execute(
                         "SELECT name FROM sqlite_master WHERE type='table'"

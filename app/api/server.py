@@ -32,6 +32,18 @@ REPORT_JSON = REPORT_DIR / "双渠道结构化结论_v6.2_TikHub_2026-08-02.json
 REPORT_MD = REPORT_DIR / "双渠道结构化结论报告_v6.2_TikHub_2026-08-02.md"
 PIPELINE_SCRIPT = ROOT / "src" / "dcar_eval" / "restructure_channel_report_v6_tikhub.py"
 PYTHONPATH = ROOT / "src" / "dcar_eval"
+if str(PYTHONPATH) not in sys.path:
+    sys.path.insert(0, str(PYTHONPATH))
+
+from workflow.storage import migrate  # noqa: E402
+from workflow.tasks import (  # noqa: E402
+    CURRENT_REPORT_VERSION,
+    CURRENT_RULE_VERSION,
+    RunContext,
+    TaskManager,
+    promote_formal_baseline,
+    recover_interrupted_runs,
+)
 
 EXPORTS = {
     "report-json": REPORT_JSON,
@@ -67,27 +79,10 @@ def connect() -> sqlite3.Connection:
 
 def init_db() -> None:
     with connect() as connection:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS runs (
-                id TEXT PRIMARY KEY,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                mode TEXT NOT NULL,
-                channel TEXT NOT NULL,
-                status TEXT NOT NULL,
-                progress INTEGER NOT NULL DEFAULT 0,
-                input_count INTEGER NOT NULL DEFAULT 0,
-                message TEXT NOT NULL DEFAULT '',
-                output_path TEXT,
-                output_sha256 TEXT
-            )
-            """
-        )
-        connection.execute(
-            "CREATE INDEX IF NOT EXISTS idx_runs_created_at ON runs(created_at DESC)"
-        )
-        connection.commit()
+        migrate(connection)
+
+
+TASK_MANAGER = TaskManager(DB_PATH)
 
 
 def row_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -186,13 +181,14 @@ def validate_inputs(channel: str, text: str) -> dict[str, Any]:
     }
 
 
-def execute_cached_regression(run_id: str) -> None:
+def execute_cached_regression(context: RunContext) -> None:
+    run_id = context.run_id
     try:
-        update_run(run_id, status="running", progress=15, message="正在读取本地缓存")
+        context.progress(15, "正在读取本地缓存")
         before = sha256(REPORT_JSON)
         env = os.environ.copy()
         env["PYTHONPATH"] = str(PYTHONPATH)
-        update_run(run_id, progress=45, message="正在重建双渠道结构化报告")
+        context.progress(45, "正在重建双渠道结构化报告")
         completed = subprocess.run(
             [sys.executable, str(PIPELINE_SCRIPT)],
             cwd=ROOT,
@@ -213,13 +209,8 @@ def execute_cached_regression(run_id: str) -> None:
             output_path=str(REPORT_JSON.relative_to(ROOT)),
             output_sha256=after,
         )
-    except Exception as exc:  # local job boundary
-        update_run(
-            run_id,
-            status="failed",
-            progress=100,
-            message=f"{type(exc).__name__}: {exc}"[:500],
-        )
+    except Exception:
+        raise
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -316,14 +307,47 @@ class Handler(BaseHTTPRequestHandler):
                 with connect() as connection:
                     connection.execute(
                         """
-                        INSERT INTO runs (id, created_at, updated_at, mode, channel, status, progress, input_count, message)
-                        VALUES (?, ?, ?, 'cache_regression', 'dual', 'queued', 0, 776, '任务已进入本地队列')
+                        INSERT INTO runs (
+                            id, created_at, updated_at, mode, channel, status, progress,
+                            input_count, message, run_kind, scope, rule_version, report_version
+                        )
+                        VALUES (?, ?, ?, 'cache_regression', 'dual', 'queued', 0, 776,
+                                '任务已进入本地队列', 'regression', 'dual_channel', ?, ?)
                         """,
-                        (run_id, timestamp, timestamp),
+                        (run_id, timestamp, timestamp, CURRENT_RULE_VERSION, CURRENT_REPORT_VERSION),
                     )
                     connection.commit()
-                threading.Thread(target=execute_cached_regression, args=(run_id,), daemon=True).start()
+                TASK_MANAGER.submit(run_id, execute_cached_regression)
                 self.send_json(get_run(run_id), 202)
+                return
+            match = re.fullmatch(r"/api/runs/([a-zA-Z0-9_-]+)/cancel", route)
+            if match:
+                run_id = match.group(1)
+                run = get_run(run_id)
+                if not run:
+                    self.send_json({"error": "任务不存在"}, 404)
+                    return
+                accepted = TASK_MANAGER.cancel(run_id)
+                self.send_json(get_run(run_id), 202 if accepted else 409)
+                return
+            match = re.fullmatch(r"/api/runs/([a-zA-Z0-9_-]+)/resume", route)
+            if match:
+                run_id = match.group(1)
+                run = get_run(run_id)
+                if not run:
+                    self.send_json({"error": "任务不存在"}, 404)
+                    return
+                if run["mode"] != "cache_regression" or run["status"] not in {"interrupted", "failed", "cancelled"}:
+                    self.send_json({"error": "该任务当前不可恢复"}, 409)
+                    return
+                update_run(run_id, status="queued", progress=0, cancel_requested=0, message="恢复任务已进入队列")
+                TASK_MANAGER.submit(run_id, execute_cached_regression)
+                self.send_json(get_run(run_id), 202)
+                return
+            match = re.fullmatch(r"/api/runs/([a-zA-Z0-9_-]+)/baseline", route)
+            if match:
+                promote_formal_baseline(DB_PATH, match.group(1))
+                self.send_json(get_run(match.group(1)))
                 return
             self.send_json({"error": "接口不存在"}, 404)
         except (ValueError, json.JSONDecodeError) as exc:
@@ -338,14 +362,16 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
     init_db()
+    recovered = recover_interrupted_runs(DB_PATH)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"DCar local API: http://{args.host}:{args.port}", flush=True)
+    print(f"DCar local API: http://{args.host}:{args.port} · recovered={recovered}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         server.server_close()
+        TASK_MANAGER.shutdown(wait=False)
     return 0
 
 
