@@ -237,6 +237,10 @@ def upsert_account(value: Mapping[str, Any], *, db_path: Path = DEFAULT_DB) -> D
                         identity["real_name_status"], captured_at, captured_at,
                     ),
                 )
+            connection.execute(
+                "DELETE FROM pending_platform_identities WHERE platform=? AND uid=?",
+                (identity["platform"], identity["uid"]),
+            )
         connection.execute(
             """
             UPDATE content_items SET account_id=NULL, updated_at=?

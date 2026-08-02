@@ -680,6 +680,7 @@ def resolve_review(
     reviewer: str,
     evidence_type: str,
     evidence_text: str,
+    base_evaluation_id: Optional[int] = None,
     overrides: Optional[Mapping[str, Any]] = None,
     db_path: Path = DEFAULT_DB,
 ) -> EvaluationResult:
@@ -717,6 +718,14 @@ def resolve_review(
             """,
             (queue["content_id"],),
         ).fetchone()
+        current_evaluation_id = int(previous["id"]) if previous is not None else None
+        if (
+            base_evaluation_id is not None
+            and current_evaluation_id != base_evaluation_id
+        ):
+            raise EvaluationError(
+                "评估证据已更新，请刷新证据后重新复核"
+            )
         review_cursor = connection.execute(
             """
             INSERT INTO evaluation_reviews(

@@ -1,5 +1,5 @@
-import InsightDashboard from "./InsightDashboard";
+import { redirect } from "next/navigation";
 
 export default function Home() {
-  return <InsightDashboard />;
+  redirect("/overview");
 }

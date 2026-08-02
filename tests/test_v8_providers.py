@@ -15,6 +15,7 @@ from v8.providers import (
     _collect_media_urls,
     _request_json,
     discover_account_content,
+    retry_content_media,
     update_content_data,
 )
 from v8.storage import connect, initialize_database, now_utc
@@ -286,6 +287,47 @@ class V8ProviderUpdateTest(unittest.TestCase):
         self.assertIsNotNone(source)
         manifest = Path(str(source["local_path"]))
         self.assertEqual(json.loads(manifest.read_text(encoding="utf-8"))["media_kind"], "video")
+
+    def test_explicit_paid_media_retry_uses_one_lifetime_refresh_slot(self) -> None:
+        def detail_call(stage, content):
+            self.assertEqual(stage, "detail")
+            data = {
+                "title": "媒体补证详情",
+                "body": "汽车媒体补证正文",
+                "published_at": "2026-08-01T04:00:00Z",
+                "content_type": "video",
+                "media_urls": ["https://cdn.example/refreshed.mp4"],
+            }
+            return ProviderResult(data, {"data": data}, 200, True)
+
+        with (
+            patch("v8.media.MEDIA_ROOT", self.root / "media"),
+            patch(
+                "v8.providers.process_content_media",
+                side_effect=[
+                    {"content_id": self.content_id, "status": "no_source"},
+                    {"content_id": self.content_id, "status": "evidence_ready"},
+                ],
+            ),
+        ):
+            result = retry_content_media(
+                self.content_id,
+                allow_paid_refresh=True,
+                db_path=self.db,
+                call_override=detail_call,
+            )
+        self.assertEqual(result["status"], "evidence_ready")
+        self.assertEqual(result["provider_cost"], 0.001)
+        with connect(self.db) as connection:
+            slot = connection.execute(
+                "SELECT * FROM fetch_slots WHERE stage='media_source_refresh'"
+            ).fetchone()
+            source = connection.execute(
+                "SELECT * FROM evidence_artifacts WHERE artifact_type='media_source'"
+            ).fetchone()
+        self.assertEqual(slot["window_key"], "lifetime")
+        self.assertEqual(slot["status"], "succeeded")
+        self.assertIsNotNone(source)
 
 
 if __name__ == "__main__":

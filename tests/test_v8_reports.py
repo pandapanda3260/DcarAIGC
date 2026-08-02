@@ -6,7 +6,14 @@ import unittest
 from pathlib import Path
 
 from v8.evaluation import evaluate_content
-from v8.reports import ReportTaskError, create_task, get_task, run_task
+from v8.reports import (
+    ReportTaskError,
+    create_task,
+    get_task,
+    request_task_cancel,
+    resume_task,
+    run_task,
+)
 from v8.storage import PROJECT_ROOT, connect, initialize_database, now_utc
 
 
@@ -131,6 +138,25 @@ class V8ReportTaskTest(unittest.TestCase):
                 creation_source="automatic", db_path=self.db,
             )
 
+    def test_cancelled_task_can_resume_and_create_a_new_revision(self) -> None:
+        task = create_task(
+            task_type="custom", period_start="2026-07-01", period_end="2026-07-01",
+            creation_source="manual", db_path=self.db,
+        )
+        cancelled = request_task_cancel(task["id"], db_path=self.db)
+        self.assertEqual(cancelled["task_status"], "cancelled")
+        with self.assertRaisesRegex(ReportTaskError, "not runnable"):
+            run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
+        resumed = resume_task(task["id"], db_path=self.db)
+        self.assertEqual(resumed["task_status"], "queued")
+        run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
+        completed = get_task(task["id"], db_path=self.db)
+        self.assertIn(completed["task_status"], {"succeeded", "partial"})
+        self.assertEqual(len(completed["revisions"]), 1)
+        self.assertEqual(
+            [event["event_type"] for event in completed["events"]][1:3],
+            ["cancelled", "resumed"],
+        )
     def test_pending_gray_review_blocks_first_report_without_creating_revision(self) -> None:
         with connect(self.db) as connection:
             evaluation_id = connection.execute(

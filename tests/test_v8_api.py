@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import logging
 import tempfile
 import unittest
@@ -12,6 +13,7 @@ from fastapi.testclient import TestClient
 import v8.api as api_module
 from v8.contracts import CURRENT_REPORT_VERSION
 from v8.evaluation import evaluate_content
+from v8.reports import create_task
 from v8.storage import PROJECT_ROOT, connect, initialize_database, now_utc
 
 
@@ -70,6 +72,8 @@ class V8ApiTest(unittest.TestCase):
         self.assertEqual(accounts.status_code, 200)
         self.assertEqual(accounts.json()["total"], 0)
         self.assertEqual(accounts.json()["legacy_unassociated_content_count"], 776)
+        self.assertEqual(accounts.json()["pending_platform_identity_count"], 30)
+        self.assertEqual(len(accounts.json()["pending_platform_identities"]), 30)
         self.assertEqual(contents.status_code, 200)
         self.assertEqual(contents.json()["total"], 776)
         self.assertEqual(len(contents.json()["items"]), 20)
@@ -191,6 +195,7 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
             connection.commit()
             self.content_id = int(content.lastrowid)
         evaluation = evaluate_content(self.content_id, db_path=self.db)
+        self.evaluation_id = evaluation.evaluation_id
         with connect(self.db) as connection:
             queue = connection.execute(
                 """
@@ -223,6 +228,7 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         resolved = self.client.post(
             f"/api/v8/reviews/{self.queue_id}/resolve",
             json={
+                "base_evaluation_id": started.json()["base_evaluation_id"],
                 "decision": "override",
                 "reason": "画面明确展示汽车保养流程",
                 "reviewer": "测试复核员",
@@ -250,6 +256,137 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         self.assertEqual([row[0] for row in versions], ["automatic", "manual_review"])
         self.assertEqual(evidence_count, 1)
         self.assertEqual(status, "resolved")
+
+    def test_review_api_rejects_stale_evaluation_cursor(self) -> None:
+        started = self.client.post(f"/api/v8/reviews/{self.queue_id}/start")
+        self.assertEqual(started.status_code, 200)
+        stale_id = started.json()["base_evaluation_id"]
+        with connect(self.db) as connection:
+            connection.execute(
+                "UPDATE content_items SET body='保养知识已更新',updated_at=? WHERE id=?",
+                (now_utc(), self.content_id),
+            )
+            connection.commit()
+        changed = evaluate_content(self.content_id, db_path=self.db)
+        self.assertNotEqual(changed.evaluation_id, stale_id)
+        rejected = self.client.post(
+            f"/api/v8/reviews/{self.queue_id}/resolve",
+            json={
+                "base_evaluation_id": stale_id,
+                "decision": "confirm",
+                "reason": "旧页面提交",
+                "reviewer": "测试复核员",
+                "evidence_type": "review_note",
+                "evidence_text": "这是基于旧评估打开的复核页面",
+            },
+        )
+        self.assertEqual(rejected.status_code, 409)
+        self.assertIn("请刷新证据", rejected.json()["detail"])
+
+    def test_evidence_media_file_and_processing_search_are_readable(self) -> None:
+        media_path = Path(self.temp.name) / "evidence.jpg"
+        asr_path = Path(self.temp.name) / "asr.json"
+        ocr_path = Path(self.temp.name) / "ocr.json"
+        media_path.write_bytes(b"local-image-evidence")
+        asr_path.write_text(
+            json.dumps({"status": "success", "model": "pinned", "text": "完整的本地语音证据"}),
+            encoding="utf-8",
+        )
+        ocr_path.write_text(
+            json.dumps({"status": "success", "ocr_observation_count": 2, "combined_text": "关键帧文字证据"}),
+            encoding="utf-8",
+        )
+        with connect(self.db) as connection:
+            artifact_ids = []
+            for artifact_type, path in (("media", media_path), ("asr", asr_path), ("ocr", ocr_path)):
+                cursor = connection.execute(
+                    """
+                    INSERT INTO evidence_artifacts(
+                        content_id,artifact_type,local_path,status,sha256,created_at
+                    ) VALUES (?,?,?,'available',?,?)
+                    """,
+                    (self.content_id, artifact_type, str(path), artifact_type * 16, now_utc()),
+                )
+                artifact_ids.append(int(cursor.lastrowid))
+            comments = Path(self.temp.name) / "comments.json"
+            comments.write_text("{}", encoding="utf-8")
+            version = connection.execute(
+                """
+                INSERT INTO comment_evidence_versions(
+                    content_id,captured_at,iso_week,source,local_path,sha256,
+                    comment_count,status,created_at
+                ) VALUES (?,?,?,'test',?,?,1,'available',?)
+                """,
+                (self.content_id, now_utc(), "2026-W31", str(comments), "c" * 64, now_utc()),
+            )
+            connection.execute(
+                """
+                INSERT INTO comments(evidence_version_id,platform_comment_id,body,like_count)
+                VALUES (?,'comment-1','这是一条评论摘要',3)
+                """,
+                (version.lastrowid,),
+            )
+            connection.execute(
+                """
+                INSERT INTO media_processing_slots(
+                    content_id,source_sha256,processor_type,processor_version,status,
+                    output_artifact_id,attempt_count,created_at,updated_at
+                ) VALUES (?,?,'ocr','ocr-test','succeeded',?,1,?,?)
+                """,
+                (self.content_id, "m" * 64, artifact_ids[-1], now_utc(), now_utc()),
+            )
+            connection.commit()
+        evidence = self.client.get(f"/api/v8/contents/{self.content_id}/evidence")
+        self.assertEqual(evidence.status_code, 200)
+        value = evidence.json()
+        self.assertEqual(value["base_evaluation_id"], self.evaluation_id)
+        self.assertEqual(value["asr"]["text"], "完整的本地语音证据")
+        self.assertEqual(value["ocr"]["text"], "关键帧文字证据")
+        self.assertEqual(value["comments"]["stored_count"], 1)
+        self.assertEqual(len(value["media"]), 1)
+        media = self.client.get(value["media"][0]["url"])
+        self.assertEqual(media.status_code, 200)
+        self.assertEqual(media.content, b"local-image-evidence")
+        processing = self.client.post(
+            "/api/v8/media-processing/search",
+            json={"content_id": self.content_id, "status": "succeeded"},
+        )
+        self.assertEqual(processing.status_code, 200)
+        self.assertEqual(processing.json()["total"], 1)
+        no_source = self.client.post(
+            f"/api/v8/contents/{self.content_id}/media/retry",
+            json={"allow_paid_refresh": False},
+        )
+        self.assertEqual(no_source.status_code, 409)
+        self.assertIn("付费刷新", no_source.json()["detail"])
+
+    def test_task_cancel_and_resume_routes_preserve_revision_history(self) -> None:
+        resolved = self.client.post(
+            f"/api/v8/reviews/{self.queue_id}/resolve",
+            json={
+                "base_evaluation_id": self.evaluation_id,
+                "decision": "insufficient_evidence",
+                "reason": "任务控制测试先清零首发闸门",
+                "reviewer": "测试复核员",
+                "evidence_type": "review_note",
+                "evidence_text": "确认当前测试内容没有足够媒体证据",
+            },
+        )
+        self.assertEqual(resolved.status_code, 200)
+        task = create_task(
+            task_type="custom",
+            period_start="2026-07-01",
+            period_end="2026-07-01",
+            creation_source="manual",
+            db_path=self.db,
+        )
+        cancelled = self.client.post(f"/api/v8/tasks/{task['id']}/cancel")
+        self.assertEqual(cancelled.status_code, 200)
+        self.assertEqual(cancelled.json()["task_status"], "cancelled")
+        resumed = self.client.post(f"/api/v8/tasks/{task['id']}/resume")
+        self.assertEqual(resumed.status_code, 200)
+        self.assertIn(resumed.json()["task_status"], {"succeeded", "partial"})
+        self.assertEqual(len(resumed.json()["revisions"]), 1)
 
     def test_selling_point_api_edits_only_a_draft_then_publishes(self) -> None:
         drafted = self.client.post("/api/v8/selling-points/draft")
@@ -280,6 +417,7 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         reviewed = self.client.post(
             f"/api/v8/reviews/{self.queue_id}/resolve",
             json={
+                "base_evaluation_id": self.evaluation_id,
                 "decision": "insufficient_evidence",
                 "reason": "报告测试先清零人工复核闸门",
                 "reviewer": "测试复核员",

@@ -38,6 +38,105 @@ class ReportTaskError(RuntimeError):
     pass
 
 
+class TaskCancelled(ReportTaskError):
+    pass
+
+
+def request_task_cancel(task_id: str, *, db_path: Path = DEFAULT_DB) -> Dict[str, Any]:
+    with connect(db_path) as connection, transaction(connection):
+        task = connection.execute(
+            "SELECT * FROM report_tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        if task is None:
+            raise ReportTaskError(f"task does not exist: {task_id}")
+        current = str(task["task_status"])
+        if current == "running":
+            next_status, message = "cancel_requested", "已请求取消，等待当前安全点"
+        elif current in RUNNABLE_STATUSES:
+            next_status, message = "cancelled", "任务已取消"
+        elif current == "cancel_requested":
+            next_status, message = current, "取消请求已存在"
+        else:
+            raise ReportTaskError(f"task {task_id} cannot be cancelled from {current}")
+        captured_at = now_utc()
+        connection.execute(
+            """
+            UPDATE report_tasks SET task_status=?, message=?,
+                completed_at=CASE WHEN ?='cancelled' THEN ? ELSE completed_at END,
+                updated_at=? WHERE id=?
+            """,
+            (next_status, message, next_status, captured_at, captured_at, task_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO task_events(task_id,event_type,message,payload_json,created_at)
+            VALUES (?, ?, ?, '{}', ?)
+            """,
+            (
+                task_id,
+                "cancel_requested" if next_status == "cancel_requested" else "cancelled",
+                message,
+                captured_at,
+            ),
+        )
+    return get_task(task_id, db_path=db_path)
+
+
+def resume_task(task_id: str, *, db_path: Path = DEFAULT_DB) -> Dict[str, Any]:
+    with connect(db_path) as connection, transaction(connection):
+        task = connection.execute(
+            "SELECT task_status FROM report_tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        if task is None:
+            raise ReportTaskError(f"task does not exist: {task_id}")
+        if task["task_status"] != "cancelled":
+            raise ReportTaskError(
+                f"task {task_id} cannot be resumed from {task['task_status']}"
+            )
+        captured_at = now_utc()
+        connection.execute(
+            """
+            UPDATE report_tasks SET task_status='queued', progress=0,
+                message='任务已恢复，等待生成新 revision', started_at=NULL,
+                completed_at=NULL, updated_at=? WHERE id=?
+            """,
+            (captured_at, task_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO task_events(task_id,event_type,message,payload_json,created_at)
+            VALUES (?, 'resumed', '任务已恢复', '{}', ?)
+            """,
+            (task_id, captured_at),
+        )
+    return get_task(task_id, db_path=db_path)
+
+
+def _acknowledge_cancel(task_id: str, *, db_path: Path) -> bool:
+    with connect(db_path) as connection, transaction(connection):
+        task = connection.execute(
+            "SELECT task_status FROM report_tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        if task is None or task["task_status"] != "cancel_requested":
+            return False
+        captured_at = now_utc()
+        connection.execute(
+            """
+            UPDATE report_tasks SET task_status='cancelled', message='任务已在安全点取消',
+                completed_at=?, updated_at=? WHERE id=?
+            """,
+            (captured_at, captured_at, task_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO task_events(task_id,event_type,message,payload_json,created_at)
+            VALUES (?, 'cancelled', '任务已在安全点取消', '{}', ?)
+            """,
+            (task_id, captured_at),
+        )
+    return True
+
+
 def _date(value: str) -> date:
     try:
         return date.fromisoformat(value)
@@ -747,6 +846,8 @@ def run_task(
         temp_paths["report-json"].write_text(
             json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
+        if _acknowledge_cancel(task_id, db_path=db_path):
+            raise TaskCancelled("任务已在写入 revision 前取消")
         if target.exists():
             raise ReportTaskError(f"immutable revision directory already exists: {target}")
         os.replace(temporary, target)
@@ -757,6 +858,11 @@ def run_task(
         completed_at = now_utc()
         terminal_status = str(report["task"]["task_status"])
         with connect(db_path) as connection, transaction(connection):
+            current_status = connection.execute(
+                "SELECT task_status FROM report_tasks WHERE id=?", (task_id,)
+            ).fetchone()
+            if current_status is not None and current_status["task_status"] == "cancel_requested":
+                raise TaskCancelled("任务已在 revision 登记前取消")
             connection.execute(
                 """
                 INSERT INTO report_revisions(
@@ -805,6 +911,13 @@ def run_task(
                 ),
             )
         return report
+    except TaskCancelled:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        if target.exists():
+            shutil.rmtree(target)
+        _acknowledge_cancel(task_id, db_path=db_path)
+        raise
     except Exception as exc:
         if temporary.exists():
             shutil.rmtree(temporary)

@@ -20,8 +20,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
+from .capture import BudgetBlocked, CaptureError, SlotUnavailable
 from .contracts import CURRENT_REPORT_VERSION, quantity_metric, ratio_metric
 from .evaluation import EvaluationError, resolve_review
+from .media import MediaProcessingError
 from .operations import (
     OperationError,
     content_identity,
@@ -34,12 +36,14 @@ from .operations import (
     upsert_account,
     upsert_content,
 )
-from .providers import ProviderConfigurationError, update_content_data
+from .providers import ProviderConfigurationError, retry_content_media, update_content_data
 from .reports import (
     REPORTS_ROOT,
     ReportTaskError,
     create_and_run_task,
     get_task,
+    request_task_cancel,
+    resume_task,
     run_task,
 )
 from .scheduler import install_jobs, startup_catchup
@@ -105,6 +109,7 @@ class ContentSearchRequest(BaseModel):
 
 
 class ReviewResolveRequest(BaseModel):
+    base_evaluation_id: int = Field(ge=1)
     decision: str = Field(max_length=40)
     reason: str = Field(min_length=1, max_length=2000)
     reviewer: str = Field(min_length=1, max_length=100)
@@ -167,6 +172,18 @@ class ContentMutationRequest(BaseModel):
 class BulkImportRequest(BaseModel):
     source_name: str = Field(min_length=1, max_length=300)
     rows: List[Dict[str, Any]] = Field(max_length=10000)
+
+
+class MediaRetryRequest(BaseModel):
+    allow_paid_refresh: bool = False
+
+
+class MediaProcessingSearchRequest(BaseModel):
+    status: Optional[str] = Field(default=None, max_length=32)
+    processor_type: Optional[str] = Field(default=None, max_length=40)
+    content_id: Optional[int] = Field(default=None, ge=1)
+    page: int = Field(default=1, ge=1)
+    page_size: int = Field(default=50, ge=1, le=100)
 
 
 def _legacy_connect() -> sqlite3.Connection:
@@ -494,12 +511,28 @@ def _account_search(payload: AccountSearchRequest) -> Dict[str, Any]:
                 "SELECT COUNT(*) FROM content_items WHERE account_id IS NULL"
             ).fetchone()[0]
         )
+        pending_identities = connection.execute(
+            """
+            SELECT platform, uid, nickname, content_count,
+                   first_published_at, last_published_at
+            FROM pending_platform_identities
+            ORDER BY content_count DESC, platform, uid
+            LIMIT 100
+            """
+        ).fetchall()
+        pending_identity_count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM pending_platform_identities"
+            ).fetchone()[0]
+        )
     return {
         "items": items,
         "total": total,
         "page": payload.page,
         "page_size": payload.page_size,
         "legacy_unassociated_content_count": legacy_unassociated,
+        "pending_platform_identity_count": pending_identity_count,
+        "pending_platform_identities": [dict(row) for row in pending_identities],
     }
 
 
@@ -656,6 +689,169 @@ def _selling_point_list() -> Dict[str, Any]:
     }
 
 
+def _read_local_json(local_path: str) -> Dict[str, Any]:
+    path = _safe_project_path(local_path)
+    if not path.is_file() or path.suffix.lower() != ".json":
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _artifact_media_paths(row: sqlite3.Row) -> List[Path]:
+    path = _safe_project_path(str(row["local_path"]))
+    if path.suffix.lower() != ".json":
+        return [path] if path.is_file() else []
+    value = _read_local_json(str(row["local_path"]))
+    candidates: List[str] = []
+    if value.get("video_path"):
+        candidates.append(str(value["video_path"]))
+    candidates.extend(
+        str(item) for item in value.get("image_paths", []) if isinstance(item, str)
+    )
+    paths: List[Path] = []
+    for candidate in candidates:
+        resolved = _safe_project_path(candidate)
+        if resolved.is_file():
+            paths.append(resolved)
+    return paths
+
+
+def _content_evidence(content_id: int) -> Dict[str, Any]:
+    with connect(API_DB_PATH) as connection:
+        content = connection.execute(
+            "SELECT * FROM content_items WHERE id=?", (content_id,)
+        ).fetchone()
+        if content is None:
+            raise HTTPException(status_code=404, detail="内容不存在")
+        evaluation = connection.execute(
+            """
+            SELECT * FROM evaluation_versions
+            WHERE content_id=? AND invalidated_at IS NULL
+            ORDER BY evaluated_at DESC, id DESC LIMIT 1
+            """,
+            (content_id,),
+        ).fetchone()
+        artifact_rows = connection.execute(
+            """
+            SELECT * FROM evidence_artifacts
+            WHERE content_id=? AND status='available'
+            ORDER BY id DESC
+            """,
+            (content_id,),
+        ).fetchall()
+        latest: Dict[str, sqlite3.Row] = {}
+        for row in artifact_rows:
+            latest.setdefault(str(row["artifact_type"]), row)
+        media_row = next(
+            (latest[kind] for kind in ("media", "media_manifest") if kind in latest),
+            None,
+        )
+        asr_row = next(
+            (
+                latest[kind]
+                for kind in ("asr", "transcript", "media_transcript")
+                if kind in latest
+            ),
+            None,
+        )
+        ocr_row = next(
+            (latest[kind] for kind in ("ocr", "media_ocr") if kind in latest),
+            None,
+        )
+        comment_version = connection.execute(
+            """
+            SELECT * FROM comment_evidence_versions
+            WHERE content_id=? ORDER BY captured_at DESC, id DESC LIMIT 1
+            """,
+            (content_id,),
+        ).fetchone()
+        comment_rows = [] if comment_version is None else connection.execute(
+            """
+            SELECT body, like_count, published_at FROM comments
+            WHERE evidence_version_id=?
+            ORDER BY COALESCE(like_count,0) DESC, id LIMIT 20
+            """,
+            (comment_version["id"],),
+        ).fetchall()
+        stored_comment_count = 0 if comment_version is None else int(
+            connection.execute(
+                "SELECT COUNT(*) FROM comments WHERE evidence_version_id=?",
+                (comment_version["id"],),
+            ).fetchone()[0]
+        )
+        processing = connection.execute(
+            """
+            SELECT id,processor_type,processor_version,status,attempt_count,
+                   error_message,updated_at
+            FROM media_processing_slots WHERE content_id=?
+            ORDER BY updated_at DESC,id DESC
+            """,
+            (content_id,),
+        ).fetchall()
+        review = connection.execute(
+            """
+            SELECT id,reason_code,status,priority,assigned_to,updated_at
+            FROM review_queue WHERE content_id=?
+            ORDER BY CASE status WHEN 'in_review' THEN 0 WHEN 'pending' THEN 1
+                WHEN 'manual_required' THEN 2 ELSE 3 END, id DESC LIMIT 1
+            """,
+            (content_id,),
+        ).fetchone()
+    media_items: List[Dict[str, Any]] = []
+    if media_row is not None:
+        for index, path in enumerate(_artifact_media_paths(media_row)):
+            suffix = path.suffix.lower()
+            media_items.append(
+                {
+                    "artifact_id": int(media_row["id"]),
+                    "index": index,
+                    "kind": "video" if suffix in {".mp4", ".mov", ".m4v", ".webm"} else "image",
+                    "name": path.name,
+                    "url": f"/api/v8/contents/{content_id}/evidence/files/{media_row['id']}/{index}",
+                }
+            )
+    asr_payload = _read_local_json(str(asr_row["local_path"])) if asr_row else {}
+    ocr_payload = _read_local_json(str(ocr_row["local_path"])) if ocr_row else {}
+    evaluation_payload = (
+        json.loads(str(evaluation["payload_json"])) if evaluation is not None else None
+    )
+    return {
+        "content": {
+            key: content[key]
+            for key in (
+                "id", "link_id", "platform", "canonical_url", "title", "body",
+                "content_type", "published_at", "raw_account_uid", "raw_account_name",
+            )
+        },
+        "base_evaluation_id": int(evaluation["id"]) if evaluation is not None else None,
+        "evaluation": evaluation_payload,
+        "media": media_items,
+        "asr": {
+            "status": asr_payload.get("status") or ("missing" if asr_row is None else "available"),
+            "model": asr_payload.get("model"),
+            "text": asr_payload.get("text") or "",
+        },
+        "ocr": {
+            "status": ocr_payload.get("status") or ("missing" if ocr_row is None else "available"),
+            "observation_count": ocr_payload.get("ocr_observation_count")
+            or ocr_payload.get("source_count") or 0,
+            "text": ocr_payload.get("combined_text") or "",
+        },
+        "comments": {
+            "status": str(comment_version["status"]) if comment_version else "missing",
+            "captured_at": comment_version["captured_at"] if comment_version else None,
+            "declared_count": comment_version["comment_count"] if comment_version else None,
+            "stored_count": stored_comment_count,
+            "top_items": [dict(row) for row in comment_rows],
+        },
+        "processing_slots": [dict(row) for row in processing],
+        "review": dict(review) if review is not None else None,
+    }
+
+
 def _recover_interrupted_tasks() -> int:
     with connect(API_DB_PATH) as connection:
         cursor = connection.execute(
@@ -787,6 +983,24 @@ def get_v8_task(task_id: str) -> Dict[str, Any]:
 @app.post("/api/v8/tasks/{task_id}/retry")
 def retry_v8_task(task_id: str) -> Dict[str, Any]:
     try:
+        run_task(task_id, db_path=API_DB_PATH, reports_root=API_REPORTS_ROOT)
+        return get_task(task_id, db_path=API_DB_PATH)
+    except ReportTaskError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/v8/tasks/{task_id}/cancel")
+def cancel_v8_task(task_id: str) -> Dict[str, Any]:
+    try:
+        return request_task_cancel(task_id, db_path=API_DB_PATH)
+    except ReportTaskError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/v8/tasks/{task_id}/resume")
+def resume_v8_task(task_id: str) -> Dict[str, Any]:
+    try:
+        resume_task(task_id, db_path=API_DB_PATH)
         run_task(task_id, db_path=API_DB_PATH, reports_root=API_REPORTS_ROOT)
         return get_task(task_id, db_path=API_DB_PATH)
     except ReportTaskError as exc:
@@ -925,6 +1139,94 @@ def update_v8_content_data(content_id: int) -> Dict[str, Any]:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+@app.get("/api/v8/contents/{content_id}/evidence")
+def get_v8_content_evidence(content_id: int) -> Dict[str, Any]:
+    return _content_evidence(content_id)
+
+
+@app.get("/api/v8/contents/{content_id}/evidence/files/{artifact_id}/{index}")
+def get_v8_content_evidence_file(
+    content_id: int, artifact_id: int, index: int
+) -> FileResponse:
+    with connect(API_DB_PATH) as connection:
+        row = connection.execute(
+            """
+            SELECT * FROM evidence_artifacts
+            WHERE id=? AND content_id=? AND artifact_type IN ('media','media_manifest')
+              AND status='available'
+            """,
+            (artifact_id, content_id),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="媒体证据不存在")
+    paths = _artifact_media_paths(row)
+    if index < 0 or index >= len(paths):
+        raise HTTPException(status_code=404, detail="媒体证据文件不存在")
+    return FileResponse(paths[index])
+
+
+@app.post("/api/v8/contents/{content_id}/media/retry")
+def retry_v8_content_media(
+    content_id: int, payload: MediaRetryRequest
+) -> Dict[str, Any]:
+    try:
+        return retry_content_media(
+            content_id,
+            allow_paid_refresh=payload.allow_paid_refresh,
+            db_path=API_DB_PATH,
+        )
+    except (
+        ProviderConfigurationError,
+        MediaProcessingError,
+        CaptureError,
+        SlotUnavailable,
+        BudgetBlocked,
+    ) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/v8/media-processing/search")
+def search_v8_media_processing(
+    payload: MediaProcessingSearchRequest,
+) -> Dict[str, Any]:
+    where: List[str] = []
+    parameters: List[Any] = []
+    if payload.status:
+        where.append("m.status=?")
+        parameters.append(payload.status)
+    if payload.processor_type:
+        where.append("m.processor_type=?")
+        parameters.append(payload.processor_type)
+    if payload.content_id:
+        where.append("m.content_id=?")
+        parameters.append(payload.content_id)
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+    offset = (payload.page - 1) * payload.page_size
+    with connect(API_DB_PATH) as connection:
+        total = int(
+            connection.execute(
+                f"SELECT COUNT(*) FROM media_processing_slots m {where_sql}", parameters
+            ).fetchone()[0]
+        )
+        rows = connection.execute(
+            f"""
+            SELECT m.id,m.content_id,c.link_id,c.platform,m.processor_type,
+                   m.processor_version,m.status,m.attempt_count,m.error_message,m.updated_at
+            FROM media_processing_slots m
+            JOIN content_items c ON c.id=m.content_id
+            {where_sql}
+            ORDER BY m.updated_at DESC,m.id DESC LIMIT ? OFFSET ?
+            """,
+            [*parameters, payload.page_size, offset],
+        ).fetchall()
+    return {
+        "items": [dict(row) for row in rows],
+        "total": total,
+        "page": payload.page,
+        "page_size": payload.page_size,
+    }
+
+
 @app.get("/api/v8/contents/export")
 def export_v8_contents() -> Response:
     return Response(
@@ -987,7 +1289,7 @@ def get_v8_reviews(status: Optional[str] = None, limit: int = 100) -> Dict[str, 
 def start_v8_review(queue_id: int) -> Dict[str, Any]:
     with connect(API_DB_PATH) as connection, transaction(connection):
         row = connection.execute(
-            "SELECT status FROM review_queue WHERE id=?", (queue_id,)
+            "SELECT status,content_id FROM review_queue WHERE id=?", (queue_id,)
         ).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="复核任务不存在")
@@ -997,7 +1299,19 @@ def start_v8_review(queue_id: int) -> Dict[str, Any]:
             "UPDATE review_queue SET status='in_review', updated_at=? WHERE id=?",
             (now_utc(), queue_id),
         )
-    return {"id": queue_id, "status": "in_review"}
+        evaluation = connection.execute(
+            """
+            SELECT id FROM evaluation_versions
+            WHERE content_id=? AND invalidated_at IS NULL
+            ORDER BY evaluated_at DESC,id DESC LIMIT 1
+            """,
+            (row["content_id"],),
+        ).fetchone()
+    return {
+        "id": queue_id,
+        "status": "in_review",
+        "base_evaluation_id": int(evaluation["id"]) if evaluation is not None else None,
+    }
 
 
 @app.post("/api/v8/reviews/{queue_id}/resolve")
@@ -1021,6 +1335,7 @@ def resolve_v8_review(queue_id: int, payload: ReviewResolveRequest) -> Dict[str,
             reviewer=payload.reviewer,
             evidence_type=payload.evidence_type,
             evidence_text=payload.evidence_text,
+            base_evaluation_id=payload.base_evaluation_id,
             overrides=overrides,
             db_path=API_DB_PATH,
         )

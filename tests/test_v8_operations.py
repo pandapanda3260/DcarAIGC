@@ -106,6 +106,42 @@ class V8OperationsTest(unittest.TestCase):
         self.assertEqual(account["operator_name"], "新")
         self.assertEqual([row[0] for row in rows], ["duplicate_in_file", "inserted"])
 
+    def test_account_identity_claims_pending_uid_and_backfills_content(self) -> None:
+        content = upsert_content(
+            {
+                "platform": "douyin",
+                "platform_content_id": "778899",
+                "canonical_url": "https://www.douyin.com/video/778899",
+                "account_uid": "99887766",
+                "account_name": "待归属车号",
+            },
+            db_path=self.db,
+        )
+        with connect(self.db) as connection:
+            initialize_database(connection)
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM pending_platform_identities"
+                ).fetchone()[0],
+                1,
+            )
+        account = upsert_account(
+            {
+                "phone": "13800138000",
+                "platforms": [{"platform": "douyin", "uid": "99887766"}],
+            },
+            db_path=self.db,
+        )
+        with connect(self.db) as connection:
+            linked = connection.execute(
+                "SELECT account_id FROM content_items WHERE id=?", (content["id"],)
+            ).fetchone()[0]
+            pending = connection.execute(
+                "SELECT COUNT(*) FROM pending_platform_identities"
+            ).fetchone()[0]
+        self.assertEqual(linked, account["id"])
+        self.assertEqual(pending, 0)
+
     def test_account_export_shape_round_trips_through_flat_csv_import_rows(self) -> None:
         result = import_accounts(
             [{

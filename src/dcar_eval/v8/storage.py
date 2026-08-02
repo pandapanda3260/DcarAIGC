@@ -11,7 +11,7 @@ from typing import Iterator
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_DB = PROJECT_ROOT / "app" / "data" / "dcar_insight.sqlite3"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def now_utc() -> str:
@@ -84,6 +84,18 @@ CREATE TABLE IF NOT EXISTS account_provider_references (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     PRIMARY KEY(account_identity_id, provider, reference_kind)
+);
+
+CREATE TABLE IF NOT EXISTS pending_platform_identities (
+    platform TEXT NOT NULL CHECK(platform IN ('douyin','xiaohongshu','wechat_channels','kuaishou')),
+    uid TEXT NOT NULL,
+    nickname TEXT NOT NULL DEFAULT '',
+    content_count INTEGER NOT NULL DEFAULT 0,
+    first_published_at TEXT,
+    last_published_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(platform, uid)
 );
 
 CREATE TABLE IF NOT EXISTS content_items (
@@ -711,6 +723,42 @@ def initialize_database(connection: sqlite3.Connection) -> None:
                 """,
                 (invalidated_at, invalidated_at),
             )
+        captured_at = now_utc()
+        connection.execute(
+            """
+            INSERT INTO pending_platform_identities(
+                platform, uid, nickname, content_count, first_published_at,
+                last_published_at, created_at, updated_at
+            )
+            SELECT c.platform, c.raw_account_uid,
+                   COALESCE(MAX(NULLIF(c.raw_account_name, '')), ''),
+                   COUNT(*), MIN(c.published_at), MAX(c.published_at), ?, ?
+            FROM content_items c
+            WHERE c.account_id IS NULL AND COALESCE(c.raw_account_uid, '')<>''
+              AND NOT EXISTS (
+                  SELECT 1 FROM account_platform_identities api
+                  WHERE api.platform=c.platform AND api.uid=c.raw_account_uid
+              )
+            GROUP BY c.platform, c.raw_account_uid
+            ON CONFLICT(platform,uid) DO UPDATE SET
+                nickname=excluded.nickname,
+                content_count=excluded.content_count,
+                first_published_at=excluded.first_published_at,
+                last_published_at=excluded.last_published_at,
+                updated_at=excluded.updated_at
+            """,
+            (captured_at, captured_at),
+        )
+        connection.execute(
+            """
+            DELETE FROM pending_platform_identities
+            WHERE EXISTS (
+                SELECT 1 FROM account_platform_identities api
+                WHERE api.platform=pending_platform_identities.platform
+                  AND api.uid=pending_platform_identities.uid
+            )
+            """
+        )
         connection.execute(
             """
             INSERT INTO schema_migrations(version, name, applied_at)
@@ -741,5 +789,13 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             VALUES (?, ?, ?)
             ON CONFLICT(version) DO NOTHING
             """,
-            (SCHEMA_VERSION, "gray-review-report-release-gate", now_utc()),
+            (5, "gray-review-report-release-gate", now_utc()),
+        )
+        connection.execute(
+            """
+            INSERT INTO schema_migrations(version, name, applied_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(version) DO NOTHING
+            """,
+            (SCHEMA_VERSION, "pending-platform-identities-and-operator-controls", now_utc()),
         )

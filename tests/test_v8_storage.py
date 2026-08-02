@@ -23,7 +23,8 @@ class V8StorageTest(unittest.TestCase):
                     )
                 }
                 required = {
-                    "accounts", "account_platform_identities", "content_items",
+                    "accounts", "account_platform_identities", "pending_platform_identities",
+                    "content_items",
                     "content_identities", "content_aliases", "import_batches", "import_rows",
                     "fetch_slots", "fetch_attempts", "provider_raw_responses",
                     "provider_usage", "provider_budget_batches", "content_metric_snapshots",
@@ -99,6 +100,37 @@ class V8StorageTest(unittest.TestCase):
                         """,
                         (captured_at, captured_at),
                     )
+            finally:
+                connection.close()
+
+    def test_unassigned_platform_identity_is_materialized_without_fake_phone(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            connection = connect(Path(temporary) / "v8.sqlite3")
+            try:
+                initialize_database(connection)
+                captured_at = "2026-08-02T00:00:00Z"
+                connection.execute(
+                    """
+                    INSERT INTO content_items(
+                        link_id,platform,platform_content_id,canonical_url,
+                        raw_account_uid,raw_account_name,imported_at,created_at,updated_at
+                    ) VALUES ('A2BC3D','douyin','1','https://example.com/1',
+                              '99887766','待归属车号',?,?,?)
+                    """,
+                    (captured_at, captured_at, captured_at),
+                )
+                connection.commit()
+                initialize_database(connection)
+                pending = connection.execute(
+                    "SELECT * FROM pending_platform_identities"
+                ).fetchone()
+                self.assertEqual(pending["platform"], "douyin")
+                self.assertEqual(pending["uid"], "99887766")
+                self.assertEqual(pending["nickname"], "待归属车号")
+                self.assertEqual(pending["content_count"], 1)
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM accounts").fetchone()[0], 0
+                )
             finally:
                 connection.close()
 

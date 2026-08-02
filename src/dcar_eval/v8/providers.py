@@ -881,3 +881,90 @@ def update_content_data(
         "provider_cost": round(sum(float(item.get("amount") or 0) for item in outcomes), 6),
         "currency": "USD",
     }
+
+
+def retry_content_media(
+    content_id: int,
+    *,
+    allow_paid_refresh: bool = False,
+    db_path: Path = DEFAULT_DB,
+    call_override: Optional[Callable[[str, Mapping[str, Any]], ProviderResult]] = None,
+) -> Dict[str, Any]:
+    """Retry local processing first, then one explicit paid lifetime source refresh."""
+
+    local = process_content_media(content_id, db_path=db_path)
+    if local.get("status") != "no_source":
+        evaluation = evaluate_content(content_id, db_path=db_path)
+        return {
+            "content_id": content_id,
+            "status": str(local.get("status")),
+            "media": local,
+            "evaluation_id": evaluation.evaluation_id,
+            "evaluation_created": evaluation.created,
+            "provider_cost": 0.0,
+            "currency": "USD",
+        }
+    if not allow_paid_refresh:
+        raise ProviderConfigurationError(
+            "本地没有可用媒体源；如确认供应商费用，请使用付费刷新重试"
+        )
+    with connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT * FROM content_items WHERE id=?", (content_id,)
+        ).fetchone()
+        if row is None:
+            raise ProviderConfigurationError("内容不存在")
+        content = dict(row)
+    platform = str(content["platform"])
+    if platform not in {"douyin", "xiaohongshu"}:
+        raise ProviderConfigurationError("视频号和快手未配置自动媒体源刷新")
+    provider, _, operation, price = STAGE_CONFIG[(platform, "detail")]
+    adapter_version = (
+        "tikhub-media-source-refresh-v8.0"
+        if platform == "douyin"
+        else "rnote-media-source-refresh-v8.0"
+    )
+    budget_id = ensure_operational_budget(
+        provider=provider, operation=operation, price=price, db_path=db_path
+    )
+    if call_override is not None:
+        call = partial(call_override, "detail", content)
+    elif platform == "douyin":
+        call = partial(
+            _douyin_call,
+            "detail",
+            str(content["platform_content_id"]),
+            _load_key(TIKHUB_KEY_FILE, "TIKHUB_API_KEY"),
+        )
+    else:
+        call = partial(
+            _rnote_call,
+            "detail",
+            str(content["platform_content_id"]),
+            _load_key(RNOTE_KEY_FILE, "RNOTE_API_KEY"),
+            str(content["content_type"]),
+        )
+    outcome = execute_content_fetch(
+        content_id=content_id,
+        stage="media_source_refresh",
+        window_key="lifetime",
+        provider=provider,
+        adapter_version=adapter_version,
+        operation=operation,
+        call=call,
+        db_path=db_path,
+        budget_id=budget_id,
+        allow_terminal_retry=True,
+    )
+    _store_stage_result(content, "detail", "lifetime", outcome, db_path=db_path)
+    media = process_content_media(content_id, db_path=db_path)
+    evaluation = evaluate_content(content_id, db_path=db_path)
+    return {
+        "content_id": content_id,
+        "status": str(media.get("status")),
+        "media": media,
+        "evaluation_id": evaluation.evaluation_id,
+        "evaluation_created": evaluation.created,
+        "provider_cost": outcome.amount,
+        "currency": outcome.currency or "USD",
+    }
