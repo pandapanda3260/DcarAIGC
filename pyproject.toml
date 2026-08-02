@@ -6,8 +6,10 @@ requires-python = "==3.12.13"
 dependencies = [
   "apscheduler==3.11.3",
   "fastapi==0.128.7",
+  "imagehash==4.3.2",
   "mlx==0.32.0",
   "mlx-whisper==0.4.3",
+  "pillow==12.3.0",
   "pydantic==2.11.8",
   "uvicorn==0.34.0",
 ]
@@ -23,5 +25,5 @@ dev = [
 package = false
 
 [tool.dcar]
-report-version = "dcar-content-operations-report-v8.1"
+report-version = "dcar-content-operations-report-v8.2"
 web-mode = "local-cache-only"

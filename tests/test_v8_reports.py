@@ -11,6 +11,7 @@ from v8.reports import (
     create_task,
     get_task,
     request_task_cancel,
+    retry_task,
     resume_task,
     run_task,
 )
@@ -110,6 +111,7 @@ class V8ReportTaskTest(unittest.TestCase):
         self.assertEqual(report["summary_metrics"]["comment_count"]["status"], "missing")
         self.assertEqual(report["summary_metrics"]["estimated_leads"]["status"], "not_calculable")
         self.assertEqual(report["summary_metrics"]["estimated_leads"]["unit"], "lead")
+        self.assertEqual(report["summary_metrics"]["duplicate_rate"]["status"], "below_threshold")
         self.assertEqual(report["scope"]["period_end"], "2026-07-02T00:00:00+08:00")
         state = get_task(task["id"], db_path=self.db)
         self.assertEqual(state["content_counts"], {"excluded_missing_boundary": 1, "included": 1})
@@ -138,6 +140,19 @@ class V8ReportTaskTest(unittest.TestCase):
                 creation_source="automatic", db_path=self.db,
             )
 
+    def test_succeeded_task_can_queue_a_new_immutable_revision(self) -> None:
+        task = create_task(
+            task_type="custom", period_start="2026-07-01", period_end="2026-07-01",
+            creation_source="manual", db_path=self.db,
+        )
+        first = run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
+        queued = retry_task(task["id"], db_path=self.db)
+        self.assertEqual(queued["task_status"], "queued")
+        second = run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
+        self.assertEqual((first["metadata"]["revision"], second["metadata"]["revision"]), (1, 2))
+        state = get_task(task["id"], db_path=self.db)
+        self.assertEqual(len(state["revisions"]), 2)
+        self.assertIn("retry_requested", [event["event_type"] for event in state["events"]])
     def test_cancelled_task_can_resume_and_create_a_new_revision(self) -> None:
         task = create_task(
             task_type="custom", period_start="2026-07-01", period_end="2026-07-01",

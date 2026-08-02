@@ -11,7 +11,7 @@ from .storage import PROJECT_ROOT
 
 
 CONTRACT_PATH = PROJECT_ROOT / "config" / "report_contract_v8.json"
-CURRENT_REPORT_VERSION = "dcar-content-operations-report-v8.1"
+CURRENT_REPORT_VERSION = "dcar-content-operations-report-v8.2"
 
 
 class V8ContractViolation(ValueError):
@@ -227,7 +227,7 @@ def validate_report(report: Mapping[str, Any]) -> None:
         publication_value = publication.get("value") if isinstance(publication, Mapping) else None
         if isinstance(publication_value, (int, float)):
             for name in (
-                "verticality_rate", "selling_point_coverage_rate",
+                "verticality_rate", "selling_point_coverage_rate", "duplicate_rate",
             ):
                 metric = summary.get(name)
                 if isinstance(metric, Mapping) and metric.get("denominator") != int(publication_value):

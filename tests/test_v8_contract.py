@@ -39,6 +39,7 @@ def valid_report() -> dict:
             "evaluation_coverage": 95.0,
             "core_artifact_coverage": 100.0,
             "media_terminal_coverage": 95.0,
+            "duplicate_fingerprint_coverage": 95.0,
             "weekly_comment_coverage": 90.0,
         },
         "summary_metrics": {
@@ -48,6 +49,7 @@ def valid_report() -> dict:
             "comment_count": quantity_metric(20, unit="comment", status="sample_only", coverage_percentage=50),
             "verticality_rate": ratio_metric(7, publications, status="available", eligible_count=8, coverage_percentage=80),
             "selling_point_coverage_rate": ratio_metric(4, publications, status="available", eligible_count=8, coverage_percentage=80),
+            "duplicate_rate": ratio_metric(2, publications, status="available", eligible_count=10, coverage_percentage=100),
             "estimated_new_users": quantity_metric(None, unit="person", status="not_calculable", reason="model unavailable"),
             "estimated_reactivated_users": quantity_metric(None, unit="person", status="not_calculable", reason="model unavailable"),
             "estimated_leads": quantity_metric(None, unit="lead", status="not_calculable", reason="model unavailable"),

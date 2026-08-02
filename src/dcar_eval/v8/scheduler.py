@@ -14,6 +14,7 @@ from apscheduler.triggers.cron import CronTrigger  # type: ignore[import-untyped
 
 from .backfill import run_daily_backfill_batch
 from .capture import ProviderResult, ensure_content_slot
+from .duplicates import run_duplicate_fingerprint_queue
 from .evaluation import evaluate_incremental
 from .media import run_media_download_queue, run_media_processing_queue
 from .providers import STAGE_CONFIG, discover_account_content, update_content_data
@@ -418,7 +419,10 @@ def _run_job_action(
             "fresh_content": run_media_download_queue(limit=100, db_path=db_path),
         }
     if job_id == "daily_media_processing":
-        return "succeeded", run_media_processing_queue(limit=100, db_path=db_path)
+        return "succeeded", {
+            "media": run_media_processing_queue(limit=100, db_path=db_path),
+            "duplicates": run_duplicate_fingerprint_queue(limit=500, db_path=db_path),
+        }
     if job_id == "daily_media_cutoff":
         return "succeeded", run_media_cutoff(scheduled_for, db_path=db_path)
     if job_id == "daily_report":

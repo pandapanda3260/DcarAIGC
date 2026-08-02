@@ -25,6 +25,7 @@ from .contracts import (
     validate_report,
 )
 from .evaluation import EVIDENCE_VERSION, RULE_VERSION
+from .duplicates import FINGERPRINT_VERSION, THRESHOLDS
 from .storage import DEFAULT_DB, PROJECT_ROOT, connect, now_utc, transaction
 
 
@@ -106,6 +107,38 @@ def resume_task(task_id: str, *, db_path: Path = DEFAULT_DB) -> Dict[str, Any]:
             """
             INSERT INTO task_events(task_id,event_type,message,payload_json,created_at)
             VALUES (?, 'resumed', '任务已恢复', '{}', ?)
+            """,
+            (task_id, captured_at),
+        )
+    return get_task(task_id, db_path=db_path)
+
+
+def retry_task(task_id: str, *, db_path: Path = DEFAULT_DB) -> Dict[str, Any]:
+    """Queue a new immutable revision without changing any previous revision."""
+
+    with connect(db_path) as connection, transaction(connection):
+        task = connection.execute(
+            "SELECT task_status FROM report_tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        if task is None:
+            raise ReportTaskError(f"task does not exist: {task_id}")
+        if task["task_status"] not in {"succeeded", "partial", "failed", "interrupted"}:
+            raise ReportTaskError(
+                f"task {task_id} cannot create a revision from {task['task_status']}"
+            )
+        captured_at = now_utc()
+        connection.execute(
+            """
+            UPDATE report_tasks SET task_status='queued', progress=0,
+                message='已请求生成新 revision', started_at=NULL, completed_at=NULL,
+                updated_at=? WHERE id=?
+            """,
+            (captured_at, task_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO task_events(task_id,event_type,message,payload_json,created_at)
+            VALUES (?, 'retry_requested', '已请求生成新 revision', '{}', ?)
             """,
             (task_id, captured_at),
         )
@@ -393,6 +426,8 @@ def _build_report_data(
     )
     active_accounts = len({int(row["account_id"]) for row in content_rows if row["account_id"] is not None})
     detail_ready = 0
+    fingerprint_ready = 0
+    duplicate_calibration_ready = False
     if ids:
         placeholders = ",".join("?" for _ in ids)
         detail_ready = int(
@@ -404,6 +439,26 @@ def _build_report_data(
                 ids,
             ).fetchone()[0]
         )
+        fingerprint_ready = int(
+            connection.execute(
+                f"""
+                SELECT COUNT(DISTINCT content_id) FROM duplicate_fingerprints
+                WHERE content_id IN ({placeholders}) AND fingerprint_version=?
+                """,
+                [*ids, FINGERPRINT_VERSION],
+            ).fetchone()[0]
+        )
+        duplicate_calibration_ready = connection.execute(
+            """
+            SELECT 1 FROM duplicate_calibration_runs
+            WHERE fingerprint_version=? AND thresholds_json=? AND status='passed'
+            LIMIT 1
+            """,
+            (
+                FINGERPRINT_VERSION,
+                json.dumps(THRESHOLDS, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            ),
+        ).fetchone() is not None
     generated_dt = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
     metric_eligible_ids = {
         int(row["id"]) for row in content_rows
@@ -466,6 +521,9 @@ def _build_report_data(
         "evaluation_coverage": _percentage(eval_ready, total) if total else 100.0,
         "core_artifact_coverage": 100.0,
         "media_terminal_coverage": media_terminal_coverage,
+        "duplicate_fingerprint_coverage": (
+            _percentage(fingerprint_ready, total) if duplicate_calibration_ready and total else 100.0 if not total else 0.0
+        ),
         "weekly_comment_coverage": weekly_comment_coverage,
     }
     task_status = expected_terminal_task_status(data_quality)
@@ -503,10 +561,19 @@ def _build_report_data(
             SELECT content_id FROM task_contents
             WHERE task_id=? AND inclusion_status='included'
         )
+          AND d.status='confirmed'
+          AND d.id=(
+              SELECT d2.id FROM duplicate_relations d2
+              WHERE d2.duplicate_content_id=d.duplicate_content_id AND d2.status='confirmed'
+              ORDER BY d2.confidence DESC,d2.id LIMIT 1
+          )
         ORDER BY d.id
         """,
         (task["id"],),
     ).fetchall()
+    duplicate_by_content = {
+        int(row["duplicate_content_id"]): dict(row) for row in duplicate_rows
+    }
     review_rows = connection.execute(
         """
         SELECT rq.status, COUNT(*) count FROM review_queue rq
@@ -542,6 +609,7 @@ def _build_report_data(
         content_id = int(content["id"])
         evaluation = current_evaluations.get(content_id)
         snapshot = snapshots.get(content_id)
+        duplicate = duplicate_by_content.get(content_id)
         details.append(
             {
                 "content_id": content_id,
@@ -560,6 +628,9 @@ def _build_report_data(
                 "content_automotive_score": evaluation["content_automotive_score"] if evaluation else None,
                 "view_count": snapshot["view_count"] if snapshot else None,
                 "comment_count": snapshot["comment_count"] if snapshot else None,
+                "duplicate_original_link_id": duplicate["original_link_id"] if duplicate else None,
+                "duplicate_method": duplicate["method"] if duplicate else None,
+                "duplicate_confidence": duplicate["confidence"] if duplicate else None,
                 "evaluation_current": evaluation is not None,
             }
         )
@@ -599,6 +670,21 @@ def _build_report_data(
             "selling_point_coverage_rate": ratio_metric(
                 selling if total else None, total, status=eval_status,
                 eligible_count=eval_ready, coverage_percentage=data_quality["evaluation_coverage"],
+            ),
+            "duplicate_rate": ratio_metric(
+                len(duplicate_rows) if total else None,
+                total,
+                status=(
+                    "not_applicable" if total == 0 else "available"
+                    if float(data_quality["duplicate_fingerprint_coverage"] or 0) >= 95
+                    else "below_threshold"
+                ),
+                eligible_count=fingerprint_ready,
+                coverage_percentage=data_quality["duplicate_fingerprint_coverage"],
+                reason=(
+                    "感知指纹定标未通过或覆盖不足，重复率暂不发布"
+                    if total and float(data_quality["duplicate_fingerprint_coverage"] or 0) < 95 else ""
+                ),
             ),
             "estimated_new_users": quantity_metric(
                 None, unit="person", status="not_applicable" if total == 0 else "not_calculable",
@@ -648,6 +734,7 @@ def _markdown(report: Mapping[str, Any]) -> str:
         f"- 统计区间：{report['scope']['period_start']} 至 {report['scope']['period_end']}（右开）", "",
         "## 概览", "",
         f"- 发布内容：{metrics['publication_count']['value']} 条",
+        f"- 重复内容率：{metrics['duplicate_rate']['percentage'] if metrics['duplicate_rate']['percentage'] is not None else '暂不可计算'}%",
         f"- 发布账号：{metrics['active_account_count']['value']} 个",
         f"- 阅读 / 播放：{metrics['view_count']['value'] if metrics['view_count']['value'] is not None else '暂不可计算'}",
         f"- 评论数：{metrics['comment_count']['value'] if metrics['comment_count']['value'] is not None else '暂不可计算'}",
@@ -686,7 +773,8 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         "content_id", "link_id", "platform", "published_at", "canonical_url", "title",
         "account_uid", "account_name", "account_type", "content_direction", "evidence_level",
         "primary_selling_point_code", "selling_point_score", "content_automotive_score",
-        "view_count", "comment_count", "evaluation_current",
+        "view_count", "comment_count", "duplicate_original_link_id", "duplicate_method",
+        "duplicate_confidence", "evaluation_current",
     ]
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)

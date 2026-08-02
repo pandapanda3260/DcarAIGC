@@ -1,0 +1,910 @@
+{
+  "fingerprint_version": "duplicate-fingerprint-v1|ImageHash==4.3.2|Pillow==12.3.0|phash64|simhash64",
+  "label_policy": "正样本由媒体字节/规范化正文完全一致或人工画面对照确认；负样本由人工明确不同命题对与 ASR 污染高难对组成。",
+  "negative_count": 75,
+  "pair_count": 150,
+  "pairs": [
+    {
+      "label": "duplicate",
+      "left_link_id": "FDR3VR",
+      "rationale": "人工画面对照：抖音与小红书为同一油门踏板/AEB 素材",
+      "right_link_id": "FVEEW7"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "E89DU6",
+      "rationale": "跨平台标题、主题与关键帧一致：轮胎 vs 转向拉杆",
+      "right_link_id": "9ENK4R"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "H66SMN",
+      "rationale": "正文 SHA-256 完全一致：0031d6b5259c",
+      "right_link_id": "QFW3LD"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "829XL5",
+      "rationale": "正文 SHA-256 完全一致：3aee408adbe4",
+      "right_link_id": "9UMFAK"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "CEY34J",
+      "rationale": "正文 SHA-256 完全一致：4f1481c3e9a9",
+      "right_link_id": "XLSNQ6"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "KU59JK",
+      "rationale": "正文 SHA-256 完全一致：5185a0970947",
+      "right_link_id": "SXE3AJ"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "PZ5S6Z",
+      "rationale": "正文 SHA-256 完全一致：59929bc4e425",
+      "right_link_id": "UUECY3"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "KBRBF6",
+      "rationale": "正文 SHA-256 完全一致：620225390da0",
+      "right_link_id": "UT9L63"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "3UYZWK",
+      "rationale": "正文 SHA-256 完全一致：631b265e1334",
+      "right_link_id": "LWNVB7"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "3SJ96A",
+      "rationale": "正文 SHA-256 完全一致：640da3e46b6c",
+      "right_link_id": "V4RTAA"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "7NDAFJ",
+      "rationale": "正文 SHA-256 完全一致：6586c979b473",
+      "right_link_id": "WZLY7F"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "FDR3VR",
+      "rationale": "正文 SHA-256 完全一致：68e41a4e483c",
+      "right_link_id": "LCF3C8"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "2XD3YS",
+      "rationale": "正文 SHA-256 完全一致：73d87ea3c2b7",
+      "right_link_id": "FMRKJ4"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "PJY4P9",
+      "rationale": "正文 SHA-256 完全一致：835ccdc1f1b1",
+      "right_link_id": "QUB7HU"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "S46QMM",
+      "rationale": "正文 SHA-256 完全一致：85b487bf97b7",
+      "right_link_id": "W6LCKF"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "25U46C",
+      "rationale": "正文 SHA-256 完全一致：8a5f4ff07852",
+      "right_link_id": "2KKTWJ"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "8SB9WZ",
+      "rationale": "正文 SHA-256 完全一致：8c1cd3d223e2",
+      "right_link_id": "E6UDFU"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "QDXUC6",
+      "rationale": "正文 SHA-256 完全一致：8f4252db5b89",
+      "right_link_id": "SL3VHB"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "PYW7B7",
+      "rationale": "正文 SHA-256 完全一致：91abedce0789",
+      "right_link_id": "UHB3JW"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "B877NV",
+      "rationale": "正文 SHA-256 完全一致：91f478a22d60",
+      "right_link_id": "BXUEZ6"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "VL7578",
+      "rationale": "正文 SHA-256 完全一致：97e5c5234e63",
+      "right_link_id": "YLAFF2"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "6LFDVE",
+      "rationale": "正文 SHA-256 完全一致：a20095a680c2",
+      "right_link_id": "8J6C8Q"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "6B98L8",
+      "rationale": "正文 SHA-256 完全一致：a2bd066837a4",
+      "right_link_id": "DFLCF3"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "5PNELT",
+      "rationale": "正文 SHA-256 完全一致：a7ac89af5265",
+      "right_link_id": "MTBBV5"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "E89DU6",
+      "rationale": "正文 SHA-256 完全一致：acbd6a94e182",
+      "right_link_id": "GL4YYV"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "5QQNNL",
+      "rationale": "正文 SHA-256 完全一致：b156b9327a59",
+      "right_link_id": "T2DSX3"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "43MJCT",
+      "rationale": "正文 SHA-256 完全一致：e3ba82da154f",
+      "right_link_id": "G55UMY"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "BGP8PH",
+      "rationale": "正文 SHA-256 完全一致：f287422c0b6a",
+      "right_link_id": "YMSCY5"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "DJQMG6",
+      "rationale": "正文 SHA-256 完全一致：fe8b71e92106",
+      "right_link_id": "G55Y94"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "4VDFV9",
+      "rationale": "媒体字节 SHA-256 完全一致：0103ee9eb284",
+      "right_link_id": "5RXR2B"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "MYLR2U",
+      "rationale": "媒体字节 SHA-256 完全一致：d837e9a5de96",
+      "right_link_id": "WHMCV4"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "H66SMN",
+      "rationale": "正文 SHA-256 完全一致：0031d6b5259c",
+      "right_link_id": "QXPPV7"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "829XL5",
+      "rationale": "正文 SHA-256 完全一致：3aee408adbe4",
+      "right_link_id": "F4ZYRD"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "2XD3YS",
+      "rationale": "正文 SHA-256 完全一致：73d87ea3c2b7",
+      "right_link_id": "KJA9KL"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "S46QMM",
+      "rationale": "正文 SHA-256 完全一致：85b487bf97b7",
+      "right_link_id": "YNMEU2"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "25U46C",
+      "rationale": "正文 SHA-256 完全一致：8a5f4ff07852",
+      "right_link_id": "5RYR8P"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "B877NV",
+      "rationale": "正文 SHA-256 完全一致：91f478a22d60",
+      "right_link_id": "CPBQA4"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "5PNELT",
+      "rationale": "正文 SHA-256 完全一致：a7ac89af5265",
+      "right_link_id": "QP3U7X"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "4VDFV9",
+      "rationale": "媒体字节 SHA-256 完全一致：0103ee9eb284",
+      "right_link_id": "838SVA"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "H66SMN",
+      "rationale": "正文 SHA-256 完全一致：0031d6b5259c",
+      "right_link_id": "Z6CEL4"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "829XL5",
+      "rationale": "正文 SHA-256 完全一致：3aee408adbe4",
+      "right_link_id": "JN4CMC"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "2XD3YS",
+      "rationale": "正文 SHA-256 完全一致：73d87ea3c2b7",
+      "right_link_id": "QE5T48"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "W6LCKF",
+      "rationale": "正文 SHA-256 完全一致：85b487bf97b7",
+      "right_link_id": "YNMEU2"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "25U46C",
+      "rationale": "正文 SHA-256 完全一致：8a5f4ff07852",
+      "right_link_id": "66KKAD"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "B877NV",
+      "rationale": "正文 SHA-256 完全一致：91f478a22d60",
+      "right_link_id": "GWFUM8"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "MTBBV5",
+      "rationale": "正文 SHA-256 完全一致：a7ac89af5265",
+      "right_link_id": "QP3U7X"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "4VDFV9",
+      "rationale": "媒体字节 SHA-256 完全一致：0103ee9eb284",
+      "right_link_id": "8VSDTP"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "QFW3LD",
+      "rationale": "正文 SHA-256 完全一致：0031d6b5259c",
+      "right_link_id": "QXPPV7"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "829XL5",
+      "rationale": "正文 SHA-256 完全一致：3aee408adbe4",
+      "right_link_id": "LSGJG6"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "2XD3YS",
+      "rationale": "正文 SHA-256 完全一致：73d87ea3c2b7",
+      "right_link_id": "QV5ZE4"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "25U46C",
+      "rationale": "正文 SHA-256 完全一致：8a5f4ff07852",
+      "right_link_id": "8TT6XG"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "B877NV",
+      "rationale": "正文 SHA-256 完全一致：91f478a22d60",
+      "right_link_id": "GXLWL5"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "4VDFV9",
+      "rationale": "媒体字节 SHA-256 完全一致：0103ee9eb284",
+      "right_link_id": "AR85GE"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "QFW3LD",
+      "rationale": "正文 SHA-256 完全一致：0031d6b5259c",
+      "right_link_id": "Z6CEL4"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "9UMFAK",
+      "rationale": "正文 SHA-256 完全一致：3aee408adbe4",
+      "right_link_id": "F4ZYRD"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "2XD3YS",
+      "rationale": "正文 SHA-256 完全一致：73d87ea3c2b7",
+      "right_link_id": "VSS53F"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "25U46C",
+      "rationale": "正文 SHA-256 完全一致：8a5f4ff07852",
+      "right_link_id": "9LF3AF"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "B877NV",
+      "rationale": "正文 SHA-256 完全一致：91f478a22d60",
+      "right_link_id": "HXRV4F"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "4VDFV9",
+      "rationale": "媒体字节 SHA-256 完全一致：0103ee9eb284",
+      "right_link_id": "B7MRYT"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "QXPPV7",
+      "rationale": "正文 SHA-256 完全一致：0031d6b5259c",
+      "right_link_id": "Z6CEL4"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "9UMFAK",
+      "rationale": "正文 SHA-256 完全一致：3aee408adbe4",
+      "right_link_id": "JN4CMC"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "2XD3YS",
+      "rationale": "正文 SHA-256 完全一致：73d87ea3c2b7",
+      "right_link_id": "XZCRX7"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "25U46C",
+      "rationale": "正文 SHA-256 完全一致：8a5f4ff07852",
+      "right_link_id": "C8FLQD"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "B877NV",
+      "rationale": "正文 SHA-256 完全一致：91f478a22d60",
+      "right_link_id": "JYRX3M"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "4VDFV9",
+      "rationale": "媒体字节 SHA-256 完全一致：0103ee9eb284",
+      "right_link_id": "CMWDV6"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "9UMFAK",
+      "rationale": "正文 SHA-256 完全一致：3aee408adbe4",
+      "right_link_id": "LSGJG6"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "2XD3YS",
+      "rationale": "正文 SHA-256 完全一致：73d87ea3c2b7",
+      "right_link_id": "YNJ5ZX"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "25U46C",
+      "rationale": "正文 SHA-256 完全一致：8a5f4ff07852",
+      "right_link_id": "FHFYD8"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "B877NV",
+      "rationale": "正文 SHA-256 完全一致：91f478a22d60",
+      "right_link_id": "KHJCN2"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "4VDFV9",
+      "rationale": "媒体字节 SHA-256 完全一致：0103ee9eb284",
+      "right_link_id": "GB32DW"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "F4ZYRD",
+      "rationale": "正文 SHA-256 完全一致：3aee408adbe4",
+      "right_link_id": "JN4CMC"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "FMRKJ4",
+      "rationale": "正文 SHA-256 完全一致：73d87ea3c2b7",
+      "right_link_id": "KJA9KL"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "25U46C",
+      "rationale": "正文 SHA-256 完全一致：8a5f4ff07852",
+      "right_link_id": "GYVEG3"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "B877NV",
+      "rationale": "正文 SHA-256 完全一致：91f478a22d60",
+      "right_link_id": "PUKTG4"
+    },
+    {
+      "label": "duplicate",
+      "left_link_id": "4VDFV9",
+      "rationale": "媒体字节 SHA-256 完全一致：0103ee9eb284",
+      "right_link_id": "LMFYM5"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "8N2ANE",
+      "rationale": "人工画面对照：夜间道路与蓝色车辆是不同视频",
+      "right_link_id": "DQXSD9"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "ER7PUF",
+      "rationale": "不同命题：一万元家用车与首车能源类型",
+      "right_link_id": "LCEE3H"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "C2UBT3",
+      "rationale": "不同命题：老车车龄与首车能源类型",
+      "right_link_id": "LCEE3H"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "S62ANS",
+      "rationale": "不同车型与脚本：宝马 X3 与奔腾 B70",
+      "right_link_id": "R2TX6G"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "87S3LH",
+      "rationale": "不同车型与脚本：本田思域与本田皓影",
+      "right_link_id": "39TZJP"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "RXULL9",
+      "rationale": "不同车型与脚本：凯迪拉克 CT5 与大众 CC",
+      "right_link_id": "Y5MR6X"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "SEMV6N",
+      "rationale": "不同车型与脚本：卡宴/卡罗拉与亚洲龙",
+      "right_link_id": "WY3GY6"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "ZZJDH2",
+      "rationale": "不同命题：二手车购买与速腾报价",
+      "right_link_id": "GQ4H8A"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "C8DQ47",
+      "rationale": "不同车型与脚本：吉利帝豪与长安糯玉米",
+      "right_link_id": "V69UTG"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "ZJZT5M",
+      "rationale": "不同车型与脚本：凯美瑞与奔腾 B70",
+      "right_link_id": "R2TX6G"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "PTZ4CJ",
+      "rationale": "不同命题：锋兰达报价与懂车人车型选择",
+      "right_link_id": "9TVT5E"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "EV45MJ",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "NWGQQ7"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "8N2ANE",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "VJU67H"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "2B63VP",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "T2DSX3"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "6B98L8",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "NHTCK4"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "DURQ2Z",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "Q2T84Y"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "JJ2AD7",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "BLP6GH"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "VYLB6Y",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "JJ2AD7"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "NWGQQ7",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "DQXSD9"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "EV45MJ",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "DQXSD9"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "WZLZB3",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "K4NQMZ"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "WZLZB3",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "C8FLQD"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "KZN8A6",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "GEVFC2"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "B9LEEQ",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "GEVFC2"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "VYLB6Y",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "6KQNXP"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "J6X8KD",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "PSJL7U"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "5DAL5L",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "K4NQMZ"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "EPEV8H",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "YNMEU2"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "KZN8A6",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "FW2KAD"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "JJ2AD7",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "MQECZ7"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "C8FLQD",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "QFW3LD"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "FHFYD8",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "QFW3LD"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "Q2T84Y",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "239JD5"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "2KKTWJ",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "H66SMN"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "5QQNNL",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "C5JNWK"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "JD6TKT",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "Z6CEL4"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "Y8URMY",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "9M45JS"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "KCYHM6",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "H66SMN"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "PSJL7U",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "XH438L"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "PSJL7U",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "6KQNXP"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "K4NQMZ",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "2KKTWJ"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "JBA6DG",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "Y8URMY"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "WZLZB3",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "H66SMN"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "2BM6WR",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "GFXNY3"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "MQECZ7",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "BLP6GH"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "E38KQS",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "B3BQN2"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "B9LEEQ",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "G55Y94"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "5DAL5L",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "KCYHM6"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "4KK4PF",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "EF33SM"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "4T625L",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "VQWYB2"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "XNU8QA",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "KWVH6K"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "AFJ2HQ",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "239JD5"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "MA3ZJA",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "QDXUC6"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "K4NQMZ",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "66KKAD"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "B9LEEQ",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "B3BQN2"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "BLP6GH",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "LD5MV6"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "Q2T84Y",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "6KQNXP"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "VYLB6Y",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "PSJL7U"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "DURQ2Z",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "MQECZ7"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "2B63VP",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "5QQNNL"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "YMSCY5",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "PYW7B7"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "9RCXCE",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "4YC8F7"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "AFJ2HQ",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "J6X8KD"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "JJ2AD7",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "6KQNXP"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "RT9HZY",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "XH438L"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "MQECZ7",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "LD5MV6"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "G55Y94",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "LSXCV8"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "25U46C",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "QXPPV7"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "Q2T84Y",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "RT9HZY"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "2KKTWJ",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "QXPPV7"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "DURQ2Z",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "2QY57F"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "BR83PQ",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "XH438L"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "LFTY22",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "9LCWZ4"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "8TT6XG",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "QXPPV7"
+    },
+    {
+      "label": "distinct",
+      "left_link_id": "MCCPZ7",
+      "rationale": "高难负样本：旧 ASR 高相似，但正文、OCR、媒体指纹与内容命题不共同成立",
+      "right_link_id": "DJQMG6"
+    }
+  ],
+  "positive_count": 75,
+  "version": "duplicate-calibration-v1"
+}

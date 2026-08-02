@@ -139,6 +139,33 @@ class V8MediaTest(unittest.TestCase):
             ).fetchone()
         self.assertEqual((slot["status"], slot["attempt_count"]), ("succeeded", 1))
 
+    def test_complete_migrated_evidence_is_ready_without_paid_source_refresh(self) -> None:
+        media_path = self.root / "legacy.mp4"
+        asr_path = self.root / "legacy-asr.json"
+        ocr_path = self.root / "legacy-ocr.json"
+        media_path.write_bytes(b"legacy-media" * 200)
+        media._atomic_json(asr_path, {"status": "success", "text": "完整语音证据"})
+        media._atomic_json(ocr_path, {"status": "success", "combined_text": "完整画面证据"})
+        with connect(self.db) as connection:
+            for artifact_type, path in (("media", media_path), ("transcript", asr_path), ("ocr", ocr_path)):
+                media.register_artifact(
+                    connection,
+                    content_id=1,
+                    artifact_type=artifact_type,
+                    path=path,
+                    processor_version="legacy-test",
+                )
+            connection.commit()
+        result = media.process_content_media(1, db_path=self.db)
+        self.assertEqual(result["status"], "evidence_ready")
+        self.assertEqual(result["source"], "existing_local_evidence")
+        self.assertEqual(set(result["artifacts"]), {"media", "asr", "ocr"})
+        with connect(self.db) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM media_processing_slots").fetchone()[0],
+                0,
+            )
+
     def test_automatic_download_and_processing_queues_produce_complete_video_evidence(self) -> None:
         calls = {"download": 0, "frames": 0, "asr": 0, "ocr": 0}
 

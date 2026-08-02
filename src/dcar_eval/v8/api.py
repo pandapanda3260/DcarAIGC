@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 
 from .capture import BudgetBlocked, CaptureError, SlotUnavailable
 from .contracts import CURRENT_REPORT_VERSION, quantity_metric, ratio_metric
+from .duplicates import FINGERPRINT_VERSION, THRESHOLDS
 from .evaluation import EvaluationError, resolve_review
 from .media import MediaProcessingError
 from .operations import (
@@ -43,6 +44,7 @@ from .reports import (
     create_and_run_task,
     get_task,
     request_task_cancel,
+    retry_task,
     resume_task,
     run_task,
 )
@@ -360,8 +362,38 @@ def _window_summary(connection: sqlite3.Connection, start: datetime, end: dateti
             """,
             content_ids,
         ).fetchall()
+        duplicate_count = int(
+            connection.execute(
+                f"""
+                SELECT COUNT(DISTINCT duplicate_content_id) FROM duplicate_relations
+                WHERE status='confirmed' AND duplicate_content_id IN ({placeholders})
+                """,
+                content_ids,
+            ).fetchone()[0]
+        )
+        fingerprint_count = int(
+            connection.execute(
+                f"""
+                SELECT COUNT(DISTINCT content_id) FROM duplicate_fingerprints
+                WHERE fingerprint_version=? AND content_id IN ({placeholders})
+                """,
+                [FINGERPRINT_VERSION, *content_ids],
+            ).fetchone()[0]
+        )
+        duplicate_calibrated = connection.execute(
+            """
+            SELECT 1 FROM duplicate_calibration_runs
+            WHERE fingerprint_version=? AND thresholds_json=? AND status='passed' LIMIT 1
+            """,
+            (
+                FINGERPRINT_VERSION,
+                json.dumps(THRESHOLDS, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            ),
+        ).fetchone() is not None
     else:
         evaluations, metrics = [], []
+        duplicate_count = fingerprint_count = 0
+        duplicate_calibrated = False
     eligible = sum(1 for row in evaluations if row["evidence_level"] in {"V2", "V3"})
     vertical = sum(
         1 for row in evaluations
@@ -374,6 +406,11 @@ def _window_summary(connection: sqlite3.Connection, start: datetime, end: dateti
     views = sum(int(row["view_count"] or 0) for row in metrics)
     comments = sum(int(row["comment_count"] or 0) for row in metrics if row["comment_count"] is not None)
     ratio_status = "not_applicable" if total == 0 else "available" if eligible * 100 / total >= 95 else "below_threshold"
+    duplicate_coverage = round(fingerprint_count * 100 / total, 2) if total else None
+    duplicate_status = (
+        "not_applicable" if total == 0 else "available"
+        if duplicate_calibrated and (duplicate_coverage or 0) >= 95 else "below_threshold"
+    )
     return {
         "period_start": start.isoformat(),
         "period_end": end.isoformat(),
@@ -405,6 +442,17 @@ def _window_summary(connection: sqlite3.Connection, start: datetime, end: dateti
                 eligible_count=eligible,
                 coverage_percentage=round(eligible * 100 / total, 2) if total else None,
             ),
+            "duplicate_rate": ratio_metric(
+                duplicate_count if total else None,
+                total,
+                status=duplicate_status,
+                eligible_count=fingerprint_count,
+                coverage_percentage=duplicate_coverage,
+                reason=(
+                    "感知指纹定标未通过或覆盖不足，重复率暂不发布"
+                    if duplicate_status == "below_threshold" else ""
+                ),
+            ),
             "estimated_new_users": quantity_metric(None, unit="person", status="not_applicable" if total == 0 else "not_calculable", reason="首版没有已验证模型"),
             "estimated_reactivated_users": quantity_metric(None, unit="person", status="not_applicable" if total == 0 else "not_calculable", reason="首版没有已验证模型"),
             "estimated_leads": quantity_metric(None, unit="lead", status="not_applicable" if total == 0 else "not_calculable", reason="首版没有已验证模型"),
@@ -431,6 +479,29 @@ def v8_overview() -> Dict[str, Any]:
             ),
             "terminal_reviews": int(
                 connection.execute("SELECT COUNT(*) FROM review_queue WHERE status='terminal_failed'").fetchone()[0]
+            ),
+            "duplicate_fingerprint_coverage": round(
+                int(connection.execute(
+                    "SELECT COUNT(DISTINCT content_id) FROM duplicate_fingerprints WHERE fingerprint_version=?",
+                    (FINGERPRINT_VERSION,),
+                ).fetchone()[0]) * 100
+                / max(1, int(connection.execute("SELECT COUNT(*) FROM content_items").fetchone()[0])),
+                2,
+            ),
+            "duplicate_calibration_ready": connection.execute(
+                """
+                SELECT 1 FROM duplicate_calibration_runs
+                WHERE fingerprint_version=? AND thresholds_json=? AND status='passed' LIMIT 1
+                """,
+                (
+                    FINGERPRINT_VERSION,
+                    json.dumps(THRESHOLDS, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                ),
+            ).fetchone() is not None,
+            "confirmed_duplicate_count": int(
+                connection.execute(
+                    "SELECT COUNT(DISTINCT duplicate_content_id) FROM duplicate_relations WHERE status='confirmed'"
+                ).fetchone()[0]
             ),
         }
     return {
@@ -889,7 +960,7 @@ async def lifespan(app: FastAPI):
             scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="DCar Insight API", version="8.0", lifespan=lifespan)
+app = FastAPI(title="DCar Insight API", version="8.2", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"http://(?:localhost|127\.0\.0\.1):\d{2,5}",
@@ -983,6 +1054,7 @@ def get_v8_task(task_id: str) -> Dict[str, Any]:
 @app.post("/api/v8/tasks/{task_id}/retry")
 def retry_v8_task(task_id: str) -> Dict[str, Any]:
     try:
+        retry_task(task_id, db_path=API_DB_PATH)
         run_task(task_id, db_path=API_DB_PATH, reports_root=API_REPORTS_ROOT)
         return get_task(task_id, db_path=API_DB_PATH)
     except ReportTaskError as exc:

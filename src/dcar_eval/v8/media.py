@@ -762,6 +762,39 @@ def _latest_media_source(content_id: int, *, db_path: Path) -> Optional[Dict[str
     return value if value.get("urls") else None
 
 
+def _existing_complete_evidence(
+    content_id: int, *, db_path: Path
+) -> Optional[Dict[str, int]]:
+    with connect(db_path) as connection:
+        content = connection.execute(
+            "SELECT content_type FROM content_items WHERE id=?", (content_id,)
+        ).fetchone()
+        rows = connection.execute(
+            """
+            SELECT id,artifact_type FROM evidence_artifacts
+            WHERE content_id=? AND status='available'
+              AND artifact_type IN (
+                  'media','media_manifest','asr','transcript','media_transcript','ocr','media_ocr'
+              )
+            ORDER BY id DESC
+            """,
+            (content_id,),
+        ).fetchall()
+    if content is None:
+        return None
+    latest: Dict[str, int] = {}
+    for row in rows:
+        artifact_type = str(row["artifact_type"])
+        category = (
+            "media" if artifact_type in {"media", "media_manifest"}
+            else "asr" if artifact_type in {"asr", "transcript", "media_transcript"}
+            else "ocr"
+        )
+        latest.setdefault(category, int(row["id"]))
+    required = {"media", "ocr", "asr"} if content["content_type"] == "video" else {"media", "ocr"}
+    return latest if required <= latest.keys() else None
+
+
 def process_content_media(
     content_id: int,
     *,
@@ -770,6 +803,14 @@ def process_content_media(
 ) -> Dict[str, Any]:
     source = _latest_media_source(content_id, db_path=db_path)
     if source is None:
+        existing = _existing_complete_evidence(content_id, db_path=db_path)
+        if existing is not None:
+            return {
+                "content_id": content_id,
+                "status": "evidence_ready",
+                "source": "existing_local_evidence",
+                "artifacts": existing,
+            }
         return {"content_id": content_id, "status": "no_source"}
     media_kind = str(source.get("media_kind") or "")
     urls = [str(value) for value in source.get("urls", []) if isinstance(value, str)]

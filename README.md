@@ -4,10 +4,10 @@
 
 ## 当前正式基线
 
-- 数据库：`app/data/dcar_insight.sqlite3`（SQLite schema v3）
+- 数据库：`app/data/dcar_insight.sqlite3`（SQLite schema v7）
 - 报告合同：`config/report_contract_v8.json`
 - 卖点标准：数据库中最新 `published` taxonomy（迁移初始版本为 `selling-points-v5.0`）
-- Web：概览、任务、账号、内容、卖点五个页面
+- Web：概览、任务列表、任务详情、账号、内容、卖点六类真实路由
 - 历史：v7 报告及 5 个 revision 只读保留，不再作为 v8 当前状态
 
 ## 目录

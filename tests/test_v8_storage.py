@@ -33,6 +33,7 @@ class V8StorageTest(unittest.TestCase):
                     "taxonomy_versions", "selling_points", "selling_point_scenes",
                     "evaluation_versions", "evaluation_matches", "review_queue",
                     "evaluation_reviews", "manual_evidence", "duplicate_relations",
+                    "duplicate_fingerprints", "duplicate_calibration_runs",
                     "report_tasks", "task_events", "task_contents", "report_revisions",
                     "report_files", "scheduler_runs", "migration_audit", "migration_row_audit",
                 }

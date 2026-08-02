@@ -30,6 +30,9 @@ export type Overview = {
     missing_published_at: number;
     pending_reviews: number;
     terminal_reviews: number;
+    duplicate_fingerprint_coverage: number;
+    duplicate_calibration_ready: boolean;
+    confirmed_duplicate_count: number;
   };
 };
 

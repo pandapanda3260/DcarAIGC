@@ -21,6 +21,9 @@ app = api_module.app
 
 
 class V8ApiTest(unittest.TestCase):
+    def test_openapi_version_matches_v8_contract_release(self) -> None:
+        self.assertEqual(app.version, "8.2")
+
     def setUp(self) -> None:
         self.client_context = TestClient(app)
         self.client = self.client_context.__enter__()
@@ -45,6 +48,9 @@ class V8ApiTest(unittest.TestCase):
             self.assertEqual(metrics["estimated_new_users"]["value"], None)
             self.assertEqual(metrics["estimated_new_users"]["unit"], "person")
             self.assertNotEqual(metrics["estimated_new_users"]["status"], "partial")
+            self.assertIn("duplicate_rate", metrics)
+        self.assertIn("duplicate_fingerprint_coverage", value["data_quality"])
+        self.assertIn("duplicate_calibration_ready", value["data_quality"])
 
     def test_five_page_read_models_use_migrated_v8_data(self) -> None:
         tasks = self.client.get("/api/v8/tasks")
@@ -353,12 +359,13 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         )
         self.assertEqual(processing.status_code, 200)
         self.assertEqual(processing.json()["total"], 1)
-        no_source = self.client.post(
+        existing_evidence = self.client.post(
             f"/api/v8/contents/{self.content_id}/media/retry",
             json={"allow_paid_refresh": False},
         )
-        self.assertEqual(no_source.status_code, 409)
-        self.assertIn("付费刷新", no_source.json()["detail"])
+        self.assertEqual(existing_evidence.status_code, 200)
+        self.assertEqual(existing_evidence.json()["status"], "evidence_ready")
+        self.assertEqual(existing_evidence.json()["provider_cost"], 0.0)
 
     def test_task_cancel_and_resume_routes_preserve_revision_history(self) -> None:
         resolved = self.client.post(

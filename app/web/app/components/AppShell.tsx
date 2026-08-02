@@ -37,7 +37,7 @@ export default function AppShell({ active, actions, children }: { active: Sectio
       <main className="main-area">
         <header className="topbar">
           <div><span className="eyebrow">{copy.eyebrow}</span><h1>{copy.title}</h1></div>
-          <div className="topbar-actions"><span className="rule-chip">v8.1 合同</span><span className="safe-chip">本地优先</span>{actions}</div>
+          <div className="topbar-actions"><span className="rule-chip">v8.2 合同</span><span className="safe-chip">本地优先</span>{actions}</div>
         </header>
         {children}
       </main>

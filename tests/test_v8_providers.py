@@ -279,12 +279,18 @@ class V8ProviderUpdateTest(unittest.TestCase):
             )
         self.assertEqual(result["status"], "succeeded")
         self.assertEqual(result["media"]["status"], "evidence_ready")
+        self.assertIsNotNone(result["duplicates"])
         process_media.assert_called_once_with(self.content_id, db_path=self.db)
         with connect(self.db) as connection:
             source = connection.execute(
                 "SELECT * FROM evidence_artifacts WHERE artifact_type='media_source'"
             ).fetchone()
         self.assertIsNotNone(source)
+        with connect(self.db) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM duplicate_fingerprints").fetchone()[0],
+                1,
+            )
         manifest = Path(str(source["local_path"]))
         self.assertEqual(json.loads(manifest.read_text(encoding="utf-8"))["media_kind"], "video")
 

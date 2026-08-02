@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
 
-from workflow.privacy import CommentHasher  # type: ignore[import-not-found]
+from workflow.privacy import CommentHasher  # type: ignore[import-not-found,import-untyped]
 
 from .capture import (
     CaptureError,
@@ -23,6 +23,7 @@ from .capture import (
     execute_account_fetch,
     execute_content_fetch,
 )
+from .duplicates import refresh_content_duplicates
 from .evaluation import evaluate_content, upsert_comment_user_scores
 from .media import process_content_media, store_media_source_manifest
 from .operations import upsert_content
@@ -626,7 +627,7 @@ def _store_stage_result(
             db_path=db_path,
         )
     if stage == "comments" and evidence_id is not None:
-        import analyze_douyin_tikhub_v6 as scoring  # type: ignore[import-not-found]
+        import analyze_douyin_tikhub_v6 as scoring  # type: ignore[import-not-found,import-untyped]
 
         rows = []
         for item in data.get("comments") or []:
@@ -868,8 +869,20 @@ def update_content_data(
                 "error": f"{type(exc).__name__}: {exc}"[:500],
             }
     evaluation = evaluate_content(content_id, db_path=db_path) if process_media else None
+    duplicate_result: Optional[Dict[str, Any]] = None
+    if process_media:
+        try:
+            duplicate_result = refresh_content_duplicates(content_id, db_path=db_path)
+        except Exception as exc:
+            duplicate_result = {
+                "content_id": content_id,
+                "status": "retryable_failed",
+                "error": f"{type(exc).__name__}: {exc}"[:500],
+            }
     failed = any(item["status"] == "failed" for item in outcomes)
     if media_result is not None and media_result.get("status") == "retryable_failed":
+        failed = True
+    if duplicate_result is not None and duplicate_result.get("status") == "retryable_failed":
         failed = True
     return {
         "content_id": content_id,
@@ -878,6 +891,7 @@ def update_content_data(
         "media": media_result,
         "evaluation_id": evaluation.evaluation_id if evaluation is not None else None,
         "evaluation_created": evaluation.created if evaluation is not None else False,
+        "duplicates": duplicate_result,
         "provider_cost": round(sum(float(item.get("amount") or 0) for item in outcomes), 6),
         "currency": "USD",
     }
@@ -895,12 +909,14 @@ def retry_content_media(
     local = process_content_media(content_id, db_path=db_path)
     if local.get("status") != "no_source":
         evaluation = evaluate_content(content_id, db_path=db_path)
+        duplicates = refresh_content_duplicates(content_id, db_path=db_path)
         return {
             "content_id": content_id,
             "status": str(local.get("status")),
             "media": local,
             "evaluation_id": evaluation.evaluation_id,
             "evaluation_created": evaluation.created,
+            "duplicates": duplicates,
             "provider_cost": 0.0,
             "currency": "USD",
         }
@@ -959,12 +975,14 @@ def retry_content_media(
     _store_stage_result(content, "detail", "lifetime", outcome, db_path=db_path)
     media = process_content_media(content_id, db_path=db_path)
     evaluation = evaluate_content(content_id, db_path=db_path)
+    duplicates = refresh_content_duplicates(content_id, db_path=db_path)
     return {
         "content_id": content_id,
         "status": str(media.get("status")),
         "media": media,
         "evaluation_id": evaluation.evaluation_id,
         "evaluation_created": evaluation.created,
+        "duplicates": duplicates,
         "provider_cost": outcome.amount,
         "currency": outcome.currency or "USD",
     }

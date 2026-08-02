@@ -12,6 +12,7 @@ const metricLabels: Array<[string, string]> = [
   ["publication_count", "发布内容"], ["active_account_count", "发布账号"],
   ["view_count", "阅读 / 播放"], ["comment_count", "评论数"],
   ["verticality_rate", "内容垂直度"], ["selling_point_coverage_rate", "卖点覆盖率"],
+  ["duplicate_rate", "重复内容率"],
   ["estimated_new_users", "预估拉新量"], ["estimated_reactivated_users", "预估拉活量"],
   ["estimated_leads", "预估线索量"],
 ];
@@ -68,6 +69,9 @@ export default function OverviewPage() {
                 <div><strong>{overview?.data_quality.missing_published_at ?? "—"}</strong><span>缺失发布日期</span></div>
                 <div><strong>{overview?.data_quality.pending_reviews ?? "—"}</strong><span>待复核 / 补证</span></div>
                 <div><strong>{overview?.data_quality.terminal_reviews ?? "—"}</strong><span>终态不可用</span></div>
+                <div><strong>{overview?.data_quality.duplicate_fingerprint_coverage ?? "—"}%</strong><span>重复指纹覆盖</span></div>
+                <div><strong>{overview?.data_quality.confirmed_duplicate_count ?? "—"}</strong><span>确认重复内容</span></div>
+                <div><strong>{overview?.data_quality.duplicate_calibration_ready ? "已通过" : "未通过"}</strong><span>150 对定标</span></div>
               </div>
             </article>
           </div>

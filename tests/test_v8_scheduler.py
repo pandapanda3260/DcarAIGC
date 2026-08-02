@@ -84,7 +84,12 @@ class V8SchedulerTest(unittest.TestCase):
         self.assertEqual(capture["status"], "skipped")
         self.assertIn("没有已启用", capture["details"]["reason"])
         weekly = next(item for item in results if item["job_id"] == "weekly_report")
+        media_processing = next(
+            item for item in results if item["job_id"] == "daily_media_processing"
+        )
         self.assertEqual(weekly["status"], "succeeded")
+        self.assertEqual(set(media_processing["details"]), {"media", "duplicates"})
+        self.assertEqual(media_processing["details"]["duplicates"]["failed"], 0)
         with connect(self.db) as connection:
             statuses = {
                 row["job_id"]: row["status"]

@@ -11,7 +11,7 @@ from typing import Iterator
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_DB = PROJECT_ROOT / "app" / "data" / "dcar_insight.sqlite3"
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 def now_utc() -> str:
@@ -497,6 +497,48 @@ CREATE TABLE IF NOT EXISTS duplicate_relations (
     CHECK(duplicate_content_id <> original_content_id)
 );
 
+CREATE TABLE IF NOT EXISTS duplicate_fingerprints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
+    fingerprint_version TEXT NOT NULL,
+    source_sha256 TEXT NOT NULL,
+    text_sha256 TEXT,
+    media_sha256_json TEXT NOT NULL DEFAULT '[]',
+    frame_phashes_json TEXT NOT NULL DEFAULT '[]',
+    text_simhash TEXT,
+    asr_simhash TEXT,
+    ocr_simhash TEXT,
+    text_char_count INTEGER NOT NULL DEFAULT 0,
+    asr_char_count INTEGER NOT NULL DEFAULT 0,
+    ocr_char_count INTEGER NOT NULL DEFAULT 0,
+    artifact_id INTEGER REFERENCES evidence_artifacts(id) ON DELETE SET NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(content_id, fingerprint_version, source_sha256)
+);
+
+CREATE INDEX IF NOT EXISTS idx_duplicate_fingerprint_current
+ON duplicate_fingerprints(content_id, fingerprint_version, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS duplicate_calibration_runs (
+    id TEXT PRIMARY KEY,
+    calibration_version TEXT NOT NULL,
+    fingerprint_version TEXT NOT NULL,
+    dataset_sha256 TEXT NOT NULL,
+    pair_count INTEGER NOT NULL,
+    positive_count INTEGER NOT NULL,
+    negative_count INTEGER NOT NULL,
+    predicted_positive_count INTEGER NOT NULL,
+    true_positive_count INTEGER NOT NULL,
+    false_positive_count INTEGER NOT NULL,
+    precision REAL NOT NULL,
+    recall REAL NOT NULL,
+    thresholds_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('passed','failed')),
+    created_at TEXT NOT NULL,
+    UNIQUE(calibration_version, fingerprint_version, dataset_sha256)
+);
+
 CREATE TABLE IF NOT EXISTS report_tasks (
     id TEXT PRIMARY KEY,
     task_type TEXT NOT NULL CHECK(task_type IN ('daily','weekly','custom')),
@@ -797,5 +839,13 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             VALUES (?, ?, ?)
             ON CONFLICT(version) DO NOTHING
             """,
-            (SCHEMA_VERSION, "pending-platform-identities-and-operator-controls", now_utc()),
+            (6, "pending-platform-identities-and-operator-controls", now_utc()),
+        )
+        connection.execute(
+            """
+            INSERT INTO schema_migrations(version, name, applied_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(version) DO NOTHING
+            """,
+            (SCHEMA_VERSION, "perceptual-duplicate-fingerprints-and-calibration", now_utc()),
         )

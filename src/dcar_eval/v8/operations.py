@@ -654,6 +654,14 @@ def upsert_content(value: Mapping[str, Any], *, db_path: Path = DEFAULT_DB) -> D
             """,
             (content_id, kind, identity_value, identity["identity_key"], captured_at),
         )
+        connection.execute(
+            """
+            DELETE FROM duplicate_relations
+            WHERE method='fingerprint_v1'
+              AND (duplicate_content_id=? OR original_content_id=?)
+            """,
+            (content_id, content_id),
+        )
         _rebuild_text_duplicate_group(connection, content_id)
     return {"id": content_id, "action": action}
 
