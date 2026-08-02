@@ -1,0 +1,229 @@
+{
+  "taxonomy_version": "4.0-final",
+  "generated_at": "2026-08-02",
+  "definition": "卖点是用户通过懂车帝可以完成的任务、获得的平台能力或持续内容服务。",
+  "core_ids": [
+    "E1",
+    "E2",
+    "X1",
+    "X2",
+    "X3",
+    "M1",
+    "M2",
+    "M3"
+  ],
+  "labels": [
+    {
+      "id": "E1",
+      "tier": "core",
+      "label": "通过懂车帝卖车，由专业收车团队实现卖得高、到账快",
+      "business_scene": "二手车"
+    },
+    {
+      "id": "E2",
+      "tier": "core",
+      "label": "通过懂车帝购买海量靠谱二手车，查看透明车况并获得保障",
+      "business_scene": "二手车"
+    },
+    {
+      "id": "E3",
+      "tier": "other",
+      "label": "通过懂车帝按预算和行情筛选高性价比二手车",
+      "business_scene": "二手车"
+    },
+    {
+      "id": "E4",
+      "tier": "other",
+      "label": "通过懂车帝按人群和场景获得二手车推荐方案",
+      "business_scene": "二手车"
+    },
+    {
+      "id": "E5",
+      "tier": "other",
+      "label": "通过懂车帝查看检测报告、车辆档案或专业检测，识别问题二手车",
+      "business_scene": "二手车"
+    },
+    {
+      "id": "E6",
+      "tier": "other",
+      "label": "通过懂车帝查询估价、保值率和市场行情，减少价格信息差",
+      "business_scene": "二手车"
+    },
+    {
+      "id": "E7",
+      "tier": "other",
+      "label": "通过懂车帝获得合同、过户、交易流程和权益保障",
+      "business_scene": "二手车"
+    },
+    {
+      "id": "X1",
+      "tier": "core",
+      "label": "通过懂车帝对同级候选车型进行多维度全面对比",
+      "business_scene": "新车"
+    },
+    {
+      "id": "X2",
+      "tier": "core",
+      "label": "通过懂车帝查看权威第三方测评和真实车主口碑",
+      "business_scene": "新车"
+    },
+    {
+      "id": "X3",
+      "tier": "core",
+      "label": "通过懂车帝查询最新车价、落地价、优惠和现车信息",
+      "business_scene": "新车"
+    },
+    {
+      "id": "X4",
+      "tier": "other",
+      "label": "通过懂车帝按预算、人群和用车场景完成选车",
+      "business_scene": "新车"
+    },
+    {
+      "id": "X5",
+      "tier": "other",
+      "label": "通过懂车帝比较车型版本、配置差异和配置价值",
+      "business_scene": "新车"
+    },
+    {
+      "id": "X6",
+      "tier": "other",
+      "label": "通过懂车帝计算购车和长期用车成本",
+      "business_scene": "新车"
+    },
+    {
+      "id": "X7",
+      "tier": "other",
+      "label": "通过懂车帝的独立解析验证参数、配置和营销话术",
+      "business_scene": "新车"
+    },
+    {
+      "id": "X8",
+      "tier": "other",
+      "label": "通过懂车帝了解定金、合同、选配、交付和购车权益",
+      "business_scene": "新车"
+    },
+    {
+      "id": "M1",
+      "tier": "core",
+      "label": "通过AI小懂一键预约试驾并提前获得试驾指南",
+      "business_scene": "媒体-AI小懂"
+    },
+    {
+      "id": "M2",
+      "tier": "core",
+      "label": "通过AI小懂查询最新真实优惠、库存、现车、展车和试驾车",
+      "business_scene": "媒体-AI小懂"
+    },
+    {
+      "id": "M3",
+      "tier": "core",
+      "label": "通过AI小懂预约洗车、维修保养并管理日常用车",
+      "business_scene": "媒体-AI小懂"
+    },
+    {
+      "id": "M4",
+      "tier": "other",
+      "label": "通过AI小懂用自然语言完成选车和个性化推荐",
+      "business_scene": "媒体-AI小懂"
+    },
+    {
+      "id": "M5",
+      "tier": "other",
+      "label": "通过AI小懂解释故障并获得安全处置建议",
+      "business_scene": "媒体-AI小懂"
+    },
+    {
+      "id": "M6",
+      "tier": "other",
+      "label": "通过AI小懂完成估价和卖车流程准备",
+      "business_scene": "媒体-AI小懂"
+    },
+    {
+      "id": "C1",
+      "tier": "other",
+      "label": "通过懂车帝获取实用汽车知识和用车问题解答",
+      "business_scene_options": [
+        "二手车",
+        "媒体-AI小懂"
+      ]
+    },
+    {
+      "id": "C2",
+      "tier": "other",
+      "label": "通过懂车帝查看车型细节、真实影像和场景化体验",
+      "business_scene_options": [
+        "二手车",
+        "新车"
+      ]
+    },
+    {
+      "id": "C3",
+      "tier": "other",
+      "label": "通过懂车帝车友社区交流用车体验并参与玩车内容",
+      "business_scene_options": [
+        "媒体-AI小懂"
+      ]
+    },
+    {
+      "id": "C4",
+      "tier": "other",
+      "label": "通过懂车帝跟踪新车发布和汽车行业动态",
+      "business_scene_options": [
+        "二手车",
+        "新车",
+        "媒体-AI小懂"
+      ]
+    }
+  ],
+  "evidence_priority": [
+    "video_asr",
+    "video_ocr",
+    "keyframe_visual_semantics",
+    "post_text",
+    "cover_ocr",
+    "hashtags",
+    "account_context"
+  ],
+  "evidence_caps": {
+    "V3": 100,
+    "V2": 90,
+    "V1": 74,
+    "V0": 0
+  },
+  "score_dimensions": {
+    "semantic_fit": 30,
+    "dcar_linkage": 25,
+    "video_evidence": 20,
+    "user_benefit": 15,
+    "narrative_prominence": 10
+  },
+  "thresholds": {
+    "strong_min": 90,
+    "included_min": 75,
+    "review_min": 60,
+    "no_match_max": 59
+  },
+  "primary_label_rule": "每条内容只用一个主卖点参与核心占比，最多两个次卖点不参与核心比例。",
+  "comments_and_engagement": "不参与卖点表达判断，只用于后续验证用户理解与传播效果。",
+  "business_scenes": [
+    "二手车",
+    "新车",
+    "媒体-AI小懂"
+  ],
+  "primary_denominator": "全部唯一内容链接的发布条数；同链接去重，不做创意去重",
+  "deprecated_outputs": [
+    "仅标题/正文口径",
+    "去重创意主结论"
+  ],
+  "scene_assignment_rules": {
+    "E1-E7": "二手车",
+    "X1-X8": "新车",
+    "M1-M6": "媒体-AI小懂",
+    "C1": "二手车交易/鉴别/二手用车任务归二手车；其他实用汽车知识归媒体-AI小懂",
+    "C2": "二手车源/车况实拍归二手车；新车或在售车型细节体验归新车",
+    "C3": "媒体-AI小懂",
+    "C4": "二手车市场动态归二手车；新车发布、销量及行业动态归新车；泛社区服务仅在不能归入前两者时归媒体-AI小懂"
+  },
+  "narrative_dominance_rule": "情感、剧情、末日或娱乐内容中，卖点只在中后段短暂植入且不构成主要用户任务时，不得命中正式卖点。"
+}

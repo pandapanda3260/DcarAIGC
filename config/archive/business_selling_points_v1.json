@@ -1,0 +1,266 @@
+{
+  "taxonomy_version": "1.0",
+  "generated_at": "2026-08-01",
+  "language": "zh-CN",
+  "proposition": {
+    "id": "P4",
+    "name": "内容对应的业务卖点",
+    "question": "这条内容主要对应哪个业务卖点？",
+    "primary_label_limit": 1,
+    "secondary_label_limit": 2,
+    "auto_include_min_score": 75,
+    "manual_review_score_range": [60, 74],
+    "no_match_max_score": 59,
+    "core_status_derived_from": "primary_label"
+  },
+  "business_lines": [
+    {
+      "id": "USED_CAR",
+      "name": "二手车",
+      "selling_points": [
+        {
+          "id": "E1",
+          "sub_line": "C1",
+          "tier": "core",
+          "status": "confirmed",
+          "label": "懂车帝专业收车团队：卖得高、到账快",
+          "definition": "突出懂车帝专业收车服务带来的高价、效率与到账确定性。",
+          "positive_signals": ["上门收车", "专业估价", "快速成交", "快速到账", "急用钱卖车"],
+          "inheritance_notes": ["应急变现归入E1", "上门收车归入E1"],
+          "exclusions": ["只讲个人卖车经历且未体现平台服务价值"]
+        },
+        {
+          "id": "E2",
+          "sub_line": "C2",
+          "tier": "core",
+          "status": "confirmed",
+          "label": "海量靠谱二手车：车况透明有保障",
+          "definition": "突出平台车源规模、真实透明车况及交易保障。",
+          "positive_signals": ["海量车源", "真实车况", "检测报告", "事故车排查", "平台保障"],
+          "inheritance_notes": [],
+          "exclusions": ["只有车型或价格展示，没有车源可靠或车况保障信息"]
+        },
+        {
+          "id": "E3",
+          "sub_line": "C2",
+          "tier": "other",
+          "status": "proposed",
+          "label": "二手车高性价比：花小钱办大事",
+          "definition": "突出二手车在预算、配置或折旧方面的价值优势。",
+          "positive_signals": ["同预算更高配置", "低折旧", "准新车性价比", "预算有限选车"],
+          "inheritance_notes": [],
+          "exclusions": ["只有低价噱头，没有价值依据"]
+        },
+        {
+          "id": "E4",
+          "sub_line": "C2",
+          "tier": "other",
+          "status": "proposed",
+          "label": "多场景车型解决方案",
+          "definition": "按具体人群和使用场景推荐适配的二手车型。",
+          "positive_signals": ["家庭", "通勤", "露营", "越野", "商务", "新手第一辆车"],
+          "inheritance_notes": [],
+          "exclusions": ["单车泛介绍且没有人群或场景选择关系"]
+        },
+        {
+          "id": "E5",
+          "sub_line": "C2",
+          "tier": "other",
+          "status": "proposed",
+          "label": "专业车况鉴定与问题车避坑",
+          "definition": "提供二手车检测、问题识别与风险规避能力。",
+          "positive_signals": ["验车", "事故车识别", "里程核验", "维保核验", "问题车案例"],
+          "inheritance_notes": [],
+          "exclusions": ["与二手车交易无关的泛养护知识"]
+        },
+        {
+          "id": "E6",
+          "sub_line": "C1_C2",
+          "tier": "other",
+          "status": "proposed",
+          "label": "公道估价与交易价格透明",
+          "definition": "解释残值、行情、报价差异和交易费用，降低价格信息差。",
+          "positive_signals": ["残值评估", "估价依据", "行情价", "报价差异", "费用透明"],
+          "inheritance_notes": ["若主线是卖得高到账快，E1为主标签，E6可为次标签"],
+          "exclusions": ["没有估价依据的单一报价"]
+        },
+        {
+          "id": "E7",
+          "sub_line": "C1_C2",
+          "tier": "other",
+          "status": "proposed",
+          "label": "合同、过户与交易权益保障",
+          "definition": "降低二手车合同、产权、过户及售后环节的交易风险。",
+          "positive_signals": ["合同条款", "过户流程", "产权核验", "违章处理", "售后保障"],
+          "inheritance_notes": [],
+          "exclusions": ["与二手车交易无关的泛法律常识"]
+        }
+      ]
+    },
+    {
+      "id": "NEW_CAR",
+      "name": "新车",
+      "selling_points": [
+        {
+          "id": "X1",
+          "tier": "core",
+          "status": "confirmed",
+          "label": "支持同级车进行各细节全面对比",
+          "definition": "在统一维度下对同级候选车型做可决策的横向比较。",
+          "positive_signals": ["A/B车型对比", "空间对比", "动力对比", "配置对比", "能耗对比", "安全对比"],
+          "inheritance_notes": [],
+          "exclusions": ["单车介绍", "没有具体比较维度的车型罗列"]
+        },
+        {
+          "id": "X2",
+          "tier": "core",
+          "status": "confirmed",
+          "label": "权威第三方测评、真实车主口碑",
+          "definition": "用独立测试或真实长期使用经验降低购车信息不对称。",
+          "positive_signals": ["实测数据", "专业测评", "长期体验", "车主评价", "故障反馈"],
+          "inheritance_notes": [],
+          "exclusions": ["只复述厂商参数或广告话术"]
+        },
+        {
+          "id": "X3",
+          "tier": "core",
+          "status": "confirmed",
+          "label": "底价播报、落地价拆解、限时优惠盘点",
+          "definition": "提供用户可执行的购车价格、费用和时效信息。",
+          "positive_signals": ["裸车价", "落地价", "金融方案", "补贴", "限时优惠", "地区价差"],
+          "inheritance_notes": [],
+          "exclusions": ["只报厂商指导价"]
+        },
+        {
+          "id": "X4",
+          "tier": "other",
+          "status": "proposed",
+          "label": "场景化选车与人群适配推荐",
+          "definition": "按具体人群、预算和使用场景给出选择建议。",
+          "positive_signals": ["家庭选车", "通勤选车", "长途选车", "新手选车", "宝妈选车"],
+          "inheritance_notes": [],
+          "exclusions": ["没有选择依据的车型罗列"]
+        },
+        {
+          "id": "X5",
+          "tier": "other",
+          "status": "proposed",
+          "label": "配置差异与配置价值解读",
+          "definition": "解释不同版本和选配的实际使用价值。",
+          "positive_signals": ["高低配差异", "选配建议", "配置值不值得", "功能实用性"],
+          "inheritance_notes": ["跨同级车型全面对比时X1优先"],
+          "exclusions": ["只朗读配置表"]
+        },
+        {
+          "id": "X6",
+          "tier": "other",
+          "status": "proposed",
+          "label": "购车及长期养车成本分析",
+          "definition": "分析购置到长期使用的全周期成本。",
+          "positive_signals": ["保险", "税费", "金融利息", "能耗", "保养", "保值率"],
+          "inheritance_notes": [],
+          "exclusions": ["只有裸车报价且无成本分析"]
+        },
+        {
+          "id": "X7",
+          "tier": "other",
+          "status": "proposed",
+          "label": "广告参数与销售话术拆解",
+          "definition": "验证厂商参数和销售说法，帮助用户识别宣传边界。",
+          "positive_signals": ["参数验证", "销售套路", "宣传边界", "试驾验证", "反向避坑"],
+          "inheritance_notes": [],
+          "exclusions": ["简单转述广告或销售话术"]
+        },
+        {
+          "id": "X8",
+          "tier": "other",
+          "status": "proposed",
+          "label": "合同、选配与购车权益避坑",
+          "definition": "降低定金、合同、交付、选配和质保环节风险。",
+          "positive_signals": ["定金", "合同", "交付", "选配", "库存车", "质保权益"],
+          "inheritance_notes": [],
+          "exclusions": ["与新车购买无关的泛消费维权"]
+        }
+      ]
+    },
+    {
+      "id": "AI_XIAODONG",
+      "name": "媒体-AI小懂",
+      "selling_points": [
+        {
+          "id": "M1",
+          "tier": "core",
+          "status": "confirmed",
+          "label": "AI小懂陪试驾：一键预约试驾、提前准备试驾指南",
+          "definition": "用AI小懂完成试驾预约和试驾前后的决策辅助。",
+          "positive_signals": ["预约试驾", "试驾清单", "试驾路线", "试驾准备", "试驾重点"],
+          "inheritance_notes": [],
+          "exclusions": ["未体现AI小懂能力的泛试驾体验"]
+        },
+        {
+          "id": "M2",
+          "tier": "core",
+          "status": "confirmed",
+          "label": "AI小懂惠买车：最全最新真实优惠、查库存、查现车、查展车、试驾车",
+          "definition": "用AI小懂查询真实购车机会并辅助成交。",
+          "positive_signals": ["优惠查询", "库存查询", "现车查询", "展车查询", "试驾车查询", "购车补贴"],
+          "inheritance_notes": ["补贴查询归入M2", "合同检查等购车辅助归入M2"],
+          "exclusions": ["未体现AI小懂能力的普通优惠播报"]
+        },
+        {
+          "id": "M3",
+          "tier": "core",
+          "status": "confirmed",
+          "label": "AI小懂省心养：一键预约洗车、一键预约维修保养",
+          "definition": "用AI小懂承接洗车、维修、保养及日常用车管理。",
+          "positive_signals": ["预约洗车", "预约保养", "预约维修", "保养提醒", "车档案", "用车账本", "补能辅助"],
+          "inheritance_notes": ["车档案归入M3", "提醒和补能归入M3", "用车账本归入M3"],
+          "exclusions": ["未体现AI小懂能力的泛养车知识"]
+        },
+        {
+          "id": "M4",
+          "tier": "other",
+          "status": "proposed",
+          "label": "AI小懂帮选车：需求问答与个性化推荐",
+          "definition": "通过自然语言交互理解需求并推荐、解释候选车型。",
+          "positive_signals": ["自然语言选车", "预算问答", "场景问答", "个性化车型推荐", "对比解释"],
+          "inheritance_notes": [],
+          "exclusions": ["未体现AI小懂交互能力的普通编辑推荐"]
+        },
+        {
+          "id": "M5",
+          "tier": "other",
+          "status": "proposed",
+          "label": "AI小懂查故障：故障解释与处置建议",
+          "definition": "解释故障现象并给出安全、可执行的下一步建议。",
+          "positive_signals": ["故障灯", "异响", "异常症状", "原因排查", "是否需要维修"],
+          "inheritance_notes": [],
+          "exclusions": ["只给百科知识", "宣称替代专业检修"]
+        },
+        {
+          "id": "M6",
+          "tier": "other",
+          "status": "proposed",
+          "label": "AI小懂帮卖车：估价与卖车流程辅助",
+          "definition": "用AI小懂完成估价、准备材料和卖车流程提示。",
+          "positive_signals": ["智能估价", "残值判断", "卖车准备", "材料提示", "流程提示"],
+          "inheritance_notes": ["主要宣传专业收车服务时E1优先"],
+          "exclusions": ["未体现AI小懂能力的普通卖车内容"]
+        }
+      ]
+    }
+  ],
+  "fallback_label": {
+    "id": "NO_MATCH",
+    "name": "无明确业务卖点",
+    "tier": "none",
+    "is_core": false
+  },
+  "metrics": {
+    "core_share_all_posts": "core_primary_posts / all_published_posts",
+    "selling_point_coverage": "clear_primary_label_posts / all_published_posts",
+    "core_share_labeled_posts": "core_primary_posts / clear_primary_label_posts",
+    "target_core_share_all_posts": [0.6, 0.7],
+    "reporting_views": ["publication_count", "deduplicated_creative_count"]
+  }
+}

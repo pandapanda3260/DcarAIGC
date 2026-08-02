@@ -1,0 +1,10 @@
+[project]
+name = "dcar-content-evaluation"
+version = "0.1.0"
+description = "Local-first DCar content evaluation workflow"
+requires-python = ">=3.9"
+
+[tool.dcar]
+report-version = "channel-structured-conclusions-v6.2-tikhub"
+web-mode = "local-cache-only"
+

@@ -1,0 +1,54 @@
+{
+  "taxonomy_version": "2.0",
+  "generated_at": "2026-08-01",
+  "principle": "卖点必须回答用户通过懂车帝能完成什么，不能只描述汽车内容本身的信息或情绪价值。",
+  "evidence_levels": {
+    "A": "明确出现懂车帝模块、工具、服务、数据、页面、入口或行动引导",
+    "B": "完整演示懂车帝可持续提供的比较、测评、价格、车源或社区能力",
+    "C": "只有懂车帝标签、Logo或账号归属，不足以计入正式卖点",
+    "D": "只有泛汽车知识、娱乐或情绪价值，不足以计入正式卖点"
+  },
+  "official_points": [
+    {"id":"E1","business_line":"二手车","tier":"core","status":"confirmed","label":"通过懂车帝卖车，由专业收车团队实现卖得高、到账快"},
+    {"id":"E2","business_line":"二手车","tier":"core","status":"confirmed","label":"通过懂车帝购买海量靠谱二手车，查看透明车况并获得保障"},
+    {"id":"E3","business_line":"二手车","tier":"other","status":"revised","label":"通过懂车帝按预算和行情筛选高性价比二手车"},
+    {"id":"E4","business_line":"二手车","tier":"other","status":"revised","label":"通过懂车帝按人群和场景获得二手车推荐方案"},
+    {"id":"E5","business_line":"二手车","tier":"other","status":"revised","label":"通过懂车帝查看检测报告、车辆档案或专业检测，识别问题二手车"},
+    {"id":"E6","business_line":"二手车","tier":"other","status":"revised","label":"通过懂车帝查询估价、保值率和市场行情，减少价格信息差"},
+    {"id":"E7","business_line":"二手车","tier":"other","status":"revised","label":"通过懂车帝获得合同、过户、交易流程和权益保障"},
+    {"id":"X1","business_line":"新车","tier":"core","status":"confirmed","label":"通过懂车帝对同级候选车型进行多维度全面对比"},
+    {"id":"X2","business_line":"新车","tier":"core","status":"confirmed","label":"通过懂车帝查看权威第三方测评和真实车主口碑"},
+    {"id":"X3","business_line":"新车","tier":"core","status":"confirmed","label":"通过懂车帝查询最新车价、落地价、优惠和现车信息"},
+    {"id":"X4","business_line":"新车","tier":"other","status":"revised","label":"通过懂车帝按预算、人群和用车场景完成选车"},
+    {"id":"X5","business_line":"新车","tier":"other","status":"revised","label":"通过懂车帝比较车型版本、配置差异和配置价值"},
+    {"id":"X6","business_line":"新车","tier":"other","status":"revised","label":"通过懂车帝计算购车和长期用车成本"},
+    {"id":"X7","business_line":"新车","tier":"other","status":"revised","label":"通过懂车帝的独立解析验证参数、配置和营销话术"},
+    {"id":"X8","business_line":"新车","tier":"other","status":"revised","label":"通过懂车帝了解定金、合同、选配、交付和购车权益"},
+    {"id":"M1","business_line":"媒体-AI小懂","tier":"core","status":"confirmed","label":"通过AI小懂一键预约试驾并提前获得试驾指南"},
+    {"id":"M2","business_line":"媒体-AI小懂","tier":"core","status":"confirmed","label":"通过AI小懂查询最新真实优惠、库存、现车、展车和试驾车"},
+    {"id":"M3","business_line":"媒体-AI小懂","tier":"core","status":"confirmed","label":"通过AI小懂预约洗车、维修保养并管理日常用车"},
+    {"id":"M4","business_line":"媒体-AI小懂","tier":"other","status":"revised","label":"通过AI小懂用自然语言完成选车和个性化推荐"},
+    {"id":"M5","business_line":"媒体-AI小懂","tier":"other","status":"revised","label":"通过AI小懂解释故障并获得安全处置建议"},
+    {"id":"M6","business_line":"媒体-AI小懂","tier":"other","status":"revised","label":"通过AI小懂完成估价和卖车流程准备"}
+  ],
+  "candidate_points": [
+    {"id":"C1","business_line":"媒体内容","tier":"candidate","status":"proposed","label":"通过懂车帝获取实用汽车知识和用车问题解答"},
+    {"id":"C2","business_line":"媒体内容","tier":"candidate","status":"proposed","label":"通过懂车帝查看车型细节、真实影像和场景化体验"},
+    {"id":"C3","business_line":"车友社区","tier":"candidate","status":"proposed","label":"通过懂车帝车友社区交流用车体验并参与玩车内容"},
+    {"id":"C4","business_line":"媒体内容","tier":"candidate","status":"proposed","label":"通过懂车帝跟踪新车发布和汽车行业动态"}
+  ],
+  "fallbacks": [
+    {"id":"NO_MATCH_STORY","label":"汽车情绪或生活故事，不是懂车帝平台卖点"},
+    {"id":"NO_MATCH_ENTERTAINMENT","label":"汽车娱乐、AI幻想或概念视觉，不是懂车帝平台卖点"},
+    {"id":"NO_MATCH_BRAND_ONLY","label":"只有懂车帝品牌露出，没有平台任务"},
+    {"id":"NO_MATCH_DUPLICATE_LOW_INFO","label":"重复铺量或信息不足，无法识别平台卖点"},
+    {"id":"NO_MATCH_OTHER","label":"其他未命中"}
+  ],
+  "thresholds": {"auto_include":75,"manual_review_min":60,"no_match_max":59},
+  "metrics": {
+    "official_coverage":"official_included_posts / all_posts",
+    "official_core_share":"official_core_posts / all_posts",
+    "candidate_explainable_share":"candidate_only_posts / all_posts",
+    "expanded_unmatched_share":"neither_official_nor_candidate_posts / all_posts"
+  }
+}

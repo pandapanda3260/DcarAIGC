@@ -1,0 +1,69 @@
+# Local credentials
+.env.local
+onebound.env
+brightdata.env
+万邦key.txt
+Rnote key.txt
+
+# Legacy Douyin provider credential filenames
+[Aa]pify*.env
+[Aa]pify*key*.txt
+[Tt]ik[Hh]ub*.env
+[Tt]ik[Hh]ub*key*.txt
+
+# Reusable Douyin API cache (kept locally, not committed)
+douyin_cache/
+.douyin_deps/
+data/cache/
+runtime/dependencies/
+
+# Temporary renders and media used for manual review
+tmp/
+/runtime/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.tsbuildinfo
+
+# Rnote reusable cache contains collected comment text and pseudonymous IDs
+rnote_cache/
+
+# Bright Data probe output
+brightdata_mcp_tools.json
+
+# Raw API responses (if created during debugging)
+raw_responses/
+
+# Generated pilot content and downloaded media
+pilot_media/
+pilot_public_*
+pilot_media_manifest.json
+pilot_media_download_results.csv
+onebound_detail_smoke_*
+
+# Replacement queues contain temporary Xiaohongshu access parameters
+pilot_replacement_queue_*
+
+# Local research inputs and generated evidence/results
+data/inputs/
+data/processed/
+reports/current/
+reports/archive/
+app/web/public/data/
+app/web/public/exports/
+
+# Local web task state and secrets
+.env
+.env.*
+!.env.example
+app/data/
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3-shm
+*.sqlite3-wal
+/config/providers/*.env
+
+# macOS metadata
+.DS_Store
