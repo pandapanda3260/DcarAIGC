@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-import json
 import unittest
 
 import rebuild_channel_evaluation_v4 as v4

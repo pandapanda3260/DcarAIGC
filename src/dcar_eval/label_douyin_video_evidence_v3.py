@@ -429,7 +429,6 @@ def match_points(
 
     # Integrated content and community selling points.
     c3_actual = f"{asr}\n{visual_text}"
-    c3_narrative = f"{full_desc}\n{c3_actual}"
     c3_campaign_signal = contains(
         c3_actual,
         ("玩车社区", "趣玩车社区", "主题改装大赛", "电车还能这么玩", "改装玩家", "上传你的改装作品"),

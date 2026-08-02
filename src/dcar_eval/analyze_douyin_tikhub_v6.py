@@ -7,7 +7,6 @@ import csv
 import json
 import re
 from collections import Counter
-from pathlib import Path
 from statistics import mean
 from typing import Any
 
@@ -418,7 +417,6 @@ def build_report(data: dict[str, Any]) -> str:
             f"{format_number(s['core_exposure'])} · {s['core_exposure_share_all']}% | "
             f"{s['content_automotive_score']}/100 | {audience} | {acquisition} |"
         )
-    x = data["channels"]["xiaohongshu"]
     lines.extend([
         "",
         "> 互动受众和拉新预估只代表达到20名有效独立评论用户门槛的内容。二手车场景本轮没有达标内容，不能写成0分。",

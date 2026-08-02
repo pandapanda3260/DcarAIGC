@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 from project_paths import DOUYIN_INPUT_DIR, DOUYIN_MEDIA_CACHE_DIR
 

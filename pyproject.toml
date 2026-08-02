@@ -2,9 +2,26 @@
 name = "dcar-content-evaluation"
 version = "0.1.0"
 description = "Local-first DCar content evaluation workflow"
-requires-python = ">=3.9"
+requires-python = "==3.12.13"
+dependencies = [
+  "apscheduler==3.11.3",
+  "fastapi==0.128.7",
+  "mlx==0.32.0",
+  "mlx-whisper==0.4.3",
+  "pydantic==2.11.8",
+  "uvicorn==0.34.0",
+]
+
+[dependency-groups]
+dev = [
+  "httpx==0.28.1",
+  "mypy==1.17.1",
+  "ruff==0.12.11",
+]
+
+[tool.uv]
+package = false
 
 [tool.dcar]
-report-version = "channel-structured-conclusions-v6.2-tikhub"
+report-version = "dcar-content-operations-report-v8.0"
 web-mode = "local-cache-only"
-

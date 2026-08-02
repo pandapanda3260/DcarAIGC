@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from statistics import mean
 from typing import Any
 
@@ -86,7 +85,7 @@ def douyin_section(rows: list[dict[str, Any]]) -> dict[str, Any]:
             value=content_score,
             display=f"{content_score}/100 · {content_pass}/{total} · {pct(content_pass, total)}%",
             qualitative=v4.auto_qualitative(content_score),
-            scope=f"437/438条完整媒体证据；评论达标内容按终版规则作最多±5分校准",
+            scope="437/438条完整媒体证据；评论达标内容按终版规则作最多±5分校准",
         ),
         "audience_verticality": metric(
             value=audience_score,
@@ -176,7 +175,7 @@ def douyin_section(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 value=pct(scene_core_play, total_play),
                 display=f"{scene_core_play:,}/{total_play:,}次 · {pct(scene_core_play, total_play)}%",
                 qualitative="占全部抖音有效曝光",
-                scope=f"该场景核心卖点有效播放 / 全部有效播放",
+                scope="该场景核心卖点有效播放 / 全部有效播放",
             ),
             "content_verticality": metric(
                 value=scene_content_score,

@@ -6,7 +6,6 @@ import csv
 import json
 import re
 import sqlite3
-from collections import Counter
 from pathlib import Path
 from statistics import mean
 from typing import Any

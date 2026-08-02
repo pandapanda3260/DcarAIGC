@@ -8,7 +8,6 @@ import json
 import re
 import statistics
 import subprocess
-import sys
 import time
 import urllib.error
 import urllib.request
@@ -16,12 +15,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-from project_paths import RNOTE_CACHE_DIR, VIDEO_DEPENDENCY_DIR
+from project_paths import RNOTE_CACHE_DIR, RUNTIME_BIN_DIR
+from v8.media import load_media_config, pinned_whisper_model_path
 
 
 NOTES_ROOT = RNOTE_CACHE_DIR / "notes"
 MEDIA_ROOT = RNOTE_CACHE_DIR / "media"
-OCR_BIN = Path(__file__).resolve().parents[2] / "data/cache/douyin_media/bin/vision_ocr"
+OCR_BIN = RUNTIME_BIN_DIR / "vision_ocr"
 MODEL = "mlx-community/whisper-large-v3-turbo"
 PROMPT = "汽车，懂车帝，AI小懂，二手车，新车，选车，买车，卖车，试驾，保养，维修，车型，价格，配置。"
 
@@ -260,13 +260,14 @@ def transcribe(note_id: str) -> dict[str, Any]:
         result = {"note_id": note_id, "status": "not_video", "text": "", "segments": []}
         atomic_json(target, result)
         return result
-    sys.path.insert(0, str(VIDEO_DEPENDENCY_DIR))
     import mlx_whisper  # type: ignore
 
+    model_path = pinned_whisper_model_path()
+    model_config = load_media_config()["asr"]
     started = time.time()
     try:
         raw = mlx_whisper.transcribe(
-            str(video), path_or_hf_repo=MODEL, language="zh", verbose=None,
+            str(video), path_or_hf_repo=str(model_path), language="zh", verbose=None,
             word_timestamps=False, initial_prompt=PROMPT, condition_on_previous_text=True,
         )
         segments = compact_segments(raw.get("segments") or [])
@@ -274,6 +275,8 @@ def transcribe(note_id: str) -> dict[str, Any]:
             "note_id": note_id,
             "status": "success",
             "model": MODEL,
+            "model_revision": model_config["model_revision"],
+            "processor_version": model_config["processor_version"],
             "language": raw.get("language") or "zh",
             "text": str(raw.get("text") or "").strip(),
             "segments": segments,

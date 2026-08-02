@@ -1,0 +1,20 @@
+{
+  "schema_version": "dcar-media-processor-v8.0",
+  "asr": {
+    "library": "mlx-whisper",
+    "library_version": "0.4.3",
+    "model_id": "mlx-community/whisper-large-v3-turbo",
+    "model_revision": "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb",
+    "language": "zh",
+    "processor_version": "mlx-whisper==0.4.3|mlx==0.32.0|mlx-community/whisper-large-v3-turbo@a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
+  },
+  "frames": {
+    "processor_version": "ffmpeg-keyframes-v8.0",
+    "maximum_frames": 24,
+    "target_width": 960
+  },
+  "ocr": {
+    "processor_version": "macos-vision-ocr-v8.0",
+    "binary": "runtime/bin/vision_ocr"
+  }
+}

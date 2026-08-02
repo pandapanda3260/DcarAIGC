@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 from project_paths import CURRENT_REPORTS_DIR
 
@@ -142,7 +141,7 @@ def main() -> int:
     xs = [92, 414, 690, 970, 1235, 1495]
     for x, h in zip(xs, headers):
         text(draw, (x, 1290), h, F_SMALL, MUTED)
-    for idx, scene in enumerate(v4_scenes := ["二手车", "新车", "媒体-AI小懂"]):
+    for idx, scene in enumerate(["二手车", "新车", "媒体-AI小懂"]):
         row = d["scenes"][scene]
         y = 1342 + idx * 78
         if idx:

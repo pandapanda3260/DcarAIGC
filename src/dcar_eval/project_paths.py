@@ -32,9 +32,9 @@ CURRENT_REPORTS_DIR = REPORTS_DIR / "current"
 ARCHIVE_REPORTS_DIR = REPORTS_DIR / "archive"
 
 RUNTIME_DIR = PROJECT_ROOT / "runtime"
+RUNTIME_BIN_DIR = RUNTIME_DIR / "bin"
 DEPENDENCY_DIR = RUNTIME_DIR / "dependencies"
 DOUYIN_DEPENDENCY_DIR = DEPENDENCY_DIR / "douyin"
-VIDEO_DEPENDENCY_DIR = DEPENDENCY_DIR / "video"
 
 
 def ensure_runtime_directories() -> None:
@@ -49,5 +49,6 @@ def ensure_runtime_directories() -> None:
         TIKHUB_CACHE_DIR,
         RNOTE_CACHE_DIR,
         RAW_RESPONSE_CACHE_DIR,
+        RUNTIME_BIN_DIR,
     ):
         directory.mkdir(parents=True, exist_ok=True)

@@ -17,9 +17,8 @@ from __future__ import annotations
 import csv
 import json
 import re
-from collections import Counter, defaultdict
+from collections import Counter
 from copy import deepcopy
-from datetime import date
 from pathlib import Path
 from statistics import mean
 from typing import Any, Iterable
@@ -173,8 +172,6 @@ def content_auto_score(row: dict[str, Any]) -> int | None:
     asr = str(row.get("asr_text") or "")
     ocr = str(row.get("ocr_text") or "")
     visual = str(row.get("visual_review_summary") or "")
-    all_text = "\n".join((desc, asr, ocr, visual))
-
     asr_terms = unique_term_count(asr, AUTO_TERMS)
     ocr_terms = unique_term_count(ocr, AUTO_TERMS)
     desc_terms = unique_term_count(desc_plain, AUTO_TERMS)

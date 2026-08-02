@@ -1,6 +1,5 @@
 import json
 import unittest
-from pathlib import Path
 
 from build_rnote_three_proposition_report import (
     base_content_rows,

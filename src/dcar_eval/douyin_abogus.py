@@ -263,8 +263,10 @@ class ABogus:
             i[5] = i[4]
             i[4] = (b ^ self.de(b, 9) ^ self.de(b, 17)) & 0xFFFFFFFF
 
-        for l in range(8):
-            self.reg[l] = (self.reg[l] ^ i[l]) & 0xFFFFFFFF
+        for register_index in range(8):
+            self.reg[register_index] = (
+                self.reg[register_index] ^ i[register_index]
+            ) & 0xFFFFFFFF
 
     @classmethod
     def generate_f(cls, e):

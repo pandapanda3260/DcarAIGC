@@ -1,6 +1,5 @@
-import EvaluationDashboard from "./EvaluationDashboard";
+import InsightDashboard from "./InsightDashboard";
 
 export default function Home() {
-  return <EvaluationDashboard />;
+  return <InsightDashboard />;
 }
-

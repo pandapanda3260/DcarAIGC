@@ -5,7 +5,6 @@ import unittest
 from pathlib import Path
 
 from workflow.bootstrap_corpus import bootstrap
-from workflow.cache_index import preflight
 from workflow.storage import connect, migrate
 
 

@@ -18,7 +18,6 @@ from collect_rnote_pilot import (
     RnoteClient,
     load_key,
     process_one,
-    read_jsonl,
     utc_now,
     write_json,
     write_jsonl,

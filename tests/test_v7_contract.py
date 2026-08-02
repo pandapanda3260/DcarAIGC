@@ -133,6 +133,13 @@ def report() -> dict:
 
 
 class V7ContractTest(unittest.TestCase):
+    def test_all_five_historical_v7_revisions_remain_valid(self):
+        paths = sorted((ROOT / "reports" / "runs").glob("*/revision_*/report.json"))
+        self.assertEqual(len(paths), 5)
+        for path in paths:
+            with self.subTest(path=path):
+                validate_report(json.loads(path.read_text(encoding="utf-8")))
+
     def test_machine_contract_has_fixed_four_plus_four_plus_three_metrics(self):
         contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
         self.assertEqual(len(contract["count_metrics"]), 4)

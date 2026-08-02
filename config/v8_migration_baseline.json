@@ -1,0 +1,92 @@
+{
+  "baseline_id": "dcar-insight-v8-migration-baseline-2026-08-02",
+  "captured_at": "2026-08-02T20:00:00+08:00",
+  "legacy_database": "app/data/web_mvp.sqlite3",
+  "target_database": "app/data/dcar_insight.sqlite3",
+  "versions": {
+    "report_contract": "dcar-content-operations-report-v8.0",
+    "evaluation_rule": "evaluation-v6",
+    "selling_point_taxonomy": "selling-points-v5.0",
+    "evidence_envelope": "evidence-v1",
+    "database_schema": 2
+  },
+  "content": {
+    "total": 776,
+    "by_platform": {
+      "douyin": 438,
+      "xiaohongshu": 338
+    },
+    "published_at": {
+      "iso_8601": 438,
+      "unix_seconds": 326,
+      "missing": 12
+    },
+    "exposure": {
+      "present": 732,
+      "missing": 44
+    }
+  },
+  "account_quality": {
+    "精品IP号": 114,
+    "原创号": 157,
+    "混剪号": 167,
+    "unknown": 338
+  },
+  "business_scene": {
+    "新车": 195,
+    "二手车": 44,
+    "媒体-AI小懂": 159,
+    "unknown": 378
+  },
+  "selling_point_primary_family": {
+    "C": 195,
+    "E": 13,
+    "X": 190,
+    "M": 0
+  },
+  "evaluation": {
+    "V0_pending": 12,
+    "V1_closed": 1,
+    "V1_pending": 165,
+    "V2_closed": 194,
+    "V2_pending": 9,
+    "V3_closed": 395,
+    "manual_review_history": 1
+  },
+  "comment_user_scores": {
+    "rows": 3605,
+    "content_items": 418
+  },
+  "v7_history": {
+    "report_runs": 2,
+    "revisions": 5
+  },
+  "fetch_slot_initialization": {
+    "detail_succeeded": 764,
+    "detail_terminal_failed": 12,
+    "metrics_succeeded": 732,
+    "metrics_terminal_failed": 44,
+    "comments_succeeded": 776,
+    "comments_week_2026_W31": 720,
+    "comments_week_2026_W29": 56
+  },
+  "legacy_media_backfill": {
+    "queue_total": 165,
+    "local_evidence_recompute": 1,
+    "paid_refresh_candidates": 164,
+    "pilot_size": 20,
+    "daily_attempt_quota": 20,
+    "unit_price_usd": 0.008,
+    "pilot_budget_usd": 0.16,
+    "hard_budget_usd": 1.312,
+    "minimum_media_recovery_rate": 0.7,
+    "minimum_evidence_ready_rate": 0.6
+  },
+  "media_runtime": {
+    "legacy_dependency_kib": 1171228,
+    "mlx_whisper_version": "0.4.3",
+    "mlx_version": "0.32.0",
+    "model_id": "mlx-community/whisper-large-v3-turbo",
+    "model_revision": "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
+  }
+}

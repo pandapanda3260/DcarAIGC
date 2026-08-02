@@ -12,14 +12,14 @@ from typing import Any
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from process_douyin_video_evidence_v3 import raw_aweme_map, read_jsonl, SOURCE
-from project_paths import DOUYIN_MEDIA_CACHE_DIR
+from project_paths import DOUYIN_MEDIA_CACHE_DIR, RUNTIME_BIN_DIR
 
 
 ANALYSIS = DOUYIN_MEDIA_CACHE_DIR
 IMAGE_ROOT = ANALYSIS / "image_posts"
 OCR_DIR = ANALYSIS / "ocr"
 CONTACT_DIR = ANALYSIS / "contact_sheets"
-OCR_BIN = ANALYSIS / "bin" / "vision_ocr"
+OCR_BIN = RUNTIME_BIN_DIR / "vision_ocr"
 FONT_PATH = "/System/Library/Fonts/Hiragino Sans GB.ttc"
 
 

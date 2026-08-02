@@ -10,7 +10,6 @@ import shutil
 import subprocess
 import sqlite3
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 from statistics import mean
 from typing import Any, Iterable

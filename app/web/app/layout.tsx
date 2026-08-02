@@ -6,8 +6,8 @@ const geistSans = Geist({ variable: "--font-geist-sans", subsets: ["latin"] });
 const geistMono = Geist_Mono({ variable: "--font-geist-mono", subsets: ["latin"] });
 
 export const metadata: Metadata = {
-  title: "DCar Insight · 内容评估工作台",
-  description: "本地优先的抖音与小红书内容、卖点、受众和拉新潜力评估工作流。",
+  title: "DCar Insight · 内容运营工作台",
+  description: "本地优先的账号、内容、卖点、抓取和报告运营工作流。",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
@@ -17,4 +17,3 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
     </html>
   );
 }
-

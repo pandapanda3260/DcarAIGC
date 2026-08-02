@@ -31,7 +31,7 @@ import urllib.request
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from project_paths import ARCHIVE_PROCESSED_DIR, RNOTE_CACHE_DIR, XHS_INPUT_DIR
 

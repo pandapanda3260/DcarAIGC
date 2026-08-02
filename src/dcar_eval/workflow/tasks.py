@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import socket
-import sqlite3
 import ssl
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor

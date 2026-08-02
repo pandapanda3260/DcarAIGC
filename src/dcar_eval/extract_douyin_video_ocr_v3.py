@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from project_paths import DOUYIN_INPUT_DIR, DOUYIN_MEDIA_CACHE_DIR
+from project_paths import DOUYIN_INPUT_DIR, DOUYIN_MEDIA_CACHE_DIR, RUNTIME_BIN_DIR
 
 
 SOURCE = DOUYIN_INPUT_DIR / "douyin_30_account_content_sample_2026-08-01.jsonl"
@@ -22,7 +22,7 @@ MEDIA_DIR = ANALYSIS / "media"
 TRANSCRIPT_DIR = ANALYSIS / "transcripts"
 OCR_DIR = ANALYSIS / "ocr"
 OCR_RESULTS = ANALYSIS / "ocr_results.jsonl"
-OCR_BIN = ANALYSIS / "bin" / "vision_ocr"
+OCR_BIN = RUNTIME_BIN_DIR / "vision_ocr"
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:

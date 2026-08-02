@@ -12,7 +12,7 @@ from pathlib import Path
 from statistics import mean
 from typing import Any, Iterable, Mapping
 
-from project_paths import ARCHIVE_PROCESSED_DIR, CURRENT_REPORTS_DIR, RNOTE_CACHE_DIR, XHS_PROCESSED_DIR
+from project_paths import CURRENT_REPORTS_DIR, RNOTE_CACHE_DIR, XHS_PROCESSED_DIR
 
 from generate_three_proposition_visual import write_visual
 from three_proposition_scoring import (
@@ -381,7 +381,7 @@ def render_report(
         "",
         "业务解读（不要只看5+5总均分）：",
         "",
-        f"- 基础内容判定区分度高：汽车来源基础组均分95/100，非汽车来源基础组0/100。",
+        "- 基础内容判定区分度高：汽车来源基础组均分95/100，非汽车来源基础组0/100。",
         f"- 最终10篇中真正达到汽车内容门槛（命题1>=70）的有{automotive_cohort['sample_size']}篇：{'、'.join(automotive_cohort['sample_ids'])}。这些笔记的用户汽车倾向均分{automotive_cohort['audience_auto_score']}/100，懂车帝拉新潜力均分{automotive_cohort['dcd_acquisition_score']}/100。",
         "- RA077和RA089均为67/100，值得进入小流量拉新实验；RA046为58/100，更像驾驶安全泛兴趣内容。",
         "- RA049和RA054虽来自“汽车”链接文件，但内容主体是末日短剧，评论人群也几乎完全非汽车；尾部懂车帝植入不能替代真实的汽车内容和用户意图。",
@@ -451,11 +451,11 @@ def render_report(
         [
             "## 四、抽检与数据质量",
             "",
-            f"- 输入池去重后共338篇：汽车来源313篇、非汽车来源25篇；基础随机样本固定为5+5。",
+            "- 输入池去重后共338篇：汽车来源313篇、非汽车来源25篇；基础随机样本固定为5+5。",
             f"- Rnote实际尝试{counts['collection_attempts']}篇：基础10篇、补抽{counts['replacement_attempts']}篇；56/56次尝试都取得明确评论语义结果。",
             f"- 未进入最终样本：确认0评论{failure.get('confirmed_zero', 0)}篇、有效用户不足20人{failure.get('below_minimum', 0)}篇；不存在把技术缺失当0评论的情况。",
             f"- 最终样本汽车来源5篇、非汽车来源5篇，累计{counts['valid_unique_commenters_final']}名有效独立评论用户。",
-            f"- 评论统计采用一级评论及页面内嵌回复；作者、纯表情/纯@、广告引流和重复复制文本被排除。同一用户多条留言只计1人。",
+            "- 评论统计采用一级评论及页面内嵌回复；作者、纯表情/纯@、广告引流和重复复制文本被排除。同一用户多条留言只计1人。",
             "- P006有1名用户聚合了24条模板式内嵌回复，疑似运营互动；敏感性复核中即使排除，该篇仍有39名有效用户且三个分数不变。",
             f"- 本轮共记录{counts['rnote_billed_requests']}次Rnote成功计费请求；后续重算读取缓存，不再重复调用。",
             "",

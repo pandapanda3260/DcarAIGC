@@ -6,15 +6,14 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
-import os
 import statistics
 import subprocess
-import sys
 import time
 from pathlib import Path
 from typing import Any
 
-from project_paths import DOUYIN_INPUT_DIR, DOUYIN_MEDIA_CACHE_DIR, DOUYIN_PUBLIC_CACHE_DIR, VIDEO_DEPENDENCY_DIR
+from project_paths import DOUYIN_INPUT_DIR, DOUYIN_MEDIA_CACHE_DIR, DOUYIN_PUBLIC_CACHE_DIR
+from v8.media import load_media_config, pinned_whisper_model_path
 
 
 SOURCE = DOUYIN_INPUT_DIR / "douyin_30_account_content_sample_2026-08-01.jsonl"
@@ -178,9 +177,10 @@ def compact_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def transcribe_all(shard_index: int, shard_count: int) -> None:
-    sys.path.insert(0, str(VIDEO_DEPENDENCY_DIR))
     import mlx_whisper  # type: ignore
 
+    model_path = pinned_whisper_model_path()
+    model_config = load_media_config()["asr"]
     TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
     source = read_jsonl(SOURCE)
     selected = [row for index, row in enumerate(source) if index % shard_count == shard_index]
@@ -207,7 +207,7 @@ def transcribe_all(shard_index: int, shard_count: int) -> None:
         try:
             raw = mlx_whisper.transcribe(
                 str(media),
-                path_or_hf_repo=MODEL,
+                path_or_hf_repo=str(model_path),
                 language="zh",
                 verbose=None,
                 word_timestamps=False,
@@ -219,6 +219,8 @@ def transcribe_all(shard_index: int, shard_count: int) -> None:
                 "aweme_id": aweme_id,
                 "status": "success",
                 "model": MODEL,
+                "model_revision": model_config["model_revision"],
+                "processor_version": model_config["processor_version"],
                 "language": raw.get("language") or "zh",
                 "text": str(raw.get("text") or "").strip(),
                 "segments": segments,

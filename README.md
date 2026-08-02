@@ -1,28 +1,44 @@
-# DCar 内容评估工作流
+# DCar Insight v8
 
-本项目用于对抖音和小红书内容进行业务卖点、内容汽车性、互动受众汽车性与懂车帝拉新潜力评估。
+本地单用户内容运营工作台，管理账号、内容、卖点标准和不可变数据报告。系统对抖音和小红书执行账号发现、详情、实时指标、评论与本地媒体证据处理；视频号和快手首版支持人工导入。
 
 ## 当前正式基线
 
-- 规则：`config/business_selling_points_v4_final.json`
-- 判断标准：`config/懂车帝内容评估判断标准与流程_v4_终版.md`
-- 报告：`reports/current/双渠道结构化结论报告_v6.2_TikHub_2026-08-02.md`
-- Web MVP：本地、单用户、缓存优先；默认禁止刷新付费采集接口。
+- 数据库：`app/data/dcar_insight.sqlite3`（SQLite schema v3）
+- 报告合同：`config/report_contract_v8.json`
+- 卖点标准：数据库中最新 `published` taxonomy（迁移初始版本为 `selling-points-v5.0`）
+- Web：概览、任务、账号、内容、卖点五个页面
+- 历史：v7 报告及 5 个 revision 只读保留，不再作为 v8 当前状态
 
 ## 目录
 
-- `src/dcar_eval/`：正式采集、媒体解析、评分与报告代码
+- `src/dcar_eval/v8/`：v8 存储、迁移、采集、媒体、评估、报告、调度和 API
+- `src/dcar_eval/` 其他模块：冻结的历史评估链及 v8 复用的媒体处理器
 - `data/inputs/`：输入链接和UID清单
 - `data/cache/`：可复用采集、视频、ASR、OCR和评论缓存
 - `data/processed/`：结构化中间结果
-- `reports/current/`：当前正式报告
-- `reports/archive/`：历史报告
+- `reports/runs/v8/`：v8 任务不可变 revision 产物
+- `reports/current/`、`reports/archive/`：v7 历史报告
 - `tests/`：自动化回归测试
-- `app/api/`：本地任务服务
-- `app/web/`：Web MVP
-- `docs/migration/`：资产清单、迁移映射和回归结果
+- `app/data/`：本地 SQLite 状态
+- `app/web/`：v8 Web 应用
+- `docs/v8/`：实施记录、合同和运行说明
 
 ## 本地启动
 
-运行 `scripts/start_web_mvp.sh`，然后打开终端显示的本地地址。网页任务服务固定使用 `http://127.0.0.1:8765`。
+首次运行：
 
+```bash
+python3 -m uv sync --frozen
+npm --prefix app/web ci
+```
+
+启动：
+
+```bash
+scripts/start_web_mvp.sh
+```
+
+打开 `http://127.0.0.1:4173`；本地 API 固定使用 `http://127.0.0.1:8765`。调度器默认启用，启动时执行有界补跑；临时禁用可在启动命令前设置 `DCAR_SCHEDULER_ENABLED=0`。
+
+完整验证和备份流程见 `docs/v8/运行与备份手册.md`。
