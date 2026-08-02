@@ -126,9 +126,9 @@ def ensure_content_slot(
     row = connection.execute(
         """
         SELECT id FROM fetch_slots
-        WHERE content_id=? AND stage=? AND window_key=? AND provider=? AND adapter_version=?
+        WHERE content_id=? AND stage=? AND window_key=?
         """,
-        (content_id, stage, window_key, provider, adapter_version),
+        (content_id, stage, window_key),
     ).fetchone()
     if row is not None:
         return int(row["id"])
@@ -159,9 +159,9 @@ def ensure_account_slot(
     row = connection.execute(
         """
         SELECT id FROM fetch_slots
-        WHERE account_id=? AND stage=? AND window_key=? AND provider=? AND adapter_version=?
+        WHERE account_id=? AND stage=? AND window_key=?
         """,
-        (account_id, stage, window_key, provider, adapter_version),
+        (account_id, stage, window_key),
     ).fetchone()
     if row is not None:
         return int(row["id"])
@@ -221,11 +221,12 @@ def claim_content_slot(
         connection.execute(
             """
             UPDATE fetch_slots
-            SET status='running', attempt_count=?, started_at=?, finished_at=NULL,
+            SET provider=?, adapter_version=?, status='running', attempt_count=?,
+                started_at=?, finished_at=NULL,
                 last_error_code=NULL, last_error_message=NULL, updated_at=?
             WHERE id=?
             """,
-            (attempt_number, started_at, started_at, slot_id),
+            (provider, adapter_version, attempt_number, started_at, started_at, slot_id),
         )
     return SlotClaim(
         slot_id=slot_id,
@@ -280,11 +281,12 @@ def claim_account_slot(
         connection.execute(
             """
             UPDATE fetch_slots
-            SET status='running', attempt_count=?, started_at=?, finished_at=NULL,
+            SET provider=?, adapter_version=?, status='running', attempt_count=?,
+                started_at=?, finished_at=NULL,
                 last_error_code=NULL, last_error_message=NULL, updated_at=?
             WHERE id=?
             """,
-            (attempt_number, started_at, started_at, slot_id),
+            (provider, adapter_version, attempt_number, started_at, started_at, slot_id),
         )
     return SlotClaim(
         slot_id=slot_id,

@@ -346,6 +346,7 @@ def run_media_cutoff(
             evaluation = connection.execute(
                 """
                 SELECT id FROM evaluation_versions WHERE content_id=?
+                  AND invalidated_at IS NULL
                 ORDER BY evaluated_at DESC, id DESC LIMIT 1
                 """,
                 (content_id,),

@@ -10,6 +10,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 import v8.api as api_module
+from v8.contracts import CURRENT_REPORT_VERSION
 from v8.evaluation import evaluate_content
 from v8.storage import PROJECT_ROOT, connect, initialize_database, now_utc
 
@@ -28,7 +29,7 @@ class V8ApiTest(unittest.TestCase):
     def test_health_reports_v8_database(self) -> None:
         response = self.client.get("/api/v8/health")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["report_version"], "dcar-content-operations-report-v8.0")
+        self.assertEqual(response.json()["report_version"], CURRENT_REPORT_VERSION)
         self.assertEqual(response.json()["database"], "dcar_insight.sqlite3")
 
     def test_overview_has_three_shanghai_windows_and_no_fake_forecast(self) -> None:
@@ -39,8 +40,9 @@ class V8ApiTest(unittest.TestCase):
         self.assertEqual(value["timezone"], "Asia/Shanghai")
         for window in value["windows"].values():
             metrics = window["metrics"]
-            self.assertEqual(metrics["estimated_new_user_rate"]["percentage"], None)
-            self.assertNotEqual(metrics["estimated_new_user_rate"]["status"], "partial")
+            self.assertEqual(metrics["estimated_new_users"]["value"], None)
+            self.assertEqual(metrics["estimated_new_users"]["unit"], "person")
+            self.assertNotEqual(metrics["estimated_new_users"]["status"], "partial")
 
     def test_five_page_read_models_use_migrated_v8_data(self) -> None:
         tasks = self.client.get("/api/v8/tasks")

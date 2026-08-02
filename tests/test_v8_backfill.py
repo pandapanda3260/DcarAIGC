@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from io import BytesIO
 from pathlib import Path
+from urllib.error import HTTPError
 from unittest.mock import patch
 
 from v8.backfill import (
     BUDGET_ID,
     OPERATION,
     PROVIDER,
+    RnoteVideoAdapter,
     normalize_video_detail,
     prepare_backfill_slots,
     process_paid_candidate,
@@ -122,6 +125,18 @@ class V8BackfillTest(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertTrue(all(row["stage"] == "media_source_refresh" for row in rows))
         self.assertTrue(all(row["window_key"] == "lifetime" for row in rows))
+
+    def test_backfill_auth_failure_is_terminal(self) -> None:
+        error = HTTPError(
+            "https://rnote.dev/api", 401, "unauthorized", {}, BytesIO(b"{}")
+        )
+        with (
+            patch("v8.backfill.urllib.request.urlopen", side_effect=error),
+            self.assertRaises(CaptureError) as raised,
+        ):
+            RnoteVideoAdapter("invalid").fetch("a" * 24)
+        self.assertFalse(raised.exception.retryable)
+        self.assertEqual(raised.exception.error_code, "provider_auth_blocked")
 
     def test_paid_candidate_saves_raw_source_and_routes_to_evidence_ready(self) -> None:
         prepare_backfill_slots(db_path=self.db)

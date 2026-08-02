@@ -11,7 +11,7 @@ from .storage import PROJECT_ROOT
 
 
 CONTRACT_PATH = PROJECT_ROOT / "config" / "report_contract_v8.json"
-CURRENT_REPORT_VERSION = "dcar-content-operations-report-v8.0"
+CURRENT_REPORT_VERSION = "dcar-content-operations-report-v8.1"
 
 
 class V8ContractViolation(ValueError):
@@ -134,6 +134,8 @@ def _validate_metric(metric: Any, expected: Mapping[str, str], path: str, errors
         required = {"value", "unit", "status", "coverage_percentage", "reason"}
         if expected["unit"] not in contract["quantity_units"]:
             errors.append(f"{path}.unit is not an allowed quantity unit")
+        if status in {"not_calculable", "not_applicable", "missing"} and metric.get("value") is not None:
+            errors.append(f"{path}.value must be null for status {status}")
     elif kind == "ratio":
         required = {
             "numerator", "denominator", "percentage", "unit", "status",
@@ -225,8 +227,7 @@ def validate_report(report: Mapping[str, Any]) -> None:
         publication_value = publication.get("value") if isinstance(publication, Mapping) else None
         if isinstance(publication_value, (int, float)):
             for name in (
-                "verticality_rate", "selling_point_coverage_rate", "estimated_new_user_rate",
-                "estimated_reactivation_rate", "estimated_lead_rate",
+                "verticality_rate", "selling_point_coverage_rate",
             ):
                 metric = summary.get(name)
                 if isinstance(metric, Mapping) and metric.get("denominator") != int(publication_value):

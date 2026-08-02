@@ -11,7 +11,7 @@ from typing import Iterator
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_DB = PROJECT_ROOT / "app" / "data" / "dcar_insight.sqlite3"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def now_utc() -> str:
@@ -193,10 +193,10 @@ CREATE TABLE IF NOT EXISTS fetch_slots (
 
 CREATE INDEX IF NOT EXISTS idx_fetch_slots_due ON fetch_slots(stage, status, window_key);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_fetch_content_slot
-ON fetch_slots(content_id, stage, window_key, provider, adapter_version)
+ON fetch_slots(content_id, stage, window_key)
 WHERE content_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_fetch_account_slot
-ON fetch_slots(account_id, stage, window_key, provider, adapter_version)
+ON fetch_slots(account_id, stage, window_key)
 WHERE account_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS fetch_attempts (
@@ -417,10 +417,14 @@ CREATE TABLE IF NOT EXISTS evaluation_versions (
     pending_review INTEGER NOT NULL DEFAULT 0 CHECK(pending_review IN (0,1)),
     payload_json TEXT NOT NULL,
     evaluated_at TEXT NOT NULL,
+    invalidated_at TEXT,
+    invalidation_reason TEXT,
     UNIQUE(content_id, rule_version, taxonomy_version, evidence_sha256)
 );
 
 CREATE INDEX IF NOT EXISTS idx_evaluation_current ON evaluation_versions(content_id, evaluated_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_evaluation_idempotency
+ON evaluation_versions(content_id, rule_version, taxonomy_version, evidence_sha256);
 
 CREATE TABLE IF NOT EXISTS evaluation_matches (
     evaluation_id INTEGER NOT NULL REFERENCES evaluation_versions(id) ON DELETE CASCADE,
@@ -593,6 +597,71 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             connection.execute(
                 "ALTER TABLE provider_raw_responses ADD COLUMN account_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE"
             )
+        evaluation_columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(evaluation_versions)").fetchall()
+        }
+        if "invalidated_at" not in evaluation_columns:
+            connection.execute("ALTER TABLE evaluation_versions ADD COLUMN invalidated_at TEXT")
+        if "invalidation_reason" not in evaluation_columns:
+            connection.execute("ALTER TABLE evaluation_versions ADD COLUMN invalidation_reason TEXT")
+        content_slot_columns = [
+            str(row["name"])
+            for row in connection.execute("PRAGMA index_info(uq_fetch_content_slot)").fetchall()
+        ]
+        if content_slot_columns != ["content_id", "stage", "window_key"]:
+            connection.execute("DROP INDEX IF EXISTS uq_fetch_content_slot")
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX uq_fetch_content_slot
+                ON fetch_slots(content_id, stage, window_key)
+                WHERE content_id IS NOT NULL
+                """
+            )
+        account_slot_columns = [
+            str(row["name"])
+            for row in connection.execute("PRAGMA index_info(uq_fetch_account_slot)").fetchall()
+        ]
+        if account_slot_columns != ["account_id", "stage", "window_key"]:
+            connection.execute("DROP INDEX IF EXISTS uq_fetch_account_slot")
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX uq_fetch_account_slot
+                ON fetch_slots(account_id, stage, window_key)
+                WHERE account_id IS NOT NULL
+                """
+            )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_evaluation_idempotency
+            ON evaluation_versions(
+                content_id, rule_version, taxonomy_version, evidence_sha256
+            )
+            """
+        )
+        connection.execute(
+            """
+            UPDATE evaluation_versions
+            SET invalidated_at=COALESCE(invalidated_at, ?),
+                invalidation_reason=COALESCE(
+                    invalidation_reason, 'non_evidence_provider_response_in_envelope'
+                )
+            WHERE invalidated_at IS NULL
+              AND evidence_envelope_id IN (
+                  SELECT ee.id
+                  FROM evidence_envelopes ee
+                  JOIN provider_raw_responses pr
+                    ON pr.content_id=ee.content_id
+                   AND pr.sha256=ee.detail_raw_sha256
+                  WHERE pr.operation NOT IN (
+                      'douyin_video_detail',
+                      'xiaohongshu_note_detail',
+                      'xiaohongshu_video_detail'
+                  )
+              )
+            """,
+            (now_utc(),),
+        )
         connection.execute(
             """
             INSERT INTO schema_migrations(version, name, applied_at)
@@ -607,5 +676,13 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             VALUES (?, ?, ?)
             ON CONFLICT(version) DO NOTHING
             """,
-            (SCHEMA_VERSION, "account-discovery-provider-references", now_utc()),
+            (3, "account-discovery-provider-references", now_utc()),
+        )
+        connection.execute(
+            """
+            INSERT INTO schema_migrations(version, name, applied_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(version) DO NOTHING
+            """,
+            (SCHEMA_VERSION, "business-fetch-slots-and-evaluation-invalidation", now_utc()),
         )

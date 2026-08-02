@@ -89,7 +89,13 @@ def _artifact_components(connection: sqlite3.Connection, content_id: int) -> Dic
     detail = connection.execute(
         """
         SELECT sha256 FROM provider_raw_responses
-        WHERE content_id=? ORDER BY captured_at DESC, id DESC LIMIT 1
+        WHERE content_id=?
+          AND operation IN (
+              'douyin_video_detail',
+              'xiaohongshu_note_detail',
+              'xiaohongshu_video_detail'
+          )
+        ORDER BY captured_at DESC, id DESC LIMIT 1
         """,
         (content_id,),
     ).fetchone()
@@ -410,7 +416,8 @@ def evaluate_content(
         existing = connection.execute(
             """
             SELECT * FROM evaluation_versions
-            WHERE content_id=? AND rule_version=? AND taxonomy_version=? AND evidence_sha256=?
+            WHERE content_id=? AND rule_version=? AND taxonomy_version=?
+              AND evidence_sha256=? AND invalidated_at IS NULL
             """,
             (content_id, RULE_VERSION, taxonomy_version, evidence_sha),
         ).fetchone()
@@ -585,11 +592,23 @@ def incremental_candidates(*, db_path: Path = DEFAULT_DB) -> List[int]:
             FROM content_items c
             LEFT JOIN evidence_envelopes ee ON ee.id=(
                 SELECT ee2.id FROM evidence_envelopes ee2
-                WHERE ee2.content_id=c.id ORDER BY ee2.created_at DESC, ee2.id DESC LIMIT 1
+                WHERE ee2.content_id=c.id
+                  AND NOT EXISTS (
+                      SELECT 1 FROM provider_raw_responses invalid_raw
+                      WHERE invalid_raw.content_id=ee2.content_id
+                        AND invalid_raw.sha256=ee2.detail_raw_sha256
+                        AND invalid_raw.operation NOT IN (
+                            'douyin_video_detail',
+                            'xiaohongshu_note_detail',
+                            'xiaohongshu_video_detail'
+                        )
+                  )
+                ORDER BY ee2.created_at DESC, ee2.id DESC LIMIT 1
             )
             LEFT JOIN evaluation_versions ev ON ev.id=(
                 SELECT ev2.id FROM evaluation_versions ev2
-                WHERE ev2.content_id=c.id ORDER BY ev2.evaluated_at DESC, ev2.id DESC LIMIT 1
+                WHERE ev2.content_id=c.id AND ev2.invalidated_at IS NULL
+                ORDER BY ev2.evaluated_at DESC, ev2.id DESC LIMIT 1
             )
             WHERE ee.id IS NULL OR ev.id IS NULL OR ev.evidence_envelope_id<>ee.id
                OR ev.taxonomy_version<>?
@@ -597,6 +616,10 @@ def incremental_candidates(*, db_path: Path = DEFAULT_DB) -> List[int]:
                OR EXISTS (
                     SELECT 1 FROM evidence_artifacts ea
                     WHERE ea.content_id=c.id AND ea.created_at>ee.created_at
+                      AND ea.artifact_type IN (
+                          'provider_content','public_content','media','media_manifest',
+                          'asr','transcript','media_transcript','ocr','media_ocr'
+                      )
                )
                OR EXISTS (
                     SELECT 1 FROM comment_evidence_versions cev
@@ -680,6 +703,7 @@ def resolve_review(
         previous = connection.execute(
             """
             SELECT id FROM evaluation_versions WHERE content_id=?
+              AND invalidated_at IS NULL
             ORDER BY evaluated_at DESC, id DESC LIMIT 1
             """,
             (queue["content_id"],),

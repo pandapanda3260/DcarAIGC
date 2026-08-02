@@ -286,9 +286,9 @@ const metricLabels: Array<[string, string]> = [
   ["comment_count", "评论数"],
   ["verticality_rate", "内容垂直度"],
   ["selling_point_coverage_rate", "卖点覆盖率"],
-  ["estimated_new_user_rate", "预估拉新率"],
-  ["estimated_reactivation_rate", "预估拉活率"],
-  ["estimated_lead_rate", "预估线索率"],
+  ["estimated_new_users", "预估拉新量"],
+  ["estimated_reactivated_users", "预估拉活量"],
+  ["estimated_leads", "预估线索量"],
 ];
 
 const enumLabels: Record<string, string> = {

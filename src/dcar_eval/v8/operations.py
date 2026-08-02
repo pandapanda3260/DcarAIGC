@@ -791,7 +791,11 @@ def export_contents_csv(*, db_path: Path = DEFAULT_DB) -> bytes:
                    ev.primary_selling_point_code, ev.content_automotive_score,
                    ms.view_count, ms.comment_count, original.link_id duplicate_original_link_id
             FROM content_items c LEFT JOIN accounts a ON a.id=c.account_id
-            LEFT JOIN evaluation_versions ev ON ev.id=(SELECT id FROM evaluation_versions WHERE content_id=c.id ORDER BY evaluated_at DESC,id DESC LIMIT 1)
+            LEFT JOIN evaluation_versions ev ON ev.id=(
+                SELECT id FROM evaluation_versions
+                WHERE content_id=c.id AND invalidated_at IS NULL
+                ORDER BY evaluated_at DESC,id DESC LIMIT 1
+            )
             LEFT JOIN content_metric_snapshots ms ON ms.id=(SELECT id FROM content_metric_snapshots WHERE content_id=c.id ORDER BY captured_at DESC,id DESC LIMIT 1)
             LEFT JOIN duplicate_relations d ON d.id=(SELECT id FROM duplicate_relations WHERE duplicate_content_id=c.id AND status='confirmed' ORDER BY id LIMIT 1)
             LEFT JOIN content_items original ON original.id=d.original_content_id

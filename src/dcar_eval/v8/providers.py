@@ -133,7 +133,12 @@ def _request_json(
         provider_blocked = status in {401, 402, 403}
         terminal = status in {400, 404, 410, 422}
         raise CaptureError(
-            f"{provider} HTTP {status}", retryable=provider_blocked or (not terminal and (status in {408, 429} or status >= 500)),
+            f"{provider} HTTP {status}",
+            retryable=status == 402 or (
+                status not in {401, 403}
+                and not terminal
+                and (status in {408, 429} or status >= 500)
+            ),
             error_code="provider_balance_blocked" if status == 402 else "provider_auth_blocked" if provider_blocked else f"http_{status}",
             http_status=status, billed=False, raw_response=payload,
         ) from exc

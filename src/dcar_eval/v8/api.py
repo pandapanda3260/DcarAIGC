@@ -325,7 +325,7 @@ def _window_summary(connection: sqlite3.Connection, start: datetime, end: dateti
             JOIN (
                 SELECT content_id, MAX(id) id
                 FROM evaluation_versions
-                WHERE content_id IN ({placeholders})
+                WHERE content_id IN ({placeholders}) AND invalidated_at IS NULL
                 GROUP BY content_id
             ) latest ON latest.id=ev.id
             """,
@@ -356,7 +356,7 @@ def _window_summary(connection: sqlite3.Connection, start: datetime, end: dateti
     metric_coverage = round(len(metrics) * 100 / total, 2) if total else None
     views = sum(int(row["view_count"] or 0) for row in metrics)
     comments = sum(int(row["comment_count"] or 0) for row in metrics if row["comment_count"] is not None)
-    ratio_status = "not_applicable" if total == 0 else "available" if eligible * 100 / total >= 80 else "below_threshold"
+    ratio_status = "not_applicable" if total == 0 else "available" if eligible * 100 / total >= 95 else "below_threshold"
     return {
         "period_start": start.isoformat(),
         "period_end": end.isoformat(),
@@ -388,9 +388,9 @@ def _window_summary(connection: sqlite3.Connection, start: datetime, end: dateti
                 eligible_count=eligible,
                 coverage_percentage=round(eligible * 100 / total, 2) if total else None,
             ),
-            "estimated_new_user_rate": ratio_metric(None, total, status="not_applicable" if total == 0 else "not_calculable", reason="首版没有已验证模型"),
-            "estimated_reactivation_rate": ratio_metric(None, total, status="not_applicable" if total == 0 else "not_calculable", reason="首版没有已验证模型"),
-            "estimated_lead_rate": ratio_metric(None, total, status="not_applicable" if total == 0 else "not_calculable", reason="首版没有已验证模型"),
+            "estimated_new_users": quantity_metric(None, unit="person", status="not_applicable" if total == 0 else "not_calculable", reason="首版没有已验证模型"),
+            "estimated_reactivated_users": quantity_metric(None, unit="person", status="not_applicable" if total == 0 else "not_calculable", reason="首版没有已验证模型"),
+            "estimated_leads": quantity_metric(None, unit="lead", status="not_applicable" if total == 0 else "not_calculable", reason="首版没有已验证模型"),
         },
         "empty_explanation": (
             "所选窗口没有进入有效监控范围的已发布内容，并非抓取故障。"
@@ -537,7 +537,7 @@ def _content_search(payload: ContentSearchRequest) -> Dict[str, Any]:
         LEFT JOIN accounts a ON a.id=c.account_id
         LEFT JOIN evaluation_versions ev ON ev.id=(
             SELECT ev2.id FROM evaluation_versions ev2
-            WHERE ev2.content_id=c.id
+            WHERE ev2.content_id=c.id AND ev2.invalidated_at IS NULL
             ORDER BY ev2.evaluated_at DESC, ev2.id DESC LIMIT 1
         )
         LEFT JOIN (
@@ -619,7 +619,8 @@ def _selling_point_list() -> Dict[str, Any]:
                    COUNT(DISTINCT ev.content_id) total_hits
             FROM selling_points sp
             LEFT JOIN evaluation_matches em ON em.selling_point_code=sp.code
-            LEFT JOIN evaluation_versions ev ON ev.id=em.evaluation_id
+            LEFT JOIN evaluation_versions ev
+              ON ev.id=em.evaluation_id AND ev.invalidated_at IS NULL
             WHERE sp.taxonomy_id=?
             GROUP BY sp.id
             ORDER BY substr(sp.code, 1, 1), CAST(substr(sp.code, 2) AS INTEGER)
@@ -954,7 +955,7 @@ def get_v8_reviews(status: Optional[str] = None, limit: int = 100) -> Dict[str, 
             JOIN content_items c ON c.id=rq.content_id
             LEFT JOIN evaluation_versions ev ON ev.id=(
                 SELECT ev2.id FROM evaluation_versions ev2
-                WHERE ev2.content_id=c.id
+                WHERE ev2.content_id=c.id AND ev2.invalidated_at IS NULL
                 ORDER BY ev2.evaluated_at DESC, ev2.id DESC LIMIT 1
             )
             {where}

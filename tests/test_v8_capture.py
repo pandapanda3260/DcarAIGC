@@ -94,13 +94,15 @@ class V8CaptureTest(unittest.TestCase):
                 stage="media_source_refresh",
                 window_key="lifetime",
                 provider="Rnote",
-                adapter_version="rnote-video-v8.0",
+                adapter_version="rnote-video-v8.1",
                 operation="xiaohongshu_video_detail",
                 budget_id="pilot",
                 db_path=self.db,
                 raw_root=self.raw,
                 call=lambda: ProviderResult({}, {}, 200, True),
             )
+        with connect(self.db) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM fetch_slots").fetchone()[0], 1)
 
     def test_failed_attempt_is_retryable_and_not_billed(self) -> None:
         activate_pilot_budget("pilot", expected_unit_price=0.008, db_path=self.db)

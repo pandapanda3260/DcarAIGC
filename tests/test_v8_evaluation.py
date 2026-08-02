@@ -152,6 +152,92 @@ class V8EvaluationTest(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(count, 2)
 
+    def test_statistics_raw_response_and_media_source_do_not_change_evidence(self) -> None:
+        first = evaluate_content(1, db_path=self.db)
+        source = self.root / "source.json"
+        source.write_text('{"urls":["https://cdn.example/video.mp4"]}', encoding="utf-8")
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                INSERT INTO provider_raw_responses(
+                    content_id, provider, operation, local_path, sha256, byte_size,
+                    http_status, captured_at, source
+                ) VALUES (1, 'TikHub', 'douyin_video_statistics', 'statistics.json',
+                          ?, 10, 200, '2099-01-01T00:00:00Z', 'live')
+                """,
+                ("9" * 64,),
+            )
+            connection.execute(
+                """
+                INSERT INTO evidence_artifacts(
+                    content_id, artifact_type, local_path, status, byte_size,
+                    sha256, processor_version, created_at
+                ) VALUES (1, 'media_source', ?, 'available', ?, ?, 'provider-media-source-v8.0',
+                          '2099-01-01T00:00:00Z')
+                """,
+                (
+                    str(source), source.stat().st_size,
+                    hashlib.sha256(source.read_bytes()).hexdigest(),
+                ),
+            )
+            connection.commit()
+        second = evaluate_content(1, db_path=self.db)
+        self.assertFalse(second.created)
+        self.assertEqual(second.evaluation_id, first.evaluation_id)
+        self.assertEqual(second.evidence_sha256, first.evidence_sha256)
+        self.assertEqual(incremental_candidates(db_path=self.db), [2])
+        with connect(self.db) as connection:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM evaluation_versions WHERE content_id=1"
+            ).fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_existing_statistics_polluted_version_is_invalidated_and_not_current(self) -> None:
+        first = evaluate_content(1, db_path=self.db)
+        captured_at = "2099-01-01T00:00:00Z"
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                INSERT INTO provider_raw_responses(
+                    content_id, provider, operation, local_path, sha256, byte_size,
+                    http_status, captured_at, source
+                ) VALUES (1, 'TikHub', 'douyin_video_statistics', 'statistics.json',
+                          ?, 10, 200, ?, 'live')
+                """,
+                ("9" * 64, captured_at),
+            )
+            envelope = connection.execute(
+                """
+                INSERT INTO evidence_envelopes(
+                    content_id, schema_version, detail_raw_sha256, text_sha256,
+                    evidence_sha256, components_json, created_at
+                ) VALUES (1, 'evidence-v1', ?, ?, ?, '{}', ?)
+                """,
+                ("9" * 64, "8" * 64, "7" * 64, captured_at),
+            )
+            polluted = connection.execute(
+                """
+                INSERT INTO evaluation_versions(
+                    content_id, evidence_envelope_id, rule_version, taxonomy_version,
+                    evidence_sha256, evaluation_source, evaluation_status, evidence_level,
+                    payload_json, evaluated_at
+                ) VALUES (1, ?, 'evaluation-v6', 'selling-points-v5.0', ?,
+                          'automatic', 'evaluated', 'V3', '{}', ?)
+                """,
+                (envelope.lastrowid, "7" * 64, captured_at),
+            )
+            connection.commit()
+            initialize_database(connection)
+            invalidated = connection.execute(
+                "SELECT invalidated_at FROM evaluation_versions WHERE id=?",
+                (polluted.lastrowid,),
+            ).fetchone()
+        self.assertIsNotNone(invalidated["invalidated_at"])
+        self.assertEqual(incremental_candidates(db_path=self.db), [2])
+        current = evaluate_content(1, db_path=self.db)
+        self.assertFalse(current.created)
+        self.assertEqual(current.evaluation_id, first.evaluation_id)
+
     def test_comment_scores_upsert_without_deleting_other_users(self) -> None:
         with connect(self.db) as connection:
             evidence = connection.execute(

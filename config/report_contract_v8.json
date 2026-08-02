@@ -1,5 +1,5 @@
 {
-  "report_version": "dcar-content-operations-report-v8.0",
+  "report_version": "dcar-content-operations-report-v8.1",
   "rule_version": "evaluation-v6",
   "taxonomy_version_pattern": "^selling-points-v[1-9][0-9]*\\.[0-9]+$",
   "evidence_version": "evidence-v1",
@@ -29,6 +29,7 @@
     "view",
     "comment",
     "person",
+    "lead",
     "request",
     "currency"
   ],
@@ -39,16 +40,18 @@
     "comment_count": {"kind": "quantity", "unit": "comment"},
     "verticality_rate": {"kind": "ratio", "unit": "percent"},
     "selling_point_coverage_rate": {"kind": "ratio", "unit": "percent"},
-    "estimated_new_user_rate": {"kind": "ratio", "unit": "percent"},
-    "estimated_reactivation_rate": {"kind": "ratio", "unit": "percent"},
-    "estimated_lead_rate": {"kind": "ratio", "unit": "percent"}
+    "estimated_new_users": {"kind": "quantity", "unit": "person"},
+    "estimated_reactivated_users": {"kind": "quantity", "unit": "person"},
+    "estimated_leads": {"kind": "quantity", "unit": "lead"}
   },
   "required_coverage_thresholds": {
     "discovery_coverage": 100.0,
-    "detail_coverage": 95.0,
+    "detail_coverage": 98.0,
     "metrics_freshness": 90.0,
-    "evaluation_coverage": 80.0,
-    "core_artifact_coverage": 100.0
+    "evaluation_coverage": 95.0,
+    "core_artifact_coverage": 100.0,
+    "media_terminal_coverage": 95.0,
+    "weekly_comment_coverage": 90.0
   },
   "required_top_level_keys": [
     "report_version",

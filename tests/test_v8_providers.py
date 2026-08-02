@@ -4,12 +4,19 @@ import json
 import tempfile
 import unittest
 from datetime import date
+from io import BytesIO
 from pathlib import Path
+from urllib.error import HTTPError
 from unittest.mock import patch
 
 from v8.capture import CaptureError, ProviderResult
 from v8.operations import upsert_account, upsert_content
-from v8.providers import _collect_media_urls, discover_account_content, update_content_data
+from v8.providers import (
+    _collect_media_urls,
+    _request_json,
+    discover_account_content,
+    update_content_data,
+)
 from v8.storage import connect, initialize_database, now_utc
 
 
@@ -73,6 +80,24 @@ class V8ProviderUpdateTest(unittest.TestCase):
             _collect_media_urls(payload, "image"),
             ["https://cdn.example/image-1.jpg", "https://cdn.example/image-2.jpg"],
         )
+
+    def test_http_auth_failures_are_terminal_but_balance_can_retry(self) -> None:
+        for status, retryable in ((401, False), (402, True), (403, False)):
+            error = HTTPError(
+                "https://provider.example/api", status, "blocked", {}, BytesIO(b"{}")
+            )
+            with (
+                self.subTest(status=status),
+                patch("v8.providers.urllib.request.urlopen", side_effect=error),
+                self.assertRaises(CaptureError) as raised,
+            ):
+                _request_json(
+                    "https://provider.example/api",
+                    headers={},
+                    params={},
+                    provider="TestProvider",
+                )
+            self.assertEqual(raised.exception.retryable, retryable)
 
     @staticmethod
     def successful_call(stage, content):

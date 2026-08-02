@@ -206,8 +206,10 @@ def _latest_rows(connection, table: str, ids: Sequence[int], order: str) -> Dict
     if not ids:
         return {}
     placeholders = ",".join("?" for _ in ids)
+    validity = " AND invalidated_at IS NULL" if table == "evaluation_versions" else ""
     rows = connection.execute(
-        f"SELECT * FROM {table} WHERE content_id IN ({placeholders}) ORDER BY {order}", ids
+        f"SELECT * FROM {table} WHERE content_id IN ({placeholders}){validity} ORDER BY {order}",
+        ids,
     ).fetchall()
     output: Dict[int, Dict[str, Any]] = {}
     for row in rows:
@@ -319,12 +321,53 @@ def _build_report_data(
         _percentage(len(fresh_metric_ids), len(metric_eligible_ids))
         if metric_eligible_ids else 100.0
     )
+    routed_media_ids: set[int] = set()
+    recent_comment_ids: set[int] = set()
+    if ids:
+        placeholders = ",".join("?" for _ in ids)
+        routed_media_ids = {
+            int(row["content_id"])
+            for row in connection.execute(
+                f"""
+                SELECT DISTINCT content_id FROM review_queue
+                WHERE content_id IN ({placeholders})
+                  AND status IN ('manual_required','resolved','terminal_failed')
+                """,
+                ids,
+            ).fetchall()
+        }
+        comment_cutoff = (
+            datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
+            - timedelta(days=8)
+        ).isoformat().replace("+00:00", "Z")
+        recent_comment_ids = {
+            int(row["content_id"])
+            for row in connection.execute(
+                f"""
+                SELECT DISTINCT content_id FROM comment_evidence_versions
+                WHERE content_id IN ({placeholders}) AND status='available'
+                  AND captured_at>=? AND captured_at<=?
+                """,
+                [*ids, comment_cutoff, generated_at],
+            ).fetchall()
+        }
+    media_terminal_ids = {
+        content_id for content_id, value in current_evaluations.items()
+        if value["evidence_level"] in {"V2", "V3"}
+    } | routed_media_ids
+    media_terminal_coverage = _percentage(len(media_terminal_ids), total) if total else 100.0
+    weekly_comment_coverage = (
+        _percentage(len(recent_comment_ids), total)
+        if task["task_type"] == "weekly" and total else 100.0
+    )
     data_quality = {
         "discovery_coverage": 100.0,
         "detail_coverage": _percentage(detail_ready, total) if total else 100.0,
         "metrics_freshness": metrics_freshness,
         "evaluation_coverage": _percentage(eval_ready, total) if total else 100.0,
         "core_artifact_coverage": 100.0,
+        "media_terminal_coverage": media_terminal_coverage,
+        "weekly_comment_coverage": weekly_comment_coverage,
     }
     task_status = expected_terminal_task_status(data_quality)
     metric_coverage = _percentage(len(snapshots), total)
@@ -344,7 +387,7 @@ def _build_report_data(
     )
     eval_status = (
         "not_applicable" if total == 0 else "available"
-        if float(data_quality["evaluation_coverage"] or 0) >= 80 else "below_threshold"
+        if float(data_quality["evaluation_coverage"] or 0) >= 95 else "below_threshold"
     )
     point_counts = Counter(
         str(value["primary_selling_point_code"])
@@ -458,16 +501,16 @@ def _build_report_data(
                 selling if total else None, total, status=eval_status,
                 eligible_count=eval_ready, coverage_percentage=data_quality["evaluation_coverage"],
             ),
-            "estimated_new_user_rate": ratio_metric(
-                None, total, status="not_applicable" if total == 0 else "not_calculable",
+            "estimated_new_users": quantity_metric(
+                None, unit="person", status="not_applicable" if total == 0 else "not_calculable",
                 reason="v8 首版没有经过验证的业务预估模型",
             ),
-            "estimated_reactivation_rate": ratio_metric(
-                None, total, status="not_applicable" if total == 0 else "not_calculable",
+            "estimated_reactivated_users": quantity_metric(
+                None, unit="person", status="not_applicable" if total == 0 else "not_calculable",
                 reason="v8 首版没有经过验证的业务预估模型",
             ),
-            "estimated_lead_rate": ratio_metric(
-                None, total, status="not_applicable" if total == 0 else "not_calculable",
+            "estimated_leads": quantity_metric(
+                None, unit="lead", status="not_applicable" if total == 0 else "not_calculable",
                 reason="v8 首版没有经过验证的业务预估模型",
             ),
         },

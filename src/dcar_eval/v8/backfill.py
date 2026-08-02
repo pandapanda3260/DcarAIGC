@@ -264,7 +264,11 @@ class RnoteVideoAdapter:
             terminal = status in {400, 404, 410, 422}
             raise CaptureError(
                 f"Rnote HTTP {status}: {_provider_message(payload) or 'request failed'}",
-                retryable=provider_blocked or (not terminal and (status in {408, 429} or status >= 500)),
+                retryable=status == 402 or (
+                    status not in {401, 403}
+                    and not terminal
+                    and (status in {408, 429} or status >= 500)
+                ),
                 error_code=(
                     "provider_balance_blocked" if status == 402
                     else "provider_auth_blocked" if provider_blocked

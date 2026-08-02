@@ -34,8 +34,10 @@ def valid_report() -> dict:
             "discovery_coverage": 100.0,
             "detail_coverage": 100.0,
             "metrics_freshness": 90.0,
-            "evaluation_coverage": 80.0,
+            "evaluation_coverage": 95.0,
             "core_artifact_coverage": 100.0,
+            "media_terminal_coverage": 95.0,
+            "weekly_comment_coverage": 90.0,
         },
         "summary_metrics": {
             "publication_count": quantity_metric(10, unit="content", status="available"),
@@ -44,9 +46,9 @@ def valid_report() -> dict:
             "comment_count": quantity_metric(20, unit="comment", status="sample_only", coverage_percentage=50),
             "verticality_rate": ratio_metric(7, publications, status="available", eligible_count=8, coverage_percentage=80),
             "selling_point_coverage_rate": ratio_metric(4, publications, status="available", eligible_count=8, coverage_percentage=80),
-            "estimated_new_user_rate": ratio_metric(None, publications, status="not_calculable", reason="model unavailable"),
-            "estimated_reactivation_rate": ratio_metric(None, publications, status="not_calculable", reason="model unavailable"),
-            "estimated_lead_rate": ratio_metric(None, publications, status="not_calculable", reason="model unavailable"),
+            "estimated_new_users": quantity_metric(None, unit="person", status="not_calculable", reason="model unavailable"),
+            "estimated_reactivated_users": quantity_metric(None, unit="person", status="not_calculable", reason="model unavailable"),
+            "estimated_leads": quantity_metric(None, unit="lead", status="not_calculable", reason="model unavailable"),
         },
         "platform_dimensions": [],
         "account_type_dimensions": [],
@@ -93,7 +95,7 @@ class V8ContractTest(unittest.TestCase):
 
     def test_required_coverage_controls_terminal_task_status(self) -> None:
         report = valid_report()
-        report["data_quality"]["evaluation_coverage"] = 79.99
+        report["data_quality"]["evaluation_coverage"] = 94.99
         self.assertEqual(expected_terminal_task_status(report["data_quality"]), "partial")
         with self.assertRaisesRegex(V8ContractViolation, "task_status must be partial"):
             validate_report(report)
@@ -108,8 +110,8 @@ class V8ContractTest(unittest.TestCase):
 
     def test_forecast_metrics_cannot_publish_a_value_as_not_calculable(self) -> None:
         report = valid_report()
-        report["summary_metrics"]["estimated_lead_rate"]["percentage"] = 30.0
-        with self.assertRaisesRegex(V8ContractViolation, "percentage must be null"):
+        report["summary_metrics"]["estimated_leads"]["value"] = 30
+        with self.assertRaisesRegex(V8ContractViolation, "value must be null"):
             validate_report(report)
 
     def test_view_quantity_uses_view_not_people(self) -> None:
