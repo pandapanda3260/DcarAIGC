@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import tomllib
 import unittest
+from pathlib import Path
 
 from v8.contracts import (
     CURRENT_REPORT_VERSION,
@@ -64,6 +66,10 @@ def valid_report() -> dict:
 
 
 class V8ContractTest(unittest.TestCase):
+    def test_project_metadata_matches_runtime_report_version(self) -> None:
+        project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+        self.assertEqual(project["tool"]["dcar"]["report-version"], CURRENT_REPORT_VERSION)
+
     def test_valid_operational_report_passes(self) -> None:
         validate_report(valid_report())
 

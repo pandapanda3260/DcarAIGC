@@ -325,6 +325,46 @@ class V8EvaluationTest(unittest.TestCase):
                 db_path=self.db,
             )
 
+    def test_manual_override_without_selling_point_clears_automatic_matches(self) -> None:
+        automatic = evaluate_content(1, db_path=self.db)
+        with connect(self.db) as connection:
+            queue = connection.execute(
+                """
+                INSERT INTO review_queue(
+                    content_id, evaluation_id, reason_code, status, created_at, updated_at
+                ) VALUES (1, ?, 'evaluation_gray_zone', 'pending', ?, ?)
+                """,
+                (automatic.evaluation_id, now_utc(), now_utc()),
+            )
+            connection.commit()
+        reviewed = resolve_review(
+            int(queue.lastrowid),
+            decision="override",
+            reason="本地媒体确认是非汽车旅行内容",
+            reviewer="测试复核员",
+            evidence_type="visual_summary",
+            evidence_text="画面仅展示民宿、沙滩与泳池，不包含汽车产品或用车任务",
+            overrides={
+                "primary_selling_point_code": None,
+                "selling_point_score": 0,
+                "selling_point_included": False,
+                "content_automotive_score": 0,
+                "content_direction": "other",
+            },
+            db_path=self.db,
+        )
+        with connect(self.db) as connection:
+            row = connection.execute(
+                "SELECT * FROM evaluation_versions WHERE id=?", (reviewed.evaluation_id,)
+            ).fetchone()
+            matches = connection.execute(
+                "SELECT * FROM evaluation_matches WHERE evaluation_id=?",
+                (reviewed.evaluation_id,),
+            ).fetchall()
+        self.assertIsNone(row["primary_selling_point_code"])
+        self.assertEqual(row["selling_point_score"], 0)
+        self.assertEqual(matches, [])
+
 
 if __name__ == "__main__":
     unittest.main()

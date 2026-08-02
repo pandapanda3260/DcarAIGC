@@ -277,6 +277,17 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         self.assertEqual(current.json()["items"][0]["label"], "汽车养护服务")
 
     def test_custom_task_generates_revision_and_downloads_run_scoped_files(self) -> None:
+        reviewed = self.client.post(
+            f"/api/v8/reviews/{self.queue_id}/resolve",
+            json={
+                "decision": "insufficient_evidence",
+                "reason": "报告测试先清零人工复核闸门",
+                "reviewer": "测试复核员",
+                "evidence_type": "review_note",
+                "evidence_text": "测试内容没有本地媒体，人工确认当前证据不足",
+            },
+        )
+        self.assertEqual(reviewed.status_code, 200)
         created = self.client.post(
             "/api/v8/tasks",
             json={"period_start": "2026-07-01", "period_end": "2026-07-01"},

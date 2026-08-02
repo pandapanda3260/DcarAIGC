@@ -499,6 +499,15 @@ def evaluate_content(
             if override.get("content_direction") is not None:
                 direction = str(override["content_direction"])
             pending_review = False
+            matches = (
+                [{
+                    "id": primary_code,
+                    "score": selling_score,
+                    "reason": "人工复核覆盖",
+                    "source": "manual",
+                }]
+                if primary_code else []
+            )
         elif decision == "confirm":
             pending_review = False
             matches = (

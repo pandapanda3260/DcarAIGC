@@ -131,6 +131,112 @@ class V8ReportTaskTest(unittest.TestCase):
                 creation_source="automatic", db_path=self.db,
             )
 
+    def test_pending_gray_review_blocks_first_report_without_creating_revision(self) -> None:
+        with connect(self.db) as connection:
+            evaluation_id = connection.execute(
+                "SELECT id FROM evaluation_versions WHERE content_id=1 ORDER BY id DESC"
+            ).fetchone()[0]
+            connection.execute(
+                """
+                INSERT INTO review_queue(
+                    content_id, evaluation_id, reason_code, status, created_at, updated_at
+                ) VALUES (1, ?, 'evaluation_gray_zone', 'pending', ?, ?)
+                """,
+                (evaluation_id, now_utc(), now_utc()),
+            )
+            connection.commit()
+        task = create_task(
+            task_type="custom", period_start="2026-07-01", period_end="2026-07-01",
+            creation_source="manual", db_path=self.db,
+        )
+        with self.assertRaisesRegex(ReportTaskError, "1 条灰区内容"):
+            run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
+        state = get_task(task["id"], db_path=self.db)
+        self.assertEqual(state["task_status"], "failed")
+        self.assertEqual(state["revisions"], [])
+        self.assertEqual(state["events"][-1]["event_type"], "review_gate_blocked")
+
+    def test_pending_gray_review_is_reported_but_does_not_block_after_first_release(self) -> None:
+        first = create_task(
+            task_type="custom", period_start="2026-07-01", period_end="2026-07-01",
+            creation_source="manual", db_path=self.db,
+        )
+        run_task(first["id"], db_path=self.db, reports_root=self.reports_root)
+        with connect(self.db) as connection:
+            evaluation_id = connection.execute(
+                "SELECT id FROM evaluation_versions WHERE content_id=1 ORDER BY id DESC"
+            ).fetchone()[0]
+            connection.execute(
+                """
+                INSERT INTO review_queue(
+                    content_id, evaluation_id, reason_code, status, created_at, updated_at
+                ) VALUES (1, ?, 'evaluation_gray_zone', 'pending', ?, ?)
+                """,
+                (evaluation_id, now_utc(), now_utc()),
+            )
+            connection.commit()
+        later = create_task(
+            task_type="custom", period_start="2026-07-01", period_end="2026-07-02",
+            creation_source="manual", db_path=self.db,
+        )
+        report = run_task(later["id"], db_path=self.db, reports_root=self.reports_root)
+        self.assertEqual(report["metadata"]["revision"], 1)
+        self.assertEqual(report["review_summary"][0]["status"], "pending")
+
+    def test_schema_upgrade_marks_pre_gate_v8_report_audit_only(self) -> None:
+        task = create_task(
+            task_type="custom", period_start="2026-07-01", period_end="2026-07-01",
+            creation_source="manual", db_path=self.db,
+        )
+        run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
+        released_status = get_task(task["id"], db_path=self.db)["task_status"]
+        with connect(self.db) as connection:
+            evaluation_id = connection.execute(
+                "SELECT id FROM evaluation_versions WHERE content_id=1 ORDER BY id DESC"
+            ).fetchone()[0]
+            connection.execute(
+                "UPDATE report_revisions SET contract_version='dcar-content-operations-report-v8.0'"
+            )
+            connection.execute(
+                """
+                INSERT INTO review_queue(
+                    content_id, evaluation_id, reason_code, status, created_at, updated_at
+                ) VALUES (1, ?, 'evaluation_gray_zone', 'pending', ?, ?)
+                """,
+                (evaluation_id, now_utc(), now_utc()),
+            )
+            connection.commit()
+            initialize_database(connection)
+            revision = connection.execute("SELECT * FROM report_revisions").fetchone()
+            task_row = connection.execute(
+                "SELECT * FROM report_tasks WHERE id=?", (task["id"],)
+            ).fetchone()
+        self.assertIsNotNone(revision["invalidated_at"])
+        self.assertEqual(
+            revision["invalidation_reason"],
+            "released_before_gray_review_gate_cleared",
+        )
+        self.assertEqual(task_row["task_status"], "failed")
+
+        with connect(self.db) as connection:
+            connection.execute(
+                "UPDATE review_queue SET status='resolved', resolved_at=?, updated_at=?",
+                (now_utc(), now_utc()),
+            )
+            connection.commit()
+        run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
+        with connect(self.db) as connection:
+            connection.execute(
+                "UPDATE review_queue SET status='pending', resolved_at=NULL, updated_at=?",
+                (now_utc(),),
+            )
+            connection.commit()
+            initialize_database(connection)
+            current_task = connection.execute(
+                "SELECT * FROM report_tasks WHERE id=?", (task["id"],)
+            ).fetchone()
+        self.assertEqual(current_task["task_status"], released_status)
+
 
 if __name__ == "__main__":
     unittest.main()

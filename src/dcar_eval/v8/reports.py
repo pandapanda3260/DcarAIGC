@@ -629,6 +629,54 @@ def run_task(
     db_path: Path = DEFAULT_DB,
     reports_root: Path = REPORTS_ROOT,
 ) -> Dict[str, Any]:
+    blocked_message: Optional[str] = None
+    with connect(db_path) as connection, transaction(connection):
+        task = connection.execute("SELECT * FROM report_tasks WHERE id=?", (task_id,)).fetchone()
+        if task is None:
+            raise ReportTaskError(f"task does not exist: {task_id}")
+        if task["task_status"] not in RUNNABLE_STATUSES:
+            raise ReportTaskError(f"task {task_id} is not runnable from {task['task_status']}")
+        pending_gray_reviews = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM review_queue
+                WHERE reason_code='evaluation_gray_zone'
+                  AND status IN ('pending','manual_required','in_review')
+                """
+            ).fetchone()[0]
+        )
+        formal_release_exists = connection.execute(
+            """
+            SELECT 1 FROM report_revisions
+            WHERE contract_version=? AND invalidated_at IS NULL
+            LIMIT 1
+            """,
+            (CURRENT_REPORT_VERSION,),
+        ).fetchone() is not None
+        if pending_gray_reviews and not formal_release_exists:
+            blocked_message = f"正式报告已阻断：仍有 {pending_gray_reviews} 条灰区内容未完成人工复核"
+            blocked_at = now_utc()
+            connection.execute(
+                """
+                UPDATE report_tasks SET task_status='failed', progress=0, message=?,
+                    completed_at=?, updated_at=? WHERE id=?
+                """,
+                (blocked_message, blocked_at, blocked_at, task_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO task_events(task_id, event_type, message, payload_json, created_at)
+                VALUES (?, 'review_gate_blocked', ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    blocked_message,
+                    json.dumps({"pending_gray_reviews": pending_gray_reviews}),
+                    blocked_at,
+                ),
+            )
+    if blocked_message is not None:
+        raise ReportTaskError(blocked_message)
     with connect(db_path) as connection, transaction(connection):
         task = connection.execute("SELECT * FROM report_tasks WHERE id=?", (task_id,)).fetchone()
         if task is None:

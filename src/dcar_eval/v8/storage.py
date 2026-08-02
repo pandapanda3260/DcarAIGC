@@ -11,7 +11,7 @@ from typing import Iterator
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_DB = PROJECT_ROOT / "app" / "data" / "dcar_insight.sqlite3"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def now_utc() -> str:
@@ -531,6 +531,8 @@ CREATE TABLE IF NOT EXISTS report_revisions (
     report_json_path TEXT NOT NULL,
     report_sha256 TEXT NOT NULL,
     created_at TEXT NOT NULL,
+    invalidated_at TEXT,
+    invalidation_reason TEXT,
     PRIMARY KEY(task_id, revision)
 );
 
@@ -605,6 +607,14 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             connection.execute("ALTER TABLE evaluation_versions ADD COLUMN invalidated_at TEXT")
         if "invalidation_reason" not in evaluation_columns:
             connection.execute("ALTER TABLE evaluation_versions ADD COLUMN invalidation_reason TEXT")
+        revision_columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(report_revisions)").fetchall()
+        }
+        if "invalidated_at" not in revision_columns:
+            connection.execute("ALTER TABLE report_revisions ADD COLUMN invalidated_at TEXT")
+        if "invalidation_reason" not in revision_columns:
+            connection.execute("ALTER TABLE report_revisions ADD COLUMN invalidation_reason TEXT")
         content_slot_columns = [
             str(row["name"])
             for row in connection.execute("PRAGMA index_info(uq_fetch_content_slot)").fetchall()
@@ -662,6 +672,45 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             """,
             (now_utc(),),
         )
+        pending_gray_reviews = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM review_queue
+                WHERE reason_code='evaluation_gray_zone'
+                  AND status IN ('pending','manual_required','in_review')
+                """
+            ).fetchone()[0]
+        )
+        if pending_gray_reviews:
+            invalidated_at = now_utc()
+            connection.execute(
+                """
+                UPDATE report_revisions
+                SET invalidated_at=?,
+                    invalidation_reason='released_before_gray_review_gate_cleared'
+                WHERE contract_version='dcar-content-operations-report-v8.0'
+                  AND invalidated_at IS NULL
+                """,
+                (invalidated_at,),
+            )
+            connection.execute(
+                """
+                UPDATE report_tasks
+                SET task_status='failed', progress=100,
+                    message='历史报告未通过首发人工复核闸门；旧 revision 仅供审计',
+                    completed_at=COALESCE(completed_at, ?), updated_at=?
+                WHERE task_status IN ('succeeded','partial')
+                  AND EXISTS (
+                      SELECT 1 FROM report_revisions rr
+                      WHERE rr.task_id=report_tasks.id AND rr.invalidated_at IS NOT NULL
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM report_revisions rr
+                      WHERE rr.task_id=report_tasks.id AND rr.invalidated_at IS NULL
+                  )
+                """,
+                (invalidated_at, invalidated_at),
+            )
         connection.execute(
             """
             INSERT INTO schema_migrations(version, name, applied_at)
@@ -684,5 +733,13 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             VALUES (?, ?, ?)
             ON CONFLICT(version) DO NOTHING
             """,
-            (SCHEMA_VERSION, "business-fetch-slots-and-evaluation-invalidation", now_utc()),
+            (4, "business-fetch-slots-and-evaluation-invalidation", now_utc()),
+        )
+        connection.execute(
+            """
+            INSERT INTO schema_migrations(version, name, applied_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(version) DO NOTHING
+            """,
+            (SCHEMA_VERSION, "gray-review-report-release-gate", now_utc()),
         )
