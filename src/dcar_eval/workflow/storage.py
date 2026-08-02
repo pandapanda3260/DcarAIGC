@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Iterator
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def now_iso() -> str:
@@ -159,6 +159,64 @@ RUN_V2_COLUMNS = {
 }
 
 
+MIGRATION_3 = """
+CREATE TABLE IF NOT EXISTS evaluations (
+    content_item_id INTEGER PRIMARY KEY REFERENCES content_items(id) ON DELETE CASCADE,
+    rule_version TEXT NOT NULL,
+    taxonomy_version TEXT NOT NULL,
+    evaluation_status TEXT NOT NULL,
+    evidence_level TEXT NOT NULL,
+    evidence_summary TEXT NOT NULL DEFAULT '',
+    primary_selling_point_id TEXT NOT NULL DEFAULT '',
+    primary_selling_point_label TEXT NOT NULL DEFAULT '',
+    primary_tier TEXT NOT NULL DEFAULT '',
+    business_scene TEXT NOT NULL DEFAULT '',
+    selling_point_score INTEGER,
+    selling_point_qualitative TEXT NOT NULL DEFAULT '',
+    selling_point_included INTEGER NOT NULL DEFAULT 0,
+    pending_review INTEGER NOT NULL DEFAULT 0,
+    secondary_selling_point_ids_json TEXT NOT NULL DEFAULT '[]',
+    no_match_reason TEXT NOT NULL DEFAULT '',
+    content_automotive_score INTEGER,
+    content_automotive_qualitative TEXT NOT NULL DEFAULT '',
+    valid_unique_commenters INTEGER,
+    comment_sample_status TEXT NOT NULL DEFAULT 'technical_missing',
+    audience_automotive_score INTEGER,
+    audience_automotive_qualitative TEXT NOT NULL DEFAULT '',
+    dcar_task_fit_score INTEGER,
+    action_intent_score INTEGER,
+    acquisition_potential INTEGER,
+    acquisition_potential_qualitative TEXT NOT NULL DEFAULT '',
+    evaluated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_evaluations_scene
+ON evaluations(business_scene, primary_tier);
+
+CREATE TABLE IF NOT EXISTS comment_user_scores (
+    content_item_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
+    anonymous_user_key TEXT NOT NULL,
+    audience_automotive_score INTEGER NOT NULL,
+    action_intent_score INTEGER NOT NULL,
+    evaluated_at TEXT NOT NULL,
+    PRIMARY KEY(content_item_id, anonymous_user_key)
+);
+
+CREATE TABLE IF NOT EXISTS provider_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT REFERENCES runs(id),
+    provider TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    request_attempts INTEGER NOT NULL DEFAULT 0,
+    billed_requests INTEGER NOT NULL DEFAULT 0,
+    currency TEXT NOT NULL DEFAULT '',
+    amount REAL,
+    recorded_at TEXT NOT NULL,
+    details_json TEXT NOT NULL DEFAULT '{}'
+);
+"""
+
+
 def _column_names(connection: sqlite3.Connection, table: str) -> set[str]:
     return {str(row["name"]) for row in connection.execute(f"PRAGMA table_info({table})")}
 
@@ -189,6 +247,14 @@ def migrate(connection: sqlite3.Connection) -> int:
                 (2, now_iso()),
             )
         current = 2
+    if current < 3:
+        with transaction(connection):
+            connection.executescript(MIGRATION_3)
+            connection.execute(
+                "INSERT OR REPLACE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                (3, now_iso()),
+            )
+        current = 3
     if current != SCHEMA_VERSION:
         raise RuntimeError(f"unsupported schema version {current}; expected {SCHEMA_VERSION}")
     return current

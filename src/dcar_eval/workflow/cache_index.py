@@ -15,7 +15,10 @@ from .storage import now_iso, transaction
 
 
 DOUYIN_TYPES = ("media", "transcript", "ocr", "provider_statistics", "comments")
-XHS_TYPES = ("public_screen", "public_content", "provider_content", "comments")
+XHS_TYPES = (
+    "public_screen", "public_content", "provider_content", "comments",
+    "media_manifest", "media_ocr", "media_transcript",
+)
 
 
 def _path_fingerprint(path: Path) -> tuple[int | None, str]:
@@ -85,6 +88,9 @@ def index_evidence(connection: sqlite3.Connection, root: Path = PROJECT_ROOT) ->
                     "public_content": note_root / "public_content.json",
                     "provider_content": note_root / "content.json",
                     "comments": note_root / "comments.jsonl",
+                    "media_manifest": root / f"data/cache/rnote/media/{content_id}/manifest.json",
+                    "media_ocr": root / f"data/cache/rnote/media/{content_id}/ocr.json",
+                    "media_transcript": root / f"data/cache/rnote/media/{content_id}/transcript.json",
                 }
             for evidence_type, path in paths.items():
                 _upsert_asset(
@@ -182,4 +188,3 @@ def _query_digest(connection: sqlite3.Connection, table: str) -> str:
     return hashlib.sha256(
         json.dumps([dict(row) for row in rows], ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
-

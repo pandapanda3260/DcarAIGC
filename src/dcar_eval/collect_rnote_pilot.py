@@ -17,10 +17,13 @@ import argparse
 import csv
 import hashlib
 import hmac
+import http.client
 import json
 import os
 import re
 import secrets
+import socket
+import ssl
 import time
 import urllib.error
 import urllib.parse
@@ -72,6 +75,10 @@ class CollectorError(RuntimeError):
     """A safe, user-facing collection failure."""
 
 
+class FatalProviderError(CollectorError):
+    """Authentication, credit, or quota failure that must stop the whole batch."""
+
+
 class RequestBudgetExceeded(CollectorError):
     pass
 
@@ -96,11 +103,11 @@ class ApiResult:
 
 @dataclass
 class RequestBudget:
-    maximum: int
+    maximum: int | None
     used: int = 0
 
     def consume(self) -> None:
-        if self.used >= self.maximum:
+        if self.maximum is not None and self.used >= self.maximum:
             raise RequestBudgetExceeded(
                 f"Rnote request budget reached ({self.used}/{self.maximum})"
             )
@@ -213,7 +220,7 @@ class RnoteClient:
         *,
         timeout: float = 45.0,
         delay: float = 0.25,
-        retries: int = 2,
+        retries: int = 1,
     ) -> None:
         self.api_key = api_key
         self.budget = budget
@@ -230,11 +237,15 @@ class RnoteClient:
         debug_id = body.get("debug_id") if isinstance(body.get("debug_id"), str) else None
         if body.get("success") is False:
             message = body.get("error") or body.get("detail") or "outer success=false"
+            if re.search(r"(?:balance|credit|quota|api.?key|auth|余额|额度|密钥|鉴权)", str(message), re.I):
+                raise FatalProviderError(f"Rnote fatal provider error: {message}")
             raise CollectorError(f"Rnote semantic error: {message}")
         layer = body.get("data")
         if isinstance(layer, dict) and "success" in layer:
             if layer.get("success") is False or layer.get("code") not in (None, 0, "0"):
                 message = layer.get("msg") or layer.get("message") or layer.get("code")
+                if re.search(r"(?:balance|credit|quota|api.?key|auth|余额|额度|密钥|鉴权)", str(message), re.I):
+                    raise FatalProviderError(f"Rnote fatal provider error: {message}")
                 raise CollectorError(f"Rnote upstream error: {message}")
             if isinstance(layer.get("debug_id"), str):
                 debug_id = layer["debug_id"]
@@ -297,7 +308,7 @@ class RnoteClient:
             except urllib.error.HTTPError as exc:
                 status = exc.code
                 message = self._error_message(exc.read(), status)
-                last_error = CollectorError(message)
+                last_error = FatalProviderError(message) if status in {401, 402, 403} else CollectorError(message)
                 self.request_log.append(
                     {
                         "at": utc_now(),
@@ -307,11 +318,19 @@ class RnoteClient:
                         "elapsed_seconds": round(time.monotonic() - started, 3),
                     }
                 )
-                retryable = status == 429 or status >= 500
-                if not retryable or attempt >= self.retries:
+                retryable = status in {408, 429} or status >= 500
+                if isinstance(last_error, FatalProviderError) or not retryable or attempt >= self.retries:
                     raise last_error
                 time.sleep(min(4.0, 0.75 * (2**attempt)))
-            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            except (
+                urllib.error.URLError,
+                TimeoutError,
+                ConnectionError,
+                socket.gaierror,
+                ssl.SSLError,
+                http.client.IncompleteRead,
+                json.JSONDecodeError,
+            ) as exc:
                 last_error = CollectorError(f"Rnote transport error: {type(exc).__name__}")
                 self.request_log.append(
                     {
@@ -483,7 +502,11 @@ def normalize_content(
     if not user and isinstance(container.get("user"), dict):
         user = container["user"]
     author_id = first_value(user, ("userid", "id", "user_id", "userId"))
-    author_hash = store.digest("user", str(author_id)) if author_id else None
+    author_hash = (
+        store.digest(f"xiaohongshu:{note_id}:user", str(author_id))
+        if author_id
+        else None
+    )
 
     interaction_names = {
         "likes": ("liked_count", "likedCount", "likes"),
@@ -629,7 +652,11 @@ def normalize_comment(
     text = normalize_text(first_value(comment, ("content", "text", "comment")))
     user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
     raw_user_id = first_value(user, ("userid", "id", "user_id", "userId"))
-    user_hash = store.digest("user", str(raw_user_id)) if raw_user_id else None
+    user_hash = (
+        store.digest(f"xiaohongshu:{note_id}:user", str(raw_user_id))
+        if raw_user_id
+        else None
+    )
     raw_comment_id = first_value(comment, ("id", "comment_id", "commentId"))
     fallback_identity = "|".join(
         (
@@ -844,6 +871,8 @@ def collect_content(
         except (CollectorError, RequestBudgetExceeded) as exc:
             if isinstance(exc, RequestBudgetExceeded):
                 raise
+            if isinstance(exc, FatalProviderError):
+                raise
             errors.append(f"{endpoint_type}:{exc}")
     metadata["schema_version"] = CACHE_SCHEMA
     metadata["note_id"] = row["note_id"].lower()
@@ -997,7 +1026,7 @@ def collect_comments(
             if stop_reason:
                 break
             cursor = next_cursor
-    except RequestBudgetExceeded:
+    except (RequestBudgetExceeded, FatalProviderError):
         raise
     except CollectorError as exc:
         error = str(exc)
@@ -1337,7 +1366,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=45.0)
     parser.add_argument("--public-timeout", type=int, default=30)
     parser.add_argument("--delay", type=float, default=0.25)
-    parser.add_argument("--retries", type=int, default=2)
+    parser.add_argument("--retries", type=int, default=1)
     parser.add_argument(
         "--refresh",
         action="store_true",

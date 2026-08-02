@@ -17,14 +17,17 @@ class WorkflowCorpusTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             db = Path(temporary) / "test.sqlite3"
             with connect(db) as connection:
-                self.assertEqual(migrate(connection), 2)
-                self.assertEqual(migrate(connection), 2)
+                self.assertEqual(migrate(connection), 3)
+                self.assertEqual(migrate(connection), 3)
                 tables = {
                     row[0] for row in connection.execute(
                         "SELECT name FROM sqlite_master WHERE type='table'"
                     ).fetchall()
                 }
-            self.assertTrue({"runs", "content_items", "evidence_assets", "corpus_snapshots"} <= tables)
+            self.assertTrue({
+                "runs", "content_items", "evidence_assets", "corpus_snapshots",
+                "evaluations", "comment_user_scores", "provider_usage",
+            } <= tables)
 
     def test_real_frozen_corpus_imports_expected_counts_without_tokens(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -61,10 +64,13 @@ class WorkflowCorpusTest(unittest.TestCase):
             self.assertEqual(value["channels"]["douyin"]["evidence"]["transcript"]["available"], 438)
             self.assertEqual(value["channels"]["douyin"]["evidence"]["ocr"]["available"], 438)
             self.assertEqual(value["channels"]["douyin"]["evidence"]["comments"]["available"], 438)
-            self.assertEqual(value["channels"]["xiaohongshu"]["evidence"]["provider_content"]["available"], 56)
-            self.assertEqual(value["channels"]["xiaohongshu"]["evidence"]["comments"]["available"], 56)
-            self.assertEqual(value["paid_refresh_gap"]["xiaohongshu_provider_content_missing"], 282)
-            self.assertEqual(value["paid_refresh_gap"]["xiaohongshu_comments_missing"], 282)
+            self.assertEqual(value["channels"]["xiaohongshu"]["evidence"]["provider_content"]["available"], 338)
+            self.assertEqual(value["channels"]["xiaohongshu"]["evidence"]["comments"]["available"], 338)
+            self.assertEqual(value["channels"]["xiaohongshu"]["evidence"]["media_manifest"]["available"], 338)
+            self.assertEqual(value["channels"]["xiaohongshu"]["evidence"]["media_ocr"]["available"], 338)
+            self.assertEqual(value["channels"]["xiaohongshu"]["evidence"]["media_transcript"]["available"], 138)
+            self.assertEqual(value["paid_refresh_gap"]["xiaohongshu_provider_content_missing"], 0)
+            self.assertEqual(value["paid_refresh_gap"]["xiaohongshu_comments_missing"], 0)
 
     def test_bootstrap_is_idempotent(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -75,7 +81,7 @@ class WorkflowCorpusTest(unittest.TestCase):
             with connect(db) as connection:
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM content_items").fetchone()[0], 776)
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM content_import_audit").fetchone()[0], 375)
-                self.assertEqual(connection.execute("SELECT COUNT(*) FROM evidence_assets").fetchone()[0], 3542)
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM evidence_assets").fetchone()[0], 4556)
 
 
 if __name__ == "__main__":

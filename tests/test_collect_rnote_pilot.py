@@ -1,17 +1,22 @@
 import json
+import http.client
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from collect_rnote_pilot import (
     CacheStore,
     CollectorError,
+    FatalProviderError,
     RnoteClient,
     RnoteCursor,
+    RequestBudget,
     apply_duplicate_filter,
     collection_status,
     find_note,
     load_key,
+    normalize_content,
     normalize_comment_tree,
     parse_cursor,
     valid_user_hashes,
@@ -64,7 +69,7 @@ class RnoteCollectorTest(unittest.TestCase):
     def test_comment_cache_hashes_ids_filters_author_and_keeps_semantic_text(self):
         with tempfile.TemporaryDirectory() as directory:
             store = CacheStore(Path(directory))
-            author_hash = store.digest("user", "author")
+            author_hash = store.digest("xiaohongshu:" + "a" * 24 + ":user", "author")
             rows, _ = normalize_comment_tree(
                 [
                     {
@@ -102,6 +107,77 @@ class RnoteCollectorTest(unittest.TestCase):
             self.assertNotIn('"author"', serialized)
             self.assertEqual(rows[2]["exclusion_reason"], "author_comment")
             self.assertEqual(rows[3]["exclusion_reason"], "no_semantic_text")
+
+    def test_user_hash_is_scoped_to_content_and_default_is_two_total_attempts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = CacheStore(Path(directory))
+            first, _ = normalize_comment_tree(
+                [{"id": "1", "content": "有效文字", "user": {"userid": "same"}}],
+                note_id="a" * 24,
+                store=store,
+                author_hash=None,
+                start_order=0,
+            )
+            second, _ = normalize_comment_tree(
+                [{"id": "2", "content": "有效文字", "user": {"userid": "same"}}],
+                note_id="b" * 24,
+                store=store,
+                author_hash=None,
+                start_order=0,
+            )
+            self.assertNotEqual(first[0]["user_hash"], second[0]["user_hash"])
+        client = RnoteClient("sk-test", RequestBudget(None), delay=0)
+        self.assertEqual(client.retries, 1)
+
+    def test_truncated_response_is_retried_once_then_succeeds(self):
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps({"success": True, "data": {"comments": []}}).encode()
+
+        budget = RequestBudget(None)
+        client = RnoteClient("sk-test", budget, delay=0, retries=1)
+        with patch(
+            "collect_rnote_pilot.urllib.request.urlopen",
+            side_effect=[http.client.IncompleteRead(b"partial", 10), Response()],
+        ):
+            result = client.get("https://example.invalid/comments", {"note_id": "x"})
+        self.assertEqual(result.data, {"comments": []})
+        self.assertEqual(budget.used, 2)
+
+    def test_content_author_and_comment_user_use_the_same_content_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = CacheStore(Path(directory))
+            note_id = "a" * 24
+            content = normalize_content(
+                [{"note_list": [{"id": note_id, "user": {"userid": "author"}}]}],
+                row={"note_id": note_id, "sample_attempt_id": "A1", "url": "https://www.xiaohongshu.com/explore/" + note_id},
+                endpoint_type="image",
+                store=store,
+            )
+            comments, _ = normalize_comment_tree(
+                [{"id": "comment", "content": "作者回复", "user": {"userid": "author"}}],
+                note_id=note_id,
+                store=store,
+                author_hash=content["author_hash"],
+                start_order=0,
+            )
+            self.assertEqual(comments[0]["exclusion_reason"], "author_comment")
+
+    def test_balance_and_authentication_errors_are_fatal(self):
+        for payload in (
+            {"success": False, "error": "insufficient balance"},
+            {"success": False, "detail": "API key invalid"},
+        ):
+            with self.assertRaises(FatalProviderError):
+                RnoteClient._unwrap(payload)
 
     def test_repeated_long_copy_is_excluded_but_short_common_text_is_kept(self):
         records = []

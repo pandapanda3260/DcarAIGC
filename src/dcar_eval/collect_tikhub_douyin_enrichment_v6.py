@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime as dt
-import hashlib
 import json
 import re
 from pathlib import Path
@@ -23,6 +22,7 @@ from typing import Any, Iterable
 
 from probe_tikhub_douyin import KEY_FILE, atomic_write_json, fetch, load_key
 from project_paths import DOUYIN_PROCESSED_DIR, TIKHUB_CACHE_DIR
+from workflow.privacy import CommentHasher
 
 
 INPUT = DOUYIN_PROCESSED_DIR / "douyin_selling_point_labels_v4_full_publication_2026-08-02.jsonl"
@@ -35,6 +35,7 @@ SPAM_RE = re.compile(
     re.I,
 )
 PRINT_LOCK = threading.Lock()
+COMMENT_HASHER = CommentHasher()
 
 
 def read_rows(path: Path = INPUT) -> list[dict[str, Any]]:
@@ -48,7 +49,7 @@ def chunks(values: list[str], size: int) -> Iterable[list[str]]:
 
 def api_call(endpoint: str, params: dict[str, Any], key: str) -> tuple[int, dict[str, Any]]:
     last: Exception | None = None
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             status, payload = fetch(endpoint, params, key)
             if status == 200 and isinstance(payload, dict) and payload.get("code") == 200:
@@ -67,7 +68,7 @@ def anon_user_key(aweme_id: str, user: Any) -> str:
     raw = str(user.get("sec_uid") or user.get("uid") or user.get("unique_id") or "")
     if not raw:
         return ""
-    return "U" + hashlib.sha256(f"{aweme_id}|{raw}".encode()).hexdigest()[:12]
+    return COMMENT_HASHER.user_key("douyin", aweme_id, raw)
 
 
 def is_author(user: Any, author_uid: str) -> bool:
@@ -117,7 +118,7 @@ def sanitize_comment_page(
         "has_more": bool(data.get("has_more")),
         "reported_total": int(data.get("total") or 0),
         "comments": comments,
-        "privacy_note": "TikHub user IDs were one-way hashed per post; nicknames and profile fields were not retained.",
+        "privacy_note": "TikHub user IDs were content-scoped with HMAC-SHA256; nicknames and profile fields were not retained.",
     }
 
 
