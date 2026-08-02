@@ -139,6 +139,149 @@ class V8MediaTest(unittest.TestCase):
             ).fetchone()
         self.assertEqual((slot["status"], slot["attempt_count"]), ("succeeded", 1))
 
+    def test_automatic_download_and_processing_queues_produce_complete_video_evidence(self) -> None:
+        calls = {"download": 0, "frames": 0, "asr": 0, "ocr": 0}
+
+        def fake_download(_urls, target: Path) -> Path:
+            calls["download"] += 1
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(self.video.read_bytes())
+            return target
+
+        def fake_frames(_source: Path, target_dir: Path) -> Path:
+            calls["frames"] += 1
+            target_dir.mkdir(parents=True, exist_ok=True)
+            frame = target_dir / "frame-000.jpg"
+            frame.write_bytes(b"frame" * 500)
+            manifest = target_dir / "frames.json"
+            media._atomic_json(
+                manifest,
+                {"frames": [{"path": str(frame), "sha256": media.file_sha256(frame)}]},
+            )
+            return manifest
+
+        def fake_asr(_source: Path, target: Path) -> Path:
+            calls["asr"] += 1
+            media._atomic_json(target, {"status": "success", "text": "完整汽车语音证据"})
+            return target
+
+        def fake_ocr(_manifest: Path, target: Path) -> Path:
+            calls["ocr"] += 1
+            media._atomic_json(
+                target,
+                {"status": "success", "combined_text": "完整汽车画面证据", "source_count": 1},
+            )
+            return target
+
+        with (
+            patch.object(media, "MEDIA_ROOT", self.root / "automatic"),
+            patch.object(media, "_download_video", side_effect=fake_download),
+            patch.object(media, "_extract_frames", side_effect=fake_frames),
+            patch.object(media, "_run_asr", side_effect=fake_asr),
+            patch.object(media, "_run_ocr", side_effect=fake_ocr),
+            patch.object(media, "compile_ocr_binary", return_value=self.root / "vision_ocr"),
+        ):
+            source = media.store_media_source_manifest(
+                1,
+                media_kind="video",
+                urls=["https://cdn.example/video.mp4"],
+                raw_response_id=1,
+                db_path=self.db,
+            )
+            downloaded = media.run_media_download_queue(db_path=self.db)
+            processed = media.run_media_processing_queue(db_path=self.db)
+            repeated_download = media.run_media_download_queue(db_path=self.db)
+            repeated_processing = media.run_media_processing_queue(db_path=self.db)
+
+        self.assertIsNotNone(source)
+        self.assertEqual(downloaded["downloaded"], 1)
+        self.assertEqual(processed["evidence_ready"], 1)
+        self.assertEqual(repeated_download["candidates"], 0)
+        self.assertEqual(repeated_processing["candidates"], 0)
+        self.assertEqual(calls, {"download": 1, "frames": 1, "asr": 1, "ocr": 1})
+        with connect(self.db) as connection:
+            artifact_types = {
+                row["artifact_type"]
+                for row in connection.execute(
+                    "SELECT artifact_type FROM evidence_artifacts WHERE content_id=1"
+                )
+            }
+        self.assertTrue({"media_source", "media", "frames_manifest", "asr", "ocr"} <= artifact_types)
+
+    def test_automatic_image_queue_downloads_and_produces_ocr_without_asr(self) -> None:
+        with connect(self.db) as connection:
+            connection.execute("UPDATE content_items SET content_type='image' WHERE id=1")
+            connection.commit()
+
+        def fake_download(_urls, target_dir: Path) -> Path:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            image = target_dir / "image-000.jpg"
+            image.write_bytes(b"\xff\xd8\xff" + b"image" * 200)
+            manifest = target_dir / "manifest.json"
+            media._atomic_json(
+                manifest,
+                {
+                    "status": "complete",
+                    "frames": [{"path": str(image), "sha256": media.file_sha256(image)}],
+                },
+            )
+            return manifest
+
+        def fake_ocr(_manifest: Path, target: Path) -> Path:
+            media._atomic_json(
+                target,
+                {"status": "success", "combined_text": "图文汽车证据", "source_count": 1},
+            )
+            return target
+
+        with (
+            patch.object(media, "MEDIA_ROOT", self.root / "automatic-images"),
+            patch.object(media, "_download_images", side_effect=fake_download),
+            patch.object(media, "_run_ocr", side_effect=fake_ocr),
+            patch.object(media, "compile_ocr_binary", return_value=self.root / "vision_ocr"),
+        ):
+            media.store_media_source_manifest(
+                1,
+                media_kind="image",
+                urls=["https://cdn.example/image.jpg"],
+                raw_response_id=2,
+                db_path=self.db,
+            )
+            downloaded = media.run_media_download_queue(db_path=self.db)
+            processed = media.run_media_processing_queue(db_path=self.db)
+
+        self.assertEqual(downloaded["downloaded"], 1)
+        self.assertEqual(processed["evidence_ready"], 1)
+        with connect(self.db) as connection:
+            artifact_types = {
+                row["artifact_type"]
+                for row in connection.execute(
+                    "SELECT artifact_type FROM evidence_artifacts WHERE content_id=1"
+                )
+            }
+        self.assertTrue({"media_source", "media_manifest", "ocr"} <= artifact_types)
+        self.assertNotIn("asr", artifact_types)
+
+    def test_processing_queue_does_not_reprocess_migrated_media_without_v8_source(self) -> None:
+        captured_at = now_utc()
+        legacy = self.root / "legacy.mp4"
+        legacy.write_bytes(self.video.read_bytes())
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                INSERT INTO evidence_artifacts(
+                    content_id, artifact_type, local_path, sha256, processor_version,
+                    status, captured_at, created_at
+                ) VALUES (1, 'media', ?, ?, 'legacy-migration', 'available', ?, ?)
+                """,
+                (str(legacy), media.file_sha256(legacy), captured_at, captured_at),
+            )
+            connection.commit()
+        with patch.object(media, "compile_ocr_binary") as compile_ocr:
+            result = media.run_media_processing_queue(db_path=self.db)
+        self.assertEqual(result["candidates"], 0)
+        compile_ocr.assert_not_called()
+
     def test_legacy_ocr_observations_are_aggregated_before_resolution(self) -> None:
         asr = self.root / "asr.json"
         ocr = self.root / "ocr.json"

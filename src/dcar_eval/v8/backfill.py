@@ -590,6 +590,62 @@ def run_pilot(*, db_path: Path = DEFAULT_DB, key_file: Path = KEY_FILE) -> Dict[
     return {"results": results, "status": pilot_metrics, "gate": gate}
 
 
+def run_daily_backfill_batch(
+    *,
+    limit: int = 20,
+    db_path: Path = DEFAULT_DB,
+    key_file: Path = KEY_FILE,
+) -> Dict[str, Any]:
+    """Run the bounded automatic backfill without bypassing the pilot or daily quota."""
+
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+    with connect(db_path) as connection:
+        budget = connection.execute(
+            "SELECT * FROM provider_budget_batches WHERE id=?", (BUDGET_ID,)
+        ).fetchone()
+    if budget is None:
+        return {"status": "skipped", "reason": "backfill budget is missing", "attempted": 0}
+    budget_status = str(budget["status"])
+    if budget_status in {"draft", "pilot"}:
+        return {"status": "pilot", **run_pilot(db_path=db_path, key_file=key_file)}
+    if budget_status != "approved":
+        return {
+            "status": "skipped",
+            "reason": f"backfill budget is {budget_status}",
+            "attempted": 0,
+        }
+    items = [
+        item for item in backfill_candidates(db_path=db_path)
+        if item["reason_code"] == "media_evidence_missing"
+        and item["review_status"] in {"pending", "manual_required"}
+    ][: min(limit, int(budget["daily_quota"]))]
+    if not items:
+        return {"status": "succeeded", "attempted": 0, "results": {}}
+    adapter = RnoteVideoAdapter(load_key(key_file))
+    results: Dict[str, int] = {}
+    attempted = 0
+    for item in items:
+        try:
+            item_status = process_paid_candidate(item, adapter=adapter, db_path=db_path)
+            attempted += 1
+        except CaptureError as exc:
+            results[exc.error_code] = results.get(exc.error_code, 0) + 1
+            if exc.error_code in {"provider_balance_blocked", "provider_auth_blocked"}:
+                break
+            continue
+        except (BudgetBlocked, SlotUnavailable) as exc:
+            results[type(exc).__name__] = results.get(type(exc).__name__, 0) + 1
+            break
+        results[item_status] = results.get(item_status, 0) + 1
+    return {
+        "status": "partial" if any(key.endswith("blocked") for key in results) else "succeeded",
+        "attempted": attempted,
+        "results": results,
+        "routes": route_summary(db_path=db_path),
+    }
+
+
 def route_remaining_manual_after_failed_gate(*, db_path: Path = DEFAULT_DB) -> int:
     with connect(db_path) as connection, transaction(connection):
         budget = connection.execute(

@@ -24,6 +24,9 @@ from .storage import DEFAULT_DB, PROJECT_ROOT, connect, now_utc, transaction
 CONFIG_PATH = PROJECT_ROOT / "config" / "media_processor_v8.json"
 MEDIA_ROOT = PROJECT_ROOT / "data" / "cache" / "v8" / "media"
 OCR_SOURCE = PROJECT_ROOT / "src" / "dcar_eval" / "vision_ocr.swift"
+MEDIA_SOURCE_VERSION = "provider-media-source-v8.0"
+VIDEO_DOWNLOAD_VERSION = "provider-media-download-v8.0"
+IMAGE_DOWNLOAD_VERSION = "provider-image-download-v8.0"
 
 
 class MediaProcessingError(RuntimeError):
@@ -108,6 +111,16 @@ def _relative(path: Path) -> str:
 def _resolved(local_path: str) -> Path:
     path = Path(local_path)
     return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def _read_json_object(path: Path) -> Dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def _safe_float(value: Any) -> Optional[float]:
@@ -361,9 +374,144 @@ def download_video_sources(
         content_id=content_id,
         source_sha256=source_sha256,
         processor_type="download",
-        processor_version="provider-media-download-v8.0",
+        processor_version=VIDEO_DOWNLOAD_VERSION,
         artifact_type="media",
         produce=lambda: _download_video(values, target),
+        metadata={"source_count": len(values)},
+    )
+
+
+def store_media_source_manifest(
+    content_id: int,
+    *,
+    media_kind: str,
+    urls: Iterable[str],
+    raw_response_id: int,
+    db_path: Path = DEFAULT_DB,
+) -> Optional[Artifact]:
+    """Persist normalized provider media URLs for the later local-compute jobs."""
+
+    if media_kind not in {"video", "image"}:
+        raise MediaProcessingError(f"unsupported media kind: {media_kind}")
+    values = [value for value in dict.fromkeys(urls) if value.startswith("https://")]
+    if not values:
+        return None
+    with connect(db_path) as connection:
+        content = connection.execute(
+            "SELECT link_id FROM content_items WHERE id=?", (content_id,)
+        ).fetchone()
+    if content is None:
+        raise MediaProcessingError(f"unknown content {content_id}")
+    target = MEDIA_ROOT / str(content["link_id"]) / "source.json"
+    _atomic_json(
+        target,
+        {
+            "schema_version": MEDIA_SOURCE_VERSION,
+            "media_kind": media_kind,
+            "urls": values,
+            "raw_response_id": raw_response_id,
+            "captured_at": now_utc(),
+        },
+    )
+    with connect(db_path) as connection, transaction(connection):
+        return register_artifact(
+            connection,
+            content_id=content_id,
+            artifact_type="media_source",
+            path=target,
+            processor_version=MEDIA_SOURCE_VERSION,
+            metadata={"media_kind": media_kind, "source_count": len(values)},
+        )
+
+
+def _valid_image(path: Path) -> bool:
+    if not path.is_file() or path.stat().st_size <= 512:
+        return False
+    header = path.read_bytes()[:16]
+    return bool(
+        header.startswith(b"\xff\xd8\xff")
+        or header.startswith(b"\x89PNG\r\n\x1a\n")
+        or (header.startswith(b"RIFF") and header[8:12] == b"WEBP")
+        or header.startswith((b"GIF87a", b"GIF89a"))
+    )
+
+
+def _download_images(urls: Iterable[str], target_dir: Path) -> Path:
+    values = list(dict.fromkeys(urls))
+    target_dir.mkdir(parents=True, exist_ok=True)
+    paths: List[Path] = []
+    errors: List[str] = []
+    for index, url in enumerate(values):
+        target = target_dir / f"image-{index:03d}.bin"
+        if _valid_image(target):
+            paths.append(target)
+            continue
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "image/*,*/*;q=0.8"},
+        )
+        temporary = target.with_name(f".{target.name}.tmp")
+        temporary.unlink(missing_ok=True)
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response, temporary.open("wb") as handle:
+                while True:
+                    block = response.read(1024 * 1024)
+                    if not block:
+                        break
+                    handle.write(block)
+            if not _valid_image(temporary):
+                errors.append(f"image {index} was not a supported image")
+                continue
+            temporary.replace(target)
+            paths.append(target)
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
+            errors.append(f"image {index}: {type(exc).__name__}")
+        finally:
+            temporary.unlink(missing_ok=True)
+    if not paths:
+        raise MediaProcessingError("image download failed: " + " | ".join(errors[-3:]))
+    manifest = target_dir / "manifest.json"
+    _atomic_json(
+        manifest,
+        {
+            "status": "complete" if len(paths) == len(values) else "partial",
+            "image_paths": [_relative(path) for path in paths],
+            "frames": [
+                {"path": _relative(path), "sha256": file_sha256(path)} for path in paths
+            ],
+            "errors": errors,
+        },
+    )
+    return manifest
+
+
+def download_image_sources(
+    content_id: int,
+    urls: Iterable[str],
+    *,
+    db_path: Path = DEFAULT_DB,
+) -> Artifact:
+    values = [value for value in dict.fromkeys(urls) if value.startswith("https://")]
+    if not values:
+        raise MediaProcessingError("provider returned no HTTPS image source")
+    source_sha256 = hashlib.sha256(
+        json.dumps(values, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    with connect(db_path) as connection:
+        content = connection.execute(
+            "SELECT link_id FROM content_items WHERE id=?", (content_id,)
+        ).fetchone()
+    if content is None:
+        raise MediaProcessingError(f"unknown content {content_id}")
+    target_dir = MEDIA_ROOT / str(content["link_id"]) / "images"
+    return _run_processing_slot(
+        db_path=db_path,
+        content_id=content_id,
+        source_sha256=source_sha256,
+        processor_type="download",
+        processor_version=IMAGE_DOWNLOAD_VERSION,
+        artifact_type="media_manifest",
+        produce=lambda: _download_images(values, target_dir),
         metadata={"source_count": len(values)},
     )
 
@@ -561,6 +709,201 @@ def process_video_evidence(
         produce=lambda: _run_ocr(_resolved(frames.local_path), content_root / "ocr.json"),
     )
     return {"media": media, "frames": frames, "asr": asr, "ocr": ocr}
+
+
+def process_image_evidence(
+    content_id: int,
+    manifest_path: Path,
+    *,
+    db_path: Path = DEFAULT_DB,
+) -> Dict[str, Artifact]:
+    if not manifest_path.is_file():
+        raise MediaProcessingError(f"image manifest does not exist: {manifest_path}")
+    versions = processor_versions()
+    with connect(db_path) as connection, transaction(connection):
+        media_manifest = register_artifact(
+            connection,
+            content_id=content_id,
+            artifact_type="media_manifest",
+            path=manifest_path,
+            processor_version=IMAGE_DOWNLOAD_VERSION,
+        )
+        content = connection.execute(
+            "SELECT link_id FROM content_items WHERE id=?", (content_id,)
+        ).fetchone()
+        if content is None:
+            raise MediaProcessingError(f"unknown content {content_id}")
+    target = MEDIA_ROOT / str(content["link_id"]) / "ocr.json"
+    ocr = _run_processing_slot(
+        db_path=db_path,
+        content_id=content_id,
+        source_sha256=media_manifest.sha256,
+        processor_type="ocr",
+        processor_version=versions["ocr"],
+        artifact_type="ocr",
+        produce=lambda: _run_ocr(manifest_path, target),
+    )
+    return {"media": media_manifest, "ocr": ocr}
+
+
+def _latest_media_source(content_id: int, *, db_path: Path) -> Optional[Dict[str, Any]]:
+    with connect(db_path) as connection:
+        row = connection.execute(
+            """
+            SELECT local_path FROM evidence_artifacts
+            WHERE content_id=? AND artifact_type='media_source' AND status='available'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (content_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    value = _read_json_object(_resolved(str(row["local_path"])))
+    return value if value.get("urls") else None
+
+
+def process_content_media(
+    content_id: int,
+    *,
+    download_only: bool = False,
+    db_path: Path = DEFAULT_DB,
+) -> Dict[str, Any]:
+    source = _latest_media_source(content_id, db_path=db_path)
+    if source is None:
+        return {"content_id": content_id, "status": "no_source"}
+    media_kind = str(source.get("media_kind") or "")
+    urls = [str(value) for value in source.get("urls", []) if isinstance(value, str)]
+    if media_kind == "video":
+        media = download_video_sources(content_id, urls, db_path=db_path)
+        if download_only:
+            return {
+                "content_id": content_id,
+                "status": "downloaded",
+                "media_kind": media_kind,
+                "artifact_id": media.id,
+            }
+        artifacts = process_video_evidence(
+            content_id, _resolved(media.local_path), db_path=db_path
+        )
+    elif media_kind == "image":
+        media = download_image_sources(content_id, urls, db_path=db_path)
+        if download_only:
+            return {
+                "content_id": content_id,
+                "status": "downloaded",
+                "media_kind": media_kind,
+                "artifact_id": media.id,
+            }
+        artifacts = process_image_evidence(
+            content_id, _resolved(media.local_path), db_path=db_path
+        )
+    else:
+        raise MediaProcessingError(f"invalid media source kind for content {content_id}")
+    return {
+        "content_id": content_id,
+        "status": "evidence_ready",
+        "media_kind": media_kind,
+        "artifacts": {name: artifact.id for name, artifact in artifacts.items()},
+    }
+
+
+def _queue_content_ids(*, stage: str, limit: int, db_path: Path) -> List[int]:
+    if stage == "download":
+        predicate = """
+            EXISTS (
+                SELECT 1 FROM evidence_artifacts source
+                WHERE source.content_id=c.id AND source.artifact_type='media_source'
+                  AND source.status='available'
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM evidence_artifacts media
+                WHERE media.content_id=c.id AND media.artifact_type IN ('media','media_manifest')
+                  AND media.status='available'
+            )
+        """
+    elif stage == "process":
+        predicate = """
+            EXISTS (
+                SELECT 1 FROM evidence_artifacts source
+                WHERE source.content_id=c.id AND source.artifact_type='media_source'
+                  AND source.status='available'
+            )
+            AND
+            EXISTS (
+                SELECT 1 FROM evidence_artifacts media
+                WHERE media.content_id=c.id AND media.artifact_type IN ('media','media_manifest')
+                  AND media.status='available'
+            )
+            AND (
+                (c.content_type='video' AND (
+                    NOT EXISTS (SELECT 1 FROM evidence_artifacts a WHERE a.content_id=c.id AND a.artifact_type='asr' AND a.status='available')
+                    OR NOT EXISTS (SELECT 1 FROM evidence_artifacts o WHERE o.content_id=c.id AND o.artifact_type='ocr' AND o.status='available')
+                ))
+                OR (c.content_type<>'video' AND NOT EXISTS (
+                    SELECT 1 FROM evidence_artifacts o WHERE o.content_id=c.id AND o.artifact_type='ocr' AND o.status='available'
+                ))
+            )
+        """
+    else:
+        raise ValueError(f"unknown media queue stage: {stage}")
+    with connect(db_path) as connection:
+        rows = connection.execute(
+            f"SELECT c.id FROM content_items c WHERE {predicate} ORDER BY c.id LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [int(row["id"]) for row in rows]
+
+
+def run_media_download_queue(
+    *, limit: int = 100, db_path: Path = DEFAULT_DB
+) -> Dict[str, Any]:
+    content_ids = _queue_content_ids(stage="download", limit=limit, db_path=db_path)
+    results: List[Dict[str, Any]] = []
+    for content_id in content_ids:
+        try:
+            results.append(
+                process_content_media(content_id, download_only=True, db_path=db_path)
+            )
+        except Exception as exc:
+            results.append(
+                {
+                    "content_id": content_id,
+                    "status": "retryable_failed",
+                    "error": f"{type(exc).__name__}: {exc}"[:500],
+                }
+            )
+    return {
+        "candidates": len(content_ids),
+        "downloaded": sum(item["status"] == "downloaded" for item in results),
+        "failed": sum(item["status"] == "retryable_failed" for item in results),
+        "results": results,
+    }
+
+
+def run_media_processing_queue(
+    *, limit: int = 100, db_path: Path = DEFAULT_DB
+) -> Dict[str, Any]:
+    content_ids = _queue_content_ids(stage="process", limit=limit, db_path=db_path)
+    if content_ids and not ocr_binary_path().is_file():
+        compile_ocr_binary()
+    results: List[Dict[str, Any]] = []
+    for content_id in content_ids:
+        try:
+            results.append(process_content_media(content_id, db_path=db_path))
+        except Exception as exc:
+            results.append(
+                {
+                    "content_id": content_id,
+                    "status": "retryable_failed",
+                    "error": f"{type(exc).__name__}: {exc}"[:500],
+                }
+            )
+    return {
+        "candidates": len(content_ids),
+        "evidence_ready": sum(item["status"] == "evidence_ready" for item in results),
+        "failed": sum(item["status"] == "retryable_failed" for item in results),
+        "results": results,
+    }
 
 
 def ingest_existing_video_evidence(

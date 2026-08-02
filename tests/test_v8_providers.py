@@ -1,20 +1,23 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
+from unittest.mock import patch
 
 from v8.capture import CaptureError, ProviderResult
 from v8.operations import upsert_account, upsert_content
-from v8.providers import discover_account_content, update_content_data
+from v8.providers import _collect_media_urls, discover_account_content, update_content_data
 from v8.storage import connect, initialize_database, now_utc
 
 
 class V8ProviderUpdateTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
-        self.db = Path(self.temp.name) / "providers.sqlite3"
+        self.root = Path(self.temp.name)
+        self.db = self.root / "providers.sqlite3"
         with connect(self.db) as connection:
             initialize_database(connection)
             captured_at = now_utc()
@@ -50,6 +53,27 @@ class V8ProviderUpdateTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
+    def test_media_url_extraction_keeps_sources_and_excludes_covers_and_avatars(self) -> None:
+        payload = {
+            "video": {
+                "play_addr": {"url_list": ["https://cdn.example/video.mp4"]},
+                "cover": {"url_list": ["https://cdn.example/cover.jpg"]},
+            },
+            "author": {"avatar": "https://cdn.example/avatar.jpg"},
+            "images": [
+                {"url_default": "https://cdn.example/image-1.jpg"},
+                {"url_pre": "https://cdn.example/image-2.jpg"},
+            ],
+        }
+        self.assertEqual(
+            _collect_media_urls(payload, "video"),
+            ["https://cdn.example/video.mp4"],
+        )
+        self.assertEqual(
+            _collect_media_urls(payload, "image"),
+            ["https://cdn.example/image-1.jpg", "https://cdn.example/image-2.jpg"],
+        )
+
     @staticmethod
     def successful_call(stage, content):
         if stage == "detail":
@@ -80,6 +104,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
         )
         self.assertEqual(first["status"], "succeeded")
         self.assertEqual(first["provider_cost"], 0.003)
+        self.assertEqual(first["media"]["status"], "no_source")
         self.assertEqual([item["stage"] for item in first["stages"]], ["detail", "metrics", "comments"])
         second = update_content_data(
             self.content_id, db_path=self.db, call_override=self.successful_call
@@ -200,6 +225,42 @@ class V8ProviderUpdateTest(unittest.TestCase):
         self.assertEqual(len(slots), 2)
         self.assertTrue(all(row["status"] == "succeeded" for row in slots))
         self.assertEqual(len(raws), 2)
+
+    def test_detail_persists_media_source_and_update_data_runs_local_media(self) -> None:
+        def detail_call(stage, content):
+            self.assertEqual(stage, "detail")
+            data = {
+                "title": "汽车视频", "body": "汽车视频正文",
+                "published_at": "2026-08-01T04:00:00Z",
+                "account_uid": "99887766", "account_name": "汽车号",
+                "content_type": "video",
+                "media_urls": ["https://cdn.example/video.mp4"],
+            }
+            return ProviderResult(data, {"stage": stage, "data": data}, 200, True)
+
+        with (
+            patch("v8.media.MEDIA_ROOT", self.root / "media"),
+            patch(
+                "v8.providers.process_content_media",
+                return_value={"content_id": self.content_id, "status": "evidence_ready"},
+            ) as process_media,
+        ):
+            result = update_content_data(
+                self.content_id,
+                db_path=self.db,
+                call_override=detail_call,
+                stages=["detail"],
+            )
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["media"]["status"], "evidence_ready")
+        process_media.assert_called_once_with(self.content_id, db_path=self.db)
+        with connect(self.db) as connection:
+            source = connection.execute(
+                "SELECT * FROM evidence_artifacts WHERE artifact_type='media_source'"
+            ).fetchone()
+        self.assertIsNotNone(source)
+        manifest = Path(str(source["local_path"]))
+        self.assertEqual(json.loads(manifest.read_text(encoding="utf-8"))["media_kind"], "video")
 
 
 if __name__ == "__main__":

@@ -24,6 +24,7 @@ from .capture import (
     execute_content_fetch,
 )
 from .evaluation import evaluate_content, upsert_comment_user_scores
+from .media import process_content_media, store_media_source_manifest
 from .operations import upsert_content
 from .storage import DEFAULT_DB, connect, now_utc, transaction
 
@@ -228,6 +229,40 @@ def _collect_dicts(value: Any, identity_name: str) -> List[Mapping[str, Any]]:
     return found
 
 
+def _collect_media_urls(value: Any, media_kind: str) -> List[str]:
+    """Extract provider media URLs while excluding avatars and unrelated navigation assets."""
+
+    positive: tuple[str, ...]
+    if media_kind == "video":
+        positive = ("video", "play", "stream", "h264", "h265", "master", "bit_rate")
+    elif media_kind == "image":
+        positive = ("image", "images", "image_list", "imageinfo", "url_default", "url_pre")
+    else:
+        raise ValueError(f"unsupported media kind: {media_kind}")
+    excluded = ("avatar", "author", "user", "music", "share", "icon", "cover")
+    output: List[str] = []
+
+    def visit(child: Any, path: str) -> None:
+        if isinstance(child, str):
+            lowered = path.lower()
+            if (
+                child.startswith("https://")
+                and any(token in lowered for token in positive)
+                and not any(token in lowered for token in excluded)
+                and child not in output
+            ):
+                output.append(child)
+        elif isinstance(child, dict):
+            for key, nested in child.items():
+                visit(nested, f"{path}.{key}" if path else str(key))
+        elif isinstance(child, list):
+            for index, nested in enumerate(child):
+                visit(nested, f"{path}[{index}]")
+
+    visit(value, "")
+    return output
+
+
 def _douyin_reference_call(uid: str, key: str) -> ProviderResult:
     status, payload = _request_json(
         f"{TIKHUB_BASE}/api/v1/douyin/web/encrypt_uid_to_sec_user_id",
@@ -342,12 +377,14 @@ def _douyin_call(stage: str, content_id: str, key: str) -> ProviderResult:
             )
         author = _mapping(item.get("author"))
         published = _first_int(item, "create_time")
+        content_type = "image" if item.get("images") else "video"
         normalized = {
             "title": str(item.get("desc") or ""), "body": str(item.get("desc") or ""),
             "published_at": datetime.fromtimestamp(published, tz=ZoneInfo("UTC")).isoformat().replace("+00:00", "Z") if published else None,
             "account_uid": str(author.get("uid") or ""),
             "account_name": str(author.get("nickname") or ""),
-            "content_type": "video",
+            "content_type": content_type,
+            "media_urls": _collect_media_urls(item, content_type),
         }
         return ProviderResult(normalized, payload, status, True)
     page = data if isinstance(data, dict) else {}
@@ -473,6 +510,7 @@ def _rnote_call(stage: str, content_id: str, key: str, content_type: str) -> Pro
             "account_uid": str(note_user.get("user_id") or note_user.get("id") or note_user.get("uid") or ""),
             "account_name": str(note_user.get("nickname") or note_user.get("name") or ""),
             "content_type": content_type,
+            "media_urls": _collect_media_urls(note, "video" if content_type == "video" else "image"),
         }
     else:
         normalized = {
@@ -574,6 +612,14 @@ def _store_stage_result(
                         item.get("published_at"), item.get("like_count"), item.get("parent_comment_id"),
                     ),
                 )
+    if stage == "detail":
+        store_media_source_manifest(
+            int(content["id"]),
+            media_kind="video" if data.get("content_type") == "video" else "image",
+            urls=[str(value) for value in data.get("media_urls", []) if isinstance(value, str)],
+            raw_response_id=int(outcome.raw_response_id),
+            db_path=db_path,
+        )
     if stage == "comments" and evidence_id is not None:
         import analyze_douyin_tikhub_v6 as scoring  # type: ignore[import-not-found]
 
@@ -721,6 +767,7 @@ def update_content_data(
     db_path: Path = DEFAULT_DB,
     call_override: Optional[Callable[[str, Mapping[str, Any]], ProviderResult]] = None,
     stages: Optional[Sequence[str]] = None,
+    process_media: bool = True,
 ) -> Dict[str, Any]:
     with connect(db_path) as connection:
         row = connection.execute("SELECT * FROM content_items WHERE id=?", (content_id,)).fetchone()
@@ -805,14 +852,27 @@ def update_content_data(
             )
             if error_code in {"provider_balance_blocked", "provider_auth_blocked", "budget_blocked"}:
                 break
-    evaluation = evaluate_content(content_id, db_path=db_path)
+    media_result: Optional[Dict[str, Any]] = None
+    if process_media:
+        try:
+            media_result = process_content_media(content_id, db_path=db_path)
+        except Exception as exc:
+            media_result = {
+                "content_id": content_id,
+                "status": "retryable_failed",
+                "error": f"{type(exc).__name__}: {exc}"[:500],
+            }
+    evaluation = evaluate_content(content_id, db_path=db_path) if process_media else None
     failed = any(item["status"] == "failed" for item in outcomes)
+    if media_result is not None and media_result.get("status") == "retryable_failed":
+        failed = True
     return {
         "content_id": content_id,
         "status": "partial" if failed else "succeeded",
         "stages": outcomes,
-        "evaluation_id": evaluation.evaluation_id,
-        "evaluation_created": evaluation.created,
+        "media": media_result,
+        "evaluation_id": evaluation.evaluation_id if evaluation is not None else None,
+        "evaluation_created": evaluation.created if evaluation is not None else False,
         "provider_cost": round(sum(float(item.get("amount") or 0) for item in outcomes), 6),
         "currency": "USD",
     }

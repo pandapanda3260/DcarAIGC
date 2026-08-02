@@ -13,6 +13,7 @@ from v8.backfill import (
     prepare_backfill_slots,
     process_paid_candidate,
     route_provider_blocked_manual,
+    run_daily_backfill_batch,
     run_pilot,
 )
 from v8.capture import CaptureError, ProviderResult, activate_pilot_budget
@@ -203,6 +204,9 @@ class V8BackfillTest(unittest.TestCase):
         self.assertTrue(all(row["status"] == "manual_required" for row in reviews))
         self.assertEqual(budget["status"], "suspended")
         self.assertEqual(budget["consumed_amount"], 0)
+        automatic = run_daily_backfill_batch(db_path=self.db, key_file=self.root / "unused")
+        self.assertEqual(automatic["status"], "skipped")
+        self.assertEqual(automatic["attempted"], 0)
 
 
 if __name__ == "__main__":

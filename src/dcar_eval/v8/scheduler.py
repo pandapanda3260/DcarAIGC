@@ -12,8 +12,10 @@ from zoneinfo import ZoneInfo
 from apscheduler.schedulers.background import BackgroundScheduler  # type: ignore[import-untyped]
 from apscheduler.triggers.cron import CronTrigger  # type: ignore[import-untyped]
 
+from .backfill import run_daily_backfill_batch
 from .capture import ProviderResult, ensure_content_slot
 from .evaluation import evaluate_incremental
+from .media import run_media_download_queue, run_media_processing_queue
 from .providers import STAGE_CONFIG, discover_account_content, update_content_data
 from .reports import REPORTS_ROOT, create_and_run_task
 from .storage import DEFAULT_DB, connect, now_utc, transaction
@@ -30,7 +32,9 @@ class JobDefinition:
 
 JOBS = (
     JobDefinition("daily_capture", 2, 0),
-    JobDefinition("daily_evaluation", 2, 30),
+    JobDefinition("daily_media_download", 2, 20),
+    JobDefinition("daily_media_processing", 3, 0),
+    JobDefinition("daily_media_cutoff", 7, 30),
     JobDefinition("daily_report", 8, 0),
     JobDefinition("weekly_report", 8, 30, "mon"),
 )
@@ -259,7 +263,7 @@ def run_due_capture(
             continue
         result = update_content_data(
             int(content["id"]), as_of=local_day, db_path=db_path,
-            call_override=call_override, stages=stages,
+            call_override=call_override, stages=stages, process_media=False,
         )
         content_updates.append(result)
         blocked = next(
@@ -285,6 +289,112 @@ def run_due_capture(
     }
 
 
+def run_media_cutoff(
+    scheduled_for: datetime,
+    *,
+    db_path: Path = DEFAULT_DB,
+) -> Dict[str, Any]:
+    """Route unfinished same-day media to review, then evaluate only final evidence state."""
+
+    local_day = scheduled_for.astimezone(SHANGHAI).date()
+    start = datetime.combine(local_day, time.min, SHANGHAI).astimezone(timezone.utc)
+    end = start + timedelta(days=1)
+    start_iso = start.isoformat(timespec="seconds").replace("+00:00", "Z")
+    end_iso = end.isoformat(timespec="seconds").replace("+00:00", "Z")
+    with connect(db_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT c.id, c.content_type,
+              EXISTS(
+                SELECT 1 FROM evidence_artifacts ea
+                WHERE ea.content_id=c.id AND ea.artifact_type IN ('media','media_manifest')
+                  AND ea.status='available'
+              ) media_ready,
+              EXISTS(
+                SELECT 1 FROM evidence_artifacts ea
+                WHERE ea.content_id=c.id AND ea.artifact_type='asr' AND ea.status='available'
+              ) asr_ready,
+              EXISTS(
+                SELECT 1 FROM evidence_artifacts ea
+                WHERE ea.content_id=c.id AND ea.artifact_type='ocr' AND ea.status='available'
+              ) ocr_ready
+            FROM content_items c
+            WHERE c.platform IN ('douyin','xiaohongshu')
+              AND c.content_type IN ('video','image')
+              AND (
+                (c.source_group='' AND c.imported_at>=? AND c.imported_at<?)
+                OR EXISTS(
+                    SELECT 1 FROM provider_raw_responses pr
+                    WHERE pr.content_id=c.id AND pr.operation IN (
+                        'douyin_video_detail','xiaohongshu_note_detail'
+                    ) AND pr.captured_at>=? AND pr.captured_at<?
+                )
+              )
+            ORDER BY c.id
+            """,
+            (start_iso, end_iso, start_iso, end_iso),
+        ).fetchall()
+    complete_ids: List[int] = []
+    incomplete_ids: List[int] = []
+    for row in rows:
+        complete = bool(row["media_ready"] and row["ocr_ready"])
+        if row["content_type"] == "video":
+            complete = bool(complete and row["asr_ready"])
+        (complete_ids if complete else incomplete_ids).append(int(row["id"]))
+    with connect(db_path) as connection, transaction(connection):
+        for content_id in incomplete_ids:
+            evaluation = connection.execute(
+                """
+                SELECT id FROM evaluation_versions WHERE content_id=?
+                ORDER BY evaluated_at DESC, id DESC LIMIT 1
+                """,
+                (content_id,),
+            ).fetchone()
+            connection.execute(
+                """
+                INSERT INTO review_queue(
+                    content_id, evaluation_id, reason_code, priority, status,
+                    created_at, updated_at
+                ) VALUES (?, ?, 'media_processing_incomplete', 90, 'manual_required', ?, ?)
+                ON CONFLICT(content_id, reason_code) DO UPDATE SET
+                    evaluation_id=excluded.evaluation_id,
+                    status=CASE
+                        WHEN review_queue.status IN ('resolved','terminal_failed')
+                        THEN review_queue.status ELSE 'manual_required' END,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    content_id,
+                    evaluation["id"] if evaluation is not None else None,
+                    now_utc(),
+                    now_utc(),
+                ),
+            )
+        for content_id in complete_ids:
+            connection.execute(
+                """
+                UPDATE review_queue SET status='resolved', resolved_at=?, updated_at=?
+                WHERE content_id=? AND reason_code='media_processing_incomplete'
+                  AND status NOT IN ('resolved','terminal_failed')
+                """,
+                (now_utc(), now_utc(), content_id),
+            )
+    evaluation = evaluate_incremental(db_path=db_path)
+    total = len(rows)
+    coverage = round(len(complete_ids) / total, 4) if total else 1.0
+    return {
+        "window_start": start_iso,
+        "window_end": end_iso,
+        "candidates": total,
+        "complete": len(complete_ids),
+        "manual_required": len(incomplete_ids),
+        "terminal_coverage": coverage,
+        "threshold": 0.95,
+        "threshold_status": "available" if coverage >= 0.95 else "below_threshold",
+        "evaluation": evaluation,
+    }
+
+
 def _run_job_action(
     job_id: str,
     scheduled_for: datetime,
@@ -301,8 +411,15 @@ def _run_job_action(
             scheduled_for, db_path=db_path, call_override=capture_call_override
         )
         return str(details.pop("status")), details
-    if job_id == "daily_evaluation":
-        return "succeeded", evaluate_incremental(db_path=db_path)
+    if job_id == "daily_media_download":
+        return "succeeded", {
+            "backfill": run_daily_backfill_batch(limit=20, db_path=db_path),
+            "fresh_content": run_media_download_queue(limit=100, db_path=db_path),
+        }
+    if job_id == "daily_media_processing":
+        return "succeeded", run_media_processing_queue(limit=100, db_path=db_path)
+    if job_id == "daily_media_cutoff":
+        return "succeeded", run_media_cutoff(scheduled_for, db_path=db_path)
     if job_id == "daily_report":
         target = local_date - timedelta(days=1)
         task = create_and_run_task(

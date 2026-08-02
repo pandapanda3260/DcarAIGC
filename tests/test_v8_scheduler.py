@@ -10,7 +10,14 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 from v8.capture import ProviderResult
 from v8.operations import upsert_account
-from v8.scheduler import JOBS, execute_job, install_jobs, latest_occurrence, startup_catchup
+from v8.scheduler import (
+    JOBS,
+    execute_job,
+    install_jobs,
+    latest_occurrence,
+    run_media_cutoff,
+    startup_catchup,
+)
 from v8.storage import PROJECT_ROOT, connect, initialize_database, now_utc
 
 
@@ -40,13 +47,15 @@ class V8SchedulerTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def test_four_fixed_jobs_are_registered_with_the_expected_times(self) -> None:
+    def test_six_fixed_jobs_are_registered_with_the_expected_times(self) -> None:
         scheduler = BackgroundScheduler(timezone=SHANGHAI)
         install_jobs(scheduler, db_path=self.db, reports_root=self.reports)
         jobs = {job.id: str(job.trigger) for job in scheduler.get_jobs()}
         self.assertEqual(set(jobs), {job.job_id for job in JOBS})
         self.assertIn("hour='2', minute='0'", jobs["daily_capture"])
-        self.assertIn("hour='2', minute='30'", jobs["daily_evaluation"])
+        self.assertIn("hour='2', minute='20'", jobs["daily_media_download"])
+        self.assertIn("hour='3', minute='0'", jobs["daily_media_processing"])
+        self.assertIn("hour='7', minute='30'", jobs["daily_media_cutoff"])
         self.assertIn("hour='8', minute='0'", jobs["daily_report"])
         self.assertIn("day_of_week='mon'", jobs["weekly_report"])
 
@@ -82,7 +91,9 @@ class V8SchedulerTest(unittest.TestCase):
                 for row in connection.execute("SELECT job_id, status FROM scheduler_runs")
             }
         self.assertEqual(statuses["daily_capture"], "skipped")
-        self.assertEqual(statuses["daily_evaluation"], "succeeded")
+        self.assertEqual(statuses["daily_media_download"], "succeeded")
+        self.assertEqual(statuses["daily_media_processing"], "succeeded")
+        self.assertEqual(statuses["daily_media_cutoff"], "succeeded")
 
     def test_latest_weekly_occurrence_is_monday_0830(self) -> None:
         weekly = next(job for job in JOBS if job.job_id == "weekly_report")
@@ -139,6 +150,46 @@ class V8SchedulerTest(unittest.TestCase):
         self.assertEqual(content["title"], "新车内容详情")
         self.assertEqual(snapshot["view_count"], 100)
         self.assertTrue(all(row["status"] == "succeeded" for row in slots))
+
+    def test_media_cutoff_routes_only_new_unfinished_content(self) -> None:
+        captured_at = "2026-08-02T00:00:00Z"
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                INSERT INTO content_items(
+                    link_id, platform, platform_content_id, canonical_url, title, body,
+                    content_type, source_group, imported_at, created_at, updated_at
+                ) VALUES ('A2BC3D','douyin','111111111','https://www.douyin.com/video/111111111',
+                          '新内容','汽车新内容','video','',?,?,?)
+                """,
+                (captured_at, captured_at, captured_at),
+            )
+            connection.execute(
+                """
+                INSERT INTO content_items(
+                    link_id, platform, platform_content_id, canonical_url, title, body,
+                    content_type, source_group, imported_at, created_at, updated_at
+                ) VALUES ('A2BC3E','douyin','222222222','https://www.douyin.com/video/222222222',
+                          '迁移内容','汽车迁移内容','video','30-account-random-sample',?,?,?)
+                """,
+                (captured_at, captured_at, captured_at),
+            )
+            connection.commit()
+
+        result = run_media_cutoff(
+            datetime(2026, 8, 2, 7, 30, tzinfo=SHANGHAI), db_path=self.db
+        )
+        self.assertEqual(result["candidates"], 1)
+        self.assertEqual(result["manual_required"], 1)
+        self.assertEqual(result["threshold_status"], "below_threshold")
+        with connect(self.db) as connection:
+            queue = connection.execute(
+                "SELECT content_id,reason_code,status FROM review_queue"
+            ).fetchall()
+        self.assertEqual(
+            [(row["content_id"], row["reason_code"], row["status"]) for row in queue],
+            [(1, "media_processing_incomplete", "manual_required")],
+        )
 
 
 if __name__ == "__main__":
