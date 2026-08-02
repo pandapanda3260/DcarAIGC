@@ -49,6 +49,7 @@ data/inputs/
 data/processed/
 reports/current/
 reports/archive/
+reports/runs/
 app/web/public/data/
 app/web/public/exports/
 

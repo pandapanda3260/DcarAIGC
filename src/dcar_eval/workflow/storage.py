@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Iterator
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def now_iso() -> str:
@@ -217,6 +217,45 @@ CREATE TABLE IF NOT EXISTS provider_usage (
 """
 
 
+MIGRATION_4 = """
+CREATE TABLE IF NOT EXISTS run_evaluations (
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    content_item_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
+    evaluation_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(run_id, content_item_id)
+);
+
+CREATE TABLE IF NOT EXISTS manual_reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    content_item_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
+    previous_evaluation_json TEXT NOT NULL,
+    patch_json TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    reviewer TEXT NOT NULL DEFAULT 'local-user',
+    applied_revision INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_manual_reviews_run
+ON manual_reviews(run_id, id);
+
+CREATE TABLE IF NOT EXISTS report_revisions (
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    report_json_path TEXT NOT NULL,
+    report_markdown_path TEXT NOT NULL,
+    summary_image_path TEXT NOT NULL,
+    output_sha256 TEXT NOT NULL,
+    source_evaluation_sha256 TEXT NOT NULL,
+    is_current INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY(run_id, revision)
+);
+"""
+
+
 def _column_names(connection: sqlite3.Connection, table: str) -> set[str]:
     return {str(row["name"]) for row in connection.execute(f"PRAGMA table_info({table})")}
 
@@ -255,6 +294,14 @@ def migrate(connection: sqlite3.Connection) -> int:
                 (3, now_iso()),
             )
         current = 3
+    if current < 4:
+        with transaction(connection):
+            connection.executescript(MIGRATION_4)
+            connection.execute(
+                "INSERT OR REPLACE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                (4, now_iso()),
+            )
+        current = 4
     if current != SCHEMA_VERSION:
         raise RuntimeError(f"unsupported schema version {current}; expected {SCHEMA_VERSION}")
     return current

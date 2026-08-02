@@ -20,7 +20,7 @@ def load_contract(path: Path = CONTRACT_PATH) -> dict[str, Any]:
 
 
 def ratio_metric(
-    numerator: int,
+    numerator: int | None,
     denominator: int,
     *,
     status: str,
@@ -28,7 +28,11 @@ def ratio_metric(
     scope: str,
     reason: str = "",
 ) -> dict[str, Any]:
-    percentage = round(numerator * 100 / denominator, 2) if denominator else None
+    percentage = (
+        round(numerator * 100 / denominator, 2)
+        if numerator is not None and denominator
+        else None
+    )
     return {
         "kind": "ratio",
         "numerator": numerator,

@@ -17,8 +17,8 @@ class WorkflowCorpusTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             db = Path(temporary) / "test.sqlite3"
             with connect(db) as connection:
-                self.assertEqual(migrate(connection), 3)
-                self.assertEqual(migrate(connection), 3)
+                self.assertEqual(migrate(connection), 4)
+                self.assertEqual(migrate(connection), 4)
                 tables = {
                     row[0] for row in connection.execute(
                         "SELECT name FROM sqlite_master WHERE type='table'"
@@ -27,6 +27,7 @@ class WorkflowCorpusTest(unittest.TestCase):
             self.assertTrue({
                 "runs", "content_items", "evidence_assets", "corpus_snapshots",
                 "evaluations", "comment_user_scores", "provider_usage",
+                "run_evaluations", "manual_reviews", "report_revisions",
             } <= tables)
 
     def test_real_frozen_corpus_imports_expected_counts_without_tokens(self):
@@ -43,6 +44,9 @@ class WorkflowCorpusTest(unittest.TestCase):
                 token_urls = connection.execute(
                     "SELECT COUNT(*) FROM content_items WHERE canonical_url LIKE '%xsec_token%'"
                 ).fetchone()[0]
+                xhs_captions = connection.execute(
+                    "SELECT COUNT(*) FROM content_items WHERE platform='xiaohongshu' AND caption != ''"
+                ).fetchone()[0]
                 duplicates = connection.execute(
                     "SELECT COUNT(*) FROM content_import_audit WHERE status LIKE '%duplicate'"
                 ).fetchone()[0]
@@ -51,6 +55,7 @@ class WorkflowCorpusTest(unittest.TestCase):
                 ).fetchone()[0]
             self.assertEqual(xhs, 338)
             self.assertEqual(token_urls, 0)
+            self.assertGreaterEqual(xhs_captions, 320)
             self.assertEqual(duplicates, 33)
             self.assertEqual(invalid, 4)
 

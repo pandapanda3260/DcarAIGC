@@ -18,6 +18,7 @@ DOUYIN_SOURCE = Path("data/inputs/douyin/douyin_30_account_content_sample_2026-0
 DOUYIN_ENRICHMENT = Path("reports/current/抖音438条内容渠道评估_v6_TikHub补充_2026-08-02.csv")
 XHS_UNIQUE_SOURCE = Path("data/inputs/xiaohongshu/notes_unique.csv")
 XHS_AUDIT_SOURCE = Path("data/inputs/xiaohongshu/notes_all.csv")
+XHS_PROVIDER_CACHE = Path("data/cache/rnote/notes")
 XHS_ID_RE = re.compile(r"^[0-9a-f]{24}$", re.I)
 DOUYIN_ID_RE = re.compile(r"^\d{10,24}$")
 
@@ -128,7 +129,22 @@ def import_xiaohongshu(connection: sqlite3.Connection, root: Path = PROJECT_ROOT
             if note_id in seen:
                 raise ValueError(f"duplicate Xiaohongshu note_id: {note_id}")
             seen.add(note_id)
+            cached_content_path = root / XHS_PROVIDER_CACHE / note_id / "content.json"
+            cached_content: dict[str, Any] = {}
+            if cached_content_path.exists():
+                try:
+                    value = json.loads(cached_content_path.read_text(encoding="utf-8"))
+                    if isinstance(value, dict):
+                        cached_content = value
+                except (OSError, json.JSONDecodeError):
+                    cached_content = {}
             exposure = _positive_int(raw.get("vv"))
+            cached_caption = "\n".join(
+                value for value in (
+                    str(cached_content.get("title") or "").strip(),
+                    str(cached_content.get("desc") or "").strip(),
+                ) if value
+            )
             _upsert_content(connection, {
                 "platform": "xiaohongshu",
                 "platform_content_id": note_id,
@@ -138,9 +154,9 @@ def import_xiaohongshu(connection: sqlite3.Connection, root: Path = PROJECT_ROOT
                 "account_uid": "",
                 "account_name": str(raw.get("account_name") or ""),
                 "account_quality": "",
-                "caption": str(raw.get("share_title") or ""),
-                "content_type": "",
-                "published_at": "",
+                "caption": cached_caption or str(raw.get("share_title") or ""),
+                "content_type": str(cached_content.get("note_type") or ""),
+                "published_at": str(cached_content.get("published_at") or ""),
                 "exposure_value": exposure,
                 "exposure_status": "valid" if exposure is not None else "missing",
                 "source_path": project_relative(unique_source, root),
@@ -189,4 +205,3 @@ def corpus_digest(connection: sqlite3.Connection) -> str:
     return hashlib.sha256(
         json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
-
