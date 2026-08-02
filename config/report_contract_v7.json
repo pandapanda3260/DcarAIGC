@@ -1,0 +1,112 @@
+{
+  "schema_version": "dcar-report-contract-v7.0",
+  "report_version": "channel-structured-conclusions-v7.0",
+  "rule_version": "dcar-evaluation-v5.0",
+  "channels": [
+    "douyin",
+    "xiaohongshu"
+  ],
+  "business_scenes": [
+    "二手车",
+    "新车",
+    "媒体-AI小懂"
+  ],
+  "report_order": [
+    "douyin_summary",
+    "douyin_scenes",
+    "xiaohongshu_summary",
+    "xiaohongshu_scenes",
+    "conclusion_summary",
+    "douyin_content_details",
+    "xiaohongshu_content_details",
+    "assets"
+  ],
+  "count_metrics": [
+    "identifiable",
+    "selling_point_covered",
+    "core_selling_point",
+    "other_selling_point"
+  ],
+  "exposure_metrics": [
+    "identifiable",
+    "selling_point_covered",
+    "core_selling_point",
+    "other_selling_point"
+  ],
+  "verticality_metrics": [
+    "content_automotive",
+    "audience_automotive",
+    "acquisition_potential"
+  ],
+  "count_diagnostics": [
+    "no_selling_point_count",
+    "unidentifiable_count",
+    "v2_v3_count",
+    "v0_v1_count",
+    "evidence_coverage_percentage",
+    "failed_count",
+    "pending_review_count"
+  ],
+  "exposure_coverage": [
+    "total_valid_exposure",
+    "valid_exposure_items",
+    "missing_exposure_items",
+    "zero_or_invalid_exposure_items",
+    "label_exposure_cross_covered_items",
+    "cross_coverage_percentage",
+    "required_percentage",
+    "calculable",
+    "unavailable_reason"
+  ],
+  "verticality_coverage": [
+    "content_automotive_scorable_items",
+    "audience_automotive_scorable_items",
+    "acquisition_potential_scorable_items",
+    "total_items",
+    "audience_gate"
+  ],
+  "statuses": [
+    "available",
+    "sample_only",
+    "directional_estimate",
+    "unavailable"
+  ],
+  "channel_target": {
+    "metric": "core_selling_point_publication_share",
+    "minimum_percentage": 60,
+    "maximum_percentage": 70,
+    "denominator": "channel_publications"
+  },
+  "scene_internal_metrics": {
+    "core_share_within_scene_publications": "scene_core_publications / scene_publications",
+    "selling_point_coverage_within_scene": "scene_selling_point_publications / scene_publications"
+  },
+  "audience_gate": {
+    "minimum_valid_unique_commenters": 20,
+    "below_gate_score": null
+  },
+  "acquisition_potential": {
+    "weights": {
+      "content_automotive": 0.2,
+      "audience_automotive": 0.25,
+      "dcar_task_fit": 0.35,
+      "action_intent": 0.2
+    },
+    "missing_component_behavior": "unavailable",
+    "reweight_missing_components": false,
+    "fill_missing_with_zero": false
+  },
+  "exposure_cross_coverage_required_percentage": 90,
+  "forbidden_key_fragments": [
+    "actual_acquisition",
+    "actual_new_user",
+    "attributed_new_user"
+  ],
+  "formal_baseline": {
+    "eligible_run_kind": "full_corpus",
+    "required_scope": "dual_channel",
+    "requires_current_rule_version": true,
+    "requires_fresh_report": true,
+    "temporary_runs_are_ineligible": true
+  }
+}
