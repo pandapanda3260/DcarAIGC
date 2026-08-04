@@ -41,7 +41,7 @@ def main() -> None:
         "",
         f"从正式未命中内容中，新提炼的4类候选卖点可以解释 **{pub['candidate_only']}条（占全部内容 {pub['candidate_explainable_share_pct']:.1f}%；占正式未命中内容 {pub['candidate_rescue_rate_among_official_unmatched_pct']:.1f}%）**。加入候选后总可解释率也只有 **{pub['expanded_coverage_pct']:.1f}%**，仍有 **{pub['expanded_unmatched']}条（{pub['expanded_unmatched_share_pct']:.1f}%）** 无法合理解释为懂车帝卖点。",
         "",
-        f"因此，问题不只是标签库过窄：**确实可以从无标签内容中补出C1–C4四个候选方向，但主要矛盾仍是大量内容在创作时没有设计“懂车帝任务承接”。** 只有懂车帝话题、账号归属、泛汽车知识、车型展示或降价噱头，都不能自动算卖点。",
+        "因此，问题不只是标签库过窄：**确实可以从无标签内容中补出C1–C4四个候选方向，但主要矛盾仍是大量内容在创作时没有设计“懂车帝任务承接”。** 只有懂车帝话题、账号归属、泛汽车知识、车型展示或降价噱头，都不能自动算卖点。",
         "",
         "## 二、修正后的判定口径",
         "",

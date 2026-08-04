@@ -120,8 +120,8 @@ class GenerateThreePropositionReportTest(unittest.TestCase):
     def test_scorable_row_must_match_formula_and_comment_counts(self):
         with self.assertRaisesRegex(ValueError, "audience_auto_score does not match"):
             validate_attempt(scorable_row(audience_auto_score=50))
-        with self.assertRaisesRegex(ValueError, "at least 20 valid users"):
-            validate_attempt(scorable_row(valid_unique_commenters=19))
+        with self.assertRaisesRegex(ValueError, "at least 5 valid users"):
+            validate_attempt(scorable_row(valid_unique_commenters=4))
 
     def test_scorable_row_requires_successful_fetch_and_real_comment_page(self):
         with self.assertRaisesRegex(ValueError, "complete or partial"):

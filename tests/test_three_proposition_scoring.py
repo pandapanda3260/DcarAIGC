@@ -38,17 +38,35 @@ class ThreePropositionScoringTest(unittest.TestCase):
             media_score=90,
             media_reliability=1,
             comment_topic_score=0,
-            valid_unique_commenters=20,
+            valid_unique_commenters=5,
         )
         self.assertEqual((score, adjustment), (85, -5))
+
+        below_gate_score, below_gate_adjustment = content_auto_score(
+            text_score=90,
+            text_reliability=1,
+            media_score=90,
+            media_reliability=1,
+            comment_topic_score=0,
+            valid_unique_commenters=4,
+        )
+        self.assertEqual((below_gate_score, below_gate_adjustment), (90, 0))
 
     def test_audience_gate_and_score(self):
         self.assertIsNone(
             audience_auto_score(
-                {100: 3, 70: 4, 30: 2, 0: 10},
-                valid_unique_commenters=19,
+                {100: 1, 70: 1, 30: 1, 0: 1},
+                valid_unique_commenters=4,
                 comment_sample_status="below_minimum",
             )
+        )
+        self.assertEqual(
+            audience_auto_score(
+                {100: 2, 70: 1, 30: 1, 0: 1},
+                valid_unique_commenters=5,
+                comment_sample_status="scorable",
+            ),
+            60,
         )
         self.assertEqual(
             audience_auto_score(
@@ -81,7 +99,7 @@ class ThreePropositionScoringTest(unittest.TestCase):
             media_score=84.6,
             media_reliability=1,
             comment_topic_score=90,
-            valid_unique_commenters=20,
+            valid_unique_commenters=5,
         )
         self.assertAlmostEqual(adjustment, 0.54)
         self.assertEqual(score, 85)

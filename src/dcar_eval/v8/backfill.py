@@ -1,4 +1,4 @@
-"""Bounded Xiaohongshu legacy-media backfill using Rnote video detail."""
+"""Retired Rnote backfill; historical local-cache and routing tools remain."""
 
 from __future__ import annotations
 
@@ -43,6 +43,7 @@ ADAPTER_VERSION = "rnote-video-v8.0"
 ENDPOINT = "https://rnote.dev/api/v2/crawler/note/video"
 KEY_FILE = Path("/Users/mark/Documents/key/DcarKey/Rnote.env.local")
 VERIFIED_UNIT_PRICE = 0.008
+RNOTE_RETIRED_MESSAGE = "Rnote retired; use TikHub"
 
 
 def load_key(path: Path) -> str:
@@ -244,6 +245,15 @@ class RnoteVideoAdapter:
         self.timeout = timeout
 
     def fetch(self, note_id: str) -> ProviderResult:
+        raise CaptureError(
+            RNOTE_RETIRED_MESSAGE,
+            retryable=False,
+            error_code="provider_retired",
+        )
+
+        # Historical implementation retained below for response-schema archaeology.
+        # The unconditional guard above is the product boundary: this adapter cannot
+        # read credentials or make a network request after Rnote retirement.
         query = urllib.parse.urlencode({"note_id": note_id})
         request = urllib.request.Request(
             f"{ENDPOINT}?{query}",
@@ -549,6 +559,14 @@ def pilot_status(*, db_path: Path = DEFAULT_DB) -> Dict[str, Any]:
 
 
 def run_pilot(*, db_path: Path = DEFAULT_DB, key_file: Path = KEY_FILE) -> Dict[str, Any]:
+    raise CaptureError(
+        RNOTE_RETIRED_MESSAGE,
+        retryable=False,
+        error_code="provider_retired",
+    )
+
+    # Retain the historical budget workflow for audit/reference only. The guard
+    # above intentionally executes before database or credential access.
     with connect(db_path) as connection:
         budget = connection.execute(
             "SELECT status FROM provider_budget_batches WHERE id=?", (BUDGET_ID,)
@@ -601,6 +619,12 @@ def run_daily_backfill_batch(
     key_file: Path = KEY_FILE,
 ) -> Dict[str, Any]:
     """Run the bounded automatic backfill without bypassing the pilot or daily quota."""
+
+    raise CaptureError(
+        RNOTE_RETIRED_MESSAGE,
+        retryable=False,
+        error_code="provider_retired",
+    )
 
     if limit <= 0:
         raise ValueError("limit must be positive")

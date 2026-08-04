@@ -97,7 +97,7 @@ SUPPRESSED_V3_IDS = {
     "7659724890028080238",
 }
 
-XHS_SELLING_POINT_SAMPLE = {
+XHS_SELLING_POINT_SAMPLE: dict[str, dict[str, Any]] = {
     "RA046": {"id": "C1", "score": 90, "scene": "媒体-AI小懂", "reason": "视频主体持续回答查酒驾与道路安全问题"},
     "RA077": {"id": "C1", "score": 96, "scene": "媒体-AI小懂", "reason": "视频主体讲解新手驾驶坏习惯和汽车零件保护"},
     "RA089": {"id": "C1", "score": 92, "scene": "媒体-AI小懂", "reason": "视频主体演绎等红灯起步、鸣笛与道路礼仪"},

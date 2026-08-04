@@ -9,10 +9,16 @@ import json
 import re
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
+from .evaluation_selectors import (
+    DISPLAY_EFFECTIVE_EVALUATIONS_CTE,
+    active_release,
+    effective_direction_sql,
+)
 from .migration import generate_link_id, normalize_timestamp
 from .storage import DEFAULT_DB, connect, now_utc, transaction
 
@@ -21,12 +27,78 @@ PLATFORMS = {"douyin", "xiaohongshu", "wechat_channels", "kuaishou"}
 ACCOUNT_TYPES = {"boutique_ip", "original", "mixed_edit", "unknown"}
 DIRECTIONS = {"new_car", "used_car", "media", "other", "unknown"}
 REAL_NAME_STATUSES = {"yes", "no", "unknown"}
+CONTENT_PATCH_FIELDS = frozenset(
+    {
+        "platform",
+        "platform_content_id",
+        "canonical_url",
+        "published_at",
+        "title",
+        "body",
+        "content_type",
+        "account_uid",
+        "account_name",
+        "account_type",
+        "content_direction",
+    }
+)
+CONTENT_CHILD_REKEY_TABLES = (
+    "fetch_slots",
+    "provider_raw_responses",
+    "content_metric_snapshots",
+    "comment_evidence_versions",
+    "evidence_artifacts",
+    "evidence_envelopes",
+    "media_processing_slots",
+    "duplicate_fingerprints",
+)
+CONTENT_CHILD_MERGE_POLICIES = {
+    **{table: "rekey" for table in CONTENT_CHILD_REKEY_TABLES},
+    "content_identities": "special_rekey",
+    "content_aliases": "special_rekey",
+    "comment_user_scores": "special_rekey",
+    "duplicate_relations": "special_relation",
+    "evaluation_versions": "protected_history",
+    "review_queue": "protected_history",
+    "evaluation_reviews": "protected_history",
+    "review_reopen_events": "protected_history",
+    "manual_evidence": "protected_history",
+    "task_contents": "protected_history",
+}
 DOUYIN_ID_RE = re.compile(r"(?:/video/|[?&]modal_id=)(\d{6,24})(?:[/?&#]|$)", re.I)
-XHS_ID_RE = re.compile(r"/(?:explore|discovery/item)/(?:[^/?#]*/)?([0-9a-f]{24})(?:[/?#]|$)", re.I)
+XHS_ID_RE = re.compile(
+    r"/(?:explore|discovery/item)/(?:[^/?#]*/)?([0-9a-f]{24})(?:[/?#]|$)", re.I
+)
 
 
 class OperationError(RuntimeError):
     pass
+
+
+class IdentityConflictError(OperationError):
+    error_code = "identity_conflict"
+
+    def __init__(self, message: str, *, provider_cost: float = 0.0) -> None:
+        super().__init__(message)
+        self.provider_cost = provider_cost
+
+
+@contextmanager
+def _content_write_transaction(db_path: Path) -> Iterator[sqlite3.Connection]:
+    """Commit only the conflict marker when an identity merge fails closed."""
+
+    with connect(db_path) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            yield connection
+        except IdentityConflictError:
+            connection.commit()
+            raise
+        except Exception:
+            connection.rollback()
+            raise
+        else:
+            connection.commit()
 
 
 def normalize_phone(value: Any) -> tuple[str, str]:
@@ -53,7 +125,9 @@ def normalize_url(value: Any) -> str:
     return urlunsplit(("https", f"{host}{port}", path, "", ""))
 
 
-def content_identity(platform: str, url: str, explicit_id: Any = None) -> Dict[str, Any]:
+def content_identity(
+    platform: str, url: str, explicit_id: Any = None
+) -> Dict[str, Any]:
     if platform not in PLATFORMS:
         raise OperationError(f"不支持的平台：{platform}")
     canonical = normalize_url(url)
@@ -71,7 +145,11 @@ def content_identity(platform: str, url: str, explicit_id: Any = None) -> Dict[s
     elif content_id and len(content_id) > 128:
         raise OperationError("平台内容 ID 不能超过 128 个字符")
     normalized_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    key = f"{platform}:{content_id}" if content_id else f"{platform}:url:{normalized_hash}"
+    key = (
+        f"{platform}:{content_id}"
+        if content_id
+        else f"{platform}:url:{normalized_hash}"
+    )
     return {
         "platform": platform,
         "platform_content_id": content_id or None,
@@ -106,7 +184,8 @@ def _identity_rows(value: Mapping[str, Any]) -> List[Dict[str, str]]:
                 "uid": uid,
                 "nickname": str(item.get("nickname") or "").strip(),
                 "real_name_status": _enum(
-                    item.get("real_name_status"), REAL_NAME_STATUSES,
+                    item.get("real_name_status"),
+                    REAL_NAME_STATUSES,
                     "real_name_status",
                 ),
             }
@@ -138,11 +217,80 @@ def _expand_flat_account_row(value: Mapping[str, Any]) -> Dict[str, Any]:
     expanded["platforms"] = platforms
     enabled = expanded.get("enabled")
     if isinstance(enabled, str):
-        expanded["enabled"] = enabled.strip().lower() not in {"0", "false", "no", "否", "停用"}
+        expanded["enabled"] = enabled.strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "否",
+            "停用",
+        }
     return expanded
 
 
-def upsert_account(value: Mapping[str, Any], *, db_path: Path = DEFAULT_DB) -> Dict[str, Any]:
+def _refresh_pending_platform_identity(
+    connection: sqlite3.Connection,
+    platform: str,
+    uid: str,
+    *,
+    captured_at: str,
+) -> None:
+    """Synchronize one pending identity inside the caller's write transaction."""
+
+    if not uid:
+        return
+    claimed = connection.execute(
+        """
+        SELECT 1 FROM account_platform_identities
+        WHERE platform=? AND uid=?
+        """,
+        (platform, uid),
+    ).fetchone()
+    aggregate = connection.execute(
+        """
+        SELECT COALESCE(MAX(NULLIF(raw_account_name, '')), '') AS nickname,
+               COUNT(*) AS content_count,
+               MIN(published_at) AS first_published_at,
+               MAX(published_at) AS last_published_at
+        FROM content_items
+        WHERE account_id IS NULL AND platform=? AND raw_account_uid=?
+        """,
+        (platform, uid),
+    ).fetchone()
+    if claimed is not None or aggregate is None or int(aggregate["content_count"]) == 0:
+        connection.execute(
+            "DELETE FROM pending_platform_identities WHERE platform=? AND uid=?",
+            (platform, uid),
+        )
+        return
+    connection.execute(
+        """
+        INSERT INTO pending_platform_identities(
+            platform,uid,nickname,content_count,first_published_at,
+            last_published_at,created_at,updated_at
+        ) VALUES (?,?,?,?,?,?,?,?)
+        ON CONFLICT(platform,uid) DO UPDATE SET
+            nickname=excluded.nickname,
+            content_count=excluded.content_count,
+            first_published_at=excluded.first_published_at,
+            last_published_at=excluded.last_published_at,
+            updated_at=excluded.updated_at
+        """,
+        (
+            platform,
+            uid,
+            aggregate["nickname"],
+            aggregate["content_count"],
+            aggregate["first_published_at"],
+            aggregate["last_published_at"],
+            captured_at,
+            captured_at,
+        ),
+    )
+
+
+def upsert_account(
+    value: Mapping[str, Any], *, db_path: Path = DEFAULT_DB
+) -> Dict[str, Any]:
     phone, normalized = normalize_phone(value.get("phone"))
     identities = _identity_rows(value)
     account_type = _enum(value.get("account_type"), ACCOUNT_TYPES, "account_type")
@@ -162,8 +310,14 @@ def upsert_account(value: Mapping[str, Any], *, db_path: Path = DEFAULT_DB) -> D
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    phone, normalized, str(value.get("operator_name") or "").strip(),
-                    account_type, direction, int(enabled), captured_at, captured_at,
+                    phone,
+                    normalized,
+                    str(value.get("operator_name") or "").strip(),
+                    account_type,
+                    direction,
+                    int(enabled),
+                    captured_at,
+                    captured_at,
                 ),
             )
             if cursor.lastrowid is None:
@@ -178,8 +332,13 @@ def upsert_account(value: Mapping[str, Any], *, db_path: Path = DEFAULT_DB) -> D
                     content_direction=?, enabled=?, updated_at=? WHERE id=?
                 """,
                 (
-                    phone, str(value.get("operator_name") or "").strip(), account_type,
-                    direction, int(enabled), captured_at, account_id,
+                    phone,
+                    str(value.get("operator_name") or "").strip(),
+                    account_type,
+                    direction,
+                    int(enabled),
+                    captured_at,
+                    account_id,
                 ),
             )
             action = "updated"
@@ -199,13 +358,19 @@ def upsert_account(value: Mapping[str, Any], *, db_path: Path = DEFAULT_DB) -> D
         existing_identities = {
             str(row["platform"]): row
             for row in connection.execute(
-                "SELECT * FROM account_platform_identities WHERE account_id=?", (account_id,)
+                "SELECT * FROM account_platform_identities WHERE account_id=?",
+                (account_id,),
             ).fetchall()
         }
+        affected_identity_keys = {
+            (str(row["platform"]), str(row["uid"]))
+            for row in existing_identities.values()
+        } | {(identity["platform"], identity["uid"]) for identity in identities}
         for platform, existing in existing_identities.items():
             if platform not in incoming_platforms:
                 connection.execute(
-                    "DELETE FROM account_platform_identities WHERE id=?", (existing["id"],)
+                    "DELETE FROM account_platform_identities WHERE id=?",
+                    (existing["id"],),
                 )
         for identity in identities:
             existing = existing_identities.get(identity["platform"])
@@ -216,14 +381,17 @@ def upsert_account(value: Mapping[str, Any], *, db_path: Path = DEFAULT_DB) -> D
                     SET nickname=?, real_name_status=?, updated_at=? WHERE id=?
                     """,
                     (
-                        identity["nickname"], identity["real_name_status"], captured_at,
+                        identity["nickname"],
+                        identity["real_name_status"],
+                        captured_at,
                         existing["id"],
                     ),
                 )
             else:
                 if existing is not None:
                     connection.execute(
-                        "DELETE FROM account_platform_identities WHERE id=?", (existing["id"],)
+                        "DELETE FROM account_platform_identities WHERE id=?",
+                        (existing["id"],),
                     )
                 connection.execute(
                     """
@@ -233,8 +401,13 @@ def upsert_account(value: Mapping[str, Any], *, db_path: Path = DEFAULT_DB) -> D
                     ) VALUES (?, ?, ?, ?, ?, 'manual', ?, ?)
                     """,
                     (
-                        account_id, identity["platform"], identity["uid"], identity["nickname"],
-                        identity["real_name_status"], captured_at, captured_at,
+                        account_id,
+                        identity["platform"],
+                        identity["uid"],
+                        identity["nickname"],
+                        identity["real_name_status"],
+                        captured_at,
+                        captured_at,
                     ),
                 )
             connection.execute(
@@ -263,19 +436,31 @@ def upsert_account(value: Mapping[str, Any], *, db_path: Path = DEFAULT_DB) -> D
             """,
             (account_id, captured_at, account_id),
         )
+        for platform, uid in sorted(affected_identity_keys):
+            _refresh_pending_platform_identity(
+                connection, platform, uid, captured_at=captured_at
+            )
     return {"id": account_id, "action": action}
 
 
-def update_account(account_id: int, value: Mapping[str, Any], *, db_path: Path = DEFAULT_DB) -> Dict[str, Any]:
+def update_account(
+    account_id: int, value: Mapping[str, Any], *, db_path: Path = DEFAULT_DB
+) -> Dict[str, Any]:
     with connect(db_path) as connection:
-        row = connection.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
+        row = connection.execute(
+            "SELECT * FROM accounts WHERE id=?", (account_id,)
+        ).fetchone()
         if row is None:
             raise OperationError("账号不存在")
         platforms = connection.execute(
             "SELECT platform, uid, nickname, real_name_status FROM account_platform_identities WHERE account_id=?",
             (account_id,),
         ).fetchall()
-    merged = {**dict(row), "platforms": [dict(item) for item in platforms], **dict(value)}
+    merged = {
+        **dict(row),
+        "platforms": [dict(item) for item in platforms],
+        **dict(value),
+    }
     result = upsert_account(merged, db_path=db_path)
     if int(result["id"]) != account_id:
         raise OperationError("修改后的手机号已属于其他账号")
@@ -310,7 +495,11 @@ def import_accounts(
     for index, row in enumerate(expanded_rows, start=1):
         key = normalized_keys[index - 1]
         if key and last_by_key[key] != index:
-            status, entity_id, reason = "duplicate_in_file", None, "同文件后续行覆盖本行"
+            status, entity_id, reason = (
+                "duplicate_in_file",
+                None,
+                "同文件后续行覆盖本行",
+            )
             counts.rejected += 1
         else:
             try:
@@ -331,8 +520,13 @@ def import_accounts(
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    batch_id, index, status, entity_id, key or "",
-                    json.dumps(dict(row), ensure_ascii=False), reason[:1000],
+                    batch_id,
+                    index,
+                    status,
+                    entity_id,
+                    key or "",
+                    json.dumps(dict(row), ensure_ascii=False),
+                    reason[:1000],
                 ),
             )
     with connect(db_path) as connection, transaction(connection):
@@ -370,15 +564,140 @@ def _account_for_uid(connection, platform: str, uid: str) -> Optional[int]:
     return int(row["account_id"]) if row else None
 
 
+def reconcile_content_account_identity(
+    connection: sqlite3.Connection,
+    content_id: int,
+    *,
+    captured_at: str,
+    previous_identity_keys: Sequence[tuple[str, str]] = (),
+) -> Optional[int]:
+    """Apply exact account ownership and pending-identity state for one content."""
+
+    content = connection.execute(
+        "SELECT platform,raw_account_uid FROM content_items WHERE id=?", (content_id,)
+    ).fetchone()
+    if content is None:
+        raise OperationError("内容不存在")
+    platform = str(content["platform"])
+    uid = str(content["raw_account_uid"] or "").strip()
+    account_id = _account_for_uid(connection, platform, uid)
+    connection.execute(
+        "UPDATE content_items SET account_id=? WHERE id=?", (account_id, content_id)
+    )
+    affected_keys = {
+        (str(key_platform), str(key_uid))
+        for key_platform, key_uid in previous_identity_keys
+        if key_uid
+    }
+    if uid:
+        affected_keys.add((platform, uid))
+    for pending_platform, pending_uid in sorted(affected_keys):
+        _refresh_pending_platform_identity(
+            connection,
+            pending_platform,
+            pending_uid,
+            captured_at=captured_at,
+        )
+    return account_id
+
+
 def _merge_unique_children(connection, table: str, survivor: int, loser: int) -> None:
-    rows = connection.execute(f"SELECT id FROM {table} WHERE content_id=?", (loser,)).fetchall()
+    rows = connection.execute(
+        f"SELECT id FROM {table} WHERE content_id=?", (loser,)
+    ).fetchall()
     for row in rows:
-        try:
+        connection.execute(
+            f"UPDATE {table} SET content_id=? WHERE id=?", (survivor, row["id"])
+        )
+
+
+_PROTECTED_CONTENT_HISTORY_TABLES = (
+    "evaluation_versions",
+    "review_queue",
+    "evaluation_reviews",
+    "review_reopen_events",
+    "manual_evidence",
+    "task_contents",
+)
+
+
+def _protected_content_history(
+    connection: sqlite3.Connection, content_id: int
+) -> Dict[str, int]:
+    return {
+        table: int(
             connection.execute(
-                f"UPDATE {table} SET content_id=? WHERE id=?", (survivor, row["id"])
-            )
-        except sqlite3.IntegrityError:
-            connection.execute(f"DELETE FROM {table} WHERE id=?", (row["id"],))
+                f"SELECT COUNT(*) FROM {table} WHERE content_id=?", (content_id,)
+            ).fetchone()[0]
+        )
+        for table in _PROTECTED_CONTENT_HISTORY_TABLES
+    }
+
+
+def _record_identity_conflict(
+    connection: sqlite3.Connection,
+    original: sqlite3.Row,
+    duplicate: sqlite3.Row,
+    *,
+    histories: Mapping[int, Mapping[str, int]],
+    reason: str,
+) -> None:
+    evidence = {
+        "error_code": IdentityConflictError.error_code,
+        "reason": reason,
+        "contents": [
+            {
+                "id": int(row["id"]),
+                "link_id": str(row["link_id"]),
+                "platform": str(row["platform"]),
+                "platform_content_id": row["platform_content_id"],
+                "canonical_url": str(row["canonical_url"]),
+                "protected_history": dict(histories[int(row["id"])]),
+            }
+            for row in (original, duplicate)
+        ],
+    }
+    connection.execute(
+        """
+        INSERT INTO duplicate_relations(
+            duplicate_content_id,original_content_id,method,confidence,
+            evidence_json,status,created_at
+        ) VALUES (?,?,'identity_conflict',1.0,?,'pending_review',?)
+        ON CONFLICT(duplicate_content_id,original_content_id,method) DO UPDATE SET
+            status='pending_review'
+        """,
+        (
+            duplicate["id"],
+            original["id"],
+            json.dumps(
+                evidence,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            now_utc(),
+        ),
+    )
+
+
+def _raise_identity_conflict(
+    connection: sqlite3.Connection,
+    original: sqlite3.Row,
+    duplicate: sqlite3.Row,
+    *,
+    histories: Mapping[int, Mapping[str, int]],
+    reason: str,
+) -> None:
+    _record_identity_conflict(
+        connection,
+        original,
+        duplicate,
+        histories=histories,
+        reason=reason,
+    )
+    raise IdentityConflictError(
+        "identity_conflict: 内容身份冲突，已进入重复内容人工复核"
+    )
 
 
 def merge_content_records(connection, first_id: int, second_id: int) -> int:
@@ -388,194 +707,250 @@ def merge_content_records(connection, first_id: int, second_id: int) -> int:
     ).fetchall()
     if len(rows) != 2:
         raise OperationError("需要合并的内容记录不存在")
-    survivor, loser = rows[0], rows[1]
-    survivor_id, loser_id = int(survivor["id"]), int(loser["id"])
-    connection.execute(
+    original, duplicate = rows[0], rows[1]
+    histories = {
+        int(row["id"]): _protected_content_history(connection, int(row["id"]))
+        for row in rows
+    }
+    has_history = {
+        content_id: any(count > 0 for count in counts.values())
+        for content_id, counts in histories.items()
+    }
+    existing_conflict = connection.execute(
         """
-        INSERT INTO content_aliases(alias_link_id, content_id, reason, created_at)
-        VALUES (?, ?, 'identity_upgrade_merge', ?)
-        ON CONFLICT(alias_link_id) DO UPDATE SET content_id=excluded.content_id
+        SELECT 1 FROM duplicate_relations
+        WHERE status='pending_review'
+          AND ((duplicate_content_id=? AND original_content_id=?)
+            OR (duplicate_content_id=? AND original_content_id=?))
         """,
-        (loser["link_id"], survivor_id, now_utc()),
+        (first_id, second_id, second_id, first_id),
+    ).fetchone()
+    if existing_conflict is not None:
+        _raise_identity_conflict(
+            connection,
+            original,
+            duplicate,
+            histories=histories,
+            reason="existing_pending_identity_conflict",
+        )
+    if has_history[int(original["id"])] and has_history[int(duplicate["id"])]:
+        _raise_identity_conflict(
+            connection,
+            original,
+            duplicate,
+            histories=histories,
+            reason="both_contents_have_protected_history",
+        )
+    survivor, loser = (
+        (duplicate, original)
+        if has_history[int(duplicate["id"])]
+        else (original, duplicate)
     )
-    identities = connection.execute(
-        "SELECT * FROM content_identities WHERE content_id=?", (loser_id,)
-    ).fetchall()
-    for identity in identities:
+    survivor_id, loser_id = int(survivor["id"]), int(loser["id"])
+    if any(histories[loser_id].values()):
+        raise RuntimeError("identity merge selected a protected-history loser")
+
+    connection.execute("SAVEPOINT merge_content_records")
+    try:
+        connection.execute(
+            "UPDATE content_aliases SET content_id=? WHERE content_id=?",
+            (survivor_id, loser_id),
+        )
         connection.execute(
             """
-            INSERT INTO content_identities(
-                content_id, identity_kind, identity_value, platform_identity_key,
-                is_primary, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(platform_identity_key) DO NOTHING
+            INSERT INTO content_aliases(alias_link_id, content_id, reason, created_at)
+            VALUES (?, ?, 'identity_upgrade_merge', ?)
+            ON CONFLICT(alias_link_id) DO UPDATE SET content_id=excluded.content_id
             """,
-            (
-                survivor_id, identity["identity_kind"], identity["identity_value"],
-                identity["platform_identity_key"], identity["is_primary"], identity["created_at"],
-            ),
+            (loser["link_id"], survivor_id, now_utc()),
         )
-    connection.execute("DELETE FROM content_identities WHERE content_id=?", (loser_id,))
-    for table in (
-        "fetch_slots", "provider_raw_responses", "content_metric_snapshots", "comment_evidence_versions",
-        "evidence_artifacts", "evidence_envelopes", "media_processing_slots",
-    ):
-        _merge_unique_children(connection, table, survivor_id, loser_id)
-    evaluations = connection.execute(
-        "SELECT id FROM evaluation_versions WHERE content_id=? ORDER BY id", (loser_id,)
-    ).fetchall()
-    for evaluation in evaluations:
-        try:
-            connection.execute(
-                "UPDATE evaluation_versions SET content_id=? WHERE id=?",
-                (survivor_id, evaluation["id"]),
-            )
-        except sqlite3.IntegrityError:
-            existing = connection.execute(
-                """
-                SELECT id FROM evaluation_versions survivor
-                WHERE survivor.content_id=? AND (
-                    survivor.rule_version, survivor.taxonomy_version, survivor.evidence_sha256
-                )=(SELECT rule_version, taxonomy_version, evidence_sha256
-                   FROM evaluation_versions WHERE id=?)
-                """,
-                (survivor_id, evaluation["id"]),
-            ).fetchone()
-            if existing:
-                connection.execute(
-                    "UPDATE review_queue SET evaluation_id=? WHERE evaluation_id=?",
-                    (existing["id"], evaluation["id"]),
-                )
-                connection.execute(
-                    "UPDATE evaluation_reviews SET previous_evaluation_id=? WHERE previous_evaluation_id=?",
-                    (existing["id"], evaluation["id"]),
-                )
-                connection.execute(
-                    "UPDATE evaluation_reviews SET resulting_evaluation_id=? WHERE resulting_evaluation_id=?",
-                    (existing["id"], evaluation["id"]),
-                )
-                connection.execute("DELETE FROM evaluation_versions WHERE id=?", (evaluation["id"],))
-    connection.execute("UPDATE evaluation_reviews SET content_id=? WHERE content_id=?", (survivor_id, loser_id))
-    connection.execute("UPDATE manual_evidence SET content_id=? WHERE content_id=?", (survivor_id, loser_id))
-    queue_rows = connection.execute("SELECT id FROM review_queue WHERE content_id=?", (loser_id,)).fetchall()
-    for row in queue_rows:
-        try:
-            connection.execute("UPDATE review_queue SET content_id=? WHERE id=?", (survivor_id, row["id"]))
-        except sqlite3.IntegrityError:
-            connection.execute("UPDATE evaluation_reviews SET queue_id=NULL WHERE queue_id=?", (row["id"],))
-            connection.execute("DELETE FROM review_queue WHERE id=?", (row["id"],))
-    score_rows = connection.execute(
-        "SELECT * FROM comment_user_scores WHERE content_id=?", (loser_id,)
-    ).fetchall()
-    for row in score_rows:
-        connection.execute(
-            """
-            INSERT INTO comment_user_scores(
-                content_id, evidence_version_id, anonymous_user_key,
-                audience_automotive_score, action_intent_score, evaluated_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(content_id, anonymous_user_key) DO UPDATE SET
-                evidence_version_id=excluded.evidence_version_id,
-                audience_automotive_score=excluded.audience_automotive_score,
-                action_intent_score=excluded.action_intent_score,
-                evaluated_at=excluded.evaluated_at
-            """,
-            (
-                survivor_id, row["evidence_version_id"], row["anonymous_user_key"],
-                row["audience_automotive_score"], row["action_intent_score"], row["evaluated_at"],
-            ),
-        )
-    connection.execute("DELETE FROM comment_user_scores WHERE content_id=?", (loser_id,))
-    connection.execute(
-        "DELETE FROM duplicate_relations WHERE duplicate_content_id IN (?,?) AND original_content_id IN (?,?)",
-        (survivor_id, loser_id, survivor_id, loser_id),
-    )
-    for column in ("duplicate_content_id", "original_content_id"):
-        relations = connection.execute(
-            f"SELECT id FROM duplicate_relations WHERE {column}=?", (loser_id,)
+        identities = connection.execute(
+            "SELECT * FROM content_identities WHERE content_id=?", (loser_id,)
         ).fetchall()
-        for relation in relations:
-            try:
+        for identity in identities:
+            connection.execute(
+                """
+                INSERT INTO content_identities(
+                    content_id, identity_kind, identity_value, platform_identity_key,
+                    is_primary, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(platform_identity_key) DO NOTHING
+                """,
+                (
+                    survivor_id,
+                    identity["identity_kind"],
+                    identity["identity_value"],
+                    identity["platform_identity_key"],
+                    identity["is_primary"],
+                    identity["created_at"],
+                ),
+            )
+        connection.execute(
+            "DELETE FROM content_identities WHERE content_id=?", (loser_id,)
+        )
+        for table in CONTENT_CHILD_REKEY_TABLES:
+            _merge_unique_children(connection, table, survivor_id, loser_id)
+        score_rows = connection.execute(
+            "SELECT * FROM comment_user_scores WHERE content_id=?", (loser_id,)
+        ).fetchall()
+        for row in score_rows:
+            connection.execute(
+                """
+                INSERT INTO comment_user_scores(
+                    content_id,evidence_version_id,anonymous_user_key,
+                    audience_automotive_score,action_intent_score,evaluated_at
+                ) VALUES (?,?,?,?,?,?)
+                ON CONFLICT(content_id,anonymous_user_key) DO UPDATE SET
+                    evidence_version_id=excluded.evidence_version_id,
+                    audience_automotive_score=excluded.audience_automotive_score,
+                    action_intent_score=excluded.action_intent_score,
+                    evaluated_at=excluded.evaluated_at
+                """,
+                (
+                    survivor_id,
+                    row["evidence_version_id"],
+                    row["anonymous_user_key"],
+                    row["audience_automotive_score"],
+                    row["action_intent_score"],
+                    row["evaluated_at"],
+                ),
+            )
+        connection.execute(
+            "DELETE FROM comment_user_scores WHERE content_id=?", (loser_id,)
+        )
+        connection.execute(
+            """
+            DELETE FROM duplicate_relations
+            WHERE duplicate_content_id IN (?,?) AND original_content_id IN (?,?)
+            """,
+            (survivor_id, loser_id, survivor_id, loser_id),
+        )
+        for column in ("duplicate_content_id", "original_content_id"):
+            relations = connection.execute(
+                f"SELECT id FROM duplicate_relations WHERE {column}=?", (loser_id,)
+            ).fetchall()
+            for relation in relations:
                 connection.execute(
                     f"UPDATE duplicate_relations SET {column}=? WHERE id=?",
                     (survivor_id, relation["id"]),
                 )
-            except sqlite3.IntegrityError:
-                connection.execute("DELETE FROM duplicate_relations WHERE id=?", (relation["id"],))
-    task_rows = connection.execute("SELECT * FROM task_contents WHERE content_id=?", (loser_id,)).fetchall()
-    for row in task_rows:
-        connection.execute(
-            """
-            INSERT INTO task_contents(task_id, content_id, inclusion_status, reason)
-            VALUES (?, ?, ?, ?) ON CONFLICT(task_id, content_id) DO NOTHING
-            """,
-            (row["task_id"], survivor_id, row["inclusion_status"], row["reason"]),
+        connection.execute("DELETE FROM content_items WHERE id=?", (loser_id,))
+    except sqlite3.IntegrityError as exc:
+        connection.execute("ROLLBACK TO merge_content_records")
+        connection.execute("RELEASE merge_content_records")
+        _record_identity_conflict(
+            connection,
+            original,
+            duplicate,
+            histories=histories,
+            reason=f"merge_constraint_conflict:{type(exc).__name__}",
         )
-    connection.execute("DELETE FROM task_contents WHERE content_id=?", (loser_id,))
-    connection.execute("DELETE FROM content_items WHERE id=?", (loser_id,))
-    return survivor_id
+        raise IdentityConflictError(
+            "identity_conflict: 内容身份合并无法无损完成，已进入重复内容人工复核"
+        ) from exc
+    except Exception:
+        connection.execute("ROLLBACK TO merge_content_records")
+        connection.execute("RELEASE merge_content_records")
+        raise
+    else:
+        connection.execute("RELEASE merge_content_records")
+        return survivor_id
 
 
-def _rebuild_text_duplicate_group(connection, content_id: int) -> None:
-    content = connection.execute(
-        "SELECT title, body FROM content_items WHERE id=?", (content_id,)
-    ).fetchone()
-    if content is None:
-        return
-    normalized = " ".join(f"{content['title']}\n{content['body']}".lower().split())
+def _text_sha256(title: Any, body: Any) -> Optional[str]:
+    normalized = " ".join(f"{title or ''}\n{body or ''}".lower().split())
     if len(normalized) < 12:
-        return
-    fingerprint = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-    candidates = connection.execute(
-        "SELECT id, title, body, published_at, imported_at FROM content_items ORDER BY id"
-    ).fetchall()
-    group = [
-        row for row in candidates
-        if hashlib.sha256(
-            " ".join(f"{row['title']}\n{row['body']}".lower().split()).encode("utf-8")
-        ).hexdigest() == fingerprint
-    ]
-    ids = [int(row["id"]) for row in group]
-    if ids:
-        placeholders = ",".join("?" for _ in ids)
-        connection.execute(
-            f"DELETE FROM duplicate_relations WHERE method='text_sha256' AND duplicate_content_id IN ({placeholders})",
-            ids,
-        )
-    if len(group) < 2:
-        return
-    ordered = sorted(group, key=lambda row: (row["published_at"] or row["imported_at"], row["id"]))
-    original = int(ordered[0]["id"])
-    for row in ordered[1:]:
-        connection.execute(
+        return None
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _rebuild_text_duplicate_groups(
+    connection: sqlite3.Connection,
+    fingerprints: set[str],
+    *,
+    touched_content_ids: set[int],
+) -> None:
+    groups: Dict[str, List[sqlite3.Row]] = {
+        fingerprint: [] for fingerprint in fingerprints
+    }
+    if groups:
+        candidates = connection.execute(
             """
-            INSERT INTO duplicate_relations(
-                duplicate_content_id, original_content_id, method, confidence,
-                evidence_json, status, created_at
-            ) VALUES (?, ?, 'text_sha256', 1.0, ?, 'confirmed', ?)
+            SELECT id,title,body,published_at,imported_at
+            FROM content_items ORDER BY id
+            """
+        ).fetchall()
+        for row in candidates:
+            fingerprint = _text_sha256(row["title"], row["body"])
+            if fingerprint in groups:
+                groups[fingerprint].append(row)
+
+    affected_ids = set(touched_content_ids)
+    for group in groups.values():
+        affected_ids.update(int(row["id"]) for row in group)
+    if affected_ids:
+        ordered_ids = sorted(affected_ids)
+        placeholders = ",".join("?" for _ in ordered_ids)
+        connection.execute(
+            f"""
+            DELETE FROM duplicate_relations
+            WHERE method='text_sha256'
+              AND (duplicate_content_id IN ({placeholders})
+                   OR original_content_id IN ({placeholders}))
             """,
-            (
-                row["id"], original,
-                json.dumps({"sha256": fingerprint}, ensure_ascii=False), now_utc(),
+            (*ordered_ids, *ordered_ids),
+        )
+
+    for fingerprint in sorted(groups):
+        group = groups[fingerprint]
+        if len(group) < 2:
+            continue
+        ordered = sorted(
+            group,
+            key=lambda row: (
+                row["published_at"] or row["imported_at"],
+                row["id"],
             ),
         )
+        original = int(ordered[0]["id"])
+        for row in ordered[1:]:
+            connection.execute(
+                """
+                INSERT INTO duplicate_relations(
+                    duplicate_content_id, original_content_id, method, confidence,
+                    evidence_json, status, created_at
+                ) VALUES (?, ?, 'text_sha256', 1.0, ?, 'confirmed', ?)
+                """,
+                (
+                    row["id"],
+                    original,
+                    json.dumps({"sha256": fingerprint}, ensure_ascii=False),
+                    now_utc(),
+                ),
+            )
 
 
-def upsert_content(value: Mapping[str, Any], *, db_path: Path = DEFAULT_DB) -> Dict[str, Any]:
+def upsert_content(
+    value: Mapping[str, Any], *, db_path: Path = DEFAULT_DB
+) -> Dict[str, Any]:
     platform = str(value.get("platform") or "")
     identity = content_identity(
-        platform, str(value.get("canonical_url") or value.get("url") or ""),
+        platform,
+        str(value.get("canonical_url") or value.get("url") or ""),
         value.get("platform_content_id"),
     )
     published_raw = value.get("published_at")
-    published = normalize_timestamp(published_raw) if published_raw not in (None, "") else None
+    published = (
+        normalize_timestamp(published_raw) if published_raw not in (None, "") else None
+    )
     if published_raw not in (None, "") and published is None:
         raise OperationError("发布日期必须是 ISO 时间或 Unix 秒")
     account_type = _enum(value.get("account_type"), ACCOUNT_TYPES, "account_type")
     direction = _enum(value.get("content_direction"), DIRECTIONS, "content_direction")
+    content_type = str(value.get("content_type") or "unknown").strip() or "unknown"
     uid = str(value.get("account_uid") or "").strip()
     captured_at = now_utc()
-    with connect(db_path) as connection, transaction(connection):
+    with _content_write_transaction(db_path) as connection:
         by_id = None
         if identity["platform_content_id"]:
             by_id = connection.execute(
@@ -586,13 +961,37 @@ def upsert_content(value: Mapping[str, Any], *, db_path: Path = DEFAULT_DB) -> D
             "SELECT * FROM content_items WHERE platform=? AND normalized_url_hash=?",
             (platform, identity["normalized_url_hash"]),
         ).fetchone()
-        if by_id is not None and by_url is not None and int(by_id["id"]) != int(by_url["id"]):
-            content_id = merge_content_records(connection, int(by_id["id"]), int(by_url["id"]))
-            current = connection.execute("SELECT * FROM content_items WHERE id=?", (content_id,)).fetchone()
+        affected_text_ids = {
+            int(row["id"]) for row in (by_id, by_url) if row is not None
+        }
+        affected_text_fingerprints = {
+            fingerprint
+            for row in (by_id, by_url)
+            if row is not None
+            for fingerprint in (_text_sha256(row["title"], row["body"]),)
+            if fingerprint is not None
+        }
+        affected_identity_keys = {
+            (str(row["platform"]), str(row["raw_account_uid"]))
+            for row in (by_id, by_url)
+            if row is not None and row["raw_account_uid"]
+        }
+        if (
+            by_id is not None
+            and by_url is not None
+            and int(by_id["id"]) != int(by_url["id"])
+        ):
+            content_id = merge_content_records(
+                connection, int(by_id["id"]), int(by_url["id"])
+            )
+            current = connection.execute(
+                "SELECT * FROM content_items WHERE id=?", (content_id,)
+            ).fetchone()
         else:
             current = by_id or by_url
-        account_id = _account_for_uid(connection, platform, uid)
         if current is None:
+            effective_uid = uid
+            account_id = _account_for_uid(connection, platform, effective_uid)
             link_id = generate_link_id(connection, str(identity["identity_key"]))
             cursor = connection.execute(
                 """
@@ -604,13 +1003,24 @@ def upsert_content(value: Mapping[str, Any], *, db_path: Path = DEFAULT_DB) -> D
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    link_id, platform, identity["platform_content_id"], identity["canonical_url"],
-                    identity["normalized_url_hash"], account_id, uid or None,
-                    str(value.get("account_name") or "").strip() or None, account_type,
-                    str(value.get("title") or "").strip(), str(value.get("body") or "").strip(),
-                    str(value.get("content_type") or "unknown").strip(), published,
+                    link_id,
+                    platform,
+                    identity["platform_content_id"],
+                    identity["canonical_url"],
+                    identity["normalized_url_hash"],
+                    account_id,
+                    effective_uid or None,
+                    str(value.get("account_name") or "").strip() or None,
+                    account_type,
+                    str(value.get("title") or "").strip(),
+                    str(value.get("body") or "").strip(),
+                    content_type,
+                    published,
                     str(published_raw) if published_raw not in (None, "") else None,
-                    direction, captured_at, captured_at, captured_at,
+                    None if direction == "unknown" else direction,
+                    captured_at,
+                    captured_at,
+                    captured_at,
                 ),
             )
             if cursor.lastrowid is None:
@@ -619,31 +1029,65 @@ def upsert_content(value: Mapping[str, Any], *, db_path: Path = DEFAULT_DB) -> D
             action = "inserted"
         else:
             content_id = int(current["id"])
+            effective_uid = uid or str(current["raw_account_uid"] or "").strip()
+            account_id = _account_for_uid(connection, platform, effective_uid)
+            effective_account_type = (
+                str(current["legacy_account_type"] or "unknown")
+                if account_type == "unknown"
+                else account_type
+            )
+            effective_content_type = (
+                str(current["content_type"] or "unknown")
+                if content_type == "unknown"
+                else content_type
+            )
+            effective_direction = (
+                current["manual_content_direction"]
+                if direction == "unknown"
+                else direction
+            )
             connection.execute(
                 """
                 UPDATE content_items SET platform_content_id=?, canonical_url=?,
-                    normalized_url_hash=?, account_id=COALESCE(?, account_id),
+                    normalized_url_hash=?, account_id=?,
                     raw_account_uid=?, raw_account_name=?, legacy_account_type=?,
                     title=?, body=?, content_type=?, published_at=?, published_at_raw=?,
                     manual_content_direction=?, updated_at=? WHERE id=?
                 """,
                 (
-                    identity["platform_content_id"], identity["canonical_url"],
-                    identity["normalized_url_hash"], account_id, uid or current["raw_account_uid"],
-                    str(value.get("account_name") or current["raw_account_name"] or "").strip() or None,
-                    account_type, str(value.get("title") or "").strip(),
+                    identity["platform_content_id"],
+                    identity["canonical_url"],
+                    identity["normalized_url_hash"],
+                    account_id,
+                    effective_uid or None,
+                    str(
+                        value.get("account_name") or current["raw_account_name"] or ""
+                    ).strip()
+                    or None,
+                    effective_account_type,
+                    str(value.get("title") or "").strip(),
                     str(value.get("body") or "").strip(),
-                    str(value.get("content_type") or current["content_type"] or "unknown").strip(),
-                    published, str(published_raw) if published_raw not in (None, "") else None,
-                    direction, captured_at, content_id,
+                    effective_content_type,
+                    published,
+                    str(published_raw) if published_raw not in (None, "") else None,
+                    effective_direction,
+                    captured_at,
+                    content_id,
                 ),
             )
             action = "updated"
         connection.execute(
-            "UPDATE content_identities SET is_primary=0 WHERE content_id=?", (content_id,)
+            "UPDATE content_identities SET is_primary=0 WHERE content_id=?",
+            (content_id,),
         )
-        kind = "platform_content_id" if identity["platform_content_id"] else "canonical_url"
-        identity_value = str(identity["platform_content_id"] or identity["canonical_url"])
+        kind = (
+            "platform_content_id"
+            if identity["platform_content_id"]
+            else "canonical_url"
+        )
+        identity_value = str(
+            identity["platform_content_id"] or identity["canonical_url"]
+        )
         connection.execute(
             """
             INSERT INTO content_identities(
@@ -662,26 +1106,314 @@ def upsert_content(value: Mapping[str, Any], *, db_path: Path = DEFAULT_DB) -> D
             """,
             (content_id, content_id),
         )
-        _rebuild_text_duplicate_group(connection, content_id)
+        updated_content = connection.execute(
+            "SELECT title,body FROM content_items WHERE id=?", (content_id,)
+        ).fetchone()
+        if updated_content is None:
+            raise RuntimeError("content upsert target disappeared")
+        new_text_fingerprint = _text_sha256(
+            updated_content["title"], updated_content["body"]
+        )
+        if new_text_fingerprint is not None:
+            affected_text_fingerprints.add(new_text_fingerprint)
+        affected_text_ids.add(content_id)
+        _rebuild_text_duplicate_groups(
+            connection,
+            affected_text_fingerprints,
+            touched_content_ids=affected_text_ids,
+        )
+        reconcile_content_account_identity(
+            connection,
+            content_id,
+            captured_at=captured_at,
+            previous_identity_keys=tuple(affected_identity_keys),
+        )
     return {"id": content_id, "action": action}
 
 
-def update_content(content_id: int, value: Mapping[str, Any], *, db_path: Path = DEFAULT_DB) -> Dict[str, Any]:
-    with connect(db_path) as connection:
-        row = connection.execute("SELECT * FROM content_items WHERE id=?", (content_id,)).fetchone()
+def normalize_unknown_content_directions(*, db_path: Path) -> Dict[str, Any]:
+    """Replace the legacy unknown sentinel with NULL without touching row timestamps."""
+
+    if not db_path.is_file():
+        raise OperationError(f"数据库不存在：{db_path}")
+
+    def distribution(connection: sqlite3.Connection) -> Dict[str, int]:
+        return {
+            str(row["direction"]): int(row["count"])
+            for row in connection.execute(
+                """
+                SELECT COALESCE(manual_content_direction,'null') direction,
+                       COUNT(*) count
+                FROM content_items
+                GROUP BY COALESCE(manual_content_direction,'null')
+                ORDER BY direction
+                """
+            )
+        }
+
+    with connect(db_path) as connection, transaction(connection):
+        before = distribution(connection)
+        total_rows = int(
+            connection.execute("SELECT COUNT(*) FROM content_items").fetchone()[0]
+        )
+        cursor = connection.execute(
+            """
+            UPDATE content_items SET manual_content_direction=NULL
+            WHERE manual_content_direction='unknown'
+            """
+        )
+        after = distribution(connection)
+    if sum(before.values()) != total_rows or sum(after.values()) != total_rows:
+        raise RuntimeError("content direction normalization changed the row count")
+    return {
+        "total_rows": total_rows,
+        "updated_rows": cursor.rowcount,
+        "before": before,
+        "after": after,
+    }
+
+
+def update_content(
+    content_id: int, value: Mapping[str, Any], *, db_path: Path = DEFAULT_DB
+) -> Dict[str, Any]:
+    updates = dict(value)
+    unexpected = set(updates) - CONTENT_PATCH_FIELDS
+    if unexpected:
+        raise OperationError(f"不支持修改的内容字段：{sorted(unexpected)}")
+    if not updates:
+        raise OperationError("至少提交一个要修改的字段")
+    original_content_id = content_id
+    captured_at = now_utc()
+    with _content_write_transaction(db_path) as connection:
+        row = connection.execute(
+            "SELECT * FROM content_items WHERE id=?", (content_id,)
+        ).fetchone()
         if row is None:
             raise OperationError("内容不存在")
-    merged = {
-        "platform": row["platform"], "platform_content_id": row["platform_content_id"],
-        "canonical_url": row["canonical_url"], "account_uid": row["raw_account_uid"],
-        "account_name": row["raw_account_name"], "account_type": row["legacy_account_type"],
-        "title": row["title"], "body": row["body"], "content_type": row["content_type"],
-        "published_at": row["published_at"], "content_direction": row["manual_content_direction"],
-        **dict(value),
-    }
-    result = upsert_content(merged, db_path=db_path)
-    if int(result["id"]) != content_id:
-        return {**result, "merged_from_id": content_id}
+        affected_text_ids = {content_id}
+        affected_text_fingerprints = {
+            fingerprint
+            for fingerprint in (_text_sha256(row["title"], row["body"]),)
+            if fingerprint is not None
+        }
+        affected_identity_keys = {(str(row["platform"]), str(row["raw_account_uid"]))}
+        identity_fields = {"platform", "platform_content_id", "canonical_url"}
+        identity = None
+        identity_merged = False
+        if identity_fields & updates.keys():
+            identity = content_identity(
+                str(updates.get("platform", row["platform"]) or ""),
+                str(updates.get("canonical_url", row["canonical_url"]) or ""),
+                updates.get("platform_content_id", row["platform_content_id"]),
+            )
+            candidate_ids: set[int] = set()
+            if identity["platform_content_id"]:
+                by_id = connection.execute(
+                    """
+                    SELECT id FROM content_items
+                    WHERE platform=? AND platform_content_id=?
+                    """,
+                    (identity["platform"], identity["platform_content_id"]),
+                ).fetchone()
+                if by_id is not None:
+                    candidate_ids.add(int(by_id["id"]))
+            by_url = connection.execute(
+                """
+                SELECT id FROM content_items
+                WHERE platform=? AND normalized_url_hash=?
+                """,
+                (identity["platform"], identity["normalized_url_hash"]),
+            ).fetchone()
+            if by_url is not None:
+                candidate_ids.add(int(by_url["id"]))
+            external_candidate_ids = sorted(candidate_ids - {content_id})
+            if len(external_candidate_ids) > 1:
+                for candidate_id in external_candidate_ids:
+                    candidate = connection.execute(
+                        "SELECT * FROM content_items WHERE id=?", (candidate_id,)
+                    ).fetchone()
+                    if candidate is None:
+                        raise RuntimeError("identity candidate disappeared")
+                    original, duplicate = sorted(
+                        (row, candidate),
+                        key=lambda value: (value["created_at"], value["id"]),
+                    )
+                    histories = {
+                        int(value["id"]): _protected_content_history(
+                            connection, int(value["id"])
+                        )
+                        for value in (original, duplicate)
+                    }
+                    _record_identity_conflict(
+                        connection,
+                        original,
+                        duplicate,
+                        histories=histories,
+                        reason="multiple_identity_candidates",
+                    )
+                raise IdentityConflictError(
+                    "identity_conflict: 平台内容 ID 与链接命中不同内容，已进入重复内容人工复核"
+                )
+            for candidate_id in external_candidate_ids:
+                affected_text_ids.add(candidate_id)
+                candidate = connection.execute(
+                    """
+                    SELECT platform,raw_account_uid,title,body
+                    FROM content_items WHERE id=?
+                    """,
+                    (candidate_id,),
+                ).fetchone()
+                if candidate is not None:
+                    affected_identity_keys.add(
+                        (
+                            str(candidate["platform"]),
+                            str(candidate["raw_account_uid"] or ""),
+                        )
+                    )
+                    candidate_fingerprint = _text_sha256(
+                        candidate["title"], candidate["body"]
+                    )
+                    if candidate_fingerprint is not None:
+                        affected_text_fingerprints.add(candidate_fingerprint)
+                content_id = merge_content_records(connection, content_id, candidate_id)
+                identity_merged = True
+            row = connection.execute(
+                "SELECT * FROM content_items WHERE id=?", (content_id,)
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("identity merge survivor disappeared")
+            affected_identity_keys.add(
+                (str(row["platform"]), str(row["raw_account_uid"] or ""))
+            )
+
+        columns: Dict[str, Any] = {}
+        if identity is not None:
+            columns.update(
+                {
+                    "platform": identity["platform"],
+                    "platform_content_id": identity["platform_content_id"],
+                    "canonical_url": identity["canonical_url"],
+                    "normalized_url_hash": identity["normalized_url_hash"],
+                }
+            )
+        if "published_at" in updates:
+            published_raw = updates["published_at"]
+            published = (
+                normalize_timestamp(published_raw)
+                if published_raw not in (None, "")
+                else None
+            )
+            if published_raw not in (None, "") and published is None:
+                raise OperationError("发布日期必须是 ISO 时间或 Unix 秒")
+            columns["published_at"] = published
+            columns["published_at_raw"] = (
+                str(published_raw) if published_raw not in (None, "") else None
+            )
+        for request_field, column in (
+            ("title", "title"),
+            ("body", "body"),
+            ("account_uid", "raw_account_uid"),
+            ("account_name", "raw_account_name"),
+        ):
+            if request_field in updates:
+                normalized = str(updates[request_field] or "").strip()
+                columns[column] = (
+                    normalized
+                    if request_field in {"title", "body"}
+                    else normalized or None
+                )
+        if "content_type" in updates:
+            columns["content_type"] = (
+                str(updates["content_type"] or "unknown").strip() or "unknown"
+            )
+        if "account_type" in updates:
+            columns["legacy_account_type"] = _enum(
+                updates["account_type"], ACCOUNT_TYPES, "account_type"
+            )
+        if "content_direction" in updates:
+            direction = _enum(
+                updates["content_direction"], DIRECTIONS, "content_direction"
+            )
+            columns["manual_content_direction"] = (
+                None if direction == "unknown" else direction
+            )
+
+        assignments = [f"{column}=?" for column in columns]
+        assignments.append("updated_at=?")
+        connection.execute(
+            f"UPDATE content_items SET {', '.join(assignments)} WHERE id=?",
+            (*columns.values(), captured_at, content_id),
+        )
+        if identity is not None:
+            connection.execute(
+                "UPDATE content_identities SET is_primary=0 WHERE content_id=?",
+                (content_id,),
+            )
+            kind = (
+                "platform_content_id"
+                if identity["platform_content_id"]
+                else "canonical_url"
+            )
+            identity_value = str(
+                identity["platform_content_id"] or identity["canonical_url"]
+            )
+            connection.execute(
+                """
+                INSERT INTO content_identities(
+                    content_id,identity_kind,identity_value,platform_identity_key,
+                    is_primary,created_at
+                ) VALUES (?,?,?,?,1,?)
+                ON CONFLICT(platform_identity_key) DO UPDATE SET
+                    content_id=excluded.content_id,is_primary=1
+                """,
+                (
+                    content_id,
+                    kind,
+                    identity_value,
+                    identity["identity_key"],
+                    captured_at,
+                ),
+            )
+        if {"title", "body"} & updates.keys():
+            connection.execute(
+                """
+                DELETE FROM duplicate_relations
+                WHERE method='fingerprint_v1'
+                  AND (duplicate_content_id=? OR original_content_id=?)
+                """,
+                (content_id, content_id),
+            )
+        if {"title", "body", "published_at"} & updates.keys() or identity_merged:
+            updated_content = connection.execute(
+                "SELECT title,body FROM content_items WHERE id=?", (content_id,)
+            ).fetchone()
+            if updated_content is None:
+                raise RuntimeError("content update target disappeared")
+            new_text_fingerprint = _text_sha256(
+                updated_content["title"], updated_content["body"]
+            )
+            if new_text_fingerprint is not None:
+                affected_text_fingerprints.add(new_text_fingerprint)
+            affected_text_ids.add(content_id)
+            _rebuild_text_duplicate_groups(
+                connection,
+                affected_text_fingerprints,
+                touched_content_ids=affected_text_ids,
+            )
+        if {
+            "platform",
+            "account_uid",
+            "account_name",
+        } & updates.keys() or identity_merged:
+            reconcile_content_account_identity(
+                connection,
+                content_id,
+                captured_at=captured_at,
+                previous_identity_keys=tuple(affected_identity_keys),
+            )
+    result: Dict[str, Any] = {"id": content_id, "action": "updated"}
+    if content_id != original_content_id:
+        result["merged_from_id"] = original_content_id
     return result
 
 
@@ -717,7 +1449,11 @@ def import_contents(
     for index, row in enumerate(rows, start=1):
         key = keys[index - 1]
         if key and last_by_key[key] != index:
-            status, entity_id, reason = "duplicate_in_file", None, "同文件后续行覆盖本行"
+            status, entity_id, reason = (
+                "duplicate_in_file",
+                None,
+                "同文件后续行覆盖本行",
+            )
             counts.rejected += 1
         else:
             try:
@@ -736,8 +1472,13 @@ def import_contents(
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    batch_id, index, status, entity_id, key or "",
-                    json.dumps(dict(row), ensure_ascii=False), reason[:1000],
+                    batch_id,
+                    index,
+                    status,
+                    entity_id,
+                    key or "",
+                    json.dumps(dict(row), ensure_ascii=False),
+                    reason[:1000],
                 ),
             )
     with connect(db_path) as connection, transaction(connection):
@@ -754,11 +1495,23 @@ def import_contents(
 def export_accounts_csv(*, db_path: Path = DEFAULT_DB) -> bytes:
     output = io.StringIO()
     fields = [
-        "phone", "operator_name", "account_type", "content_direction", "enabled",
-        "douyin_uid", "douyin_nickname", "douyin_real_name_status",
-        "xiaohongshu_uid", "xiaohongshu_nickname", "xiaohongshu_real_name_status",
-        "wechat_channels_uid", "wechat_channels_nickname", "wechat_channels_real_name_status",
-        "kuaishou_uid", "kuaishou_nickname", "kuaishou_real_name_status",
+        "phone",
+        "operator_name",
+        "account_type",
+        "content_direction",
+        "enabled",
+        "douyin_uid",
+        "douyin_nickname",
+        "douyin_real_name_status",
+        "xiaohongshu_uid",
+        "xiaohongshu_nickname",
+        "xiaohongshu_real_name_status",
+        "wechat_channels_uid",
+        "wechat_channels_nickname",
+        "wechat_channels_real_name_status",
+        "kuaishou_uid",
+        "kuaishou_nickname",
+        "kuaishou_real_name_status",
     ]
     writer = csv.DictWriter(output, fieldnames=fields)
     writer.writeheader()
@@ -768,13 +1521,16 @@ def export_accounts_csv(*, db_path: Path = DEFAULT_DB) -> bytes:
             row: Dict[str, Any] = {field: "" for field in fields}
             row.update(
                 {
-                    "phone": account["phone"], "operator_name": account["operator_name"],
+                    "phone": account["phone"],
+                    "operator_name": account["operator_name"],
                     "account_type": account["account_type"],
-                    "content_direction": account["content_direction"], "enabled": account["enabled"],
+                    "content_direction": account["content_direction"],
+                    "enabled": account["enabled"],
                 }
             )
             identities = connection.execute(
-                "SELECT * FROM account_platform_identities WHERE account_id=?", (account["id"],)
+                "SELECT * FROM account_platform_identities WHERE account_id=?",
+                (account["id"],),
             ).fetchall()
             for identity in identities:
                 prefix = str(identity["platform"])
@@ -788,26 +1544,38 @@ def export_accounts_csv(*, db_path: Path = DEFAULT_DB) -> bytes:
 def export_contents_csv(*, db_path: Path = DEFAULT_DB) -> bytes:
     output = io.StringIO()
     fields = [
-        "link_id", "platform", "platform_content_id", "published_at", "canonical_url",
-        "title", "account_uid", "account_name", "account_type", "content_direction",
-        "primary_selling_point_code", "content_automotive_score", "view_count", "comment_count",
+        "link_id",
+        "platform",
+        "platform_content_id",
+        "published_at",
+        "canonical_url",
+        "title",
+        "account_uid",
+        "account_name",
+        "account_type",
+        "content_direction",
+        "primary_selling_point_code",
+        "content_automotive_score",
+        "evaluation_freshness",
+        "view_count",
+        "comment_count",
         "duplicate_original_link_id",
     ]
     writer = csv.DictWriter(output, fieldnames=fields)
     writer.writeheader()
+    direction_sql = effective_direction_sql()
     with connect(db_path) as connection:
+        active_release(connection)
         rows = connection.execute(
-            """
+            f"""
+            WITH {DISPLAY_EFFECTIVE_EVALUATIONS_CTE}
             SELECT c.*, COALESCE(a.account_type,c.legacy_account_type,'unknown') account_type,
-                   COALESCE(c.manual_content_direction,c.evaluation_content_direction,a.content_direction,'unknown') direction,
+                   {direction_sql} direction,
                    ev.primary_selling_point_code, ev.content_automotive_score,
+                   COALESCE(ev.evaluation_freshness,'missing') evaluation_freshness,
                    ms.view_count, ms.comment_count, original.link_id duplicate_original_link_id
             FROM content_items c LEFT JOIN accounts a ON a.id=c.account_id
-            LEFT JOIN evaluation_versions ev ON ev.id=(
-                SELECT id FROM evaluation_versions
-                WHERE content_id=c.id AND invalidated_at IS NULL
-                ORDER BY evaluated_at DESC,id DESC LIMIT 1
-            )
+            LEFT JOIN display_effective_evaluations ev ON ev.content_id=c.id
             LEFT JOIN content_metric_snapshots ms ON ms.id=(SELECT id FROM content_metric_snapshots WHERE content_id=c.id ORDER BY captured_at DESC,id DESC LIMIT 1)
             LEFT JOIN duplicate_relations d ON d.id=(SELECT id FROM duplicate_relations WHERE duplicate_content_id=c.id AND status='confirmed' ORDER BY id LIMIT 1)
             LEFT JOIN content_items original ON original.id=d.original_content_id
@@ -817,15 +1585,21 @@ def export_contents_csv(*, db_path: Path = DEFAULT_DB) -> bytes:
         for item in rows:
             writer.writerow(
                 {
-                    "link_id": item["link_id"], "platform": item["platform"],
+                    "link_id": item["link_id"],
+                    "platform": item["platform"],
                     "platform_content_id": item["platform_content_id"],
-                    "published_at": item["published_at"], "canonical_url": item["canonical_url"],
-                    "title": item["title"], "account_uid": item["raw_account_uid"],
-                    "account_name": item["raw_account_name"], "account_type": item["account_type"],
+                    "published_at": item["published_at"],
+                    "canonical_url": item["canonical_url"],
+                    "title": item["title"],
+                    "account_uid": item["raw_account_uid"],
+                    "account_name": item["raw_account_name"],
+                    "account_type": item["account_type"],
                     "content_direction": item["direction"],
                     "primary_selling_point_code": item["primary_selling_point_code"],
                     "content_automotive_score": item["content_automotive_score"],
-                    "view_count": item["view_count"], "comment_count": item["comment_count"],
+                    "evaluation_freshness": item["evaluation_freshness"],
+                    "view_count": item["view_count"],
+                    "comment_count": item["comment_count"],
                     "duplicate_original_link_id": item["duplicate_original_link_id"],
                 }
             )

@@ -245,12 +245,20 @@ def _source_inputs(connection: sqlite3.Connection, content_id: int) -> Dict[str,
     }
 
 
+def _current_source_state(
+    connection: sqlite3.Connection, content_id: int
+) -> tuple[Dict[str, Any], str]:
+    """Return the exact inputs and source digest used by fingerprint creation."""
+
+    inputs = _source_inputs(connection, content_id)
+    return inputs, _sha256_json(inputs["source"])
+
+
 def fingerprint_content(content_id: int, *, db_path: Path = DEFAULT_DB) -> Dict[str, Any]:
     if package_version("ImageHash") != "4.3.2" or package_version("Pillow") != "12.3.0":
         raise DuplicateDetectionError("duplicate processor dependency version mismatch")
     with connect(db_path) as connection:
-        inputs = _source_inputs(connection, content_id)
-    source_sha256 = _sha256_json(inputs["source"])
+        inputs, source_sha256 = _current_source_state(connection, content_id)
     content = inputs["content"]
     output_root = (
         FINGERPRINT_ROOT
@@ -601,31 +609,32 @@ def refresh_content_duplicates(
 
 def _pending_content_ids(*, limit: Optional[int], db_path: Path) -> List[int]:
     with connect(db_path) as connection:
-        sql = """
-            SELECT c.id FROM content_items c
-            WHERE NOT EXISTS (
-                SELECT 1 FROM duplicate_fingerprints df
-                WHERE df.content_id=c.id AND df.fingerprint_version=?
-            ) OR c.updated_at > COALESCE((
-                SELECT MAX(df.created_at) FROM duplicate_fingerprints df
-                WHERE df.content_id=c.id AND df.fingerprint_version=?
-            ), '') OR EXISTS (
-                SELECT 1 FROM evidence_artifacts ea
-                WHERE ea.content_id=c.id AND ea.status='available'
-                  AND ea.artifact_type<>'duplicate_fingerprint'
-                  AND COALESCE(ea.captured_at,ea.created_at) > COALESCE((
-                      SELECT MAX(df.created_at) FROM duplicate_fingerprints df
-                      WHERE df.content_id=c.id AND df.fingerprint_version=?
-                  ), '')
-            )
-            ORDER BY c.id
-        """
-        parameters: List[Any] = [FINGERPRINT_VERSION] * 3
-        if limit is not None:
-            sql += " LIMIT ?"
-            parameters.append(limit)
-        rows = connection.execute(sql, parameters).fetchall()
-    return [int(row["id"]) for row in rows]
+        content_rows = connection.execute(
+            "SELECT id FROM content_items ORDER BY id"
+        ).fetchall()
+        fingerprint_rows = connection.execute(
+            """
+            SELECT content_id,source_sha256 FROM duplicate_fingerprints
+            WHERE fingerprint_version=?
+            """,
+            (FINGERPRINT_VERSION,),
+        ).fetchall()
+        completed = {
+            (int(row["content_id"]), str(row["source_sha256"]))
+            for row in fingerprint_rows
+        }
+        if limit == 0:
+            return []
+        pending: List[int] = []
+        for row in content_rows:
+            content_id = int(row["id"])
+            _, source_sha256 = _current_source_state(connection, content_id)
+            if (content_id, source_sha256) in completed:
+                continue
+            pending.append(content_id)
+            if limit is not None and limit > 0 and len(pending) >= limit:
+                break
+    return pending
 
 
 def run_duplicate_fingerprint_queue(
@@ -642,13 +651,15 @@ def run_duplicate_fingerprint_queue(
             failures.append(
                 {"content_id": content_id, "error": f"{type(exc).__name__}: {exc}"[:500]}
             )
+    queue_drained = not _pending_content_ids(limit=1, db_path=db_path)
+    ready = calibration_ready(db_path=db_path)
     relations: Optional[Dict[str, Any]] = None
-    if processed and calibration_ready(db_path=db_path):
+    if processed and not failures and queue_drained and ready:
         relations = rebuild_duplicate_relations(db_path=db_path)
     return {
         "candidates": len(content_ids), "processed": processed, "failed": len(failures),
         "failures": failures, "relations": relations,
-        "calibration_ready": calibration_ready(db_path=db_path),
+        "calibration_ready": ready,
     }
 
 

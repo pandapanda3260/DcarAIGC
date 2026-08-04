@@ -1,6 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import Image from "next/image";
+import { Fragment, useEffect, useState } from "react";
+import { BroadcastIcon, VideoCameraIcon } from "@phosphor-icons/react";
 import AppShell from "../components/AppShell";
 import { Feedback, Loading } from "../components/Feedback";
 import { API_BASE, jsonRequest, parseCsv, readJson } from "../lib/api";
@@ -13,6 +15,34 @@ type AccountForm = {
   platforms: Record<string, { uid: string; nickname: string; realNameStatus: string }>;
 };
 const blankIdentity = () => ({ uid: "", nickname: "", realNameStatus: "unknown" });
+const integerFormat = new Intl.NumberFormat("zh-CN");
+
+function formatIdentityCount(value: number | null | undefined, suffix = "") {
+  return value == null ? "—" : `${integerFormat.format(value)}${suffix}`;
+}
+
+function AccountPlatformCells({ account }: { account: Account }) {
+  const identities = new Map(account.platforms.map((identity) => [identity.platform, identity]));
+  return platformKeys.map((platformKey) => {
+    const identity = identities.get(platformKey);
+    return <Fragment key={platformKey}>
+      <td className="account-platform-start">{identity?.uid || "—"}</td>
+      <td>{identity ? label(identity.real_name_status) : "未绑定"}</td>
+      <td>{identity?.nickname || "—"}</td>
+      <td className="account-number-cell">{formatIdentityCount(identity?.follower_count)}</td>
+      <td className="account-number-cell">{formatIdentityCount(identity ? identity.content_count : 0, " 条")}</td>
+    </Fragment>;
+  });
+}
+
+function PlatformHeaderMark({ platformKey }: { platformKey: string }) {
+  let mark = <VideoCameraIcon weight="fill" />;
+  if (platformKey === "douyin") mark = <Image src="/brand-douyin-tiktok.svg" alt="" width={10} height={10} unoptimized />;
+  if (platformKey === "xiaohongshu") mark = <Image src="/brand-xiaohongshu.svg" alt="" width={10} height={10} unoptimized />;
+  if (platformKey === "wechat_channels") mark = <BroadcastIcon weight="fill" />;
+  return <span className="account-platform-icon" data-platform-mark={platformKey} aria-hidden="true">{mark}</span>;
+}
+
 function emptyForm(): AccountForm {
   return { id: null, phone: "", operatorName: "", accountType: "unknown", contentDirection: "unknown", enabled: true,
     platforms: Object.fromEntries(platformKeys.map((key) => [key, blankIdentity()])),
@@ -86,10 +116,45 @@ export default function AccountsPage() {
   return <AppShell active="accounts" actions={<button className="primary small" onClick={() => edit()}>新增账号</button>}>
     <Feedback error={error} message={message} onClose={() => { setError(""); setMessage(""); }} />
     {loading ? <Loading label="正在读取账号库" /> : <section className="page-stack wide-stack">
-      <div className="detail-toolbar"><div><span className="eyebrow">PHONE AS BUSINESS KEY</span><h2>账号主数据</h2><p>手机号完整显示且作为唯一键；导入重复手机号时由新数据覆盖旧数据。</p></div><div className="placeholder-actions"><a className="secondary button-link" href={`${API_BASE}/api/v8/accounts/export`}>下载 CSV</a><label className="secondary button-link">批量导入<input className="file-input" type="file" accept=".csv,text/csv" disabled={saving} onChange={(event) => { const file = event.target.files?.[0]; if (file) void importCsv(file); event.currentTarget.value = ""; }} /></label></div></div>
+      <div className="detail-toolbar"><div><span className="eyebrow">PHONE AS BUSINESS KEY</span><h2>账号主数据</h2><p>一个手机号对应一行账号主数据；平台粉丝量未采集时显示“—”。</p></div><div className="placeholder-actions"><a className="secondary button-link" href={`${API_BASE}/api/v8/accounts/export`}>下载 CSV</a><label className="secondary button-link">批量导入<input className="file-input" type="file" accept=".csv,text/csv" disabled={saving} onChange={(event) => { const file = event.target.files?.[0]; if (file) void importCsv(file); event.currentTarget.value = ""; }} /></label></div></div>
       <div className="filter-bar"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="手机号、运营人员、UID、昵称" onKeyDown={(event) => { if (event.key === "Enter") void reload(); }} /><select value={accountType} onChange={(event) => { setAccountType(event.target.value); void reload({ accountType: event.target.value }); }}><option value="">全部账号类型</option><option value="boutique_ip">精品 IP</option><option value="original">原创</option><option value="mixed_edit">混剪</option><option value="unknown">未知</option></select><select value={direction} onChange={(event) => { setDirection(event.target.value); void reload({ direction: event.target.value }); }}><option value="">全部内容方向</option><option value="new_car">新车</option><option value="used_car">二手车</option><option value="media">媒体</option><option value="other">其他</option><option value="unknown">未知</option></select><select value={platform} onChange={(event) => { setPlatform(event.target.value); void reload({ platform: event.target.value }); }}><option value="">全部平台</option>{platformKeys.map((key) => <option key={key} value={key}>{label(key)}</option>)}</select><button className="secondary" onClick={() => void reload()}>搜索</button><span>{total} 个账号</span></div>
-      <article className="panel table-panel"><div className="table-scroll"><table><thead><tr><th>手机号 / 运营人员</th><th>账号类型</th><th>内容方向</th><th>平台身份</th><th>状态</th><th>操作</th></tr></thead><tbody>{items.map((item) => <tr key={item.id}><td><strong>{item.phone}</strong><span>{item.operator_name || "未填写运营人员"}</span></td><td>{label(item.account_type)}</td><td>{label(item.content_direction)}</td><td>{item.platforms.length ? item.platforms.map((identity) => <span className="identity-line" key={`${identity.platform}:${identity.uid}`}>{label(identity.platform)} · {identity.uid} · {identity.nickname || "无昵称"} · 实名 {label(identity.real_name_status)}</span>) : "未绑定平台身份"}</td><td>{item.enabled ? "运营中" : "停用"}</td><td><button className="text-button" onClick={() => edit(item)}>修改</button></td></tr>)}</tbody></table></div></article>
-      <article className="panel"><div className="panel-head"><div><span className="eyebrow">PENDING PLATFORM IDENTITIES</span><h3>待归属平台身份 · {pendingCount}</h3><p>{unassociated} 条存量内容尚未关联手机号账号；账号新增或导入匹配 UID 后会自动回填。</p></div></div><div className="pending-identity-grid">{pending.map((item) => <div key={`${item.platform}:${item.uid}`}><strong>{label(item.platform)} · {item.uid}</strong><span>{item.nickname || "昵称缺失"} · {item.content_count} 条内容</span></div>)}</div></article>
+      <article className="panel table-panel account-master-panel"><div className="table-scroll"><table className="account-master-table">
+        <caption className="visually-hidden">以手机号为锚点的账号主数据列表</caption>
+        <colgroup>
+          <col className="account-phone-col" /><col className="account-operator-col" /><col className="account-type-col" /><col className="account-direction-col" />
+        </colgroup>
+        {platformKeys.map((key) => <colgroup key={key} data-platform-columns={key}>
+          <col className="account-uid-col" /><col className="account-realname-col" /><col className="account-nickname-col" /><col className="account-followers-col" /><col className="account-content-count-col" />
+        </colgroup>)}
+        <colgroup>
+          <col className="account-status-col" /><col className="account-action-col" />
+        </colgroup>
+        <thead>
+          <tr className="account-group-row">
+            <th className="account-base-group" colSpan={4} scope="colgroup">账号基础信息</th>
+            {platformKeys.map((key) => <th className="account-platform-group" data-platform={key} colSpan={5} scope="colgroup" key={key}><span className="account-platform-heading"><PlatformHeaderMark platformKey={key} />{label(key)}</span></th>)}
+            <th className="account-management-group" colSpan={2} scope="colgroup">账号管理</th>
+          </tr>
+          <tr className="account-column-row"><th className="account-sticky account-phone" scope="col">手机号</th><th className="account-sticky account-operator" scope="col">运营人员</th><th className="account-sticky account-type" scope="col">账号类型</th><th className="account-sticky account-direction" scope="col">内容方向</th>{platformKeys.map((key) => <Fragment key={key}><th className="account-platform-start" scope="col">UID</th><th scope="col">是否实名</th><th scope="col">昵称</th><th scope="col">粉丝量</th><th scope="col">关联内容量</th></Fragment>)}<th scope="col">状态</th><th scope="col">操作</th></tr>
+        </thead>
+        <tbody>
+          {items.map((item) => <tr key={item.id}><th className="account-sticky account-phone" scope="row"><strong>{item.phone}</strong></th><td className="account-sticky account-operator">{item.operator_name || "未填写"}</td><td className="account-sticky account-type">{label(item.account_type)}</td><td className="account-sticky account-direction">{label(item.content_direction)}</td><AccountPlatformCells account={item} /><td>{item.enabled ? "运营中" : "停用"}</td><td><button className="text-button" onClick={() => edit(item)}>修改</button></td></tr>)}
+          {!items.length && <tr><td className="account-master-empty" colSpan={26}>暂无账号，请新增账号或批量导入</td></tr>}
+        </tbody>
+      </table></div></article>
+      <article className="panel pending-identity-panel">
+        <div className="panel-head"><div><span className="eyebrow">PENDING PLATFORM IDENTITIES</span><h3>待归属平台身份 · {pendingCount}</h3><p>{unassociated} 条存量内容尚未关联手机号账号；账号新增或导入匹配 UID 后会自动回填。</p></div></div>
+        <div className="pending-identity-list table-scroll">
+          <table className="pending-identity-table">
+            <caption className="visually-hidden">待归属平台身份列表</caption>
+            <thead><tr><th>平台</th><th>平台 UID</th><th>昵称</th><th>关联内容</th></tr></thead>
+            <tbody>
+              {pending.map((item) => <tr key={`${item.platform}:${item.uid}`}><td><span className="pending-platform-label">{label(item.platform)}</span></td><td><strong>{item.uid}</strong></td><td>{item.nickname || "昵称缺失"}</td><td>{item.content_count} 条</td></tr>)}
+              {!pending.length && <tr><td className="pending-identity-empty" colSpan={4}>暂无待归属平台身份</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </article>
     </section>}
     {form && <div className="modal-backdrop" role="presentation"><section className="review-modal operation-modal" role="dialog" aria-modal="true" aria-label="编辑账号"><div className="panel-head"><div><span className="eyebrow">ACCOUNT MASTER DATA</span><h3>{form.id ? "修改账号" : "新增账号"}</h3></div><button className="modal-close" onClick={() => setForm(null)} aria-label="关闭">×</button></div><div className="review-fields"><label>手机号<input value={form.phone} onChange={(event) => setForm({ ...form, phone: event.target.value })} /></label><label>运营人员<input value={form.operatorName} onChange={(event) => setForm({ ...form, operatorName: event.target.value })} /></label><label>账号类型<select value={form.accountType} onChange={(event) => setForm({ ...form, accountType: event.target.value })}><option value="unknown">未知</option><option value="boutique_ip">精品 IP</option><option value="original">原创</option><option value="mixed_edit">混剪</option></select></label><label>内容方向<select value={form.contentDirection} onChange={(event) => setForm({ ...form, contentDirection: event.target.value })}><option value="unknown">未知</option><option value="new_car">新车</option><option value="used_car">二手车</option><option value="media">媒体</option><option value="other">其他</option></select></label><label className="toggle-field"><input type="checkbox" checked={form.enabled} onChange={(event) => setForm({ ...form, enabled: event.target.checked })} />运营中</label></div><div className="platform-editor">{platformKeys.map((key) => <fieldset key={key}><legend>{label(key)}</legend><label>UID<input value={form.platforms[key].uid} onChange={(event) => setForm({ ...form, platforms: { ...form.platforms, [key]: { ...form.platforms[key], uid: event.target.value } } })} /></label><label>实名<select value={form.platforms[key].realNameStatus} onChange={(event) => setForm({ ...form, platforms: { ...form.platforms, [key]: { ...form.platforms[key], realNameStatus: event.target.value } } })}><option value="unknown">未知</option><option value="yes">是</option><option value="no">否</option></select></label><label>昵称<input value={form.platforms[key].nickname} onChange={(event) => setForm({ ...form, platforms: { ...form.platforms, [key]: { ...form.platforms[key], nickname: event.target.value } } })} /></label></fieldset>)}</div><div className="modal-actions"><button className="secondary" onClick={() => setForm(null)}>取消</button><button className="primary" disabled={saving} onClick={() => void save()}>{saving ? "保存中" : "保存账号"}</button></div></section></div>}
   </AppShell>;

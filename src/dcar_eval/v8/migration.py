@@ -10,7 +10,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
 
-from .storage import DEFAULT_DB, PROJECT_ROOT, connect, initialize_database, now_utc, transaction
+from .storage import (
+    DEFAULT_DB,
+    PROJECT_ROOT,
+    connect,
+    ensure_legacy_evaluation_release,
+    initialize_database,
+    now_utc,
+    transaction,
+)
 
 
 LEGACY_DB = PROJECT_ROOT / "app" / "data" / "web_mvp.sqlite3"
@@ -133,8 +141,12 @@ def generate_link_id(connection: sqlite3.Connection, identity: str) -> str:
     while True:
         material = identity if nonce == 0 else f"{identity}|{nonce}"
         candidate = _encode_link_material(material)
-        row = connection.execute("SELECT 1 FROM content_items WHERE link_id=?", (candidate,)).fetchone()
-        alias = connection.execute("SELECT 1 FROM content_aliases WHERE alias_link_id=?", (candidate,)).fetchone()
+        row = connection.execute(
+            "SELECT 1 FROM content_items WHERE link_id=?", (candidate,)
+        ).fetchone()
+        alias = connection.execute(
+            "SELECT 1 FROM content_aliases WHERE alias_link_id=?", (candidate,)
+        ).fetchone()
         if row is None and alias is None:
             return candidate
         nonce += 1
@@ -150,18 +162,44 @@ def _read_json(path: Path) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
-def _captured_at_for_comments(platform: str, content_id: str, imported_at: str) -> Tuple[str, Path]:
+def _captured_at_for_comments(
+    platform: str, content_id: str, imported_at: str
+) -> Tuple[str, Path]:
     if platform == "xiaohongshu":
         note_root = PROJECT_ROOT / "data" / "cache" / "rnote" / "notes" / content_id
         collection = _read_json(note_root / "collection.json")
-        comments = collection.get("comments") if isinstance(collection.get("comments"), Mapping) else {}
-        captured_text = normalize_timestamp(comments.get("collected_at") if comments else None)
-        return captured_text or normalize_timestamp(imported_at) or now_utc(), note_root / "comments.jsonl"
-    comment_root = PROJECT_ROOT / "data" / "cache" / "tikhub" / "2026-08-02" / "comments" / content_id
-    files = [item for item in comment_root.rglob("*") if item.is_file()] if comment_root.exists() else []
+        comments = (
+            collection.get("comments")
+            if isinstance(collection.get("comments"), Mapping)
+            else {}
+        )
+        captured_text = normalize_timestamp(
+            comments.get("collected_at") if comments else None
+        )
+        return captured_text or normalize_timestamp(
+            imported_at
+        ) or now_utc(), note_root / "comments.jsonl"
+    comment_root = (
+        PROJECT_ROOT
+        / "data"
+        / "cache"
+        / "tikhub"
+        / "2026-08-02"
+        / "comments"
+        / content_id
+    )
+    files = (
+        [item for item in comment_root.rglob("*") if item.is_file()]
+        if comment_root.exists()
+        else []
+    )
     if files:
-        captured_time = datetime.fromtimestamp(max(item.stat().st_mtime for item in files), tz=timezone.utc)
-        return captured_time.isoformat(timespec="seconds").replace("+00:00", "Z"), comment_root
+        captured_time = datetime.fromtimestamp(
+            max(item.stat().st_mtime for item in files), tz=timezone.utc
+        )
+        return captured_time.isoformat(timespec="seconds").replace(
+            "+00:00", "Z"
+        ), comment_root
     return normalize_timestamp(imported_at) or now_utc(), comment_root
 
 
@@ -182,8 +220,13 @@ def _insert_taxonomy(connection: sqlite3.Connection, captured_at: str) -> None:
         ) VALUES (?, ?, 'published', ?, ?, ?, ?, ?)
         """,
         (
-            taxonomy_id, taxonomy_id, str(source.get("definition") or ""),
-            _project_relative(TAXONOMY_PATH), sha256_file(TAXONOMY_PATH), captured_at, captured_at,
+            taxonomy_id,
+            taxonomy_id,
+            str(source.get("definition") or ""),
+            _project_relative(TAXONOMY_PATH),
+            sha256_file(TAXONOMY_PATH),
+            captured_at,
+            captured_at,
         ),
     )
     scene_map = {"新车": "new_car", "二手车": "used_car", "媒体-AI小懂": "media"}
@@ -232,8 +275,16 @@ def _register_artifact(
             captured_at=excluded.captured_at
         """,
         (
-            content_id, artifact_type, _project_relative(path), status, size, digest,
-            legacy_fingerprint or None, captured_at, "{}", captured_at,
+            content_id,
+            artifact_type,
+            _project_relative(path),
+            status,
+            size,
+            digest,
+            legacy_fingerprint or None,
+            captured_at,
+            "{}",
+            captured_at,
         ),
     )
     return digest
@@ -241,10 +292,23 @@ def _register_artifact(
 
 def _evaluation_payload(row: sqlite3.Row) -> Dict[str, Any]:
     excluded = {
-        "id", "platform", "platform_content_id", "canonical_url", "source_group",
-        "source_label", "account_uid", "account_name", "account_quality", "caption",
-        "content_type", "published_at", "exposure_value", "exposure_status", "source_path",
-        "source_line", "imported_at",
+        "id",
+        "platform",
+        "platform_content_id",
+        "canonical_url",
+        "source_group",
+        "source_label",
+        "account_uid",
+        "account_name",
+        "account_quality",
+        "caption",
+        "content_type",
+        "published_at",
+        "exposure_value",
+        "exposure_status",
+        "source_path",
+        "source_line",
+        "imported_at",
     }
     return {key: row[key] for key in row.keys() if key not in excluded}
 
@@ -283,8 +347,11 @@ def migrate(
                 ) VALUES (?, ?, ?, ?, 'running', ?)
                 """,
                 (
-                    migration_id, migration_id, _project_relative(legacy_db),
-                    _file_sha(legacy_db), captured_at,
+                    migration_id,
+                    migration_id,
+                    _project_relative(legacy_db),
+                    _file_sha(legacy_db),
+                    captured_at,
                 ),
             )
             destination.execute(
@@ -293,9 +360,19 @@ def migrate(
                     id, entity_type, source_name, status, total_rows, created_at
                 ) VALUES (?, 'legacy_migration', ?, 'previewed', ?, ?)
                 """,
-                (migration_id, _project_relative(legacy_db), baseline["content"]["total"], captured_at),
+                (
+                    migration_id,
+                    _project_relative(legacy_db),
+                    baseline["content"]["total"],
+                    captured_at,
+                ),
             )
             _insert_taxonomy(destination, captured_at)
+            legacy_release = ensure_legacy_evaluation_release(
+                destination,
+                rule_version="evaluation-v6",
+                taxonomy_version="selling-points-v5.0",
+            )
             budget = baseline["legacy_media_backfill"]
             destination.execute(
                 """
@@ -306,10 +383,16 @@ def migrate(
                 ) VALUES (?, ?, 'Rnote', 'xiaohongshu_video_detail', 'USD', ?, ?, ?, ?, ?, ?, 'draft', ?, ?)
                 """,
                 (
-                    "legacy-xhs-media-backfill-v1", "legacy_media_backfill",
-                    budget["unit_price_usd"], budget["paid_refresh_candidates"],
-                    budget["hard_budget_usd"], budget["pilot_size"], budget["daily_attempt_quota"],
-                    captured_at, captured_at, captured_at,
+                    "legacy-xhs-media-backfill-v1",
+                    "legacy_media_backfill",
+                    budget["unit_price_usd"],
+                    budget["paid_refresh_candidates"],
+                    budget["hard_budget_usd"],
+                    budget["pilot_size"],
+                    budget["daily_attempt_quota"],
+                    captured_at,
+                    captured_at,
+                    captured_at,
                 ),
             )
 
@@ -343,12 +426,25 @@ def migrate(
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        link_id, platform, platform_content_id, row["canonical_url"],
-                        row["account_uid"] or None, row["account_name"] or None,
-                        account_type(row["account_quality"]), row["caption"], row["content_type"] or "unknown",
-                        normalized_published, row["published_at"] or None,
-                        content_direction(row["business_scene"]), row["source_group"], row["source_label"],
-                        row["source_path"], row["source_line"], imported_at, imported_at, captured_at,
+                        link_id,
+                        platform,
+                        platform_content_id,
+                        row["canonical_url"],
+                        row["account_uid"] or None,
+                        row["account_name"] or None,
+                        account_type(row["account_quality"]),
+                        row["caption"],
+                        row["content_type"] or "unknown",
+                        normalized_published,
+                        row["published_at"] or None,
+                        content_direction(row["business_scene"]),
+                        row["source_group"],
+                        row["source_label"],
+                        row["source_path"],
+                        row["source_line"],
+                        imported_at,
+                        imported_at,
+                        captured_at,
                     ),
                 )
                 new_id = lastrowid(cursor)
@@ -368,8 +464,16 @@ def migrate(
                     ) VALUES (?, ?, 'inserted', ?, ?, ?)
                     """,
                     (
-                        migration_id, source_row_number, new_id, identity,
-                        canonical_json({"source_path": row["source_path"], "source_line": row["source_line"]}),
+                        migration_id,
+                        source_row_number,
+                        new_id,
+                        identity,
+                        canonical_json(
+                            {
+                                "source_path": row["source_path"],
+                                "source_line": row["source_line"],
+                            }
+                        ),
                     ),
                 )
                 destination.execute(
@@ -380,13 +484,20 @@ def migrate(
                     ) VALUES (?, 'content_items', ?, 'published_at', ?, ?, ?, ?)
                     """,
                     (
-                        migration_id, str(old_id), row["published_at"] or None, normalized_published,
+                        migration_id,
+                        str(old_id),
+                        row["published_at"] or None,
+                        normalized_published,
                         "normalized" if normalized_published else "missing",
-                        "" if normalized_published else "source timestamp is empty or zero",
+                        ""
+                        if normalized_published
+                        else "source timestamp is empty or zero",
                     ),
                 )
 
-                detail_status = "succeeded" if normalized_published else "terminal_failed"
+                detail_status = (
+                    "succeeded" if normalized_published else "terminal_failed"
+                )
                 destination.execute(
                     """
                     INSERT INTO fetch_slots(
@@ -395,12 +506,19 @@ def migrate(
                     ) VALUES (?, 'detail', 'lifetime', 'legacy-cache', 'migration-v1', ?, 1, ?, ?, ?, ?)
                     """,
                     (
-                        new_id, detail_status,
+                        new_id,
+                        detail_status,
                         None if normalized_published else "legacy_detail_incomplete",
-                        captured_at, captured_at, captured_at,
+                        captured_at,
+                        captured_at,
+                        captured_at,
                     ),
                 )
-                metric_status = "succeeded" if row["exposure_value"] is not None else "terminal_failed"
+                metric_status = (
+                    "succeeded"
+                    if row["exposure_value"] is not None
+                    else "terminal_failed"
+                )
                 destination.execute(
                     """
                     INSERT INTO fetch_slots(
@@ -409,9 +527,14 @@ def migrate(
                     ) VALUES (?, 'metrics', 'legacy', 'legacy-cache', 'migration-v1', ?, 1, ?, ?, ?, ?)
                     """,
                     (
-                        new_id, metric_status,
-                        None if row["exposure_value"] is not None else "legacy_metrics_missing",
-                        captured_at, captured_at, captured_at,
+                        new_id,
+                        metric_status,
+                        None
+                        if row["exposure_value"] is not None
+                        else "legacy_metrics_missing",
+                        captured_at,
+                        captured_at,
+                        captured_at,
                     ),
                 )
                 if row["exposure_value"] is not None:
@@ -422,8 +545,15 @@ def migrate(
                         ) VALUES (?, ?, 'legacy', ?, 'available', 'migrated_historical', ?)
                         """,
                         (
-                            new_id, imported_at, int(row["exposure_value"]),
-                            canonical_json({"trend_eligible": False, "original_status": row["exposure_status"]}),
+                            new_id,
+                            imported_at,
+                            int(row["exposure_value"]),
+                            canonical_json(
+                                {
+                                    "trend_eligible": False,
+                                    "original_status": row["exposure_status"],
+                                }
+                            ),
                         ),
                     )
 
@@ -441,8 +571,12 @@ def migrate(
                     ) VALUES (?, ?, ?, 'legacy-cache', ?, ?, 'available', ?)
                     """,
                     (
-                        new_id, comments_captured_at, week, _project_relative(comments_path),
-                        comment_sha, captured_at,
+                        new_id,
+                        comments_captured_at,
+                        week,
+                        _project_relative(comments_path),
+                        comment_sha,
+                        captured_at,
                     ),
                 )
                 destination.execute(
@@ -506,8 +640,13 @@ def migrate(
                 envelope = {
                     key: components.get(key)
                     for key in (
-                        "detail_raw_sha256", "text_sha256", "media_sha256", "asr_sha256",
-                        "ocr_sha256", "comments_version_sha256", "manual_evidence_sha256",
+                        "detail_raw_sha256",
+                        "text_sha256",
+                        "media_sha256",
+                        "asr_sha256",
+                        "ocr_sha256",
+                        "comments_version_sha256",
+                        "manual_evidence_sha256",
                     )
                 }
                 evidence_sha = sha256_json(envelope)
@@ -520,32 +659,50 @@ def migrate(
                     ) VALUES (?, 'evidence-v1', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        new_id, envelope["detail_raw_sha256"], envelope["text_sha256"],
-                        envelope["media_sha256"], envelope["asr_sha256"], envelope["ocr_sha256"],
-                        envelope["comments_version_sha256"], envelope["manual_evidence_sha256"],
-                        evidence_sha, canonical_json(envelope), captured_at,
+                        new_id,
+                        envelope["detail_raw_sha256"],
+                        envelope["text_sha256"],
+                        envelope["media_sha256"],
+                        envelope["asr_sha256"],
+                        envelope["ocr_sha256"],
+                        envelope["comments_version_sha256"],
+                        envelope["manual_evidence_sha256"],
+                        evidence_sha,
+                        canonical_json(envelope),
+                        captured_at,
                     ),
                 )
                 payload = _evaluation_payload(row)
                 evaluation_cursor = destination.execute(
                     """
                     INSERT INTO evaluation_versions(
-                        content_id, evidence_envelope_id, rule_version, taxonomy_version,
-                        evidence_sha256, evaluation_source, evaluation_status, evidence_level,
+                        content_id, evidence_envelope_id, release_id, rule_version,
+                        taxonomy_version, matcher_rule_sha256, evidence_sha256,
+                        evaluation_source, evaluation_status, evidence_level,
                         primary_selling_point_code, selling_point_score, selling_point_included,
                         content_direction, content_automotive_score, audience_automotive_score,
                         acquisition_potential_score, pending_review, payload_json, evaluated_at
-                    ) VALUES (?, ?, 'evaluation-v6', 'selling-points-v5.0', ?, 'migrated_from_v5',
-                              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, 'evaluation-v6', 'selling-points-v5.0', ?, ?,
+                              'migrated_from_v5', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        new_id, lastrowid(envelope_cursor), evidence_sha,
-                        row["evaluation_status"], row["evidence_level"],
-                        row["primary_selling_point_id"] or None, row["selling_point_score"],
-                        int(row["selling_point_included"]), content_direction(row["business_scene"]),
-                        row["content_automotive_score"], row["audience_automotive_score"],
-                        row["acquisition_potential"], int(row["pending_review"]),
-                        canonical_json(payload), normalize_timestamp(row["evaluated_at"]) or captured_at,
+                        new_id,
+                        lastrowid(envelope_cursor),
+                        legacy_release["id"],
+                        legacy_release["matcher_rule_sha256"],
+                        evidence_sha,
+                        row["evaluation_status"],
+                        row["evidence_level"],
+                        row["primary_selling_point_id"] or None,
+                        row["selling_point_score"],
+                        int(row["selling_point_included"]),
+                        content_direction(row["business_scene"]),
+                        row["content_automotive_score"],
+                        row["audience_automotive_score"],
+                        row["acquisition_potential"],
+                        int(row["pending_review"]),
+                        canonical_json(payload),
+                        normalize_timestamp(row["evaluated_at"]) or captured_at,
                     ),
                 )
                 evaluation_id = lastrowid(evaluation_cursor)
@@ -555,13 +712,21 @@ def migrate(
                     destination.execute(
                         """
                         INSERT INTO evaluation_matches(
-                            evaluation_id, selling_point_code, match_role, score, evidence_json
-                        ) VALUES (?, ?, 'primary', ?, '{}')
+                            evaluation_id, selling_point_code, scene, match_role,
+                            score, evidence_json
+                        ) VALUES (?, ?, ?, 'primary', ?, '{}')
                         """,
-                        (evaluation_id, primary, row["selling_point_score"]),
+                        (
+                            evaluation_id,
+                            primary,
+                            content_direction(row["business_scene"]),
+                            row["selling_point_score"],
+                        ),
                     )
                 try:
-                    secondary = json.loads(row["secondary_selling_point_ids_json"] or "[]")
+                    secondary = json.loads(
+                        row["secondary_selling_point_ids_json"] or "[]"
+                    )
                 except json.JSONDecodeError:
                     secondary = []
                 for code in secondary:
@@ -569,25 +734,39 @@ def migrate(
                         destination.execute(
                             """
                             INSERT OR IGNORE INTO evaluation_matches(
-                                evaluation_id, selling_point_code, match_role, evidence_json
-                            ) VALUES (?, ?, 'secondary', '{}')
+                                evaluation_id, selling_point_code, scene, match_role,
+                                evidence_json
+                            ) VALUES (?, ?, ?, 'secondary', '{}')
                             """,
-                            (evaluation_id, str(code)),
+                            (
+                                evaluation_id,
+                                str(code),
+                                content_direction(row["business_scene"]),
+                            ),
                         )
 
                 evidence_level = str(row["evidence_level"])
                 pending = int(row["pending_review"])
                 if pending:
                     if evidence_level == "V0":
-                        queue_status, reason = "terminal_failed", "legacy_content_unavailable"
+                        queue_status, reason = (
+                            "terminal_failed",
+                            "legacy_content_unavailable",
+                        )
                     elif evidence_level == "V1":
                         local_video = (
-                            PROJECT_ROOT / "data" / "cache" / "rnote" / "media"
-                            / str(row["platform_content_id"]) / "video.mp4"
+                            PROJECT_ROOT
+                            / "data"
+                            / "cache"
+                            / "rnote"
+                            / "media"
+                            / str(row["platform_content_id"])
+                            / "video.mp4"
                         )
                         reason = (
                             "stale_local_evidence"
-                            if local_video.exists() and local_video.stat().st_size > 1024
+                            if local_video.exists()
+                            and local_video.stat().st_size > 1024
                             else "media_evidence_missing"
                         )
                         queue_status = "pending"
@@ -601,7 +780,12 @@ def migrate(
                         ) VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
-                            new_id, evaluation_id, reason, queue_status, captured_at, captured_at,
+                            new_id,
+                            evaluation_id,
+                            reason,
+                            queue_status,
+                            captured_at,
+                            captured_at,
                             captured_at if queue_status == "terminal_failed" else None,
                         ),
                     )
@@ -625,13 +809,18 @@ def migrate(
                     ) VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        new_id, comment_versions.get(new_id), score["anonymous_user_key"],
-                        score["audience_automotive_score"], score["action_intent_score"],
+                        new_id,
+                        comment_versions.get(new_id),
+                        score["anonymous_user_key"],
+                        score["audience_automotive_score"],
+                        score["action_intent_score"],
                         normalize_timestamp(score["evaluated_at"]) or captured_at,
                     ),
                 )
 
-            review_rows = source.execute("SELECT * FROM manual_reviews ORDER BY id").fetchall()
+            review_rows = source.execute(
+                "SELECT * FROM manual_reviews ORDER BY id"
+            ).fetchall()
             for review in review_rows:
                 new_id = old_to_new[int(review["content_item_id"])]
                 review_cursor = destination.execute(
@@ -641,8 +830,10 @@ def migrate(
                     ) VALUES (?, ?, 'migrated_patch', ?, ?, ?)
                     """,
                     (
-                        new_id, evaluation_by_old_id[int(review["content_item_id"])],
-                        review["reason"], review["reviewer"],
+                        new_id,
+                        evaluation_by_old_id[int(review["content_item_id"])],
+                        review["reason"],
+                        review["reviewer"],
                         normalize_timestamp(review["created_at"]) or captured_at,
                     ),
                 )
@@ -654,22 +845,65 @@ def migrate(
                     ) VALUES (?, ?, 'legacy_review_patch', ?, ?, ?)
                     """,
                     (
-                        lastrowid(review_cursor), new_id, patch_json,
+                        lastrowid(review_cursor),
+                        new_id,
+                        patch_json,
                         sha256_bytes(patch_json.encode("utf-8")),
                         normalize_timestamp(review["created_at"]) or captured_at,
                     ),
                 )
 
+            destination.execute(
+                """
+                INSERT INTO pending_platform_identities(
+                    platform,uid,nickname,content_count,first_published_at,
+                    last_published_at,created_at,updated_at
+                )
+                SELECT c.platform,c.raw_account_uid,
+                       COALESCE(MAX(NULLIF(c.raw_account_name,'')),''),
+                       COUNT(*),MIN(c.published_at),MAX(c.published_at),?,?
+                FROM content_items c
+                WHERE c.account_id IS NULL AND COALESCE(c.raw_account_uid,'')<>''
+                  AND NOT EXISTS (
+                      SELECT 1 FROM account_platform_identities api
+                      WHERE api.platform=c.platform AND api.uid=c.raw_account_uid
+                  )
+                GROUP BY c.platform,c.raw_account_uid
+                """,
+                (captured_at, captured_at),
+            )
+
             summary = {
                 "migration_id": migration_id,
                 "content_items": len(rows),
-                "evidence_artifacts": int(destination.execute("SELECT COUNT(*) FROM evidence_artifacts").fetchone()[0]),
-                "evaluation_versions": int(destination.execute("SELECT COUNT(*) FROM evaluation_versions").fetchone()[0]),
-                "comment_evidence_versions": int(destination.execute("SELECT COUNT(*) FROM comment_evidence_versions").fetchone()[0]),
+                "evidence_artifacts": int(
+                    destination.execute(
+                        "SELECT COUNT(*) FROM evidence_artifacts"
+                    ).fetchone()[0]
+                ),
+                "evaluation_versions": int(
+                    destination.execute(
+                        "SELECT COUNT(*) FROM evaluation_versions"
+                    ).fetchone()[0]
+                ),
+                "comment_evidence_versions": int(
+                    destination.execute(
+                        "SELECT COUNT(*) FROM comment_evidence_versions"
+                    ).fetchone()[0]
+                ),
                 "comment_user_scores": len(score_rows),
                 "comment_weeks": dict(sorted(weeks.items())),
-                "review_queue": int(destination.execute("SELECT COUNT(*) FROM review_queue").fetchone()[0]),
+                "review_queue": int(
+                    destination.execute("SELECT COUNT(*) FROM review_queue").fetchone()[
+                        0
+                    ]
+                ),
                 "manual_review_history": len(review_rows),
+                "pending_platform_identities": int(
+                    destination.execute(
+                        "SELECT COUNT(*) FROM pending_platform_identities"
+                    ).fetchone()[0]
+                ),
                 "provider_calls": 0,
             }
             destination.execute(
@@ -700,7 +934,13 @@ def main() -> int:
     parser.add_argument("--target-db", type=Path, default=DEFAULT_DB)
     parser.add_argument("--baseline", type=Path, default=BASELINE_PATH)
     arguments = parser.parse_args()
-    print(json.dumps(migrate(arguments.legacy_db, arguments.target_db, arguments.baseline), ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            migrate(arguments.legacy_db, arguments.target_db, arguments.baseline),
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
     return 0
 
 

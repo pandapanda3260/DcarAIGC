@@ -291,7 +291,7 @@ def write_collection_summary(rows: list[dict[str, Any]], cache_dir: Path, target
         record = json.loads(path.read_text(encoding="utf-8"))
         for item in record.get("statistics") or []:
             stats[str(item.get("aweme_id") or "")] = item
-    comment_status = []
+    comment_status: list[dict[str, Any]] = []
     for row in rows:
         aweme_id = str(row["aweme_id"])
         pages = [json.loads(path.read_text(encoding="utf-8")) for path in sorted((cache_dir / "comments" / aweme_id).glob("page_*.json"))]

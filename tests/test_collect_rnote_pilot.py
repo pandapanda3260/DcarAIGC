@@ -1,10 +1,12 @@
 import json
-import http.client
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import collect_rnote_full
+import collect_rnote_pilot
 from collect_rnote_pilot import (
     CacheStore,
     CollectorError,
@@ -129,28 +131,59 @@ class RnoteCollectorTest(unittest.TestCase):
         client = RnoteClient("sk-test", RequestBudget(None), delay=0)
         self.assertEqual(client.retries, 1)
 
-    def test_truncated_response_is_retried_once_then_succeeds(self):
-        class Response:
-            status = 200
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
-            def read(self):
-                return json.dumps({"success": True, "data": {"comments": []}}).encode()
-
+    def test_retired_client_fails_before_budget_or_network(self):
         budget = RequestBudget(None)
         client = RnoteClient("sk-test", budget, delay=0, retries=1)
-        with patch(
-            "collect_rnote_pilot.urllib.request.urlopen",
-            side_effect=[http.client.IncompleteRead(b"partial", 10), Response()],
+        with (
+            patch("collect_rnote_pilot.urllib.request.urlopen") as urlopen,
+            self.assertRaisesRegex(CollectorError, "Rnote retired; use TikHub"),
         ):
-            result = client.get("https://example.invalid/comments", {"note_id": "x"})
-        self.assertEqual(result.data, {"comments": []})
-        self.assertEqual(budget.used, 2)
+            client.get("https://rnote.dev/api/v2/crawler/note/comments", {"note_id": "x"})
+        urlopen.assert_not_called()
+        self.assertEqual(budget.used, 0)
+        self.assertEqual(client.request_log, [])
+
+    def test_retired_collectors_fail_before_credentials_or_input(self):
+        with (
+            patch("collect_rnote_pilot.load_key") as pilot_key,
+            patch("collect_rnote_pilot.build_base_rows") as pilot_input,
+            self.assertRaisesRegex(CollectorError, "Rnote retired; use TikHub"),
+        ):
+            collect_rnote_pilot.run_pilot(SimpleNamespace())
+        pilot_key.assert_not_called()
+        pilot_input.assert_not_called()
+
+        with (
+            patch("collect_rnote_full.load_key") as full_key,
+            patch("collect_rnote_full.read_input") as full_input,
+            self.assertRaisesRegex(CollectorError, "Rnote retired; use TikHub"),
+        ):
+            collect_rnote_full.collect_all(SimpleNamespace())
+        full_key.assert_not_called()
+        full_input.assert_not_called()
+
+    def test_retired_collector_clis_fail_before_credentials(self):
+        with (
+            patch(
+                "collect_rnote_pilot.parse_args",
+                return_value=SimpleNamespace(),
+            ),
+            patch("collect_rnote_pilot.load_key") as pilot_key,
+            self.assertRaisesRegex(CollectorError, "Rnote retired; use TikHub"),
+        ):
+            collect_rnote_pilot.main()
+        pilot_key.assert_not_called()
+
+        with (
+            patch(
+                "collect_rnote_full.parse_args",
+                return_value=SimpleNamespace(preflight=False),
+            ),
+            patch("collect_rnote_full.load_key") as full_key,
+            self.assertRaisesRegex(CollectorError, "Rnote retired; use TikHub"),
+        ):
+            collect_rnote_full.main()
+        full_key.assert_not_called()
 
     def test_content_author_and_comment_user_use_the_same_content_scope(self):
         with tempfile.TemporaryDirectory() as directory:

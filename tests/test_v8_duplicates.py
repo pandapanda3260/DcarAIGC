@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from collections import Counter
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image, ImageDraw
 
@@ -15,6 +16,7 @@ from v8.duplicates import (
     FINGERPRINT_VERSION,
     THRESHOLDS,
     _image_phash,
+    _pending_content_ids,
     _simhash,
     calibrate,
     calibration_ready,
@@ -77,6 +79,36 @@ class V8DuplicateDetectionTest(unittest.TestCase):
                 ),
             )
             connection.commit()
+
+    def _insert_artifact(
+        self,
+        content_id: int,
+        *,
+        suffix: str,
+        body: bytes,
+        created_at: str,
+    ) -> Path:
+        path = self.root / f"{content_id}-{suffix}.json"
+        path.write_bytes(body)
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                INSERT INTO evidence_artifacts(
+                    content_id,artifact_type,local_path,status,byte_size,sha256,
+                    captured_at,processor_version,created_at
+                ) VALUES (?, 'asr', ?, 'available', ?, ?, ?, 'test', ?)
+                """,
+                (
+                    content_id,
+                    str(path),
+                    len(body),
+                    hashlib.sha256(body).hexdigest(),
+                    created_at,
+                    created_at,
+                ),
+            )
+            connection.commit()
+        return path
 
     def test_phash_survives_jpeg_reencode_and_simhash_survives_punctuation(self) -> None:
         source = self.root / "source.png"
@@ -165,6 +197,162 @@ class V8DuplicateDetectionTest(unittest.TestCase):
             fingerprints = connection.execute("SELECT * FROM duplicate_fingerprints").fetchall()
         self.assertEqual([(row["status"], row["attempt_count"]) for row in slots], [("succeeded", 1)])
         self.assertEqual(len(fingerprints), 1)
+
+    def test_fingerprint_queue_ignores_timestamp_churn_for_same_source_sha256(self) -> None:
+        content_id = self._content("Q2BC3D")
+        asr_body = json.dumps(
+            {"status": "success", "text": "相同的汽车语音证据"},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        self._insert_artifact(
+            content_id,
+            suffix="initial-asr",
+            body=asr_body,
+            created_at="2026-08-01T00:00:00Z",
+        )
+        first = fingerprint_content(content_id, db_path=self.db)
+        self._insert_artifact(
+            content_id,
+            suffix="timestamp-only-asr",
+            body=asr_body,
+            created_at="2099-01-01T00:00:00Z",
+        )
+        with connect(self.db) as connection:
+            connection.execute(
+                "UPDATE content_items SET updated_at='2099-01-01T00:00:00Z' WHERE id=?",
+                (content_id,),
+            )
+            connection.commit()
+
+        queued = run_duplicate_fingerprint_queue(limit=None, db_path=self.db)
+
+        self.assertEqual(queued["candidates"], 0)
+        with connect(self.db) as connection:
+            current = connection.execute(
+                """
+                SELECT source_sha256 FROM duplicate_fingerprints
+                WHERE content_id=? ORDER BY id DESC LIMIT 1
+                """,
+                (content_id,),
+            ).fetchone()
+        self.assertEqual(current["source_sha256"], first["source_sha256"])
+
+    def test_fingerprint_queue_detects_source_hash_change_with_stale_timestamp(self) -> None:
+        content_id = self._content("R2BC3D")
+        first = fingerprint_content(content_id, db_path=self.db)
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                UPDATE content_items
+                SET title='真实变化后的汽车内容', updated_at='2000-01-01T00:00:00Z'
+                WHERE id=?
+                """,
+                (content_id,),
+            )
+            connection.commit()
+
+        queued = run_duplicate_fingerprint_queue(limit=None, db_path=self.db)
+
+        self.assertEqual(queued["candidates"], 1)
+        self.assertEqual(queued["processed"], 1)
+        with connect(self.db) as connection:
+            rows = connection.execute(
+                """
+                SELECT source_sha256 FROM duplicate_fingerprints
+                WHERE content_id=? ORDER BY id
+                """,
+                (content_id,),
+            ).fetchall()
+        self.assertEqual(len(rows), 2)
+        self.assertNotEqual(rows[-1]["source_sha256"], first["source_sha256"])
+
+    def test_pending_fingerprint_limit_is_applied_after_source_hash_filtering(self) -> None:
+        false_candidate = self._content("S2BC3D")
+        true_candidate = self._content("T2BC3D")
+        asr_body = b'{"status":"success","text":"same source"}'
+        self._insert_artifact(
+            false_candidate,
+            suffix="initial-limit-asr",
+            body=asr_body,
+            created_at="2026-08-01T00:00:00Z",
+        )
+        fingerprint_content(false_candidate, db_path=self.db)
+        fingerprint_content(true_candidate, db_path=self.db)
+        self._insert_artifact(
+            false_candidate,
+            suffix="timestamp-limit-asr",
+            body=asr_body,
+            created_at="2099-01-01T00:00:00Z",
+        )
+        with connect(self.db) as connection:
+            connection.execute(
+                "UPDATE content_items SET updated_at='2099-01-01T00:00:00Z' WHERE id=?",
+                (false_candidate,),
+            )
+            connection.execute(
+                """
+                UPDATE content_items
+                SET body='真实变化但时间戳不前进', updated_at='2000-01-01T00:00:00Z'
+                WHERE id=?
+                """,
+                (true_candidate,),
+            )
+            connection.commit()
+
+        self.assertEqual(
+            _pending_content_ids(limit=1, db_path=self.db),
+            [true_candidate],
+        )
+
+    def test_queue_rebuilds_relations_only_after_the_full_backlog_is_drained(self) -> None:
+        self._content("U2BC3D")
+        self._content("V2BC3D")
+        rebuilt_payload = {"duplicate_relations": 0}
+
+        with (
+            patch("v8.duplicates.calibration_ready", return_value=True),
+            patch(
+                "v8.duplicates.rebuild_duplicate_relations",
+                return_value=rebuilt_payload,
+            ) as rebuild,
+        ):
+            first = run_duplicate_fingerprint_queue(limit=1, db_path=self.db)
+            self.assertEqual(first["processed"], 1)
+            self.assertIsNone(first["relations"])
+            rebuild.assert_not_called()
+
+            second = run_duplicate_fingerprint_queue(limit=1, db_path=self.db)
+            self.assertEqual(second["processed"], 1)
+            self.assertEqual(second["relations"], rebuilt_payload)
+            rebuild.assert_called_once_with(db_path=self.db)
+
+    def test_queue_does_not_rebuild_when_batch_reports_failure_even_if_fingerprint_was_written(self) -> None:
+        successful_id = self._content("W2BC3D")
+        content_id = self._content("X2BC3D")
+        real_fingerprint = fingerprint_content
+
+        def fingerprint_then_fail(value: int, *, db_path: Path) -> dict[str, object]:
+            result = real_fingerprint(value, db_path=db_path)
+            if value == content_id:
+                raise RuntimeError("post-write validation failed")
+            return result
+
+        with (
+            patch("v8.duplicates.calibration_ready", return_value=True),
+            patch(
+                "v8.duplicates.fingerprint_content",
+                side_effect=fingerprint_then_fail,
+            ),
+            patch("v8.duplicates.rebuild_duplicate_relations") as rebuild,
+        ):
+            result = run_duplicate_fingerprint_queue(limit=None, db_path=self.db)
+
+        self.assertEqual(result["processed"], 1)
+        self.assertEqual(result["failed"], 1)
+        self.assertEqual(_pending_content_ids(limit=1, db_path=self.db), [])
+        rebuild.assert_not_called()
+        self.assertEqual(result["failures"][0]["content_id"], content_id)
+        self.assertNotEqual(successful_id, content_id)
 
     def test_150_pair_calibration_gates_relations_and_uses_earliest_original(self) -> None:
         duplicate_links = [f"D{i:05d}" for i in range(13)]

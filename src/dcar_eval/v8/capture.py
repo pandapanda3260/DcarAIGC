@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
+from zoneinfo import ZoneInfo
 
 from .storage import DEFAULT_DB, PROJECT_ROOT, connect, now_utc, transaction
 
 
 RAW_ROOT = PROJECT_ROOT / "data" / "cache" / "v8" / "raw_responses"
+SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 class CaptureError(RuntimeError):
@@ -40,9 +44,24 @@ class CaptureError(RuntimeError):
 class SlotUnavailable(RuntimeError):
     """The requested idempotency slot is running, terminal or already successful."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str = "slot_unavailable",
+        slot_id: Optional[int] = None,
+    ) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.slot_id = slot_id
+
 
 class BudgetBlocked(RuntimeError):
     """The budget is absent, inactive, stale or exhausted."""
+
+
+class RawResponseIntegrityError(RuntimeError):
+    """A stored provider response is absent, unreadable or fails SHA-256 validation."""
 
 
 @dataclass(frozen=True)
@@ -77,6 +96,19 @@ class CaptureOutcome:
     currency: str
 
 
+@dataclass(frozen=True)
+class StoredRawResponse:
+    slot_id: int
+    raw_response_id: int
+    provider: str
+    operation: str
+    value: Any
+    http_status: Optional[int]
+    captured_at: str
+    sha256: str
+    local_path: Path
+
+
 def canonical_json_bytes(value: Any) -> bytes:
     return (
         json.dumps(
@@ -92,12 +124,20 @@ def canonical_json_bytes(value: Any) -> bytes:
 
 def _scrub_secrets(value: Any) -> Any:
     secret_names = {
-        "authorization", "cookie", "set-cookie", "x-api-key", "api-key",
-        "api_key", "access_token", "token",
+        "authorization",
+        "cookie",
+        "set-cookie",
+        "x-api-key",
+        "api-key",
+        "api_key",
+        "access_token",
+        "token",
     }
     if isinstance(value, dict):
         return {
-            key: "[REDACTED]" if str(key).lower() in secret_names else _scrub_secrets(child)
+            key: "[REDACTED]"
+            if str(key).lower() in secret_names
+            else _scrub_secrets(child)
             for key, child in value.items()
         }
     if isinstance(value, list):
@@ -112,6 +152,117 @@ def _atomic_bytes(path: Path, value: bytes) -> None:
     temporary.write_bytes(value)
     os.chmod(temporary, 0o600)
     temporary.replace(path)
+
+
+def _utc_iso(value: datetime) -> str:
+    return (
+        value.astimezone(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _shanghai_day_utc_bounds(recorded_at: str) -> tuple[str, str]:
+    try:
+        instant = datetime.fromisoformat(recorded_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("recorded_at must be an ISO timestamp") from exc
+    if instant.tzinfo is None:
+        instant = instant.replace(tzinfo=timezone.utc)
+    local_day = instant.astimezone(SHANGHAI).date()
+    start = datetime.combine(local_day, time.min, SHANGHAI).astimezone(timezone.utc)
+    return _utc_iso(start), _utc_iso(start + timedelta(days=1))
+
+
+def _validate_task_budget(
+    *,
+    budget_id: Optional[str],
+    task_id: Optional[str],
+    task_max_amount: Optional[float],
+) -> None:
+    if task_id is not None and not task_id.strip():
+        raise ValueError("task_id must not be blank")
+    if task_max_amount is not None:
+        if task_id is None:
+            raise ValueError("task_max_amount requires task_id")
+        if task_max_amount <= 0:
+            raise ValueError("task_max_amount must be positive")
+    if task_id is not None and budget_id is None:
+        raise ValueError("task_id requires budget_id")
+
+
+def load_succeeded_raw_response(
+    *,
+    stage: str,
+    window_key: str,
+    db_path: Path = DEFAULT_DB,
+    content_id: Optional[int] = None,
+    account_id: Optional[int] = None,
+    operation: Optional[str] = None,
+) -> StoredRawResponse:
+    """Read the newest raw response for a successful slot without any provider call."""
+
+    if (content_id is None) == (account_id is None):
+        raise ValueError("exactly one of content_id and account_id is required")
+    target_column = "content_id" if content_id is not None else "account_id"
+    target_value = content_id if content_id is not None else account_id
+    operation_clause = " AND pr.operation=?" if operation is not None else ""
+    parameters: list[Any] = [target_value, stage, window_key]
+    if operation is not None:
+        parameters.append(operation)
+    with connect(db_path) as connection:
+        row = connection.execute(
+            f"""
+            SELECT fs.id slot_id, pr.id raw_response_id, pr.provider, pr.operation,
+                   pr.local_path, pr.sha256, pr.byte_size, pr.http_status, pr.captured_at
+            FROM fetch_slots fs
+            JOIN fetch_attempts fa ON fa.slot_id=fs.id
+            JOIN provider_raw_responses pr ON pr.fetch_attempt_id=fa.id
+            WHERE fs.{target_column}=? AND fs.stage=? AND fs.window_key=?
+              AND fs.status='succeeded'{operation_clause}
+            ORDER BY fa.attempt_number DESC, pr.id DESC
+            LIMIT 1
+            """,
+            parameters,
+        ).fetchone()
+    if row is None:
+        raise SlotUnavailable("successful slot has no matching raw response")
+
+    local_path = Path(str(row["local_path"]))
+    resolved = local_path if local_path.is_absolute() else PROJECT_ROOT / local_path
+    try:
+        body = resolved.read_bytes()
+    except OSError as exc:
+        raise RawResponseIntegrityError(
+            f"stored raw response is unreadable: {resolved}"
+        ) from exc
+    actual_sha256 = hashlib.sha256(body).hexdigest()
+    expected_sha256 = str(row["sha256"])
+    if not hmac.compare_digest(actual_sha256, expected_sha256):
+        raise RawResponseIntegrityError(
+            f"stored raw response SHA-256 mismatch: {resolved}"
+        )
+    if len(body) != int(row["byte_size"]):
+        raise RawResponseIntegrityError(
+            f"stored raw response byte size mismatch: {resolved}"
+        )
+    try:
+        value = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RawResponseIntegrityError(
+            f"stored raw response is not valid UTF-8 JSON: {resolved}"
+        ) from exc
+    return StoredRawResponse(
+        slot_id=int(row["slot_id"]),
+        raw_response_id=int(row["raw_response_id"]),
+        provider=str(row["provider"]),
+        operation=str(row["operation"]),
+        value=value,
+        http_status=int(row["http_status"]) if row["http_status"] is not None else None,
+        captured_at=str(row["captured_at"]),
+        sha256=expected_sha256,
+        local_path=resolved,
+    )
 
 
 def ensure_content_slot(
@@ -140,7 +291,15 @@ def ensure_content_slot(
             status, created_at, updated_at
         ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
         """,
-        (content_id, stage, window_key, provider, adapter_version, captured_at, captured_at),
+        (
+            content_id,
+            stage,
+            window_key,
+            provider,
+            adapter_version,
+            captured_at,
+            captured_at,
+        ),
     )
     if cursor.lastrowid is None:
         raise RuntimeError("fetch slot insert returned no id")
@@ -173,11 +332,55 @@ def ensure_account_slot(
             status, created_at, updated_at
         ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
         """,
-        (account_id, stage, window_key, provider, adapter_version, captured_at, captured_at),
+        (
+            account_id,
+            stage,
+            window_key,
+            provider,
+            adapter_version,
+            captured_at,
+            captured_at,
+        ),
     )
     if cursor.lastrowid is None:
         raise RuntimeError("account fetch slot insert returned no id")
     return int(cursor.lastrowid)
+
+
+def recover_stale_fetch_slots(
+    *,
+    db_path: Path = DEFAULT_DB,
+    stale_after_seconds: int = 600,
+    current_time: Optional[datetime] = None,
+) -> Dict[str, int]:
+    """Release capture slots abandoned by an interrupted service process."""
+    if stale_after_seconds <= 0:
+        raise ValueError("stale_after_seconds must be positive")
+    current = (current_time or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    cutoff = current - timedelta(seconds=stale_after_seconds)
+    captured_at = current.isoformat(timespec="seconds").replace("+00:00", "Z")
+    cutoff_at = cutoff.isoformat(timespec="seconds").replace("+00:00", "Z")
+    with connect(db_path) as connection, transaction(connection):
+        rows = connection.execute(
+            """
+            SELECT id FROM fetch_slots
+            WHERE status='running' AND COALESCE(started_at,updated_at) < ?
+            ORDER BY id
+            """,
+            (cutoff_at,),
+        ).fetchall()
+        if rows:
+            connection.executemany(
+                """
+                UPDATE fetch_slots SET status='retryable_failed',
+                    last_error_code='interrupted',
+                    last_error_message='服务中断后自动释放，可安全重试',
+                    finished_at=?, updated_at=?
+                WHERE id=? AND status='running'
+                """,
+                [(captured_at, captured_at, int(row["id"])) for row in rows],
+            )
+    return {"stale_candidates": len(rows), "recovered": len(rows)}
 
 
 def claim_content_slot(
@@ -199,14 +402,20 @@ def claim_content_slot(
             provider=provider,
             adapter_version=adapter_version,
         )
-        row = connection.execute("SELECT * FROM fetch_slots WHERE id=?", (slot_id,)).fetchone()
+        row = connection.execute(
+            "SELECT * FROM fetch_slots WHERE id=?", (slot_id,)
+        ).fetchone()
         if row is None:
             raise RuntimeError("fetch slot disappeared")
         allowed = {"pending", "retryable_failed"}
         if allow_terminal_retry:
             allowed.add("terminal_failed")
         if row["status"] not in allowed:
-            raise SlotUnavailable(f"slot {slot_id} is {row['status']}")
+            raise SlotUnavailable(
+                f"slot {slot_id} is {row['status']}",
+                error_code=str(row["last_error_code"] or "slot_unavailable"),
+                slot_id=slot_id,
+            )
         attempt_number = int(row["attempt_count"]) + 1
         started_at = now_utc()
         cursor = connection.execute(
@@ -226,7 +435,14 @@ def claim_content_slot(
                 last_error_code=NULL, last_error_message=NULL, updated_at=?
             WHERE id=?
             """,
-            (provider, adapter_version, attempt_number, started_at, started_at, slot_id),
+            (
+                provider,
+                adapter_version,
+                attempt_number,
+                started_at,
+                started_at,
+                slot_id,
+            ),
         )
     return SlotClaim(
         slot_id=slot_id,
@@ -259,14 +475,20 @@ def claim_account_slot(
             provider=provider,
             adapter_version=adapter_version,
         )
-        row = connection.execute("SELECT * FROM fetch_slots WHERE id=?", (slot_id,)).fetchone()
+        row = connection.execute(
+            "SELECT * FROM fetch_slots WHERE id=?", (slot_id,)
+        ).fetchone()
         if row is None:
             raise RuntimeError("account fetch slot disappeared")
         allowed = {"pending", "retryable_failed"}
         if allow_terminal_retry:
             allowed.add("terminal_failed")
         if row["status"] not in allowed:
-            raise SlotUnavailable(f"slot {slot_id} is {row['status']}")
+            raise SlotUnavailable(
+                f"slot {slot_id} is {row['status']}",
+                error_code=str(row["last_error_code"] or "slot_unavailable"),
+                slot_id=slot_id,
+            )
         attempt_number = int(row["attempt_count"]) + 1
         started_at = now_utc()
         cursor = connection.execute(
@@ -286,7 +508,14 @@ def claim_account_slot(
                 last_error_code=NULL, last_error_message=NULL, updated_at=?
             WHERE id=?
             """,
-            (provider, adapter_version, attempt_number, started_at, started_at, slot_id),
+            (
+                provider,
+                adapter_version,
+                attempt_number,
+                started_at,
+                started_at,
+                slot_id,
+            ),
         )
     return SlotClaim(
         slot_id=slot_id,
@@ -299,6 +528,52 @@ def claim_account_slot(
         adapter_version=adapter_version,
         account_id=account_id,
     )
+
+
+def mark_fetch_slot_terminal_failure(
+    *,
+    db_path: Path,
+    slot_id: int,
+    error_code: str,
+    error_message: str,
+) -> Dict[str, Any]:
+    """Record a post-fetch business failure without rewriting provider facts."""
+
+    if not error_code.strip():
+        raise ValueError("error_code must not be blank")
+    captured_at = now_utc()
+    with connect(db_path) as connection, transaction(connection):
+        row = connection.execute(
+            "SELECT * FROM fetch_slots WHERE id=?", (slot_id,)
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(f"fetch slot does not exist: {slot_id}")
+        if row["status"] not in {"succeeded", "terminal_failed"}:
+            raise RuntimeError(
+                f"fetch slot {slot_id} cannot become terminal from {row['status']}"
+            )
+        finished_at = str(row["finished_at"] or captured_at)
+        connection.execute(
+            """
+            UPDATE fetch_slots
+            SET status='terminal_failed',last_error_code=?,last_error_message=?,
+                finished_at=?,updated_at=?
+            WHERE id=?
+            """,
+            (
+                error_code,
+                error_message[:500],
+                finished_at,
+                captured_at,
+                slot_id,
+            ),
+        )
+    return {
+        "slot_id": slot_id,
+        "status": "terminal_failed",
+        "error_code": error_code,
+        "finished_at": finished_at,
+    }
 
 
 def activate_pilot_budget(
@@ -314,9 +589,13 @@ def activate_pilot_budget(
         if row is None:
             raise BudgetBlocked(f"budget {budget_id} does not exist")
         if row["status"] != "draft":
-            raise BudgetBlocked(f"budget {budget_id} is {row['status']}, expected draft")
+            raise BudgetBlocked(
+                f"budget {budget_id} is {row['status']}, expected draft"
+            )
         if abs(float(row["verified_unit_price"]) - expected_unit_price) > 1e-9:
-            raise BudgetBlocked("verified provider price does not match the approved price")
+            raise BudgetBlocked(
+                "verified provider price does not match the approved price"
+            )
         if not row["price_verified_at"]:
             raise BudgetBlocked("provider price has not been verified")
         connection.execute(
@@ -331,6 +610,8 @@ def _reserve_budget(
     budget_id: str,
     provider: str,
     operation: str,
+    task_id: Optional[str] = None,
+    task_max_amount: Optional[float] = None,
 ) -> tuple[int, float, str]:
     row = connection.execute(
         "SELECT * FROM provider_budget_batches WHERE id=?", (budget_id,)
@@ -348,14 +629,15 @@ def _reserve_budget(
         raise BudgetBlocked("billable request ceiling reached")
     if consumed_amount + unit_price > float(row["max_amount"]) + 1e-9:
         raise BudgetBlocked("amount ceiling reached")
-    today = now_utc()[:10]
+    recorded_at = now_utc()
+    day_start, day_end = _shanghai_day_utc_bounds(recorded_at)
     usage = connection.execute(
         """
         SELECT COALESCE(SUM(request_attempts), 0) attempts
         FROM provider_usage
-        WHERE budget_batch_id=? AND substr(recorded_at, 1, 10)=?
+        WHERE budget_batch_id=? AND recorded_at>=? AND recorded_at<?
         """,
-        (budget_id, today),
+        (budget_id, day_start, day_end),
     ).fetchone()
     daily_attempts = int(usage["attempts"])
     if daily_attempts >= int(row["daily_quota"]):
@@ -368,21 +650,41 @@ def _reserve_budget(
     )
     if row["status"] == "pilot" and total_attempts >= int(row["pilot_size"]):
         raise BudgetBlocked("pilot sample is complete and awaits quality gate")
+    if task_id is not None and task_max_amount is not None:
+        task_amount = float(
+            connection.execute(
+                "SELECT COALESCE(SUM(amount), 0) FROM provider_usage WHERE task_id=?",
+                (task_id,),
+            ).fetchone()[0]
+        )
+        if task_amount + unit_price > task_max_amount + 1e-9:
+            raise BudgetBlocked("task amount ceiling reached")
 
-    recorded_at = now_utc()
     cursor = connection.execute(
         """
         INSERT INTO provider_usage(
-            budget_batch_id, provider, operation, request_attempts, billed_requests,
+            task_id, budget_batch_id, provider, operation, request_attempts, billed_requests,
             currency, amount, recorded_at, details_json
-        ) VALUES (?, ?, ?, 1, 1, ?, ?, ?, '{"state":"reserved"}')
+        ) VALUES (?, ?, ?, ?, 1, 1, ?, ?, ?, '{"state":"reserved"}')
         """,
-        (budget_id, provider, operation, row["currency"], unit_price, recorded_at),
+        (
+            task_id,
+            budget_id,
+            provider,
+            operation,
+            row["currency"],
+            unit_price,
+            recorded_at,
+        ),
     )
     if cursor.lastrowid is None:
         raise RuntimeError("provider usage insert returned no id")
     new_attempts = total_attempts + 1
-    next_status = "suspended" if row["status"] == "pilot" and new_attempts >= int(row["pilot_size"]) else row["status"]
+    next_status = (
+        "suspended"
+        if row["status"] == "pilot" and new_attempts >= int(row["pilot_size"])
+        else row["status"]
+    )
     connection.execute(
         """
         UPDATE provider_budget_batches
@@ -404,7 +706,9 @@ def _settle_budget(
     billed: bool,
     details: Dict[str, Any],
 ) -> None:
-    details_json = json.dumps(details, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    details_json = json.dumps(
+        details, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
     if billed:
         connection.execute(
             "UPDATE provider_usage SET details_json=? WHERE id=?",
@@ -441,9 +745,16 @@ def _store_raw_response(
     captured_at = now_utc()
     body = canonical_json_bytes(_scrub_secrets(value))
     digest = hashlib.sha256(body).hexdigest()
-    target = str(claim.content_id) if claim.content_id is not None else f"account-{claim.account_id}"
+    target = (
+        str(claim.content_id)
+        if claim.content_id is not None
+        else f"account-{claim.account_id}"
+    )
     path = (
-        raw_root / claim.provider.lower() / target / operation
+        raw_root
+        / claim.provider.lower()
+        / target
+        / operation
         / f"attempt-{claim.attempt_number:03d}-{digest[:12]}.json"
     )
     _atomic_bytes(path, body)
@@ -459,8 +770,16 @@ def _store_raw_response(
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'live')
         """,
         (
-            claim.attempt_id, claim.account_id, claim.content_id, claim.provider, operation,
-            local_path, digest, len(body), http_status, captured_at,
+            claim.attempt_id,
+            claim.account_id,
+            claim.content_id,
+            claim.provider,
+            operation,
+            local_path,
+            digest,
+            len(body),
+            http_status,
+            captured_at,
         ),
     )
     if cursor.lastrowid is None:
@@ -476,6 +795,8 @@ def _execute_claimed_fetch(
     db_path: Path = DEFAULT_DB,
     raw_root: Path = RAW_ROOT,
     budget_id: Optional[str] = None,
+    task_id: Optional[str] = None,
+    task_max_amount: Optional[float] = None,
 ) -> CaptureOutcome:
     provider = claim.provider
     usage_id: Optional[int] = None
@@ -489,6 +810,8 @@ def _execute_claimed_fetch(
                     budget_id=budget_id,
                     provider=provider,
                     operation=operation,
+                    task_id=task_id,
+                    task_max_amount=task_max_amount,
                 )
         except Exception as exc:
             with connect(db_path) as connection, transaction(connection):
@@ -529,7 +852,11 @@ def _execute_claimed_fetch(
                     budget_id=budget_id,
                     unit_price=unit_price,
                     billed=result.billed,
-                    details={"state": "completed", "slot_id": claim.slot_id, "http_status": result.http_status},
+                    details={
+                        "state": "completed",
+                        "slot_id": claim.slot_id,
+                        "http_status": result.http_status,
+                    },
                 )
             finished_at = now_utc()
             connection.execute(
@@ -539,8 +866,12 @@ def _execute_claimed_fetch(
                 WHERE id=?
                 """,
                 (
-                    finished_at, result.http_status, int(result.billed),
-                    unit_price if result.billed else 0.0, currency, claim.attempt_id,
+                    finished_at,
+                    result.http_status,
+                    int(result.billed),
+                    unit_price if result.billed else 0.0,
+                    currency,
+                    claim.attempt_id,
                 ),
             )
             connection.execute(
@@ -560,10 +891,14 @@ def _execute_claimed_fetch(
             currency=currency,
         )
     except Exception as exc:
-        failure = exc if isinstance(exc, CaptureError) else CaptureError(
-            f"{type(exc).__name__}: {exc}",
-            retryable=True,
-            error_code="unhandled_adapter_error",
+        failure = (
+            exc
+            if isinstance(exc, CaptureError)
+            else CaptureError(
+                f"{type(exc).__name__}: {exc}",
+                retryable=True,
+                error_code="unhandled_adapter_error",
+            )
         )
         with connect(db_path) as connection, transaction(connection):
             if failure.raw_response is not None:
@@ -582,7 +917,11 @@ def _execute_claimed_fetch(
                     budget_id=budget_id,
                     unit_price=unit_price,
                     billed=failure.billed,
-                    details={"state": "failed", "slot_id": claim.slot_id, "error_code": failure.error_code},
+                    details={
+                        "state": "failed",
+                        "slot_id": claim.slot_id,
+                        "error_code": failure.error_code,
+                    },
                 )
             finished_at = now_utc()
             next_status = "retryable_failed" if failure.retryable else "terminal_failed"
@@ -593,9 +932,14 @@ def _execute_claimed_fetch(
                     error_code=?, error_message=? WHERE id=?
                 """,
                 (
-                    finished_at, failure.http_status, int(failure.billed),
-                    unit_price if failure.billed else 0.0, currency,
-                    failure.error_code, str(failure)[:500], claim.attempt_id,
+                    finished_at,
+                    failure.http_status,
+                    int(failure.billed),
+                    unit_price if failure.billed else 0.0,
+                    currency,
+                    failure.error_code,
+                    str(failure)[:500],
+                    claim.attempt_id,
                 ),
             )
             connection.execute(
@@ -605,8 +949,12 @@ def _execute_claimed_fetch(
                     finished_at=?, updated_at=? WHERE id=?
                 """,
                 (
-                    next_status, failure.error_code, str(failure)[:500],
-                    finished_at, finished_at, claim.slot_id,
+                    next_status,
+                    failure.error_code,
+                    str(failure)[:500],
+                    finished_at,
+                    finished_at,
+                    claim.slot_id,
                 ),
             )
         raise failure from exc
@@ -624,8 +972,15 @@ def execute_content_fetch(
     db_path: Path = DEFAULT_DB,
     raw_root: Path = RAW_ROOT,
     budget_id: Optional[str] = None,
+    task_id: Optional[str] = None,
+    task_max_amount: Optional[float] = None,
     allow_terminal_retry: bool = False,
 ) -> CaptureOutcome:
+    _validate_task_budget(
+        budget_id=budget_id,
+        task_id=task_id,
+        task_max_amount=task_max_amount,
+    )
     claim = claim_content_slot(
         db_path=db_path,
         content_id=content_id,
@@ -642,6 +997,8 @@ def execute_content_fetch(
         db_path=db_path,
         raw_root=raw_root,
         budget_id=budget_id,
+        task_id=task_id,
+        task_max_amount=task_max_amount,
     )
 
 
@@ -657,8 +1014,15 @@ def execute_account_fetch(
     db_path: Path = DEFAULT_DB,
     raw_root: Path = RAW_ROOT,
     budget_id: Optional[str] = None,
+    task_id: Optional[str] = None,
+    task_max_amount: Optional[float] = None,
     allow_terminal_retry: bool = False,
 ) -> CaptureOutcome:
+    _validate_task_budget(
+        budget_id=budget_id,
+        task_id=task_id,
+        task_max_amount=task_max_amount,
+    )
     claim = claim_account_slot(
         db_path=db_path,
         account_id=account_id,
@@ -675,6 +1039,8 @@ def execute_account_fetch(
         db_path=db_path,
         raw_root=raw_root,
         budget_id=budget_id,
+        task_id=task_id,
+        task_max_amount=task_max_amount,
     )
 
 

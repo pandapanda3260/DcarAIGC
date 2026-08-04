@@ -7,6 +7,8 @@ import unittest
 from pathlib import Path
 
 from v8.migration import _encode_link_material, migrate
+from v8.storage import initialize_database
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BASELINE = json.loads(
     (PROJECT_ROOT / "config" / "v8_migration_baseline.json").read_text(encoding="utf-8")
@@ -33,24 +35,35 @@ class V8MigrationTest(unittest.TestCase):
         return int(row[0])
 
     def test_link_ids_are_unique_mixed_and_unambiguous(self) -> None:
-        ids = [str(row[0]) for row in self.connection.execute("SELECT link_id FROM content_items")]
+        ids = [
+            str(row[0])
+            for row in self.connection.execute("SELECT link_id FROM content_items")
+        ]
         self.assertEqual(len(ids), BASELINE["content"]["total"])
         self.assertEqual(len(ids), len(set(ids)))
         for value in ids:
             self.assertRegex(value, r"^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{6}$")
             self.assertRegex(value, r"[23456789]")
             self.assertRegex(value, r"[ABCDEFGHJKLMNPQRSTUVWXYZ]")
-        self.assertEqual(_encode_link_material("douyin:123"), _encode_link_material("douyin:123"))
+        self.assertEqual(
+            _encode_link_material("douyin:123"), _encode_link_material("douyin:123")
+        )
 
     def test_content_dates_and_direction_mapping_are_normalized(self) -> None:
         expected = BASELINE["content"]
-        self.assertEqual(self.scalar("SELECT COUNT(*) FROM content_items"), expected["total"])
         self.assertEqual(
-            self.scalar("SELECT COUNT(*) FROM content_items WHERE published_at IS NULL"),
+            self.scalar("SELECT COUNT(*) FROM content_items"), expected["total"]
+        )
+        self.assertEqual(
+            self.scalar(
+                "SELECT COUNT(*) FROM content_items WHERE published_at IS NULL"
+            ),
             expected["published_at"]["missing"],
         )
         self.assertEqual(
-            self.scalar("SELECT COUNT(*) FROM content_items WHERE published_at LIKE '%Z'"),
+            self.scalar(
+                "SELECT COUNT(*) FROM content_items WHERE published_at LIKE '%Z'"
+            ),
             expected["total"] - expected["published_at"]["missing"],
         )
         direction_counts = {
@@ -59,9 +72,15 @@ class V8MigrationTest(unittest.TestCase):
                 "SELECT evaluation_content_direction, COUNT(*) n FROM content_items GROUP BY 1"
             )
         }
-        self.assertEqual(direction_counts, {
-            "new_car": 195, "used_car": 44, "media": 159, "unknown": 378,
-        })
+        self.assertEqual(
+            direction_counts,
+            {
+                "new_car": 195,
+                "used_car": 44,
+                "media": 159,
+                "unknown": 378,
+            },
+        )
 
     def test_fetch_slot_initialization_matches_baseline(self) -> None:
         expected = BASELINE["fetch_slot_initialization"]
@@ -74,7 +93,10 @@ class V8MigrationTest(unittest.TestCase):
         }
         for (stage, status), count in checks.items():
             self.assertEqual(
-                self.scalar("SELECT COUNT(*) FROM fetch_slots WHERE stage=? AND status=?", (stage, status)),
+                self.scalar(
+                    "SELECT COUNT(*) FROM fetch_slots WHERE stage=? AND status=?",
+                    (stage, status),
+                ),
                 count,
             )
         weeks = {
@@ -90,7 +112,9 @@ class V8MigrationTest(unittest.TestCase):
         self.assertEqual(self.scalar("SELECT COUNT(*) FROM evidence_envelopes"), total)
         self.assertEqual(self.scalar("SELECT COUNT(*) FROM evaluation_versions"), total)
         self.assertEqual(
-            self.scalar("SELECT COUNT(*) FROM evaluation_versions WHERE evaluation_source='migrated_from_v5'"),
+            self.scalar(
+                "SELECT COUNT(*) FROM evaluation_versions WHERE evaluation_source='migrated_from_v5'"
+            ),
             total,
         )
         self.assertEqual(self.scalar("SELECT COUNT(*) FROM review_queue"), 186)
@@ -100,14 +124,19 @@ class V8MigrationTest(unittest.TestCase):
                 "SELECT reason_code, COUNT(*) n FROM review_queue GROUP BY reason_code"
             )
         }
-        self.assertEqual(routes, {
-            "legacy_content_unavailable": 12,
-            "media_evidence_missing": 164,
-            "stale_local_evidence": 1,
-            "evaluation_gray_zone": 9,
-        })
         self.assertEqual(
-            self.scalar("SELECT COUNT(*) FROM evidence_artifacts WHERE status='available' AND sha256 IS NULL"),
+            routes,
+            {
+                "legacy_content_unavailable": 12,
+                "media_evidence_missing": 164,
+                "stale_local_evidence": 1,
+                "evaluation_gray_zone": 9,
+            },
+        )
+        self.assertEqual(
+            self.scalar(
+                "SELECT COUNT(*) FROM evidence_artifacts WHERE status='available' AND sha256 IS NULL"
+            ),
             0,
         )
 
@@ -117,25 +146,66 @@ class V8MigrationTest(unittest.TestCase):
         ).fetchone()
         self.assertIsNotNone(row)
         expected = BASELINE["legacy_media_backfill"]
-        self.assertEqual(row["max_billable_requests"], expected["paid_refresh_candidates"])
+        self.assertEqual(
+            row["max_billable_requests"], expected["paid_refresh_candidates"]
+        )
         self.assertAlmostEqual(row["verified_unit_price"], expected["unit_price_usd"])
         self.assertAlmostEqual(row["max_amount"], expected["hard_budget_usd"])
         self.assertEqual(self.scalar("SELECT COUNT(*) FROM fetch_attempts"), 0)
         self.assertEqual(self.scalar("SELECT COUNT(*) FROM provider_usage"), 0)
 
+    def test_pending_identities_are_materialized_by_the_migration_transaction(
+        self,
+    ) -> None:
+        expected_groups = self.scalar(
+            """
+            SELECT COUNT(*) FROM (
+                SELECT platform,raw_account_uid
+                FROM content_items
+                WHERE account_id IS NULL AND COALESCE(raw_account_uid,'')<>''
+                GROUP BY platform,raw_account_uid
+            )
+            """
+        )
+        expected_contents = self.scalar(
+            """
+            SELECT COUNT(*) FROM content_items
+            WHERE account_id IS NULL AND COALESCE(raw_account_uid,'')<>''
+            """
+        )
+        self.assertEqual(
+            self.scalar("SELECT COUNT(*) FROM pending_platform_identities"),
+            expected_groups,
+        )
+        self.assertEqual(
+            self.scalar(
+                "SELECT COALESCE(SUM(content_count),0) FROM pending_platform_identities"
+            ),
+            expected_contents,
+        )
+        changes_before = self.connection.total_changes
+        initialize_database(self.connection)
+        self.assertEqual(self.connection.total_changes, changes_before)
+
     def test_migration_is_idempotent_and_foreign_keys_are_valid(self) -> None:
         before = {
             table: self.scalar(f"SELECT COUNT(*) FROM {table}")
-            for table in ("content_items", "fetch_slots", "evaluation_versions", "review_queue")
+            for table in (
+                "content_items",
+                "fetch_slots",
+                "evaluation_versions",
+                "review_queue",
+            )
         }
         summary = migrate(target_db=self.database)
         after = {
-            table: self.scalar(f"SELECT COUNT(*) FROM {table}")
-            for table in before
+            table: self.scalar(f"SELECT COUNT(*) FROM {table}") for table in before
         }
         self.assertEqual(before, after)
         self.assertEqual(summary["content_items"], BASELINE["content"]["total"])
-        self.assertEqual(self.connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+        self.assertEqual(
+            self.connection.execute("PRAGMA foreign_key_check").fetchall(), []
+        )
 
     def test_taxonomy_preserves_multi_scene_c_labels(self) -> None:
         rows = self.connection.execute(
@@ -148,12 +218,15 @@ class V8MigrationTest(unittest.TestCase):
             """
         ).fetchall()
         actual = {str(row["code"]): set(str(row["scenes"]).split(",")) for row in rows}
-        self.assertEqual(actual, {
-            "C1": {"used_car", "media"},
-            "C2": {"used_car", "new_car"},
-            "C3": {"media"},
-            "C4": {"used_car", "new_car", "media"},
-        })
+        self.assertEqual(
+            actual,
+            {
+                "C1": {"used_car", "media"},
+                "C2": {"used_car", "new_car"},
+                "C3": {"media"},
+                "C4": {"used_car", "new_car", "media"},
+            },
+        )
 
 
 if __name__ == "__main__":

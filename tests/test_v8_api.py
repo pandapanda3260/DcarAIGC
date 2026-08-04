@@ -7,36 +7,322 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
 import v8.api as api_module
 from v8.contracts import CURRENT_REPORT_VERSION
-from v8.evaluation import evaluate_content
+from v8.evaluation import evaluate_content, evaluate_release_content
+from v8.matcher_dsl import (
+    POINT_IDS,
+    canonical_json,
+    canonical_materialized_rule,
+    load_bundle,
+    materialize_point_rule,
+    project_materialized_rule,
+)
 from v8.reports import create_task
-from v8.storage import PROJECT_ROOT, connect, initialize_database, now_utc
+from v8.storage import (
+    LEGACY_MATCHER_RULE_SHA256,
+    PROJECT_ROOT,
+    connect,
+    ensure_legacy_evaluation_release,
+    initialize_database,
+    now_utc,
+)
+from v8.taxonomy_rule_backfill import backfill_v5_1_matcher_rules
+from workflow.storage import connect as legacy_connect
+from workflow.storage import migrate as migrate_legacy
 
 
-app = api_module.app
+def _test_config(
+    root: Path, *, db_name: str = "dcar_insight.sqlite3"
+) -> api_module.ApiConfig:
+    root.mkdir(parents=True, exist_ok=True)
+    db_path = root / db_name
+    if db_path.resolve() == api_module.DEFAULT_DB.resolve():
+        raise AssertionError("API tests must never use the production database")
+    return api_module.ApiConfig(
+        db_path=db_path,
+        reports_root=root / "reports",
+        legacy_db_path=root / "legacy.sqlite3",
+        operator_freeze_lock=root / "nonexistent-freeze.lock",
+        scheduler_enabled=False,
+        startup_catchup_enabled=False,
+    )
+
+
+def _seed_read_model_database(db_path: Path) -> None:
+    source = json.loads(
+        (PROJECT_ROOT / "config" / "business_selling_points_v4_final.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    created_at = "2026-08-04T00:00:00Z"
+    scene_map = {"二手车": "used_car", "新车": "new_car", "媒体-AI小懂": "media"}
+    with connect(db_path) as connection:
+        initialize_database(connection)
+        connection.execute(
+            """
+            INSERT INTO taxonomy_versions(
+                id,version,status,definition,source_path,source_sha256,
+                created_at,published_at
+            ) VALUES ('taxonomy-v5','selling-points-v5.0','published',?,?,?, ?,?)
+            """,
+            (
+                source["definition"],
+                "config/business_selling_points_v4_final.json",
+                "fixture",
+                created_at,
+                created_at,
+            ),
+        )
+        for label in source["labels"]:
+            point = connection.execute(
+                """
+                INSERT INTO selling_points(taxonomy_id,code,tier,label,definition)
+                VALUES ('taxonomy-v5',?,?,?,'')
+                """,
+                (label["id"], label["tier"], label["label"]),
+            )
+            scenes = label.get("business_scene_options") or [
+                label.get("business_scene")
+            ]
+            for scene in scenes:
+                normalized = scene_map.get(scene)
+                if normalized:
+                    connection.execute(
+                        """
+                        INSERT INTO selling_point_scenes(selling_point_id,scene)
+                        VALUES (?,?)
+                        """,
+                        (point.lastrowid, normalized),
+                    )
+        ensure_legacy_evaluation_release(
+            connection,
+            rule_version="evaluation-v7",
+            taxonomy_version="selling-points-v5.0",
+        )
+        account = connection.execute(
+            """
+            INSERT INTO accounts(
+                phone,phone_normalized,operator_name,account_type,
+                content_direction,created_at,updated_at
+            ) VALUES ('13800138000','13800138000','fixture','boutique_ip',
+                      'new_car',?,?)
+            """,
+            (created_at, created_at),
+        )
+        account_id = int(account.lastrowid)
+        connection.execute(
+            """
+            INSERT INTO account_platform_identities(
+                account_id,platform,uid,nickname,created_at,updated_at
+            ) VALUES (?,'douyin','fixture-uid','fixture-account',?,?)
+            """,
+            (account_id, created_at, created_at),
+        )
+        connection.execute(
+            """
+            INSERT INTO content_items(
+                link_id,platform,platform_content_id,canonical_url,account_id,
+                raw_account_uid,raw_account_name,legacy_account_type,title,body,
+                content_type,published_at,source_group,source_label,source_path,
+                imported_at,created_at,updated_at
+            ) VALUES (
+                'T2ST3A','douyin','fixture-content',
+                'https://www.douyin.com/video/fixture-content',?,
+                'fixture-uid','fixture-account','boutique_ip','测试新车内容',
+                '用于 API 临时库隔离测试','video','2026-08-03T08:00:00Z',
+                'test','test','tests/test_v8_api.py',?,?,?
+            )
+            """,
+            (account_id, created_at, created_at, created_at),
+        )
+        connection.commit()
+
+
+def _seed_legacy_database(db_path: Path, root: Path) -> None:
+    created_at = "2026-08-04T00:00:00Z"
+    report_dir = root / "legacy-report"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_path = report_dir / "report.json"
+    report = {
+        "report_version": "channel-structured-conclusions-v7.0",
+        "rule_version": "evaluation-v6",
+        "metadata": {
+            "generated_at": created_at,
+            "run_id": "LEGACY-FIXTURE",
+            "revision": 5,
+        },
+        "run_summary": {},
+        "channels": {
+            channel: {
+                "denominator": 0,
+                "count_distribution": {},
+                "verticality": {},
+            }
+            for channel in ("douyin", "xiaohongshu")
+        },
+    }
+    report_path.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+    with legacy_connect(db_path) as connection:
+        migrate_legacy(connection)
+        connection.execute(
+            """
+            INSERT INTO runs(
+                id,created_at,updated_at,mode,channel,status,progress,input_count,
+                message,output_path,output_sha256,run_kind,scope,rule_version,
+                report_version,is_formal_baseline,report_revision,report_stale
+            ) VALUES (
+                'LEGACY-FIXTURE',?,?,'test','dual','completed',100,0,'fixture',
+                ?,'fixture','formal','dual','evaluation-v6',
+                'channel-structured-conclusions-v7.0',1,5,0
+            )
+            """,
+            (created_at, created_at, str(report_path)),
+        )
+        connection.execute(
+            """
+            INSERT INTO formal_baseline(singleton_id,run_id,selected_at)
+            VALUES (1,'LEGACY-FIXTURE',?)
+            """,
+            (created_at,),
+        )
+        connection.executemany(
+            """
+            INSERT INTO report_revisions(
+                run_id,revision,created_at,report_json_path,report_markdown_path,
+                summary_image_path,output_sha256,source_evaluation_sha256,is_current
+            ) VALUES ('LEGACY-FIXTURE',?,?,?,'fixture.md','fixture.png',
+                      'fixture','fixture',?)
+            """,
+            [
+                (revision, created_at, str(report_path), int(revision == 5))
+                for revision in range(1, 6)
+            ],
+        )
+        connection.commit()
+
+
+class ApiFactoryIsolationTest(unittest.TestCase):
+    def test_two_apps_keep_database_and_runtime_state_isolated(self) -> None:
+        (PROJECT_ROOT / "tmp").mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=PROJECT_ROOT / "tmp") as temporary:
+            root = Path(temporary)
+            config_a = _test_config(root / "a")
+            config_b = _test_config(root / "b")
+            _seed_read_model_database(config_a.db_path)
+            _seed_read_model_database(config_b.db_path)
+            created_at = "2026-08-04T00:00:00Z"
+            with connect(config_b.db_path) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO accounts(
+                        phone,phone_normalized,operator_name,account_type,
+                        content_direction,created_at,updated_at
+                    ) VALUES ('13900139000','13900139000','fixture-b','original',
+                              'media',?,?)
+                    """,
+                    (created_at, created_at),
+                )
+                connection.commit()
+
+            app_a = api_module.create_app(config_a)
+            app_b = api_module.create_app(config_b)
+            with TestClient(app_a) as client_a, TestClient(app_b) as client_b:
+                total_a = client_a.post("/api/v8/accounts/search", json={}).json()[
+                    "total"
+                ]
+                total_b = client_b.post("/api/v8/accounts/search", json={}).json()[
+                    "total"
+                ]
+
+            self.assertEqual(total_a, 1)
+            self.assertEqual(total_b, 2)
+            self.assertEqual(app_a.state.config.db_path, config_a.db_path)
+            self.assertEqual(app_b.state.config.db_path, config_b.db_path)
+            self.assertIsNot(app_a.state, app_b.state)
 
 
 class V8ApiTest(unittest.TestCase):
-    def test_openapi_version_matches_v8_contract_release(self) -> None:
-        self.assertEqual(app.version, "8.2")
-
     def setUp(self) -> None:
-        self.client_context = TestClient(app)
-        self.client = self.client_context.__enter__()
+        (PROJECT_ROOT / "tmp").mkdir(exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(dir=PROJECT_ROOT / "tmp")
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.config = _test_config(root)
+        self.db = self.config.db_path
+        _seed_read_model_database(self.db)
+        _seed_legacy_database(self.config.legacy_db_path, root)
+        self.app = api_module.create_app(self.config)
+        self.assertEqual(self.app.state.config.db_path, self.db)
+        self.assertNotEqual(self.db.resolve(), api_module.DEFAULT_DB.resolve())
+        self.client_context = TestClient(self.app)
+        empty_recovery = {
+            "stale_candidates": 0,
+            "recovered": 0,
+            "retryable_failed": 0,
+            "terminal_failed": 0,
+            "cas_conflicts": 0,
+            "exhausted_normalized": 0,
+        }
+        with (
+            patch.object(
+                api_module,
+                "recover_stale_fetch_slots",
+                return_value={"stale_candidates": 0, "recovered": 0},
+            ),
+            patch.object(
+                api_module,
+                "recover_stale_media_processing_slots",
+                return_value=empty_recovery,
+            ),
+            patch.object(api_module, "_recover_interrupted_tasks", return_value=0),
+        ):
+            self.client = self.client_context.__enter__()
 
     def tearDown(self) -> None:
         self.client_context.__exit__(None, None, None)
+
+    def test_openapi_version_matches_v8_contract_release(self) -> None:
+        self.assertEqual(self.app.version, "8.3")
 
     def test_health_reports_v8_database(self) -> None:
         response = self.client.get("/api/v8/health")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["report_version"], CURRENT_REPORT_VERSION)
         self.assertEqual(response.json()["database"], "dcar_insight.sqlite3")
+
+    def test_startup_catchup_worker_records_results(self) -> None:
+        fake_app = SimpleNamespace(
+            state=SimpleNamespace(
+                catchup_status="running", catchup_results=[], catchup_error=None
+            )
+        )
+        expected = [{"job_id": "daily_capture", "status": "succeeded"}]
+        with patch.object(api_module, "startup_catchup", return_value=expected):
+            api_module._run_startup_catchup(
+                fake_app,
+                db_path=self.db,
+                reports_root=self.config.reports_root,
+            )
+        self.assertEqual(fake_app.state.catchup_status, "succeeded")
+        self.assertEqual(fake_app.state.catchup_results, expected)
+        self.assertIsNone(fake_app.state.catchup_error)
+
+    def test_scheduler_status_reports_disabled_startup_catchup(self) -> None:
+        response = self.client.get("/api/v8/scheduler")
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["requested"])
+        self.assertFalse(response.json()["enabled"])
+        self.assertEqual(
+            response.json()["report_runtime"], {"ready": None, "error": None}
+        )
+        self.assertEqual(response.json()["startup_catchup"]["status"], "disabled")
+        self.assertIn("fetch_slot_recovery", response.json())
 
     def test_overview_has_three_shanghai_windows_and_no_fake_forecast(self) -> None:
         response = self.client.get("/api/v8/overview")
@@ -64,7 +350,9 @@ class V8ApiTest(unittest.TestCase):
                         "acquisition_potential",
                     ],
                 )
-                self.assertEqual(list(channel["scenes"]), ["used_car", "new_car", "media"])
+                self.assertEqual(
+                    list(channel["scenes"]), ["used_car", "new_car", "media"]
+                )
                 for scene in channel["scenes"].values():
                     self.assertEqual(
                         list(scene["metrics"]), list(channel["summary"]["metrics"])
@@ -72,7 +360,9 @@ class V8ApiTest(unittest.TestCase):
         self.assertIn("duplicate_fingerprint_coverage", value["data_quality"])
         self.assertIn("duplicate_calibration_ready", value["data_quality"])
 
-    def test_overview_channel_conclusions_restore_v7_denominators_and_scores(self) -> None:
+    def test_overview_channel_conclusions_restore_v7_denominators_and_scores(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             db_path = Path(temporary) / "overview.sqlite3"
             created_at = "2026-08-02T08:00:00Z"
@@ -94,6 +384,38 @@ class V8ApiTest(unittest.TestCase):
                     """,
                     [("E1", "core", "核心卖点"), ("C1", "other", "其他卖点")],
                 )
+                connection.executemany(
+                    """
+                    INSERT INTO evaluation_releases(
+                        id,rule_version,taxonomy_version,matcher_rule_sha256,status,
+                        created_at,updated_at,activated_at,retired_at
+                    ) VALUES (?,?,?,?,?,?,?,?,?)
+                    """,
+                    [
+                        (
+                            "test-current-release",
+                            api_module.RULE_VERSION,
+                            "selling-points-test",
+                            LEGACY_MATCHER_RULE_SHA256,
+                            "active",
+                            created_at,
+                            created_at,
+                            created_at,
+                            None,
+                        ),
+                        (
+                            "test-old-release",
+                            "evaluation-v6",
+                            "selling-points-test",
+                            LEGACY_MATCHER_RULE_SHA256,
+                            "retired",
+                            created_at,
+                            created_at,
+                            created_at,
+                            created_at,
+                        ),
+                    ],
+                )
                 content_rows = [
                     ("TST1A2", "content-a", "new_car", "2026-08-02T10:00:00Z"),
                     ("TST2B3", "content-b", "used_car", "2026-08-02T11:00:00Z"),
@@ -109,9 +431,15 @@ class V8ApiTest(unittest.TestCase):
                         ) VALUES (?,'douyin',?,?,?,'video',?,?,?, ?,?)
                         """,
                         (
-                            link_id, platform_id, f"https://example.com/{platform_id}",
-                            platform_id, published_at, direction,
-                            created_at, created_at, created_at,
+                            link_id,
+                            platform_id,
+                            f"https://example.com/{platform_id}",
+                            platform_id,
+                            published_at,
+                            direction,
+                            created_at,
+                            created_at,
+                            created_at,
                         ),
                     )
                 ids = {
@@ -120,40 +448,70 @@ class V8ApiTest(unittest.TestCase):
                         "SELECT id,platform_content_id FROM content_items"
                     )
                 }
+                connection.execute(
+                    "UPDATE content_items SET manual_content_direction='unknown' WHERE id=?",
+                    (ids["content-a"],),
+                )
                 evaluations = [
                     (ids["content-a"], "a" * 64, "E1", 1, "new_car", 80, 60, 55),
                     (ids["content-b"], "b" * 64, "C1", 1, "used_car", 60, None, None),
                     (ids["content-c"], "c" * 64, None, 0, "other", 40, None, None),
                 ]
-                for content_id, evidence_sha, code, included, direction, content_score, audience_score, acquisition_score in evaluations:
+                for (
+                    content_id,
+                    evidence_sha,
+                    code,
+                    included,
+                    direction,
+                    content_score,
+                    audience_score,
+                    acquisition_score,
+                ) in evaluations:
                     connection.execute(
                         """
                         INSERT INTO evaluation_versions(
-                            content_id,rule_version,taxonomy_version,evidence_sha256,
+                            content_id,release_id,rule_version,taxonomy_version,
+                            matcher_rule_sha256,evidence_sha256,
                             evaluation_source,evaluation_status,evidence_level,
                             primary_selling_point_code,selling_point_score,
                             selling_point_included,content_direction,
                             content_automotive_score,audience_automotive_score,
                             acquisition_potential_score,pending_review,payload_json,evaluated_at
-                        ) VALUES (?,?,?,?,'automatic','evaluated','V3',?,90,?,?,?,?,?,0,'{}',?)
+                        ) VALUES (?,?,?,?,?,?,'automatic','evaluated','V3',?,90,?,?,?,?,?,0,'{}',?)
                         """,
                         (
-                            content_id, api_module.RULE_VERSION, "selling-points-test",
-                            evidence_sha, code, included, direction, content_score,
-                            audience_score, acquisition_score, created_at,
+                            content_id,
+                            "test-current-release",
+                            api_module.RULE_VERSION,
+                            "selling-points-test",
+                            LEGACY_MATCHER_RULE_SHA256,
+                            evidence_sha,
+                            code,
+                            included,
+                            direction,
+                            content_score,
+                            audience_score,
+                            acquisition_score,
+                            created_at,
                         ),
                     )
                 connection.execute(
                     """
                     INSERT INTO evaluation_versions(
-                        content_id,rule_version,taxonomy_version,evidence_sha256,
+                        content_id,release_id,rule_version,taxonomy_version,
+                        matcher_rule_sha256,evidence_sha256,
                         evaluation_source,evaluation_status,evidence_level,
                         selling_point_included,content_direction,pending_review,
                         payload_json,evaluated_at
-                    ) VALUES (?,'old-rule','selling-points-test',?,'automatic',
+                    ) VALUES (?,?,'evaluation-v6','selling-points-test',?,?,'automatic',
                               'evaluated','V3',0,'new_car',0,'{}','2026-08-02T13:00:00Z')
                     """,
-                    (ids["content-a"], "d" * 64),
+                    (
+                        ids["content-a"],
+                        "test-old-release",
+                        LEGACY_MATCHER_RULE_SHA256,
+                        "d" * 64,
+                    ),
                 )
                 for content_id, view_count in (
                     (ids["content-a"], 100),
@@ -168,6 +526,16 @@ class V8ApiTest(unittest.TestCase):
                         """,
                         (content_id, view_count),
                     )
+                connection.execute(
+                    """
+                    INSERT INTO content_metric_snapshots(
+                        content_id,captured_at,window_key,view_count,status,source
+                    ) VALUES (
+                        ?,'2026-08-02T15:00:00Z','2026-08-02',NULL,'missing','test-missing'
+                    )
+                    """,
+                    (ids["content-a"],),
+                )
                 connection.commit()
                 window = api_module._window_summary(
                     connection,
@@ -179,9 +547,15 @@ class V8ApiTest(unittest.TestCase):
             summary = douyin["summary"]["metrics"]
             self.assertEqual(douyin["publication_count"], 3)
             self.assertEqual(summary["selling_point_count_share"]["percentage"], 66.67)
-            self.assertEqual(summary["core_selling_point_count_share"]["percentage"], 33.33)
-            self.assertEqual(summary["selling_point_exposure_share"]["percentage"], 80.0)
-            self.assertEqual(summary["core_selling_point_exposure_share"]["percentage"], 20.0)
+            self.assertEqual(
+                summary["core_selling_point_count_share"]["percentage"], 33.33
+            )
+            self.assertEqual(
+                summary["selling_point_exposure_share"]["percentage"], 80.0
+            )
+            self.assertEqual(
+                summary["core_selling_point_exposure_share"]["percentage"], 20.0
+            )
             self.assertEqual(summary["content_verticality"]["value"], 60)
             self.assertEqual(summary["audience_verticality"]["value"], 60)
             self.assertEqual(summary["audience_verticality"]["status"], "sample_only")
@@ -191,9 +565,15 @@ class V8ApiTest(unittest.TestCase):
             used_car = douyin["scenes"]["used_car"]["metrics"]
             media = douyin["scenes"]["media"]["metrics"]
             self.assertEqual(new_car["selling_point_count_share"]["denominator"], 3)
-            self.assertEqual(new_car["selling_point_exposure_share"]["denominator"], 500)
-            self.assertEqual(new_car["selling_point_exposure_share"]["percentage"], 20.0)
-            self.assertEqual(used_car["selling_point_exposure_share"]["percentage"], 60.0)
+            self.assertEqual(
+                new_car["selling_point_exposure_share"]["denominator"], 500
+            )
+            self.assertEqual(
+                new_car["selling_point_exposure_share"]["percentage"], 20.0
+            )
+            self.assertEqual(
+                used_car["selling_point_exposure_share"]["percentage"], 60.0
+            )
             self.assertEqual(media["selling_point_count_share"]["percentage"], 0.0)
             self.assertEqual(media["content_verticality"]["status"], "not_applicable")
 
@@ -206,11 +586,26 @@ class V8ApiTest(unittest.TestCase):
                 )
             )
 
-    def test_five_page_read_models_use_migrated_v8_data(self) -> None:
+    def test_five_page_read_models_use_current_v8_data(self) -> None:
+        with connect(self.db) as connection:
+            expected_account_count = int(
+                connection.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
+            )
+            expected_unassociated_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM content_items WHERE account_id IS NULL"
+                ).fetchone()[0]
+            )
+            expected_pending_identity_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM pending_platform_identities"
+                ).fetchone()[0]
+            )
+            expected_content_count = int(
+                connection.execute("SELECT COUNT(*) FROM content_items").fetchone()[0]
+            )
         tasks = self.client.get("/api/v8/tasks")
-        accounts = self.client.post(
-            "/api/v8/accounts/search", json={"query": "13800138000"}
-        )
+        accounts = self.client.post("/api/v8/accounts/search", json={})
         contents = self.client.post(
             "/api/v8/contents/search", json={"page": 1, "page_size": 20}
         )
@@ -225,18 +620,37 @@ class V8ApiTest(unittest.TestCase):
         for task in tasks.json()["items"]:
             self.assertTrue(
                 {
-                    "id", "task_type", "period_start", "period_end", "task_status",
-                    "content_count", "missing_boundary_count", "revision_count",
+                    "id",
+                    "task_type",
+                    "period_start",
+                    "period_end",
+                    "task_status",
+                    "content_count",
+                    "missing_boundary_count",
+                    "revision_count",
+                    "historical_revision_count",
+                    "current_valid_revision",
+                    "stale_display_revision",
+                    "display_effective_revision",
                 }.issubset(task)
             )
         self.assertEqual(accounts.status_code, 200)
-        self.assertEqual(accounts.json()["total"], 0)
-        self.assertEqual(accounts.json()["legacy_unassociated_content_count"], 776)
-        self.assertEqual(accounts.json()["pending_platform_identity_count"], 30)
-        self.assertEqual(len(accounts.json()["pending_platform_identities"]), 30)
+        self.assertEqual(accounts.json()["total"], expected_account_count)
+        self.assertEqual(
+            accounts.json()["legacy_unassociated_content_count"],
+            expected_unassociated_count,
+        )
+        self.assertEqual(
+            accounts.json()["pending_platform_identity_count"],
+            expected_pending_identity_count,
+        )
+        self.assertEqual(
+            len(accounts.json()["pending_platform_identities"]),
+            min(expected_pending_identity_count, 100),
+        )
         self.assertEqual(contents.status_code, 200)
-        self.assertEqual(contents.json()["total"], 776)
-        self.assertEqual(len(contents.json()["items"]), 20)
+        self.assertEqual(contents.json()["total"], expected_content_count)
+        self.assertEqual(len(contents.json()["items"]), min(expected_content_count, 20))
         self.assertEqual(pending.status_code, 200)
         overview = self.client.get("/api/v8/overview")
         self.assertEqual(overview.status_code, 200)
@@ -248,11 +662,82 @@ class V8ApiTest(unittest.TestCase):
             selling_points.json()["taxonomy"]["version"], "selling-points-v5.0"
         )
         self.assertEqual(len(selling_points.json()["items"]), 25)
+        self.assertTrue(
+            all(
+                item["matcher_rule"] is None
+                and set(item["scene_hits"]) == {"used_car", "new_car", "media"}
+                and {
+                    "positive_evidence",
+                    "negative_evidence",
+                    "boundary_rules",
+                    "scenes",
+                }.issubset(item)
+                for item in selling_points.json()["items"]
+            )
+        )
         m_points = [
-            item for item in selling_points.json()["items"] if item["code"].startswith("M")
+            item
+            for item in selling_points.json()["items"]
+            if item["code"].startswith("M")
         ]
         self.assertTrue(m_points)
         self.assertTrue(all(item["primary_hits"] == 0 for item in m_points))
+
+    def test_selling_point_read_model_rejects_multiple_published_taxonomies(
+        self,
+    ) -> None:
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                INSERT INTO taxonomy_versions(
+                    id,version,status,definition,created_at,published_at
+                ) VALUES ('unexpected-published','selling-points-v4.9','published',
+                          'unexpected',?,?)
+                """,
+                (now_utc(), now_utc()),
+            )
+            connection.commit()
+            before = "\n".join(connection.iterdump())
+
+        response = self.client.get("/api/v8/selling-points")
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("multiple published taxonomies", response.json()["detail"])
+        with connect(self.db) as connection:
+            after = "\n".join(connection.iterdump())
+        self.assertEqual(after, before)
+
+    def test_selling_point_read_model_rejects_active_release_taxonomy_mismatch(
+        self,
+    ) -> None:
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                INSERT INTO taxonomy_versions(
+                    id,version,status,definition,created_at,published_at
+                ) VALUES ('retired-v5.1','selling-points-v5.1','retired',
+                          'mismatch',?,?)
+                """,
+                (now_utc(), now_utc()),
+            )
+            connection.execute(
+                """
+                UPDATE evaluation_releases
+                SET taxonomy_version='selling-points-v5.1'
+                WHERE status='active'
+                """
+            )
+            connection.commit()
+            before = "\n".join(connection.iterdump())
+
+        response = self.client.get("/api/v8/selling-points")
+        self.assertEqual(response.status_code, 409)
+        self.assertIn(
+            "active evaluation release does not match published taxonomy",
+            response.json()["detail"],
+        )
+        with connect(self.db) as connection:
+            after = "\n".join(connection.iterdump())
+        self.assertEqual(after, before)
 
     def test_content_filters_preserve_migrated_enums(self) -> None:
         response = self.client.post(
@@ -274,7 +759,9 @@ class V8ApiTest(unittest.TestCase):
             f"/api/v7/history/reports/{first['run_id']}/revisions/{first['revision']}"
         )
         self.assertEqual(report.status_code, 200)
-        self.assertEqual(report.json()["report_version"], "channel-structured-conclusions-v7.0")
+        self.assertEqual(
+            report.json()["report_version"], "channel-structured-conclusions-v7.0"
+        )
 
     def test_existing_frontend_read_routes_remain_available(self) -> None:
         overview = self.client.get("/api/overview")
@@ -283,7 +770,9 @@ class V8ApiTest(unittest.TestCase):
         self.assertEqual(overview.status_code, 200)
         self.assertEqual(latest.status_code, 200)
         self.assertEqual(runs.status_code, 200)
-        self.assertEqual(overview.json()["report_version"], "channel-structured-conclusions-v7.0")
+        self.assertEqual(
+            overview.json()["report_version"], "channel-structured-conclusions-v7.0"
+        )
 
     def test_legacy_writes_return_migration_conflict(self) -> None:
         response = self.client.post("/api/runs/full", json={})
@@ -314,10 +803,8 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         (PROJECT_ROOT / "tmp").mkdir(exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(dir=PROJECT_ROOT / "tmp")
         self.db = Path(self.temp.name) / "api.sqlite3"
-        self.original_db = api_module.API_DB_PATH
-        self.original_reports_root = api_module.API_REPORTS_ROOT
-        api_module.API_DB_PATH = self.db
-        api_module.API_REPORTS_ROOT = Path(self.temp.name) / "reports"
+        self.config = _test_config(Path(self.temp.name), db_name="api.sqlite3")
+        self.assertEqual(self.config.db_path, self.db)
         with connect(self.db) as connection:
             initialize_database(connection)
             captured_at = now_utc()
@@ -367,14 +854,106 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
             )
             connection.commit()
             self.queue_id = int(queue.lastrowid)
-        self.client_context = TestClient(app)
+        self.app = api_module.create_app(self.config)
+        self.client_context = TestClient(self.app)
         self.client = self.client_context.__enter__()
 
     def tearDown(self) -> None:
         self.client_context.__exit__(None, None, None)
-        api_module.API_DB_PATH = self.original_db
-        api_module.API_REPORTS_ROOT = self.original_reports_root
         self.temp.cleanup()
+
+    def _activate_v8_report_release(self) -> None:
+        bundle = load_bundle()
+        with connect(self.db) as connection:
+            captured_at = now_utc()
+            for code in sorted(POINT_IDS):
+                rule = materialize_point_rule(bundle, code)
+                projection = project_materialized_rule(rule)
+                point = connection.execute(
+                    """
+                    SELECT id FROM selling_points
+                    WHERE taxonomy_id='taxonomy' AND code=?
+                    """,
+                    (code,),
+                ).fetchone()
+                if point is None:
+                    cursor = connection.execute(
+                        """
+                        INSERT INTO selling_points(
+                            taxonomy_id,code,tier,label,definition
+                        ) VALUES ('taxonomy',?,?,?,'test')
+                        """,
+                        (code, "other", f"测试卖点 {code}"),
+                    )
+                    point_id = int(cursor.lastrowid)
+                else:
+                    point_id = int(point["id"])
+                connection.execute(
+                    "DELETE FROM selling_point_scenes WHERE selling_point_id=?",
+                    (point_id,),
+                )
+                for scene in projection["scenes"]:
+                    connection.execute(
+                        """
+                        INSERT INTO selling_point_scenes(selling_point_id,scene)
+                        VALUES (?,?)
+                        """,
+                        (point_id, scene),
+                    )
+            connection.commit()
+        matcher = backfill_v5_1_matcher_rules(db_path=self.db)
+        release_id = "evaluation-v8__selling-points-v5.1"
+        with connect(self.db) as connection:
+            captured_at = now_utc()
+            connection.execute(
+                """
+                INSERT INTO evaluation_releases(
+                    id,rule_version,taxonomy_version,matcher_rule_sha256,status,
+                    created_at,updated_at
+                ) VALUES (?,'evaluation-v8','selling-points-v5.1',?,'backfilling',?,?)
+                """,
+                (
+                    release_id,
+                    matcher["matcher_rule_sha256"],
+                    captured_at,
+                    captured_at,
+                ),
+            )
+            connection.commit()
+        evaluate_release_content(
+            self.content_id, release_id=release_id, db_path=self.db
+        )
+        with connect(self.db) as connection:
+            captured_at = now_utc()
+            connection.execute(
+                """
+                UPDATE evaluation_releases
+                SET status='retired',retired_at=?,updated_at=?
+                WHERE status='active' AND id<>?
+                """,
+                (captured_at, captured_at, release_id),
+            )
+            connection.execute(
+                """
+                UPDATE taxonomy_versions SET status='retired'
+                WHERE status='published' AND version<>'selling-points-v5.1'
+                """
+            )
+            connection.execute(
+                """
+                UPDATE taxonomy_versions SET status='published',published_at=?
+                WHERE version='selling-points-v5.1'
+                """,
+                (captured_at,),
+            )
+            connection.execute(
+                """
+                UPDATE evaluation_releases
+                SET status='active',activated_at=?,updated_at=? WHERE id=?
+                """,
+                (captured_at, captured_at, release_id),
+            )
+            connection.commit()
 
     def test_review_api_starts_and_resolves_as_append_only_override(self) -> None:
         listed = self.client.get("/api/v8/reviews")
@@ -416,6 +995,113 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         self.assertEqual([row[0] for row in versions], ["automatic", "manual_review"])
         self.assertEqual(evidence_count, 1)
         self.assertEqual(status, "resolved")
+
+    def test_backfilling_evaluation_is_hidden_from_display_but_remains_review_cas_anchor(
+        self,
+    ) -> None:
+        with connect(self.db) as connection:
+            captured_at = "2099-01-01T00:00:00Z"
+            connection.execute(
+                """
+                INSERT INTO taxonomy_versions(
+                    id,version,status,definition,created_at
+                ) VALUES ('taxonomy-v51','selling-points-v5.1','draft','test',?)
+                """,
+                (captured_at,),
+            )
+            connection.execute(
+                """
+                INSERT INTO evaluation_releases(
+                    id,rule_version,taxonomy_version,matcher_rule_sha256,status,
+                    created_at,updated_at
+                ) VALUES ('release-v8','evaluation-v8','selling-points-v5.1',?,
+                          'backfilling',?,?)
+                """,
+                ("8" * 64, captured_at, captured_at),
+            )
+            backfill = connection.execute(
+                """
+                INSERT INTO evaluation_versions(
+                    content_id,release_id,rule_version,taxonomy_version,
+                    matcher_rule_sha256,evidence_sha256,evaluation_source,
+                    evaluation_status,evidence_level,primary_selling_point_code,
+                    selling_point_score,selling_point_included,content_direction,
+                    pending_review,payload_json,evaluated_at
+                ) VALUES (?,'release-v8','evaluation-v8','selling-points-v5.1',?,?,
+                          'automatic','evaluated','V3','X8',99,1,'new_car',0,?,?)
+                """,
+                (
+                    self.content_id,
+                    "8" * 64,
+                    "9" * 64,
+                    json.dumps(
+                        {
+                            "primary_selling_point_id": "X8",
+                            "content_direction": "new_car",
+                        }
+                    ),
+                    captured_at,
+                ),
+            )
+            connection.commit()
+            backfill_id = int(backfill.lastrowid)
+
+        searched = self.client.post(
+            "/api/v8/contents/search", json={"page": 1, "page_size": 50}
+        )
+        self.assertEqual(searched.status_code, 200)
+        item = searched.json()["items"][0]
+        self.assertEqual(item["display_evaluation_id"], self.evaluation_id)
+        self.assertNotEqual(item["primary_selling_point_code"], "X8")
+        self.assertEqual(item["evaluation_freshness"], "current")
+        self.assertFalse(item["evaluation_is_stale"])
+
+        evidence = self.client.get(f"/api/v8/contents/{self.content_id}/evidence")
+        self.assertEqual(evidence.status_code, 200)
+        evidence_value = evidence.json()
+        self.assertEqual(evidence_value["display_evaluation_id"], self.evaluation_id)
+        self.assertEqual(evidence_value["base_evaluation_id"], backfill_id)
+        self.assertNotEqual(
+            evidence_value["evaluation"]["primary_selling_point_id"], "X8"
+        )
+        self.assertEqual(evidence_value["evaluation_freshness"], "current")
+
+        reviews = self.client.get("/api/v8/reviews")
+        self.assertEqual(reviews.status_code, 200)
+        review = reviews.json()["items"][0]
+        self.assertEqual(review["display_evaluation_id"], self.evaluation_id)
+        self.assertNotEqual(review["evaluation"]["primary_selling_point_id"], "X8")
+        self.assertEqual(review["evaluation_freshness"], "current")
+
+        started = self.client.post(f"/api/v8/reviews/{self.queue_id}/start")
+        self.assertEqual(started.status_code, 200)
+        self.assertEqual(started.json()["base_evaluation_id"], backfill_id)
+        rejected = self.client.post(
+            f"/api/v8/reviews/{self.queue_id}/resolve",
+            json={
+                "base_evaluation_id": backfill_id,
+                "decision": "confirm",
+                "reason": "回填期间不得跨 release 复核",
+                "reviewer": "测试复核员",
+                "evidence_type": "review_note",
+                "evidence_text": "这条提交必须整体回滚",
+            },
+        )
+        self.assertEqual(rejected.status_code, 409)
+        self.assertIn("lineage", rejected.json()["detail"])
+        with connect(self.db) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM evaluation_reviews"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM manual_evidence").fetchone()[
+                    0
+                ],
+                0,
+            )
 
     def test_review_api_reopens_with_audit_event_and_appends_new_version(self) -> None:
         started = self.client.post(f"/api/v8/reviews/{self.queue_id}/start")
@@ -519,22 +1205,125 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         self.assertEqual(evidence_count, 2)
         self.assertEqual(queue_status, "resolved")
 
-    def test_review_api_rejects_selling_point_scene_conflict(self) -> None:
+    def test_review_api_distinguishes_omitted_override_from_explicit_null(
+        self,
+    ) -> None:
+        with connect(self.db) as connection:
+            parent = dict(
+                connection.execute(
+                    "SELECT * FROM evaluation_versions WHERE id=?",
+                    (self.evaluation_id,),
+                ).fetchone()
+            )
         started = self.client.post(f"/api/v8/reviews/{self.queue_id}/start")
         self.assertEqual(started.status_code, 200)
-        rejected = self.client.post(
+        partial = self.client.post(
             f"/api/v8/reviews/{self.queue_id}/resolve",
             json={
                 "base_evaluation_id": started.json()["base_evaluation_id"],
+                "decision": "override",
+                "reason": "只修正内容垂直度",
+                "reviewer": "测试复核员",
+                "evidence_type": "review_note",
+                "evidence_text": "人工核验后内容垂直度应为十二分",
+                "content_automotive_score": 12,
+            },
+        )
+        self.assertEqual(partial.status_code, 200)
+        partial_id = int(partial.json()["evaluation_id"])
+        with connect(self.db) as connection:
+            partial_row = connection.execute(
+                "SELECT * FROM evaluation_versions WHERE id=?", (partial_id,)
+            ).fetchone()
+        self.assertEqual(
+            partial_row["primary_selling_point_code"],
+            parent["primary_selling_point_code"],
+        )
+        self.assertEqual(
+            partial_row["selling_point_score"], parent["selling_point_score"]
+        )
+        self.assertEqual(
+            partial_row["selling_point_included"], parent["selling_point_included"]
+        )
+        self.assertEqual(partial_row["content_automotive_score"], 12)
+
+        reopened = self.client.post(
+            f"/api/v8/reviews/{self.queue_id}/reopen",
+            json={"reason": "明确清空主卖点", "reopened_by": "测试复核员"},
+        )
+        self.assertEqual(reopened.status_code, 200)
+        cleared = self.client.post(
+            f"/api/v8/reviews/{self.queue_id}/resolve",
+            json={
+                "base_evaluation_id": reopened.json()["base_evaluation_id"],
+                "decision": "override",
+                "reason": "明确清空主卖点",
+                "reviewer": "测试复核员",
+                "evidence_type": "review_note",
+                "evidence_text": "人工证据确认不应保留任何卖点",
+                "primary_selling_point_code": None,
+            },
+        )
+        self.assertEqual(cleared.status_code, 200)
+        with connect(self.db) as connection:
+            cleared_row = connection.execute(
+                "SELECT * FROM evaluation_versions WHERE id=?",
+                (cleared.json()["evaluation_id"],),
+            ).fetchone()
+            match_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM evaluation_matches WHERE evaluation_id=?",
+                    (cleared.json()["evaluation_id"],),
+                ).fetchone()[0]
+            )
+        self.assertIsNone(cleared_row["primary_selling_point_code"])
+        self.assertEqual(cleared_row["selling_point_score"], 0)
+        self.assertEqual(cleared_row["selling_point_included"], 0)
+        self.assertEqual(match_count, 0)
+
+    def test_review_api_rejects_selling_point_scene_conflict(self) -> None:
+        started = self.client.post(f"/api/v8/reviews/{self.queue_id}/start")
+        self.assertEqual(started.status_code, 200)
+        seeded = self.client.post(
+            f"/api/v8/reviews/{self.queue_id}/resolve",
+            json={
+                "base_evaluation_id": started.json()["base_evaluation_id"],
+                "decision": "override",
+                "reason": "先建立媒体场景主卖点",
+                "reviewer": "测试复核员",
+                "evidence_type": "visual_summary",
+                "evidence_text": "画面明确展示汽车保养知识",
+                "primary_selling_point_code": "C1",
+                "selling_point_score": 90,
+                "selling_point_included": True,
+                "content_automotive_score": 90,
+                "content_direction": "media",
+            },
+        )
+        self.assertEqual(seeded.status_code, 200)
+        reopened = self.client.post(
+            f"/api/v8/reviews/{self.queue_id}/reopen",
+            json={"reason": "检查继承场景约束", "reopened_by": "测试复核员"},
+        )
+        self.assertEqual(reopened.status_code, 200)
+        with connect(self.db) as connection:
+            before_reviews = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM evaluation_reviews"
+                ).fetchone()[0]
+            )
+            before_evidence = int(
+                connection.execute("SELECT COUNT(*) FROM manual_evidence").fetchone()[0]
+            )
+        rejected = self.client.post(
+            f"/api/v8/reviews/{self.queue_id}/resolve",
+            json={
+                "base_evaluation_id": reopened.json()["base_evaluation_id"],
                 "decision": "override",
                 "reason": "尝试提交冲突场景",
                 "reviewer": "测试复核员",
                 "evidence_type": "visual_summary",
                 "evidence_text": "画面证据摘要",
-                "primary_selling_point_code": "C1",
-                "selling_point_score": 90,
-                "selling_point_included": True,
-                "content_automotive_score": 90,
                 "content_direction": "new_car",
             },
         )
@@ -542,8 +1331,16 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         self.assertIn("does not allow content direction", rejected.json()["detail"])
         with connect(self.db) as connection:
             self.assertEqual(
-                connection.execute("SELECT COUNT(*) FROM evaluation_reviews").fetchone()[0],
-                0,
+                connection.execute(
+                    "SELECT COUNT(*) FROM evaluation_reviews"
+                ).fetchone()[0],
+                before_reviews,
+            )
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM manual_evidence").fetchone()[
+                    0
+                ],
+                before_evidence,
             )
             self.assertEqual(
                 connection.execute(
@@ -551,6 +1348,132 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
                 ).fetchone()[0],
                 "in_review",
             )
+
+    def test_selling_point_hits_are_split_into_the_latest_business_scene(self) -> None:
+        with connect(self.db) as connection:
+            point = connection.execute(
+                """
+                INSERT INTO selling_points(taxonomy_id,code,tier,label,definition)
+                VALUES ('taxonomy','C2','other','跨场景卖点','test')
+                """
+            )
+            connection.executemany(
+                "INSERT INTO selling_point_scenes(selling_point_id,scene) VALUES (?,?)",
+                [(point.lastrowid, "used_car"), (point.lastrowid, "new_car")],
+            )
+            created_at = now_utc()
+            content_ids = []
+            for link_id, platform_id in (("B2CD3E", "scene-a"), ("C2DE3F", "scene-b")):
+                content = connection.execute(
+                    """
+                    INSERT INTO content_items(
+                        link_id,platform,platform_content_id,canonical_url,title,content_type,
+                        imported_at,created_at,updated_at
+                    ) VALUES (?,'douyin',?,?,'跨场景','video',?,?,?)
+                    """,
+                    (
+                        link_id,
+                        platform_id,
+                        f"https://www.douyin.com/video/{platform_id}",
+                        created_at,
+                        created_at,
+                        created_at,
+                    ),
+                )
+                content_ids.append(int(content.lastrowid))
+
+            connection.execute(
+                "UPDATE content_items SET manual_content_direction='other' WHERE id=?",
+                (content_ids[0],),
+            )
+            connection.execute(
+                "UPDATE content_items SET manual_content_direction='new_car' WHERE id=?",
+                (content_ids[1],),
+            )
+
+            evaluation_rows = [
+                (content_ids[0], "1" * 64, "used_car"),
+                (content_ids[0], "2" * 64, "new_car"),
+                (content_ids[1], "3" * 64, "used_car"),
+            ]
+            release = ensure_legacy_evaluation_release(
+                connection,
+                rule_version="evaluation-v7",
+                taxonomy_version="selling-points-v5.0",
+            )
+            for content_id, evidence_sha, scene in evaluation_rows:
+                evaluation = connection.execute(
+                    """
+                    INSERT INTO evaluation_versions(
+                        content_id,release_id,rule_version,taxonomy_version,
+                        matcher_rule_sha256,evidence_sha256,
+                        evaluation_source,evaluation_status,evidence_level,
+                        primary_selling_point_code,selling_point_score,selling_point_included,
+                        content_direction,payload_json,evaluated_at
+                    ) VALUES (?,?,'evaluation-v7','selling-points-v5.0',?,?,'automatic',
+                              'evaluated','V3','C2',90,1,?,'{}',?)
+                    """,
+                    (
+                        content_id,
+                        release["id"],
+                        LEGACY_MATCHER_RULE_SHA256,
+                        evidence_sha,
+                        scene,
+                        created_at,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO evaluation_matches(
+                        evaluation_id,selling_point_code,scene,match_role,score,evidence_json
+                    ) VALUES (?,'C2',?,'primary',90,'{}')
+                    """,
+                    (evaluation.lastrowid, scene),
+                )
+
+            retired_release = ensure_legacy_evaluation_release(
+                connection,
+                rule_version="evaluation-v6",
+                taxonomy_version="selling-points-v5.0",
+            )
+            retired = connection.execute(
+                """
+                INSERT INTO evaluation_versions(
+                    content_id,release_id,rule_version,taxonomy_version,
+                    matcher_rule_sha256,evidence_sha256,
+                    evaluation_source,evaluation_status,evidence_level,
+                    primary_selling_point_code,selling_point_score,selling_point_included,
+                    content_direction,payload_json,evaluated_at
+                ) VALUES (?,?,'evaluation-v6','selling-points-v5.0',?,?,'automatic',
+                          'evaluated','V3','C2',90,1,'new_car','{}',?)
+                """,
+                (
+                    content_ids[1],
+                    retired_release["id"],
+                    LEGACY_MATCHER_RULE_SHA256,
+                    "4" * 64,
+                    created_at,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO evaluation_matches(
+                    evaluation_id,selling_point_code,scene,match_role,score,evidence_json
+                ) VALUES (?,'C2','new_car','primary',90,'{}')
+                """,
+                (retired.lastrowid,),
+            )
+            connection.commit()
+
+        response = self.client.get("/api/v8/selling-points")
+        self.assertEqual(response.status_code, 200)
+        point_value = next(
+            item for item in response.json()["items"] if item["code"] == "C2"
+        )
+        self.assertEqual(point_value["primary_hits"], 2)
+        self.assertEqual(point_value["scene_hits"]["new_car"]["primary_hits"], 1)
+        self.assertEqual(point_value["scene_hits"]["used_car"]["primary_hits"], 1)
+        self.assertEqual(point_value["scene_hits"]["media"]["primary_hits"], 0)
 
     def test_review_api_rejects_stale_evaluation_cursor(self) -> None:
         started = self.client.post(f"/api/v8/reviews/{self.queue_id}/start")
@@ -564,6 +1487,29 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
             connection.commit()
         changed = evaluate_content(self.content_id, db_path=self.db)
         self.assertNotEqual(changed.evaluation_id, stale_id)
+        with connect(self.db) as connection:
+            before = {
+                "reviews": int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM evaluation_reviews"
+                    ).fetchone()[0]
+                ),
+                "manual_evidence": int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM manual_evidence"
+                    ).fetchone()[0]
+                ),
+                "evaluations": int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM evaluation_versions"
+                    ).fetchone()[0]
+                ),
+                "queue": dict(
+                    connection.execute(
+                        "SELECT * FROM review_queue WHERE id=?", (self.queue_id,)
+                    ).fetchone()
+                ),
+            }
         rejected = self.client.post(
             f"/api/v8/reviews/{self.queue_id}/resolve",
             json={
@@ -577,6 +1523,30 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         )
         self.assertEqual(rejected.status_code, 409)
         self.assertIn("请刷新证据", rejected.json()["detail"])
+        with connect(self.db) as connection:
+            after = {
+                "reviews": int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM evaluation_reviews"
+                    ).fetchone()[0]
+                ),
+                "manual_evidence": int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM manual_evidence"
+                    ).fetchone()[0]
+                ),
+                "evaluations": int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM evaluation_versions"
+                    ).fetchone()[0]
+                ),
+                "queue": dict(
+                    connection.execute(
+                        "SELECT * FROM review_queue WHERE id=?", (self.queue_id,)
+                    ).fetchone()
+                ),
+            }
+        self.assertEqual(after, before)
 
     def test_evidence_media_file_and_processing_search_are_readable(self) -> None:
         media_path = Path(self.temp.name) / "evidence.jpg"
@@ -584,7 +1554,9 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         ocr_path = Path(self.temp.name) / "ocr.json"
         media_path.write_bytes(b"local-image-evidence")
         asr_path.write_text(
-            json.dumps({"status": "success", "model": "pinned", "text": "完整的本地语音证据"}),
+            json.dumps(
+                {"status": "success", "model": "pinned", "text": "完整的本地语音证据"}
+            ),
             encoding="utf-8",
         )
         ocr_path.write_text(
@@ -604,14 +1576,24 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         )
         with connect(self.db) as connection:
             artifact_ids = []
-            for artifact_type, path in (("media", media_path), ("asr", asr_path), ("ocr", ocr_path)):
+            for artifact_type, path in (
+                ("media", media_path),
+                ("asr", asr_path),
+                ("ocr", ocr_path),
+            ):
                 cursor = connection.execute(
                     """
                     INSERT INTO evidence_artifacts(
                         content_id,artifact_type,local_path,status,sha256,created_at
                     ) VALUES (?,?,?,'available',?,?)
                     """,
-                    (self.content_id, artifact_type, str(path), artifact_type * 16, now_utc()),
+                    (
+                        self.content_id,
+                        artifact_type,
+                        str(path),
+                        artifact_type * 16,
+                        now_utc(),
+                    ),
                 )
                 artifact_ids.append(int(cursor.lastrowid))
             comments = Path(self.temp.name) / "comments.json"
@@ -623,7 +1605,14 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
                     comment_count,status,created_at
                 ) VALUES (?,?,?,'test',?,?,1,'available',?)
                 """,
-                (self.content_id, now_utc(), "2026-W31", str(comments), "c" * 64, now_utc()),
+                (
+                    self.content_id,
+                    now_utc(),
+                    "2026-W31",
+                    str(comments),
+                    "c" * 64,
+                    now_utc(),
+                ),
             )
             connection.execute(
                 """
@@ -640,6 +1629,52 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
                 ) VALUES (?,?,'ocr','ocr-test','succeeded',?,1,?,?)
                 """,
                 (self.content_id, "m" * 64, artifact_ids[-1], now_utc(), now_utc()),
+            )
+            connection.executemany(
+                """
+                INSERT INTO media_processing_slots(
+                    content_id,source_sha256,processor_type,processor_version,status,
+                    attempt_count,created_at,updated_at
+                ) VALUES (?,?,?,?,?,1,?,?)
+                """,
+                [
+                    (
+                        self.content_id,
+                        "p" * 64,
+                        "download",
+                        "download-test",
+                        "pending",
+                        now_utc(),
+                        now_utc(),
+                    ),
+                    (
+                        self.content_id,
+                        "r" * 64,
+                        "frames",
+                        "frames-running",
+                        "running",
+                        now_utc(),
+                        now_utc(),
+                    ),
+                    (
+                        self.content_id,
+                        "f" * 64,
+                        "frames",
+                        "frames-failed",
+                        "retryable_failed",
+                        now_utc(),
+                        now_utc(),
+                    ),
+                    (
+                        self.content_id,
+                        "t" * 64,
+                        "asr",
+                        "asr-terminal",
+                        "terminal_failed",
+                        now_utc(),
+                        now_utc(),
+                    ),
+                ],
             )
             connection.commit()
         evidence = self.client.get(f"/api/v8/contents/{self.content_id}/evidence")
@@ -659,6 +1694,32 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         )
         self.assertEqual(processing.status_code, 200)
         self.assertEqual(processing.json()["total"], 1)
+        self.assertEqual(
+            processing.json()["slot_status_counts"],
+            {
+                "pending": 0,
+                "running": 0,
+                "succeeded": 1,
+                "retryable_failed": 0,
+                "terminal_failed": 0,
+            },
+        )
+        frame_processing = self.client.post(
+            "/api/v8/media-processing/search",
+            json={"content_id": self.content_id, "processor_type": "frames"},
+        )
+        self.assertEqual(frame_processing.status_code, 200)
+        self.assertEqual(frame_processing.json()["total"], 2)
+        self.assertEqual(
+            frame_processing.json()["slot_status_counts"],
+            {
+                "pending": 0,
+                "running": 1,
+                "succeeded": 0,
+                "retryable_failed": 1,
+                "terminal_failed": 0,
+            },
+        )
         existing_evidence = self.client.post(
             f"/api/v8/contents/{self.content_id}/media/retry",
             json={"allow_paid_refresh": False},
@@ -690,37 +1751,154 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         cancelled = self.client.post(f"/api/v8/tasks/{task['id']}/cancel")
         self.assertEqual(cancelled.status_code, 200)
         self.assertEqual(cancelled.json()["task_status"], "cancelled")
+        self._activate_v8_report_release()
         resumed = self.client.post(f"/api/v8/tasks/{task['id']}/resume")
         self.assertEqual(resumed.status_code, 200)
         self.assertIn(resumed.json()["task_status"], {"succeeded", "partial"})
         self.assertEqual(len(resumed.json()["revisions"]), 1)
 
-    def test_selling_point_api_edits_only_a_draft_then_publishes(self) -> None:
+    def test_selling_point_api_edits_only_an_unreleased_matcher_draft(self) -> None:
+        bundle = load_bundle()
+        with connect(self.db) as connection:
+            for code in sorted(POINT_IDS - {"C1"}):
+                rule = materialize_point_rule(bundle, code)
+                projection = project_materialized_rule(rule)
+                point = connection.execute(
+                    """
+                    INSERT INTO selling_points(
+                        taxonomy_id,code,tier,label,definition
+                    ) VALUES ('taxonomy',?,?,?,'test')
+                    """,
+                    (code, "other", f"测试卖点 {code}"),
+                )
+                for scene in projection["scenes"]:
+                    connection.execute(
+                        """
+                        INSERT INTO selling_point_scenes(selling_point_id,scene)
+                        VALUES (?,?)
+                        """,
+                        (point.lastrowid, scene),
+                    )
+            connection.commit()
+        backfill_v5_1_matcher_rules(db_path=self.db)
         drafted = self.client.post("/api/v8/selling-points/draft")
         self.assertEqual(drafted.status_code, 200)
         self.assertEqual(drafted.json()["version"], "selling-points-v5.1")
+        invalid_delete = self.client.delete("/api/v8/selling-points/items/not-a-code")
+        self.assertEqual(invalid_delete.status_code, 422)
+        matcher_rule = materialize_point_rule(bundle, "C1")
+        projection = project_materialized_rule(matcher_rule)
         updated = self.client.patch(
             "/api/v8/selling-points/items/C1",
             json={
                 "tier": "core",
                 "label": "汽车养护服务",
                 "definition": "车辆保养与维修能力",
-                "positive_evidence": ["保养", "维修"],
-                "negative_evidence": [],
-                "boundary_rules": ["必须有明确服务能力"],
-                "scenes": ["media", "used_car"],
+                "matcher_rule": matcher_rule,
             },
         )
         self.assertEqual(updated.status_code, 200)
-        self.assertEqual(updated.json()["scenes"], ["media", "used_car"])
-        published = self.client.post("/api/v8/selling-points/publish")
-        self.assertEqual(published.status_code, 200)
-        self.assertEqual(published.json()["status"], "published")
-        current = self.client.get("/api/v8/selling-points")
-        self.assertEqual(current.json()["taxonomy"]["version"], "selling-points-v5.1")
-        self.assertEqual(current.json()["items"][0]["label"], "汽车养护服务")
+        self.assertEqual(updated.json()["matcher_rule"], matcher_rule)
+        self.assertEqual(updated.json()["scenes"], projection["scenes"])
+        self.assertEqual(
+            updated.json()["positive_evidence"], projection["positive_evidence"]
+        )
 
-    def test_custom_task_generates_revision_and_downloads_run_scoped_files(self) -> None:
+        legacy_writable_projection = self.client.patch(
+            "/api/v8/selling-points/items/C1",
+            json={
+                "tier": "core",
+                "label": "汽车养护服务",
+                "definition": "车辆保养与维修能力",
+                "matcher_rule": matcher_rule,
+                "scenes": ["media"],
+            },
+        )
+        self.assertEqual(legacy_writable_projection.status_code, 422)
+
+        mismatched_rule = materialize_point_rule(bundle, "C2")
+        mismatched = self.client.patch(
+            "/api/v8/selling-points/items/C1",
+            json={
+                "tier": "core",
+                "label": "汽车养护服务",
+                "definition": "车辆保养与维修能力",
+                "matcher_rule": mismatched_rule,
+            },
+        )
+        self.assertEqual(mismatched.status_code, 422)
+
+        published = self.client.post("/api/v8/selling-points/publish")
+        self.assertEqual(published.status_code, 409)
+        current = self.client.get("/api/v8/selling-points")
+        self.assertEqual(current.json()["taxonomy"]["version"], "selling-points-v5.0")
+        draft = self.client.get("/api/v8/selling-points/draft")
+        self.assertEqual(draft.status_code, 200)
+        c1 = next(item for item in draft.json()["items"] if item["code"] == "C1")
+        self.assertEqual(c1["label"], "汽车养护服务")
+        self.assertEqual(c1["matcher_rule"], matcher_rule)
+
+    def test_selling_point_draft_version_conflict_is_zero_write_409(self) -> None:
+        rule = materialize_point_rule(load_bundle(), "C1")
+        projection = project_materialized_rule(rule)
+        captured_at = now_utc()
+        with connect(self.db) as connection:
+            point = connection.execute(
+                """
+                SELECT id FROM selling_points
+                WHERE taxonomy_id='taxonomy' AND code='C1'
+                """
+            ).fetchone()
+            assert point is not None
+            connection.execute(
+                """
+                UPDATE selling_points
+                SET positive_evidence_json=?,negative_evidence_json=?,
+                    boundary_rules_json=?,matcher_rule_json=?
+                WHERE id=?
+                """,
+                (
+                    canonical_json(projection["positive_evidence"]),
+                    canonical_json(projection["negative_evidence"]),
+                    canonical_json(projection["boundary_rules"]),
+                    canonical_materialized_rule(rule),
+                    point["id"],
+                ),
+            )
+            connection.execute(
+                "DELETE FROM selling_point_scenes WHERE selling_point_id=?",
+                (point["id"],),
+            )
+            for scene in projection["scenes"]:
+                connection.execute(
+                    """
+                    INSERT INTO selling_point_scenes(selling_point_id,scene)
+                    VALUES (?,?)
+                    """,
+                    (point["id"], scene),
+                )
+            connection.execute(
+                """
+                INSERT INTO taxonomy_versions(
+                    id,version,status,definition,created_at,published_at
+                ) VALUES ('retired-v5.1','selling-points-v5.1','retired',
+                          'rollback history',?,?)
+                """,
+                (captured_at, captured_at),
+            )
+            connection.commit()
+            before = "\n".join(connection.iterdump())
+
+        response = self.client.post("/api/v8/selling-points/draft")
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("already exists with status retired", response.json()["detail"])
+        with connect(self.db) as connection:
+            after = "\n".join(connection.iterdump())
+        self.assertEqual(after, before)
+
+    def test_custom_task_generates_revision_and_downloads_run_scoped_files(
+        self,
+    ) -> None:
         reviewed = self.client.post(
             f"/api/v8/reviews/{self.queue_id}/resolve",
             json={
@@ -733,6 +1911,7 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
             },
         )
         self.assertEqual(reviewed.status_code, 200)
+        self._activate_v8_report_release()
         created = self.client.post(
             "/api/v8/tasks",
             json={"period_start": "2026-07-01", "period_end": "2026-07-01"},
@@ -756,13 +1935,24 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         self.assertEqual(image.status_code, 200)
         self.assertIn(image.headers["content-type"], {"image/svg+xml", "image/png"})
 
-    def test_account_crud_import_and_export_keep_full_phone_with_post_search(self) -> None:
+    def test_account_crud_import_and_export_keep_full_phone_with_post_search(
+        self,
+    ) -> None:
         created = self.client.post(
             "/api/v8/accounts",
             json={
-                "phone": "13800138000", "operator_name": "运营甲",
-                "account_type": "original", "content_direction": "new_car",
-                "platforms": [{"platform": "douyin", "uid": "123456789", "nickname": "账号甲", "real_name_status": "yes"}],
+                "phone": "13800138000",
+                "operator_name": "运营甲",
+                "account_type": "original",
+                "content_direction": "new_car",
+                "platforms": [
+                    {
+                        "platform": "douyin",
+                        "uid": "123456789",
+                        "nickname": "账号甲",
+                        "real_name_status": "yes",
+                    }
+                ],
             },
         )
         self.assertEqual(created.status_code, 200)
@@ -770,23 +1960,166 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         updated = self.client.patch(
             f"/api/v8/accounts/{account_id}",
             json={
-                "phone": "+86 138-0013-8000", "operator_name": "运营乙",
-                "account_type": "boutique_ip", "content_direction": "media",
-                "platforms": [{"platform": "douyin", "uid": "123456789", "nickname": "账号乙", "real_name_status": "no"}],
+                "phone": "+86 138-0013-8000",
+                "operator_name": "运营乙",
+                "account_type": "boutique_ip",
+                "content_direction": "media",
+                "platforms": [
+                    {
+                        "platform": "douyin",
+                        "uid": "123456789",
+                        "nickname": "账号乙",
+                        "real_name_status": "no",
+                    }
+                ],
             },
         )
         self.assertEqual(updated.status_code, 200)
-        searched = self.client.post("/api/v8/accounts/search", json={"query": "13800138000"})
+        linked_content = self.client.post(
+            "/api/v8/contents",
+            json={
+                "platform": "douyin",
+                "canonical_url": "https://www.douyin.com/video/1234567890000000001",
+                "published_at": "2026-07-03T08:00:00+08:00",
+                "title": "账号关联内容",
+                "body": "用于验证账号列表的平台关联内容量",
+                "content_type": "video",
+                "account_uid": "123456789",
+                "account_name": "账号乙",
+                "account_type": "boutique_ip",
+                "content_direction": "media",
+            },
+        )
+        self.assertEqual(linked_content.status_code, 200)
+        searched = self.client.post(
+            "/api/v8/accounts/search", json={"query": "13800138000"}
+        )
         self.assertEqual(searched.json()["total"], 1)
         self.assertEqual(searched.json()["items"][0]["phone"], "+86 138-0013-8000")
+        identity = searched.json()["items"][0]["platforms"][0]
+        self.assertIsNone(identity["follower_count"])
+        self.assertEqual(identity["content_count"], 1)
         exported = self.client.get("/api/v8/accounts/export")
         self.assertEqual(exported.status_code, 200)
         self.assertIn("+86 138-0013-8000", exported.content.decode("utf-8-sig"))
 
+    def test_partial_content_patch_preserves_omitted_and_effective_fields(self) -> None:
+        captured_at = now_utc()
+        with connect(self.db) as connection:
+            account = connection.execute(
+                """
+                INSERT INTO accounts(
+                    phone,phone_normalized,operator_name,account_type,
+                    content_direction,created_at,updated_at
+                ) VALUES ('13900139000','13900139000','PATCH fixture','original',
+                          'new_car',?,?)
+                """,
+                (captured_at, captured_at),
+            )
+            connection.execute(
+                """
+                INSERT INTO account_platform_identities(
+                    account_id,platform,uid,nickname,created_at,updated_at
+                ) VALUES (?,'douyin','patch-api-uid','PATCH API',?,?)
+                """,
+                (account.lastrowid, captured_at, captured_at),
+            )
+            connection.execute(
+                """
+                UPDATE content_items
+                SET account_id=?,raw_account_uid='patch-api-uid',
+                    raw_account_name='PATCH API',legacy_account_type=NULL,
+                    manual_content_direction=NULL
+                WHERE id=?
+                """,
+                (account.lastrowid, self.content_id),
+            )
+            before = dict(
+                connection.execute(
+                    "SELECT * FROM content_items WHERE id=?", (self.content_id,)
+                ).fetchone()
+            )
+            connection.commit()
+
+        searched = self.client.post(
+            "/api/v8/contents/search",
+            json={"query": "A2BC3D", "page_size": 10},
+        )
+        self.assertEqual(searched.status_code, 200)
+        item = searched.json()["items"][0]
+        self.assertEqual(item["account_type"], "original")
+        self.assertEqual(item["content_direction"], "new_car")
+
+        updated = self.client.patch(
+            f"/api/v8/contents/{self.content_id}", json={"title": "仅修改标题"}
+        )
+        self.assertEqual(updated.status_code, 200)
+        with connect(self.db) as connection:
+            after = dict(
+                connection.execute(
+                    "SELECT * FROM content_items WHERE id=?", (self.content_id,)
+                ).fetchone()
+            )
+        self.assertEqual(after["title"], "仅修改标题")
+        self.assertIsNone(after["legacy_account_type"])
+        self.assertIsNone(after["manual_content_direction"])
+        for field in (
+            "platform",
+            "platform_content_id",
+            "canonical_url",
+            "published_at",
+            "body",
+            "content_type",
+            "raw_account_uid",
+            "raw_account_name",
+        ):
+            self.assertEqual(after[field], before[field], field)
+
+        self.assertEqual(
+            self.client.patch(
+                f"/api/v8/contents/{self.content_id}", json={}
+            ).status_code,
+            422,
+        )
+        self.assertEqual(
+            self.client.patch(
+                f"/api/v8/contents/{self.content_id}", json={"unknown_field": 1}
+            ).status_code,
+            422,
+        )
+        self.assertEqual(
+            self.client.post(
+                "/api/v8/contents", json={"title": "缺少身份"}
+            ).status_code,
+            422,
+        )
+
+        overridden = self.client.patch(
+            f"/api/v8/contents/{self.content_id}",
+            json={"content_direction": "media"},
+        )
+        self.assertEqual(overridden.status_code, 200)
+        cleared = self.client.patch(
+            f"/api/v8/contents/{self.content_id}",
+            json={"content_direction": "unknown"},
+        )
+        self.assertEqual(cleared.status_code, 200)
+        with connect(self.db) as connection:
+            manual_direction = connection.execute(
+                "SELECT manual_content_direction FROM content_items WHERE id=?",
+                (self.content_id,),
+            ).fetchone()[0]
+        self.assertIsNone(manual_direction)
+
     def test_content_validate_import_search_and_export(self) -> None:
         invalid = self.client.post(
             "/api/v8/contents/validate",
-            json={"source_name": "input.csv", "rows": [{"platform": "douyin", "canonical_url": "https://v.douyin.com/abc"}]},
+            json={
+                "source_name": "input.csv",
+                "rows": [
+                    {"platform": "douyin", "canonical_url": "https://v.douyin.com/abc"}
+                ],
+            },
         )
         self.assertEqual(invalid.status_code, 200)
         self.assertEqual(invalid.json()["rejected"], 1)
@@ -794,11 +2127,15 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
             "/api/v8/contents/import",
             json={
                 "source_name": "input.csv",
-                "rows": [{
-                    "platform": "douyin", "canonical_url": "https://www.douyin.com/video/999999999",
-                    "title": "导入的汽车内容", "body": "导入的汽车内容完整正文",
-                    "published_at": "2026-07-03T08:00:00+08:00",
-                }],
+                "rows": [
+                    {
+                        "platform": "douyin",
+                        "canonical_url": "https://www.douyin.com/video/999999999",
+                        "title": "导入的汽车内容",
+                        "body": "导入的汽车内容完整正文",
+                        "published_at": "2026-07-03T08:00:00+08:00",
+                    }
+                ],
             },
         )
         self.assertEqual(imported.status_code, 200)
@@ -810,19 +2147,105 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         self.assertEqual(searched.json()["total"], 1)
         exported = self.client.get("/api/v8/contents/export")
         self.assertEqual(exported.status_code, 200)
-        self.assertIn("999999999", exported.content.decode("utf-8-sig"))
+        export_text = exported.content.decode("utf-8-sig")
+        self.assertIn("999999999", export_text)
+        self.assertIn("evaluation_freshness", export_text.splitlines()[0])
 
     def test_update_data_route_returns_provider_execution_result(self) -> None:
         expected = {
-            "content_id": self.content_id, "status": "succeeded", "stages": [],
-            "evaluation_id": 1, "evaluation_created": False,
-            "provider_cost": 0.001, "currency": "USD",
+            "content_id": self.content_id,
+            "status": "succeeded",
+            "stages": [],
+            "evaluation_id": 1,
+            "evaluation_created": False,
+            "provider_cost": 0.001,
+            "currency": "USD",
         }
-        with patch.object(api_module, "update_content_data", return_value=expected) as mocked:
-            response = self.client.post(f"/api/v8/contents/{self.content_id}/update-data")
+        with patch.object(
+            api_module, "update_content_data", return_value=expected
+        ) as mocked:
+            response = self.client.post(
+                f"/api/v8/contents/{self.content_id}/update-data"
+            )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), expected)
         mocked.assert_called_once_with(self.content_id, db_path=self.db)
+
+
+class V8MediaRecoveryApiTest(unittest.TestCase):
+    def setUp(self) -> None:
+        (PROJECT_ROOT / "tmp").mkdir(exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(dir=PROJECT_ROOT / "tmp")
+        self.db = Path(self.temp.name) / "recovery.sqlite3"
+        self.config = _test_config(Path(self.temp.name), db_name="recovery.sqlite3")
+        self.assertEqual(self.config.db_path, self.db)
+        with connect(self.db) as connection:
+            initialize_database(connection)
+            created_at = now_utc()
+            content = connection.execute(
+                """
+                INSERT INTO content_items(
+                    link_id,platform,platform_content_id,canonical_url,title,
+                    content_type,imported_at,created_at,updated_at
+                ) VALUES ('R2CV3Y','douyin','recovery-content',
+                          'https://www.douyin.com/video/recovery-content',
+                          '恢复测试','video',?,?,?)
+                """,
+                (created_at, created_at, created_at),
+            )
+            content_id = int(content.lastrowid)
+            connection.executemany(
+                """
+                INSERT INTO media_processing_slots(
+                    content_id,source_sha256,processor_type,processor_version,
+                    status,attempt_count,created_at,updated_at
+                ) VALUES (?,?,'frames',?,'running',2,?,?)
+                """,
+                [
+                    (
+                        content_id,
+                        "s" * 64,
+                        "stale-frames",
+                        "2000-01-01T00:00:00Z",
+                        "2000-01-01T00:00:00Z",
+                    ),
+                    (
+                        content_id,
+                        "n" * 64,
+                        "fresh-frames",
+                        created_at,
+                        created_at,
+                    ),
+                ],
+            )
+            connection.commit()
+        self.app = api_module.create_app(self.config)
+        self.client_context = TestClient(self.app)
+        self.client = self.client_context.__enter__()
+
+    def tearDown(self) -> None:
+        self.client_context.__exit__(None, None, None)
+        self.temp.cleanup()
+
+    def test_startup_recovers_only_stale_media_slots_and_reports_result(self) -> None:
+        recovery = self.app.state.recovered_media_slots
+        self.assertEqual(recovery["stale_candidates"], 1)
+        self.assertEqual(recovery["recovered"], 1)
+        self.assertEqual(recovery["retryable_failed"], 1)
+        self.assertEqual(recovery["terminal_failed"], 0)
+        with connect(self.db) as connection:
+            statuses = {
+                row["processor_version"]: row["status"]
+                for row in connection.execute(
+                    "SELECT processor_version,status FROM media_processing_slots"
+                )
+            }
+        self.assertEqual(statuses["stale-frames"], "retryable_failed")
+        self.assertEqual(statuses["fresh-frames"], "running")
+
+        response = self.client.get("/api/v8/scheduler")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["media_slot_recovery"], recovery)
 
 
 if __name__ == "__main__":

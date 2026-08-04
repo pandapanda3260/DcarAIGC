@@ -8,7 +8,6 @@ import json
 import re
 import sqlite3
 import sys
-import threading
 import uuid
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -33,7 +32,6 @@ from workflow.reporting import (  # noqa: E402
 from workflow.storage import migrate  # noqa: E402
 from workflow.tasks import (  # noqa: E402
     CURRENT_REPORT_VERSION,
-    CURRENT_RULE_VERSION,
     RunContext,
     TaskManager,
     promote_formal_baseline,

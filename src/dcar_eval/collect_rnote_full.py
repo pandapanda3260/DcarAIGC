@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect the frozen 338-note Xiaohongshu corpus with terminal-cache reuse."""
+"""Read historical Rnote cache state; active network collection is retired."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from collect_rnote_pilot import (
     FatalProviderError,
     RequestBudget,
     RnoteClient,
+    RNOTE_RETIRED_MESSAGE,
     load_key,
     process_one,
     utc_now,
@@ -101,6 +102,10 @@ def load_cached_public_types(cache_dir: Path) -> dict[str, str]:
 
 
 def collect_all(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    raise CollectorError(RNOTE_RETIRED_MESSAGE)
+
+    # Historical full-corpus workflow retained for cache-schema compatibility.
+    # The guard above executes before input, credential, or network access.
     rows = read_input(args.input)
     store = CacheStore(args.cache_dir)
     client = RnoteClient(

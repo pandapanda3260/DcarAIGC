@@ -19,7 +19,6 @@ from typing import Any, Mapping
 from collect_rnote_pilot import (
     CACHE_SCHEMA,
     CacheStore,
-    atomic_write_text,
     read_csv,
     read_json,
     safe_int,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect and cache Rnote content/comments for the three-proposition pilot.
+"""Historical Rnote pilot cache/parser; active network collection is retired.
 
 The cache is deliberately provider-independent and privacy-minimised:
 
@@ -9,6 +9,8 @@ The cache is deliberately provider-independent and privacy-minimised:
   spend API balance again.
 * The 5+5 base sample is preserved.  Notes below the 20-user gate consume the
   existing same-stratum replacement queue in its frozen order.
+
+Any active collection entry point fails closed with ``Rnote retired; use TikHub``.
 """
 
 from __future__ import annotations
@@ -49,6 +51,7 @@ KEY_ROOT = Path("/Users/mark/Documents/key/DcarKey")
 API_BASE = "https://rnote.dev/api/v2/crawler/note"
 CACHE_SCHEMA = "rnote-cache-v1.0"
 COLLECTOR_VERSION = "rnote-pilot-collector-v1.0"
+RNOTE_RETIRED_MESSAGE = "Rnote retired; use TikHub"
 MIN_VALID_COMMENTERS = 20
 TERMINAL_STOP_REASONS = {
     "target_valid_users",
@@ -269,6 +272,10 @@ class RnoteClient:
         return f"HTTP {status}"
 
     def get(self, endpoint: str, params: Mapping[str, Any]) -> ApiResult:
+        raise CollectorError(RNOTE_RETIRED_MESSAGE)
+
+        # Historical request implementation retained for audit/reference only.
+        # The unconditional guard above prevents budget consumption and I/O.
         safe_endpoint = endpoint.rsplit("/", 1)[-1]
         last_error: Exception | None = None
         for attempt in range(self.retries + 1):
@@ -1200,6 +1207,10 @@ def process_one(
 
 
 def run_pilot(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    raise CollectorError(RNOTE_RETIRED_MESSAGE)
+
+    # Historical collection workflow retained for cache-schema compatibility.
+    # The guard above executes before source, credential, or network access.
     base_rows = build_base_rows(args.base_input, args.base_labels)
     replacement_rows = build_replacement_rows(args.replacements, args.replacement_labels)
     store = CacheStore(args.cache_dir)

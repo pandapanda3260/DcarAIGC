@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import tomllib
 import unittest
 from pathlib import Path
 
 from v8.contracts import (
+    CURRENT_REPORT_RULE_VERSION,
     CURRENT_REPORT_VERSION,
     V8ContractViolation,
     expected_terminal_task_status,
@@ -18,8 +20,8 @@ def valid_report() -> dict:
     publications = 10
     return {
         "report_version": CURRENT_REPORT_VERSION,
-        "rule_version": "evaluation-v6",
-        "taxonomy_version": "selling-points-v5.0",
+        "rule_version": CURRENT_REPORT_RULE_VERSION,
+        "taxonomy_version": "selling-points-v5.1",
         "evidence_version": "evidence-v1",
         "metadata": {
             "task_id": "task-test",
@@ -43,16 +45,48 @@ def valid_report() -> dict:
             "weekly_comment_coverage": 90.0,
         },
         "summary_metrics": {
-            "publication_count": quantity_metric(10, unit="content", status="available"),
-            "active_account_count": quantity_metric(3, unit="account", status="available"),
-            "view_count": quantity_metric(1000, unit="view", status="available", coverage_percentage=90),
-            "comment_count": quantity_metric(20, unit="comment", status="sample_only", coverage_percentage=50),
-            "verticality_rate": ratio_metric(7, publications, status="available", eligible_count=8, coverage_percentage=80),
-            "selling_point_coverage_rate": ratio_metric(4, publications, status="available", eligible_count=8, coverage_percentage=80),
-            "duplicate_rate": ratio_metric(2, publications, status="available", eligible_count=10, coverage_percentage=100),
-            "estimated_new_users": quantity_metric(None, unit="person", status="not_calculable", reason="model unavailable"),
-            "estimated_reactivated_users": quantity_metric(None, unit="person", status="not_calculable", reason="model unavailable"),
-            "estimated_leads": quantity_metric(None, unit="lead", status="not_calculable", reason="model unavailable"),
+            "publication_count": quantity_metric(
+                10, unit="content", status="available"
+            ),
+            "active_account_count": quantity_metric(
+                3, unit="account", status="available"
+            ),
+            "view_count": quantity_metric(
+                1000, unit="view", status="available", coverage_percentage=90
+            ),
+            "comment_count": quantity_metric(
+                20, unit="comment", status="sample_only", coverage_percentage=50
+            ),
+            "verticality_rate": ratio_metric(
+                7,
+                publications,
+                status="available",
+                eligible_count=8,
+                coverage_percentage=80,
+            ),
+            "selling_point_coverage_rate": ratio_metric(
+                4,
+                publications,
+                status="available",
+                eligible_count=8,
+                coverage_percentage=80,
+            ),
+            "duplicate_rate": ratio_metric(
+                2,
+                publications,
+                status="available",
+                eligible_count=10,
+                coverage_percentage=100,
+            ),
+            "estimated_new_users": quantity_metric(
+                None, unit="person", status="not_calculable", reason="model unavailable"
+            ),
+            "estimated_reactivated_users": quantity_metric(
+                None, unit="person", status="not_calculable", reason="model unavailable"
+            ),
+            "estimated_leads": quantity_metric(
+                None, unit="lead", status="not_calculable", reason="model unavailable"
+            ),
         },
         "platform_dimensions": [],
         "account_type_dimensions": [],
@@ -70,10 +104,34 @@ def valid_report() -> dict:
 class V8ContractTest(unittest.TestCase):
     def test_project_metadata_matches_runtime_report_version(self) -> None:
         project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
-        self.assertEqual(project["tool"]["dcar"]["report-version"], CURRENT_REPORT_VERSION)
+        self.assertEqual(
+            project["tool"]["dcar"]["report-version"], CURRENT_REPORT_VERSION
+        )
+        self.assertEqual(
+            json.loads(
+                Path("config/report_contract_v8.json").read_text(encoding="utf-8")
+            )["rule_version"],
+            CURRENT_REPORT_RULE_VERSION,
+        )
 
     def test_valid_operational_report_passes(self) -> None:
         validate_report(valid_report())
+
+    def test_frozen_v8_2_report_remains_valid_but_versions_cannot_cross(self) -> None:
+        historical = valid_report()
+        historical["report_version"] = "dcar-content-operations-report-v8.2"
+        historical["rule_version"] = "evaluation-v6"
+        validate_report(historical)
+
+        historical["rule_version"] = "evaluation-v7"
+        with self.assertRaisesRegex(V8ContractViolation, "rule_version"):
+            validate_report(historical)
+
+        for legacy_rule in ("evaluation-v6", "evaluation-v7"):
+            current = valid_report()
+            current["rule_version"] = legacy_rule
+            with self.assertRaisesRegex(V8ContractViolation, "rule_version"):
+                validate_report(current)
 
     def test_v7_report_is_not_accepted_as_v8(self) -> None:
         report = valid_report()
@@ -104,7 +162,9 @@ class V8ContractTest(unittest.TestCase):
     def test_required_coverage_controls_terminal_task_status(self) -> None:
         report = valid_report()
         report["data_quality"]["evaluation_coverage"] = 94.99
-        self.assertEqual(expected_terminal_task_status(report["data_quality"]), "partial")
+        self.assertEqual(
+            expected_terminal_task_status(report["data_quality"]), "partial"
+        )
         with self.assertRaisesRegex(V8ContractViolation, "task_status must be partial"):
             validate_report(report)
         report["task"]["task_status"] = "partial"

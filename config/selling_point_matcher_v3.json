@@ -1,0 +1,2861 @@
+{
+  "dsl_version": 1,
+  "engine_version": "matcher-dsl-engine-v1",
+  "legacy_matcher_sha256": "38f647e9b05e38777bbe4727b5c563b67c61e28854d8b37027af8119023eefdc",
+  "normalization": {
+    "ordered_replacements": [
+      [
+        "总车帝",
+        "懂车帝"
+      ],
+      [
+        "董车帝",
+        "懂车帝"
+      ],
+      [
+        "懂车弟",
+        "懂车帝"
+      ],
+      [
+        "懂车地",
+        "懂车帝"
+      ],
+      [
+        "总车递",
+        "懂车帝"
+      ],
+      [
+        "总车第一",
+        "懂车帝"
+      ],
+      [
+        "懂车第一",
+        "懂车帝"
+      ],
+      [
+        "等车帝",
+        "懂车帝"
+      ],
+      [
+        "懂事得",
+        "懂车帝"
+      ],
+      [
+        "董车弟",
+        "懂车帝"
+      ],
+      [
+        "懂车递",
+        "懂车帝"
+      ],
+      [
+        "堵车币",
+        "懂车帝"
+      ],
+      [
+        "小东",
+        "小懂"
+      ],
+      [
+        "ai 小懂",
+        "AI小懂"
+      ],
+      [
+        "ai小懂",
+        "AI小懂"
+      ]
+    ]
+  },
+  "views": {
+    "raw_desc": {
+      "op": "source",
+      "source": "row.desc"
+    },
+    "desc": {
+      "op": "source",
+      "source": "row.desc",
+      "transforms": [
+        "strip_hashtags",
+        "canonical"
+      ]
+    },
+    "full_desc": {
+      "op": "source",
+      "source": "row.desc",
+      "transforms": [
+        "canonical"
+      ]
+    },
+    "asr": {
+      "op": "source",
+      "source": "transcript.text",
+      "transforms": [
+        "canonical"
+      ]
+    },
+    "ocr": {
+      "op": "source",
+      "source": "ocr.combined_text",
+      "transforms": [
+        "canonical"
+      ]
+    },
+    "visual": {
+      "op": "source",
+      "source": "visual.summary",
+      "transforms": [
+        "canonical"
+      ]
+    },
+    "video_text": {
+      "op": "concat",
+      "views": [
+        "asr",
+        "ocr",
+        "visual"
+      ],
+      "separator": "\n"
+    },
+    "combined": {
+      "op": "concat",
+      "views": [
+        "video_text",
+        "desc"
+      ],
+      "separator": "\n"
+    },
+    "video_narrative": {
+      "op": "concat",
+      "views": [
+        "asr",
+        "visual",
+        "desc"
+      ],
+      "separator": "\n"
+    },
+    "used_basis": {
+      "op": "select",
+      "when": {
+        "op": "ref",
+        "name": "is_image_post"
+      },
+      "then": "combined",
+      "else": "video_narrative"
+    },
+    "comparison_basis": {
+      "op": "select",
+      "when": {
+        "op": "ref",
+        "name": "is_image_post"
+      },
+      "then": "combined",
+      "else": "video_narrative"
+    },
+    "x2_narrative": {
+      "op": "concat",
+      "views": [
+        "asr",
+        "visual",
+        "desc"
+      ],
+      "separator": "\n"
+    },
+    "c3_actual": {
+      "op": "concat",
+      "views": [
+        "asr",
+        "visual"
+      ],
+      "separator": "\n"
+    },
+    "story_model_task": {
+      "op": "select",
+      "when": {
+        "op": "ref",
+        "name": "is_image_post"
+      },
+      "then": "combined",
+      "else": "c3_actual"
+    }
+  },
+  "term_sets": {
+    "dcar_explicit": [
+      "懂车帝",
+      "DCar",
+      "AI小懂"
+    ],
+    "dcar_brand": [
+      "懂车帝",
+      "DCar"
+    ],
+    "ai_guard": [
+      "AI小懂",
+      "小懂助手"
+    ],
+    "used_narrative": [
+      "二手车",
+      "二手行情",
+      "二手平台",
+      "二手车源",
+      "买二手",
+      "卖二手"
+    ],
+    "new_car_narrative": [
+      "新车",
+      "一手车",
+      "一手新车",
+      "全新车"
+    ],
+    "used_support": [
+      "车况",
+      "里程",
+      "过户",
+      "车源",
+      "检测报告",
+      "验车",
+      "二手行情",
+      "二手平台",
+      "估价"
+    ],
+    "strong_used_listing": [
+      "同一车源",
+      "表显里程",
+      "上牌时间",
+      "免费估价",
+      "车况报告",
+      "二手行情"
+    ],
+    "used_desc_marker": [
+      "二手车"
+    ],
+    "M1_when": [
+      "预约试驾",
+      "试驾指南",
+      "试驾清单"
+    ],
+    "M1_evidence": [
+      "AI小懂",
+      "预约试驾",
+      "试驾指南"
+    ],
+    "M2_when": [
+      "库存",
+      "现车",
+      "展车",
+      "试驾车",
+      "真实优惠"
+    ],
+    "M2_evidence": [
+      "AI小懂",
+      "库存",
+      "现车",
+      "真实优惠"
+    ],
+    "M3_when": [
+      "洗车",
+      "维修保养",
+      "保养预约",
+      "车档案",
+      "用车账本"
+    ],
+    "M3_evidence": [
+      "AI小懂",
+      "洗车",
+      "维修保养",
+      "车档案"
+    ],
+    "M4_when": [
+      "选车",
+      "推荐",
+      "怎么选",
+      "对比"
+    ],
+    "M4_evidence": [
+      "AI小懂",
+      "选车",
+      "推荐",
+      "对比"
+    ],
+    "M5_when": [
+      "故障",
+      "报警灯",
+      "异响",
+      "安全处置"
+    ],
+    "M5_evidence": [
+      "AI小懂",
+      "故障",
+      "报警灯",
+      "异响"
+    ],
+    "M6_when": [
+      "估价",
+      "卖车"
+    ],
+    "M6_evidence": [
+      "AI小懂",
+      "估价",
+      "卖车"
+    ],
+    "E1_when": [
+      "收车",
+      "上门评估",
+      "高价卖车",
+      "卖车到账",
+      "专业收车"
+    ],
+    "E1_evidence": [
+      "收车",
+      "上门评估",
+      "卖车到账",
+      "专业收车"
+    ],
+    "E2_when": [
+      "认证车源",
+      "个人车源",
+      "商家车源",
+      "透明车况",
+      "平台保障",
+      "选车估价验车"
+    ],
+    "E2_evidence": [
+      "认证车源",
+      "个人车源",
+      "透明车况",
+      "平台保障",
+      "选车估价验车"
+    ],
+    "E5_when": [
+      "检测报告",
+      "车辆档案",
+      "车况报告",
+      "懂车帝检测",
+      "专业验车"
+    ],
+    "E5_evidence": [
+      "检测报告",
+      "车辆档案",
+      "车况报告",
+      "专业验车"
+    ],
+    "E6_terms": [
+      "估价",
+      "保值率",
+      "成交行情",
+      "市场行情",
+      "历史价格",
+      "同一车源不同价格"
+    ],
+    "E7_terms": [
+      "过户",
+      "交易合同",
+      "交易流程",
+      "权益保障"
+    ],
+    "used_budget_patterns": [
+      "预算.{0,10}(?:\\d+(?:\\.\\d+)?万|[一二三四五六七八九十两]+万)",
+      "\\d+(?:\\.\\d+)?万以内",
+      "\\d+(?:\\.\\d+)?(?:[-—到至]\\d+(?:\\.\\d+)?)?万.{0,8}预算"
+    ],
+    "used_recommendation": [
+      "车型推荐",
+      "推荐车型",
+      "值得买",
+      "怎么选",
+      "如何选",
+      "首选",
+      "性价比二手车"
+    ],
+    "used_scene": [
+      "新手",
+      "家庭",
+      "家用",
+      "女生",
+      "通勤",
+      "代步",
+      "宝妈"
+    ],
+    "E3_E4_evidence": [
+      "预算",
+      "万以内",
+      "怎么选",
+      "推荐",
+      "新手",
+      "家用"
+    ],
+    "compare_terms": [
+      "全面对比",
+      "横向对比",
+      "同级对比",
+      "二选一",
+      "选哪个",
+      "vs",
+      "PK"
+    ],
+    "comparison_dimensions": [
+      "空间",
+      "动力",
+      "配置",
+      "油耗",
+      "续航",
+      "价格",
+      "舒适",
+      "操控",
+      "安全",
+      "成本",
+      "智能"
+    ],
+    "car_brands": [
+      "奔驰",
+      "宝马",
+      "奥迪",
+      "大众",
+      "丰田",
+      "本田",
+      "日产",
+      "别克",
+      "福特",
+      "现代",
+      "起亚",
+      "沃尔沃",
+      "凯迪拉克",
+      "雷克萨斯",
+      "保时捷",
+      "路虎",
+      "捷豹",
+      "特斯拉",
+      "比亚迪",
+      "吉利",
+      "领克",
+      "极氪",
+      "长安",
+      "奇瑞",
+      "捷途",
+      "哈弗",
+      "坦克",
+      "小鹏",
+      "理想",
+      "蔚来",
+      "零跑",
+      "鸿蒙智行",
+      "问界",
+      "智界",
+      "享界",
+      "尊界",
+      "小米",
+      "五菱",
+      "红旗",
+      "广汽传祺",
+      "腾势",
+      "岚图",
+      "阿维塔",
+      "深蓝",
+      "荣威",
+      "名爵",
+      "马自达",
+      "斯巴鲁",
+      "雪佛兰",
+      "标致",
+      "雪铁龙"
+    ],
+    "two_candidates": [
+      "两款车",
+      "两台车",
+      "这两款",
+      "这两台",
+      "同级车型",
+      "同级竞品",
+      "二选一",
+      "选哪个",
+      "对手"
+    ],
+    "X1_evidence": [
+      "全面对比",
+      "横向对比",
+      "同级对比",
+      "二选一",
+      "选哪个",
+      "vs",
+      "PK",
+      "空间",
+      "动力",
+      "配置",
+      "油耗",
+      "续航",
+      "价格",
+      "舒适",
+      "操控",
+      "安全",
+      "成本",
+      "智能"
+    ],
+    "x2_strong": [
+      "懂车帝实测",
+      "实测榜",
+      "权威测评",
+      "车主口碑",
+      "车主评价",
+      "长期测评"
+    ],
+    "x2_score": [
+      "懂车分"
+    ],
+    "sales_topic": [
+      "销量",
+      "销量榜",
+      "销量排行",
+      "卖不动",
+      "月销"
+    ],
+    "X2_evidence": [
+      "懂车帝实测",
+      "实测榜",
+      "权威测评",
+      "车主口碑",
+      "车主评价",
+      "懂车分"
+    ],
+    "price_values": [
+      "\\d+(?:\\.\\d+)?万(?!公里|千米|km)|\\d{1,3}(?:[,，]\\d{3})+|[一二三四五六七八九十两]+万[一二三四五六七八九十百千]*|\\d+(?:\\.\\d+)?[wW]|\\d{4,7}(?:元|块钱)|(?<!\\d)\\d{5,6}(?!\\d|公里|千米|km)"
+    ],
+    "price_specific_cues": [
+      "最新价",
+      "一口价",
+      "指导价",
+      "售价",
+      "裸车价",
+      "落地价",
+      "渠道价",
+      "降到",
+      "降至",
+      "跌到",
+      "杀到",
+      "干到",
+      "砸到",
+      "低至",
+      "优惠后",
+      "优惠完",
+      "起售价",
+      "价格来到",
+      "价格是",
+      "价格为",
+      "价格直接",
+      "万起",
+      "元起",
+      "起步"
+    ],
+    "price_generic_cues": [
+      "现在",
+      "现价",
+      "只要",
+      "仅售"
+    ],
+    "price_auto_markers": [
+      "车型",
+      "车价",
+      "买车",
+      "提车",
+      "开走",
+      "车主",
+      "新车",
+      "款",
+      "版",
+      "奔驰",
+      "宝马",
+      "奥迪",
+      "大众",
+      "丰田",
+      "本田",
+      "日产",
+      "别克",
+      "福特",
+      "现代",
+      "起亚",
+      "沃尔沃",
+      "凯迪拉克",
+      "特斯拉",
+      "比亚迪",
+      "吉利",
+      "领克",
+      "极氪",
+      "长安",
+      "奇瑞",
+      "捷途",
+      "哈弗",
+      "坦克",
+      "小鹏",
+      "理想",
+      "蔚来",
+      "零跑",
+      "问界",
+      "小米",
+      "五菱",
+      "红旗",
+      "速腾",
+      "桑塔纳",
+      "轩逸",
+      "凯美瑞",
+      "雅阁",
+      "迈腾",
+      "高尔夫",
+      "思域",
+      "model"
+    ],
+    "price_bare_auto_markers": [
+      "车型",
+      "车价",
+      "新车",
+      "奔驰",
+      "宝马",
+      "奥迪",
+      "大众",
+      "丰田",
+      "本田",
+      "日产",
+      "别克",
+      "福特",
+      "现代",
+      "起亚",
+      "沃尔沃",
+      "凯迪拉克",
+      "特斯拉",
+      "比亚迪",
+      "吉利",
+      "领克",
+      "极氪",
+      "长安",
+      "奇瑞",
+      "捷途",
+      "哈弗",
+      "坦克",
+      "小鹏",
+      "理想",
+      "蔚来",
+      "零跑",
+      "问界",
+      "小米",
+      "五菱",
+      "红旗",
+      "速腾",
+      "桑塔纳",
+      "轩逸",
+      "凯美瑞",
+      "雅阁",
+      "迈腾",
+      "高尔夫",
+      "思域",
+      "model"
+    ],
+    "price_non_vehicle": [
+      "奖金",
+      "借钱",
+      "贷款",
+      "维修费",
+      "保养费",
+      "停车费",
+      "收入",
+      "工资",
+      "成本",
+      "一套",
+      "公里"
+    ],
+    "price_historical": [
+      "当年",
+      "以前",
+      "曾经",
+      "那年",
+      "早年",
+      "原来花",
+      "之前花"
+    ],
+    "price_current_before": [
+      "现在",
+      "现价",
+      "一口价",
+      "指导价",
+      "售价",
+      "只要",
+      "降到",
+      "降至",
+      "低至",
+      "渠道价"
+    ],
+    "price_speculative": [
+      "据说",
+      "预计",
+      "预测",
+      "可能",
+      "估计",
+      "网传",
+      "传闻",
+      "即将",
+      "有望",
+      "或将",
+      "听说",
+      "概念车",
+      "渲染图"
+    ],
+    "price_verified": [
+      "指导价",
+      "渠道价",
+      "一口价",
+      "裸车价",
+      "落地价",
+      "优惠后",
+      "优惠完",
+      "懂车帝降价榜",
+      "实时查看降价"
+    ],
+    "quote_capability": [
+      "查看当地经销商报价",
+      "查询经销商报价",
+      "查看最新报价",
+      "查询最新报价",
+      "对比价格",
+      "查询底价",
+      "查询真实成交价",
+      "查真实成交价"
+    ],
+    "new_car_context": [
+      "新车",
+      "全新",
+      "指导价",
+      "经销商",
+      "现车",
+      "裸车价",
+      "新车价格"
+    ],
+    "X3_evidence": [
+      "价格",
+      "现价",
+      "降价",
+      "直降",
+      "优惠",
+      "一口价",
+      "落地价",
+      "裸车价",
+      "现车",
+      "售价",
+      "只要",
+      "免息"
+    ],
+    "x4_explicit_selection": [
+      "买什么车",
+      "配什么车",
+      "该配什么车",
+      "车型推荐",
+      "推荐车型",
+      "怎么选车",
+      "如何选车",
+      "车怎么选",
+      "车型怎么选",
+      "买车怎么选"
+    ],
+    "x4_first_car": [
+      "第一辆车"
+    ],
+    "x4_first_actions": [
+      "买",
+      "选",
+      "推荐"
+    ],
+    "x4_budget": [
+      "预算"
+    ],
+    "x4_budget_actions": [
+      "选车",
+      "推荐",
+      "车型",
+      "买车"
+    ],
+    "x4_scene": [
+      "新手",
+      "女生",
+      "家庭",
+      "家用",
+      "通勤",
+      "代步",
+      "年轻人",
+      "第一辆车",
+      "工资",
+      "月薪",
+      "收入"
+    ],
+    "x4_scene_actions": [
+      "适合",
+      "推荐",
+      "选车",
+      "买什么车",
+      "怎么选车",
+      "如何选车"
+    ],
+    "X4_evidence": [
+      "预算",
+      "选车",
+      "怎么选",
+      "如何选",
+      "车型推荐",
+      "推荐车型",
+      "适合",
+      "新手",
+      "家用",
+      "买什么车",
+      "配什么车",
+      "工资",
+      "月薪",
+      "收入"
+    ],
+    "X5_terms": [
+      "版本对比",
+      "配置对比",
+      "高低配",
+      "哪个版本",
+      "选装包",
+      "配置差异"
+    ],
+    "X6_cost": [
+      "养车成本",
+      "用车成本",
+      "一年要花",
+      "月供",
+      "贷款方案",
+      "保险油费",
+      "每公里成本",
+      "保养成本",
+      "维修费用",
+      "保险费用",
+      "能耗成本"
+    ],
+    "X6_support": [
+      "一年要花",
+      "每公里",
+      "每月",
+      "每年",
+      "算下来",
+      "合计",
+      "总成本"
+    ],
+    "X6_categories": [
+      "保养",
+      "维修",
+      "保险",
+      "油费",
+      "电费",
+      "月供",
+      "贷款",
+      "折旧",
+      "保值"
+    ],
+    "X7_risk": [
+      "减配",
+      "虚标",
+      "营销话术",
+      "智商税",
+      "配置骗局",
+      "参数骗局"
+    ],
+    "X7_validation": [
+      "拆解",
+      "验证",
+      "实测",
+      "测试数据",
+      "数据对比",
+      "实验",
+      "测出来"
+    ],
+    "X7_evidence": [
+      "减配",
+      "虚标",
+      "营销话术",
+      "智商税",
+      "配置骗局",
+      "参数骗局",
+      "拆解",
+      "验证",
+      "实测",
+      "测试数据",
+      "数据对比",
+      "实验",
+      "测出来"
+    ],
+    "X8_terms": [
+      "购车合同",
+      "交定金",
+      "退定金",
+      "交付权益",
+      "购车权益",
+      "提车周期",
+      "选配合同"
+    ],
+    "X8_strong": [
+      "购车合同",
+      "退定金",
+      "交付权益",
+      "购车权益",
+      "选配合同"
+    ],
+    "X8_instruction": [
+      "注意",
+      "检查",
+      "看清",
+      "流程",
+      "避坑",
+      "怎么",
+      "如何",
+      "不要",
+      "必须",
+      "签订",
+      "条款"
+    ],
+    "X8_evidence": [
+      "购车合同",
+      "交定金",
+      "退定金",
+      "交付权益",
+      "购车权益",
+      "提车周期",
+      "选配合同",
+      "注意",
+      "检查",
+      "看清",
+      "流程",
+      "避坑",
+      "怎么",
+      "如何",
+      "不要",
+      "必须",
+      "签订",
+      "条款"
+    ],
+    "c3_campaign": [
+      "玩车社区",
+      "趣玩车社区",
+      "主题改装大赛",
+      "电车还能这么玩",
+      "改装玩家",
+      "上传你的改装作品"
+    ],
+    "c3_dcar_exact": [
+      "懂车帝玩车社区",
+      "懂车帝趣玩车社区",
+      "懂车帝车友圈"
+    ],
+    "c3_community": [
+      "车友社区",
+      "车友圈",
+      "改装交流",
+      "车友分享"
+    ],
+    "c3_engagement": [
+      "交流",
+      "分享",
+      "改装",
+      "帖子",
+      "车友",
+      "社区"
+    ],
+    "C3_evidence": [
+      "懂车帝玩车社区",
+      "懂车帝趣玩车社区",
+      "懂车帝车友圈",
+      "玩车社区",
+      "主题改装大赛",
+      "电车还能这么玩",
+      "车友社区",
+      "车友圈"
+    ],
+    "c4_speculative": [
+      "概念车",
+      "如果把",
+      "假如",
+      "AI设计",
+      "脑洞",
+      "想象",
+      "机甲",
+      "末日"
+    ],
+    "c4_factual": [
+      "正式上市",
+      "正式发布",
+      "官图",
+      "预售",
+      "申报图",
+      "新车发布",
+      "销量榜",
+      "销量排行",
+      "新款发布",
+      "发布会"
+    ],
+    "C4_evidence": [
+      "正式上市",
+      "正式发布",
+      "官图",
+      "预售",
+      "申报图",
+      "销量榜",
+      "新款发布",
+      "发布会"
+    ],
+    "c4_used_scene": [
+      "二手车市场",
+      "二手行情",
+      "二手车销量"
+    ],
+    "c4_new_scene": [
+      "新车",
+      "车型",
+      "汽车行业",
+      "车企",
+      "正式上市",
+      "官图",
+      "预售",
+      "申报图",
+      "销量",
+      "新款发布",
+      "发布会"
+    ],
+    "C1_knowledge": [
+      "保养",
+      "维修",
+      "故障",
+      "发动机",
+      "变速箱",
+      "轮胎",
+      "刹车",
+      "玻璃水",
+      "机油",
+      "冷却液",
+      "防冻液",
+      "底盘",
+      "安全驾驶",
+      "用车技巧",
+      "驾驶技巧",
+      "避坑",
+      "事故车",
+      "泡水车",
+      "火烧车",
+      "调表车",
+      "如何判断",
+      "电池",
+      "油门",
+      "空调",
+      "滤芯",
+      "手刹",
+      "充气泵",
+      "灭火器",
+      "汽车落水",
+      "门把手",
+      "充电桩",
+      "差速器",
+      "火花塞",
+      "油泵",
+      "换挡",
+      "爆胎",
+      "仪表盘",
+      "故障灯",
+      "二手车平台",
+      "买二手车",
+      "买车流程",
+      "汽油",
+      "燃油标号",
+      "加错油",
+      "92号",
+      "95号",
+      "98号",
+      "快充",
+      "充电枪",
+      "油表",
+      "油箱",
+      "燃油泵",
+      "搭电线",
+      "拖车绳",
+      "安全锤",
+      "隐藏把手",
+      "机械把手",
+      "电动把手",
+      "车门限位器",
+      "安全带导向环",
+      "调表车",
+      "雨刮",
+      "雨刮片",
+      "暴雨",
+      "车机",
+      "OTA",
+      "起动机",
+      "启动电机",
+      "喷油嘴",
+      "高压泵",
+      "低压泵",
+      "油路",
+      "油温",
+      "刹车灯",
+      "手动挡",
+      "离合",
+      "车钥匙",
+      "织物座椅",
+      "真皮座椅",
+      "硅胶管",
+      "编织管",
+      "机械锁扣",
+      "智能感应",
+      "电子手刹",
+      "悬挂",
+      "空气悬架",
+      "螺旋弹簧",
+      "车载大屏",
+      "智能大屏",
+      "手机支架"
+    ],
+    "C1_instruction": [
+      "怎么",
+      "如何",
+      "为什么",
+      "原理",
+      "教你",
+      "讲清楚",
+      "区别",
+      "注意",
+      "记住",
+      "判断",
+      "检查",
+      "作用",
+      "千万别",
+      "不要",
+      "正确",
+      "误区",
+      "步骤",
+      "方法",
+      "先看",
+      "再看",
+      "一定要",
+      "vs",
+      "对比"
+    ],
+    "story_terms": [
+      "人生副本",
+      "小时候",
+      "父亲",
+      "爸爸",
+      "妈妈",
+      "老公",
+      "婚姻",
+      "前女友",
+      "成长",
+      "体面",
+      "家里",
+      "家庭",
+      "那年",
+      "回忆",
+      "眼泪",
+      "治愈",
+      "情感",
+      "情感故事",
+      "女性视角",
+      "童年",
+      "剧情",
+      "短片"
+    ],
+    "C1_tutorial": [
+      "记住",
+      "注意",
+      "教你",
+      "步骤",
+      "方法",
+      "指南",
+      "避坑",
+      "正确操作",
+      "千万别",
+      "必须",
+      "一定要",
+      "如何判断"
+    ],
+    "C1_platform_task": [
+      "查询",
+      "查过",
+      "检测",
+      "报告",
+      "车况",
+      "数据",
+      "功能",
+      "攻略",
+      "技巧"
+    ],
+    "c1_used_scene": [
+      "二手车",
+      "二手行情",
+      "二手车源",
+      "收车",
+      "卖车",
+      "车况报告",
+      "检测报告",
+      "事故车",
+      "泡水车",
+      "火烧车",
+      "调表车",
+      "过户",
+      "估价",
+      "保值率",
+      "车商"
+    ],
+    "C2_model": [
+      "内饰",
+      "外观",
+      "空间",
+      "座舱",
+      "后排",
+      "驾驶感受",
+      "乘坐体验",
+      "氛围灯",
+      "音响",
+      "电动尾门",
+      "天窗",
+      "实车",
+      "试驾感受",
+      "动力表现",
+      "隔音",
+      "座椅",
+      "储物",
+      "后备箱",
+      "悬架",
+      "操控",
+      "自动泊车",
+      "车身线条"
+    ],
+    "C2_emotional": [
+      "精神内耗",
+      "情绪",
+      "人生",
+      "成长",
+      "治愈",
+      "身份",
+      "体面",
+      "父亲",
+      "爸爸",
+      "妈妈",
+      "婚姻",
+      "回忆",
+      "那年"
+    ],
+    "C2_descriptive": [
+      "实拍",
+      "体验",
+      "展示",
+      "来看",
+      "带你看",
+      "试驾",
+      "测量",
+      "打开",
+      "乘坐",
+      "坐进",
+      "后排",
+      "储物"
+    ],
+    "C2_platform_task": [
+      "实拍",
+      "图片",
+      "空间",
+      "后备箱",
+      "参数",
+      "内饰",
+      "外观",
+      "车主体验"
+    ],
+    "c2_used_scene": [
+      "二手车",
+      "二手车源",
+      "车况",
+      "表显里程"
+    ]
+  },
+  "predicates": {
+    "is_image_post": {
+      "op": "any",
+      "args": [
+        {
+          "op": "field_eq",
+          "field": "content_type",
+          "coerce": "str",
+          "value": "image_text"
+        },
+        {
+          "op": "field_eq",
+          "field": "media_type",
+          "coerce": "int",
+          "value": 2
+        }
+      ]
+    },
+    "used_count": {
+      "op": "term_count",
+      "view": "used_basis",
+      "terms": "used_narrative",
+      "mode": "occurrences"
+    },
+    "new_count": {
+      "op": "term_count",
+      "view": "used_basis",
+      "terms": "new_car_narrative",
+      "mode": "occurrences"
+    },
+    "is_used": {
+      "op": "any",
+      "args": [
+        {
+          "op": "all",
+          "args": [
+            {
+              "op": "compare",
+              "cmp": "gt",
+              "left": {
+                "op": "ref",
+                "name": "used_count"
+              },
+              "right": 0
+            },
+            {
+              "op": "compare",
+              "cmp": "gte",
+              "left": {
+                "op": "ref",
+                "name": "used_count"
+              },
+              "right": {
+                "op": "ref",
+                "name": "new_count"
+              }
+            }
+          ]
+        },
+        {
+          "op": "all",
+          "args": [
+            {
+              "op": "contains_any",
+              "view": "full_desc",
+              "terms": "used_desc_marker"
+            },
+            {
+              "op": "contains_any",
+              "view": "combined",
+              "terms": "used_support"
+            },
+            {
+              "op": "any",
+              "args": [
+                {
+                  "op": "compare",
+                  "cmp": "eq",
+                  "left": {
+                    "op": "ref",
+                    "name": "new_count"
+                  },
+                  "right": 0
+                },
+                {
+                  "op": "contains_any",
+                  "view": "combined",
+                  "terms": "strong_used_listing"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "explicit_dcar": {
+      "op": "contains_any",
+      "view": "combined",
+      "terms": "dcar_explicit"
+    },
+    "has_dcar_any": {
+      "op": "any",
+      "args": [
+        {
+          "op": "ref",
+          "name": "explicit_dcar"
+        },
+        {
+          "op": "contains_any",
+          "view": "full_desc",
+          "terms": "dcar_brand"
+        }
+      ]
+    },
+    "has_dcar_video": {
+      "op": "contains_any",
+      "view": "video_text",
+      "terms": "dcar_explicit"
+    },
+    "used_budget_amount": {
+      "op": "regex_any",
+      "view": "combined",
+      "patterns": "used_budget_patterns"
+    },
+    "used_budget": {
+      "op": "any",
+      "args": [
+        {
+          "op": "ref",
+          "name": "used_budget_amount"
+        },
+        {
+          "op": "contains_any",
+          "view": "combined",
+          "terms": "used_recommendation"
+        }
+      ]
+    },
+    "used_scene": {
+      "op": "contains_any",
+      "view": "combined",
+      "terms": "used_scene"
+    },
+    "explicit_two_candidates": {
+      "op": "any",
+      "args": [
+        {
+          "op": "contains_any",
+          "view": "combined",
+          "terms": "two_candidates"
+        },
+        {
+          "op": "compare",
+          "cmp": "gte",
+          "left": {
+            "op": "term_count",
+            "view": "combined",
+            "terms": "car_brands"
+          },
+          "right": 2
+        }
+      ]
+    },
+    "sales_topic": {
+      "op": "contains_any",
+      "view": "combined",
+      "terms": "sales_topic"
+    },
+    "current_price_mention": {
+      "op": "context_regex_any",
+      "view": "$source_text",
+      "pattern": "\\d+(?:\\.\\d+)?万(?!公里|千米|km)|\\d{1,3}(?:[,，]\\d{3})+|[一二三四五六七八九十两]+万[一二三四五六七八九十百千]*|\\d+(?:\\.\\d+)?[wW]|\\d{4,7}(?:元|块钱)|(?<!\\d)\\d{5,6}(?!\\d|公里|千米|km)",
+      "flags": "i",
+      "transforms": [
+        "lower",
+        "remove_whitespace"
+      ],
+      "before": 18,
+      "after": 12,
+      "around_before": 30,
+      "around_after": 30,
+      "where": {
+        "op": "all",
+        "args": [
+          {
+            "op": "any",
+            "args": [
+              {
+                "op": "contains_any",
+                "view": "$nearby",
+                "terms": "price_specific_cues"
+              },
+              {
+                "op": "all",
+                "args": [
+                  {
+                    "op": "contains_any",
+                    "view": "$nearby",
+                    "terms": "price_generic_cues"
+                  },
+                  {
+                    "op": "contains_any",
+                    "view": "$around",
+                    "terms": "price_auto_markers"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "op": "any",
+            "args": [
+              {
+                "op": "not",
+                "arg": {
+                  "op": "regex_fullmatch",
+                  "view": "$match",
+                  "pattern": "\\d{5,6}"
+                }
+              },
+              {
+                "op": "all",
+                "args": [
+                  {
+                    "op": "contains_any",
+                    "view": "$nearby",
+                    "terms": "price_specific_cues"
+                  },
+                  {
+                    "op": "contains_any",
+                    "view": "$around",
+                    "terms": "price_bare_auto_markers"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "op": "any",
+            "args": [
+              {
+                "op": "not",
+                "arg": {
+                  "op": "contains_any",
+                  "view": "$nearby",
+                  "terms": "price_non_vehicle"
+                }
+              },
+              {
+                "op": "contains_any",
+                "view": "$nearby",
+                "terms": "price_specific_cues"
+              }
+            ]
+          },
+          {
+            "op": "any",
+            "args": [
+              {
+                "op": "not",
+                "arg": {
+                  "op": "contains_any",
+                  "view": "$before",
+                  "terms": "price_historical"
+                }
+              },
+              {
+                "op": "contains_any",
+                "view": "$before",
+                "terms": "price_current_before"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "source_price_match": {
+      "op": "any",
+      "args": [
+        {
+          "op": "all",
+          "args": [
+            {
+              "op": "ref",
+              "name": "current_price_mention"
+            },
+            {
+              "op": "any",
+              "args": [
+                {
+                  "op": "not",
+                  "arg": {
+                    "op": "contains_any",
+                    "view": "$source_text",
+                    "terms": "price_speculative"
+                  }
+                },
+                {
+                  "op": "contains_any",
+                  "view": "$source_text",
+                  "terms": "price_verified"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "op": "all",
+          "args": [
+            {
+              "op": "contains_any",
+              "view": "$source_text",
+              "terms": "quote_capability"
+            },
+            {
+              "op": "contains_any",
+              "view": "$source_text",
+              "terms": "dcar_brand"
+            }
+          ]
+        }
+      ]
+    },
+    "x4_source_match": {
+      "op": "any",
+      "args": [
+        {
+          "op": "contains_any",
+          "view": "$source_text",
+          "terms": "x4_explicit_selection"
+        },
+        {
+          "op": "terms_near",
+          "view": "$source_text",
+          "left_terms": "x4_first_car",
+          "right_terms": "x4_first_actions",
+          "distance": 50
+        },
+        {
+          "op": "terms_near",
+          "view": "$source_text",
+          "left_terms": "x4_budget",
+          "right_terms": "x4_budget_actions",
+          "distance": 50
+        },
+        {
+          "op": "terms_near",
+          "view": "$source_text",
+          "left_terms": "x4_scene",
+          "right_terms": "x4_scene_actions",
+          "distance": 50
+        }
+      ]
+    },
+    "cost_supported": {
+      "op": "all",
+      "args": [
+        {
+          "op": "contains_any",
+          "view": "combined",
+          "terms": "X6_cost"
+        },
+        {
+          "op": "any",
+          "args": [
+            {
+              "op": "contains_any",
+              "view": "combined",
+              "terms": "X6_support"
+            },
+            {
+              "op": "compare",
+              "cmp": "gte",
+              "left": {
+                "op": "term_count",
+                "view": "combined",
+                "terms": "X6_categories"
+              },
+              "right": 2
+            }
+          ]
+        }
+      ]
+    },
+    "c1_knowledge_signal": {
+      "op": "any",
+      "args": [
+        {
+          "op": "contains_any",
+          "view": "combined",
+          "terms": "C1_instruction"
+        },
+        {
+          "op": "compare",
+          "cmp": "gte",
+          "left": {
+            "op": "term_count",
+            "view": "combined",
+            "terms": "C1_knowledge"
+          },
+          "right": 2
+        }
+      ]
+    },
+    "c1_explicit_tutorial": {
+      "op": "contains_any",
+      "view": "video_text",
+      "terms": "C1_tutorial"
+    },
+    "c1_platform_task": {
+      "op": "all",
+      "args": [
+        {
+          "op": "ref",
+          "name": "has_dcar_video"
+        },
+        {
+          "op": "contains_any",
+          "view": "video_text",
+          "terms": "C1_platform_task"
+        }
+      ]
+    },
+    "c1_story_without_instruction": {
+      "op": "all",
+      "args": [
+        {
+          "op": "contains_any",
+          "view": "full_desc",
+          "terms": "story_terms"
+        },
+        {
+          "op": "not",
+          "arg": {
+            "op": "ref",
+            "name": "c1_explicit_tutorial"
+          }
+        },
+        {
+          "op": "not",
+          "arg": {
+            "op": "ref",
+            "name": "c1_platform_task"
+          }
+        }
+      ]
+    },
+    "c2_emotional_only": {
+      "op": "contains_any",
+      "view": "combined",
+      "terms": "C2_emotional"
+    },
+    "c2_model_signal": {
+      "op": "any",
+      "args": [
+        {
+          "op": "contains_any",
+          "view": "combined",
+          "terms": "C2_descriptive"
+        },
+        {
+          "op": "compare",
+          "cmp": "gte",
+          "left": {
+            "op": "term_count",
+            "view": "combined",
+            "terms": "C2_model"
+          },
+          "right": 2
+        }
+      ]
+    },
+    "c2_story_platform_task": {
+      "op": "all",
+      "args": [
+        {
+          "op": "contains_any",
+          "view": "story_model_task",
+          "terms": "dcar_brand"
+        },
+        {
+          "op": "terms_near",
+          "view": "story_model_task",
+          "left_terms": "dcar_brand",
+          "right_terms": "C2_platform_task",
+          "distance": 120
+        }
+      ]
+    },
+    "c2_strong_story": {
+      "op": "contains_any",
+      "view": "full_desc",
+      "terms": "story_terms"
+    }
+  },
+  "predicate_scopes": {
+    "current_price_mention": [
+      "source_text"
+    ],
+    "source_price_match": [
+      "source_text"
+    ],
+    "x4_source_match": [
+      "source_text"
+    ]
+  },
+  "scoring": {
+    "linkage_explicit": 25,
+    "linkage_implicit": 18,
+    "force_linkage_points": [
+      "M1",
+      "M2",
+      "M3",
+      "M4",
+      "M5",
+      "M6"
+    ],
+    "video_scores": {
+      "V3": 20,
+      "V2": 16,
+      "V1": 6,
+      "V0": 0
+    },
+    "desc_only_video_score": 6,
+    "prominence_multi": 10,
+    "prominence_video": 8,
+    "prominence_desc": 4,
+    "caps": {
+      "V3": 100,
+      "V2": 90,
+      "V1": 74,
+      "V0": 0
+    },
+    "no_video_cap": 74
+  },
+  "thresholds": {
+    "included_min": 75,
+    "review_min": 60,
+    "max_secondary": 2
+  },
+  "rules": [
+    {
+      "point_id": "M1",
+      "when": {
+        "op": "all",
+        "args": [
+          {
+            "op": "contains_any",
+            "view": "combined",
+            "terms": "ai_guard"
+          },
+          {
+            "op": "contains_any",
+            "view": "combined",
+            "terms": "M1_when"
+          }
+        ]
+      },
+      "scene": "media",
+      "evidence": {
+        "terms": "M1_evidence",
+        "reason": "明确展示AI小懂预约试驾或试驾指南"
+      },
+      "explain": {
+        "positive_evidence": ["明确提及AI小懂，并展示预约试驾、试驾指南或试驾清单"],
+        "negative_evidence": ["仅介绍普通试驾知识，未明确提及AI小懂"],
+        "boundary_rules": ["AI小懂名称与试驾任务必须在内容证据中同时出现"]
+      },
+      "score": {
+        "semantic_fit": 30,
+        "user_benefit": 15
+      },
+      "priority": 1
+    },
+    {
+      "point_id": "M2",
+      "when": {
+        "op": "all",
+        "args": [
+          {
+            "op": "contains_any",
+            "view": "combined",
+            "terms": "ai_guard"
+          },
+          {
+            "op": "contains_any",
+            "view": "combined",
+            "terms": "M2_when"
+          }
+        ]
+      },
+      "scene": "media",
+      "evidence": {
+        "terms": "M2_evidence",
+        "reason": "明确展示AI小懂查询优惠或库存"
+      },
+      "explain": {
+        "positive_evidence": ["明确提及AI小懂，并展示优惠、库存、现车、展车或试驾车查询"],
+        "negative_evidence": ["只播报普通车价或库存信息，没有AI小懂能力承接"],
+        "boundary_rules": ["AI小懂名称与优惠或库存查询任务必须同时出现"]
+      },
+      "score": {
+        "semantic_fit": 30,
+        "user_benefit": 15
+      },
+      "priority": 1
+    },
+    {
+      "point_id": "M3",
+      "when": {
+        "op": "all",
+        "args": [
+          {
+            "op": "contains_any",
+            "view": "combined",
+            "terms": "ai_guard"
+          },
+          {
+            "op": "contains_any",
+            "view": "combined",
+            "terms": "M3_when"
+          }
+        ]
+      },
+      "scene": "media",
+      "evidence": {
+        "terms": "M3_evidence",
+        "reason": "明确展示AI小懂管理日常用车"
+      },
+      "explain": {
+        "positive_evidence": ["明确提及AI小懂，并展示洗车、维修保养预约或用车档案管理"],
+        "negative_evidence": ["仅讲解泛保养知识，没有AI小懂服务能力"],
+        "boundary_rules": ["泛保养知识应归C1，只有AI小懂实际承接服务时归M3"]
+      },
+      "score": {
+        "semantic_fit": 30,
+        "user_benefit": 15
+      },
+      "priority": 1
+    },
+    {
+      "point_id": "M4",
+      "when": {
+        "op": "all",
+        "args": [
+          {
+            "op": "contains_any",
+            "view": "combined",
+            "terms": "ai_guard"
+          },
+          {
+            "op": "contains_any",
+            "view": "combined",
+            "terms": "M4_when"
+          }
+        ]
+      },
+      "scene": "media",
+      "evidence": {
+        "terms": "M4_evidence",
+        "reason": "明确展示AI小懂问答选车"
+      },
+      "explain": {
+        "positive_evidence": ["明确提及AI小懂，并通过问答完成选车、推荐或车型对比"],
+        "negative_evidence": ["普通选车建议或车型推荐，没有AI小懂交互"],
+        "boundary_rules": ["AI小懂名称与选车任务必须在同一内容证据中出现"]
+      },
+      "score": {
+        "semantic_fit": 30,
+        "user_benefit": 13
+      },
+      "priority": 1
+    },
+    {
+      "point_id": "M5",
+      "when": {
+        "op": "all",
+        "args": [
+          {
+            "op": "contains_any",
+            "view": "combined",
+            "terms": "ai_guard"
+          },
+          {
+            "op": "contains_any",
+            "view": "combined",
+            "terms": "M5_when"
+          }
+        ]
+      },
+      "scene": "media",
+      "evidence": {
+        "terms": "M5_evidence",
+        "reason": "明确展示AI小懂故障解释或处置建议"
+      },
+      "explain": {
+        "positive_evidence": ["明确提及AI小懂，并解释故障、报警灯、异响或安全处置"],
+        "negative_evidence": ["只讲泛故障知识，没有AI小懂诊断或处置能力"],
+        "boundary_rules": ["泛故障知识应归C1，AI小懂明确提供解释或建议时归M5"]
+      },
+      "score": {
+        "semantic_fit": 30,
+        "user_benefit": 15
+      },
+      "priority": 1
+    },
+    {
+      "point_id": "M6",
+      "when": {
+        "op": "all",
+        "args": [
+          {
+            "op": "contains_any",
+            "view": "combined",
+            "terms": "ai_guard"
+          },
+          {
+            "op": "contains_any",
+            "view": "combined",
+            "terms": "M6_when"
+          }
+        ]
+      },
+      "scene": "media",
+      "evidence": {
+        "terms": "M6_evidence",
+        "reason": "明确展示AI小懂估价或卖车准备"
+      },
+      "explain": {
+        "positive_evidence": ["明确提及AI小懂，并展示估价或卖车流程准备"],
+        "negative_evidence": ["普通卖车或估价内容，没有AI小懂能力承接"],
+        "boundary_rules": ["AI小懂名称与估价或卖车准备任务必须同时出现"]
+      },
+      "score": {
+        "semantic_fit": 30,
+        "user_benefit": 13
+      },
+      "priority": 1
+    },
+    {
+      "point_id": "E1",
+      "when": {
+        "op": "all",
+        "args": [
+          {
+            "op": "ref",
+            "name": "is_used"
+          },
+          {
+            "op": "contains_any",
+            "view": "combined",
+            "terms": "E1_when"
+          },
+          {
+            "op": "ref",
+            "name": "has_dcar_any"
+          }
+        ]
+      },
+      "scene": "used_car",
+      "evidence": {
+        "terms": "E1_evidence",
+        "reason": "展示懂车帝收车、评估或到账服务"
+      },
+      "explain": {
+        "positive_evidence": ["二手车叙事中明确展示懂车帝收车、上门评估或卖车到账服务"],
+        "negative_evidence": ["泛卖车故事或只出现收车词，没有懂车帝承接"],
+        "boundary_rules": ["必须同时满足二手车语境、收车服务任务和懂车帝关联"]
+      },
+      "score": {
+        "semantic_fit": 30,
+        "user_benefit": 15
+      },
+      "priority": 2
+    },
+    {
+      "point_id": "E2",
+      "when": {
+        "op": "all",
+        "args": [
+          {
+            "op": "ref",
+            "name": "is_used"
+          },
+          {
+            "op": "contains_any",
+            "view": "combined",
+            "terms": "E2_when"
+          },
+          {
+            "op": "ref",
+            "name": "has_dcar_any"
+          }
+        ]
+      },
+      "scene": "used_car",
+      "evidence": {
+        "terms": "E2_evidence",
+        "reason": "展示懂车帝车源、车况或平台保障"
+      },
+      "explain": {
+        "positive_evidence": ["二手车叙事中展示懂车帝认证车源、透明车况或平台保障"],
+        "negative_evidence": ["只谈普通二手车源或车况，没有懂车帝平台关联"],
+        "boundary_rules": ["必须同时满足二手车语境、车源或保障任务和懂车帝关联"]
+      },
+      "score": {
+        "semantic_fit": 30,
+        "user_benefit": 15
+      },
+      "priority": 2
+    },
+    {
+      "point_id": "E3",
+      "when": {
+        "op": "all",
+        "args": [
+          {
+            "op": "ref",
+            "name": "is_used"
+          },
+          {
+            "op": "ref",
+            "name": "used_budget"
+          },
+          {
+            "op": "not",
+            "arg": {
+              "op": "ref",
+              "name": "used_scene"
+            }
+          }
+        ]
+      },
+      "scene": "used_car",
+      "evidence": {
+        "terms": "E3_E4_evidence",
+        "reason": "展示按预算或场景筛选二手车"
+      },
+      "explain": {
+        "positive_evidence": ["二手车语境中按明确预算或行情推荐车型，且不含特定人群场景"],
+        "negative_evidence": ["只有二手车标签，没有预算、行情或车型推荐任务"],
+        "boundary_rules": ["出现新手、家庭、家用、女生、通勤、代步或宝妈场景时改归E4"]
+      },
+      "score": {
+        "semantic_fit": 30,
+        "user_benefit": 13
+      },
+      "priority": 3
+    },
+    {
+      "point_id": "E4",
+      "when": {
+        "op": "all",
+        "args": [
+          {
+            "op": "ref",
+            "name": "is_used"
+          },
+          {
+            "op": "ref",
+            "name": "used_budget"
+          },
+          {
+            "op": "ref",
+            "name": "used_scene"
+          }
+        ]
+      },
+      "scene": "used_car",
+      "evidence": {
+        "terms": "E3_E4_evidence",
+        "reason": "展示按预算或场景筛选二手车"
+      },
+      "explain": {
+        "positive_evidence": ["二手车语境中按预算并结合人群或用车场景推荐车型"],
+        "negative_evidence": ["只有预算筛选而没有人群或用车场景"],
+        "boundary_rules": ["无特定人群或用车场景的预算筛选应归E3"]
+      },
+      "score": {
+        "semantic_fit": 30,
+        "user_benefit": 13
+      },
+      "priority": 2
+    },
+    {
+      "point_id": "E5",
+      "when": {
+        "op": "all",
+        "args": [
+          {
+            "op": "ref",
+            "name": "is_used"
+          },
+          {
+            "op": "contains_any",
+            "view": "combined",
+            "terms": "E5_when"
+          },
+          {
+            "op": "ref",
+            "name": "has_dcar_video"
+          }
+        ]
+      },
+      "scene": "used_car",
+      "evidence": {
+        "terms": "E5_evidence",
+        "reason": "展示懂车帝检测报告或车辆档案"
+      },
+      "explain": {
+        "positive_evidence": ["二手车视频证据中明确展示懂车帝检测报告、车辆档案或专业验车"],
+        "negative_evidence": ["泛二手车鉴别教程，或仅正文标签提及懂车帝"],
+        "boundary_rules": ["懂车帝关联必须出现在ASR、OCR或画面语义，正文标签不能单独满足"]
+      },
+      "score": {
+        "semantic_fit": 30,
+        "user_benefit": 15
+      },
+      "priority": 2
+    },
+    {
+      "point_id": "E6",
+      "when": {
+        "op": "all",
+        "args": [
+          {
+            "op": "ref",
+            "name": "is_used"
+          },
+          {
+            "op": "ref",
+            "name": "has_dcar_any"
+          },
+          {
+            "op": "contains_any",
+            "view": "combined",
+            "terms": "E6_terms"
+          }
+        ]
+      },
+      "scene": "used_car",
+      "evidence": {
+        "terms": "E6_terms",
+        "reason": "展示二手车估价、保值率或行情数据"
+      },
+      "explain": {
+        "positive_evidence": ["二手车语境中通过懂车帝查询估价、保值率、成交或历史行情"],
+        "negative_evidence": ["普通价格讨论或行情故事，没有懂车帝关联"],
+        "boundary_rules": ["必须同时满足二手车语境、行情数据任务和懂车帝关联"]
+      },
+      "score": {
+        "semantic_fit": 30,
+        "user_benefit": 15
+      },
+      "priority": 4
+    },
+    {
+      "point_id": "E7",
+      "when": {
+        "op": "all",
+        "args": [
+          {
+            "op": "ref",
+            "name": "is_used"
+          },
+          {
+            "op": "contains_any",
+            "view": "combined",
+            "terms": "E7_terms"
+          },
+          {
+            "op": "ref",
+            "name": "has_dcar_any"
+          }
+        ]
+      },
+      "scene": "used_car",
+      "evidence": {
+        "terms": "E7_terms",
+        "reason": "展示二手车交易流程或权益保障"
+      },
+      "explain": {
+        "positive_evidence": ["二手车语境中展示懂车帝过户、交易合同、交易流程或权益保障"],
+        "negative_evidence": ["泛购车合同知识，或没有懂车帝关联的交易流程"],
+        "boundary_rules": ["必须同时满足二手车语境、交易任务和懂车帝关联"]
+      },
+      "score": {
+        "semantic_fit": 30,
+        "user_benefit": 15
+      },
+      "priority": 2
+    },
+    {
+      "point_id": "X1",
+      "when": {
+        "op": "all",
+        "args": [
+          {
+            "op": "not",
+            "arg": {
+              "op": "ref",
+              "name": "is_used"
+            }
+          },
+          {
+            "op": "contains_any",
+            "view": "comparison_basis",
+            "terms": "compare_terms"
+          },
+          {
+            "op": "ref",
+            "name": "explicit_two_candidates"
+          },
+          {
+            "op": "compare",
+            "cmp": "gte",
+            "left": {
+              "op": "term_count",
+              "view": "comparison_basis",
+              "terms": "comparison_dimensions"
+            },
+            "right": 2
+          }
+        ]
+      },
+      "scene": "new_car",
+      "evidence": {
+        "terms": "X1_evidence",
+        "reason": "对至少两款候选车型进行多维度比较"
+      },
+      "explain": {
+        "positive_evidence": ["至少两款明确候选车型进行空间、动力、配置等两个以上维度的对比"],
+        "negative_evidence": ["单一车型功能罗列，或只有页面导航中的对比词"],
+        "boundary_rules": ["视频内容排除OCR导航噪声，且二手车主叙事不归X1"]
+      },
+      "score": {
+        "semantic_fit": 30,
+        "user_benefit": 15
+      },
+      "priority": 2
+    },
+    {
+      "point_id": "X2",
+      "when": {
+        "op": "any",
+        "args": [
+          {
+            "op": "contains_any",
+            "view": "x2_narrative",
+            "terms": "x2_strong"
+          },
+          {
+            "op": "all",
+            "args": [
+              {
+                "op": "any",
+                "args": [
+                  {
+                    "op": "contains_any",
+                    "view": "combined",
+                    "terms": "x2_strong"
+                  },
+                  {
+                    "op": "contains_any",
+                    "view": "combined",
+                    "terms": "x2_score"
+                  }
+                ]
+              },
+              {
+                "op": "not",
+                "arg": {
+                  "op": "ref",
+                  "name": "sales_topic"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "scene": "new_car",
+      "evidence": {
+        "terms": "X2_evidence",
+        "reason": "展示第三方实测、榜单或车主口碑"
+      },
+      "explain": {
+        "positive_evidence": ["展示懂车帝实测、权威测评、车主口碑、车主评价或懂车分"],
+        "negative_evidence": ["只有销量榜、销量排行或月销信息，没有实测或口碑证据"],
+        "boundary_rules": ["销量主题不能仅凭懂车分或OCR中的测评词触发X2"]
+      },
+      "score": {
+        "semantic_fit": 30,
+        "user_benefit": 15
+      },
+      "priority": 2
+    },
+    {
+      "point_id": "X3",
+      "when": {
+        "op": "all",
+        "args": [
+          {
+            "op": "any",
+            "args": [
+              {
+                "op": "not",
+                "arg": {
+                  "op": "ref",
+                  "name": "is_used"
+                }
+              },
+              {
+                "op": "contains_any",
+                "view": "combined",
+                "terms": "new_car_context"
+              }
+            ]
+          },
+          {
+            "op": "source_any",
+            "expr": {
+              "op": "ref",
+              "name": "source_price_match"
+            }
+          }
+        ]
+      },
+      "scene": "new_car",
+      "evidence": {
+        "terms": "X3_evidence",
+        "source_expr": {
+          "op": "ref",
+          "name": "source_price_match"
+        },
+        "reason": "视频提供具体价格、优惠或现车信息"
+      },
+      "explain": {
+        "positive_evidence": ["同一来源出现具体当前车价与报价线索，或懂车帝明确提供报价、底价或真实成交价查询"],
+        "negative_evidence": ["里程、奖金、维修费、历史购车价、OCR长数字或未经验证的未来价格"],
+        "boundary_rules": ["投机价格必须有指导价、一口价、落地价等已验证线索；二手语境只有出现明确新车上下文才可归X3"]
+      },
+      "score": {
+        "semantic_fit": 30,
+        "user_benefit": 15
+      },
+      "priority": 2
+    },
+    {
+      "point_id": "X4",
+      "when": {
+        "op": "all",
+        "args": [
+          {
+            "op": "not",
+            "arg": {
+              "op": "ref",
+              "name": "is_used"
+            }
+          },
+          {
+            "op": "source_any",
+            "expr": {
+              "op": "ref",
+              "name": "x4_source_match"
+            }
+          }
+        ]
+      },
+      "scene": "new_car",
+      "evidence": {
+        "terms": "X4_evidence",
+        "source_expr": {
+          "op": "ref",
+          "name": "x4_source_match"
+        },
+        "reason": "按预算、人群或用车场景推荐车型"
+      },
+      "explain": {
+        "positive_evidence": ["同一来源明确提出选车任务，或预算、人群、用车场景与选车动作在规定距离内共现"],
+        "negative_evidence": ["页面导航孤立出现选车词，或生活故事中远距离出现选择表达"],
+        "boundary_rules": ["二手车主叙事不归X4；第一辆车、预算和场景词必须与选车动作形成近邻关系"]
+      },
+      "score": {
+        "semantic_fit": 30,
+        "user_benefit": 13
+      },
+      "priority": 1
+    },
+    {
+      "point_id": "X5",
+      "when": {
+        "op": "contains_any",
+        "view": "combined",
+        "terms": "X5_terms"
+      },
+      "scene": "new_car",
+      "evidence": {
+        "terms": "X5_terms",
+        "reason": "比较版本、配置差异或配置价值"
+      },
+      "explain": {
+        "positive_evidence": ["明确比较车型版本、高低配、选装包或配置差异"],
+        "negative_evidence": ["只罗列单一版本配置，没有版本间比较任务"],
+        "boundary_rules": ["必须出现明确版本或配置差异表达"]
+      },
+      "score": {
+        "semantic_fit": 30,
+        "user_benefit": 13
+      },
+      "priority": 3
+    },
+    {
+      "point_id": "X6",
+      "when": {
+        "op": "ref",
+        "name": "cost_supported"
+      },
+      "scene": "new_car",
+      "evidence": {
+        "terms": "X6_cost",
+        "reason": "计算购车或长期用车成本"
+      },
+      "explain": {
+        "positive_evidence": ["计算养车、用车、月供、保险、油电费、保养或维修等成本，并有周期合计或至少两个成本类别"],
+        "negative_evidence": ["情感故事中孤立出现用车成本，没有计算或成本拆分"],
+        "boundary_rules": ["成本主词必须与周期合计表达或两个以上成本类别同时出现"]
+      },
+      "score": {
+        "semantic_fit": 30,
+        "user_benefit": 15
+      },
+      "priority": 3
+    },
+    {
+      "point_id": "X7",
+      "when": {
+        "op": "all",
+        "args": [
+          {
+            "op": "contains_any",
+            "view": "combined",
+            "terms": "X7_risk"
+          },
+          {
+            "op": "contains_any",
+            "view": "combined",
+            "terms": "X7_validation"
+          }
+        ]
+      },
+      "scene": "new_car",
+      "evidence": {
+        "terms": "X7_evidence",
+        "reason": "以数据、实测或拆解验证配置和营销话术"
+      },
+      "explain": {
+        "positive_evidence": ["减配、虚标或营销风险与拆解、实测、实验或数据验证同时出现"],
+        "negative_evidence": ["未经验证的减配猜测、传闻或单纯情绪评价"],
+        "boundary_rules": ["风险表达与验证证据必须同时出现"]
+      },
+      "score": {
+        "semantic_fit": 30,
+        "user_benefit": 15
+      },
+      "priority": 3
+    },
+    {
+      "point_id": "X8",
+      "when": {
+        "op": "all",
+        "args": [
+          {
+            "op": "contains_any",
+            "view": "combined",
+            "terms": "X8_terms"
+          },
+          {
+            "op": "any",
+            "args": [
+              {
+                "op": "compare",
+                "cmp": "gte",
+                "left": {
+                  "op": "term_count",
+                  "view": "combined",
+                  "terms": "X8_terms"
+                },
+                "right": 2
+              },
+              {
+                "op": "all",
+                "args": [
+                  {
+                    "op": "contains_any",
+                    "view": "combined",
+                    "terms": "X8_strong"
+                  },
+                  {
+                    "op": "contains_any",
+                    "view": "combined",
+                    "terms": "X8_instruction"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "scene": "new_car",
+      "evidence": {
+        "terms": "X8_evidence",
+        "reason": "解释购车合同、定金、交付或权益"
+      },
+      "explain": {
+        "positive_evidence": ["解释购车合同、定金、选配、交付或权益，并包含多项任务或明确操作指令"],
+        "negative_evidence": ["情感故事中孤立出现交定金，没有合同权益解释"],
+        "boundary_rules": ["至少两个合同权益任务共现，或强合同权益词与注意、流程、条款等指令同时出现"]
+      },
+      "score": {
+        "semantic_fit": 30,
+        "user_benefit": 15
+      },
+      "priority": 3
+    },
+    {
+      "point_id": "C1",
+      "when": {
+        "op": "all",
+        "args": [
+          {
+            "op": "contains_any",
+            "view": "combined",
+            "terms": "C1_knowledge"
+          },
+          {
+            "op": "ref",
+            "name": "c1_knowledge_signal"
+          },
+          {
+            "op": "compare",
+            "cmp": "gte",
+            "left": {
+              "op": "chinese_count",
+              "view": "video_text"
+            },
+            "right": 15
+          },
+          {
+            "op": "not",
+            "arg": {
+              "op": "ref",
+              "name": "c1_story_without_instruction"
+            }
+          }
+        ]
+      },
+      "scene": {
+        "cases": [
+          {
+            "when": {
+              "op": "contains_any",
+              "view": "combined",
+              "terms": "c1_used_scene"
+            },
+            "value": "used_car"
+          }
+        ],
+        "default": "media"
+      },
+      "evidence": {
+        "terms": "C1_knowledge",
+        "reason": "视频实质提供汽车知识、用车问题或风险识别解答"
+      },
+      "explain": {
+        "positive_evidence": ["视频主体提供汽车知识、驾驶安全、零件、保养、维修、应急或二手车鉴别方法"],
+        "negative_evidence": ["情感剧情中偶然出现维修、钥匙或零件词，且没有明确教程或平台任务"],
+        "boundary_rules": ["二手交易、鉴别或二手用车任务归used_car；其他实用汽车知识归media"]
+      },
+      "score": {
+        "semantic_fit": 30,
+        "user_benefit": 13
+      },
+      "priority": 6
+    },
+    {
+      "point_id": "C2",
+      "when": {
+        "op": "all",
+        "args": [
+          {
+            "op": "contains_any",
+            "view": "combined",
+            "terms": "C2_model"
+          },
+          {
+            "op": "ref",
+            "name": "c2_model_signal"
+          },
+          {
+            "op": "compare",
+            "cmp": "gte",
+            "left": {
+              "op": "chinese_count",
+              "view": "video_text"
+            },
+            "right": 15
+          },
+          {
+            "op": "not",
+            "arg": {
+              "op": "all",
+              "args": [
+                {
+                  "op": "ref",
+                  "name": "c2_emotional_only"
+                },
+                {
+                  "op": "not",
+                  "arg": {
+                    "op": "contains_any",
+                    "view": "combined",
+                    "terms": "C2_descriptive"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "op": "any",
+            "args": [
+              {
+                "op": "not",
+                "arg": {
+                  "op": "ref",
+                  "name": "c2_strong_story"
+                }
+              },
+              {
+                "op": "ref",
+                "name": "c2_story_platform_task"
+              }
+            ]
+          }
+        ]
+      },
+      "scene": {
+        "cases": [
+          {
+            "when": {
+              "op": "contains_any",
+              "view": "combined",
+              "terms": "c2_used_scene"
+            },
+            "value": "used_car"
+          }
+        ],
+        "default": "new_car"
+      },
+      "evidence": {
+        "terms": "C2_model",
+        "reason": "视频实质展示车型细节、真实影像或使用体验"
+      },
+      "explain": {
+        "positive_evidence": ["视频主体实拍或体验车型外观、内饰、空间、座舱、后排、储物或驾驶感受"],
+        "negative_evidence": ["情感剧情中车辆只是道具，或只有孤立车型词而无实拍体验"],
+        "boundary_rules": ["二手车源、车况或表显里程实拍归used_car；其他在售车型细节体验归new_car"]
+      },
+      "score": {
+        "semantic_fit": 30,
+        "user_benefit": 13
+      },
+      "priority": 6
+    },
+    {
+      "point_id": "C3",
+      "when": {
+        "op": "any",
+        "args": [
+          {
+            "op": "all",
+            "args": [
+              {
+                "op": "contains_any",
+                "view": "c3_actual",
+                "terms": "c3_campaign"
+              },
+              {
+                "op": "ref",
+                "name": "has_dcar_any"
+              }
+            ]
+          },
+          {
+            "op": "contains_any",
+            "view": "c3_actual",
+            "terms": "c3_dcar_exact"
+          },
+          {
+            "op": "all",
+            "args": [
+              {
+                "op": "contains_any",
+                "view": "c3_actual",
+                "terms": "c3_community"
+              },
+              {
+                "op": "contains_any",
+                "view": "c3_actual",
+                "terms": "c3_engagement"
+              },
+              {
+                "op": "ref",
+                "name": "has_dcar_any"
+              }
+            ]
+          }
+        ]
+      },
+      "scene": "media",
+      "evidence": {
+        "terms": "C3_evidence",
+        "reason": "展示懂车帝车友社区、玩车或交流场景"
+      },
+      "explain": {
+        "positive_evidence": ["ASR或画面语义明确展示懂车帝车友社区、玩车活动、改装交流或社区创作"],
+        "negative_evidence": ["只有OCR导航中的车友圈入口，实际视频未展示社区任务"],
+        "boundary_rules": ["社区活动证据必须来自ASR或画面语义，场景固定归media"]
+      },
+      "score": {
+        "semantic_fit": 30,
+        "user_benefit": 13
+      },
+      "priority": 5
+    },
+    {
+      "point_id": "C4",
+      "when": {
+        "op": "all",
+        "args": [
+          {
+            "op": "contains_any",
+            "view": "combined",
+            "terms": "c4_factual"
+          },
+          {
+            "op": "not",
+            "arg": {
+              "op": "contains_any",
+              "view": "combined",
+              "terms": "c4_speculative"
+            }
+          }
+        ]
+      },
+      "scene": {
+        "cases": [
+          {
+            "when": {
+              "op": "contains_any",
+              "view": "combined",
+              "terms": "c4_used_scene"
+            },
+            "value": "used_car"
+          },
+          {
+            "when": {
+              "op": "contains_any",
+              "view": "combined",
+              "terms": "c4_new_scene"
+            },
+            "value": "new_car"
+          }
+        ],
+        "default": "media"
+      },
+      "evidence": {
+        "terms": "C4_evidence",
+        "reason": "提供有事实内容的新车或行业动态"
+      },
+      "explain": {
+        "positive_evidence": ["提供正式上市、正式发布、官图、预售、申报图、销量榜、新款发布或发布会等事实动态"],
+        "negative_evidence": ["概念车、假想设计、AI脑洞、机甲或末日内容，以及未经证实的虚构动态"],
+        "boundary_rules": ["二手车市场动态归used_car；明确新车、车型或汽车行业动态归new_car；其余已命中事实动态归media"]
+      },
+      "score": {
+        "semantic_fit": 30,
+        "user_benefit": 13
+      },
+      "priority": 6
+    }
+  ]
+}

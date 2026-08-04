@@ -9,11 +9,12 @@
     "dev": "WRANGLER_LOG_PATH=.wrangler/wrangler.log npm exec --yes --package=node@22.13.1 -- node ./node_modules/vinext/dist/cli.js dev",
     "build": "WRANGLER_LOG_PATH=.wrangler/wrangler.log npm exec --yes --package=node@22.13.1 -- node ./node_modules/vinext/dist/cli.js build",
     "start": "WRANGLER_LOG_PATH=.wrangler/wrangler.log npm exec --yes --package=node@22.13.1 -- node ./node_modules/vinext/dist/cli.js start",
-    "test": "npm run build && npm exec --yes --package=node@22.13.1 -- node --test tests/rendered-html.test.mjs",
+    "test": "npm run build && npm exec --yes --package=node@22.13.1 -- node --experimental-strip-types --test tests/rendered-html.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "db:generate": "drizzle-kit generate"
   },
   "dependencies": {
+    "@phosphor-icons/react": "2.1.10",
     "drizzle-orm": "0.45.2",
     "next": "16.2.6",
     "react": "19.2.6",

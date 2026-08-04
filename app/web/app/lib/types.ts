@@ -70,6 +70,15 @@ export type Overview = {
   };
 };
 
+export type TaskRevision = {
+  revision: number;
+  created_at: string;
+  invalidated_at?: string | null;
+  invalidation_reason?: string | null;
+  revision_state: "current" | "stale" | "historical";
+  files: Array<{ file_kind: string; byte_size: number; status: string }>;
+};
+
 export type Task = {
   id: string;
   name: string;
@@ -80,17 +89,16 @@ export type Task = {
   progress: number;
   content_count: number;
   revision_count: number;
+  historical_revision_count: number;
+  current_valid_revision: TaskRevision | null;
+  stale_display_revision: TaskRevision | null;
+  display_effective_revision: TaskRevision | null;
   message?: string;
 };
 
 export type TaskDetail = Task & {
   events: Array<{ id: number; event_type: string; message: string; created_at: string }>;
-  revisions: Array<{
-    revision: number;
-    created_at: string;
-    invalidated_at?: string | null;
-    files: Array<{ file_kind: string; byte_size: number; status: string }>;
-  }>;
+  revisions: TaskRevision[];
   content_counts: Record<string, number>;
 };
 
@@ -112,6 +120,8 @@ export type PlatformIdentity = {
   uid: string;
   nickname: string;
   real_name_status: string;
+  follower_count: number | null;
+  content_count: number;
 };
 
 export type PendingPlatformIdentity = {
@@ -150,6 +160,10 @@ export type ContentItem = {
   primary_selling_point_code: string | null;
   evidence_level: string | null;
   content_automotive_score: number | null;
+  display_evaluation_id: number | null;
+  evaluation_release_id: string | null;
+  evaluation_freshness: "current" | "stale" | "missing";
+  evaluation_is_stale: boolean;
   review_queue_id: number | null;
   review_status: string | null;
   pending_review_count: number;
@@ -163,6 +177,9 @@ export type ContentItem = {
 export type EvidenceBundle = {
   content: Pick<ContentItem, "id" | "link_id" | "platform" | "canonical_url" | "title" | "body" | "content_type" | "published_at" | "raw_account_uid" | "raw_account_name">;
   base_evaluation_id: number | null;
+  display_evaluation_id: number | null;
+  evaluation_freshness: "current" | "stale" | "missing";
+  evaluation_is_stale: boolean;
   evaluation: Record<string, unknown> | null;
   media: Array<{ artifact_id: number; index: number; kind: "video" | "image"; name: string; url: string }>;
   asr: { status: string; model: string | null; text: string };
@@ -191,13 +208,15 @@ export type SellingPoint = {
   tier: string;
   label: string;
   definition: string;
-  scenes: string[];
-  positive_evidence?: string[];
-  negative_evidence?: string[];
-  boundary_rules?: string[];
+  matcher_rule: Record<string, unknown> | null;
+  readonly scenes: ReadonlyArray<BusinessSceneKey>;
+  readonly positive_evidence: ReadonlyArray<string>;
+  readonly negative_evidence: ReadonlyArray<string>;
+  readonly boundary_rules: ReadonlyArray<string>;
   enabled?: boolean;
   primary_hits?: number;
   total_hits?: number;
+  readonly scene_hits?: Partial<Record<BusinessSceneKey, { primary_hits: number; total_hits: number }>>;
 };
 
 export type SellingPointResponse = {

@@ -6,7 +6,7 @@ from __future__ import annotations
 from typing import Mapping
 
 
-MIN_VALID_COMMENTERS = 20
+MIN_VALID_COMMENTERS = 5
 
 
 def _validate_score(value: float | int, name: str) -> float:
@@ -66,7 +66,7 @@ def audience_auto_score(
     valid_unique_commenters: int | None,
     comment_sample_status: str,
 ) -> int | None:
-    """Average unique-commenter scores; return None below the 20-person gate."""
+    """Average unique-commenter scores; return None below the 5-person gate."""
 
     normalized = {int(key): int(value) for key, value in score_counts.items()}
     allowed = {0, 30, 70, 100}

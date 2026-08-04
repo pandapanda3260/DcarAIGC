@@ -5,8 +5,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Iterable
-
 from PIL import Image, ImageDraw, ImageFont
 
 
@@ -127,9 +125,6 @@ def main() -> None:
     summary = json.loads(SUMMARY.read_text(encoding="utf-8"))
     dy = summary["channels"]["douyin"]
     dm = dy["count_dimension"]
-    xhs = summary["channels"]["xiaohongshu"]
-    xd = xhs["data_diagnostics"]
-
     image = Image.new("RGB", (W, H), BG)
     draw = ImageDraw.Draw(image)
 

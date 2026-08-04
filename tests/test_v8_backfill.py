@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import tempfile
 import unittest
-from io import BytesIO
 from pathlib import Path
-from urllib.error import HTTPError
 from unittest.mock import patch
 
+import v8.backfill as backfill_module
 from v8.backfill import (
     BUDGET_ID,
     OPERATION,
@@ -15,7 +14,6 @@ from v8.backfill import (
     normalize_video_detail,
     prepare_backfill_slots,
     process_paid_candidate,
-    route_provider_blocked_manual,
     run_daily_backfill_batch,
     run_pilot,
 )
@@ -49,24 +47,6 @@ class FakeAdapter:
             raw_response=self.payload,
             http_status=200,
             billed=True,
-        )
-
-
-class BlockedAdapter:
-    calls = 0
-
-    def __init__(self, _api_key: str) -> None:
-        pass
-
-    def fetch(self, _note_id: str) -> ProviderResult:
-        type(self).calls += 1
-        raise CaptureError(
-            "Rnote HTTP 402: insufficient balance",
-            retryable=True,
-            error_code="provider_balance_blocked",
-            http_status=402,
-            billed=False,
-            raw_response={"detail": "insufficient balance"},
         )
 
 
@@ -126,17 +106,16 @@ class V8BackfillTest(unittest.TestCase):
         self.assertTrue(all(row["stage"] == "media_source_refresh" for row in rows))
         self.assertTrue(all(row["window_key"] == "lifetime" for row in rows))
 
-    def test_backfill_auth_failure_is_terminal(self) -> None:
-        error = HTTPError(
-            "https://rnote.dev/api", 401, "unauthorized", {}, BytesIO(b"{}")
-        )
+    def test_retired_adapter_fails_closed_before_network(self) -> None:
         with (
-            patch("v8.backfill.urllib.request.urlopen", side_effect=error),
+            patch("v8.backfill.urllib.request.urlopen") as urlopen,
             self.assertRaises(CaptureError) as raised,
         ):
             RnoteVideoAdapter("invalid").fetch("a" * 24)
+        urlopen.assert_not_called()
         self.assertFalse(raised.exception.retryable)
-        self.assertEqual(raised.exception.error_code, "provider_auth_blocked")
+        self.assertEqual(raised.exception.error_code, "provider_retired")
+        self.assertEqual(str(raised.exception), "Rnote retired; use TikHub")
 
     def test_paid_candidate_saves_raw_source_and_routes_to_evidence_ready(self) -> None:
         prepare_backfill_slots(db_path=self.db)
@@ -198,30 +177,44 @@ class V8BackfillTest(unittest.TestCase):
         self.assertEqual(review, "terminal_failed")
         self.assertEqual(slot, "succeeded")
 
-    def test_provider_balance_stops_on_first_attempt_and_routes_manual(self) -> None:
+    def test_retired_pilot_and_daily_batch_do_not_read_key_or_mutate_state(self) -> None:
         prepare_backfill_slots(db_path=self.db)
-        BlockedAdapter.calls = 0
         with (
-            patch("v8.backfill.RnoteVideoAdapter", BlockedAdapter),
-            patch("v8.backfill.load_key", return_value="sk-test"),
+            patch("v8.backfill.load_key") as load_key,
+            patch("v8.backfill.urllib.request.urlopen") as urlopen,
+            self.assertRaisesRegex(CaptureError, "Rnote retired; use TikHub"),
         ):
-            result = run_pilot(db_path=self.db, key_file=self.root / "unused")
-        self.assertEqual(BlockedAdapter.calls, 1)
-        self.assertEqual(result["results"], {"provider_balance_blocked": 1})
-        self.assertIsNone(result["gate"])
-        routed = route_provider_blocked_manual(db_path=self.db)
-        self.assertEqual(routed, 2)
+            run_pilot(db_path=self.db, key_file=self.root / "unused")
+        load_key.assert_not_called()
+        urlopen.assert_not_called()
+        with self.assertRaisesRegex(CaptureError, "Rnote retired; use TikHub"):
+            run_daily_backfill_batch(db_path=self.db, key_file=self.root / "unused")
         with connect(self.db) as connection:
-            attempts = connection.execute("SELECT error_code, billed FROM fetch_attempts").fetchall()
+            attempts = connection.execute("SELECT * FROM fetch_attempts").fetchall()
             reviews = connection.execute("SELECT status FROM review_queue").fetchall()
-            budget = connection.execute("SELECT status, consumed_amount FROM provider_budget_batches").fetchone()
-        self.assertEqual([(row["error_code"], row["billed"]) for row in attempts], [("provider_balance_blocked", 0)])
-        self.assertTrue(all(row["status"] == "manual_required" for row in reviews))
-        self.assertEqual(budget["status"], "suspended")
+            budget = connection.execute(
+                "SELECT status, consumed_amount FROM provider_budget_batches"
+            ).fetchone()
+        self.assertEqual(attempts, [])
+        self.assertTrue(all(row["status"] == "pending" for row in reviews))
+        self.assertEqual(budget["status"], "draft")
         self.assertEqual(budget["consumed_amount"], 0)
-        automatic = run_daily_backfill_batch(db_path=self.db, key_file=self.root / "unused")
-        self.assertEqual(automatic["status"], "skipped")
-        self.assertEqual(automatic["attempted"], 0)
+
+    def test_pilot_cli_is_retired_before_credentials_or_network(self) -> None:
+        arguments = type(
+            "Arguments",
+            (),
+            {"command": "pilot", "db": self.db, "key_file": self.root / "missing"},
+        )()
+        with (
+            patch("v8.backfill.parse_args", return_value=arguments),
+            patch("v8.backfill.load_key") as load_key,
+            patch("v8.backfill.urllib.request.urlopen") as urlopen,
+            self.assertRaisesRegex(CaptureError, "Rnote retired; use TikHub"),
+        ):
+            backfill_module.main()
+        load_key.assert_not_called()
+        urlopen.assert_not_called()
 
 
 if __name__ == "__main__":
