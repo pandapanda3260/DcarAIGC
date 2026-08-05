@@ -30,6 +30,33 @@ CREATE TABLE selling_points(
     UNIQUE(taxonomy_id,code)
 );
 CREATE TABLE content_items(id INTEGER PRIMARY KEY AUTOINCREMENT);
+CREATE TABLE fetch_slots(id INTEGER PRIMARY KEY AUTOINCREMENT);
+CREATE TABLE provider_raw_responses(id INTEGER PRIMARY KEY AUTOINCREMENT);
+CREATE TABLE comment_evidence_versions(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
+    captured_at TEXT NOT NULL, iso_week TEXT NOT NULL, source TEXT NOT NULL,
+    local_path TEXT NOT NULL, sha256 TEXT NOT NULL, comment_count INTEGER,
+    status TEXT NOT NULL, created_at TEXT NOT NULL,
+    UNIQUE(content_id, iso_week, sha256)
+);
+CREATE TABLE comments(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    evidence_version_id INTEGER NOT NULL REFERENCES comment_evidence_versions(id) ON DELETE CASCADE,
+    platform_comment_id TEXT, anonymous_user_key TEXT, body TEXT NOT NULL,
+    published_at TEXT, like_count INTEGER, parent_comment_id TEXT,
+    raw_json TEXT NOT NULL DEFAULT '{}',
+    UNIQUE(evidence_version_id, platform_comment_id)
+);
+CREATE TABLE comment_user_scores(
+    content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
+    evidence_version_id INTEGER REFERENCES comment_evidence_versions(id) ON DELETE SET NULL,
+    anonymous_user_key TEXT NOT NULL,
+    audience_automotive_score INTEGER NOT NULL,
+    action_intent_score INTEGER NOT NULL,
+    evaluated_at TEXT NOT NULL,
+    PRIMARY KEY(content_id, anonymous_user_key)
+);
 CREATE TABLE evidence_envelopes(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE CASCADE
@@ -401,14 +428,14 @@ class V9SchemaMigrationTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def test_fresh_schema_is_v9_and_second_initialization_is_read_only(self) -> None:
+    def test_fresh_schema_is_v10_and_second_initialization_is_read_only(self) -> None:
         with storage.connect(self.db) as connection:
             storage.initialize_database(connection)
             self.assertEqual(
                 connection.execute(
                     "SELECT MAX(version) FROM schema_migrations"
                 ).fetchone()[0],
-                9,
+                10,
             )
             self.assertIn(
                 "matcher_rule_json",
@@ -826,7 +853,7 @@ class V9SchemaMigrationTest(unittest.TestCase):
                 connection.execute(
                     "SELECT MAX(version) FROM schema_migrations"
                 ).fetchone()[0],
-                9,
+                10,
             )
 
 

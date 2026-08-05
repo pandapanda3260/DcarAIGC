@@ -35,6 +35,7 @@ from .evaluation_selectors import (
 )
 from .duplicates import FINGERPRINT_VERSION, THRESHOLDS
 from .storage import (
+    CURRENT_SCHEMA_MIGRATION_NAME,
     DEFAULT_DB,
     PROJECT_ROOT,
     SCHEMA_VERSION,
@@ -153,7 +154,7 @@ def assert_report_runtime_ready(connection) -> Dict[str, Any]:
     if (
         user_version != SCHEMA_VERSION
         or len(migration) != 1
-        or str(migration[0]["name"]) != "release-bound-evaluation-schema"
+        or str(migration[0]["name"]) != CURRENT_SCHEMA_MIGRATION_NAME
     ):
         raise ReportTaskError(f"complete schema v{SCHEMA_VERSION} is required")
     try:

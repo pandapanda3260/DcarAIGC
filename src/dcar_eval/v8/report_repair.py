@@ -19,7 +19,13 @@ from .release_management import (
     _read_receipt,
     _require_production_receipt_chain,
 )
-from .storage import LEGACY_V7_RELEASE_ID, SCHEMA_VERSION, now_utc, transaction
+from .storage import (
+    CURRENT_SCHEMA_MIGRATION_NAME,
+    LEGACY_V7_RELEASE_ID,
+    SCHEMA_VERSION,
+    now_utc,
+    transaction,
+)
 
 
 FREEZE_SCHEMA_VERSION = "dcar-v9-freeze-manifest-v1"
@@ -365,7 +371,7 @@ def _require_v9(connection: sqlite3.Connection) -> None:
     if (
         user_version != SCHEMA_VERSION
         or len(migration) != 1
-        or str(migration[0]["name"]) != "release-bound-evaluation-schema"
+        or str(migration[0]["name"]) != CURRENT_SCHEMA_MIGRATION_NAME
     ):
         raise ReportRepairError(f"complete schema v{SCHEMA_VERSION} is required")
     revision_columns = {

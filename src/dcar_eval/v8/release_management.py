@@ -31,6 +31,7 @@ from .evaluation import (
 )
 from .matcher_dsl import POINT_IDS, taxonomy_matcher_sha256
 from .storage import (
+    CURRENT_SCHEMA_MIGRATION_NAME,
     LEGACY_V7_RELEASE_ID,
     SCHEMA_VERSION,
     now_utc,
@@ -625,7 +626,7 @@ def _require_v9(connection: sqlite3.Connection) -> None:
     if (
         user_version != SCHEMA_VERSION
         or len(rows) != 1
-        or str(rows[0]["name"]) != "release-bound-evaluation-schema"
+        or str(rows[0]["name"]) != CURRENT_SCHEMA_MIGRATION_NAME
     ):
         raise ReleaseManagementError(f"complete schema v{SCHEMA_VERSION} is required")
     required_columns = {

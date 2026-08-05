@@ -209,10 +209,142 @@ def _validate_metric(
         errors.append(f"{path} missing {missing}")
 
 
-def validate_report(report: Mapping[str, Any]) -> None:
+def _validate_audience_quality(
+    quality: Any,
+    required_keys: List[str],
+    path: str,
+    errors: List[str],
+) -> None:
+    if not isinstance(quality, Mapping):
+        errors.append(f"{path} must be an object")
+        return
+    missing = sorted(set(required_keys) - set(quality.keys()))
+    if missing:
+        errors.append(f"{path} missing {missing}")
+    for key in (
+        "comment_collection_coverage_percentage",
+        "identity_coverage_percentage",
+    ):
+        if key in quality:
+            value = quality.get(key)
+            if value is not None and (
+                not isinstance(value, (int, float)) or not 0 <= float(value) <= 100
+            ):
+                errors.append(f"{path}.{key} must be null or between 0 and 100")
+    if "warm_up" in quality and not isinstance(quality.get("warm_up"), bool):
+        errors.append(f"{path}.warm_up must be a boolean")
+
+
+def _validate_automotive_user_rate(
+    metric: Any, path: str, errors: List[str]
+) -> None:
+    if not isinstance(metric, Mapping):
+        return
+    denominator = metric.get("denominator")
+    eligible = metric.get("eligible_count")
+    if not isinstance(eligible, int) or eligible != denominator:
+        errors.append(f"{path}.eligible_count must equal denominator")
+    coverage = metric.get("coverage_percentage")
+    if coverage is not None and (
+        not isinstance(coverage, (int, float)) or not 0 <= float(coverage) <= 100
+    ):
+        errors.append(f"{path}.coverage_percentage must be null or between 0 and 100")
+    status = metric.get("status")
+    percentage = metric.get("percentage")
+    if (
+        status in {"below_threshold", "not_applicable", "missing", "not_calculable"}
+        and percentage is not None
+    ):
+        errors.append(f"{path}.percentage must be null for status {status}")
+    if status in {"available", "sample_only"} and (
+        percentage is None or metric.get("numerator") is None
+    ):
+        errors.append(
+            f"{path} must publish numerator and percentage for status {status}"
+        )
+
+
+def _validate_channel_conclusions(
+    channels: Any,
+    contract: Mapping[str, Any],
+    errors: List[str],
+) -> None:
+    spec = contract["channel_conclusion_metrics"]
+    layout = contract.get("channels", {})
+    platforms = [str(value) for value in layout.get("platforms", [])]
+    scenes = [str(value) for value in layout.get("scenes", [])]
+    required_quality = [
+        str(value) for value in contract.get("audience_quality_required_keys", [])
+    ]
+    if not isinstance(channels, Mapping):
+        errors.append("$.channels must be an object")
+        return
+    if sorted(channels.keys()) != sorted(platforms):
+        errors.append(f"$.channels must contain exactly the platforms {platforms}")
+
+    def validate_group(group: Any, path: str) -> None:
+        if not isinstance(group, Mapping):
+            errors.append(f"{path} must be an object")
+            return
+        for key in ("label", "publication_count", "audience_quality", "metrics"):
+            if key not in group:
+                errors.append(f"{path}.{key} is required")
+        _validate_audience_quality(
+            group.get("audience_quality"),
+            required_quality,
+            f"{path}.audience_quality",
+            errors,
+        )
+        metrics = group.get("metrics")
+        if not isinstance(metrics, Mapping):
+            errors.append(f"{path}.metrics must be an object")
+            return
+        if sorted(metrics.keys()) != sorted(spec.keys()):
+            errors.append(
+                f"{path}.metrics must contain exactly the channel conclusion metrics"
+            )
+        for name, expected in spec.items():
+            _validate_metric(
+                metrics.get(name),
+                expected,
+                f"{path}.metrics.{name}",
+                errors,
+                contract,
+            )
+        _validate_automotive_user_rate(
+            metrics.get("automotive_user_rate"),
+            f"{path}.metrics.automotive_user_rate",
+            errors,
+        )
+
+    for platform, block in channels.items():
+        if platform not in platforms:
+            continue
+        path = f"$.channels.{platform}"
+        if not isinstance(block, Mapping):
+            errors.append(f"{path} must be an object")
+            continue
+        validate_group(block.get("summary"), f"{path}.summary")
+        scenes_block = block.get("scenes")
+        if not isinstance(scenes_block, Mapping):
+            errors.append(f"{path}.scenes must be an object")
+            continue
+        if sorted(scenes_block.keys()) != sorted(scenes):
+            errors.append(f"{path}.scenes must contain exactly the scenes {scenes}")
+        for scene, group in scenes_block.items():
+            if scene in scenes:
+                validate_group(group, f"{path}.scenes.{scene}")
+
+
+def validate_report(
+    report: Mapping[str, Any],
+    *,
+    contract_path: Optional[Path] = None,
+) -> None:
     report_version = report.get("report_version")
     contract = load_contract(
-        report_version=str(report_version) if report_version is not None else None
+        contract_path,
+        report_version=str(report_version) if report_version is not None else None,
     )
     errors: List[str] = []
     missing = [key for key in contract["required_top_level_keys"] if key not in report]
@@ -298,6 +430,9 @@ def validate_report(report: Mapping[str, Any]) -> None:
                     errors.append(
                         f"$.summary_metrics.{name}.denominator must equal publication_count.value"
                     )
+
+    if "channel_conclusion_metrics" in contract:
+        _validate_channel_conclusions(report.get("channels"), contract, errors)
 
     for key in (
         "platform_dimensions",

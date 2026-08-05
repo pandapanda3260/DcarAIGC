@@ -14,10 +14,15 @@ from typing import Iterator
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_DB = PROJECT_ROOT / "app" / "data" / "dcar_insight.sqlite3"
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
+CURRENT_SCHEMA_MIGRATION_NAME = "audience-interaction-user-domain"
 LEGACY_TAXONOMY_VERSION = "selling-points-v5.0"
 LEGACY_V6_RELEASE_ID = "evaluation-v6__selling-points-v5.0"
 LEGACY_V7_RELEASE_ID = "evaluation-v7__selling-points-v5.0"
+LEGACY_COMMENT_USER_KEY_VERSION = "content-user-hmac-v1"
+LEGACY_COMMENT_SCORE_RULE_VERSION = "legacy-audience-action-v1"
+PLATFORM_USER_KEY_VERSION = "platform-user-hmac-v2"
+COMMENT_COLLECTION_VERSION = "paged-comments-v2"
 LEGACY_MATCHER_RULE_SHA256 = (
     "38f647e9b05e38777bbe4727b5c563b67c61e28854d8b37027af8119023eefdc"
 )
@@ -303,6 +308,81 @@ CREATE TABLE IF NOT EXISTS content_metric_snapshots (
     UNIQUE(content_id, window_key, source)
 );
 
+CREATE TABLE IF NOT EXISTS interaction_users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform TEXT NOT NULL,
+    pseudonymous_user_key TEXT NOT NULL,
+    key_version TEXT NOT NULL DEFAULT 'platform-user-hmac-v2'
+        CHECK(key_version IN ('platform-user-hmac-v2')),
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    UNIQUE(platform, key_version, pseudonymous_user_key)
+);
+
+CREATE TABLE IF NOT EXISTS interaction_user_classification_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    interaction_user_id INTEGER NOT NULL REFERENCES interaction_users(id) ON DELETE CASCADE,
+    audience_definition_version TEXT NOT NULL,
+    classifier_version TEXT NOT NULL,
+    evidence_window_start TEXT NOT NULL,
+    evidence_window_end TEXT NOT NULL,
+    evidence_sha256 TEXT NOT NULL CHECK(length(evidence_sha256)=64),
+    label TEXT NOT NULL CHECK(label IN ('automotive','not_identified','excluded')),
+    confidence REAL CHECK(confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
+    reason_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    UNIQUE(interaction_user_id, audience_definition_version, classifier_version, evidence_sha256)
+);
+
+CREATE TABLE IF NOT EXISTS comment_capture_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
+    window_key TEXT NOT NULL,
+    collection_version TEXT NOT NULL DEFAULT 'paged-comments-v2',
+    provider TEXT NOT NULL,
+    adapter_version TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending','running','succeeded','retryable_failed','terminal_failed')),
+    completion_kind TEXT CHECK(completion_kind IS NULL OR completion_kind IN ('provider_exhausted','coverage_target_reached','cap_reached','zero_comments')),
+    stop_reason TEXT,
+    declared_total_count INTEGER,
+    captured_distinct_count INTEGER NOT NULL DEFAULT 0,
+    valid_comment_count INTEGER NOT NULL DEFAULT 0,
+    stable_identity_comment_count INTEGER NOT NULL DEFAULT 0,
+    page_count INTEGER NOT NULL DEFAULT 0,
+    comment_cap INTEGER NOT NULL DEFAULT 1000,
+    started_at TEXT,
+    completed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(content_id, window_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_comment_capture_runs_window
+ON comment_capture_runs(window_key, status);
+
+CREATE TABLE IF NOT EXISTS comment_capture_pages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    capture_run_id INTEGER NOT NULL REFERENCES comment_capture_runs(id) ON DELETE CASCADE,
+    page_number INTEGER NOT NULL CHECK(page_number >= 1),
+    request_cursor_json TEXT NOT NULL,
+    request_cursor_sha256 TEXT NOT NULL CHECK(length(request_cursor_sha256)=64),
+    next_cursor_json TEXT,
+    next_cursor_sha256 TEXT CHECK(next_cursor_sha256 IS NULL OR length(next_cursor_sha256)=64),
+    fetch_slot_id INTEGER NOT NULL REFERENCES fetch_slots(id) ON DELETE RESTRICT,
+    raw_response_id INTEGER NOT NULL REFERENCES provider_raw_responses(id) ON DELETE RESTRICT,
+    has_more INTEGER NOT NULL CHECK(has_more IN (0,1)),
+    provider_declared_total INTEGER,
+    received_count INTEGER NOT NULL DEFAULT 0,
+    captured_distinct_count INTEGER NOT NULL DEFAULT 0,
+    valid_count INTEGER NOT NULL DEFAULT 0,
+    stable_identity_count INTEGER NOT NULL DEFAULT 0,
+    captured_at TEXT NOT NULL,
+    UNIQUE(capture_run_id, page_number),
+    UNIQUE(capture_run_id, request_cursor_sha256),
+    UNIQUE(fetch_slot_id),
+    UNIQUE(raw_response_id)
+);
+
 CREATE TABLE IF NOT EXISTS comment_evidence_versions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
@@ -312,7 +392,8 @@ CREATE TABLE IF NOT EXISTS comment_evidence_versions (
     local_path TEXT NOT NULL,
     sha256 TEXT NOT NULL,
     comment_count INTEGER,
-    status TEXT NOT NULL CHECK(status IN ('available','missing','failed')),
+    capture_run_id INTEGER REFERENCES comment_capture_runs(id),
+    status TEXT NOT NULL CHECK(status IN ('available','partial','missing','failed')),
     created_at TEXT NOT NULL,
     UNIQUE(content_id, iso_week, sha256)
 );
@@ -326,9 +407,19 @@ CREATE TABLE IF NOT EXISTS comments (
     published_at TEXT,
     like_count INTEGER,
     parent_comment_id TEXT,
+    capture_page_id INTEGER REFERENCES comment_capture_pages(id),
+    interaction_user_id INTEGER REFERENCES interaction_users(id),
+    comment_identity_key TEXT,
     raw_json TEXT NOT NULL DEFAULT '{}',
     UNIQUE(evidence_version_id, platform_comment_id)
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_comments_identity_per_evidence
+ON comments(evidence_version_id, comment_identity_key)
+WHERE comment_identity_key IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_comments_interaction_user
+ON comments(interaction_user_id);
 
 CREATE TABLE IF NOT EXISTS comment_user_scores (
     content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
@@ -336,6 +427,10 @@ CREATE TABLE IF NOT EXISTS comment_user_scores (
     anonymous_user_key TEXT NOT NULL,
     audience_automotive_score INTEGER NOT NULL,
     action_intent_score INTEGER NOT NULL,
+    key_version TEXT NOT NULL DEFAULT 'content-user-hmac-v1'
+        CHECK(key_version IN ('content-user-hmac-v1')),
+    score_rule_version TEXT NOT NULL DEFAULT 'legacy-audience-action-v1'
+        CHECK(score_rule_version IN ('legacy-audience-action-v1')),
     evaluated_at TEXT NOT NULL,
     PRIMARY KEY(content_id, anonymous_user_key)
 );
@@ -1045,9 +1140,12 @@ def _preflight_v8(
 
 
 def _restore_sequences(
-    connection: sqlite3.Connection, sequences: dict[str, int]
+    connection: sqlite3.Connection,
+    sequences: dict[str, int],
+    *,
+    tables: tuple[str, ...] = _REBUILT_V9_TABLES,
 ) -> None:
-    for table in _REBUILT_V9_TABLES:
+    for table in tables:
         if table not in sequences:
             continue
         connection.execute(
@@ -1248,7 +1346,7 @@ def _migrate_v8_to_v9(connection: sqlite3.Connection) -> None:
             """,
             (captured_at,),
         )
-        connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        connection.execute("PRAGMA user_version=9")
         _migration_checkpoint("indexes_created")
 
         for table in _REBUILT_V9_TABLES:
@@ -1283,7 +1381,7 @@ def _migrate_v8_to_v9(connection: sqlite3.Connection) -> None:
         raise SchemaMigrationError(f"v9 integrity check failed: {integrity}")
 
 
-def _create_fresh_v9(connection: sqlite3.Connection) -> None:
+def _create_fresh_schema(connection: sqlite3.Connection) -> None:
     if connection.in_transaction:
         raise SchemaMigrationError(
             "fresh schema creation requires no active transaction"
@@ -1292,12 +1390,20 @@ def _create_fresh_v9(connection: sqlite3.Connection) -> None:
         connection.execute("BEGIN IMMEDIATE")
         for statement in _schema_statements():
             connection.execute(statement)
+        captured_at = now_utc()
         connection.execute(
             """
             INSERT INTO schema_migrations(version,name,applied_at)
             VALUES (9,'release-bound-evaluation-schema',?)
             """,
-            (now_utc(),),
+            (captured_at,),
+        )
+        connection.execute(
+            """
+            INSERT INTO schema_migrations(version,name,applied_at)
+            VALUES (10,'audience-interaction-user-domain',?)
+            """,
+            (captured_at,),
         )
         connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         connection.commit()
@@ -1333,11 +1439,219 @@ def _validate_v9(connection: sqlite3.Connection) -> None:
         raise SchemaMigrationError("schema v9 has foreign-key violations")
 
 
+_REBUILT_V10_TABLES = (
+    "comment_evidence_versions",
+    "comments",
+    "comment_user_scores",
+)
+_NEW_V10_TABLES = (
+    "interaction_users",
+    "interaction_user_classification_versions",
+    "comment_capture_runs",
+    "comment_capture_pages",
+)
+
+
+def _preflight_v9_for_v10(connection: sqlite3.Connection) -> None:
+    tables = _table_names(connection)
+    missing = set(_REBUILT_V10_TABLES) - tables
+    if missing:
+        raise SchemaMigrationError(
+            f"v9 schema is missing required tables: {sorted(missing)}"
+        )
+    residual = sorted(table for table in tables if table.endswith("_v10_new"))
+    if residual:
+        raise SchemaMigrationError(f"partial v10 tables already exist: {residual}")
+    already = sorted(set(_NEW_V10_TABLES) & tables)
+    if already:
+        raise SchemaMigrationError(
+            f"v10 tables already exist before migration: {already}"
+        )
+    if "key_version" in _table_columns(connection, "comment_user_scores"):
+        raise SchemaMigrationError(
+            "comment_user_scores already carries key_version before v10 migration"
+        )
+    violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        raise SchemaMigrationError(f"v9 foreign-key violations: {len(violations)}")
+
+
+def _migrate_v9_to_v10(connection: sqlite3.Connection) -> None:
+    if connection.in_transaction:
+        raise SchemaMigrationError("v10 migration requires no active transaction")
+    foreign_keys = int(connection.execute("PRAGMA foreign_keys").fetchone()[0])
+    if foreign_keys != 1:
+        raise SchemaMigrationError("v10 migration requires PRAGMA foreign_keys=ON")
+
+    _preflight_v9_for_v10(connection)
+    old_columns = {
+        table: _table_columns(connection, table) for table in _REBUILT_V10_TABLES
+    }
+    old_counts = {
+        table: int(connection.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
+        for table in _REBUILT_V10_TABLES
+    }
+    old_hashes = {
+        table: _table_projection_sha256(connection, table, columns)
+        for table, columns in old_columns.items()
+    }
+    try:
+        sequences = {
+            str(row["name"]): int(row["seq"])
+            for row in connection.execute(
+                "SELECT name, seq FROM sqlite_sequence"
+            ).fetchall()
+            if str(row["name"]) in _REBUILT_V10_TABLES
+        }
+    except sqlite3.OperationalError:
+        sequences = {}
+
+    captured_at = now_utc()
+    statements = _schema_statements()
+    tables_by_name: dict[str, str] = {}
+    for statement in statements:
+        match = re.match(r"CREATE TABLE IF NOT EXISTS ([a-z_]+) ", statement)
+        if match:
+            tables_by_name[match.group(1)] = statement
+
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        for table in _NEW_V10_TABLES:
+            statement = tables_by_name.get(table)
+            if statement is None:
+                raise SchemaMigrationError(f"missing schema template for {table}")
+            connection.execute(statement)
+        _migration_checkpoint("v10_new_tables_created")
+
+        replacements = {table: f"{table}_v10_new" for table in _REBUILT_V10_TABLES}
+        for table in _REBUILT_V10_TABLES:
+            connection.execute(_schema_table_statement(table, replacements))
+        for table in _REBUILT_V10_TABLES:
+            names = ",".join(f'"{column}"' for column in old_columns[table])
+            connection.execute(
+                f'INSERT INTO "{table}_v10_new"({names}) SELECT {names} FROM "{table}"'
+            )
+        _migration_checkpoint("v10_rows_copied")
+
+        for table in ("comments", "comment_user_scores", "comment_evidence_versions"):
+            connection.execute(f'DROP TABLE "{table}"')
+        for table in _REBUILT_V10_TABLES:
+            connection.execute(f'ALTER TABLE "{table}_v10_new" RENAME TO "{table}"')
+        _migration_checkpoint("v10_tables_renamed")
+
+        index_targets = {*_REBUILT_V10_TABLES, *_NEW_V10_TABLES}
+        for statement in statements:
+            is_index = statement.startswith(
+                "CREATE INDEX IF NOT EXISTS"
+            ) or statement.startswith("CREATE UNIQUE INDEX IF NOT EXISTS")
+            target = re.search(r"\bON\s+([a-z_]+)\s*\(", statement, re.IGNORECASE)
+            if is_index and target is not None and target.group(1) in index_targets:
+                connection.execute(statement)
+        _restore_sequences(connection, sequences, tables=_REBUILT_V10_TABLES)
+        connection.execute(
+            """
+            INSERT INTO schema_migrations(version,name,applied_at)
+            VALUES (10,'audience-interaction-user-domain',?)
+            """,
+            (captured_at,),
+        )
+        connection.execute("PRAGMA user_version=10")
+        _migration_checkpoint("v10_indexes_created")
+
+        for table in _REBUILT_V10_TABLES:
+            current_count = int(
+                connection.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+            )
+            if current_count != old_counts[table]:
+                raise SchemaMigrationError(
+                    f"row count changed for {table}: {old_counts[table]}->{current_count}"
+                )
+            current_hash = _table_projection_sha256(
+                connection, table, old_columns[table]
+            )
+            if current_hash != old_hashes[table]:
+                raise SchemaMigrationError(f"legacy projection changed for {table}")
+        drifted = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM comment_user_scores
+                WHERE key_version<>? OR score_rule_version<>?
+                """,
+                (
+                    LEGACY_COMMENT_USER_KEY_VERSION,
+                    LEGACY_COMMENT_SCORE_RULE_VERSION,
+                ),
+            ).fetchone()[0]
+        )
+        if drifted:
+            raise SchemaMigrationError(
+                f"comment_user_scores version backfill failed for {drifted} rows"
+            )
+        violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise SchemaMigrationError(
+                f"v10 foreign-key violations before commit: {len(violations)}"
+            )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.execute("PRAGMA foreign_keys=ON")
+
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        raise SchemaMigrationError("v10 foreign-key check failed after commit")
+    integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
+    if integrity != "ok":
+        raise SchemaMigrationError(f"v10 integrity check failed: {integrity}")
+
+
+def _validate_v10(connection: sqlite3.Connection) -> None:
+    tables = _table_names(connection)
+    missing = set(_NEW_V10_TABLES) - tables
+    if missing:
+        raise SchemaMigrationError(
+            f"schema v10 is missing tables: {sorted(missing)}"
+        )
+    comment_columns = set(_table_columns(connection, "comments"))
+    required_comment_columns = {
+        "capture_page_id",
+        "interaction_user_id",
+        "comment_identity_key",
+    }
+    if required_comment_columns - comment_columns:
+        raise SchemaMigrationError(
+            "schema v10 is missing comment columns: "
+            f"{sorted(required_comment_columns - comment_columns)}"
+        )
+    score_columns = set(_table_columns(connection, "comment_user_scores"))
+    if {"key_version", "score_rule_version"} - score_columns:
+        raise SchemaMigrationError(
+            "schema v10 is missing comment_user_scores version columns"
+        )
+    if "capture_run_id" not in _table_columns(connection, "comment_evidence_versions"):
+        raise SchemaMigrationError(
+            "schema v10 is missing comment_evidence_versions.capture_run_id"
+        )
+    indexes = {
+        str(row["name"])
+        for row in connection.execute("PRAGMA index_list(comments)")
+    }
+    if "uq_comments_identity_per_evidence" not in indexes:
+        raise SchemaMigrationError(
+            "schema v10 is missing the comment identity uniqueness index"
+        )
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        raise SchemaMigrationError("schema v10 has foreign-key violations")
+
+
 def initialize_database(connection: sqlite3.Connection) -> None:
     tables = _table_names(connection)
     if not tables:
-        _create_fresh_v9(connection)
+        _create_fresh_schema(connection)
         _validate_v9(connection)
+        _validate_v10(connection)
         return
     if "schema_migrations" not in tables:
         raise SchemaMigrationError("database has tables but no schema_migrations")
@@ -1345,6 +1659,11 @@ def initialize_database(connection: sqlite3.Connection) -> None:
     version = int(row[0]) if row is not None and row[0] is not None else 0
     if version == 8:
         _migrate_v8_to_v9(connection)
-    elif version != SCHEMA_VERSION:
+        version = 9
+    if version == 9:
+        _migrate_v9_to_v10(connection)
+        version = 10
+    if version != SCHEMA_VERSION:
         raise SchemaMigrationError(f"unsupported schema version: {version}")
     _validate_v9(connection)
+    _validate_v10(connection)
