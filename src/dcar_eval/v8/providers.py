@@ -31,6 +31,13 @@ from .capture import (
 )
 from .duplicates import refresh_content_duplicates
 from .evaluation import evaluate_content, upsert_comment_user_scores
+from .comment_paging import (
+    COMMENT_CAP,
+    COVERAGE_TARGET,
+    PageFetch,
+    capture_content_comments,
+    page_window_key,
+)
 from .identity import (
     PlatformUserHasher,
     comment_identity_key,
@@ -873,7 +880,14 @@ def _rnote_discovery_call(uid: str, key: str) -> ProviderResult:
     return ProviderResult({"items": items}, payload, status, True)
 
 
-def _douyin_call(stage: str, content_id: str, key: str) -> ProviderResult:
+def _douyin_call(
+    stage: str,
+    content_id: str,
+    key: str,
+    *,
+    cursor: Optional[Mapping[str, Any]] = None,
+) -> ProviderResult:
+    comment_cursor = int((cursor or {}).get("cursor") or 0)
     endpoints: Dict[str, tuple[str, Dict[str, Any]]] = {
         "detail": ("/api/v1/douyin/app/v3/fetch_one_video", {"aweme_id": content_id}),
         "metrics": (
@@ -882,7 +896,7 @@ def _douyin_call(stage: str, content_id: str, key: str) -> ProviderResult:
         ),
         "comments": (
             "/api/v1/douyin/app/v3/fetch_video_comments",
-            {"aweme_id": content_id, "cursor": 0, "count": 20},
+            {"aweme_id": content_id, "cursor": comment_cursor, "count": 20},
         ),
     }
     endpoint, params = endpoints[stage]
@@ -1005,18 +1019,33 @@ def _parse_douyin_stage_payload(
             published_at=comment["published_at"],
         )
         sanitized.append(comment)
+    declared_total = _first_int(page, "total")
+    has_more = bool(page.get("has_more"))
+    raw_cursor = page.get("cursor")
+    next_cursor_params = (
+        {"cursor": int(raw_cursor)}
+        if has_more and raw_cursor not in (None, "")
+        else None
+    )
     safe_payload = {
         "code": 200,
         "data": {
-            "total": _first_int(page, "total"),
-            "has_more": bool(page.get("has_more")),
-            "cursor": page.get("cursor"),
+            "total": declared_total,
+            "has_more": has_more,
+            "cursor": raw_cursor,
             "comments": sanitized,
             "privacy_note": "用户身份已按内容级与平台级 HMAC-SHA256 双匿名化；原始 UID、昵称、头像和主页字段未保存。",
         },
     }
     return ProviderResult(
-        {"comment_count": _first_int(page, "total"), "comments": sanitized},
+        {
+            "comment_count": declared_total,
+            "comments": sanitized,
+            "declared_total": declared_total,
+            "has_more": has_more,
+            "next_cursor": raw_cursor,
+            "next_cursor_params": next_cursor_params,
+        },
         safe_payload,
         status,
         True,
@@ -1108,17 +1137,23 @@ def _sanitize_xhs_comments(
 
 
 def _xhs_call(
-    stage: str, content_id: str, key: str, content_type: str
+    stage: str,
+    content_id: str,
+    key: str,
+    content_type: str,
+    *,
+    cursor: Optional[Mapping[str, Any]] = None,
 ) -> ProviderResult:
     if stage not in {"detail", "metrics", "comments"}:
         raise ProviderConfigurationError(f"未知小红书抓取阶段：{stage}")
     if stage == "comments":
+        page_cursor = cursor or {}
         endpoint = "/api/v1/xiaohongshu/app_v2/get_note_comments"
         params: Dict[str, Any] = {
             "note_id": content_id,
-            "cursor": "",
-            "index": 0,
-            "pageArea": "UNFOLDED",
+            "cursor": str(page_cursor.get("cursor") or ""),
+            "index": int(page_cursor.get("index") or 0),
+            "pageArea": str(page_cursor.get("pageArea") or "UNFOLDED"),
             "sort_strategy": "latest_v2",
         }
     else:
@@ -1166,6 +1201,17 @@ def _parse_xhs_stage_payload(
             page.get("comments") or page.get("comment_list"), content_id=content_id
         )
         total = _first_int(page, "comment_count", "comment_count_l1", "total")
+        has_more = _bool(page.get("has_more"))
+        raw_cursor = page.get("cursor")
+        next_cursor_params = (
+            {
+                "cursor": str(raw_cursor),
+                "index": int(page.get("index") or 0),
+                "pageArea": str(page.get("pageArea") or "UNFOLDED"),
+            }
+            if has_more and raw_cursor not in (None, "")
+            else None
+        )
         safe_payload = {
             "code": 200,
             "data": {
@@ -1174,8 +1220,8 @@ def _parse_xhs_stage_payload(
                 "data": {
                     "comment_count": total,
                     "comments": comments,
-                    "cursor": page.get("cursor"),
-                    "has_more": _bool(page.get("has_more")),
+                    "cursor": raw_cursor,
+                    "has_more": has_more,
                     "privacy_note": (
                         "用户身份已按内容 HMAC-SHA256 匿名化；昵称、头像、红薯号和主页字段未保存。"
                     ),
@@ -1186,8 +1232,10 @@ def _parse_xhs_stage_payload(
             {
                 "comment_count": total,
                 "comments": comments,
-                "next_cursor": page.get("cursor"),
-                "has_more": _bool(page.get("has_more")),
+                "declared_total": total,
+                "next_cursor": raw_cursor,
+                "next_cursor_params": next_cursor_params,
+                "has_more": has_more,
             },
             safe_payload,
             status,
@@ -2387,6 +2435,161 @@ def materialize_zero_comment_evidence(
             "status": "replayed",
             "provider_cost": 0.0,
         }
+
+
+def _comment_page_call(
+    content: Mapping[str, Any],
+    cursor: Optional[Mapping[str, Any]],
+    *,
+    call_override: Optional[Callable[[str, Mapping[str, Any]], ProviderResult]],
+) -> ProviderResult:
+    platform = str(content["platform"])
+    content_key = str(content["platform_content_id"])
+    if call_override is not None:
+        override_content = dict(content)
+        override_content["_comment_cursor"] = cursor
+        return call_override("comments", override_content)
+    key = _load_key(TIKHUB_KEY_FILE, "TIKHUB_API_KEY")
+    if platform == "douyin":
+        return _douyin_call("comments", content_key, key, cursor=cursor)
+    return _xhs_call(
+        "comments", content_key, key, str(content["content_type"]), cursor=cursor
+    )
+
+
+def _live_comment_page_fetcher(
+    content: Mapping[str, Any],
+    *,
+    base_window_key: str,
+    provider: str,
+    adapter_version: str,
+    operation: str,
+    db_path: Path,
+    budget_id: Optional[str],
+    task_id: Optional[str],
+    task_max_amount: Optional[float],
+    call_override: Optional[Callable[[str, Mapping[str, Any]], ProviderResult]],
+) -> Callable[[int, Optional[Mapping[str, Any]]], PageFetch]:
+    content_id = int(content["id"])
+
+    def fetch(page_number: int, cursor: Optional[Mapping[str, Any]]) -> PageFetch:
+        window = page_window_key(base_window_key, cursor)
+        try:
+            outcome = execute_content_fetch(
+                content_id=content_id,
+                stage="comments",
+                window_key=window,
+                provider=provider,
+                adapter_version=adapter_version,
+                operation=operation,
+                call=partial(
+                    _comment_page_call,
+                    content,
+                    cursor,
+                    call_override=call_override,
+                ),
+                db_path=db_path,
+                budget_id=budget_id,
+                task_id=task_id if budget_id is not None else None,
+                task_max_amount=(task_max_amount if budget_id is not None else None),
+            )
+            return PageFetch(
+                raw_response_id=int(outcome.raw_response_id),
+                fetch_slot_id=int(outcome.slot_id),
+                result=outcome,
+            )
+        except SlotUnavailable:
+            stored = load_succeeded_raw_response(
+                stage="comments",
+                window_key=window,
+                content_id=content_id,
+                db_path=db_path,
+            )
+            if str(content["platform"]) == "douyin":
+                result = _parse_douyin_stage_payload(
+                    "comments", str(content["platform_content_id"]), stored.value
+                )
+            else:
+                result = _parse_xhs_stage_payload(
+                    "comments",
+                    str(content["platform_content_id"]),
+                    str(content["content_type"]),
+                    stored.value,
+                )
+            return PageFetch(
+                raw_response_id=int(stored.raw_response_id),
+                fetch_slot_id=int(stored.slot_id),
+                result=result,
+                already_stored=True,
+            )
+
+    return fetch
+
+
+def capture_content_comments_live(
+    content_id: int,
+    *,
+    as_of: Optional[date] = None,
+    db_path: Path = DEFAULT_DB,
+    call_override: Optional[Callable[[str, Mapping[str, Any]], ProviderResult]] = None,
+    comment_cap: int = COMMENT_CAP,
+    coverage_target: float = COVERAGE_TARGET,
+    task_id: Optional[str] = None,
+    task_max_amount: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Run a cursor-paged comment capture for one content (paged-comments-v2)."""
+
+    with connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT * FROM content_items WHERE id=?", (content_id,)
+        ).fetchone()
+    if row is None:
+        raise ProviderConfigurationError("内容不存在")
+    content = dict(row)
+    platform = str(content["platform"])
+    if platform not in {"douyin", "xiaohongshu"}:
+        raise ProviderConfigurationError(
+            "视频号和快手首版只支持人工导入，未配置自动数据源"
+        )
+    local_date = as_of or datetime.now(SHANGHAI).date()
+    iso = local_date.isocalendar()
+    window_key = f"{iso.year}-W{iso.week:02d}"
+    provider, adapter_version, operation, price = STAGE_CONFIG[(platform, "comments")]
+    adapter_version = f"{adapter_version}+paged-comments-v2"
+    budget_id = (
+        None
+        if call_override is not None
+        else _budget_for_call(
+            provider=provider,
+            operation=operation,
+            price=price,
+            task_id=task_id,
+            task_max_amount=task_max_amount,
+            db_path=db_path,
+        )
+    )
+    fetcher = _live_comment_page_fetcher(
+        content,
+        base_window_key=window_key,
+        provider=provider,
+        adapter_version=adapter_version,
+        operation=operation,
+        db_path=db_path,
+        budget_id=budget_id,
+        task_id=task_id,
+        task_max_amount=task_max_amount,
+        call_override=call_override,
+    )
+    return capture_content_comments(
+        content,
+        window_key=window_key,
+        page_fetcher=fetcher,
+        provider=provider,
+        adapter_version=adapter_version,
+        db_path=db_path,
+        comment_cap=comment_cap,
+        coverage_target=coverage_target,
+    )
 
 
 def update_content_data(
