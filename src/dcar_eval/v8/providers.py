@@ -31,6 +31,12 @@ from .capture import (
 )
 from .duplicates import refresh_content_duplicates
 from .evaluation import evaluate_content, upsert_comment_user_scores
+from .identity import (
+    PlatformUserHasher,
+    comment_identity_key,
+    insert_comment_rows,
+    legacy_user_score_rows,
+)
 from .media import (
     get_media_source_state,
     is_supported_media_url,
@@ -959,6 +965,7 @@ def _parse_douyin_stage_payload(
         return ProviderResult(normalized, payload, status, True)
     page = data if isinstance(data, dict) else {}
     hasher = CommentHasher()
+    platform_hasher = PlatformUserHasher()
     sanitized: List[Dict[str, Any]] = []
     for item in page.get("comments") or []:
         if not isinstance(item, dict):
@@ -976,22 +983,28 @@ def _parse_douyin_stage_payload(
         text = " ".join(str(item.get("text") or "").split())[:2000]
         if not text:
             continue
-        sanitized.append(
-            {
-                "platform_comment_id": str(item.get("cid") or ""),
-                "anonymous_user_key": hasher.user_key("douyin", content_id, raw_user),
-                "body": text,
-                "published_at": datetime.fromtimestamp(
-                    int(item["create_time"]), tz=ZoneInfo("UTC")
-                )
-                .isoformat()
-                .replace("+00:00", "Z")
-                if item.get("create_time")
-                else None,
-                "like_count": _first_int(item, "digg_count"),
-                "parent_comment_id": str(item.get("reply_id") or "") or None,
-            }
+        comment = {
+            "platform_comment_id": str(item.get("cid") or ""),
+            "anonymous_user_key": hasher.user_key("douyin", content_id, raw_user),
+            "pseudonymous_user_key": platform_hasher.user_key("douyin", raw_user),
+            "body": text,
+            "published_at": datetime.fromtimestamp(
+                int(item["create_time"]), tz=ZoneInfo("UTC")
+            )
+            .isoformat()
+            .replace("+00:00", "Z")
+            if item.get("create_time")
+            else None,
+            "like_count": _first_int(item, "digg_count"),
+            "parent_comment_id": str(item.get("reply_id") or "") or None,
+        }
+        comment["comment_identity_key"] = comment_identity_key(
+            platform_comment_id=comment["platform_comment_id"],
+            pseudonymous_user_key=comment["pseudonymous_user_key"],
+            body=comment["body"],
+            published_at=comment["published_at"],
         )
+        sanitized.append(comment)
     safe_payload = {
         "code": 200,
         "data": {
@@ -999,7 +1012,7 @@ def _parse_douyin_stage_payload(
             "has_more": bool(page.get("has_more")),
             "cursor": page.get("cursor"),
             "comments": sanitized,
-            "privacy_note": "用户身份已按内容 HMAC-SHA256 匿名化；昵称、头像和主页字段未保存。",
+            "privacy_note": "用户身份已按内容级与平台级 HMAC-SHA256 双匿名化；原始 UID、昵称、头像和主页字段未保存。",
         },
     }
     return ProviderResult(
@@ -1042,6 +1055,7 @@ def _sanitize_xhs_comments(
     raw_comments: Any, *, content_id: str
 ) -> List[Dict[str, Any]]:
     hasher = CommentHasher()
+    platform_hasher = PlatformUserHasher()
     comments: List[Dict[str, Any]] = []
 
     def visit(values: Any, parent_id: Optional[str] = None) -> None:
@@ -1065,20 +1079,28 @@ def _sanitize_xhs_comments(
                 :2000
             ]
             if body:
-                comments.append(
-                    {
-                        "platform_comment_id": comment_id,
-                        "anonymous_user_key": hasher.user_key(
-                            "xiaohongshu", content_id, raw_user
-                        ),
-                        "body": body,
-                        "published_at": _timestamp_iso(
-                            item.get("time") or item.get("create_time")
-                        ),
-                        "like_count": _first_int(item, "like_count", "liked_count"),
-                        "parent_comment_id": parent_id,
-                    }
+                comment = {
+                    "platform_comment_id": comment_id,
+                    "anonymous_user_key": hasher.user_key(
+                        "xiaohongshu", content_id, raw_user
+                    ),
+                    "pseudonymous_user_key": platform_hasher.user_key(
+                        "xiaohongshu", raw_user
+                    ),
+                    "body": body,
+                    "published_at": _timestamp_iso(
+                        item.get("time") or item.get("create_time")
+                    ),
+                    "like_count": _first_int(item, "like_count", "liked_count"),
+                    "parent_comment_id": parent_id,
+                }
+                comment["comment_identity_key"] = comment_identity_key(
+                    platform_comment_id=comment["platform_comment_id"],
+                    pseudonymous_user_key=comment["pseudonymous_user_key"],
+                    body=comment["body"],
+                    published_at=comment["published_at"],
                 )
+                comments.append(comment)
             visit(item.get("sub_comments"), comment_id or parent_id)
 
     visit(raw_comments)
@@ -1527,25 +1549,13 @@ def _store_stage_result(
                     (content["id"], window_key, raw["sha256"]),
                 ).fetchone()
                 evidence_id = row["id"]
-            for item in data.get("comments") or []:
-                connection.execute(
-                    """
-                    INSERT INTO comments(
-                        evidence_version_id, platform_comment_id, anonymous_user_key,
-                        body, published_at, like_count, parent_comment_id, raw_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, '{}')
-                    ON CONFLICT(evidence_version_id, platform_comment_id) DO NOTHING
-                    """,
-                    (
-                        evidence_id,
-                        item.get("platform_comment_id") or None,
-                        item.get("anonymous_user_key") or None,
-                        item.get("body") or "",
-                        item.get("published_at"),
-                        item.get("like_count"),
-                        item.get("parent_comment_id"),
-                    ),
-                )
+            insert_comment_rows(
+                connection,
+                platform=str(content["platform"]),
+                evidence_version_id=int(evidence_id),
+                comments=data.get("comments") or [],
+                captured_at=evidence_captured_at,
+            )
     if stage == "detail":
         store_media_source_manifest(
             int(content["id"]),
@@ -1559,26 +1569,11 @@ def _store_stage_result(
             db_path=db_path,
         )
     if stage == "comments" and evidence_id is not None:
-        import analyze_douyin_tikhub_v6 as scoring  # type: ignore[import-not-found,import-untyped]
-
-        rows = []
-        for item in data.get("comments") or []:
-            key = str(item.get("anonymous_user_key") or "")
-            text = str(item.get("body") or "")
-            if key and text:
-                rows.append(
-                    {
-                        "anonymous_user_key": key,
-                        "audience_automotive_score": scoring.audience_user_score(
-                            text, context_automotive=True
-                        ),
-                        "action_intent_score": scoring.action_user_score(
-                            text, context_automotive=True
-                        ),
-                    }
-                )
         upsert_comment_user_scores(
-            int(content["id"]), int(evidence_id), rows, db_path=db_path
+            int(content["id"]),
+            int(evidence_id),
+            legacy_user_score_rows(data.get("comments") or []),
+            db_path=db_path,
         )
     if mark_raw_applied:
         _mark_raw_response_applied(
