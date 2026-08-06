@@ -40,7 +40,7 @@ const conclusionMetrics: Array<[ConclusionMetricKey, string]> = [
   ["selling_point_exposure_share", "卖点曝光占比"],
   ["core_selling_point_exposure_share", "核心卖点曝光占比"],
   ["content_verticality", "内容垂直度"],
-  ["audience_verticality", "互动用户垂直度"],
+  ["automotive_user_rate", "互动用户汽车兴趣占比"],
   ["acquisition_potential", "内容拉新效果预估"],
 ];
 const numberFormat = new Intl.NumberFormat("zh-CN");
@@ -54,7 +54,7 @@ const metricIcons = {
   selling_point_exposure_share: EyeIcon,
   core_selling_point_exposure_share: SparkleIcon,
   content_verticality: StackIcon,
-  audience_verticality: UserFocusIcon,
+  automotive_user_rate: UserFocusIcon,
   acquisition_potential: TrendUpIcon,
 } satisfies Record<ConclusionMetricKey, typeof TagIcon>;
 const sceneIcons = {

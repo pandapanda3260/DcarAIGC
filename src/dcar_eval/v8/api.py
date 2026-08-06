@@ -42,7 +42,8 @@ from .evaluation_selectors import (
     effective_direction_sql,
     review_anchor_evaluation,
 )
-from .insights import build_channel_conclusions
+from .audience_rate import build_channel_audience_rates
+from .insights import CHANNELS, SCENES, build_channel_conclusions
 from .media import MediaProcessingError, recover_stale_media_processing_slots
 from .operations import (
     OperationError,
@@ -659,13 +660,53 @@ def _window_summary(
                 reason="首版没有已验证模型",
             ),
         },
-        "channels": build_channel_conclusions(conclusion_rows),
+        "channels": build_channel_conclusions(
+            conclusion_rows,
+            audience_rates=_audience_rates(connection, conclusion_rows, end),
+        ),
         "empty_explanation": (
             "所选窗口没有进入有效监控范围的已发布内容，并非抓取故障。"
             if total == 0
             else ""
         ),
     }
+
+
+def _audience_rates(
+    connection: sqlite3.Connection,
+    conclusion_rows: List[Dict[str, Any]],
+    window_end: datetime,
+) -> Dict[str, Dict[str, Any]]:
+    """Compute per-slice automotive_user_rate for the overview window.
+
+    The classifier state defaults to ``rejected`` until a gold-set calibration
+    marks it approved/conservative, so the rate stays ``below_threshold`` (no
+    published percentage) before calibration — never a fabricated value.
+    """
+
+    evidence_window_end = _utc_text(window_end)
+    evidence_window_start = _utc_text(window_end - timedelta(days=90))
+    return build_channel_audience_rates(
+        connection,
+        conclusion_rows,
+        classifier_state=_active_classifier_state(connection),
+        evidence_window_start=evidence_window_start,
+        evidence_window_end=evidence_window_end,
+        report_cutoff_at=now_utc(),
+        warm_up=True,
+        channels=CHANNELS,
+        scenes=SCENES,
+    )
+
+
+def _active_classifier_state(connection: sqlite3.Connection) -> str:
+    """Return the calibrated classifier state, defaulting to ``rejected``.
+
+    A future calibration record can promote this to approved/conservative; the
+    conservative default guarantees no rate publishes before calibration.
+    """
+
+    return "rejected"
 
 
 def v8_overview(db_path: Path) -> Dict[str, Any]:

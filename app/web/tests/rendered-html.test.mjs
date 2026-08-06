@@ -103,7 +103,7 @@ test("overview keeps time windows outside the fixed channel conclusion structure
   assert.match(source, /sceneOrder[^=]*=\s*\["used_car",\s*"new_car",\s*"media"\]/);
   const labels = [
     "卖点条数占比", "核心卖点条数占比", "卖点曝光占比", "核心卖点曝光占比",
-    "内容垂直度", "互动用户垂直度", "内容拉新效果预估",
+    "内容垂直度", "互动用户汽车兴趣占比", "内容拉新效果预估",
   ];
   let previous = -1;
   for (const label of labels) {

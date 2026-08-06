@@ -8,8 +8,23 @@ export type ConclusionMetricKey =
   | "selling_point_exposure_share"
   | "core_selling_point_exposure_share"
   | "content_verticality"
-  | "audience_verticality"
+  | "automotive_user_rate"
   | "acquisition_potential";
+
+export type AudienceQuality = {
+  captured_comment_count: number;
+  declared_comment_count: number;
+  comment_collection_coverage_percentage: number | null;
+  identity_coverage_percentage: number | null;
+  capped_content_count: number;
+  audience_definition_version: string;
+  classifier_version: string;
+  user_key_version: string;
+  evidence_window_start: string;
+  evidence_window_end: string;
+  report_cutoff_at: string;
+  warm_up: boolean;
+};
 
 export type Metric = {
   kind: "quantity" | "ratio" | "score";
@@ -30,6 +45,7 @@ export type Metric = {
 export type ConclusionGroup = {
   label: string;
   publication_count: number;
+  audience_quality?: AudienceQuality | null;
   metrics: Record<ConclusionMetricKey, Metric>;
 };
 
