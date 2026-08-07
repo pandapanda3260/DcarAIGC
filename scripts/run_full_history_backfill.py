@@ -32,6 +32,8 @@ REPO = Path(__file__).resolve().parents[1]
 DB = REPO / "app" / "data" / "dcar_insight.sqlite3"
 STATE_DIR = REPO / "runtime" / "full_history_backfill"
 STATE_FILE = STATE_DIR / "state.json"
+TIKHUB_KEY_FILE = Path("/Users/mark/Documents/key/DcarKey/TikHub.env.local")
+TIKHUB_USER_INFO = "https://api.tikhub.io/api/v1/tikhub/user/get_user_info"
 
 FH_END = "2026-08-07T00:00:00+08:00"
 FH_ARCHIVE = "2026-02-07T00:00:00+08:00"
@@ -131,6 +133,58 @@ def gate_environment() -> None:
         raise AbortRun(f"存在运维冻结锁 {locks[0].name}，先解除再跑")
     if shutil.which("sqlite3") is None:
         raise AbortRun("缺少 sqlite3 命令行，无法在线备份")
+
+
+def phase_preflight() -> None:
+    """开跑预检：密钥可读、TikHub 可达且鉴权通过、余额可见。
+
+    只用免费的账户信息接口；密钥仅进内存，绝不写日志/输出。
+    鉴权失败或网络不通 → 硬停；余额字段只记录并提醒，不做数值硬闸
+    （余额真不足时，预算机制会以 provider_balance_blocked 失败关闭）。
+    """
+
+    import urllib.error
+    import urllib.request
+
+    if not TIKHUB_KEY_FILE.is_file():
+        raise AbortRun(f"TikHub 密钥文件不存在：{TIKHUB_KEY_FILE}")
+    key = ""
+    for line in TIKHUB_KEY_FILE.read_text(encoding="utf-8").splitlines():
+        if line.strip().startswith("TIKHUB_API_KEY="):
+            key = line.split("=", 1)[1].strip().strip('"').strip("'")
+    if not key:
+        raise AbortRun("密钥文件缺少 TIKHUB_API_KEY 变量")
+    request = urllib.request.Request(
+        TIKHUB_USER_INFO, headers={"Authorization": f"Bearer {key}"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        if error.code in (401, 403):
+            raise AbortRun(
+                f"TikHub 鉴权失败（HTTP {error.code}）：密钥无效或过期"
+            ) from error
+        raise AbortRun(f"TikHub 预检失败（HTTP {error.code}）") from error
+    except OSError as error:
+        raise AbortRun(f"无法访问 TikHub（检查网络）：{error}") from error
+
+    balances: Dict[str, Any] = {}
+
+    def walk(node: Any, path: str = "") -> None:
+        if isinstance(node, dict):
+            for name, child in node.items():
+                walk(child, f"{path}.{name}".strip("."))
+        elif isinstance(node, (int, float)) and not isinstance(node, bool):
+            if any(term in path.lower() for term in ("balance", "credit")):
+                balances[path] = node
+
+    walk(payload)
+    if balances:
+        log(f"TikHub 预检通过；余额相关字段：{json.dumps(balances, ensure_ascii=False)}")
+        log("提示：若余额低于本轮预算合计，先充值可避免半夜熔断")
+    else:
+        log("TikHub 预检通过（鉴权有效；响应未含可识别余额字段，跳过余额提示）")
 
 
 def gate_tests(skip: bool) -> None:
@@ -351,6 +405,7 @@ def main() -> int:
         return 0
     try:
         gate_environment()
+        phase_preflight()
         gate_tests(values.skip_tests)
         commit_campaign_files()
         state = load_state()
