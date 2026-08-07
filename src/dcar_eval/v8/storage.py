@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 from contextlib import contextmanager
@@ -45,6 +46,13 @@ def now_utc() -> str:
 
 
 def connect(path: Path = DEFAULT_DB) -> sqlite3.Connection:
+    if (
+        os.environ.get("DCAR_TEST_DENY_FORMAL_DB") == "1"
+        and path.resolve() == DEFAULT_DB.resolve()
+    ):
+        raise RuntimeError(
+            "test process attempted to open the formal DCar database"
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path, timeout=10)
     connection.row_factory = sqlite3.Row

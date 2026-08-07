@@ -3,9 +3,11 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from v8.storage import (
+    DEFAULT_DB,
     LEGACY_MATCHER_RULE_SHA256,
     SCHEMA_VERSION,
     connect,
@@ -15,6 +17,11 @@ from v8.storage import (
 
 
 class V8StorageTest(unittest.TestCase):
+    def test_test_guard_rejects_formal_database(self) -> None:
+        with patch.dict("os.environ", {"DCAR_TEST_DENY_FORMAL_DB": "1"}):
+            with self.assertRaisesRegex(RuntimeError, "formal DCar database"):
+                connect(DEFAULT_DB)
+
     def test_initial_schema_is_complete_and_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             database = Path(temporary) / "v8.sqlite3"

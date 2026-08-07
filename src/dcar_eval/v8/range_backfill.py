@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
 
 from .capture import BudgetBlocked, ProviderResult
-from .duplicates import refresh_content_duplicates
+from .duplicates import fingerprint_content
 from .evaluation import evaluate_content
 from .media import process_content_media
 from .providers import (
@@ -171,6 +171,92 @@ def _write_state(
     return target
 
 
+def _write_discovery_content_manifest(
+    *,
+    task_id: str,
+    start: datetime,
+    end: datetime,
+    results: Sequence[Mapping[str, Any]],
+    state_root: Path,
+    db_path: Path,
+) -> Dict[str, Any]:
+    """Persist the exact content cohort independently of transient source tags.
+
+    ``history-backfill`` is deliberately cleared after V2/V3 evidence succeeds.
+    Keeping first/latest upsert actions in a campaign-side manifest makes the
+    inserted cohort auditable without adding another production database field.
+    """
+
+    state_root.mkdir(parents=True, exist_ok=True)
+    target = state_root / f"{task_id}.contents.json"
+    entries: Dict[int, Dict[str, Any]] = {}
+    if target.is_file():
+        loaded = json.loads(target.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            for entry in loaded.get("contents") or []:
+                if isinstance(entry, dict) and entry.get("content_id") is not None:
+                    entries[int(entry["content_id"])] = dict(entry)
+    for identity in results:
+        for page in identity.get("pages") or []:
+            for change in page.get("content_changes") or []:
+                if not isinstance(change, Mapping) or change.get("content_id") is None:
+                    continue
+                content_id = int(change["content_id"])
+                action = str(change.get("action") or "unknown")
+                existing = entries.get(content_id, {})
+                entries[content_id] = {
+                    **existing,
+                    "content_id": content_id,
+                    "first_action": existing.get("first_action") or action,
+                    "latest_action": action,
+                }
+    ordered_ids = sorted(entries)
+    with connect(db_path) as connection:
+        for offset in range(0, len(ordered_ids), 500):
+            batch = ordered_ids[offset:offset + 500]
+            placeholders = ",".join("?" for _ in batch)
+            for row in connection.execute(
+                f"""
+                SELECT id,link_id,platform,source_group,published_at
+                FROM content_items WHERE id IN ({placeholders})
+                """,
+                batch,
+            ).fetchall():
+                entry = entries[int(row["id"])]
+                entry.update(
+                    {
+                        "link_id": str(row["link_id"]),
+                        "platform": str(row["platform"]),
+                        "source_group": str(row["source_group"] or ""),
+                        "published_at": row["published_at"],
+                    }
+                )
+    contents = [entries[content_id] for content_id in ordered_ids]
+    payload = {
+        "task_id": task_id,
+        "start": _iso(start),
+        "end": _iso(end),
+        "updated_at": now_utc(),
+        "contents": contents,
+    }
+    temporary = target.with_name(f".{target.name}.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(target)
+    return {
+        "path": str(target),
+        "contents": len(contents),
+        "first_inserted": sum(
+            entry.get("first_action") == "inserted" for entry in contents
+        ),
+        "first_updated": sum(
+            entry.get("first_action") == "updated" for entry in contents
+        ),
+    }
+
+
 def _enabled_identities(
     *, db_path: Path, platforms: Optional[Sequence[str]], account_limit: Optional[int]
 ) -> List[Dict[str, Any]]:
@@ -208,6 +294,7 @@ def tag_history_scopes(
     db_path: Path = DEFAULT_DB,
     platforms: Optional[Sequence[str]] = None,
     apply_changes: bool = False,
+    content_ids: Optional[Sequence[int]] = None,
 ) -> Dict[str, Any]:
     """把回溯批量入库的内容按证据窗切成两组标记，保护每日闸门与增量评估。
 
@@ -253,9 +340,26 @@ def tag_history_scopes(
         "end": _iso(end),
         "archive_before": _iso(archive_before),
         "platforms": selected_platforms,
+        "restricted_content_ids": (
+            len(set(int(value) for value in content_ids))
+            if content_ids is not None
+            else None
+        ),
         "segments": {},
     }
     with connect(db_path) as connection, transaction(connection):
+        content_scope_clause = ""
+        if content_ids is not None:
+            connection.execute(
+                "CREATE TEMP TABLE campaign_history_scope_ids(id INTEGER PRIMARY KEY)"
+            )
+            connection.executemany(
+                "INSERT OR IGNORE INTO campaign_history_scope_ids(id) VALUES (?)",
+                [(int(value),) for value in content_ids],
+            )
+            content_scope_clause = (
+                " AND c.id IN (SELECT id FROM campaign_history_scope_ids)"
+            )
         for tag, _, published_clause, published_params in segments:
             candidate_sql = f"""
                 SELECT c.id FROM content_items c
@@ -264,6 +368,7 @@ def tag_history_scopes(
                   AND c.platform IN ({platform_clause})
                   AND COALESCE(c.source_group,'')=''
                   AND {published_clause}
+                  {content_scope_clause}
                   AND NOT EXISTS (
                     SELECT 1 FROM evaluation_versions ev WHERE ev.content_id=c.id
                   )
@@ -450,8 +555,12 @@ def run_discovery_backfill(
     archive_before: Optional[datetime] = None,
     workers: int = 1,
     compact: bool = False,
+    as_of: Optional[datetime] = None,
+    require_live_detail: bool = False,
+    skip_existing_derived_stages: bool = False,
 ) -> Dict[str, Any]:
     start_utc, end_utc = _utc(start), _utc(end)
+    effective_as_of = as_of or end
     if start_utc >= end_utc:
         raise RangeBackfillError("补抓开始时间必须早于结束时间")
     if max_amount <= 0 or max_pages_per_account <= 0:
@@ -464,6 +573,16 @@ def run_discovery_backfill(
         db_path=db_path, platforms=platforms, account_limit=account_limit
     )
     blocking_stop = Event()
+
+    def initial_source_group(published_at: str) -> str:
+        if archive_before is None:
+            return ""
+        published = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+        return (
+            HISTORY_ARCHIVE_SOURCE_GROUP
+            if published < _utc(archive_before)
+            else HISTORY_BACKFILL_SOURCE_GROUP
+        )
 
     def discover_identity(identity: Mapping[str, Any]) -> Dict[str, Any]:
         cursor: Any = None
@@ -485,11 +604,17 @@ def run_discovery_backfill(
             try:
                 page = discover_account_content(
                     int(identity["account_id"]), str(identity["platform"]),
-                    str(identity["uid"]), as_of=end.astimezone(SHANGHAI).date(),
+                    str(identity["uid"]),
+                    as_of=effective_as_of.astimezone(SHANGHAI).date(),
                     cursor=cursor, window_key=window_key,
                     published_start=start_utc, published_end=end_utc,
                     task_id=task_id, task_max_amount=max_amount,
                     db_path=db_path, call_override=call_override,
+                    materialize_discovery_detail=not require_live_detail,
+                    materialize_existing_discovery_stages=(
+                        not skip_existing_derived_stages
+                    ),
+                    new_content_source_group=initial_source_group,
                 )
             except Exception as exc:
                 code = getattr(exc, "error_code", type(exc).__name__)
@@ -580,6 +705,9 @@ def run_discovery_backfill(
         "status": status,
         "start": _iso(start),
         "end": _iso(end),
+        "as_of": _iso(effective_as_of),
+        "require_live_detail": require_live_detail,
+        "skip_existing_derived_stages": skip_existing_derived_stages,
         "accounts_considered": len(identities),
         "accounts_processed": sum(1 for item in results if item["pages"]),
         "accounts_completed": accounts_completed,
@@ -600,10 +728,30 @@ def run_discovery_backfill(
     if archive_before is not None:
         # 无论本次发现是否被熔断，已入库的内容都必须立即分组标记，
         # 否则当晚的媒体截止闸门与增量评估会被批量入库冲垮。
+        inserted_content_ids = sorted(
+            {
+                int(change["content_id"])
+                for item in results
+                for page in item.get("pages") or []
+                for change in page.get("content_changes") or []
+                if isinstance(change, Mapping)
+                and change.get("content_id") is not None
+                and str(change.get("action")) == "inserted"
+            }
+        )
         output["history_scopes"] = tag_history_scopes(
             start=start, end=end, archive_before=archive_before,
             db_path=db_path, platforms=platforms, apply_changes=True,
+            content_ids=inserted_content_ids,
         )
+    output["content_manifest"] = _write_discovery_content_manifest(
+        task_id=task_id,
+        start=start,
+        end=end,
+        results=results,
+        state_root=state_root,
+        db_path=db_path,
+    )
     state_path = _write_state(
         task_id=task_id, start=start, end=end, max_amount=max_amount,
         phase="discovery", status=status, details=output, state_root=state_root,
@@ -659,7 +807,7 @@ def pending_content_ids(
         )
         window_parameters.append(week_key)
     # history_only：付费阶段只覆盖本次回溯新入库（history-* 标记）的内容，
-    # 既有语料的详情/指标/评论由每日调度按既定节奏维护，避免重复计费。
+    # 既有语料缺口不在本战役内自动重买；需独立审计、报价和授权。
     history_clause = (
         f" AND c.source_group IN ({','.join('?' for _ in BACKFILL_SOURCE_GROUPS)})"
         if history_only
@@ -699,6 +847,7 @@ def repair_discovery_placeholder_metrics(
     platforms: Optional[Sequence[str]] = None,
     limit: Optional[int] = None,
     apply_changes: bool = False,
+    history_only: bool = False,
 ) -> Dict[str, Any]:
     """Reopen only metrics slots closed by non-authoritative discovery zeros."""
 
@@ -712,6 +861,13 @@ def repair_discovery_placeholder_metrics(
     parameters: List[Any] = [
         day_key, _iso(start), _iso(end), *selected_platforms,
     ]
+    history_clause = (
+        f" AND c.source_group IN ({','.join('?' for _ in BACKFILL_SOURCE_GROUPS)})"
+        if history_only
+        else ""
+    )
+    if history_only:
+        parameters.extend(BACKFILL_SOURCE_GROUPS)
     sql = f"""
         SELECT fs.id slot_id, fs.content_id, fs.attempt_count,
                c.platform, c.link_id, c.published_at,
@@ -725,6 +881,7 @@ def repair_discovery_placeholder_metrics(
           AND fs.adapter_version='tikhub-discovery-derived-v8.1'
           AND c.published_at>=? AND c.published_at<?
           AND c.platform IN ({','.join('?' for _ in selected_platforms)})
+          {history_clause}
           AND COALESCE(ms.view_count,0)=0
         ORDER BY c.platform,c.published_at DESC,c.id DESC
     """
@@ -744,6 +901,7 @@ def repair_discovery_placeholder_metrics(
         "end": _iso(end),
         "candidates": len(rows),
         "by_platform": counts,
+        "history_only": history_only,
         "content_ids": [int(row["content_id"]) for row in rows],
         "applied": 0,
     }
@@ -811,6 +969,7 @@ def run_repaired_metrics_backfill(
     state_root: Path = STATE_ROOT,
     workers: int = 1,
     compact: bool = False,
+    history_only: bool = False,
 ) -> Dict[str, Any]:
     selected_platforms = sorted(set(platforms or ("douyin", "xiaohongshu")))
     invalid = set(selected_platforms) - {"douyin", "xiaohongshu"}
@@ -822,6 +981,13 @@ def run_repaired_metrics_backfill(
     parameters: List[Any] = [
         day_key, _iso(start), _iso(end), *selected_platforms,
     ]
+    history_clause = (
+        f" AND c.source_group IN ({','.join('?' for _ in BACKFILL_SOURCE_GROUPS)})"
+        if history_only
+        else ""
+    )
+    if history_only:
+        parameters.extend(BACKFILL_SOURCE_GROUPS)
     sql = f"""
         SELECT fs.content_id
         FROM fetch_slots fs JOIN content_items c ON c.id=fs.content_id
@@ -830,6 +996,7 @@ def run_repaired_metrics_backfill(
           AND fs.last_error_code='invalid_discovery_exposure'
           AND c.published_at>=? AND c.published_at<?
           AND c.platform IN ({','.join('?' for _ in selected_platforms)})
+          {history_clause}
         ORDER BY c.platform,c.published_at DESC,c.id DESC
     """
     if limit is not None:
@@ -877,6 +1044,7 @@ def run_repaired_metrics_backfill(
         "task_id": task_id,
         "status": status,
         "window_key": day_key,
+        "history_only": history_only,
         "candidates": len(content_ids),
         "processed": sum(
             item["status"] != "skipped_after_block" for item in results
@@ -911,10 +1079,12 @@ def run_content_backfill(
     workers: int = 1,
     compact: bool = False,
     history_only: bool = False,
+    as_of: Optional[datetime] = None,
 ) -> Dict[str, Any]:
+    effective_as_of = as_of or end
     selected_stages = list(dict.fromkeys(stages or ("detail", "metrics", "comments")))
     content_ids = pending_content_ids(
-        start=start, end=end, as_of=end, db_path=db_path, limit=limit,
+        start=start, end=end, as_of=effective_as_of, db_path=db_path, limit=limit,
         platforms=platforms, stages=selected_stages, history_only=history_only,
     )
 
@@ -934,7 +1104,9 @@ def run_content_backfill(
     results, stopped_reason = _process_content_batch(
         content_ids,
         processor=lambda content_id: update_content_data(
-            content_id, as_of=end.astimezone(SHANGHAI).date(), db_path=db_path,
+            content_id,
+            as_of=effective_as_of.astimezone(SHANGHAI).date(),
+            db_path=db_path,
             call_override=call_override, stages=selected_stages,
             process_media=False, task_id=task_id, task_max_amount=max_amount,
         ),
@@ -949,6 +1121,7 @@ def run_content_backfill(
     output = {
         "task_id": task_id,
         "status": status,
+        "as_of": _iso(effective_as_of),
         "history_only": history_only,
         "candidates": len(content_ids),
         "processed": sum(
@@ -1029,7 +1202,12 @@ def run_local_evidence_backfill(
                     f"{media.get('status') or 'unknown'}"
                 )
             evaluation = evaluate_content(content_id, db_path=db_path)
-            duplicates = refresh_content_duplicates(content_id, db_path=db_path)
+            if str(evaluation.evidence_level) not in {"V2", "V3"}:
+                raise RangeBackfillError(
+                    "评估证据等级不足："
+                    f"{evaluation.evidence_level}（清标仅接受 V2/V3）"
+                )
+            duplicate_fingerprint = fingerprint_content(content_id, db_path=db_path)
             tag_released = False
             if was_tagged:
                 with connect(db_path) as connection, transaction(connection):
@@ -1047,7 +1225,7 @@ def run_local_evidence_backfill(
                     "content_id": content_id, "status": str(media.get("status")),
                     "media": media, "evaluation_id": evaluation.evaluation_id,
                     "evaluation_created": evaluation.created,
-                    "duplicates": duplicates,
+                    "duplicate_fingerprint": duplicate_fingerprint,
                     "backfill_tag_cleared": tag_released,
                 }
             )
@@ -1104,16 +1282,19 @@ def summarize_range_status(
     platforms: Optional[Sequence[str]] = None,
     archive_before: Optional[datetime] = None,
     history_only: bool = False,
+    as_of: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """只读体检+报价：区间内容底数、标记分布、剩余付费工作量与成本估算。
 
     成本估算口径（与计费常量同源，仅供审批参考，不是合同价）：
     抖音统计/评论 $0.001/次页，小红书详情/评论 $0.01/次页；评论页数按
     最近一次快照 declared comment_count 折算（抖音≈20 条/页、小红书≈10 条/页，
-    1000 条采集上限），未知评论数按 1 页保守计。
+    1000 条采集上限）。未知评论数同时给出 1 页下界与采集上限的上界；
+    自动预算使用上界，不把最低价误当保守报价。
     """
 
     start_utc, end_utc = _utc(start), _utc(end)
+    effective_as_of = as_of or end
     if start_utc >= end_utc:
         raise RangeBackfillError("区间开始时间必须早于结束时间")
     selected_platforms = sorted(set(platforms or ("douyin", "xiaohongshu")))
@@ -1126,6 +1307,7 @@ def summarize_range_status(
         "start": _iso(start),
         "end": _iso(end),
         "archive_before": _iso(archive_before) if archive_before else None,
+        "as_of": _iso(effective_as_of),
         "history_only": history_only,
         "platforms": {},
         "pending": {},
@@ -1198,11 +1380,12 @@ def summarize_range_status(
     for stage in ("detail", "metrics", "comments"):
         for platform in selected_platforms:
             pending = pending_content_ids(
-                start=start, end=end, as_of=end, db_path=db_path,
+                start=start, end=end, as_of=effective_as_of, db_path=db_path,
                 platforms=[platform], stages=[stage], history_only=history_only,
             )
             output["pending"].setdefault(stage, {})[platform] = len(pending)
-    comment_pages = {platform: 0 for platform in selected_platforms}
+    comment_pages_lower = {platform: 0 for platform in selected_platforms}
+    comment_pages_upper = {platform: 0 for platform in selected_platforms}
     unknown_counts = {platform: 0 for platform in selected_platforms}
     for row in comment_rows:
         platform = str(row["platform"])
@@ -1210,10 +1393,13 @@ def summarize_range_status(
         page_size = COMMENT_PAGE_SIZE[platform]
         if declared is None:
             unknown_counts[platform] += 1
-            comment_pages[platform] += 1
+            comment_pages_lower[platform] += 1
+            comment_pages_upper[platform] += math.ceil(COMMENT_CAP / page_size)
         else:
             capped = min(int(declared), COMMENT_CAP)
-            comment_pages[platform] += max(1, math.ceil(capped / page_size))
+            pages = max(1, math.ceil(capped / page_size))
+            comment_pages_lower[platform] += pages
+            comment_pages_upper[platform] += pages
     estimates: Dict[str, Any] = {}
     if "douyin" in selected_platforms:
         estimates["douyin_metrics"] = round(
@@ -1222,8 +1408,11 @@ def summarize_range_status(
         estimates["douyin_detail"] = round(
             output["pending"].get("detail", {}).get("douyin", 0) * TIKHUB_PRICE, 4
         )
+        estimates["douyin_comments_lower"] = round(
+            comment_pages_lower["douyin"] * TIKHUB_PRICE, 4
+        )
         estimates["douyin_comments"] = round(
-            comment_pages["douyin"] * TIKHUB_PRICE, 4
+            comment_pages_upper["douyin"] * TIKHUB_PRICE, 4
         )
     if "xiaohongshu" in selected_platforms:
         estimates["xiaohongshu_detail"] = round(
@@ -1231,17 +1420,27 @@ def summarize_range_status(
             * TIKHUB_XHS_PRICE,
             4,
         )
+        estimates["xiaohongshu_comments_lower"] = round(
+            comment_pages_lower["xiaohongshu"] * TIKHUB_XHS_PRICE, 4
+        )
         estimates["xiaohongshu_comments"] = round(
-            comment_pages["xiaohongshu"] * TIKHUB_XHS_PRICE, 4
+            comment_pages_upper["xiaohongshu"] * TIKHUB_XHS_PRICE, 4
         )
         estimates["xiaohongshu_metrics_note"] = (
             "小红书统计接口曝光自 2026-08-02 起为平台侧缺口，"
             "本估算不含小红书 metrics 付费调用；接口恢复后另行评估"
         )
-    estimates["comment_pages"] = comment_pages
+    # Backward-compatible ``comment_pages`` is the approval-safe upper bound.
+    estimates["comment_pages"] = comment_pages_upper
+    estimates["comment_pages_lower"] = comment_pages_lower
+    estimates["comment_pages_upper"] = comment_pages_upper
     estimates["comment_declared_unknown"] = unknown_counts
     estimates["total_excluding_xhs_metrics"] = round(
-        sum(value for value in estimates.values() if isinstance(value, (int, float))),
+        float(estimates.get("douyin_metrics", 0))
+        + float(estimates.get("douyin_detail", 0))
+        + float(estimates.get("douyin_comments", 0))
+        + float(estimates.get("xiaohongshu_detail", 0))
+        + float(estimates.get("xiaohongshu_comments", 0)),
         4,
     )
     output["estimated_costs_usd"] = estimates
@@ -1265,6 +1464,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     parser.add_argument("--end", required=True)
     parser.add_argument(
+        "--as-of",
+        help="当前累计指标/评论的实际采集截面（必须含时区）；"
+        "与内容发布截止 --end 分离",
+    )
+    parser.add_argument(
         "--archive-before",
         help="证据窗边界（北京时间）：早于该时刻发布的内容标记 history-archive "
         "仅入库；之后的标记 history-backfill 待本地证据完成后回归常规链路",
@@ -1287,8 +1491,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     parser.add_argument(
         "--history-only", action="store_true",
-        help="content/status 仅覆盖 history-* 标记内容：既有语料不重复计费，"
-        "由每日调度按既定节奏维护",
+        help="content/status 仅覆盖 history-* 标记内容；"
+        "既有语料缺口需独立审计与授权",
+    )
+    parser.add_argument(
+        "--require-live-detail",
+        action="store_true",
+        help="发现阶段不用列表页派生详情关闭 lifetime 槽；"
+        "保留给后续真实 detail 接口补全正文/媒体源",
+    )
+    parser.add_argument(
+        "--skip-existing-derived-stages",
+        action="store_true",
+        help="发现只更新既有内容身份，不用列表页派生值覆盖其详情/"
+        "指标槽；避免 history-only 战役把存量内容的最新曝光改成缺失",
     )
     parser.add_argument("--platform", action="append", choices=("douyin", "xiaohongshu"))
     parser.add_argument("--stage", action="append", choices=("detail", "metrics", "comments"))
@@ -1303,6 +1519,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else _parse_datetime(values.start or DEFAULT_START.isoformat())
     )
     end = _parse_datetime(values.end)
+    as_of = _parse_datetime(values.as_of) if values.as_of else end
     archive_before = (
         _parse_datetime(values.archive_before) if values.archive_before else None
     )
@@ -1314,6 +1531,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             account_limit=values.limit, max_pages_per_account=values.max_pages,
             archive_before=archive_before, workers=values.workers,
             compact=values.compact,
+            as_of=as_of,
+            require_live_detail=values.require_live_detail,
+            skip_existing_derived_stages=values.skip_existing_derived_stages,
         )
     elif values.phase == "content":
         result = run_content_backfill(
@@ -1321,6 +1541,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             db_path=values.db, limit=values.limit, platforms=values.platform,
             stages=values.stage, workers=values.workers, compact=values.compact,
             history_only=values.history_only,
+            as_of=as_of,
         )
     elif values.phase == "local-evidence":
         result = run_local_evidence_backfill(
@@ -1331,9 +1552,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
     elif values.phase == "repair-metrics":
         result = repair_discovery_placeholder_metrics(
-            start=start, end=end, as_of=end, db_path=values.db,
+            start=start, end=end, as_of=as_of, db_path=values.db,
             platforms=values.platform, limit=values.limit,
-            apply_changes=values.apply,
+            apply_changes=values.apply, history_only=values.history_only,
         )
     elif values.phase == "tag":
         if archive_before is None:
@@ -1348,13 +1569,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             start=start, end=end, db_path=values.db,
             platforms=values.platform, archive_before=archive_before,
             history_only=values.history_only,
+            as_of=as_of,
         )
     else:
         result = run_repaired_metrics_backfill(
-            start=start, end=end, as_of=end, task_id=task_id,
+            start=start, end=end, as_of=as_of, task_id=task_id,
             max_amount=values.max_amount, db_path=values.db,
             platforms=values.platform, limit=values.limit,
             workers=values.workers, compact=values.compact,
+            history_only=values.history_only,
         )
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return 0 if result["status"] not in {"blocked", "partial"} else 2

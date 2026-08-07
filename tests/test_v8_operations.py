@@ -1336,6 +1336,38 @@ class V8OperationsTest(unittest.TestCase):
         self.assertEqual(relation["original_content_id"], contents[0]["id"])
         self.assertEqual(relation["duplicate_content_id"], contents[1]["id"])
 
+    def test_content_import_cannot_set_internal_history_scope(self) -> None:
+        result = import_contents(
+            [
+                {
+                    "platform": "douyin",
+                    "canonical_url": "https://www.douyin.com/video/1122334455",
+                    "title": "普通导入内容",
+                    "source_group": "history-archive",
+                }
+            ],
+            source_name="contents.csv",
+            db_path=self.db,
+        )
+        self.assertEqual(result["inserted_rows"], 1)
+        with connect(self.db) as connection:
+            row = connection.execute(
+                "SELECT source_group FROM content_items WHERE platform_content_id=?",
+                ("1122334455",),
+            ).fetchone()
+        self.assertEqual(row["source_group"], "")
+
+        with self.assertRaisesRegex(OperationError, "内部来源分组无效"):
+            upsert_content(
+                {
+                    "platform": "douyin",
+                    "canonical_url": "https://www.douyin.com/video/1122334466",
+                    "title": "非法内部标签",
+                },
+                db_path=self.db,
+                source_group_on_insert="manual-import",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

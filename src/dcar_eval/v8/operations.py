@@ -932,8 +932,13 @@ def _rebuild_text_duplicate_groups(
 
 
 def upsert_content(
-    value: Mapping[str, Any], *, db_path: Path = DEFAULT_DB
+    value: Mapping[str, Any],
+    *,
+    db_path: Path = DEFAULT_DB,
+    source_group_on_insert: str = "",
 ) -> Dict[str, Any]:
+    if source_group_on_insert not in {"", "history-archive", "history-backfill"}:
+        raise OperationError("新内容内部来源分组无效")
     platform = str(value.get("platform") or "")
     identity = content_identity(
         platform,
@@ -1000,8 +1005,9 @@ def upsert_content(
                     link_id, platform, platform_content_id, canonical_url, normalized_url_hash,
                     account_id, raw_account_uid, raw_account_name, legacy_account_type,
                     title, body, content_type, published_at, published_at_raw,
-                    manual_content_direction, imported_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    manual_content_direction, source_group,
+                    imported_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     link_id,
@@ -1019,6 +1025,7 @@ def upsert_content(
                     published,
                     str(published_raw) if published_raw not in (None, "") else None,
                     None if direction == "unknown" else direction,
+                    source_group_on_insert,
                     captured_at,
                     captured_at,
                     captured_at,
@@ -1030,6 +1037,40 @@ def upsert_content(
             action = "inserted"
         else:
             content_id = int(current["id"])
+            preserve_existing_content_fields = bool(
+                value.get("_preserve_existing_content_fields")
+            )
+            incoming_title = str(value.get("title") or "").strip()
+            incoming_body = str(value.get("body") or "").strip()
+            effective_title = (
+                str(current["title"] or "").strip() or incoming_title
+                if preserve_existing_content_fields
+                else incoming_title
+            )
+            effective_body = (
+                str(current["body"] or "").strip() or incoming_body
+                if preserve_existing_content_fields
+                else incoming_body
+            )
+            effective_published = (
+                current["published_at"] or published
+                if preserve_existing_content_fields
+                else published
+            )
+            effective_published_raw = (
+                current["published_at_raw"]
+                or (
+                    str(published_raw)
+                    if published_raw not in (None, "")
+                    else None
+                )
+                if preserve_existing_content_fields
+                else (
+                    str(published_raw)
+                    if published_raw not in (None, "")
+                    else None
+                )
+            )
             effective_uid = uid or str(current["raw_account_uid"] or "").strip()
             account_id = _account_for_uid(connection, platform, effective_uid)
             effective_account_type = (
@@ -1066,11 +1107,11 @@ def upsert_content(
                     ).strip()
                     or None,
                     effective_account_type,
-                    str(value.get("title") or "").strip(),
-                    str(value.get("body") or "").strip(),
+                    effective_title,
+                    effective_body,
                     effective_content_type,
-                    published,
-                    str(published_raw) if published_raw not in (None, "") else None,
+                    effective_published,
+                    effective_published_raw,
                     effective_direction,
                     captured_at,
                     content_id,

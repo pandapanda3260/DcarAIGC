@@ -472,6 +472,42 @@ def _bool(value: Any) -> bool:
     return bool(value)
 
 
+def _discovery_has_more(
+    page: Mapping[str, Any], *, provider: str, raw_response: Any
+) -> bool:
+    """Parse pagination without treating a missing field as exhaustion."""
+
+    if "has_more" not in page:
+        raise CaptureError(
+            f"{provider} discovery response omitted has_more",
+            retryable=True,
+            error_code="invalid_response",
+            http_status=200,
+            billed=True,
+            raw_response=raw_response,
+        )
+    value = page["has_more"]
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if value in {0, 1}:
+            return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"0", "false", "no"}:
+            return False
+        if normalized in {"1", "true", "yes"}:
+            return True
+    raise CaptureError(
+        f"{provider} discovery response has invalid has_more",
+        retryable=True,
+        error_code="invalid_response",
+        http_status=200,
+        billed=True,
+        raw_response=raw_response,
+    )
+
+
 def _timestamp_iso(value: Any) -> Optional[str]:
     if value in (None, "", 0, "0"):
         return None
@@ -730,7 +766,9 @@ def _parse_douyin_discovery_payload(
         {
             "items": items,
             "next_cursor": page.get("max_cursor", page.get("cursor")),
-            "has_more": _bool(page.get("has_more")),
+            "has_more": _discovery_has_more(
+                page, provider="TikHub Douyin", raw_response=payload
+            ),
         },
         payload,
         status,
@@ -833,7 +871,9 @@ def _parse_xhs_discovery_payload(payload: Any) -> Dict[str, Any]:
     return {
         "items": items,
         "next_cursor": next_cursor,
-        "has_more": _bool(page.get("has_more")),
+        "has_more": _discovery_has_more(
+            page, provider="TikHub Xiaohongshu", raw_response=payload
+        ),
     }
 
 
@@ -1794,6 +1834,7 @@ def _materialize_discovery_stages(
     discovery_operation: str,
     source_raw_response_id: int,
     db_path: Path,
+    materialize_detail: bool = True,
 ) -> Dict[str, Any]:
     """Persist fields already present in a paid discovery response at zero extra cost."""
 
@@ -1819,7 +1860,7 @@ def _materialize_discovery_stages(
     metrics_value = item.get("metrics")
     metrics = dict(metrics_value) if isinstance(metrics_value, Mapping) else {}
     stage_values: List[tuple[str, str, Dict[str, Any]]] = []
-    if media_urls:
+    if media_urls and materialize_detail:
         stage_values.append(
             (
                 "detail",
@@ -2040,6 +2081,9 @@ def discover_account_content(
     task_max_amount: Optional[float] = None,
     db_path: Path = DEFAULT_DB,
     call_override: Optional[Callable[[str, Mapping[str, Any]], ProviderResult]] = None,
+    materialize_discovery_detail: bool = True,
+    materialize_existing_discovery_stages: bool = True,
+    new_content_source_group: Optional[Callable[[str], str]] = None,
 ) -> Dict[str, Any]:
     if platform not in {"douyin", "xiaohongshu"}:
         return {
@@ -2247,15 +2291,18 @@ def discover_account_content(
     derived_already_succeeded = 0
     derived_skipped = 0
     derived_failures: List[Dict[str, Any]] = []
+    content_changes: List[Dict[str, Any]] = []
     page_items = [
         dict(item) for item in page_data.get("items") or [] if isinstance(item, Mapping)
     ]
     persisted_items: List[Dict[str, Any]] = []
+    missing_published_at_count = 0
     try:
         for item in page_items:
             published_iso = _timestamp_iso(item.get("published_at"))
             if published_start is not None or published_end is not None:
                 if published_iso is None:
+                    missing_published_at_count += 1
                     continue
                 published = datetime.fromisoformat(published_iso.replace("Z", "+00:00"))
                 if published_start is not None and published < published_start:
@@ -2265,24 +2312,53 @@ def discover_account_content(
             if published_iso is not None:
                 item["published_at"] = published_iso
             persisted_items.append(item)
+            source_group_on_insert = (
+                new_content_source_group(published_iso)
+                if new_content_source_group is not None
+                and published_iso is not None
+                else ""
+            )
             value = {
                 **dict(item),
                 "account_uid": uid,
                 "account_name": item.get("account_name") or identity["nickname"],
+                # 作品列表页的文本经常为空或截断版，只能补空，
+                # 不能覆盖已由详情/人工入库的富文本。
+                "_preserve_existing_content_fields": True,
             }
-            result = upsert_content(value, db_path=db_path)
+            result = upsert_content(
+                value,
+                db_path=db_path,
+                source_group_on_insert=source_group_on_insert,
+            )
             content_id = int(result["id"])
+            content_changes.append(
+                {"content_id": content_id, "action": str(result["action"])}
+            )
             inserted += int(result["action"] == "inserted")
             updated += int(result["action"] == "updated")
-            derived = _materialize_discovery_stages(
-                content_id=content_id,
-                item=item,
-                account_uid=uid,
-                metrics_window_key=target_day.isoformat(),
-                discovery_operation=operation,
-                source_raw_response_id=int(page_raw_response_id),
-                db_path=db_path,
-            )
+            if (
+                result["action"] == "inserted"
+                or materialize_existing_discovery_stages
+            ):
+                derived = _materialize_discovery_stages(
+                    content_id=content_id,
+                    item=item,
+                    account_uid=uid,
+                    metrics_window_key=target_day.isoformat(),
+                    discovery_operation=operation,
+                    source_raw_response_id=int(page_raw_response_id),
+                    db_path=db_path,
+                    materialize_detail=materialize_discovery_detail,
+                )
+            else:
+                derived = {
+                    "created": [],
+                    "replayed": [],
+                    "already_succeeded": [],
+                    "skipped": ["detail", "metrics"],
+                    "failed": [],
+                }
             derived_created += len(derived["created"])
             derived_replayed += len(derived["replayed"])
             derived_already_succeeded += len(derived["already_succeeded"])
@@ -2297,6 +2373,17 @@ def discover_account_content(
         )
         error.provider_cost = round(costs, 6)
         raise
+    if missing_published_at_count:
+        derived_failures.append(
+            {
+                "stage": "discovery",
+                "error_code": "missing_published_at",
+                "message": (
+                    f"{missing_published_at_count} items have no usable published_at; "
+                    "kept in raw response for quarantine/manual resolution"
+                ),
+            }
+        )
     if not derived_failures:
         _mark_raw_response_applied(int(page_raw_response_id), db_path=db_path)
     return {
@@ -2318,6 +2405,8 @@ def discover_account_content(
         "has_more": _bool(page_data.get("has_more")),
         "page_item_count": len(page_items),
         "persisted_item_count": len(persisted_items),
+        "missing_published_at_count": missing_published_at_count,
+        "content_changes": content_changes,
         "derived_stages": {
             "created": derived_created,
             "replayed": derived_replayed,
@@ -2772,6 +2861,17 @@ def update_content_data(
                 f"未知抓取阶段：{','.join(sorted(invalid))}"
             )
         requested_stages = [item for item in requested_stages if item[0] in requested]
+        if (
+            platform == "xiaohongshu"
+            and detail_ready
+            and {"detail", "metrics"}.issubset(requested)
+        ):
+            requested_stages.insert(0, ("detail", "lifetime"))
+    paired_xhs_detail_metrics = (
+        platform == "xiaohongshu"
+        and stages is not None
+        and {"detail", "metrics"}.issubset(set(stages))
+    )
     outcomes: List[Dict[str, Any]] = []
     xhs_detail_metrics: Optional[Mapping[str, Any]] = None
     xhs_detail_raw_response_id: Optional[int] = None
@@ -2849,6 +2949,43 @@ def update_content_data(
             succeeded_provider == "legacy-cache"
             or (raw_is_applied and storage_is_ready)
         ):
+            if paired_xhs_detail_metrics and stage == "detail":
+                try:
+                    outcome = _replay_content_stage(
+                        content,
+                        stage=stage,
+                        window_key=window_key,
+                        operation=STAGE_CONFIG[(platform, stage)][2],
+                        db_path=db_path,
+                    )
+                    _store_stage_result(
+                        content, stage, window_key, outcome, db_path=db_path
+                    )
+                    detail_metrics = outcome.data.get("metrics")
+                    if isinstance(detail_metrics, dict):
+                        xhs_detail_metrics = detail_metrics
+                        xhs_detail_raw_response_id = int(outcome.raw_response_id)
+                    outcomes.append(
+                        {
+                            "stage": stage,
+                            "status": "replayed",
+                            "billed": False,
+                            "amount": 0.0,
+                            "currency": "USD",
+                        }
+                    )
+                except Exception as exc:
+                    outcomes.append(
+                        {
+                            "stage": stage,
+                            "status": "failed",
+                            "error_code": getattr(
+                                exc, "error_code", type(exc).__name__
+                            ),
+                            "message": str(exc),
+                        }
+                    )
+                continue
             outcomes.append(
                 {
                     "stage": stage,
@@ -2899,6 +3036,17 @@ def update_content_data(
             and stage == "metrics"
             and xhs_detail_metrics is not None
         )
+        if paired_xhs_detail_metrics and stage == "metrics" and not derived_xhs_metrics:
+            outcomes.append(
+                {
+                    "stage": stage,
+                    "status": "failed",
+                    "error_code": "xhs_detail_metrics_missing",
+                    "retryable": False,
+                    "message": "小红书详情未返回可派生指标；未发起未报价的第二次调用",
+                }
+            )
+            continue
         budget_id = (
             None
             if derived_xhs_metrics
@@ -2963,9 +3111,65 @@ def update_content_data(
                 }
             )
         except SlotUnavailable as exc:
-            outcomes.append(
-                {"stage": stage, "status": "already_succeeded", "message": str(exc)}
+            with connect(db_path) as connection:
+                slot = connection.execute(
+                    """
+                    SELECT status,provider,last_error_code,last_error_message
+                    FROM fetch_slots
+                    WHERE content_id=? AND stage=? AND window_key=?
+                    """,
+                    (content_id, stage, window_key),
+                ).fetchone()
+            slot_status = str(slot["status"]) if slot is not None else "missing"
+            legacy_slot = (
+                slot is not None and str(slot["provider"]) == "legacy-cache"
             )
+            raw_is_applied = slot_status == "succeeded" and _slot_raw_is_applied(
+                content_id=content_id,
+                stage=stage,
+                window_key=window_key,
+                db_path=db_path,
+            )
+            storage_is_ready = stage == "detail" or _stage_storage_exists(
+                content_id=content_id,
+                platform=platform,
+                stage=stage,
+                window_key=window_key,
+                db_path=db_path,
+            )
+            if slot_status == "succeeded" and (
+                legacy_slot or (raw_is_applied and storage_is_ready)
+            ):
+                outcomes.append(
+                    {
+                        "stage": stage,
+                        "status": "already_succeeded",
+                        "message": str(exc),
+                    }
+                )
+            else:
+                outcomes.append(
+                    {
+                        "stage": stage,
+                        "status": "failed",
+                        "error_code": (
+                            str(slot["last_error_code"] or exc.error_code)
+                            if slot is not None
+                            else exc.error_code
+                        ),
+                        "retryable": slot_status in {
+                            "pending",
+                            "running",
+                            "retryable_failed",
+                        },
+                        "message": (
+                            str(slot["last_error_message"] or exc)
+                            if slot is not None
+                            else str(exc)
+                        ),
+                        "slot_status": slot_status,
+                    }
+                )
         except Exception as exc:
             error_code = getattr(exc, "error_code", type(exc).__name__)
             outcomes.append(

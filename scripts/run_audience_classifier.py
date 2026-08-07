@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Run audience-classifier-v1 over interaction users of recent contents.
+"""Run audience-classifier-v1 over interaction users in a fixed snapshot.
 
 ``automotive_user_rate`` 的分子 A 来自
 ``interaction_user_classification_versions``；这张表只有在分类器实际跑过之后
-才有数据。本脚本把最近 ``--days`` 天内发布内容的评论用户送入确定性规则分类器
+才有数据。本脚本把最近 ``--days`` 天内发布内容，或
+``--all-contents`` 选中的全部内容，其在固定 90 天证据窗内的评论用户送入确定性规则分类器
 （无付费调用、无网络请求），按证据指纹幂等写入版本行——重复执行安全。
 
 Dry-run by default (no writes). ``--apply`` persists classification rows.
@@ -97,11 +98,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=PROJECT_ROOT / "app" / "data" / "dcar_insight.sqlite3",
         help="sqlite database (default: app/data/dcar_insight.sqlite3)",
     )
-    parser.add_argument(
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument(
         "--days",
         type=int,
         default=30,
         help="classify users of contents published in the last N days (default 30)",
+    )
+    scope.add_argument(
+        "--all-contents",
+        action="store_true",
+        help="classify users across every content published before the snapshot",
+    )
+    parser.add_argument(
+        "--snapshot-end",
+        help="fixed timezone-aware snapshot end; defaults to the current UTC time",
     )
     parser.add_argument(
         "--apply",
@@ -111,23 +122,51 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not args.db.exists():
         raise SystemExit(f"database not found: {args.db}")
+    if int(args.days) <= 0:
+        parser.error("--days must be positive")
 
-    now = datetime.now(timezone.utc)
-    window_start = _utc_text(now - timedelta(days=int(args.days)))
+    actual_now = datetime.now(timezone.utc)
+    if args.snapshot_end:
+        try:
+            now = datetime.fromisoformat(args.snapshot_end.replace("Z", "+00:00"))
+        except ValueError as exc:
+            parser.error(f"invalid --snapshot-end: {exc}")
+        if now.tzinfo is None:
+            parser.error("--snapshot-end must include a timezone")
+        now = now.astimezone(timezone.utc)
+        if now > actual_now + timedelta(minutes=1):
+            parser.error("--snapshot-end cannot be in the future")
+    else:
+        now = actual_now
+    window_start = (
+        None if args.all_contents
+        else _utc_text(now - timedelta(days=int(args.days)))
+    )
 
     connection = connect(args.db.resolve())
     try:
-        content_ids = [
-            int(row["id"])
-            for row in connection.execute(
+        if args.all_contents:
+            content_rows = connection.execute(
+                "SELECT id FROM content_items"
+                " WHERE published_at IS NULL OR published_at < ?"
+                " ORDER BY id",
+                (_utc_text(now),),
+            )
+        else:
+            content_rows = connection.execute(
                 "SELECT id FROM content_items"
                 " WHERE published_at >= ? AND published_at < ?"
                 " ORDER BY id",
                 (window_start, _utc_text(now)),
             )
-        ]
+        content_ids = [int(row["id"]) for row in content_rows]
         runs = []
-        for end_dt in _overview_window_ends(now):
+        # A full-corpus backfill is a current retrospective snapshot, not a
+        # reconstruction of yesterday/last week.  Newly captured evidence did
+        # not exist at those historical report cutoffs, so emitting backdated
+        # classification rows would be unusable and misleading.
+        snapshot_ends = [now] if args.all_contents else _overview_window_ends(now)
+        for end_dt in snapshot_ends:
             end_text = _utc_text(end_dt)
             summary = classify_window(
                 connection,
@@ -136,6 +175,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     end_dt - timedelta(days=EVIDENCE_WINDOW_DAYS)
                 ),
                 evidence_window_end=end_text,
+                report_cutoff_at=end_text,
                 persist=bool(args.apply),
             )
             runs.append(
@@ -150,7 +190,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "ok": True,
             "mode": "apply" if args.apply else "dry_run",
             "db": str(args.db),
+            "content_scope": (
+                "all_contents_as_of_snapshot" if args.all_contents else "recent_contents"
+            ),
             "content_window_start": window_start,
+            "snapshot_end": _utc_text(now),
             "content_count": len(content_ids),
             "snapshot_runs": runs,
         }

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
@@ -240,6 +242,10 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
         self.assertEqual([int(row["content_id"]) for row in queue], [fresh])
 
     def test_discovery_backfill_tags_scopes_with_workers_and_compact(self) -> None:
+        preexisting_unevaluated = self._insert_content(
+            "454545454", "2025-03-01T01:00:00Z"
+        )
+
         def discovery_call(operation, identity):
             if operation == "resolve_account":
                 return ProviderResult(
@@ -256,6 +262,7 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
                     "title": "近月内容", "body": "汽车内容",
                     "published_at": "2026-08-01T01:00:00Z",
                     "content_type": "video",
+                    "media_urls": ["https://media.example.com/video.mp4"],
                     "account_uid": "99887766", "account_name": "汽车号",
                 },
                 {
@@ -281,16 +288,19 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
             db_path=self.db, platforms=["douyin"],
             call_override=discovery_call, state_root=self.state,
             archive_before=self.archive_before, workers=2, compact=True,
+            require_live_detail=True,
         )
         self.assertEqual(result["status"], "succeeded")
         self.assertEqual(result["accounts_completed"], 1)
         self.assertEqual(result["inserted"], 2)
         self.assertIn("history_scopes", result)
+        self.assertEqual(result["content_manifest"]["first_inserted"], 2)
+        self.assertEqual(result["history_scopes"]["restricted_content_ids"], 2)
         self.assertEqual(
             result["history_scopes"]["segments"][HISTORY_ARCHIVE_SOURCE_GROUP][
                 "applied"
             ],
-            1,
+            0,
         )
         account_summary = result["results"][0]
         self.assertNotIn("pages", account_summary)
@@ -306,6 +316,25 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
             }
         self.assertEqual(groups["121212121"], HISTORY_BACKFILL_SOURCE_GROUP)
         self.assertEqual(groups["343434343"], HISTORY_ARCHIVE_SOURCE_GROUP)
+        self.assertEqual(self._source_group(preexisting_unevaluated), "")
+        with connect(self.db) as connection:
+            derived_detail_slots = connection.execute(
+                """
+                SELECT COUNT(*) FROM fetch_slots
+                WHERE content_id=(
+                    SELECT id FROM content_items WHERE platform_content_id='121212121'
+                ) AND stage='detail' AND window_key='lifetime'
+                """
+            ).fetchone()[0]
+        self.assertEqual(int(derived_detail_slots), 0)
+        manifest = json.loads(
+            Path(result["content_manifest"]["path"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(len(manifest["contents"]), 2)
+        self.assertEqual(
+            {entry["first_action"] for entry in manifest["contents"]},
+            {"inserted"},
+        )
 
     def test_local_evidence_tagged_only_clears_tag_on_success(self) -> None:
         archived = self._insert_content("101010101", "2025-06-01T01:00:00Z")
@@ -324,9 +353,14 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
             "v8.range_backfill.process_content_media",
             return_value={"status": "evidence_ready"},
         ), patch(
-            "v8.range_backfill.refresh_content_duplicates",
-            return_value={"status": "succeeded"},
-        ):
+            "v8.range_backfill.evaluate_content",
+            return_value=SimpleNamespace(
+                evaluation_id=101, created=True, evidence_level="V2"
+            ),
+        ) as evaluate, patch(
+            "v8.range_backfill.fingerprint_content",
+            return_value={"source_sha256": "fingerprint"},
+        ) as fingerprint:
             result = run_local_evidence_backfill(
                 start=self.start, end=self.end, task_id="local-evidence-test",
                 max_amount=1.0, db_path=self.db, limit=10, state_root=self.state,
@@ -336,18 +370,14 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
         self.assertEqual(result["tags_cleared"], 1)
         self.assertEqual(self._source_group(pending), "")
         self.assertEqual(self._source_group(archived), HISTORY_ARCHIVE_SOURCE_GROUP)
-        with connect(self.db) as connection:
-            evaluated = connection.execute(
-                "SELECT COUNT(*) FROM evaluation_versions WHERE content_id=?",
-                (pending,),
-            ).fetchone()[0]
-        self.assertEqual(int(evaluated), 1)
+        self.assertEqual(evaluate.call_count, 1)
+        self.assertEqual(fingerprint.call_count, 1)
         with patch(
             "v8.range_backfill.process_content_media",
             return_value={"status": "evidence_ready"},
         ), patch(
-            "v8.range_backfill.refresh_content_duplicates",
-            return_value={"status": "succeeded"},
+            "v8.range_backfill.fingerprint_content",
+            return_value={"source_sha256": "fingerprint"},
         ):
             again = run_local_evidence_backfill(
                 start=self.start, end=self.end, task_id="local-evidence-test",
@@ -355,6 +385,42 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
                 tagged_only=True,
             )
         self.assertEqual(again["candidates"], 0)
+
+    def test_local_evidence_keeps_tag_when_evidence_is_below_v2(self) -> None:
+        pending = self._insert_content("212121213", "2026-08-01T01:00:00Z")
+        with connect(self.db) as connection:
+            connection.execute(
+                "UPDATE content_items SET source_group=? WHERE id=?",
+                (HISTORY_BACKFILL_SOURCE_GROUP, pending),
+            )
+            connection.commit()
+
+        with patch(
+            "v8.range_backfill.process_content_media",
+            return_value={"status": "evidence_ready"},
+        ), patch(
+            "v8.range_backfill.evaluate_content",
+            return_value=SimpleNamespace(
+                evaluation_id=102, created=True, evidence_level="V1"
+            ),
+        ), patch("v8.range_backfill.fingerprint_content") as fingerprint:
+            result = run_local_evidence_backfill(
+                start=self.start,
+                end=self.end,
+                task_id="local-evidence-v1",
+                max_amount=1.0,
+                db_path=self.db,
+                limit=10,
+                state_root=self.state,
+                tagged_only=True,
+            )
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["failed"], 1)
+        self.assertEqual(result["tags_cleared"], 0)
+        self.assertEqual(self._source_group(pending), HISTORY_BACKFILL_SOURCE_GROUP)
+        fingerprint.assert_not_called()
+        self.assertIn("V1", result["results"][0]["error"])
 
     def test_local_evidence_keeps_tag_when_media_source_is_missing(self) -> None:
         pending = self._insert_content("212121212", "2026-08-01T01:00:00Z")
@@ -451,6 +517,131 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
         self.assertEqual(missing["status"], "partial")
         self.assertEqual(missing["accounts_completed"], 0)
         self.assertEqual(missing["stopped_reason"], "missing_next_cursor")
+
+        repeated_end = datetime(2026, 8, 5, 0, 0, tzinfo=SHANGHAI)
+
+        def repeated_cursor_call(operation, identity):
+            result = page_limit_call(operation, identity)
+            if operation == "discover_content":
+                result.data["next_cursor"] = "same-cursor"
+            return result
+
+        repeated = run_discovery_backfill(
+            start=datetime(2010, 1, 3, 0, 0, tzinfo=SHANGHAI),
+            end=repeated_end,
+            task_id="repeated-cursor-test",
+            max_amount=1.0,
+            db_path=self.db,
+            platforms=["douyin"],
+            call_override=repeated_cursor_call,
+            state_root=self.state,
+            max_pages_per_account=4,
+        )
+        self.assertEqual(repeated["status"], "partial")
+        self.assertEqual(repeated["accounts_completed"], 0)
+        self.assertEqual(repeated["stopped_reason"], "cursor_repeated")
+
+    def test_discovery_does_not_blank_existing_rich_content(self) -> None:
+        existing = self._insert_content("242424242", "2026-08-01T01:00:00Z")
+
+        def discovery_call(operation, identity):
+            if operation == "resolve_account":
+                return ProviderResult(
+                    {"reference": "MS4wLjAB" + "x" * 40},
+                    {"reference": "profile"},
+                    200,
+                    True,
+                )
+            item = {
+                "platform": "douyin",
+                "platform_content_id": "242424242",
+                "canonical_url": "https://www.douyin.com/video/242424242",
+                "title": "",
+                "body": "",
+                "published_at": "2026-08-01T01:00:00Z",
+                "content_type": "video",
+                "metrics": {"view_count": 0, "like_count": 10},
+                "account_uid": str(identity["uid"]),
+                "account_name": "汽车号",
+            }
+            return ProviderResult(
+                {"items": [item], "next_cursor": None, "has_more": False},
+                {"items": [item]},
+                200,
+                True,
+            )
+
+        result = run_discovery_backfill(
+            start=self.start,
+            end=self.end,
+            task_id="preserve-rich-content-test",
+            max_amount=1.0,
+            db_path=self.db,
+            platforms=["douyin"],
+            call_override=discovery_call,
+            state_root=self.state,
+            skip_existing_derived_stages=True,
+        )
+
+        self.assertEqual(result["status"], "succeeded")
+        with connect(self.db) as connection:
+            row = connection.execute(
+                "SELECT title,body FROM content_items WHERE id=?", (existing,)
+            ).fetchone()
+        self.assertEqual(row["title"], "汽车保养知识")
+        self.assertEqual(row["body"], "教你判断刹车故障")
+        with connect(self.db) as connection:
+            snapshots = connection.execute(
+                "SELECT COUNT(*) FROM content_metric_snapshots WHERE content_id=?",
+                (existing,),
+            ).fetchone()[0]
+        self.assertEqual(int(snapshots), 0)
+
+    def test_discovery_missing_published_at_is_partial_not_silent_drop(self) -> None:
+        def discovery_call(operation, identity):
+            if operation == "resolve_account":
+                return ProviderResult(
+                    {"reference": "MS4wLjAB" + "x" * 40},
+                    {"reference": "profile"},
+                    200,
+                    True,
+                )
+            item = {
+                "platform": "douyin",
+                "platform_content_id": "252525252",
+                "canonical_url": "https://www.douyin.com/video/252525252",
+                "title": "缺时间内容",
+                "body": "",
+                "published_at": None,
+                "content_type": "video",
+                "account_uid": str(identity["uid"]),
+                "account_name": "汽车号",
+            }
+            return ProviderResult(
+                {"items": [item], "next_cursor": None, "has_more": False},
+                {"items": [item]},
+                200,
+                True,
+            )
+
+        result = run_discovery_backfill(
+            start=datetime(2010, 1, 4, 0, 0, tzinfo=SHANGHAI),
+            end=datetime(2026, 8, 4, 0, 0, tzinfo=SHANGHAI),
+            task_id="missing-published-test",
+            max_amount=1.0,
+            db_path=self.db,
+            platforms=["douyin"],
+            call_override=discovery_call,
+            state_root=self.state,
+        )
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["failed_pages"], 1)
+        self.assertEqual(result["inserted"], 0)
+        self.assertEqual(
+            result["results"][0]["pages"][0]["missing_published_at_count"],
+            1,
+        )
 
     def test_local_evidence_default_scope_excludes_archive(self) -> None:
         archived = self._insert_content("303030303", "2026-08-01T01:00:00Z")
@@ -607,6 +798,21 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
         self.assertEqual(
             summary["estimated_costs_usd"]["douyin_comments"], 0.003
         )
+
+    def test_unknown_comment_count_quotes_lower_and_safe_upper_bounds(self) -> None:
+        self._insert_content("737373738", "2026-08-01T01:00:00Z")
+
+        summary = summarize_range_status(
+            start=self.start, end=self.end, db_path=self.db,
+            archive_before=self.archive_before,
+        )
+        costs = summary["estimated_costs_usd"]
+
+        self.assertEqual(costs["comment_declared_unknown"]["douyin"], 1)
+        self.assertEqual(costs["comment_pages_lower"]["douyin"], 1)
+        self.assertEqual(costs["comment_pages_upper"]["douyin"], 50)
+        self.assertEqual(costs["douyin_comments_lower"], 0.001)
+        self.assertEqual(costs["douyin_comments"], 0.05)
 
 
 if __name__ == "__main__":

@@ -395,6 +395,20 @@ class V8ProviderUpdateTest(unittest.TestCase):
         self.assertEqual(outcome.data["items"][0]["metrics"]["view_count"], 456)
         self.assertEqual(outcome.data["items"][0]["metrics"]["comment_count"], 23)
 
+    def test_discovery_parsers_fail_closed_when_has_more_is_missing(self) -> None:
+        douyin_payload = {"code": 200, "data": {"aweme_list": []}}
+        with self.assertRaises(CaptureError) as douyin_error:
+            _parse_douyin_discovery_payload(douyin_payload)
+        self.assertEqual(douyin_error.exception.error_code, "invalid_response")
+
+        xhs_payload = {
+            "code": 200,
+            "data": {"data": {"data": {"notes": []}}},
+        }
+        with self.assertRaises(CaptureError) as xhs_error:
+            _parse_xhs_discovery_payload(xhs_payload)
+        self.assertEqual(xhs_error.exception.error_code, "invalid_response")
+
     def test_douyin_http_200_business_error_is_not_an_empty_success(self) -> None:
         payload = {
             "code": 200,
@@ -1028,6 +1042,41 @@ class V8ProviderUpdateTest(unittest.TestCase):
         self.assertEqual(budget["consumed_requests"], 0)
         self.assertEqual(budget["consumed_amount"], 0)
 
+    def test_terminal_content_slot_remains_partial_on_resume(self) -> None:
+        captured_at = now_utc()
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                INSERT INTO fetch_slots(
+                    content_id,stage,window_key,provider,adapter_version,status,
+                    attempt_count,last_error_code,last_error_message,
+                    created_at,updated_at,finished_at
+                ) VALUES (?, 'detail', 'lifetime', 'TikHub', 'test-v1',
+                          'terminal_failed', 1, 'content_unavailable',
+                          'provider says content unavailable', ?, ?, ?)
+                """,
+                (self.content_id, captured_at, captured_at, captured_at),
+            )
+            connection.commit()
+
+        def no_provider_call(stage, content):
+            raise AssertionError(f"unexpected provider call: {stage}")
+
+        for _ in range(2):
+            result = update_content_data(
+                self.content_id,
+                db_path=self.db,
+                call_override=no_provider_call,
+                stages=["detail"],
+                process_media=False,
+            )
+            self.assertEqual(result["status"], "partial")
+            self.assertEqual(result["stages"][0]["status"], "failed")
+            self.assertEqual(
+                result["stages"][0]["error_code"], "content_unavailable"
+            )
+            self.assertEqual(result["stages"][0]["slot_status"], "terminal_failed")
+
     def test_account_discovery_caches_provider_reference_and_upserts_new_content(
         self,
     ) -> None:
@@ -1070,7 +1119,8 @@ class V8ProviderUpdateTest(unittest.TestCase):
                                 "collect_count": 11,
                             },
                         }
-                    ]
+                    ],
+                    "has_more": False,
                 },
                 {
                     "data": {
@@ -1086,7 +1136,8 @@ class V8ProviderUpdateTest(unittest.TestCase):
                                 },
                                 "statistics": {"play_count": 1000},
                             }
-                        ]
+                        ],
+                        "has_more": 0,
                     },
                 },
                 200,
@@ -2148,6 +2199,79 @@ class V8ProviderUpdateTest(unittest.TestCase):
             ],
         )
         self.assertEqual([row["provider"] for row in raws], ["TikHub", "TikHub"])
+        self.assertAlmostEqual(float(usage["amount"]), 0.01)
+
+    def test_xhs_metrics_resume_replays_successful_detail_without_second_call(
+        self,
+    ) -> None:
+        content = upsert_content(
+            {
+                "platform": "xiaohongshu",
+                "platform_content_id": "66abcdef1234567890abcdef",
+                "canonical_url": "https://www.xiaohongshu.com/explore/66abcdef1234567890abcdef",
+                "title": "中断续跑",
+                "content_type": "image",
+            },
+            db_path=self.db,
+        )
+        calls: list[str] = []
+
+        def detail_call(stage, current):
+            calls.append(stage)
+            data = {
+                "title": "详情先成功",
+                "body": "随后在指标派生前中断",
+                "published_at": "2026-08-01T04:00:00Z",
+                "content_type": "image",
+                "media_urls": [],
+                "metrics": {
+                    "view_count": 321,
+                    "comment_count": 12,
+                    "like_count": 45,
+                    "share_count": 6,
+                    "collect_count": 7,
+                },
+            }
+            return ProviderResult(data, {"stage": stage, "data": data}, 200, True)
+
+        first = update_content_data(
+            int(content["id"]),
+            as_of=date(2026, 8, 2),
+            db_path=self.db,
+            call_override=detail_call,
+            stages=["detail"],
+            process_media=False,
+        )
+        self.assertEqual(first["provider_cost"], 0.01)
+        self.assertEqual(calls, ["detail"])
+
+        def no_provider_call(stage, current):
+            raise AssertionError(f"unexpected provider call: {stage}")
+
+        resumed = update_content_data(
+            int(content["id"]),
+            as_of=date(2026, 8, 2),
+            db_path=self.db,
+            call_override=no_provider_call,
+            stages=["detail", "metrics"],
+            process_media=False,
+        )
+        self.assertEqual(resumed["status"], "succeeded")
+        self.assertEqual(resumed["provider_cost"], 0.0)
+        self.assertEqual(
+            [(item["stage"], item["status"]) for item in resumed["stages"]],
+            [("detail", "replayed"), ("metrics", "succeeded")],
+        )
+        with connect(self.db) as connection:
+            snapshot = connection.execute(
+                "SELECT view_count FROM content_metric_snapshots WHERE content_id=?",
+                (content["id"],),
+            ).fetchone()
+            usage = connection.execute(
+                "SELECT COUNT(*) count,SUM(amount) amount FROM provider_usage"
+            ).fetchone()
+        self.assertEqual(snapshot["view_count"], 321)
+        self.assertEqual(usage["count"], 1)
         self.assertAlmostEqual(float(usage["amount"]), 0.01)
 
     def test_detail_persists_media_source_and_update_data_runs_local_media(

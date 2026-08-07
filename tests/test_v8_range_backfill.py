@@ -358,6 +358,22 @@ class V8RangeBackfillTest(unittest.TestCase):
             connection.commit()
             slot_id = int(slot.lastrowid)
 
+        scoped_before_tag = repair_discovery_placeholder_metrics(
+            start=self.start,
+            end=self.end,
+            as_of=self.end,
+            db_path=self.db,
+            platforms=["douyin"],
+            history_only=True,
+        )
+        self.assertEqual(scoped_before_tag["candidates"], 0)
+        with connect(self.db) as connection:
+            connection.execute(
+                "UPDATE content_items SET source_group='history-backfill' WHERE id=?",
+                (content["id"],),
+            )
+            connection.commit()
+
         dry_run = repair_discovery_placeholder_metrics(
             start=self.start, end=self.end, as_of=self.end,
             db_path=self.db, platforms=["douyin"],
@@ -417,13 +433,13 @@ class V8RangeBackfillTest(unittest.TestCase):
             start=self.start, end=self.end, as_of=self.end,
             task_id=task_id, max_amount=0.01, db_path=self.db,
             platforms=["douyin"], call_override=statistics_call,
-            state_root=self.state,
+            state_root=self.state, history_only=True,
         )
         second_fetch = run_repaired_metrics_backfill(
             start=self.start, end=self.end, as_of=self.end,
             task_id=task_id, max_amount=0.01, db_path=self.db,
             platforms=["douyin"], call_override=statistics_call,
-            state_root=self.state,
+            state_root=self.state, history_only=True,
         )
         self.assertEqual(calls, ["metrics"])
         self.assertEqual(fetched["usage"]["amount"], 0.001)
