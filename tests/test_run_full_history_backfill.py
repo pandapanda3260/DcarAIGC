@@ -75,6 +75,33 @@ class FullHistoryWrapperTest(unittest.TestCase):
             )
         self.assertEqual(command.call_count, 2)
 
+    def test_preflight_uses_provider_user_agent_and_redacts_balance(self) -> None:
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            @staticmethod
+            def read() -> bytes:
+                return b'{"data":{"balance":12.34}}'
+
+        with tempfile.TemporaryDirectory() as temporary:
+            key_file = Path(temporary) / "TikHub.env.local"
+            key_file.write_text("TIKHUB_API_KEY=test-secret\n", encoding="utf-8")
+            with patch.object(runner, "TIKHUB_KEY_FILE", key_file), patch(
+                "urllib.request.urlopen", return_value=Response()
+            ) as urlopen, patch.object(runner, "log") as log:
+                runner.phase_preflight()
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.get_header("User-agent"), "DCar-Insight-v8/1.0")
+        self.assertEqual(request.get_header("Accept"), "application/json")
+        self.assertNotIn("12.34", " ".join(str(call) for call in log.call_args_list))
+
     def test_campaign_scope_baseline_rejects_preexisting_queue(self) -> None:
         state: dict = {}
         with patch.object(

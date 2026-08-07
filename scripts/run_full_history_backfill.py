@@ -439,7 +439,12 @@ def phase_preflight() -> None:
     if not key:
         raise AbortRun("密钥文件缺少 TIKHUB_API_KEY 变量")
     request = urllib.request.Request(
-        TIKHUB_USER_INFO, headers={"Authorization": f"Bearer {key}"}
+        TIKHUB_USER_INFO,
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Accept": "application/json",
+            "User-Agent": "DCar-Insight-v8/1.0",
+        },
     )
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
