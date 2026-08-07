@@ -1,0 +1,508 @@
+from __future__ import annotations
+
+import tempfile
+import unittest
+from datetime import datetime
+from pathlib import Path
+from unittest.mock import patch
+from zoneinfo import ZoneInfo
+
+from v8.capture import ProviderResult
+from v8.evaluation import evaluate_content, incremental_candidates
+from v8.matcher_dsl import POINT_IDS, POINT_SCENES
+from v8.operations import upsert_account, upsert_content
+from v8.range_backfill import (
+    RangeBackfillError,
+    _process_content_batch,
+    pending_content_ids,
+    run_content_backfill,
+    run_discovery_backfill,
+    run_local_evidence_backfill,
+    summarize_range_status,
+    tag_history_scopes,
+)
+from v8.scheduler import run_media_cutoff
+from v8.storage import (
+    HISTORY_ARCHIVE_SOURCE_GROUP,
+    HISTORY_BACKFILL_SOURCE_GROUP,
+    connect,
+    initialize_database,
+    now_utc,
+)
+from v8.taxonomy_rule_backfill import backfill_v5_1_matcher_rules
+
+
+SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+class V8HistoryBackfillScopeTest(unittest.TestCase):
+    """全量历史回溯的分组标记、防洪闸门与批处理语义。"""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.db = self.root / "history.sqlite3"
+        self.state = self.root / "state"
+        with connect(self.db) as connection:
+            initialize_database(connection)
+            captured_at = now_utc()
+            connection.execute(
+                """
+                INSERT INTO taxonomy_versions(
+                    id, version, status, definition, created_at, published_at
+                ) VALUES ('taxonomy', 'selling-points-v5.0', 'published', 'test', ?, ?)
+                """,
+                (captured_at, captured_at),
+            )
+            for code in sorted(POINT_IDS):
+                point = connection.execute(
+                    """
+                    INSERT INTO selling_points(
+                        taxonomy_id,code,tier,label,definition,matcher_rule_json
+                    ) VALUES ('taxonomy',?,'other',?,?,'{}')
+                    """,
+                    (code, f"卖点 {code}", f"定义 {code}"),
+                )
+                for scene in sorted(POINT_SCENES[code]):
+                    connection.execute(
+                        """
+                        INSERT INTO selling_point_scenes(selling_point_id,scene)
+                        VALUES (?,?)
+                        """,
+                        (point.lastrowid, scene),
+                    )
+            connection.commit()
+        matcher = backfill_v5_1_matcher_rules(db_path=self.db)
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                UPDATE taxonomy_versions SET status='retired'
+                WHERE version='selling-points-v5.0'
+                """
+            )
+            connection.execute(
+                """
+                UPDATE taxonomy_versions SET status='published',published_at=?
+                WHERE version='selling-points-v5.1'
+                """,
+                (now_utc(),),
+            )
+            connection.execute(
+                """
+                INSERT INTO evaluation_releases(
+                    id,rule_version,taxonomy_version,matcher_rule_sha256,status,
+                    created_at,updated_at,activated_at
+                ) VALUES ('evaluation-v8__selling-points-v5.1','evaluation-v8',
+                          'selling-points-v5.1',?,'active',?,?,?)
+                """,
+                (matcher["matcher_rule_sha256"], now_utc(), now_utc(), now_utc()),
+            )
+            connection.commit()
+        upsert_account(
+            {
+                "phone": "13800138000",
+                "platforms": [
+                    {"platform": "douyin", "uid": "99887766", "nickname": "汽车号"},
+                ],
+            },
+            db_path=self.db,
+        )
+        self.start = datetime(2010, 1, 1, 0, 0, tzinfo=SHANGHAI)
+        self.end = datetime(2026, 8, 7, 0, 0, tzinfo=SHANGHAI)
+        self.archive_before = datetime(2026, 2, 7, 0, 0, tzinfo=SHANGHAI)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def _insert_content(self, content_id: str, published_at: str) -> int:
+        result = upsert_content(
+            {
+                "platform": "douyin",
+                "platform_content_id": content_id,
+                "canonical_url": f"https://www.douyin.com/video/{content_id}",
+                "title": "汽车保养知识",
+                "body": "教你判断刹车故障",
+                "published_at": published_at,
+                "content_type": "video",
+                "account_uid": "99887766",
+                "account_name": "汽车号",
+            },
+            db_path=self.db,
+        )
+        return int(result["id"])
+
+    def _source_group(self, content_id: int) -> str:
+        with connect(self.db) as connection:
+            row = connection.execute(
+                "SELECT source_group FROM content_items WHERE id=?", (content_id,)
+            ).fetchone()
+        return str(row["source_group"])
+
+    def test_tag_history_scopes_segments_and_protects_existing_rows(self) -> None:
+        archived = self._insert_content("111111111", "2025-06-01T01:00:00Z")
+        pending = self._insert_content("222222222", "2026-08-01T01:00:00Z")
+        evaluated = self._insert_content("333333333", "2025-05-01T01:00:00Z")
+        evaluate_content(evaluated, db_path=self.db)
+        manual = self._insert_content("444444444", "2025-04-01T01:00:00Z")
+        with connect(self.db) as connection:
+            connection.execute(
+                "UPDATE content_items SET source_group='manual-import' WHERE id=?",
+                (manual,),
+            )
+            connection.commit()
+
+        dry = tag_history_scopes(
+            start=self.start, end=self.end, archive_before=self.archive_before,
+            db_path=self.db,
+        )
+        self.assertEqual(dry["status"], "dry_run")
+        self.assertEqual(
+            dry["segments"][HISTORY_ARCHIVE_SOURCE_GROUP]["candidates"], 1
+        )
+        self.assertEqual(
+            dry["segments"][HISTORY_BACKFILL_SOURCE_GROUP]["candidates"], 1
+        )
+        self.assertEqual(self._source_group(archived), "")
+
+        applied = tag_history_scopes(
+            start=self.start, end=self.end, archive_before=self.archive_before,
+            db_path=self.db, apply_changes=True,
+        )
+        self.assertEqual(
+            applied["segments"][HISTORY_ARCHIVE_SOURCE_GROUP]["applied"], 1
+        )
+        self.assertEqual(
+            applied["segments"][HISTORY_BACKFILL_SOURCE_GROUP]["applied"], 1
+        )
+        self.assertEqual(self._source_group(archived), HISTORY_ARCHIVE_SOURCE_GROUP)
+        self.assertEqual(self._source_group(pending), HISTORY_BACKFILL_SOURCE_GROUP)
+        self.assertEqual(self._source_group(evaluated), "")
+        self.assertEqual(self._source_group(manual), "manual-import")
+
+        repeated = tag_history_scopes(
+            start=self.start, end=self.end, archive_before=self.archive_before,
+            db_path=self.db, apply_changes=True,
+        )
+        self.assertEqual(
+            repeated["segments"][HISTORY_ARCHIVE_SOURCE_GROUP]["candidates"], 0
+        )
+        self.assertEqual(
+            repeated["segments"][HISTORY_BACKFILL_SOURCE_GROUP]["candidates"], 0
+        )
+
+    def test_incremental_candidates_skip_tagged_until_cleared(self) -> None:
+        tagged = self._insert_content("555555555", "2025-06-01T01:00:00Z")
+        normal = self._insert_content("666666666", "2026-08-01T01:00:00Z")
+        with connect(self.db) as connection:
+            connection.execute(
+                "UPDATE content_items SET source_group=? WHERE id=?",
+                (HISTORY_ARCHIVE_SOURCE_GROUP, tagged),
+            )
+            connection.commit()
+        self.assertEqual(incremental_candidates(db_path=self.db), [normal])
+        with connect(self.db) as connection:
+            connection.execute(
+                "UPDATE content_items SET source_group='' WHERE id=?", (tagged,)
+            )
+            connection.commit()
+        self.assertEqual(
+            incremental_candidates(db_path=self.db), sorted([tagged, normal])
+        )
+
+    def test_media_cutoff_ignores_history_scoped_ingest(self) -> None:
+        fresh = self._insert_content("777777777", "2026-08-01T10:00:00Z")
+        archived = self._insert_content("888888888", "2020-05-01T01:00:00Z")
+        backfilled = self._insert_content("999999999", "2026-07-01T01:00:00Z")
+        with connect(self.db) as connection:
+            for content_id, group in (
+                (archived, HISTORY_ARCHIVE_SOURCE_GROUP),
+                (backfilled, HISTORY_BACKFILL_SOURCE_GROUP),
+            ):
+                connection.execute(
+                    "UPDATE content_items SET source_group=? WHERE id=?",
+                    (group, content_id),
+                )
+            connection.execute(
+                "UPDATE content_items SET imported_at='2026-08-02T01:00:00Z'"
+            )
+            connection.commit()
+        result = run_media_cutoff(
+            datetime(2026, 8, 2, 7, 30, tzinfo=SHANGHAI), db_path=self.db
+        )
+        self.assertEqual(result["candidates"], 1)
+        with connect(self.db) as connection:
+            queue = connection.execute(
+                """
+                SELECT content_id FROM review_queue
+                WHERE reason_code='media_processing_incomplete'
+                """
+            ).fetchall()
+        self.assertEqual([int(row["content_id"]) for row in queue], [fresh])
+
+    def test_discovery_backfill_tags_scopes_with_workers_and_compact(self) -> None:
+        def discovery_call(operation, identity):
+            if operation == "resolve_account":
+                return ProviderResult(
+                    {"reference": "MS4wLjAB" + "x" * 40},
+                    {"reference": "profile"},
+                    200,
+                    True,
+                )
+            items = [
+                {
+                    "platform": "douyin",
+                    "platform_content_id": "121212121",
+                    "canonical_url": "https://www.douyin.com/video/121212121",
+                    "title": "近月内容", "body": "汽车内容",
+                    "published_at": "2026-08-01T01:00:00Z",
+                    "content_type": "video",
+                    "account_uid": "99887766", "account_name": "汽车号",
+                },
+                {
+                    "platform": "douyin",
+                    "platform_content_id": "343434343",
+                    "canonical_url": "https://www.douyin.com/video/343434343",
+                    "title": "远古内容", "body": "汽车内容",
+                    "published_at": "2024-03-01T01:00:00Z",
+                    "content_type": "video",
+                    "account_uid": "99887766", "account_name": "汽车号",
+                },
+            ]
+            return ProviderResult(
+                {"items": items, "next_cursor": None, "has_more": False},
+                {"items": items},
+                200,
+                True,
+            )
+
+        result = run_discovery_backfill(
+            start=self.start, end=self.end,
+            task_id="full-history-test", max_amount=1.0,
+            db_path=self.db, platforms=["douyin"],
+            call_override=discovery_call, state_root=self.state,
+            archive_before=self.archive_before, workers=2, compact=True,
+        )
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["inserted"], 2)
+        self.assertIn("history_scopes", result)
+        self.assertEqual(
+            result["history_scopes"]["segments"][HISTORY_ARCHIVE_SOURCE_GROUP][
+                "applied"
+            ],
+            1,
+        )
+        account_summary = result["results"][0]
+        self.assertNotIn("pages", account_summary)
+        self.assertEqual(account_summary["pages_processed"], 1)
+        with connect(self.db) as connection:
+            groups = {
+                str(row["platform_content_id"]): str(row["source_group"])
+                for row in connection.execute(
+                    "SELECT platform_content_id, source_group FROM content_items"
+                )
+            }
+        self.assertEqual(groups["121212121"], HISTORY_BACKFILL_SOURCE_GROUP)
+        self.assertEqual(groups["343434343"], HISTORY_ARCHIVE_SOURCE_GROUP)
+
+    def test_local_evidence_tagged_only_clears_tag_on_success(self) -> None:
+        archived = self._insert_content("101010101", "2025-06-01T01:00:00Z")
+        pending = self._insert_content("202020202", "2026-08-01T01:00:00Z")
+        with connect(self.db) as connection:
+            connection.execute(
+                "UPDATE content_items SET source_group=? WHERE id=?",
+                (HISTORY_ARCHIVE_SOURCE_GROUP, archived),
+            )
+            connection.execute(
+                "UPDATE content_items SET source_group=? WHERE id=?",
+                (HISTORY_BACKFILL_SOURCE_GROUP, pending),
+            )
+            connection.commit()
+        with patch(
+            "v8.range_backfill.refresh_content_duplicates",
+            return_value={"status": "succeeded"},
+        ):
+            result = run_local_evidence_backfill(
+                start=self.start, end=self.end, task_id="local-evidence-test",
+                max_amount=1.0, db_path=self.db, limit=10, state_root=self.state,
+                tagged_only=True,
+            )
+        self.assertEqual(result["candidates"], 1)
+        self.assertEqual(result["tags_cleared"], 1)
+        self.assertEqual(self._source_group(pending), "")
+        self.assertEqual(self._source_group(archived), HISTORY_ARCHIVE_SOURCE_GROUP)
+        with connect(self.db) as connection:
+            evaluated = connection.execute(
+                "SELECT COUNT(*) FROM evaluation_versions WHERE content_id=?",
+                (pending,),
+            ).fetchone()[0]
+        self.assertEqual(int(evaluated), 1)
+        with patch(
+            "v8.range_backfill.refresh_content_duplicates",
+            return_value={"status": "succeeded"},
+        ):
+            again = run_local_evidence_backfill(
+                start=self.start, end=self.end, task_id="local-evidence-test",
+                max_amount=1.0, db_path=self.db, limit=10, state_root=self.state,
+                tagged_only=True,
+            )
+        self.assertEqual(again["candidates"], 0)
+
+    def test_local_evidence_default_scope_excludes_archive(self) -> None:
+        archived = self._insert_content("303030303", "2026-08-01T01:00:00Z")
+        with connect(self.db) as connection:
+            connection.execute(
+                "UPDATE content_items SET source_group=? WHERE id=?",
+                (HISTORY_ARCHIVE_SOURCE_GROUP, archived),
+            )
+            connection.commit()
+        result = run_local_evidence_backfill(
+            start=self.start, end=self.end, task_id="local-evidence-default",
+            max_amount=1.0, db_path=self.db, limit=10, state_root=self.state,
+        )
+        self.assertEqual(result["candidates"], 0)
+
+    def test_content_backfill_workers_compact_and_exception_isolation(self) -> None:
+        for content_id, published in (
+            ("515151515", "2026-08-01T01:00:00Z"),
+            ("626262626", "2026-08-02T01:00:00Z"),
+        ):
+            self._insert_content(content_id, published)
+
+        def content_call(stage, content):
+            if stage == "detail":
+                data = {
+                    "title": "详情", "body": "汽车详情",
+                    "published_at": content["published_at"],
+                    "account_uid": "99887766", "account_name": "汽车号",
+                    "content_type": "video", "media_urls": [],
+                }
+            elif stage == "metrics":
+                data = {
+                    "view_count": 100, "comment_count": 2, "like_count": 10,
+                    "share_count": 1, "collect_count": None,
+                }
+            else:
+                data = {"comment_count": 0, "comments": []}
+            return ProviderResult(data, {"stage": stage, "data": data}, 200, True)
+
+        result = run_content_backfill(
+            start=self.start, end=self.end, task_id="content-workers-test",
+            max_amount=1.0, db_path=self.db, call_override=content_call,
+            state_root=self.state, workers=2, compact=True,
+        )
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["processed"], 2)
+        self.assertEqual(result["results"]["status_counts"], {"succeeded": 2})
+        self.assertEqual(result["results"]["failed_contents"], 0)
+
+        def broken(content_id: int) -> dict:
+            if content_id == 1:
+                raise RuntimeError("boom")
+            return {"content_id": content_id, "status": "succeeded", "stages": []}
+
+        results, stopped = _process_content_batch(
+            [1, 2], processor=broken, workers=1
+        )
+        self.assertIsNone(stopped)
+        self.assertEqual(results[0]["status"], "partial")
+        self.assertEqual(results[0]["stages"][0]["error_code"], "RuntimeError")
+        self.assertEqual(results[1]["status"], "succeeded")
+        with self.assertRaises(RangeBackfillError):
+            _process_content_batch([1], processor=broken, workers=9)
+
+    def test_batch_stops_scheduling_after_blocking_code(self) -> None:
+        seen: list[int] = []
+
+        def blocked(content_id: int) -> dict:
+            seen.append(content_id)
+            return {
+                "content_id": content_id,
+                "status": "partial",
+                "stages": [
+                    {"stage": "metrics", "status": "failed",
+                     "error_code": "budget_blocked", "message": "预算触顶"}
+                ],
+            }
+
+        results, stopped = _process_content_batch(
+            [1, 2, 3], processor=blocked, workers=1
+        )
+        self.assertEqual(stopped, "budget_blocked")
+        self.assertEqual(seen, [1])
+        self.assertEqual(len(results), 1)
+
+    def test_history_only_scope_never_rebills_existing_corpus(self) -> None:
+        tagged = self._insert_content("848484848", "2025-06-01T01:00:00Z")
+        existing = self._insert_content("959595959", "2026-08-01T01:00:00Z")
+        with connect(self.db) as connection:
+            connection.execute(
+                "UPDATE content_items SET source_group=? WHERE id=?",
+                (HISTORY_ARCHIVE_SOURCE_GROUP, tagged),
+            )
+            connection.commit()
+        scoped = pending_content_ids(
+            start=self.start, end=self.end, as_of=self.end, db_path=self.db,
+            stages=["metrics"], history_only=True,
+        )
+        unscoped = pending_content_ids(
+            start=self.start, end=self.end, as_of=self.end, db_path=self.db,
+            stages=["metrics"],
+        )
+        self.assertEqual(scoped, [tagged])
+        self.assertEqual(sorted(unscoped), sorted([tagged, existing]))
+
+        calls: list[int] = []
+
+        def content_call(stage, content):
+            calls.append(int(content["id"]))
+            data = {
+                "view_count": 100, "comment_count": 2, "like_count": 10,
+                "share_count": 1, "collect_count": None,
+            }
+            return ProviderResult(data, {"stage": stage, "data": data}, 200, True)
+
+        result = run_content_backfill(
+            start=self.start, end=self.end, task_id="history-only-test",
+            max_amount=1.0, db_path=self.db, call_override=content_call,
+            state_root=self.state, stages=["metrics"], history_only=True,
+        )
+        self.assertEqual(result["candidates"], 1)
+        self.assertTrue(result["history_only"])
+        self.assertEqual(calls, [tagged])
+
+        summary = summarize_range_status(
+            start=self.start, end=self.end, db_path=self.db, history_only=True,
+        )
+        self.assertEqual(summary["pending"]["comments"]["douyin"], 1)
+        self.assertEqual(summary["pending"]["metrics"]["douyin"], 0)
+
+    def test_summarize_range_status_reports_pending_and_costs(self) -> None:
+        content = self._insert_content("737373737", "2026-08-01T01:00:00Z")
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                INSERT INTO content_metric_snapshots(
+                    content_id,captured_at,window_key,view_count,comment_count,
+                    like_count,status,source,metadata_json
+                ) VALUES (?,?,'2026-08-06',100,45,10,'available','douyin','{}')
+                """,
+                (content, now_utc()),
+            )
+            connection.commit()
+        summary = summarize_range_status(
+            start=self.start, end=self.end, db_path=self.db,
+            archive_before=self.archive_before,
+        )
+        self.assertEqual(summary["platforms"]["douyin"]["content_total"], 1)
+        self.assertEqual(summary["pending"]["comments"]["douyin"], 1)
+        # 45 条声明评论 ÷ 20 条/页 → 3 页 × $0.001
+        self.assertEqual(
+            summary["estimated_costs_usd"]["comment_pages"]["douyin"], 3
+        )
+        self.assertEqual(
+            summary["estimated_costs_usd"]["douyin_comments"], 0.003
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

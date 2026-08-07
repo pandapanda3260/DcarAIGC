@@ -14,8 +14,8 @@ from typing import Iterator
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_DB = PROJECT_ROOT / "app" / "data" / "dcar_insight.sqlite3"
-SCHEMA_VERSION = 10
-CURRENT_SCHEMA_MIGRATION_NAME = "audience-interaction-user-domain"
+SCHEMA_VERSION = 11
+CURRENT_SCHEMA_MIGRATION_NAME = "interaction-user-v1-fallback-keys"
 LEGACY_TAXONOMY_VERSION = "selling-points-v5.0"
 LEGACY_V6_RELEASE_ID = "evaluation-v6__selling-points-v5.0"
 LEGACY_V7_RELEASE_ID = "evaluation-v7__selling-points-v5.0"
@@ -23,6 +23,16 @@ LEGACY_COMMENT_USER_KEY_VERSION = "content-user-hmac-v1"
 LEGACY_COMMENT_SCORE_RULE_VERSION = "legacy-audience-action-v1"
 PLATFORM_USER_KEY_VERSION = "platform-user-hmac-v2"
 COMMENT_COLLECTION_VERSION = "paged-comments-v2"
+#: 全量历史回溯的内容分组标记（content_items.source_group）。
+#: history-archive：证据窗之外的历史内容，仅入库+指标，不参与自动评估与媒体截止闸门；
+#: history-backfill：证据窗内、由回溯批量入库的内容，待 local-evidence 阶段完成媒体+评估后
+#: 清除标记并回归常规增量链路。两类标记均不影响每日 30 天监控窗内的指标/评论刷新。
+HISTORY_ARCHIVE_SOURCE_GROUP = "history-archive"
+HISTORY_BACKFILL_SOURCE_GROUP = "history-backfill"
+BACKFILL_SOURCE_GROUPS = (
+    HISTORY_ARCHIVE_SOURCE_GROUP,
+    HISTORY_BACKFILL_SOURCE_GROUP,
+)
 LEGACY_MATCHER_RULE_SHA256 = (
     "38f647e9b05e38777bbe4727b5c563b67c61e28854d8b37027af8119023eefdc"
 )
@@ -312,8 +322,13 @@ CREATE TABLE IF NOT EXISTS interaction_users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     platform TEXT NOT NULL,
     pseudonymous_user_key TEXT NOT NULL,
+    -- v11: 'content-user-hmac-v1' is the explicit degraded fallback for
+    -- pre-v8.4 comments whose raw platform uid was never stored (privacy by
+    -- design), so a platform-level v2 key can never be derived for them.
+    -- v1 keys are content-scoped: the same person on two contents counts as
+    -- two users. New captures keep writing v2 keys only.
     key_version TEXT NOT NULL DEFAULT 'platform-user-hmac-v2'
-        CHECK(key_version IN ('platform-user-hmac-v2')),
+        CHECK(key_version IN ('platform-user-hmac-v2','content-user-hmac-v1')),
     first_seen_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL,
     UNIQUE(platform, key_version, pseudonymous_user_key)
@@ -1405,6 +1420,13 @@ def _create_fresh_schema(connection: sqlite3.Connection) -> None:
             """,
             (captured_at,),
         )
+        connection.execute(
+            """
+            INSERT INTO schema_migrations(version,name,applied_at)
+            VALUES (11,'interaction-user-v1-fallback-keys',?)
+            """,
+            (captured_at,),
+        )
         connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         connection.commit()
     except Exception:
@@ -1518,10 +1540,10 @@ def _migrate_v9_to_v10(connection: sqlite3.Connection) -> None:
     try:
         connection.execute("BEGIN IMMEDIATE")
         for table in _NEW_V10_TABLES:
-            statement = tables_by_name.get(table)
-            if statement is None:
+            table_statement = tables_by_name.get(table)
+            if table_statement is None:
                 raise SchemaMigrationError(f"missing schema template for {table}")
-            connection.execute(statement)
+            connection.execute(table_statement)
         _migration_checkpoint("v10_new_tables_created")
 
         replacements = {table: f"{table}_v10_new" for table in _REBUILT_V10_TABLES}
@@ -1646,12 +1668,150 @@ def _validate_v10(connection: sqlite3.Connection) -> None:
         raise SchemaMigrationError("schema v10 has foreign-key violations")
 
 
+_REBUILT_V11_TABLES = ("interaction_users",)
+
+
+def _migrate_v10_to_v11(connection: sqlite3.Connection) -> None:
+    """Widen interaction_users.key_version to accept the v1 fallback domain.
+
+    2026-08-07 owner decision (Mark): pre-v8.4 comments carry only the
+    content-scoped ``content-user-hmac-v1`` pseudonym — the raw uid was never
+    stored, so the platform-level v2 key is underivable. To let historical
+    windows publish a user-level automotive rate at all, v1 keys become an
+    explicit, queryable fallback key_version instead of dead data. Pure
+    schema rebuild: row contents are copied verbatim and hash-verified.
+    """
+
+    if connection.in_transaction:
+        raise SchemaMigrationError("v11 migration requires no active transaction")
+    foreign_keys = int(connection.execute("PRAGMA foreign_keys").fetchone()[0])
+    if foreign_keys != 1:
+        raise SchemaMigrationError("v11 migration requires PRAGMA foreign_keys=ON")
+    existing_sql = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='interaction_users'"
+    ).fetchone()
+    if existing_sql is None:
+        raise SchemaMigrationError("v11 migration requires interaction_users")
+    if "content-user-hmac-v1" in str(existing_sql[0]):
+        # The table was already created from the current template (e.g. the
+        # v9->v10 step in this same ladder run built it with the widened
+        # CHECK). Nothing to rebuild — just stamp the migration row.
+        captured_at = now_utc()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(
+                """
+                INSERT INTO schema_migrations(version,name,applied_at)
+                VALUES (11,'interaction-user-v1-fallback-keys',?)
+                """,
+                (captured_at,),
+            )
+            connection.execute("PRAGMA user_version=11")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        return
+
+    old_columns = {
+        table: _table_columns(connection, table) for table in _REBUILT_V11_TABLES
+    }
+    old_counts = {
+        table: int(connection.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
+        for table in _REBUILT_V11_TABLES
+    }
+    old_hashes = {
+        table: _table_projection_sha256(connection, table, columns)
+        for table, columns in old_columns.items()
+    }
+    try:
+        sequences = {
+            str(row["name"]): int(row["seq"])
+            for row in connection.execute(
+                "SELECT name, seq FROM sqlite_sequence"
+            ).fetchall()
+            if str(row["name"]) in _REBUILT_V11_TABLES
+        }
+    except sqlite3.OperationalError:
+        sequences = {}
+
+    captured_at = now_utc()
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        replacements = {table: f"{table}_v11_new" for table in _REBUILT_V11_TABLES}
+        for table in _REBUILT_V11_TABLES:
+            connection.execute(_schema_table_statement(table, replacements))
+        for table in _REBUILT_V11_TABLES:
+            names = ",".join(f'"{column}"' for column in old_columns[table])
+            connection.execute(
+                f'INSERT INTO "{table}_v11_new"({names}) SELECT {names} FROM "{table}"'
+            )
+        for table in _REBUILT_V11_TABLES:
+            connection.execute(f'DROP TABLE "{table}"')
+            connection.execute(f'ALTER TABLE "{table}_v11_new" RENAME TO "{table}"')
+        _restore_sequences(connection, sequences, tables=_REBUILT_V11_TABLES)
+        connection.execute(
+            """
+            INSERT INTO schema_migrations(version,name,applied_at)
+            VALUES (11,'interaction-user-v1-fallback-keys',?)
+            """,
+            (captured_at,),
+        )
+        connection.execute("PRAGMA user_version=11")
+
+        for table in _REBUILT_V11_TABLES:
+            current_count = int(
+                connection.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+            )
+            if current_count != old_counts[table]:
+                raise SchemaMigrationError(
+                    f"row count changed for {table}: {old_counts[table]}->{current_count}"
+                )
+            current_hash = _table_projection_sha256(
+                connection, table, old_columns[table]
+            )
+            if current_hash != old_hashes[table]:
+                raise SchemaMigrationError(f"projection changed for {table}")
+        violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise SchemaMigrationError(
+                f"v11 foreign-key violations before commit: {len(violations)}"
+            )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.execute("PRAGMA foreign_keys=ON")
+
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        raise SchemaMigrationError("v11 foreign-key check failed after commit")
+    integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
+    if integrity != "ok":
+        raise SchemaMigrationError(f"v11 integrity check failed: {integrity}")
+
+
+def _validate_v11(connection: sqlite3.Connection) -> None:
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='interaction_users'"
+    ).fetchone()
+    if row is None:
+        raise SchemaMigrationError("schema v11 is missing interaction_users")
+    sql = str(row[0])
+    if "content-user-hmac-v1" not in sql or "platform-user-hmac-v2" not in sql:
+        raise SchemaMigrationError(
+            "schema v11 interaction_users must accept both key versions"
+        )
+
+
 def initialize_database(connection: sqlite3.Connection) -> None:
     tables = _table_names(connection)
     if not tables:
         _create_fresh_schema(connection)
         _validate_v9(connection)
         _validate_v10(connection)
+        _validate_v11(connection)
         return
     if "schema_migrations" not in tables:
         raise SchemaMigrationError("database has tables but no schema_migrations")
@@ -1663,7 +1823,11 @@ def initialize_database(connection: sqlite3.Connection) -> None:
     if version == 9:
         _migrate_v9_to_v10(connection)
         version = 10
+    if version == 10:
+        _migrate_v10_to_v11(connection)
+        version = 11
     if version != SCHEMA_VERSION:
         raise SchemaMigrationError(f"unsupported schema version: {version}")
     _validate_v9(connection)
     _validate_v10(connection)
+    _validate_v11(connection)

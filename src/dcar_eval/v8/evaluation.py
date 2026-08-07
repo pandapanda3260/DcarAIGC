@@ -14,8 +14,14 @@ from statistics import mean
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence
 
 from .evaluation_selectors import review_anchor_evaluation
-from .matcher_dsl import MatcherDslError, MaterializedMatcher, POINT_IDS
+from .matcher_dsl import (
+    V5_1_POINT_SPEC,
+    V5_2_POINT_SPEC,
+    MatcherDslError,
+    MaterializedMatcher,
+)
 from .storage import (
+    BACKFILL_SOURCE_GROUPS,
     DEFAULT_DB,
     PROJECT_ROOT,
     SchemaMigrationError,
@@ -33,6 +39,10 @@ EVIDENCE_VERSION = "evidence-v1"
 TEXT_EVIDENCE_VERSION = "text-evidence-v2"
 INCLUDE_MIN = 75
 REVIEW_MIN = 60
+V8_TAXONOMY_POINT_SPECS = {
+    "selling-points-v5.1": V5_1_POINT_SPEC,
+    "selling-points-v5.2": V5_2_POINT_SPEC,
+}
 
 
 class EvaluationError(RuntimeError):
@@ -66,24 +76,23 @@ class _EvaluationRuntime:
     matcher: MaterializedMatcher | None
 
 
-def _synchronize_gray_review_queue(
+_ACTIVE_REVIEW_STATUSES = {"pending", "manual_required", "in_review"}
+
+
+def _is_current_active_automatic_evaluation(
     connection: sqlite3.Connection,
     *,
     content_id: int,
     evaluation_id: int,
     release_id: str,
-    evidence_level: str,
-    pending_review: bool,
-) -> None:
-    """Keep the active release queue aligned with its latest automatic result."""
-
+) -> bool:
     release = connection.execute(
         "SELECT status FROM evaluation_releases WHERE id=?", (release_id,)
     ).fetchone()
     if release is None:
         raise EvaluationError(f"evaluation release does not exist: {release_id}")
     if str(release["status"]) != "active":
-        return
+        return False
     latest = connection.execute(
         """
         SELECT id,evaluation_source FROM evaluation_versions
@@ -92,24 +101,62 @@ def _synchronize_gray_review_queue(
         """,
         (content_id, release_id),
     ).fetchone()
-    if (
-        latest is None
-        or int(latest["id"]) != evaluation_id
-        or str(latest["evaluation_source"]) != "automatic"
-    ):
-        return
+    return bool(
+        latest is not None
+        and int(latest["id"]) == evaluation_id
+        and str(latest["evaluation_source"]) == "automatic"
+    )
 
-    queue = connection.execute(
+
+def _append_review_reopen_event(
+    connection: sqlite3.Connection,
+    *,
+    queue_id: int,
+    content_id: int,
+    previous_review_id: int | None,
+    evaluation_id: int,
+    reopened_by: str,
+    reason: str,
+    created_at: str,
+) -> None:
+    connection.execute(
         """
-        SELECT * FROM review_queue
-        WHERE content_id=? AND reason_code='evaluation_gray_zone'
+        INSERT INTO review_reopen_events(
+            queue_id,content_id,previous_review_id,base_evaluation_id,
+            reopened_by,reason,created_at
+        ) VALUES (?,?,?,?,?,?,?)
         """,
-        (content_id,),
+        (
+            queue_id,
+            content_id,
+            previous_review_id,
+            evaluation_id,
+            reopened_by,
+            reason,
+            created_at,
+        ),
+    )
+
+
+def _synchronize_review_queue_state(
+    connection: sqlite3.Connection,
+    *,
+    content_id: int,
+    evaluation_id: int,
+    reason_code: str,
+    should_be_active: bool,
+    active_status: str,
+    priority: int,
+    reopen_reason: str,
+    previous_review_id: int | None = None,
+    record_reopen_on_create: bool = False,
+) -> None:
+    queue = connection.execute(
+        "SELECT * FROM review_queue WHERE content_id=? AND reason_code=?",
+        (content_id, reason_code),
     ).fetchone()
-    is_gray = pending_review and evidence_level in {"V2", "V3"}
-    active_statuses = {"pending", "manual_required", "in_review"}
-    if not is_gray:
-        if queue is None or str(queue["status"]) not in active_statuses:
+    if not should_be_active:
+        if queue is None or str(queue["status"]) not in _ACTIVE_REVIEW_STATUSES:
             return
         captured_at = now_utc()
         connection.execute(
@@ -125,62 +172,183 @@ def _synchronize_gray_review_queue(
 
     captured_at = now_utc()
     if queue is None:
-        connection.execute(
+        cursor = connection.execute(
             """
             INSERT INTO review_queue(
-                content_id,evaluation_id,reason_code,status,created_at,updated_at
-            ) VALUES (?,?,'evaluation_gray_zone','pending',?,?)
+                content_id,evaluation_id,reason_code,priority,status,created_at,updated_at
+            ) VALUES (?,?,?,?,?,?,?)
             """,
-            (content_id, evaluation_id, captured_at, captured_at),
+            (
+                content_id,
+                evaluation_id,
+                reason_code,
+                priority,
+                active_status,
+                captured_at,
+                captured_at,
+            ),
         )
+        if record_reopen_on_create:
+            if cursor.lastrowid is None:
+                raise RuntimeError("review queue insert returned no id")
+            _append_review_reopen_event(
+                connection,
+                queue_id=int(cursor.lastrowid),
+                content_id=content_id,
+                previous_review_id=previous_review_id,
+                evaluation_id=evaluation_id,
+                reopened_by="system:evaluation",
+                reason=reopen_reason,
+                created_at=captured_at,
+            )
         return
+
     status = str(queue["status"])
     if (
         queue["evaluation_id"] is not None
         and int(queue["evaluation_id"]) == evaluation_id
-        and status in active_statuses
+        and status in _ACTIVE_REVIEW_STATUSES
+        and int(queue["priority"]) == priority
     ):
         return
     if status in {"resolved", "terminal_failed"}:
-        previous_review = connection.execute(
-            """
-            SELECT id FROM evaluation_reviews
-            WHERE queue_id=? AND resulting_evaluation_id IS NOT NULL
-            ORDER BY id DESC LIMIT 1
-            """,
-            (queue["id"],),
-        ).fetchone()
-        connection.execute(
-            """
-            INSERT INTO review_reopen_events(
-                queue_id,content_id,previous_review_id,base_evaluation_id,
-                reopened_by,reason,created_at
-            ) VALUES (?,?,?,?,?,?,?)
-            """,
-            (
-                queue["id"],
-                content_id,
-                previous_review["id"] if previous_review is not None else None,
-                evaluation_id,
-                "system:evaluation",
-                "current release automatic evaluation entered gray zone",
-                captured_at,
-            ),
+        if previous_review_id is None:
+            previous_review = connection.execute(
+                """
+                SELECT id FROM evaluation_reviews
+                WHERE queue_id=? AND resulting_evaluation_id IS NOT NULL
+                ORDER BY id DESC LIMIT 1
+                """,
+                (queue["id"],),
+            ).fetchone()
+            previous_review_id = (
+                int(previous_review["id"]) if previous_review is not None else None
+            )
+        _append_review_reopen_event(
+            connection,
+            queue_id=int(queue["id"]),
+            content_id=content_id,
+            previous_review_id=previous_review_id,
+            evaluation_id=evaluation_id,
+            reopened_by="system:evaluation",
+            reason=reopen_reason,
+            created_at=captured_at,
         )
         connection.execute(
             """
             UPDATE review_queue
-            SET evaluation_id=?,status='pending',assigned_to=NULL,
+            SET evaluation_id=?,priority=?,status=?,assigned_to=NULL,
                 resolved_at=NULL,updated_at=?
             WHERE id=?
             """,
-            (evaluation_id, captured_at, queue["id"]),
+            (evaluation_id, priority, active_status, captured_at, queue["id"]),
         )
         return
 
     connection.execute(
-        "UPDATE review_queue SET evaluation_id=?,updated_at=? WHERE id=?",
-        (evaluation_id, captured_at, queue["id"]),
+        "UPDATE review_queue SET evaluation_id=?,priority=?,updated_at=? WHERE id=?",
+        (evaluation_id, priority, captured_at, queue["id"]),
+    )
+
+
+def _synchronize_gray_review_queue(
+    connection: sqlite3.Connection,
+    *,
+    content_id: int,
+    evaluation_id: int,
+    release_id: str,
+    evidence_level: str,
+    pending_review: bool,
+) -> None:
+    """Keep the active release queue aligned with its latest automatic result."""
+
+    if not _is_current_active_automatic_evaluation(
+        connection,
+        content_id=content_id,
+        evaluation_id=evaluation_id,
+        release_id=release_id,
+    ):
+        return
+    is_gray = pending_review and evidence_level in {"V2", "V3"}
+    _synchronize_review_queue_state(
+        connection,
+        content_id=content_id,
+        evaluation_id=evaluation_id,
+        reason_code="evaluation_gray_zone",
+        should_be_active=is_gray,
+        active_status="pending",
+        priority=50,
+        reopen_reason="current release automatic evaluation entered gray zone",
+    )
+
+
+def _synchronize_manual_conclusion_conflict_queue(
+    connection: sqlite3.Connection,
+    *,
+    content_id: int,
+    evaluation_id: int,
+    release_id: str,
+    evidence_level: str,
+    pending_review: bool,
+) -> None:
+    if not _is_current_active_automatic_evaluation(
+        connection,
+        content_id=content_id,
+        evaluation_id=evaluation_id,
+        release_id=release_id,
+    ):
+        return
+    automatic = connection.execute(
+        "SELECT * FROM evaluation_versions WHERE id=?", (evaluation_id,)
+    ).fetchone()
+    if automatic is None:
+        raise EvaluationError(f"evaluation does not exist: {evaluation_id}")
+    manual = connection.execute(
+        """
+        SELECT * FROM evaluation_versions
+        WHERE content_id=? AND evaluation_source='manual_review'
+          AND invalidated_at IS NULL AND id<?
+        ORDER BY evaluated_at DESC,id DESC LIMIT 1
+        """,
+        (content_id, evaluation_id),
+    ).fetchone()
+
+    def conclusion(row: sqlite3.Row) -> tuple[bool, str | None, str | None]:
+        included = bool(row["selling_point_included"])
+        if not included:
+            return False, None, None
+        primary_code = (
+            str(row["primary_selling_point_code"])
+            if row["primary_selling_point_code"] is not None
+            else None
+        )
+        return True, primary_code, str(row["content_direction"])
+
+    is_high_confidence = not pending_review and evidence_level in {"V2", "V3"}
+    is_conflict = bool(
+        is_high_confidence
+        and manual is not None
+        and conclusion(automatic) != conclusion(manual)
+    )
+    previous_review_id = (
+        int(manual["review_id"])
+        if is_conflict and manual is not None and manual["review_id"] is not None
+        else None
+    )
+    _synchronize_review_queue_state(
+        connection,
+        content_id=content_id,
+        evaluation_id=evaluation_id,
+        reason_code="manual_conclusion_conflict",
+        should_be_active=is_conflict,
+        active_status="manual_required",
+        priority=100,
+        reopen_reason=(
+            "current release automatic evaluation conflicts with the latest "
+            "human conclusion"
+        ),
+        previous_review_id=previous_review_id,
+        record_reopen_on_create=True,
     )
 
 
@@ -665,14 +833,22 @@ def _load_release_runtime(
     matcher: MaterializedMatcher | None = None
     rule_version = str(release["rule_version"])
     if rule_version == V8_RULE_VERSION:
+        taxonomy_version = str(taxonomy_row["version"])
+        point_spec = V8_TAXONOMY_POINT_SPECS.get(taxonomy_version)
+        if point_spec is None:
+            raise EvaluationError(
+                f"evaluation-v8 has no approved point contract for {taxonomy_version}"
+            )
+        point_ids = set(point_spec)
         codes = {str(row["code"]) for row in point_rows}
         if (
-            len(point_rows) != len(POINT_IDS)
-            or codes != POINT_IDS
+            len(point_rows) != len(point_ids)
+            or codes != point_ids
             or any(int(row["enabled"]) != 1 for row in point_rows)
         ):
             raise EvaluationError(
-                "evaluation-v8 taxonomy must contain exactly 25 enabled approved points"
+                "evaluation-v8 taxonomy must contain exactly "
+                f"{len(point_ids)} enabled approved points for {taxonomy_version}"
             )
         materialized_rules: Dict[str, Mapping[str, Any]] = {}
         try:
@@ -685,7 +861,7 @@ def _load_release_runtime(
                 taxonomy[code] = point
                 allowed_scenes[code] = set(point["scenes"])
                 materialized_rules[code] = rule
-            matcher = MaterializedMatcher(materialized_rules)
+            matcher = MaterializedMatcher(materialized_rules, point_spec=point_spec)
         except (TaxonomyError, MatcherDslError) as exc:
             raise EvaluationError(f"invalid release matcher snapshot: {exc}") from exc
         if matcher.matcher_rule_sha256 != str(release["matcher_rule_sha256"]):
@@ -712,26 +888,6 @@ def _load_release_runtime(
         taxonomy=taxonomy,
         allowed_scenes=allowed_scenes,
         matcher=matcher,
-    )
-
-
-def _direction_for(code: Optional[str], text: str, fallback: str) -> str:
-    if code and code.startswith("E"):
-        return "used_car"
-    if code and code.startswith("X"):
-        return "new_car"
-    if code and code.startswith("M"):
-        return "media"
-    if code == "C1":
-        return "used_car" if "二手" in text else "media"
-    if code == "C2":
-        return "used_car" if "二手" in text else "new_car"
-    if code == "C3":
-        return "media"
-    if code == "C4":
-        return "new_car"
-    return (
-        fallback if fallback in {"new_car", "used_car", "media", "other"} else "unknown"
     )
 
 
@@ -776,52 +932,6 @@ def _automotive_score(text: str, *, selling_included: bool) -> int:
     if count == 1:
         return 48
     return 8
-
-
-def _match_points(
-    *,
-    content: sqlite3.Row,
-    asr: Dict[str, Any],
-    ocr: Dict[str, Any],
-    evidence_level: str,
-    taxonomy: Mapping[str, Mapping[str, Any]],
-) -> List[Dict[str, Any]]:
-    labeler = importlib.import_module("label_douyin_video_evidence_v3")
-    row = {
-        "desc": "\n".join(
-            value for value in (content["title"], content["body"]) if value
-        ),
-        "content_type": content["content_type"],
-        "media_type": 4 if content["content_type"] == "video" else 2,
-    }
-    matches = list(labeler.match_points(row, asr, ocr, evidence_level, {}))
-    text = f"{row['desc']}\n{asr.get('text') or ''}\n{ocr.get('combined_text') or ''}"
-    existing = {str(item["id"]) for item in matches}
-    for code, point in taxonomy.items():
-        if code in existing:
-            continue
-        try:
-            positive = json.loads(str(point.get("positive_evidence_json") or "[]"))
-        except json.JSONDecodeError:
-            positive = []
-        terms = [str(term) for term in positive if str(term).strip()]
-        hits = [term for term in terms if term.lower() in text.lower()]
-        if hits:
-            score = min(90, 60 + 10 * len(hits))
-            matches.append(
-                {
-                    "id": code,
-                    "score": score,
-                    "reason": "命中卖点标准中的正向证据词",
-                    "source": "数据库词表",
-                    "evidence_snippet": "、".join(hits[:5]),
-                    "dimensions": {"taxonomy_evidence": score},
-                }
-            )
-    return sorted(
-        matches,
-        key=lambda item: (-int(item.get("score") or 0), str(item.get("id") or "")),
-    )
 
 
 def _comment_scores(
@@ -1063,6 +1173,11 @@ def _evaluate_content(
             connection, source=source, release_id=_release_id
         )
         runtime = _load_release_runtime(connection, release)
+        if source == "automatic" and runtime.matcher is None:
+            raise EvaluationError(
+                "automatic evaluation requires a materialized release matcher; "
+                "legacy matcher fallback is disabled"
+            )
         taxonomy = runtime.taxonomy
         taxonomy_version = runtime.taxonomy_version
         parent: sqlite3.Row | None = None
@@ -1117,6 +1232,14 @@ def _evaluate_content(
                 raise EvaluationError("existing evaluation has no evidence envelope")
             if source == "automatic":
                 _synchronize_gray_review_queue(
+                    connection,
+                    content_id=int(existing["content_id"]),
+                    evaluation_id=int(existing["id"]),
+                    release_id=str(release["id"]),
+                    evidence_level=str(existing["evidence_level"]),
+                    pending_review=bool(existing["pending_review"]),
+                )
+                _synchronize_manual_conclusion_conflict_queue(
                     connection,
                     content_id=int(existing["content_id"]),
                     evaluation_id=int(existing["id"]),
@@ -1185,16 +1308,9 @@ def _evaluate_content(
         elif evidence_level not in {"V2", "V3"}:
             matches = []
             included_min, review_min = INCLUDE_MIN, REVIEW_MIN
-        elif runtime.matcher is None:
-            matches = _match_points(
-                content=content,
-                asr=asr,
-                ocr=ocr,
-                evidence_level=evidence_level,
-                taxonomy=taxonomy,
-            )
-            included_min, review_min = INCLUDE_MIN, REVIEW_MIN
         else:
+            if runtime.matcher is None:
+                raise EvaluationError("materialized release matcher is unavailable")
             all_matches = runtime.matcher.match_points(
                 {
                     "desc": matcher_desc,
@@ -1235,13 +1351,11 @@ def _evaluate_content(
         )
         direction = (
             str(primary["scene"])
-            if primary is not None and runtime.matcher is not None
-            else _direction_for(
-                primary_code,
-                f"{body_text}\n{asr.get('text') or ''}\n{ocr.get('combined_text') or ''}",
-                str(content["evaluation_content_direction"] or "unknown"),
-            )
+            if primary is not None
+            else str(content["evaluation_content_direction"] or "unknown")
         )
+        if direction not in {"new_car", "used_car", "media", "other"}:
+            direction = "unknown"
         content_score = (
             _automotive_score(
                 f"{body_text}\n{asr.get('text') or ''}\n{ocr.get('combined_text') or ''}",
@@ -1559,6 +1673,14 @@ def _evaluate_content(
                 evidence_level=evidence_level,
                 pending_review=pending_review,
             )
+            _synchronize_manual_conclusion_conflict_queue(
+                connection,
+                content_id=content_id,
+                evaluation_id=evaluation_id,
+                release_id=str(release["id"]),
+                evidence_level=evidence_level,
+                pending_review=pending_review,
+            )
         if str(release["status"]) == "active":
             connection.execute(
                 "UPDATE content_items SET evaluation_content_direction=? WHERE id=?",
@@ -1614,7 +1736,14 @@ def evaluate_release_content(
 def incremental_candidates(*, db_path: Path = DEFAULT_DB) -> List[int]:
     with connect(db_path) as connection:
         content_rows = connection.execute(
-            "SELECT id FROM content_items ORDER BY id"
+            f"""
+            SELECT id FROM content_items
+            WHERE COALESCE(source_group,'') NOT IN (
+                {','.join('?' for _ in BACKFILL_SOURCE_GROUPS)}
+            )
+            ORDER BY id
+            """,
+            BACKFILL_SOURCE_GROUPS,
         ).fetchall()
         release = connection.execute(
             "SELECT id FROM evaluation_releases WHERE status='active'"

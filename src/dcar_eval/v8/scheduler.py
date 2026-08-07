@@ -19,7 +19,11 @@ from .capture import ProviderResult, ensure_content_slot
 from .duplicates import run_duplicate_fingerprint_queue
 from .evaluation import evaluate_incremental
 from .evaluation_selectors import review_anchor_evaluation
-from .media import run_media_download_queue, run_media_processing_queue
+from .media import (
+    MEDIA_QUEUE_BATCH_LIMIT,
+    run_media_download_queue,
+    run_media_processing_queue,
+)
 from .providers import STAGE_CONFIG, discover_account_content, update_content_data
 from .reports import (
     REPORTS_ROOT,
@@ -27,12 +31,24 @@ from .reports import (
     assert_report_runtime_ready,
     create_and_run_task,
 )
-from .storage import DEFAULT_DB, connect, now_utc, transaction
+from .storage import (
+    BACKFILL_SOURCE_GROUPS,
+    COMMENT_COLLECTION_VERSION,
+    DEFAULT_DB,
+    connect,
+    now_utc,
+    transaction,
+)
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
-DAILY_CAPTURE_MAX_AMOUNT = 3.0
-DAILY_CAPTURE_CONTENT_LIMIT = 1200
+#: 2026-08-07 调整：$3/1200 条追不上报表 90% 指标新鲜度门槛（当天 1,014 条
+#: 指标刷新被 budget_blocked 顺延，metrics_freshness 跌到 22%，日报恒为
+#: 部分完成）。上调总预算并把指标刷新排到详情/评论之前执行——statistics
+#: 单价极低（douyin $0.001/条），3000 条上限下指标段最多花 $3，剩余预算
+#: 天然留给贵操作，便宜的新鲜度刷新不再被饿死。
+DAILY_CAPTURE_MAX_AMOUNT = 8.0
+DAILY_CAPTURE_CONTENT_LIMIT = 3000
 DAILY_DISCOVERY_MAX_PAGES = 20
 DAILY_CAPTURE_WORKERS = 4
 DAILY_CAPTURE_MAX_ATTEMPTS = 2
@@ -202,15 +218,27 @@ def prepare_due_capture_slots(
             )
             counts["metrics"] += 1
             if local_day.weekday() == 0:
-                ensure_content_slot(
-                    connection,
-                    content_id=int(row["id"]),
-                    stage="comments",
-                    window_key=week_key,
-                    provider=comments_provider,
-                    adapter_version=comments_adapter,
+                connection.execute(
+                    """
+                    INSERT INTO comment_capture_runs(
+                        content_id,window_key,collection_version,provider,
+                        adapter_version,status,created_at,updated_at
+                    ) VALUES (?,?,?,?,?,'pending',?,?)
+                    ON CONFLICT(content_id,window_key) DO NOTHING
+                    """,
+                    (
+                        int(row["id"]),
+                        week_key,
+                        COMMENT_COLLECTION_VERSION,
+                        comments_provider,
+                        f"{comments_adapter}+{COMMENT_COLLECTION_VERSION}",
+                        now_utc(),
+                        now_utc(),
+                    ),
                 )
-                counts["comments"] += 1
+                counts["comments"] += int(
+                    connection.execute("SELECT changes()").fetchone()[0]
+                )
     return {"monitored_contents": len(rows), "prepared_slots": counts}
 
 
@@ -239,9 +267,13 @@ def _select_due_capture_contents(
             """
             SELECT c.*,
               (
-                SELECT MAX(f.updated_at) FROM fetch_slots f
-                WHERE f.content_id=c.id
-                  AND f.stage IN ('detail','metrics','comments')
+                SELECT MAX(touched_at) FROM (
+                    SELECT f.updated_at touched_at FROM fetch_slots f
+                    WHERE f.content_id=c.id AND f.stage IN ('detail','metrics')
+                    UNION ALL
+                    SELECT r.updated_at touched_at FROM comment_capture_runs r
+                    WHERE r.content_id=c.id
+                )
               ) last_capture_touched_at
             FROM content_items c JOIN accounts a ON a.id=c.account_id
             WHERE a.enabled=1 AND c.platform IN ('douyin','xiaohongshu')
@@ -260,9 +292,8 @@ def _select_due_capture_contents(
             FROM fetch_slots f
             WHERE (f.stage='detail' AND f.window_key='lifetime')
                OR (f.stage='metrics' AND f.window_key=?)
-               OR (f.stage='comments' AND f.window_key=?)
             """,
-            (day_key, week_key),
+            (day_key,),
         ).fetchall()
         valid_metric_contents = {
             int(row["content_id"])
@@ -274,12 +305,11 @@ def _select_due_capture_contents(
                 (day_key,),
             ).fetchall()
         }
-        comment_evidence_contents = {
-            int(row["content_id"])
+        comment_runs = {
+            int(row["content_id"]): dict(row)
             for row in connection.execute(
                 """
-                SELECT DISTINCT content_id FROM comment_evidence_versions
-                WHERE iso_week=?
+                SELECT * FROM comment_capture_runs WHERE window_key=?
                 """,
                 (week_key,),
             ).fetchall()
@@ -326,12 +356,24 @@ def _select_due_capture_contents(
             published is not None and published >= window_start
         )
         metrics_slot = slots_by_key.get((content_id, "metrics", day_key))
-        comments_slot = slots_by_key.get((content_id, "comments", week_key))
         metrics_needed = within_monitoring_window and needs_work(
             metrics_slot, storage_ready=content_id in valid_metric_contents
         )
-        comments_needed = within_monitoring_window and needs_work(
-            comments_slot, storage_ready=content_id in comment_evidence_contents
+        comment_run = comment_runs.get(content_id)
+        comment_status = str(comment_run["status"]) if comment_run else ""
+        stale_running = False
+        if comment_run is not None and comment_status == "running":
+            try:
+                touched = datetime.fromisoformat(
+                    str(comment_run["updated_at"]).replace("Z", "+00:00")
+                ).astimezone(timezone.utc)
+                stale_running = touched < scheduled_utc - timedelta(hours=2)
+            except (TypeError, ValueError):
+                stale_running = True
+        comments_needed = within_monitoring_window and (
+            comment_run is None
+            or comment_status in {"pending", "retryable_failed"}
+            or stale_running
         )
         if not (detail_needed or metrics_needed or comments_needed):
             continue
@@ -546,13 +588,98 @@ def run_due_capture(
     if "TikHub" in blocked_providers:
         provider_blocked.set()
 
+    # ---- 指标优先段：先刷完全部到期指标（便宜、保新鲜度），再跑详情/评论 ----
+    metrics_targets = [dict(c) for c in contents if c["metrics_needed"]]
+    metrics_refreshed: set[int] = set()
+    metrics_attempted: set[int] = set()
+    metrics_retry_ids: set[int] = set()
+    metrics_first_summary = {
+        "attempted": len(metrics_targets),
+        "succeeded": 0,
+        "budget_blocked": 0,
+        "failed": 0,
+    }
+
+    def refresh_metrics_only(content: Mapping[str, Any]) -> Dict[str, Any]:
+        if provider_blocked.is_set():
+            return {"content_id": content["id"], "status": "circuit_break_skipped"}
+        try:
+            result = update_content_data(
+                int(content["id"]),
+                as_of=local_day,
+                db_path=db_path,
+                call_override=call_override,
+                stages=["metrics"],
+                process_media=False,
+                task_id=task_id,
+                task_max_amount=max_amount,
+            )
+        except Exception as exc:
+            error_code = getattr(exc, "error_code", type(exc).__name__)
+            if error_code in CAPTURE_CIRCUIT_BREAK_CODES:
+                provider_blocked.set()
+            return {
+                "content_id": content["id"],
+                "status": "failed",
+                "error_code": error_code,
+            }
+        blocked_code = next(
+            (
+                item.get("error_code")
+                for item in result.get("stages", [])
+                if item.get("error_code") in CAPTURE_CIRCUIT_BREAK_CODES
+            ),
+            None,
+        )
+        if blocked_code:
+            provider_blocked.set()
+        return result
+
+    if metrics_targets:
+        metrics_workers = min(DAILY_CAPTURE_WORKERS, max(1, len(metrics_targets)))
+        with ThreadPoolExecutor(
+            max_workers=metrics_workers, thread_name_prefix="dcar-metrics-first"
+        ) as pool:
+            metrics_first_results = list(
+                pool.map(refresh_metrics_only, metrics_targets)
+            )
+        for content, result in zip(metrics_targets, metrics_first_results):
+            content_id = int(content["id"])
+            if result.get("status") == "circuit_break_skipped":
+                continue
+            metrics_attempted.add(content_id)
+            stage_rows = result.get("stages") or []
+            metric_stage = next(
+                (row for row in stage_rows if row.get("stage") == "metrics"), None
+            )
+            if metric_stage is not None and metric_stage.get("status") == "succeeded":
+                metrics_refreshed.add(content_id)
+                metrics_first_summary["succeeded"] += 1
+                continue
+            error_code = str(
+                (metric_stage or {}).get("error_code")
+                or result.get("error_code")
+                or ""
+            )
+            if error_code == "budget_blocked":
+                metrics_first_summary["budget_blocked"] += 1
+            else:
+                metrics_first_summary["failed"] += 1
+            retryable = bool((metric_stage or {}).get("retryable"))
+            if (
+                (retryable or error_code == "budget_blocked")
+                and error_code not in CAPTURE_CIRCUIT_BREAK_CODES
+            ):
+                metrics_retry_ids.add(content_id)
+    # ---- 指标优先段结束；未刷成功的指标在主循环里按剩余总预算继续尝试 ----
+
     def update_one_content(content: Mapping[str, Any]) -> Dict[str, Any]:
         if provider_blocked.is_set():
             return {"content_id": content["id"], "status": "circuit_break_skipped"}
         stages: List[str] = []
         if content["detail_needed"]:
             stages.append("detail")
-        if content["metrics_needed"]:
+        if content["metrics_needed"] and int(content["id"]) not in metrics_attempted:
             stages.append("metrics")
         if content["comments_needed"]:
             stages.append("comments")
@@ -609,6 +736,8 @@ def run_due_capture(
                 and stage.get("stage") in {"detail", "metrics", "comments"}
             }
         )
+        if int(content["id"]) in metrics_retry_ids and "metrics" not in retry_stages:
+            retry_stages = sorted({*retry_stages, "metrics"})
         if retry_stages:
             retry_targets.append((index, dict(content), retry_stages))
 
@@ -637,9 +766,17 @@ def run_due_capture(
             retried_by_stage = {
                 str(stage["stage"]): stage for stage in retry_result.get("stages", [])
             }
+            initial_stage_rows = initial.get("stages", []) or []
+            initial_stage_names = {
+                str(stage.get("stage")) for stage in initial_stage_rows
+            }
             merged_stages = [
                 retried_by_stage.get(str(stage.get("stage")), stage)
-                for stage in initial.get("stages", [])
+                for stage in initial_stage_rows
+            ] + [
+                row
+                for name, row in retried_by_stage.items()
+                if name not in initial_stage_names
             ]
             remaining_failed = any(
                 stage.get("status") == "failed" for stage in merged_stages
@@ -664,8 +801,22 @@ def run_due_capture(
     if provider_blocked.is_set():
         blocked_providers.add("TikHub")
 
-    provider_cost = sum(
+    reported_provider_cost = sum(
         float(item.get("provider_cost") or 0) for item in discovery + content_updates
+    )
+    with connect(db_path) as connection:
+        ledger_provider_cost = float(
+            connection.execute(
+                """
+                SELECT COALESCE(SUM(amount), 0) FROM provider_usage
+                WHERE task_id=? AND currency='USD'
+                """,
+                (task_id,),
+            ).fetchone()[0]
+            or 0
+        )
+    provider_cost = max(
+        round(reported_provider_cost, 6), round(ledger_provider_cost, 6)
     )
     failed = sum(
         item.get("status") in {"failed", "partial"}
@@ -679,11 +830,12 @@ def run_due_capture(
         "monitored_accounts": len(identities),
         "monitored_contents": len(contents),
         "eligible_contents": eligible_contents,
+        "metrics_first": metrics_first_summary,
         "discovery": discovery,
         "content_updates": content_updates,
         "blocked_providers": sorted(blocked_providers),
         "failed_operations": failed,
-        "provider_cost": round(provider_cost, 6),
+        "provider_cost": provider_cost,
     }
 
 
@@ -719,6 +871,10 @@ def run_media_cutoff(
             FROM content_items c
             WHERE c.platform IN ('douyin','xiaohongshu')
               AND c.content_type IN ('video','image')
+              -- 全量历史回溯批量入库的内容不适用“当日媒体截止”闸门：
+              -- 它们的媒体与评估由 range_backfill local-evidence 阶段按窗口推进，
+              -- 标记清除后自然回归本闸门管辖。
+              AND COALESCE(c.source_group,'') NOT IN (?,?)
               AND (
                 (c.source_group='' AND c.imported_at>=? AND c.imported_at<?)
                 OR EXISTS(
@@ -730,7 +886,7 @@ def run_media_cutoff(
               )
             ORDER BY c.id
             """,
-            (start_iso, end_iso, start_iso, end_iso),
+            (*BACKFILL_SOURCE_GROUPS, start_iso, end_iso, start_iso, end_iso),
         ).fetchall()
     complete_ids: List[int] = []
     incomplete_ids: List[int] = []
@@ -810,7 +966,7 @@ def _run_job_action(
         return str(details.pop("status")), details
     if job_id == "daily_media_download":
         fresh_content = run_media_download_queue(
-            limit=100,
+            limit=MEDIA_QUEUE_BATCH_LIMIT,
             db_path=db_path,
             published_start=fresh_start_iso,
             published_end=fresh_end_iso,
@@ -818,12 +974,13 @@ def _run_job_action(
         status = (
             "failed"
             if int(fresh_content.get("retryable_failed", 0)) > 0
+            or bool(fresh_content.get("truncated"))
             else "succeeded"
         )
         return status, {"fresh_content": fresh_content}
     if job_id == "daily_media_processing":
         media = run_media_processing_queue(
-            limit=100,
+            limit=MEDIA_QUEUE_BATCH_LIMIT,
             db_path=db_path,
             published_start=fresh_start_iso,
             published_end=fresh_end_iso,
@@ -832,6 +989,7 @@ def _run_job_action(
         status = (
             "failed"
             if int(media.get("retryable_failed", 0)) > 0
+            or bool(media.get("truncated"))
             or int(duplicates.get("failed", 0)) > 0
             else "succeeded"
         )
