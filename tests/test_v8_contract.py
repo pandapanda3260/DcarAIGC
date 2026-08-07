@@ -6,14 +6,87 @@ import unittest
 from pathlib import Path
 
 from v8.contracts import (
+    CONTRACT_PATH,
+    CURRENT_REPORT_EVIDENCE_VERSION,
     CURRENT_REPORT_RULE_VERSION,
     CURRENT_REPORT_VERSION,
     V8ContractViolation,
     expected_terminal_task_status,
     quantity_metric,
     ratio_metric,
+    score_metric,
     validate_report,
 )
+
+
+def _audience_quality() -> dict:
+    return {
+        "captured_comment_count": 120,
+        "declared_comment_count": 130,
+        "comment_collection_coverage_percentage": 92.31,
+        "identity_coverage_percentage": 97.5,
+        "capped_content_count": 0,
+        "audience_definition_version": "audience-definition-v1",
+        "classifier_version": "audience-classifier-v1",
+        "user_key_version": "platform-user-hmac-v2",
+        "evidence_window_start": "2026-05-04T16:00:00Z",
+        "evidence_window_end": "2026-08-02T16:00:00Z",
+        "report_cutoff_at": "2026-08-02T12:00:00Z",
+        "warm_up": True,
+    }
+
+
+def _conclusion_group(label: str) -> dict:
+    return {
+        "label": label,
+        "publication_count": 5,
+        "audience_quality": _audience_quality(),
+        "metrics": {
+            "selling_point_count_share": ratio_metric(
+                2, 5, status="available", eligible_count=5
+            ),
+            "core_selling_point_count_share": ratio_metric(
+                1, 5, status="available", eligible_count=5
+            ),
+            "selling_point_exposure_share": ratio_metric(
+                400, 1000, status="available", eligible_count=5
+            ),
+            "core_selling_point_exposure_share": ratio_metric(
+                150, 1000, status="available", eligible_count=5
+            ),
+            "content_verticality": score_metric(
+                72, status="available", scorable_items=5, total_items=5
+            ),
+            "automotive_user_rate": ratio_metric(
+                None,
+                12,
+                status="below_threshold",
+                eligible_count=12,
+                coverage_percentage=92.31,
+                reason="去重有效用户 12 人，低于 30 人门槛",
+            ),
+            "acquisition_potential": score_metric(
+                55, status="available", scorable_items=5, total_items=5
+            ),
+        },
+    }
+
+
+def _channel_conclusions() -> dict:
+    return {
+        platform: {
+            "platform": platform,
+            "label": label,
+            "publication_count": 5,
+            "summary": _conclusion_group("汇总"),
+            "scenes": {
+                "used_car": _conclusion_group("二手车"),
+                "new_car": _conclusion_group("新车"),
+                "media": _conclusion_group("媒体-AI小懂"),
+            },
+        }
+        for platform, label in (("douyin", "抖音"), ("xiaohongshu", "小红书"))
+    }
 
 
 def valid_report() -> dict:
@@ -22,7 +95,7 @@ def valid_report() -> dict:
         "report_version": CURRENT_REPORT_VERSION,
         "rule_version": CURRENT_REPORT_RULE_VERSION,
         "taxonomy_version": "selling-points-v5.1",
-        "evidence_version": "evidence-v1",
+        "evidence_version": CURRENT_REPORT_EVIDENCE_VERSION,
         "metadata": {
             "task_id": "task-test",
             "revision": 1,
@@ -88,6 +161,7 @@ def valid_report() -> dict:
                 None, unit="lead", status="not_calculable", reason="model unavailable"
             ),
         },
+        "channels": _channel_conclusions(),
         "platform_dimensions": [],
         "account_type_dimensions": [],
         "content_direction_dimensions": [],
@@ -107,11 +181,11 @@ class V8ContractTest(unittest.TestCase):
         self.assertEqual(
             project["tool"]["dcar"]["report-version"], CURRENT_REPORT_VERSION
         )
+        live_contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(live_contract["report_version"], CURRENT_REPORT_VERSION)
+        self.assertEqual(live_contract["rule_version"], CURRENT_REPORT_RULE_VERSION)
         self.assertEqual(
-            json.loads(
-                Path("config/report_contract_v8.json").read_text(encoding="utf-8")
-            )["rule_version"],
-            CURRENT_REPORT_RULE_VERSION,
+            live_contract["evidence_version"], CURRENT_REPORT_EVIDENCE_VERSION
         )
 
     def test_valid_operational_report_passes(self) -> None:
@@ -121,6 +195,7 @@ class V8ContractTest(unittest.TestCase):
         historical = valid_report()
         historical["report_version"] = "dcar-content-operations-report-v8.2"
         historical["rule_version"] = "evaluation-v6"
+        historical["evidence_version"] = "evidence-v1"
         validate_report(historical)
 
         historical["rule_version"] = "evaluation-v7"
@@ -132,6 +207,17 @@ class V8ContractTest(unittest.TestCase):
             current["rule_version"] = legacy_rule
             with self.assertRaisesRegex(V8ContractViolation, "rule_version"):
                 validate_report(current)
+
+    def test_frozen_v8_3_report_stays_on_evaluation_v7(self) -> None:
+        historical = valid_report()
+        historical["report_version"] = "dcar-content-operations-report-v8.3"
+        historical["rule_version"] = "evaluation-v7"
+        historical["evidence_version"] = "evidence-v1"
+        validate_report(historical)
+
+        historical["rule_version"] = "evaluation-v8"
+        with self.assertRaisesRegex(V8ContractViolation, "rule_version"):
+            validate_report(historical)
 
     def test_v7_report_is_not_accepted_as_v8(self) -> None:
         report = valid_report()

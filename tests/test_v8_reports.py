@@ -7,7 +7,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 import v8.reports as reports_module
-from v8.evaluation import evaluate_content, evaluate_release_content
+from v8.contracts import CURRENT_REPORT_VERSION
+from v8.evaluation import build_evidence_envelope, evaluate_release_content
 from v8.matcher_dsl import POINT_IDS, POINT_SCENES
 from v8.reports import (
     ReportTaskError,
@@ -24,6 +25,7 @@ from v8.storage import (
     LEGACY_V7_RELEASE_ID,
     PROJECT_ROOT,
     connect,
+    ensure_legacy_evaluation_release,
     initialize_database,
     now_utc,
 )
@@ -113,8 +115,56 @@ class V8ReportTaskTest(unittest.TestCase):
                 """,
                 (content_id,),
             )
+            legacy_release = ensure_legacy_evaluation_release(
+                connection,
+                rule_version="evaluation-v7",
+                taxonomy_version="selling-points-v5.0",
+            )
+            envelope_id, evidence_sha256, _ = build_evidence_envelope(connection, 1)
+            connection.execute(
+                """
+                INSERT INTO evaluation_versions(
+                    content_id,evidence_envelope_id,release_id,rule_version,
+                    taxonomy_version,matcher_rule_sha256,evidence_sha256,
+                    evaluation_source,evaluation_status,evidence_level,
+                    selling_point_score,selling_point_included,content_direction,
+                    pending_review,payload_json,evaluated_at
+                ) VALUES (1,?,?,?,?,?,?,'automatic','insufficient_evidence','V1',
+                          0,0,'unknown',0,?,?)
+                """,
+                (
+                    envelope_id,
+                    legacy_release["id"],
+                    legacy_release["rule_version"],
+                    legacy_release["taxonomy_version"],
+                    legacy_release["matcher_rule_sha256"],
+                    evidence_sha256,
+                    json.dumps(
+                        {
+                            "evaluation_status": "insufficient_evidence",
+                            "evidence_level": "V1",
+                            "evidence_summary": "legacy report fixture",
+                            "primary_selling_point_id": "",
+                            "selling_point_score": 0,
+                            "selling_point_included": False,
+                            "pending_review": False,
+                            "content_direction": "unknown",
+                            "content_automotive_score": None,
+                            "audience_automotive_score": None,
+                            "action_intent_score": None,
+                            "valid_unique_commenters": 0,
+                            "acquisition_potential": None,
+                            "matches": [],
+                            "evaluation_source": "automatic",
+                            "release_id": legacy_release["id"],
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    captured_at,
+                ),
+            )
             connection.commit()
-        evaluate_content(1, db_path=self.db)
         matcher = backfill_v5_1_matcher_rules(db_path=self.db)
         self.release_id = "evaluation-v8__selling-points-v5.1"
         with connect(self.db) as connection:
@@ -224,12 +274,13 @@ class V8ReportTaskTest(unittest.TestCase):
                 INSERT INTO report_revisions(
                     task_id,revision,release_id,contract_version,rule_version,
                     taxonomy_version,report_json_path,report_sha256,created_at
-                ) VALUES (?,1,?,'dcar-content-operations-report-v8.3',
+                ) VALUES (?,1,?,?,
                           'evaluation-v7','selling-points-v5.0',?,?,'2026-08-04T07:45:50Z')
                 """,
                 (
                     task_id,
                     LEGACY_V7_RELEASE_ID,
+                    CURRENT_REPORT_VERSION,
                     f"reports/runs/v8/{task_id}/revision_001/report.json",
                     "7" * 64,
                 ),
@@ -342,6 +393,85 @@ class V8ReportTaskTest(unittest.TestCase):
             ["current", "historical"],
         )
         self.assertEqual(first_path.read_bytes(), first_bytes)
+
+    def test_v8_4_report_publishes_channel_conclusions_without_fabrication(
+        self,
+    ) -> None:
+        task = create_task(
+            task_type="custom",
+            period_start="2026-07-01",
+            period_end="2026-07-01",
+            creation_source="manual",
+            db_path=self.db,
+        )
+        report = run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
+        self.assertEqual(
+            report["report_version"], "dcar-content-operations-report-v8.4"
+        )
+        self.assertEqual(report["evidence_version"], "evidence-v2")
+        channels = report["channels"]
+        self.assertEqual(sorted(channels.keys()), ["douyin", "xiaohongshu"])
+        douyin = channels["douyin"]
+        self.assertEqual(douyin["publication_count"], 1)
+        self.assertEqual(
+            sorted(douyin["scenes"].keys()), ["media", "new_car", "used_car"]
+        )
+        self.assertEqual(
+            list(douyin["summary"]["metrics"].keys()),
+            [
+                "selling_point_count_share",
+                "core_selling_point_count_share",
+                "selling_point_exposure_share",
+                "core_selling_point_exposure_share",
+                "content_verticality",
+                "automotive_user_rate",
+                "acquisition_potential",
+            ],
+        )
+        rate = douyin["summary"]["metrics"]["automotive_user_rate"]
+        # No interaction users exist in this fixture and the classifier is
+        # uncalibrated: the user-level rate must never fabricate a percentage.
+        self.assertEqual(rate["status"], "missing")
+        self.assertIsNone(rate["percentage"])
+        self.assertIsNone(rate["numerator"])
+        self.assertEqual(rate["denominator"], 0)
+        self.assertEqual(rate["eligible_count"], 0)
+        quality = douyin["summary"]["audience_quality"]
+        self.assertEqual(quality["user_key_version"], "platform-user-hmac-v2")
+        self.assertEqual(
+            quality["audience_definition_version"], "audience-definition-v1"
+        )
+        self.assertTrue(quality["warm_up"])
+        empty_channel = channels["xiaohongshu"]
+        self.assertEqual(empty_channel["publication_count"], 0)
+        self.assertEqual(
+            empty_channel["summary"]["metrics"]["automotive_user_rate"]["status"],
+            "not_applicable",
+        )
+
+        state = get_task(task["id"], db_path=self.db)
+        kinds = {item["file_kind"] for item in state["revisions"][0]["files"]}
+        self.assertIn("channel-csv", kinds)
+        revision_dir = (
+            PROJECT_ROOT / state["revisions"][0]["report_json_path"]
+        ).parent
+        csv_text = (revision_dir / "channel_conclusions.csv").read_text(
+            encoding="utf-8-sig"
+        )
+        csv_lines = csv_text.splitlines()
+        self.assertTrue(csv_lines[0].startswith("platform,platform_label,scope"))
+        self.assertEqual(len(csv_lines), 1 + 2 * 4 * 7)
+        self.assertIn("automotive_user_rate", csv_text)
+        markdown = (revision_dir / "report.md").read_text(encoding="utf-8")
+        self.assertIn("## 渠道结论", markdown)
+        self.assertIn("互动用户汽车兴趣占比", markdown)
+        self.assertIn("有效样本不足", markdown)
+        svg = (revision_dir / "core_summary.svg").read_text(encoding="utf-8")
+        self.assertNotIn("互动用户", svg)
+        content_csv = (revision_dir / "content_details.csv").read_text(
+            encoding="utf-8-sig"
+        )
+        self.assertNotIn("automotive_user_rate", content_csv)
 
     def test_revision_read_model_marks_legal_retired_report_stale(self) -> None:
         task = create_task(
@@ -1050,6 +1180,90 @@ class V8ReportTaskTest(unittest.TestCase):
         self.assertEqual(state["task_status"], "failed")
         self.assertEqual(state["revisions"], [])
         self.assertEqual(state["events"][-1]["event_type"], "review_gate_blocked")
+
+    def test_pending_manual_conclusion_conflict_blocks_first_report(self) -> None:
+        with connect(self.db) as connection:
+            evaluation_id = self._insert_report_evaluation(
+                connection,
+                content_id=1,
+                evidence_level="V3",
+                pending_review=0,
+                included=1,
+                direction="media",
+                code="M1",
+            )
+            connection.execute(
+                """
+                INSERT INTO review_queue(
+                    content_id,evaluation_id,reason_code,priority,status,created_at,updated_at
+                ) VALUES (1,?,'manual_conclusion_conflict',90,'manual_required',?,?)
+                """,
+                (evaluation_id, now_utc(), now_utc()),
+            )
+            connection.commit()
+        task = create_task(
+            task_type="custom",
+            period_start="2026-07-01",
+            period_end="2026-07-01",
+            creation_source="manual",
+            db_path=self.db,
+        )
+        with self.assertRaisesRegex(ReportTaskError, "人工结论冲突"):
+            run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
+        state = get_task(task["id"], db_path=self.db)
+        self.assertEqual(state["task_status"], "failed")
+        self.assertEqual(state["revisions"], [])
+        self.assertEqual(state["events"][-1]["event_type"], "review_gate_blocked")
+
+    def test_manual_conclusion_conflict_is_excluded_after_first_report(self) -> None:
+        with connect(self.db) as connection:
+            evaluation_id = self._insert_report_evaluation(
+                connection,
+                content_id=1,
+                evidence_level="V3",
+                pending_review=0,
+                included=1,
+                direction="media",
+                code="M1",
+            )
+            connection.commit()
+        first = create_task(
+            task_type="custom",
+            period_start="2026-07-01",
+            period_end="2026-07-01",
+            creation_source="manual",
+            db_path=self.db,
+        )
+        first_report = run_task(
+            first["id"], db_path=self.db, reports_root=self.reports_root
+        )
+        self.assertEqual(first_report["data_quality"]["evaluation_coverage"], 100.0)
+
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                INSERT INTO review_queue(
+                    content_id,evaluation_id,reason_code,priority,status,created_at,updated_at
+                ) VALUES (1,?,'manual_conclusion_conflict',90,'manual_required',?,?)
+                """,
+                (evaluation_id, now_utc(), now_utc()),
+            )
+            connection.commit()
+        second = create_task(
+            task_type="custom",
+            period_start="2026-07-01",
+            period_end="2026-07-01",
+            creation_source="manual",
+            db_path=self.db,
+        )
+        second_report = run_task(
+            second["id"], db_path=self.db, reports_root=self.reports_root
+        )
+        self.assertEqual(second_report["data_quality"]["evaluation_coverage"], 0.0)
+        verticality = second_report["summary_metrics"]["verticality_rate"]
+        self.assertEqual(verticality["denominator"], 1)
+        self.assertEqual(verticality["eligible_count"], 0)
+        self.assertEqual(verticality["numerator"], 0)
 
     def test_pending_gray_evaluation_blocks_first_report_without_queue(
         self,

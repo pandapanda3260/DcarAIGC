@@ -297,6 +297,39 @@ test("routes preserve operations and expose evidence-backed review controls", as
   await assert.rejects(access(new URL("../app/_sites-preview", import.meta.url)));
 });
 
+test("task detail renders channel conclusions in the platforms tab without fabricating rates", async () => {
+  const [taskDetail, types] = await Promise.all([
+    readFile(new URL("../app/tasks/[id]/TaskDetailPage.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/lib/types.ts", import.meta.url), "utf8"),
+  ]);
+  assert.match(types, /channels\?: Record<OverviewChannelKey, OverviewChannel> \| null;/);
+  assert.match(taskDetail, /channelOrder[^=]*=\s*\["douyin",\s*"xiaohongshu"\]/);
+  assert.match(taskDetail, /sceneOrder[^=]*=\s*\["used_car",\s*"new_car",\s*"media"\]/);
+  const labels = [
+    "卖点条数占比", "核心卖点条数占比", "卖点曝光占比", "核心卖点曝光占比",
+    "内容垂直度", "互动用户汽车兴趣占比", "内容拉新效果预估",
+  ];
+  let previous = -1;
+  for (const label of labels) {
+    const position = taskDetail.indexOf(label);
+    assert.ok(position > previous, `${label} should exist in the fixed metric order`);
+    previous = position;
+  }
+  assert.match(taskDetail, /report\?\.channels \? </);
+  assert.match(taskDetail, /channel-conclusion-table/);
+  assert.match(taskDetail, /data-channel=\{channelKey\}/);
+  assert.match(taskDetail, /below_threshold:\s*"覆盖不足"/);
+  assert.match(taskDetail, /missing:\s*"有效样本不足"/);
+  assert.match(taskDetail, /not_applicable:\s*"无适用内容"/);
+  assert.match(taskDetail, /（仅样本）/);
+  assert.match(taskDetail, /用户级去重口径/);
+  assert.match(taskDetail, /channel_conclusions\.csv/);
+  assert.match(taskDetail, /没有渠道\/场景结论/);
+  assert.match(taskDetail, /平台发布分布/);
+  assert.match(taskDetail, /platform_dimensions/);
+  assert.doesNotMatch(taskDetail, /audience_verticality|互动用户垂直度/);
+});
+
 test("private account searches stay in POST bodies and obsolete static assets remain absent", async () => {
   const [accounts, contents, apiSource] = await Promise.all([
     readFile(new URL("../app/accounts/AccountsPage.tsx", import.meta.url), "utf8"),

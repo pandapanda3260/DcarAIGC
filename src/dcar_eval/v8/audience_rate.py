@@ -300,6 +300,19 @@ def _reason_for(
     return ""
 
 
+def active_classifier_state(connection: sqlite3.Connection) -> str:
+    """Return the calibrated classifier state for publication decisions.
+
+    The state stays ``rejected`` until a 500-user/platform gold-set
+    calibration record promotes the active classifier version to
+    ``approved`` or ``conservative``, so ``automotive_user_rate`` never
+    publishes a percentage before calibration. Overview and report
+    generation must both resolve the state through this single function.
+    """
+
+    return "rejected"
+
+
 def default_warm_up(evidence_window_end: str, switchover_date: Optional[str]) -> bool:
     """Warm-up while the 90-day cross-content path has not fully accumulated."""
 

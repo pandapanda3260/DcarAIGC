@@ -17,7 +17,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
 
+from .audience_classifier import EVIDENCE_WINDOW_DAYS
+from .audience_rate import active_classifier_state, build_channel_audience_rates
 from .contracts import (
+    CURRENT_REPORT_EVIDENCE_VERSION,
     CURRENT_REPORT_VERSION,
     CURRENT_REPORT_RULE_VERSION,
     REPORT_RULE_VERSIONS,
@@ -26,7 +29,6 @@ from .contracts import (
     ratio_metric,
     validate_report,
 )
-from .evaluation import EVIDENCE_VERSION
 from .evaluation_selectors import (
     EvaluationSelectorError,
     active_release as selected_active_release,
@@ -34,6 +36,7 @@ from .evaluation_selectors import (
     release_current_evaluations,
 )
 from .duplicates import FINGERPRINT_VERSION, THRESHOLDS
+from .insights import CHANNELS, SCENES, build_channel_conclusions
 from .storage import (
     CURRENT_SCHEMA_MIGRATION_NAME,
     DEFAULT_DB,
@@ -63,7 +66,8 @@ class _GrayReviewGateError(ReportTaskError):
     def __init__(self, pending_count: int) -> None:
         self.pending_count = pending_count
         super().__init__(
-            f"正式报告已阻断：仍有 {pending_count} 条灰区内容未完成人工复核"
+            f"正式报告已阻断：仍有 {pending_count} 条灰区内容或人工结论冲突"
+            "未完成人工复核"
         )
 
 
@@ -108,7 +112,9 @@ def _first_report_pending_gray_reviews(
                 UNION
                 SELECT q.content_id FROM review_queue q
                 JOIN evaluation_versions e ON e.id=q.evaluation_id
-                WHERE q.reason_code='evaluation_gray_zone'
+                WHERE q.reason_code IN (
+                    'evaluation_gray_zone','manual_conclusion_conflict'
+                )
                   AND q.status IN ('pending','manual_required','in_review')
                   AND e.release_id=? AND e.invalidated_at IS NULL
             )
@@ -684,6 +690,40 @@ def _discovery_coverage(connection) -> float:
     return round(int(counts["covered_identity_count"]) * 100 / identity_count, 2)
 
 
+def _report_audience_rates(
+    connection,
+    conclusion_rows: List[Dict[str, Any]],
+    *,
+    window_end_utc: str,
+    generated_at: str,
+) -> Dict[str, Dict[str, Any]]:
+    """Per-slice automotive_user_rate for one report window.
+
+    The classifier state resolves through the shared calibration gate
+    (:func:`audience_rate.active_classifier_state`), so the user-level rate
+    stays ``below_threshold`` — publishing no percentage — until a gold-set
+    calibration approves the active classifier version.
+    """
+
+    window_end = datetime.fromisoformat(window_end_utc.replace("Z", "+00:00"))
+    evidence_window_start = (
+        (window_end - timedelta(days=EVIDENCE_WINDOW_DAYS))
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+    return build_channel_audience_rates(
+        connection,
+        conclusion_rows,
+        classifier_state=active_classifier_state(connection),
+        evidence_window_start=evidence_window_start,
+        evidence_window_end=window_end_utc,
+        report_cutoff_at=generated_at,
+        warm_up=True,
+        channels=CHANNELS,
+        scenes=SCENES,
+    )
+
+
 def _build_report_data(
     connection,
     task: Mapping[str, Any],
@@ -714,10 +754,30 @@ def _build_report_data(
     ids = [int(row["id"]) for row in content_rows]
     evaluations = release_current_evaluations(connection, str(release["id"]), ids)
     snapshots = _latest_metric_rows(connection, ids)
+    unresolved_manual_conflict_ids: set[int] = set()
+    if ids:
+        placeholders = ",".join("?" for _ in ids)
+        unresolved_manual_conflict_ids = {
+            int(row["content_id"])
+            for row in connection.execute(
+                f"""
+                SELECT DISTINCT q.content_id
+                FROM review_queue q
+                JOIN evaluation_versions e ON e.id=q.evaluation_id
+                WHERE q.content_id IN ({placeholders})
+                  AND q.reason_code='manual_conclusion_conflict'
+                  AND q.status IN ('pending','manual_required','in_review')
+                  AND e.release_id=? AND e.invalidated_at IS NULL
+                """,
+                [*ids, release["id"]],
+            ).fetchall()
+        }
     eligible_evaluations = {
         content_id: value
         for content_id, value in evaluations.items()
-        if int(value["pending_review"]) == 0 and value["evidence_level"] in {"V2", "V3"}
+        if int(value["pending_review"]) == 0
+        and value["evidence_level"] in {"V2", "V3"}
+        and content_id not in unresolved_manual_conflict_ids
     }
     included_evaluations = {
         content_id: value
@@ -970,6 +1030,53 @@ def _build_report_data(
         """,
         (start_utc, end_utc),
     ).fetchall()
+    tier_rows = connection.execute(
+        "SELECT code, tier FROM selling_points WHERE taxonomy_id=?",
+        (taxonomy["id"],),
+    ).fetchall()
+    tier_by_code = {str(row["code"]): row["tier"] for row in tier_rows}
+    conclusion_rows: List[Dict[str, Any]] = []
+    for content in contents:
+        content_id = int(content["id"])
+        evaluation = eligible_evaluations.get(content_id)
+        snapshot = snapshots.get(content_id)
+        conclusion_rows.append(
+            {
+                "content_id": content_id,
+                "platform": str(content["platform"]),
+                "content_direction": content["resolved_direction"],
+                "evidence_level": evaluation["evidence_level"] if evaluation else None,
+                "selling_point_included": (
+                    bool(int(evaluation["selling_point_included"]))
+                    if evaluation
+                    else False
+                ),
+                "primary_tier": (
+                    tier_by_code.get(str(evaluation["primary_selling_point_code"]))
+                    if evaluation and evaluation["primary_selling_point_code"]
+                    else None
+                ),
+                "content_automotive_score": (
+                    evaluation["content_automotive_score"] if evaluation else None
+                ),
+                "audience_automotive_score": (
+                    evaluation["audience_automotive_score"] if evaluation else None
+                ),
+                "acquisition_potential_score": (
+                    evaluation["acquisition_potential_score"] if evaluation else None
+                ),
+                "view_count": snapshot["view_count"] if snapshot else None,
+            }
+        )
+    channel_conclusions = build_channel_conclusions(
+        conclusion_rows,
+        audience_rates=_report_audience_rates(
+            connection,
+            conclusion_rows,
+            window_end_utc=end_utc,
+            generated_at=generated_at,
+        ),
+    )
     details: List[Dict[str, Any]] = []
     for content in contents:
         content_id = int(content["id"])
@@ -1014,7 +1121,7 @@ def _build_report_data(
         "report_version": CURRENT_REPORT_VERSION,
         "rule_version": str(release["rule_version"]),
         "taxonomy_version": str(taxonomy["version"]),
-        "evidence_version": EVIDENCE_VERSION,
+        "evidence_version": CURRENT_REPORT_EVIDENCE_VERSION,
         "metadata": {
             "task_id": task["id"],
             "revision": revision,
@@ -1107,6 +1214,7 @@ def _build_report_data(
                 reason="v8 首版没有经过验证的业务预估模型",
             ),
         },
+        "channels": channel_conclusions,
         "platform_dimensions": _dimension(
             (str(row["platform"]) for row in contents), total
         ),
@@ -1128,6 +1236,41 @@ def _build_report_data(
         "content_details": details,
         "files": files,
     }
+
+
+_CONCLUSION_METRIC_LABELS = (
+    ("selling_point_count_share", "卖点条数占比"),
+    ("core_selling_point_count_share", "核心卖点条数占比"),
+    ("selling_point_exposure_share", "卖点曝光占比"),
+    ("core_selling_point_exposure_share", "核心卖点曝光占比"),
+    ("content_verticality", "内容垂直度"),
+    ("automotive_user_rate", "互动用户汽车兴趣占比"),
+    ("acquisition_potential", "内容拉新效果预估"),
+)
+_UNPUBLISHED_STATUS_LABELS = {
+    "below_threshold": "覆盖不足",
+    "missing": "有效样本不足",
+    "not_applicable": "无适用内容",
+    "not_calculable": "暂无模型",
+    "stale": "数据已过期",
+}
+
+
+def _conclusion_cell(metric: Mapping[str, Any]) -> str:
+    """Status-aware display value: never fabricates an unpublished number."""
+
+    if metric.get("kind") == "score":
+        if metric.get("value") is not None:
+            value = f"{metric['value']}%"
+            if metric.get("status") == "sample_only":
+                return f"{value}（仅样本）"
+            return value
+    elif metric.get("percentage") is not None:
+        value = f"{metric['percentage']}%"
+        if metric.get("status") == "sample_only":
+            return f"{value}（仅样本）"
+        return value
+    return _UNPUBLISHED_STATUS_LABELS.get(str(metric.get("status")), "暂不可计算")
 
 
 def _markdown(report: Mapping[str, Any]) -> str:
@@ -1152,9 +1295,43 @@ def _markdown(report: Mapping[str, Any]) -> str:
         f"- 内容垂直度：{metrics['verticality_rate']['percentage'] if metrics['verticality_rate']['percentage'] is not None else '暂不可计算'}%",
         f"- 卖点覆盖率：{metrics['selling_point_coverage_rate']['percentage'] if metrics['selling_point_coverage_rate']['percentage'] is not None else '暂不可计算'}%",
         "",
-        "## 数据质量",
-        "",
     ]
+    channels = report.get("channels") or {}
+    if channels:
+        lines.extend(["## 渠道结论", ""])
+        for platform, _label in CHANNELS:
+            channel = channels.get(platform)
+            if not channel:
+                continue
+            scene_groups = channel.get("scenes") or {}
+            groups = [("汇总", channel.get("summary") or {})]
+            for scene, _scene_label in SCENES:
+                group = scene_groups.get(scene) or {}
+                groups.append((str(group.get("label") or scene), group))
+            lines.append(
+                f"### {channel.get('label') or platform}渠道"
+                f"（窗口发布 {channel.get('publication_count', 0)} 条）"
+            )
+            lines.append("")
+            header = " | ".join(title for title, _group in groups)
+            lines.append(f"| 指标 | {header} |")
+            lines.append("| --- |" + " --- |" * len(groups))
+            for key, metric_label in _CONCLUSION_METRIC_LABELS:
+                cells = []
+                for _title, group in groups:
+                    metric = (group.get("metrics") or {}).get(key) or {}
+                    cells.append(_conclusion_cell(metric))
+                lines.append(f"| {metric_label} | " + " | ".join(cells) + " |")
+            lines.append("")
+        lines.extend(
+            [
+                "互动用户汽车兴趣占比为用户级去重口径（汽车兴趣用户数 / 去重互动用户数），"
+                "未达发布门槛的切片不显示比例；各切片的用户量、覆盖率与原因见 "
+                "channel_conclusions.csv。",
+                "",
+            ]
+        )
+    lines.extend(["## 数据质量", ""])
     for key, value in report["data_quality"].items():
         lines.append(f"- {key}: {value}%")
     lines.extend(
@@ -1206,6 +1383,117 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         "duplicate_confidence",
         "evaluation_current",
     ]
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _write_channel_csv(path: Path, channels: Mapping[str, Any]) -> None:
+    """Flatten channel/scene conclusions into one row per slice metric."""
+
+    fields = [
+        "platform",
+        "platform_label",
+        "scope",
+        "scope_label",
+        "publication_count",
+        "metric",
+        "metric_label",
+        "kind",
+        "status",
+        "value",
+        "numerator",
+        "denominator",
+        "percentage",
+        "eligible_count",
+        "coverage_percentage",
+        "reason",
+        "identity_coverage_percentage",
+        "comment_collection_coverage_percentage",
+        "captured_comment_count",
+        "declared_comment_count",
+        "capped_content_count",
+        "audience_definition_version",
+        "classifier_version",
+        "user_key_version",
+        "evidence_window_start",
+        "evidence_window_end",
+        "report_cutoff_at",
+        "warm_up",
+    ]
+    rows: List[Dict[str, Any]] = []
+    for platform, _label in CHANNELS:
+        channel = channels.get(platform) or {}
+        scene_groups = channel.get("scenes") or {}
+        groups = [("summary", channel.get("summary") or {})]
+        for scene, _scene_label in SCENES:
+            groups.append((scene, scene_groups.get(scene) or {}))
+        for scope, group in groups:
+            quality = group.get("audience_quality") or {}
+            for key, metric_label in _CONCLUSION_METRIC_LABELS:
+                metric = (group.get("metrics") or {}).get(key) or {}
+                audience = key == "automotive_user_rate" and bool(quality)
+                rows.append(
+                    {
+                        "platform": platform,
+                        "platform_label": channel.get("label") or platform,
+                        "scope": scope,
+                        "scope_label": group.get("label") or scope,
+                        "publication_count": group.get("publication_count"),
+                        "metric": key,
+                        "metric_label": metric_label,
+                        "kind": metric.get("kind"),
+                        "status": metric.get("status"),
+                        "value": metric.get("value"),
+                        "numerator": metric.get("numerator"),
+                        "denominator": metric.get("denominator"),
+                        "percentage": metric.get("percentage"),
+                        "eligible_count": metric.get("eligible_count"),
+                        "coverage_percentage": metric.get("coverage_percentage"),
+                        "reason": metric.get("reason"),
+                        "identity_coverage_percentage": (
+                            quality.get("identity_coverage_percentage")
+                            if audience
+                            else None
+                        ),
+                        "comment_collection_coverage_percentage": (
+                            quality.get("comment_collection_coverage_percentage")
+                            if audience
+                            else None
+                        ),
+                        "captured_comment_count": (
+                            quality.get("captured_comment_count") if audience else None
+                        ),
+                        "declared_comment_count": (
+                            quality.get("declared_comment_count") if audience else None
+                        ),
+                        "capped_content_count": (
+                            quality.get("capped_content_count") if audience else None
+                        ),
+                        "audience_definition_version": (
+                            quality.get("audience_definition_version")
+                            if audience
+                            else None
+                        ),
+                        "classifier_version": (
+                            quality.get("classifier_version") if audience else None
+                        ),
+                        "user_key_version": (
+                            quality.get("user_key_version") if audience else None
+                        ),
+                        "evidence_window_start": (
+                            quality.get("evidence_window_start") if audience else None
+                        ),
+                        "evidence_window_end": (
+                            quality.get("evidence_window_end") if audience else None
+                        ),
+                        "report_cutoff_at": (
+                            quality.get("report_cutoff_at") if audience else None
+                        ),
+                        "warm_up": quality.get("warm_up") if audience else None,
+                    }
+                )
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
@@ -1386,6 +1674,7 @@ def run_task(
             "report-json": target / "report.json",
             "report-markdown": target / "report.md",
             "content-csv": target / "content_details.csv",
+            "channel-csv": target / "channel_conclusions.csv",
             "summary-svg": target / "core_summary.svg",
             "summary-png": target / "core_summary.png",
         }
@@ -1408,6 +1697,7 @@ def run_task(
         temp_paths["report-markdown"].write_text(_markdown(report), encoding="utf-8")
         temp_paths["content-csv"].parent.mkdir(parents=True, exist_ok=True)
         _write_csv(temp_paths["content-csv"], report["content_details"])
+        _write_channel_csv(temp_paths["channel-csv"], report["channels"])
         temp_paths["summary-svg"].write_text(_svg(report), encoding="utf-8")
         png_available = _render_png(
             temp_paths["summary-svg"], temp_paths["summary-png"]

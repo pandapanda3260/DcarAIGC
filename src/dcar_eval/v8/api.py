@@ -42,7 +42,7 @@ from .evaluation_selectors import (
     effective_direction_sql,
     review_anchor_evaluation,
 )
-from .audience_rate import build_channel_audience_rates
+from .audience_rate import active_classifier_state, build_channel_audience_rates
 from .insights import CHANNELS, SCENES, build_channel_conclusions
 from .media import MediaProcessingError, recover_stale_media_processing_slots
 from .operations import (
@@ -700,13 +700,9 @@ def _audience_rates(
 
 
 def _active_classifier_state(connection: sqlite3.Connection) -> str:
-    """Return the calibrated classifier state, defaulting to ``rejected``.
+    """Resolve the calibrated classifier state through the shared gate."""
 
-    A future calibration record can promote this to approved/conservative; the
-    conservative default guarantees no rate publishes before calibration.
-    """
-
-    return "rejected"
+    return active_classifier_state(connection)
 
 
 def v8_overview(db_path: Path) -> Dict[str, Any]:
@@ -1580,6 +1576,7 @@ def download_v8_task_file(
         "report-json": "application/json",
         "report-markdown": "text/markdown",
         "content-csv": "text/csv",
+        "channel-csv": "text/csv",
         "summary-svg": "image/svg+xml",
         "summary-png": "image/png",
     }

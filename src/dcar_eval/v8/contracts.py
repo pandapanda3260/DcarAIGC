@@ -10,16 +10,24 @@ from typing import Any, Dict, List, Mapping, Optional
 from .storage import PROJECT_ROOT
 
 
-CONTRACT_PATH = PROJECT_ROOT / "config" / "report_contract_v8.json"
+CONTRACT_PATH = PROJECT_ROOT / "config" / "report_contract_v8_4.json"
 LEGACY_CONTRACT_PATHS = {
     "dcar-content-operations-report-v8.2": (
         PROJECT_ROOT / "config" / "report_contract_v8_2.json"
     ),
+    # Every published v8.3 revision was generated under evaluation-v7 /
+    # evidence-v1 (the short-lived v8.3+evaluation-v8 live contract never
+    # produced a revision), so the frozen v8.3 file pins those versions.
+    "dcar-content-operations-report-v8.3": (
+        PROJECT_ROOT / "config" / "report_contract_v8_3.json"
+    ),
 }
-CURRENT_REPORT_VERSION = "dcar-content-operations-report-v8.3"
+CURRENT_REPORT_VERSION = "dcar-content-operations-report-v8.4"
 CURRENT_REPORT_RULE_VERSION = "evaluation-v8"
+CURRENT_REPORT_EVIDENCE_VERSION = "evidence-v2"
 REPORT_RULE_VERSIONS = {
     CURRENT_REPORT_VERSION: CURRENT_REPORT_RULE_VERSION,
+    "dcar-content-operations-report-v8.3": "evaluation-v7",
     "dcar-content-operations-report-v8.2": "evaluation-v6",
 }
 

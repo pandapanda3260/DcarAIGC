@@ -122,6 +122,7 @@ export type ReportView = {
   task: { task_status: string; name: string };
   data_quality: Record<string, number>;
   summary_metrics: Record<string, Metric>;
+  channels?: Record<OverviewChannelKey, OverviewChannel> | null;
   platform_dimensions: Array<Record<string, string | number | null>>;
   account_type_dimensions: Array<Record<string, string | number | null>>;
   content_direction_dimensions: Array<Record<string, string | number | null>>;
