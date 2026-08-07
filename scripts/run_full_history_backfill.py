@@ -100,7 +100,7 @@ def bind_campaign_contract(
         ).fetchone()
         release = connection.execute(
             """
-            SELECT id,rule_version,taxonomy_version,matcher_rule_sha256
+            SELECT *
             FROM evaluation_releases WHERE status='active'
             ORDER BY activated_at DESC,id DESC LIMIT 1
             """

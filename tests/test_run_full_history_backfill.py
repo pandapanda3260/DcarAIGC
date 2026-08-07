@@ -7,6 +7,7 @@ from contextlib import ExitStack, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from scripts import run_full_history_backfill as runner
@@ -101,6 +102,56 @@ class FullHistoryWrapperTest(unittest.TestCase):
         self.assertEqual(request.get_header("User-agent"), "DCar-Insight-v8/1.0")
         self.assertEqual(request.get_header("Accept"), "application/json")
         self.assertNotIn("12.34", " ".join(str(call) for call in log.call_args_list))
+
+    def test_campaign_contract_loads_complete_active_release_row(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            db = Path(temporary) / "contract.sqlite3"
+            captured_at = "2026-08-07T12:00:00Z"
+            with connect(db) as connection:
+                initialize_database(connection)
+                connection.execute(
+                    """
+                    INSERT INTO taxonomy_versions(
+                        id,version,status,definition,created_at,published_at
+                    ) VALUES (
+                        'taxonomy-test','selling-points-v5.2','published','{}',?,?
+                    )
+                    """,
+                    (captured_at, captured_at),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO evaluation_releases(
+                        id,rule_version,taxonomy_version,matcher_rule_sha256,status,
+                        created_at,updated_at,activated_at
+                    ) VALUES (
+                        'release-test','evaluation-v8','selling-points-v5.2',?,
+                        'active',?,?,?
+                    )
+                    """,
+                    ("a" * 64, captured_at, captured_at, captured_at),
+                )
+                connection.commit()
+
+            state: dict = {}
+            with patch.object(runner, "DB", db), patch.object(
+                runner, "save_state"
+            ), patch(
+                "v8.evaluation._load_release_runtime",
+                return_value=SimpleNamespace(matcher=object()),
+            ) as load_runtime:
+                runner.bind_campaign_contract(
+                    state,
+                    end="2026-08-07T23:00:00+08:00",
+                    archive_before="2026-02-07T00:00:00+08:00",
+                )
+
+        release = load_runtime.call_args.args[1]
+        self.assertEqual(release["status"], "active")
+        self.assertEqual(release["activated_at"], captured_at)
+        self.assertEqual(
+            state["campaign_contract"]["active_release"]["status"], "active"
+        )
 
     def test_campaign_scope_baseline_rejects_preexisting_queue(self) -> None:
         state: dict = {}
