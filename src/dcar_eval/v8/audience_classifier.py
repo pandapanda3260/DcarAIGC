@@ -442,6 +442,27 @@ PRECISION_GATE = 0.95
 RECALL_GATE = 0.80
 
 
+def state_from_counts(
+    true_positive: int, false_positive: int, false_negative: int
+) -> str:
+    """Fixed-gate calibration state from confusion counts.
+
+    Precision is the hard gate (mislabeling a non-automotive user as
+    automotive is the costly error); recall only splits approved vs
+    conservative and is never traded against the precision bar.
+    """
+
+    positive_predictions = true_positive + false_positive
+    precision = true_positive / positive_predictions if positive_predictions else None
+    positive_truths = true_positive + false_negative
+    recall = true_positive / positive_truths if positive_truths else None
+    if precision is None or precision < PRECISION_GATE:
+        return "rejected"
+    if recall is not None and recall >= RECALL_GATE:
+        return "approved"
+    return "conservative"
+
+
 def evaluate_calibration(
     predictions: Mapping[Any, str],
     gold: Mapping[Any, str],
@@ -468,13 +489,6 @@ def evaluate_calibration(
             tn += 1
     precision = tp / (tp + fp) if (tp + fp) else None
     recall = tp / (tp + fn) if (tp + fn) else None
-
-    if precision is None or precision < PRECISION_GATE:
-        state = "rejected"
-    elif recall is not None and recall >= RECALL_GATE:
-        state = "approved"
-    else:
-        state = "conservative"
     return CalibrationResult(
         precision=precision,
         recall=recall,
@@ -482,5 +496,5 @@ def evaluate_calibration(
         false_positive=fp,
         false_negative=fn,
         true_negative=tn,
-        state=state,
+        state=state_from_counts(tp, fp, fn),
     )

@@ -29,15 +29,19 @@ systematic selection bias that more volume cannot fix.
 
 from __future__ import annotations
 
+import json
 import sqlite3
-from typing import Any, Dict, Mapping, Optional, Sequence
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from .audience_classifier import (
     AUDIENCE_DEFINITION_VERSION,
     CLASSIFIER_VERSION,
     EVIDENCE_WINDOW_DAYS,
+    state_from_counts,
 )
 from .contracts import ratio_metric
+from .storage import PROJECT_ROOT
 
 MIN_USERS_AVAILABLE = 100
 MIN_USERS_SAMPLE = 30
@@ -45,7 +49,13 @@ IDENTITY_COVERAGE_GATE = 95.0
 COMMENT_COVERAGE_GATE = 90.0
 COMMENT_CAP = 1000
 
+CALIBRATION_RECORD_VERSION = "audience-calibration-v1"
+CALIBRATION_RECORD_PATH = PROJECT_ROOT / "config" / "audience_calibration_v1.json"
+CALIBRATION_PLATFORMS = ("douyin", "xiaohongshu")
+MIN_CALIBRATION_SAMPLE = 500
+
 _CLASSIFIER_STATES = {"approved", "conservative", "rejected"}
+_STATE_RANK = {"approved": 0, "conservative": 1, "rejected": 2}
 
 
 def _slice_user_universe(
@@ -300,17 +310,129 @@ def _reason_for(
     return ""
 
 
-def active_classifier_state(connection: sqlite3.Connection) -> str:
-    """Return the calibrated classifier state for publication decisions.
+def load_calibration_record(
+    record_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Load and fail-closed-validate the gold-set calibration record.
 
-    The state stays ``rejected`` until a 500-user/platform gold-set
-    calibration record promotes the active classifier version to
-    ``approved`` or ``conservative``, so ``automotive_user_rate`` never
-    publishes a percentage before calibration. Overview and report
-    generation must both resolve the state through this single function.
+    The record is the auditable file ``config/audience_calibration_v1.json``
+    written by the production runbook after the 500-user/platform human
+    labeling pass. Every defect — missing file, unparsable JSON, version
+    mismatch, missing platform, sub-500 sample, negative/absent counts, or a
+    declared ``expected_state`` that disagrees with the recomputed one —
+    collapses the effective state to ``rejected``. States are always
+    recomputed from the confusion counts through the fixed gates
+    (:func:`audience_classifier.state_from_counts`); the file cannot assert a
+    state the counts do not support.
+
+    Returns ``{"state", "platforms", "reasons", "record"}`` where ``state``
+    is the effective publication state: the weakest platform state when the
+    record is defect-free, otherwise ``rejected``.
     """
 
-    return "rejected"
+    path = Path(record_path) if record_path is not None else CALIBRATION_RECORD_PATH
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {
+            "state": "rejected",
+            "platforms": {},
+            "reasons": ["定标记录缺失或不可解析"],
+            "record": None,
+        }
+    reasons: List[str] = []
+    if not isinstance(record, Mapping):
+        return {
+            "state": "rejected",
+            "platforms": {},
+            "reasons": ["定标记录必须是 JSON 对象"],
+            "record": None,
+        }
+    for key, expected in (
+        ("record_version", CALIBRATION_RECORD_VERSION),
+        ("audience_definition_version", AUDIENCE_DEFINITION_VERSION),
+        ("classifier_version", CLASSIFIER_VERSION),
+    ):
+        if record.get(key) != expected:
+            reasons.append(f"{key} 必须等于 {expected}")
+    platforms_block = record.get("platforms")
+    if not isinstance(platforms_block, Mapping):
+        reasons.append("platforms 必须是对象")
+        platforms_block = {}
+    platform_states: Dict[str, str] = {}
+    for platform in CALIBRATION_PLATFORMS:
+        block = platforms_block.get(platform)
+        if not isinstance(block, Mapping):
+            reasons.append(f"{platform} 缺少定标结果")
+            continue
+        valid = True
+        for key in (
+            "true_positive",
+            "false_positive",
+            "false_negative",
+            "true_negative",
+        ):
+            value = block.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                reasons.append(f"{platform}.{key} 必须是非负整数")
+                valid = False
+        if not valid:
+            continue
+        true_positive = int(block["true_positive"])
+        false_positive = int(block["false_positive"])
+        false_negative = int(block["false_negative"])
+        true_negative = int(block["true_negative"])
+        sample = true_positive + false_positive + false_negative + true_negative
+        if sample < MIN_CALIBRATION_SAMPLE:
+            reasons.append(
+                f"{platform} 金标样本 {sample} 人，低于 {MIN_CALIBRATION_SAMPLE} 人门槛"
+            )
+            continue
+        state = state_from_counts(true_positive, false_positive, false_negative)
+        expected_state = block.get("expected_state")
+        if expected_state is not None and expected_state != state:
+            reasons.append(
+                f"{platform} 声明状态 {expected_state} 与按固定门槛重算的 {state} 不一致"
+            )
+            continue
+        platform_states[platform] = state
+    missing = [
+        platform
+        for platform in CALIBRATION_PLATFORMS
+        if platform not in platform_states
+    ]
+    if reasons or missing:
+        effective = "rejected"
+    else:
+        effective = max(
+            (platform_states[platform] for platform in CALIBRATION_PLATFORMS),
+            key=lambda state: _STATE_RANK[state],
+        )
+    return {
+        "state": effective,
+        "platforms": platform_states,
+        "reasons": reasons,
+        "record": dict(record),
+    }
+
+
+def active_classifier_state(
+    connection: sqlite3.Connection,
+    *,
+    record_path: Optional[Path] = None,
+) -> str:
+    """Return the calibrated classifier state for publication decisions.
+
+    Resolves through :func:`load_calibration_record`: without a valid
+    500-user/platform gold-set calibration record the state stays
+    ``rejected``, so ``automotive_user_rate`` never publishes a percentage
+    before calibration. The effective state is the weakest platform state
+    (both douyin and xiaohongshu must pass). Overview and report generation
+    must both resolve the state through this single function.
+    """
+
+    del connection  # the record is file-based (schema 10 is frozen)
+    return str(load_calibration_record(record_path)["state"])
 
 
 def default_warm_up(evidence_window_end: str, switchover_date: Optional[str]) -> bool:

@@ -243,5 +243,140 @@ class SliceRateTest(unittest.TestCase):
         self.assertIsNone(coverage["coverage_percentage"])
 
 
+class CalibrationGateTest(unittest.TestCase):
+    """active_classifier_state resolves the gold-set record fail-closed."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "audience_calibration_v1.json"
+
+    def _platform(self, tp: int, fp: int, fn: int, tn: int) -> dict:
+        return {
+            "true_positive": tp,
+            "false_positive": fp,
+            "false_negative": fn,
+            "true_negative": tn,
+        }
+
+    def _record(self, **overrides) -> dict:
+        record = {
+            "record_version": "audience-calibration-v1",
+            "audience_definition_version": "audience-definition-v1",
+            "classifier_version": "audience-classifier-v1",
+            "evaluated_at": "2026-08-20T00:00:00Z",
+            "operator": "mark",
+            "platforms": {
+                # precision 95/99≈0.9596, recall 95/110≈0.8636 -> approved
+                "douyin": self._platform(95, 4, 15, 386),
+                "xiaohongshu": self._platform(95, 4, 15, 386),
+            },
+        }
+        record.update(overrides)
+        return record
+
+    def _write(self, record: dict) -> Path:
+        import json
+
+        self.path.write_text(
+            json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return self.path
+
+    def test_missing_record_is_rejected(self) -> None:
+        self.assertEqual(
+            ar.active_classifier_state(None, record_path=self.path), "rejected"
+        )
+
+    def test_unparsable_record_is_rejected(self) -> None:
+        self.path.write_text("{not json", encoding="utf-8")
+        self.assertEqual(
+            ar.active_classifier_state(None, record_path=self.path), "rejected"
+        )
+
+    def test_valid_record_with_both_platforms_passing_is_approved(self) -> None:
+        self._write(self._record())
+        self.assertEqual(
+            ar.active_classifier_state(None, record_path=self.path), "approved"
+        )
+
+    def test_precision_exactly_at_gate_passes(self) -> None:
+        # precision 95/100 = 0.95 exactly, recall 95/114≈0.8333 -> approved
+        record = self._record()
+        record["platforms"]["douyin"] = self._platform(95, 5, 19, 381)
+        self._write(record)
+        self.assertEqual(
+            ar.active_classifier_state(None, record_path=self.path), "approved"
+        )
+
+    def test_low_recall_platform_downgrades_to_conservative(self) -> None:
+        # precision 81/84≈0.964, recall 81/111≈0.7297 -> conservative
+        record = self._record()
+        record["platforms"]["xiaohongshu"] = self._platform(81, 3, 30, 386)
+        self._write(record)
+        self.assertEqual(
+            ar.active_classifier_state(None, record_path=self.path), "conservative"
+        )
+
+    def test_low_precision_platform_rejects_everything(self) -> None:
+        # precision 90/96=0.9375 < 0.95 hard gate -> rejected
+        record = self._record()
+        record["platforms"]["douyin"] = self._platform(90, 6, 14, 390)
+        self._write(record)
+        value = ar.load_calibration_record(self.path)
+        self.assertEqual(value["state"], "rejected")
+        self.assertEqual(value["platforms"]["douyin"], "rejected")
+
+    def test_sub_500_sample_is_rejected(self) -> None:
+        record = self._record()
+        record["platforms"]["douyin"] = self._platform(95, 4, 15, 385)
+        self._write(record)
+        value = ar.load_calibration_record(self.path)
+        self.assertEqual(value["state"], "rejected")
+        self.assertTrue(any("低于 500 人门槛" in reason for reason in value["reasons"]))
+
+    def test_wrong_classifier_version_is_rejected(self) -> None:
+        self._write(self._record(classifier_version="audience-classifier-v2"))
+        self.assertEqual(
+            ar.active_classifier_state(None, record_path=self.path), "rejected"
+        )
+
+    def test_missing_platform_is_rejected(self) -> None:
+        record = self._record()
+        del record["platforms"]["xiaohongshu"]
+        self._write(record)
+        self.assertEqual(
+            ar.active_classifier_state(None, record_path=self.path), "rejected"
+        )
+
+    def test_declared_state_must_match_recomputed_state(self) -> None:
+        record = self._record()
+        record["platforms"]["douyin"]["expected_state"] = "conservative"
+        self._write(record)
+        value = ar.load_calibration_record(self.path)
+        self.assertEqual(value["state"], "rejected")
+        self.assertTrue(any("不一致" in reason for reason in value["reasons"]))
+
+    def test_negative_or_missing_counts_are_rejected(self) -> None:
+        record = self._record()
+        record["platforms"]["douyin"]["false_positive"] = -1
+        self._write(record)
+        self.assertEqual(
+            ar.active_classifier_state(None, record_path=self.path), "rejected"
+        )
+        record = self._record()
+        del record["platforms"]["douyin"]["true_negative"]
+        self._write(record)
+        self.assertEqual(
+            ar.active_classifier_state(None, record_path=self.path), "rejected"
+        )
+
+    def test_default_path_points_at_config_record(self) -> None:
+        self.assertEqual(
+            ar.CALIBRATION_RECORD_PATH,
+            storage.PROJECT_ROOT / "config" / "audience_calibration_v1.json",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
