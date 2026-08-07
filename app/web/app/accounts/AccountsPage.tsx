@@ -7,6 +7,7 @@ import AppShell from "../components/AppShell";
 import { Feedback, Loading } from "../components/Feedback";
 import { API_BASE, jsonRequest, parseCsv, readJson } from "../lib/api";
 import { label, platformKeys } from "../lib/format";
+import { publicAssetPath } from "../lib/paths";
 import type { Account, PendingPlatformIdentity } from "../lib/types";
 
 type AccountForm = {
@@ -37,8 +38,8 @@ function AccountPlatformCells({ account }: { account: Account }) {
 
 function PlatformHeaderMark({ platformKey }: { platformKey: string }) {
   let mark = <VideoCameraIcon weight="fill" />;
-  if (platformKey === "douyin") mark = <Image src="/brand-douyin-tiktok.svg" alt="" width={10} height={10} unoptimized />;
-  if (platformKey === "xiaohongshu") mark = <Image src="/brand-xiaohongshu.svg" alt="" width={10} height={10} unoptimized />;
+  if (platformKey === "douyin") mark = <Image src={publicAssetPath("/brand-douyin-tiktok.svg")} alt="" width={10} height={10} unoptimized />;
+  if (platformKey === "xiaohongshu") mark = <Image src={publicAssetPath("/brand-xiaohongshu.svg")} alt="" width={10} height={10} unoptimized />;
   if (platformKey === "wechat_channels") mark = <BroadcastIcon weight="fill" />;
   return <span className="account-platform-icon" data-platform-mark={platformKey} aria-hidden="true">{mark}</span>;
 }
@@ -113,10 +114,10 @@ export default function AccountsPage() {
     finally { setSaving(false); }
   }
 
-  return <AppShell active="accounts" actions={<button className="primary small" onClick={() => edit()}>新增账号</button>}>
+  return <AppShell active="accounts">
     <Feedback error={error} message={message} onClose={() => { setError(""); setMessage(""); }} />
     {loading ? <Loading label="正在读取账号库" /> : <section className="page-stack wide-stack">
-      <div className="detail-toolbar"><div><span className="eyebrow">PHONE AS BUSINESS KEY</span><h2>账号主数据</h2><p>一个手机号对应一行账号主数据；平台粉丝量未采集时显示“—”。</p></div><div className="placeholder-actions"><a className="secondary button-link" href={`${API_BASE}/api/v8/accounts/export`}>下载 CSV</a><label className="secondary button-link">批量导入<input className="file-input" type="file" accept=".csv,text/csv" disabled={saving} onChange={(event) => { const file = event.target.files?.[0]; if (file) void importCsv(file); event.currentTarget.value = ""; }} /></label></div></div>
+      <div className="detail-toolbar"><div><span className="eyebrow">PHONE AS BUSINESS KEY</span><h2>账号主数据</h2><p>一个手机号对应一行账号主数据；平台粉丝量未采集时显示“—”。</p></div><div className="placeholder-actions"><button className="primary small" onClick={() => edit()}>新增账号</button><a className="secondary button-link" href={`${API_BASE}/api/v8/accounts/export`}>下载 CSV</a><label className="secondary button-link">批量导入<input className="file-input" type="file" accept=".csv,text/csv" disabled={saving} onChange={(event) => { const file = event.target.files?.[0]; if (file) void importCsv(file); event.currentTarget.value = ""; }} /></label></div></div>
       <div className="filter-bar"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="手机号、运营人员、UID、昵称" onKeyDown={(event) => { if (event.key === "Enter") void reload(); }} /><select value={accountType} onChange={(event) => { setAccountType(event.target.value); void reload({ accountType: event.target.value }); }}><option value="">全部账号类型</option><option value="boutique_ip">精品 IP</option><option value="original">原创</option><option value="mixed_edit">混剪</option><option value="unknown">未知</option></select><select value={direction} onChange={(event) => { setDirection(event.target.value); void reload({ direction: event.target.value }); }}><option value="">全部内容方向</option><option value="new_car">新车</option><option value="used_car">二手车</option><option value="media">媒体</option><option value="other">其他</option><option value="unknown">未知</option></select><select value={platform} onChange={(event) => { setPlatform(event.target.value); void reload({ platform: event.target.value }); }}><option value="">全部平台</option>{platformKeys.map((key) => <option key={key} value={key}>{label(key)}</option>)}</select><button className="secondary" onClick={() => void reload()}>搜索</button><span>{total} 个账号</span></div>
       <article className="panel table-panel account-master-panel"><div className="table-scroll"><table className="account-master-table">
         <caption className="visually-hidden">以手机号为锚点的账号主数据列表</caption>

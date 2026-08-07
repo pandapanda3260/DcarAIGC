@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from v8.evaluation import (
     EvaluationError,
+    build_evidence_envelope,
     evaluate_content,
     evaluate_release_content,
     incremental_candidates,
@@ -201,6 +202,44 @@ class V8ReleaseEvaluationTest(unittest.TestCase):
                 ).fetchone()[0],
             }
 
+    def _insert_manual_visual_evidence(self) -> None:
+        evidence_text = (
+            "画面明确展示AI小懂解释故障报警灯和车辆异响，并给出安全处置建议。"
+        )
+        captured_at = "2026-08-04T00:30:00Z"
+        with connect(self.db) as connection:
+            queue = connection.execute(
+                """
+                INSERT INTO review_queue(
+                    content_id,reason_code,status,created_at,updated_at,resolved_at
+                ) VALUES (?,'manual_visual_fixture','resolved',?,?,?)
+                """,
+                (self.content_id, captured_at, captured_at, captured_at),
+            )
+            review = connection.execute(
+                """
+                INSERT INTO evaluation_reviews(
+                    queue_id,content_id,decision,reason,reviewer,created_at
+                ) VALUES (?,?,'override','测试人工画面证据','测试复核员',?)
+                """,
+                (queue.lastrowid, self.content_id, captured_at),
+            )
+            connection.execute(
+                """
+                INSERT INTO manual_evidence(
+                    review_id,content_id,evidence_type,text_value,sha256,created_at
+                ) VALUES (?,?,'visual_summary',?,?,?)
+                """,
+                (
+                    review.lastrowid,
+                    self.content_id,
+                    evidence_text,
+                    hashlib.sha256(evidence_text.encode("utf-8")).hexdigest(),
+                    captured_at,
+                ),
+            )
+            connection.commit()
+
     def _activate_release(self) -> None:
         activated_at = "2026-08-04T01:00:00Z"
         with connect(self.db) as connection:
@@ -238,7 +277,7 @@ class V8ReleaseEvaluationTest(unittest.TestCase):
     ) -> None:
         before = self._business_counts()
         with patch(
-            "v8.evaluation._match_points",
+            "label_douyin_video_evidence_v3.match_points",
             side_effect=AssertionError("legacy matcher must not run for evaluation-v8"),
         ):
             first = evaluate_release_content(
@@ -435,7 +474,7 @@ class V8ReleaseEvaluationTest(unittest.TestCase):
             connection.commit()
         self.assertIn(second_content_id, incremental_candidates(db_path=self.db))
         with patch(
-            "v8.evaluation._match_points",
+            "label_douyin_video_evidence_v3.match_points",
             side_effect=AssertionError(
                 "active evaluation-v8 must use database matcher"
             ),
@@ -462,36 +501,7 @@ class V8ReleaseEvaluationTest(unittest.TestCase):
     def test_backfill_routes_manual_visual_summary_to_visual_matcher_source(
         self,
     ) -> None:
-        automatic = evaluate_content(self.content_id, db_path=self.db)
-        with connect(self.db) as connection:
-            queue = connection.execute(
-                """
-                INSERT INTO review_queue(
-                    content_id,evaluation_id,reason_code,status,created_at,updated_at
-                ) VALUES (?,?,'evaluation_gray_zone','pending',?,?)
-                """,
-                (self.content_id, automatic.evaluation_id, now_utc(), now_utc()),
-            )
-            connection.commit()
-        resolve_review(
-            int(queue.lastrowid),
-            decision="override",
-            reason="关键帧明确展示 AI 小懂故障解释能力",
-            reviewer="测试复核员",
-            evidence_type="visual_summary",
-            evidence_text=(
-                "画面明确展示AI小懂解释故障报警灯和车辆异响，并给出安全处置建议。"
-            ),
-            base_evaluation_id=automatic.evaluation_id,
-            overrides={
-                "primary_selling_point_code": "C1",
-                "selling_point_score": 92,
-                "selling_point_included": True,
-                "content_automotive_score": 95,
-                "content_direction": "used_car",
-            },
-            db_path=self.db,
-        )
+        self._insert_manual_visual_evidence()
 
         evaluated = evaluate_release_content(
             self.content_id, release_id=self.release_id, db_path=self.db
@@ -510,6 +520,71 @@ class V8ReleaseEvaluationTest(unittest.TestCase):
         self.assertEqual(visual_match["scene"], "media")
         self.assertEqual(evidence["source"], "关键帧画面语义")
         self.assertIn("AI小懂", evidence["evidence_snippet"])
+
+    def test_automatic_legacy_release_fails_closed_without_matcher(self) -> None:
+        before = self._business_counts()
+        with patch(
+            "label_douyin_video_evidence_v3.match_points",
+            side_effect=AssertionError("legacy matcher must not be called"),
+        ):
+            with self.assertRaisesRegex(
+                EvaluationError, "requires a materialized release matcher"
+            ):
+                evaluate_content(self.content_id, db_path=self.db)
+        self.assertEqual(self._business_counts(), before)
+
+    def test_automatic_legacy_release_fails_before_idempotent_reuse(self) -> None:
+        with connect(self.db) as connection:
+            envelope_id, evidence_sha256, _ = build_evidence_envelope(
+                connection, self.content_id
+            )
+            release = connection.execute(
+                "SELECT * FROM evaluation_releases WHERE status='active'"
+            ).fetchone()
+            assert release is not None
+            connection.execute(
+                """
+                INSERT INTO evaluation_versions(
+                    content_id,evidence_envelope_id,release_id,rule_version,
+                    taxonomy_version,matcher_rule_sha256,evidence_sha256,
+                    evaluation_source,evaluation_status,evidence_level,
+                    selling_point_score,selling_point_included,content_direction,
+                    pending_review,payload_json,evaluated_at
+                ) VALUES (?,?,?,?,?,?,?,'automatic','evaluated','V3',
+                          0,0,'unknown',0,'{}',?)
+                """,
+                (
+                    self.content_id,
+                    envelope_id,
+                    release["id"],
+                    release["rule_version"],
+                    release["taxonomy_version"],
+                    release["matcher_rule_sha256"],
+                    evidence_sha256,
+                    now_utc(),
+                ),
+            )
+            connection.commit()
+        before = self._business_counts()
+        with self.assertRaisesRegex(
+            EvaluationError, "requires a materialized release matcher"
+        ):
+            evaluate_content(self.content_id, db_path=self.db)
+        self.assertEqual(self._business_counts(), before)
+
+    def test_automatic_legacy_release_fails_before_low_evidence_shortcut(self) -> None:
+        with connect(self.db) as connection:
+            connection.execute(
+                "UPDATE evidence_artifacts SET status='missing' WHERE content_id=?",
+                (self.content_id,),
+            )
+            connection.commit()
+        before = self._business_counts()
+        with self.assertRaisesRegex(
+            EvaluationError, "requires a materialized release matcher"
+        ):
+            evaluate_content(self.content_id, db_path=self.db)
+        self.assertEqual(self._business_counts(), before)
 
     def test_confirm_copies_parent_conclusion_without_rematching_manual_evidence(
         self,

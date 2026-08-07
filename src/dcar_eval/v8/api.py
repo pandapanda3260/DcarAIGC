@@ -29,7 +29,7 @@ from .capture import (
     recover_stale_fetch_slots,
 )
 from .contracts import CURRENT_REPORT_VERSION, quantity_metric, ratio_metric
-from .duplicates import FINGERPRINT_VERSION, THRESHOLDS
+from .duplicates import FINGERPRINT_VERSION, THRESHOLDS, duplicate_metric_decision
 from .evaluation import RULE_VERSION as RULE_VERSION
 from .evaluation import EvaluationError, reopen_review, resolve_review
 from .evaluation_selectors import (
@@ -40,6 +40,7 @@ from .evaluation_selectors import (
     display_effective_evaluation,
     effective_direction,
     effective_direction_sql,
+    formal_eligible_release_evaluations,
     review_anchor_evaluation,
 )
 from .audience_rate import active_classifier_state, build_channel_audience_rates
@@ -424,7 +425,11 @@ def _windows(now: Optional[datetime] = None) -> Dict[str, tuple[datetime, dateti
 
 
 def _window_summary(
-    connection: sqlite3.Connection, start: datetime, end: datetime
+    connection: sqlite3.Connection,
+    start: datetime,
+    end: datetime,
+    *,
+    report_cutoff_at: Optional[str] = None,
 ) -> Dict[str, Any]:
     start_utc, end_utc = _utc_text(start), _utc_text(end)
     content_rows = connection.execute(
@@ -448,19 +453,33 @@ def _window_summary(
     )
     if content_ids:
         placeholders = ",".join("?" for _ in content_ids)
-        active_release(connection)
-        evaluations = connection.execute(
-            f"""
-            WITH {FORMAL_CURRENT_EVALUATIONS_CTE}
-            SELECT ev.*, sp.tier primary_tier FROM evaluation_versions ev
-            JOIN formal_current_evaluations latest ON latest.id=ev.id
-            LEFT JOIN taxonomy_versions tv ON tv.version=ev.taxonomy_version
-            LEFT JOIN selling_points sp
-              ON sp.taxonomy_id=tv.id AND sp.code=ev.primary_selling_point_code
-            WHERE ev.content_id IN ({placeholders})
-            """,
-            content_ids,
-        ).fetchall()
+        release = active_release(connection)
+        assert release is not None
+        eligible_by_content = formal_eligible_release_evaluations(
+            connection, str(release["id"]), content_ids
+        )
+        tier_by_code = {
+            str(row["code"]): row["tier"]
+            for row in connection.execute(
+                """
+                SELECT sp.code,sp.tier FROM selling_points sp
+                JOIN taxonomy_versions tv ON tv.id=sp.taxonomy_id
+                WHERE tv.version=?
+                """,
+                (release["taxonomy_version"],),
+            ).fetchall()
+        }
+        evaluations = [
+            {
+                **value,
+                "primary_tier": tier_by_code.get(
+                    str(value["primary_selling_point_code"])
+                )
+                if value.get("primary_selling_point_code")
+                else None,
+            }
+            for value in eligible_by_content.values()
+        ]
         metrics = connection.execute(
             f"""
             SELECT ms.* FROM content_metric_snapshots ms
@@ -468,10 +487,7 @@ def _window_summary(
               AND ms.id=(
                   SELECT ms2.id FROM content_metric_snapshots ms2
                   WHERE ms2.content_id=ms.content_id
-                  ORDER BY
-                    CASE WHEN ms2.view_count IS NOT NULL AND ms2.view_count>0
-                      THEN 0 ELSE 1 END,
-                    ms2.captured_at DESC, ms2.id DESC LIMIT 1
+                  ORDER BY ms2.captured_at DESC, ms2.id DESC LIMIT 1
               )
             """,
             content_ids,
@@ -526,11 +542,14 @@ def _window_summary(
         content_id = int(content["id"])
         evaluation = evaluation_by_content.get(content_id, {})
         metric = metric_by_content.get(content_id, {})
+        formal_content = {**content, "evaluation_content_direction": None}
         conclusion_rows.append(
             {
                 "content_id": content_id,
                 "platform": str(content["platform"]),
-                "content_direction": effective_direction(content, evaluation),
+                "content_direction": effective_direction(
+                    formal_content, evaluation
+                ),
                 "evidence_level": evaluation.get("evidence_level"),
                 "selling_point_included": bool(
                     evaluation.get("selling_point_included")
@@ -559,13 +578,22 @@ def _window_summary(
     selling = sum(
         1 for row in evaluation_values if int(row["selling_point_included"]) == 1
     )
-    metric_coverage = round(len(metric_values) * 100 / total, 2) if total else None
-    views = sum(int(row["view_count"] or 0) for row in metric_values)
-    comments = sum(
-        int(row["comment_count"] or 0)
+    view_values = [
+        int(row["view_count"])
+        for row in metric_values
+        if row["view_count"] is not None
+    ]
+    comment_values = [
+        int(row["comment_count"])
         for row in metric_values
         if row["comment_count"] is not None
+    ]
+    view_coverage = round(len(view_values) * 100 / total, 2) if total else None
+    comment_coverage = (
+        round(len(comment_values) * 100 / total, 2) if total else None
     )
+    views = sum(view_values)
+    comments = sum(comment_values)
     ratio_status = (
         "not_applicable"
         if total == 0
@@ -573,13 +601,20 @@ def _window_summary(
         if eligible * 100 / total >= 95
         else "below_threshold"
     )
-    duplicate_coverage = round(fingerprint_count * 100 / total, 2) if total else None
-    duplicate_status = (
-        "not_applicable"
-        if total == 0
-        else "available"
-        if duplicate_calibrated and (duplicate_coverage or 0) >= 95
-        else "below_threshold"
+    evaluation_coverage = (
+        round(eligible * 100 / total, 2) if total else None
+    )
+    evaluation_reason = (
+        f"正式评估覆盖率为 {evaluation_coverage:.2f}%，低于 95% 发布阈值"
+        if ratio_status == "below_threshold" and evaluation_coverage is not None
+        else ""
+    )
+    duplicate_status, duplicate_coverage, duplicate_reason = (
+        duplicate_metric_decision(
+            total,
+            fingerprint_count,
+            duplicate_calibrated,
+        )
     )
     return {
         "period_start": start.isoformat(),
@@ -596,38 +631,54 @@ def _window_summary(
                 active_accounts, unit="account", status="available"
             ),
             "view_count": quantity_metric(
-                views if metric_values else None,
+                views if view_values else None,
                 unit="view",
                 status="not_applicable"
                 if total == 0
                 else "missing"
-                if not metric_values
-                else "available",
-                coverage_percentage=metric_coverage,
+                if not view_values
+                else "available"
+                if (view_coverage or 0) >= 90
+                else "below_threshold",
+                coverage_percentage=view_coverage,
+                reason=(
+                    f"曝光量快照覆盖率为 {view_coverage:.2f}%，低于 90% 发布阈值"
+                    if view_values and (view_coverage or 0) < 90
+                    else ""
+                ),
             ),
             "comment_count": quantity_metric(
-                comments
-                if metric_values
-                and any(row["comment_count"] is not None for row in metric_values)
-                else None,
+                comments if comment_values else None,
                 unit="comment",
-                status="not_applicable" if total == 0 else "missing",
-                coverage_percentage=metric_coverage,
-                reason="历史 valid_unique_commenters 不等于评论量" if total else "",
+                status="not_applicable"
+                if total == 0
+                else "missing"
+                if not comment_values
+                else "available"
+                if (comment_coverage or 0) >= 90
+                else "below_threshold",
+                coverage_percentage=comment_coverage,
+                reason=(
+                    f"评论量快照覆盖率为 {comment_coverage:.2f}%，低于 90% 发布阈值"
+                    if comment_values and (comment_coverage or 0) < 90
+                    else ""
+                ),
             ),
             "verticality_rate": ratio_metric(
                 vertical if total else None,
                 total,
                 status=ratio_status,
                 eligible_count=eligible,
-                coverage_percentage=round(eligible * 100 / total, 2) if total else None,
+                coverage_percentage=evaluation_coverage,
+                reason=evaluation_reason,
             ),
             "selling_point_coverage_rate": ratio_metric(
                 selling if total else None,
                 total,
                 status=ratio_status,
                 eligible_count=eligible,
-                coverage_percentage=round(eligible * 100 / total, 2) if total else None,
+                coverage_percentage=evaluation_coverage,
+                reason=evaluation_reason,
             ),
             "duplicate_rate": ratio_metric(
                 duplicate_count if total else None,
@@ -635,11 +686,7 @@ def _window_summary(
                 status=duplicate_status,
                 eligible_count=fingerprint_count,
                 coverage_percentage=duplicate_coverage,
-                reason=(
-                    "感知指纹定标未通过或覆盖不足，重复率暂不发布"
-                    if duplicate_status == "below_threshold"
-                    else ""
-                ),
+                reason=duplicate_reason,
             ),
             "estimated_new_users": quantity_metric(
                 None,
@@ -662,7 +709,12 @@ def _window_summary(
         },
         "channels": build_channel_conclusions(
             conclusion_rows,
-            audience_rates=_audience_rates(connection, conclusion_rows, end),
+            audience_rates=_audience_rates(
+                connection,
+                conclusion_rows,
+                end,
+                report_cutoff_at=report_cutoff_at,
+            ),
         ),
         "empty_explanation": (
             "所选窗口没有进入有效监控范围的已发布内容，并非抓取故障。"
@@ -676,12 +728,13 @@ def _audience_rates(
     connection: sqlite3.Connection,
     conclusion_rows: List[Dict[str, Any]],
     window_end: datetime,
+    *,
+    report_cutoff_at: Optional[str] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """Compute per-slice automotive_user_rate for the overview window.
 
-    The classifier state defaults to ``rejected`` until a gold-set calibration
-    marks it approved/conservative, so the rate stays ``below_threshold`` (no
-    published percentage) before calibration — never a fabricated value.
+    An uncalibrated classifier may publish only a complete classified sample;
+    missing identities or classifications always keep the percentage hidden.
     """
 
     evidence_window_end = _utc_text(window_end)
@@ -692,7 +745,7 @@ def _audience_rates(
         classifier_state=_active_classifier_state(connection),
         evidence_window_start=evidence_window_start,
         evidence_window_end=evidence_window_end,
-        report_cutoff_at=now_utc(),
+        report_cutoff_at=report_cutoff_at or now_utc(),
         warm_up=True,
         channels=CHANNELS,
         scenes=SCENES,
@@ -706,10 +759,17 @@ def _active_classifier_state(connection: sqlite3.Connection) -> str:
 
 
 def v8_overview(db_path: Path) -> Dict[str, Any]:
+    overview_now = datetime.now(SHANGHAI)
+    report_cutoff_at = now_utc()
     with connect(db_path) as connection:
         windows = {
-            key: _window_summary(connection, start, end)
-            for key, (start, end) in _windows().items()
+            key: _window_summary(
+                connection,
+                start,
+                end,
+                report_cutoff_at=report_cutoff_at,
+            )
+            for key, (start, end) in _windows(overview_now).items()
         }
         quality = {
             "missing_published_at": int(
@@ -770,7 +830,7 @@ def v8_overview(db_path: Path) -> Dict[str, Any]:
     return {
         "status": "ready",
         "report_version": CURRENT_REPORT_VERSION,
-        "generated_at": now_utc(),
+        "generated_at": report_cutoff_at,
         "timezone": "Asia/Shanghai",
         "windows": windows,
         "data_quality": quality,

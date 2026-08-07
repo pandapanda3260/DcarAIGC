@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Mapping, Optional
 from .storage import PROJECT_ROOT
 
 
-CONTRACT_PATH = PROJECT_ROOT / "config" / "report_contract_v8_4.json"
+CONTRACT_PATH = PROJECT_ROOT / "config" / "report_contract_v8_5.json"
 LEGACY_CONTRACT_PATHS = {
     "dcar-content-operations-report-v8.2": (
         PROJECT_ROOT / "config" / "report_contract_v8_2.json"
@@ -21,12 +21,16 @@ LEGACY_CONTRACT_PATHS = {
     "dcar-content-operations-report-v8.3": (
         PROJECT_ROOT / "config" / "report_contract_v8_3.json"
     ),
+    "dcar-content-operations-report-v8.4": (
+        PROJECT_ROOT / "config" / "report_contract_v8_4.json"
+    ),
 }
-CURRENT_REPORT_VERSION = "dcar-content-operations-report-v8.4"
+CURRENT_REPORT_VERSION = "dcar-content-operations-report-v8.5"
 CURRENT_REPORT_RULE_VERSION = "evaluation-v8"
 CURRENT_REPORT_EVIDENCE_VERSION = "evidence-v2"
 REPORT_RULE_VERSIONS = {
     CURRENT_REPORT_VERSION: CURRENT_REPORT_RULE_VERSION,
+    "dcar-content-operations-report-v8.4": "evaluation-v8",
     "dcar-content-operations-report-v8.3": "evaluation-v7",
     "dcar-content-operations-report-v8.2": "evaluation-v6",
 }
@@ -73,7 +77,11 @@ def ratio_metric(
     reason: str = "",
 ) -> Dict[str, Any]:
     percentage = None
-    if numerator is not None and denominator > 0:
+    if (
+        status in {"available", "sample_only"}
+        and numerator is not None
+        and denominator > 0
+    ):
         percentage = round(numerator * 100 / denominator, 2)
     return {
         "kind": "ratio",
@@ -114,17 +122,66 @@ def expected_terminal_task_status(
     data_quality: Mapping[str, Any],
     *,
     contract: Optional[Mapping[str, Any]] = None,
+    enforce_boolean_quality_gates: bool = True,
 ) -> str:
+    return (
+        "partial"
+        if quality_gate_failures(
+            data_quality,
+            contract=contract,
+            enforce_boolean_quality_gates=enforce_boolean_quality_gates,
+        )
+        else "succeeded"
+    )
+
+
+def quality_gate_failures(
+    data_quality: Mapping[str, Any],
+    *,
+    contract: Optional[Mapping[str, Any]] = None,
+    enforce_boolean_quality_gates: bool = True,
+) -> List[Dict[str, Any]]:
+    """Return every unmet quality prerequisite from the selected contract."""
+
     active_contract = contract or load_contract()
+    failures: List[Dict[str, Any]] = []
+    if enforce_boolean_quality_gates:
+        for key, required in active_contract.get(
+            "required_boolean_quality_gates", {}
+        ).items():
+            if data_quality.get(key) is not required:
+                failures.append(
+                    {
+                        "key": key,
+                        "kind": "boolean",
+                        "actual": data_quality.get(key),
+                        "required": required,
+                    }
+                )
     thresholds = active_contract["required_coverage_thresholds"]
     for key, minimum in thresholds.items():
         try:
             actual = float(data_quality[key])
         except (KeyError, TypeError, ValueError):
-            return "partial"
+            failures.append(
+                {
+                    "key": key,
+                    "kind": "coverage",
+                    "actual": data_quality.get(key),
+                    "required": float(minimum),
+                }
+            )
+            continue
         if actual < float(minimum):
-            return "partial"
-    return "succeeded"
+            failures.append(
+                {
+                    "key": key,
+                    "kind": "coverage",
+                    "actual": actual,
+                    "required": float(minimum),
+                }
+            )
+    return failures
 
 
 def _walk_metric_statuses(value: Any, path: str = "$") -> List[str]:
@@ -232,6 +289,7 @@ def _validate_audience_quality(
     for key in (
         "comment_collection_coverage_percentage",
         "identity_coverage_percentage",
+        "classification_coverage_percentage",
     ):
         if key in quality:
             value = quality.get(key)
@@ -239,6 +297,11 @@ def _validate_audience_quality(
                 not isinstance(value, (int, float)) or not 0 <= float(value) <= 100
             ):
                 errors.append(f"{path}.{key} must be null or between 0 and 100")
+    for key in ("candidate_user_count", "classified_user_count"):
+        if key in quality:
+            value = quality.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                errors.append(f"{path}.{key} must be a non-negative integer")
     if "warm_up" in quality and not isinstance(quality.get("warm_up"), bool):
         errors.append(f"{path}.warm_up must be a boolean")
 
@@ -393,6 +456,22 @@ def validate_report(
         errors.append("$.task.task_status is invalid")
 
     data_quality = report.get("data_quality")
+    summary_payload = report.get("summary_metrics")
+    publication_payload = (
+        summary_payload.get("publication_count")
+        if isinstance(summary_payload, Mapping)
+        else None
+    )
+    publication_value = (
+        publication_payload.get("value")
+        if isinstance(publication_payload, Mapping)
+        else None
+    )
+    enforce_boolean_quality_gates = bool(
+        isinstance(publication_value, (int, float))
+        and not isinstance(publication_value, bool)
+        and publication_value > 0
+    )
     if not isinstance(data_quality, Mapping):
         errors.append("$.data_quality must be an object")
     else:
@@ -400,9 +479,16 @@ def validate_report(
             value = data_quality.get(key)
             if not isinstance(value, (int, float)) or not 0 <= float(value) <= 100:
                 errors.append(f"$.data_quality.{key} must be 0..100")
+        for key in contract.get("required_boolean_quality_gates", {}):
+            if enforce_boolean_quality_gates and key not in data_quality:
+                errors.append(f"$.data_quality.{key} is required")
+            elif key in data_quality and not isinstance(data_quality[key], bool):
+                errors.append(f"$.data_quality.{key} must be boolean")
         if task_status in {"succeeded", "partial"}:
             expected_status = expected_terminal_task_status(
-                data_quality, contract=contract
+                data_quality,
+                contract=contract,
+                enforce_boolean_quality_gates=enforce_boolean_quality_gates,
             )
             if task_status != expected_status:
                 errors.append(

@@ -284,6 +284,87 @@ class CommentPagingTest(unittest.TestCase):
         ).fetchone()
         self.assertEqual(run["status"], "succeeded")
 
+    def test_exact_cap_with_provider_exhausted_is_not_marked_capped(self) -> None:
+        comments = [
+            _make_comment(
+                self.hasher, cid=f"c{i:05d}", raw_uid=f"u{i}", body=f"评论{i}"
+            )
+            for i in range(1000)
+        ]
+        fake = _FakePages(
+            self.connection,
+            1,
+            [
+                {
+                    "comments": comments,
+                    "declared_total": 1000,
+                    "has_more": False,
+                    "next_cursor": None,
+                }
+            ],
+        )
+        result = self._run(fake, comment_cap=1000)
+        self.assertEqual(result["completion_kind"], "provider_exhausted")
+
+    def test_declared_total_never_shrinks_on_later_pages(self) -> None:
+        pages = [
+            {
+                "comments": [
+                    _make_comment(self.hasher, cid="c01", raw_uid="u1", body="第一页")
+                ],
+                "declared_total": 100,
+                "has_more": True,
+                "next_cursor_params": {"cursor": 20},
+            },
+            {
+                "comments": [
+                    _make_comment(self.hasher, cid="c02", raw_uid="u2", body="第二页")
+                ],
+                "declared_total": 10,
+                "has_more": False,
+                "next_cursor": None,
+            },
+        ]
+        result = self._run(
+            _FakePages(self.connection, 1, pages), coverage_target=2.0
+        )
+        self.assertEqual(result["declared_total"], 100)
+
+    def test_later_declared_total_spike_does_not_rewrite_first_page_snapshot(
+        self,
+    ) -> None:
+        pages = [
+            {
+                "comments": [
+                    _make_comment(self.hasher, cid="c01", raw_uid="u1", body="第一页")
+                ],
+                "declared_total": 10,
+                "has_more": True,
+                "next_cursor_params": {"cursor": 20},
+            },
+            {
+                "comments": [
+                    _make_comment(self.hasher, cid="c02", raw_uid="u2", body="第二页")
+                ],
+                "declared_total": 999,
+                "has_more": False,
+                "next_cursor": None,
+            },
+        ]
+        result = self._run(
+            _FakePages(self.connection, 1, pages), coverage_target=2.0
+        )
+        self.assertEqual(result["declared_total"], 10)
+        self.assertEqual(result["completion_kind"], "provider_exhausted")
+        self.assertEqual(result["comment_collection_coverage_percentage"], 100.0)
+        stored = self.connection.execute(
+            """
+            SELECT provider_declared_total FROM comment_capture_pages
+            ORDER BY page_number
+            """
+        ).fetchall()
+        self.assertEqual([row[0] for row in stored], [10, 999])
+
     def test_zero_comments_completion(self) -> None:
         pages = [
             {
@@ -315,9 +396,29 @@ class CommentPagingTest(unittest.TestCase):
         pages = [looping, looping]
         fake = _FakePages(self.connection, 1, pages)
         result = self._run(fake, max_pages=10)
-        self.assertEqual(result["completion_kind"], "provider_exhausted")
+        self.assertIsNone(result["completion_kind"])
+        self.assertEqual(result["status"], "incomplete")
         self.assertEqual(result["stop_reason"], "cursor_cycle_detected")
         self.assertLessEqual(result["pages_fetched"], 2)
+        run = self.connection.execute(
+            "SELECT status,completion_kind FROM comment_capture_runs"
+        ).fetchone()
+        self.assertEqual(run["status"], "retryable_failed")
+        self.assertIsNone(run["completion_kind"])
+
+    def test_has_more_without_next_cursor_is_retryable_failure(self) -> None:
+        page = {
+            "comments": [
+                _make_comment(self.hasher, cid="c01", raw_uid="u1", body="缺失游标")
+            ],
+            "declared_total": 20,
+            "has_more": True,
+            "next_cursor": None,
+        }
+        result = self._run(_FakePages(self.connection, 1, [page]))
+        self.assertEqual(result["status"], "incomplete")
+        self.assertIsNone(result["completion_kind"])
+        self.assertEqual(result["stop_reason"], "missing_next_cursor")
 
     def test_resume_replays_stored_pages_without_new_slots(self) -> None:
         pages = [

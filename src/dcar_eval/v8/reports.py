@@ -25,6 +25,8 @@ from .contracts import (
     CURRENT_REPORT_RULE_VERSION,
     REPORT_RULE_VERSIONS,
     expected_terminal_task_status,
+    load_contract,
+    quality_gate_failures,
     quantity_metric,
     ratio_metric,
     validate_report,
@@ -33,9 +35,9 @@ from .evaluation_selectors import (
     EvaluationSelectorError,
     active_release as selected_active_release,
     effective_direction,
-    release_current_evaluations,
+    formal_eligible_release_evaluations,
 )
-from .duplicates import FINGERPRINT_VERSION, THRESHOLDS
+from .duplicates import FINGERPRINT_VERSION, THRESHOLDS, duplicate_metric_decision
 from .insights import CHANNELS, SCENES, build_channel_conclusions
 from .storage import (
     CURRENT_SCHEMA_MIGRATION_NAME,
@@ -53,6 +55,18 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 TASK_TYPES = {"daily", "weekly", "custom"}
 RUNNABLE_STATUSES = {"queued", "partial", "failed", "interrupted"}
 
+_QUALITY_GATE_LABELS = {
+    "discovery_coverage": "发现覆盖",
+    "detail_coverage": "详情覆盖",
+    "metrics_freshness": "指标新鲜度",
+    "evaluation_coverage": "正式评估覆盖",
+    "core_artifact_coverage": "核心产物覆盖",
+    "media_terminal_coverage": "媒体处理终态覆盖",
+    "duplicate_fingerprint_coverage": "重复指纹覆盖",
+    "weekly_comment_coverage": "周评论证据覆盖",
+    "duplicate_calibration_ready": "重复指纹定标未通过",
+}
+
 
 class ReportTaskError(RuntimeError):
     pass
@@ -60,6 +74,42 @@ class ReportTaskError(RuntimeError):
 
 class TaskCancelled(ReportTaskError):
     pass
+
+
+def _task_completion_message(report: Mapping[str, Any]) -> str:
+    if report.get("task", {}).get("task_status") != "partial":
+        return "报告已生成"
+    data_quality = report.get("data_quality")
+    if not isinstance(data_quality, Mapping):
+        return "报告已生成；未达发布门槛：数据质量声明缺失"
+    summary = report.get("summary_metrics")
+    publications = (
+        summary.get("publication_count", {}).get("value")
+        if isinstance(summary, Mapping)
+        else None
+    )
+    contract = load_contract(report_version=str(report.get("report_version") or ""))
+    failures = quality_gate_failures(
+        data_quality,
+        contract=contract,
+        enforce_boolean_quality_gates=bool(publications),
+    )
+    details: List[str] = []
+    for failure in failures:
+        key = str(failure["key"])
+        label = _QUALITY_GATE_LABELS.get(key, key)
+        if failure["kind"] == "boolean":
+            details.append(label)
+            continue
+        actual = failure["actual"]
+        required = float(failure["required"])
+        if isinstance(actual, (int, float)) and not isinstance(actual, bool):
+            details.append(f"{label} {float(actual):g}%（门槛 {required:g}%）")
+        else:
+            details.append(f"{label}缺失（门槛 {required:g}%）")
+    if not details:
+        details.append("历史报告未保留细分原因")
+    return "报告已生成；未达发布门槛：" + "、".join(details)
 
 
 class _GrayReviewGateError(ReportTaskError):
@@ -699,10 +749,9 @@ def _report_audience_rates(
 ) -> Dict[str, Dict[str, Any]]:
     """Per-slice automotive_user_rate for one report window.
 
-    The classifier state resolves through the shared calibration gate
-    (:func:`audience_rate.active_classifier_state`), so the user-level rate
-    stays ``below_threshold`` — publishing no percentage — until a gold-set
-    calibration approves the active classifier version.
+    The classifier state resolves through the shared calibration gate. An
+    uncalibrated classifier may publish only a fully classified sample; an
+    incomplete user classification never becomes a zero-valued percentage.
     """
 
     window_end = datetime.fromisoformat(window_end_utc.replace("Z", "+00:00"))
@@ -752,33 +801,10 @@ def _build_report_data(
     ).fetchall()
     contents = [dict(row) for row in content_rows]
     ids = [int(row["id"]) for row in content_rows]
-    evaluations = release_current_evaluations(connection, str(release["id"]), ids)
+    eligible_evaluations = formal_eligible_release_evaluations(
+        connection, str(release["id"]), ids
+    )
     snapshots = _latest_metric_rows(connection, ids)
-    unresolved_manual_conflict_ids: set[int] = set()
-    if ids:
-        placeholders = ",".join("?" for _ in ids)
-        unresolved_manual_conflict_ids = {
-            int(row["content_id"])
-            for row in connection.execute(
-                f"""
-                SELECT DISTINCT q.content_id
-                FROM review_queue q
-                JOIN evaluation_versions e ON e.id=q.evaluation_id
-                WHERE q.content_id IN ({placeholders})
-                  AND q.reason_code='manual_conclusion_conflict'
-                  AND q.status IN ('pending','manual_required','in_review')
-                  AND e.release_id=? AND e.invalidated_at IS NULL
-                """,
-                [*ids, release["id"]],
-            ).fetchall()
-        }
-    eligible_evaluations = {
-        content_id: value
-        for content_id, value in evaluations.items()
-        if int(value["pending_review"]) == 0
-        and value["evidence_level"] in {"V2", "V3"}
-        and content_id not in unresolved_manual_conflict_ids
-    }
     included_evaluations = {
         content_id: value
         for content_id, value in eligible_evaluations.items()
@@ -912,23 +938,33 @@ def _build_report_data(
         if task["task_type"] == "weekly" and total
         else 100.0
     )
-    data_quality = {
+    duplicate_status, duplicate_coverage, duplicate_reason = (
+        duplicate_metric_decision(
+            total,
+            fingerprint_ready,
+            duplicate_calibration_ready,
+        )
+    )
+    evaluation_coverage = (
+        round(eval_ready * 100 / total, 2) if total else 100.0
+    )
+    data_quality: Dict[str, Any] = {
         "discovery_coverage": _discovery_coverage(connection),
         "detail_coverage": _percentage(detail_ready, total) if total else 100.0,
         "metrics_freshness": metrics_freshness,
-        "evaluation_coverage": _percentage(eval_ready, total) if total else 100.0,
+        "evaluation_coverage": evaluation_coverage,
         "core_artifact_coverage": 100.0,
         "media_terminal_coverage": media_terminal_coverage,
         "duplicate_fingerprint_coverage": (
-            _percentage(fingerprint_ready, total)
-            if duplicate_calibration_ready and total
-            else 100.0
-            if not total
-            else 0.0
+            duplicate_coverage if duplicate_coverage is not None else 100.0
         ),
+        "duplicate_calibration_ready": duplicate_calibration_ready,
         "weekly_comment_coverage": weekly_comment_coverage,
     }
-    task_status = expected_terminal_task_status(data_quality)
+    task_status = expected_terminal_task_status(
+        data_quality,
+        enforce_boolean_quality_gates=bool(total),
+    )
     metric_coverage = _percentage(len(snapshots), total)
     view_values = [
         int(value["view_count"])
@@ -967,8 +1003,29 @@ def _build_report_data(
         "not_applicable"
         if total == 0
         else "available"
-        if float(data_quality["evaluation_coverage"] or 0) >= 95
+        if evaluation_coverage >= 95
         else "below_threshold"
+    )
+    evaluation_reason = (
+        "正式评估覆盖率为 "
+        f"{evaluation_coverage:.2f}%，低于 95% 发布阈值"
+        if eval_status == "below_threshold"
+        else ""
+    )
+    view_reason = (
+        "存量曝光为一次性历史快照，不能解释为当前实时值"
+        if all_historical
+        else f"曝光量快照覆盖率为 {metric_coverage:.2f}%，低于 90% 发布阈值"
+        if view_status == "below_threshold" and metric_coverage is not None
+        else ""
+    )
+    comment_metric_coverage = _percentage(len(comment_values), total)
+    comment_reason = (
+        "存量 valid_unique_commenters 不是评论量，未转换为评论数"
+        if comment_status == "missing"
+        else f"评论量快照覆盖率为 {comment_metric_coverage:.2f}%，低于 90% 发布阈值"
+        if comment_status == "below_threshold" and comment_metric_coverage is not None
+        else ""
     )
     point_counts = Counter(
         str(value["primary_selling_point_code"])
@@ -1151,16 +1208,14 @@ def _build_report_data(
                 unit="view",
                 status=view_status,
                 coverage_percentage=metric_coverage,
-                reason="存量曝光为一次性历史快照，不能解释为当前实时值"
-                if all_historical
-                else "",
+                reason=view_reason,
             ),
             "comment_count": quantity_metric(
                 sum(comment_values) if comment_values else None,
                 unit="comment",
                 status=comment_status,
-                coverage_percentage=_percentage(len(comment_values), total),
-                reason="存量 valid_unique_commenters 不是评论量，未转换为评论数",
+                coverage_percentage=comment_metric_coverage,
+                reason=comment_reason,
             ),
             "verticality_rate": ratio_metric(
                 vertical if total else None,
@@ -1168,6 +1223,7 @@ def _build_report_data(
                 status=eval_status,
                 eligible_count=eval_ready,
                 coverage_percentage=data_quality["evaluation_coverage"],
+                reason=evaluation_reason,
             ),
             "selling_point_coverage_rate": ratio_metric(
                 selling if total else None,
@@ -1175,25 +1231,15 @@ def _build_report_data(
                 status=eval_status,
                 eligible_count=eval_ready,
                 coverage_percentage=data_quality["evaluation_coverage"],
+                reason=evaluation_reason,
             ),
             "duplicate_rate": ratio_metric(
                 len(duplicate_rows) if total else None,
                 total,
-                status=(
-                    "not_applicable"
-                    if total == 0
-                    else "available"
-                    if float(data_quality["duplicate_fingerprint_coverage"] or 0) >= 95
-                    else "below_threshold"
-                ),
+                status=duplicate_status,
                 eligible_count=fingerprint_ready,
-                coverage_percentage=data_quality["duplicate_fingerprint_coverage"],
-                reason=(
-                    "感知指纹定标未通过或覆盖不足，重复率暂不发布"
-                    if total
-                    and float(data_quality["duplicate_fingerprint_coverage"] or 0) < 95
-                    else ""
-                ),
+                coverage_percentage=duplicate_coverage,
+                reason=duplicate_reason,
             ),
             "estimated_new_users": quantity_metric(
                 None,
@@ -1248,28 +1294,57 @@ _CONCLUSION_METRIC_LABELS = (
     ("acquisition_potential", "内容拉新效果预估"),
 )
 _UNPUBLISHED_STATUS_LABELS = {
-    "below_threshold": "覆盖不足",
-    "missing": "有效样本不足",
+    "below_threshold": "暂不发布",
+    "missing": "无数据",
     "not_applicable": "无适用内容",
     "not_calculable": "暂无模型",
     "stale": "数据已过期",
 }
+#: 按 reason 关键词给出更准确的短语（2026-08-07 决策：按成因显示，
+#: 不再使用泛化样本提示）。关键词与 audience_rate/insights 的
+#: reason 文案保持一致，改动需同步 web 端 unavailableShortLabel。
+_UNPUBLISHED_REASON_LABELS = (
+    ("感知指纹定标未通过", "重复指纹待校验"),
+    ("感知指纹覆盖率", "重复指纹待补齐"),
+    ("用户身份覆盖率", "身份数据待补齐"),
+    ("用户分类覆盖率", "用户分类未完成"),
+    ("低于 30 人门槛", "互动用户少于30人"),
+    ("可归类有效曝光", "曝光归类待补齐"),
+    ("分类器定标未通过", "分类器核验未通过"),
+    ("用户级汽车兴趣占比尚未接入", "用户聚合未接入"),
+    ("未提供阅读数", "平台未提供阅读数"),
+    ("有效曝光数据", "有效曝光待补齐"),
+    ("没有一级评论互动", "无评论互动"),
+    ("评论尚未采集", "评论未采集"),
+    ("无可识别的用户身份", "无可识别用户"),
+    ("评分证据门槛", "暂无可评分内容"),
+    ("兴趣分类尚未运行", "待运行分类器"),
+)
+_PUBLISHED_METRIC_STATUSES = {"available", "sample_only"}
 
 
 def _conclusion_cell(metric: Mapping[str, Any]) -> str:
     """Status-aware display value: never fabricates an unpublished number."""
 
-    if metric.get("kind") == "score":
+    published = metric.get("status") in _PUBLISHED_METRIC_STATUSES
+    if metric.get("kind") == "quantity" and published:
+        if metric.get("value") is not None:
+            return str(metric["value"])
+    elif metric.get("kind") == "score" and published:
         if metric.get("value") is not None:
             value = f"{metric['value']}%"
             if metric.get("status") == "sample_only":
                 return f"{value}（仅样本）"
             return value
-    elif metric.get("percentage") is not None:
+    elif published and metric.get("percentage") is not None:
         value = f"{metric['percentage']}%"
         if metric.get("status") == "sample_only":
             return f"{value}（仅样本）"
         return value
+    reason = str(metric.get("reason") or "")
+    for needle, label in _UNPUBLISHED_REASON_LABELS:
+        if needle in reason:
+            return label
     return _UNPUBLISHED_STATUS_LABELS.get(str(metric.get("status")), "暂不可计算")
 
 
@@ -1288,12 +1363,12 @@ def _markdown(report: Mapping[str, Any]) -> str:
         "## 概览",
         "",
         f"- 发布内容：{metrics['publication_count']['value']} 条",
-        f"- 重复内容率：{metrics['duplicate_rate']['percentage'] if metrics['duplicate_rate']['percentage'] is not None else '暂不可计算'}%",
+        f"- 重复内容率：{_conclusion_cell(metrics['duplicate_rate'])}",
         f"- 发布账号：{metrics['active_account_count']['value']} 个",
-        f"- 阅读 / 播放：{metrics['view_count']['value'] if metrics['view_count']['value'] is not None else '暂不可计算'}",
-        f"- 评论数：{metrics['comment_count']['value'] if metrics['comment_count']['value'] is not None else '暂不可计算'}",
-        f"- 内容垂直度：{metrics['verticality_rate']['percentage'] if metrics['verticality_rate']['percentage'] is not None else '暂不可计算'}%",
-        f"- 卖点覆盖率：{metrics['selling_point_coverage_rate']['percentage'] if metrics['selling_point_coverage_rate']['percentage'] is not None else '暂不可计算'}%",
+        f"- 阅读 / 播放：{_conclusion_cell(metrics['view_count'])}",
+        f"- 评论数：{_conclusion_cell(metrics['comment_count'])}",
+        f"- 内容垂直度：{_conclusion_cell(metrics['verticality_rate'])}",
+        f"- 卖点覆盖率：{_conclusion_cell(metrics['selling_point_coverage_rate'])}",
         "",
     ]
     channels = report.get("channels") or {}
@@ -1410,6 +1485,9 @@ def _write_channel_csv(path: Path, channels: Mapping[str, Any]) -> None:
         "coverage_percentage",
         "reason",
         "identity_coverage_percentage",
+        "candidate_user_count",
+        "classified_user_count",
+        "classification_coverage_percentage",
         "comment_collection_coverage_percentage",
         "captured_comment_count",
         "declared_comment_count",
@@ -1454,6 +1532,17 @@ def _write_channel_csv(path: Path, channels: Mapping[str, Any]) -> None:
                         "reason": metric.get("reason"),
                         "identity_coverage_percentage": (
                             quality.get("identity_coverage_percentage")
+                            if audience
+                            else None
+                        ),
+                        "candidate_user_count": (
+                            quality.get("candidate_user_count") if audience else None
+                        ),
+                        "classified_user_count": (
+                            quality.get("classified_user_count") if audience else None
+                        ),
+                        "classification_coverage_percentage": (
+                            quality.get("classification_coverage_percentage")
                             if audience
                             else None
                         ),
@@ -1794,9 +1883,7 @@ def run_task(
                 """,
                 (
                     terminal_status,
-                    "报告已生成；必需覆盖率不足"
-                    if terminal_status == "partial"
-                    else "报告已生成",
+                    _task_completion_message(report),
                     completed_at,
                     completed_at,
                     task_id,

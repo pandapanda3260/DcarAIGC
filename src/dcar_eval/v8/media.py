@@ -36,6 +36,7 @@ LEGACY_IMAGE_DOWNLOAD_VERSION = "provider-image-download-v8.0"
 MAX_MEDIA_DOWNLOAD_ATTEMPTS = 3
 MAX_MEDIA_PROCESSING_ATTEMPTS = 3
 MEDIA_DOWNLOAD_WORKERS = 6
+MEDIA_QUEUE_BATCH_LIMIT = 500
 STALE_MEDIA_SLOT_SECONDS = 2 * 60 * 60
 BOUNDED_PROCESSOR_TYPES = frozenset({"download", "frames", "asr", "ocr"})
 
@@ -1492,20 +1493,24 @@ def _queue_content_ids(
 
 def run_media_download_queue(
     *,
-    limit: int = 100,
+    limit: int = MEDIA_QUEUE_BATCH_LIMIT,
     max_workers: int = MEDIA_DOWNLOAD_WORKERS,
     db_path: Path = DEFAULT_DB,
     published_start: Optional[str] = None,
     published_end: Optional[str] = None,
 ) -> Dict[str, Any]:
+    if limit < 0:
+        raise ValueError("media queue limit must be non-negative")
     stale_recovery = recover_stale_media_processing_slots(
         db_path=db_path,
         processor_types=("download",),
     )
-    content_ids = _queue_content_ids(
-        stage="download", limit=limit, db_path=db_path,
+    probed_content_ids = _queue_content_ids(
+        stage="download", limit=limit + 1, db_path=db_path,
         published_start=published_start, published_end=published_end,
     )
+    truncated = len(probed_content_ids) > limit
+    content_ids = probed_content_ids[:limit]
 
     def download(content_id: int) -> Dict[str, Any]:
         try:
@@ -1535,6 +1540,8 @@ def run_media_download_queue(
         "retryable_failed": retryable_failed,
         "terminal_failed": terminal_failed,
         "failed": retryable_failed + terminal_failed,
+        "truncated": truncated,
+        "has_more": truncated,
         "stale_recovery": stale_recovery,
         "results": results,
     }
@@ -1542,11 +1549,13 @@ def run_media_download_queue(
 
 def run_media_processing_queue(
     *,
-    limit: int = 100,
+    limit: int = MEDIA_QUEUE_BATCH_LIMIT,
     db_path: Path = DEFAULT_DB,
     published_start: Optional[str] = None,
     published_end: Optional[str] = None,
 ) -> Dict[str, Any]:
+    if limit < 0:
+        raise ValueError("media queue limit must be non-negative")
     versions = processor_versions()
     stale_recovery = recover_stale_media_processing_slots(
         db_path=db_path,
@@ -1557,10 +1566,12 @@ def run_media_processing_queue(
             "ocr": versions["ocr"],
         },
     )
-    content_ids = _queue_content_ids(
-        stage="process", limit=limit, db_path=db_path,
+    probed_content_ids = _queue_content_ids(
+        stage="process", limit=limit + 1, db_path=db_path,
         published_start=published_start, published_end=published_end,
     )
+    truncated = len(probed_content_ids) > limit
+    content_ids = probed_content_ids[:limit]
     if content_ids and not ocr_binary_path().is_file():
         compile_ocr_binary()
     results: List[Dict[str, Any]] = []
@@ -1608,6 +1619,8 @@ def run_media_processing_queue(
         "retryable_failed": retryable_failed,
         "terminal_failed": terminal_failed,
         "failed": retryable_failed + terminal_failed,
+        "truncated": truncated,
+        "has_more": truncated,
         "stale_recovery": stale_recovery,
         "results": results,
     }

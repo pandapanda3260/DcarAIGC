@@ -4,7 +4,8 @@ import { useEffect, useState } from "react";
 import {
   CarIcon,
   GameControllerIcon,
-  PencilSimpleIcon,
+  PlusIcon,
+  StarFourIcon,
   TelevisionIcon,
 } from "@phosphor-icons/react";
 import AppShell from "../components/AppShell";
@@ -77,14 +78,20 @@ export default function SellingPointsPage() {
       .finally(() => setLoading(false));
   }, []);
 
-  async function beginEdit() {
+  async function ensureDraft() {
+    if (draftMode) return;
+    await readJson("/api/v8/selling-points/draft", { method: "POST" });
+    setData(await readJson<SellingPointResponse>("/api/v8/selling-points/draft"));
+    setDraftMode(true);
+    setMessage("已进入隔离草稿；原子激活前不影响生产评估");
+  }
+
+  async function beginPoint(point?: SellingPoint) {
     setSaving(true);
     setError("");
     try {
-      await readJson("/api/v8/selling-points/draft", { method: "POST" });
-      setData(await readJson<SellingPointResponse>("/api/v8/selling-points/draft"));
-      setDraftMode(true);
-      setMessage("已创建隔离草稿；原子激活前不影响生产评估");
+      await ensureDraft();
+      open(point);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "卖点草稿创建失败");
     } finally {
@@ -142,6 +149,7 @@ export default function SellingPointsPage() {
     setSaving(true);
     setError("");
     try {
+      await ensureDraft();
       await readJson(`/api/v8/selling-points/items/${code}`, { method: "DELETE" });
       setData(await readJson<SellingPointResponse>("/api/v8/selling-points/draft"));
       setMessage(`${code} 已从草稿删除`);
@@ -156,20 +164,18 @@ export default function SellingPointsPage() {
     ? data.items.find((point) => point.code === editingCode) ?? null
     : null;
 
-  const shellActions = draftMode ? (
+  const shellActions = (
     <>
-      <span className="selling-point-activation-note" role="status">
-        草稿须完成评估回填与验收后，由发布流程原子激活
-      </span>
-      <button className="secondary selling-point-top-action" disabled={saving} onClick={() => open()}>
+      {draftMode && (
+        <span className="selling-point-activation-note" role="status">
+          草稿须完成评估回填与验收后，由发布流程原子激活
+        </span>
+      )}
+      <button className="secondary selling-point-edit-standard" disabled={loading || saving} onClick={() => void beginPoint()}>
+        <PlusIcon size={16} weight="bold" aria-hidden />
         新增卖点
       </button>
     </>
-  ) : (
-    <button className="secondary selling-point-edit-standard" disabled={loading || saving} onClick={() => void beginEdit()}>
-      <PencilSimpleIcon size={16} weight="bold" aria-hidden />
-      编辑卖点标准
-    </button>
   );
 
   return (
@@ -194,12 +200,12 @@ export default function SellingPointsPage() {
                 );
                 return (
                   <article className="selling-point-summary-item" data-family={family.code} key={family.code}>
+                    <span className="selling-point-family-icon"><FamilyIcon code={family.code} size={26} /></span>
                     <div className="selling-point-summary-copy">
                       <span><b>{family.code}</b> {family.title}</span>
                       <strong>{draftMode || !familyHasHits ? "—" : primaryHits.toLocaleString("zh-CN")}</strong>
                       <small>{draftMode ? "草稿不含命中统计" : familyHasHits ? `primary 命中 · ${familyPoints.length} 项标准` : `${familyPoints.length} 项标准`}</small>
                     </div>
-                    <span className="selling-point-family-icon"><FamilyIcon code={family.code} size={26} /></span>
                   </article>
                 );
               })}
@@ -240,7 +246,7 @@ export default function SellingPointsPage() {
                         <col className="selling-point-label-col" />
                         <col className="selling-point-scope-col" />
                         <col className="selling-point-hit-col" />
-                        {draftMode && <col className="selling-point-action-col" />}
+                        <col className="selling-point-action-col" />
                       </colgroup>
                       <thead>
                         <tr>
@@ -248,7 +254,7 @@ export default function SellingPointsPage() {
                           <th scope="col">卖点标准</th>
                           <th scope="col">层级与适用范围</th>
                           <th scope="col">命中统计</th>
-                          {draftMode && <th scope="col">操作</th>}
+                          <th scope="col">操作</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -265,7 +271,10 @@ export default function SellingPointsPage() {
                               </td>
                               <td>
                                 <div className="selling-point-scope">
-                                  <span className="selling-point-tier">{point.tier === "core" ? "核心" : "其他"}</span>
+                                  <span className="selling-point-tier" data-tier={point.tier === "core" ? "core" : "other"}>
+                                    {point.tier === "core" && <StarFourIcon size={9} weight="fill" aria-hidden />}
+                                    {point.tier === "core" ? "核心" : "其他"}
+                                  </span>
                                   <span className="selling-point-scene-list">
                                     {point.scenes.map((pointScene) => <span className="scene-tag" key={pointScene}>{label(pointScene)}</span>)}
                                   </span>
@@ -279,14 +288,12 @@ export default function SellingPointsPage() {
                                   </span>
                                 )}
                               </td>
-                              {draftMode && (
-                                <td>
-                                  <span className="selling-point-row-actions">
-                                    <button className="text-button" disabled={saving} onClick={() => open(point)}>编辑</button>
-                                    <button className="text-button danger" disabled={saving} onClick={() => void remove(point.code)}>删除</button>
-                                  </span>
-                                </td>
-                              )}
+                              <td>
+                                <span className="selling-point-row-actions">
+                                  <button className="text-button" disabled={saving} onClick={() => void beginPoint(point)}>编辑</button>
+                                  <button className="text-button danger" disabled={saving} onClick={() => void remove(point.code)}>删除</button>
+                                </span>
+                              </td>
                             </tr>
                           );
                         })}

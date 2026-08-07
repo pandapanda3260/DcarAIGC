@@ -51,6 +51,10 @@ class CommentPagingError(RuntimeError):
     pass
 
 
+class PageFetchDeferred(RuntimeError):
+    """A page is intentionally unavailable without making a provider call."""
+
+
 @dataclass
 class PageFetch:
     """One page delivered by the injected fetcher."""
@@ -149,7 +153,11 @@ def _load_existing_pages(
 
 def _accumulate_page(accumulator: _Accumulator, result_data: Mapping[str, Any]) -> None:
     declared = result_data.get("declared_total")
-    if declared is not None:
+    # The provider's ``total`` is a point-in-time declaration.  Keep the first
+    # usable value so a later page cannot rewrite the collection-start
+    # denominator when the upstream list changes (or returns an inconsistent
+    # total) while cursors are being consumed.
+    if declared is not None and accumulator.declared_total is None:
         accumulator.declared_total = int(declared)
     for raw in result_data.get("comments") or []:
         body = str(raw.get("body") or "")
@@ -194,15 +202,15 @@ def _decide_stop(
     pages_fetched: int,
 ) -> Optional[str]:
     distinct = accumulator.distinct_l1()
-    # Hard cap first.
-    if distinct >= comment_cap:
-        return "cap_reached"
     # Genuine exhaustion (no further page) outranks an early-stop target: we
     # consumed everything rather than stopping short.
-    if not has_more or next_cursor is None:
+    if not has_more:
         if distinct == 0 and pages_fetched >= 1:
             return "zero_comments"
         return "provider_exhausted"
+    # The cap describes an early stop only while the provider has more data.
+    if distinct >= comment_cap:
+        return "cap_reached"
     # Early stop while more pages still exist and the coverage target is met.
     declared = accumulator.declared_total
     if (
@@ -268,6 +276,7 @@ def capture_content_comments(
                 "status": "already_succeeded",
                 "capture_run_id": int(run["id"]),
                 "completion_kind": run["completion_kind"],
+                "provider_cost": 0.0,
             }
         run_id = int(run["id"])
         existing_pages = _load_existing_pages(connection, run_id)
@@ -276,12 +285,20 @@ def capture_content_comments(
     cursor: Optional[Mapping[str, Any]] = None
     page_number = 0
     seen_cursor_shas: set[str] = set()
+    provider_cost = 0.0
 
     # Resume: replay already-stored pages to rebuild the cursor + accumulator.
     for stored in existing_pages:
         page_number = int(stored["page_number"])
         seen_cursor_shas.add(str(stored["request_cursor_sha256"]))
-        fetched = page_fetcher(page_number, _load_cursor(stored["request_cursor_json"]))
+        try:
+            fetched = page_fetcher(
+                page_number, _load_cursor(stored["request_cursor_json"])
+            )
+        except Exception as exc:
+            _mark_run_fetch_failure(run_id, exc, db_path=db_path)
+            raise
+        provider_cost += float(getattr(fetched.result, "amount", 0.0) or 0.0)
         _accumulate_page(accumulator, fetched.result.data)
         cursor = _load_cursor(stored["next_cursor_json"])
         if cursor is None:
@@ -294,15 +311,18 @@ def capture_content_comments(
     while pages_fetched < max_pages:
         sha = cursor_sha256(cursor)
         if sha in seen_cursor_shas and pages_fetched > 0:
-            completion_kind = "provider_exhausted"
             stop_reason = "cursor_cycle_detected"
             break
         page_number += 1
         try:
             fetched = page_fetcher(page_number, cursor)
-        except _BudgetExhausted as exc:
-            stop_reason = f"budget_exhausted:{exc}"
+        except PageFetchDeferred as exc:
+            stop_reason = str(exc) or "page_fetch_deferred"
             break
+        except Exception as exc:
+            _mark_run_fetch_failure(run_id, exc, db_path=db_path)
+            raise
+        provider_cost += float(getattr(fetched.result, "amount", 0.0) or 0.0)
         result_data = fetched.result.data
         _accumulate_page(accumulator, result_data)
         counts = _page_counts(result_data)
@@ -330,7 +350,7 @@ def capture_content_comments(
                     fetched.fetch_slot_id,
                     fetched.raw_response_id,
                     int(has_more),
-                    accumulator.declared_total,
+                    result_data.get("declared_total"),
                     counts["received"],
                     counts["distinct"],
                     counts["valid"],
@@ -340,6 +360,9 @@ def capture_content_comments(
             )
         seen_cursor_shas.add(sha)
         pages_fetched += 1
+        if has_more and next_cursor is None:
+            stop_reason = "missing_next_cursor"
+            break
         completion_kind = _decide_stop(
             accumulator=accumulator,
             has_more=has_more,
@@ -352,6 +375,9 @@ def capture_content_comments(
             break
         cursor = next_cursor
 
+    if completion_kind is None and stop_reason is None and pages_fetched >= max_pages:
+        stop_reason = "max_pages_reached"
+
     return _finalize_run(
         content=content,
         window_key=window_key,
@@ -362,6 +388,7 @@ def capture_content_comments(
         completion_kind=completion_kind,
         stop_reason=stop_reason,
         comment_cap=comment_cap,
+        provider_cost=provider_cost,
         db_path=db_path,
     )
 
@@ -377,6 +404,7 @@ def _finalize_run(
     completion_kind: Optional[str],
     stop_reason: Optional[str],
     comment_cap: int,
+    provider_cost: float,
     db_path: Path,
 ) -> Dict[str, Any]:
     content_id = int(content["id"])
@@ -384,6 +412,34 @@ def _finalize_run(
     comments = list(accumulator.comments_by_identity.values())
     distinct_l1 = accumulator.distinct_l1()
     stable_l1 = accumulator.stable_identity_l1()
+
+    if pages_fetched == 0 and not terminated:
+        with connect(db_path) as connection, transaction(connection):
+            connection.execute(
+                """
+                UPDATE comment_capture_runs SET
+                    status='retryable_failed',completion_kind=NULL,stop_reason=?,
+                    declared_total_count=NULL,captured_distinct_count=0,
+                    valid_comment_count=0,stable_identity_comment_count=0,
+                    page_count=0,completed_at=NULL,updated_at=?
+                WHERE id=?
+                """,
+                (stop_reason, now_utc(), run_id),
+            )
+        return {
+            "content_id": content_id,
+            "status": "incomplete",
+            "capture_run_id": run_id,
+            "evidence_version_id": None,
+            "completion_kind": None,
+            "stop_reason": stop_reason,
+            "pages_fetched": 0,
+            "distinct_l1_comments": 0,
+            "stable_identity_l1_comments": 0,
+            "declared_total": None,
+            "comment_collection_coverage_percentage": None,
+            "provider_cost": round(provider_cost, 6),
+        }
 
     with connect(db_path) as connection, transaction(connection):
         pages = connection.execute(
@@ -500,13 +556,17 @@ def _finalize_run(
     )
 
     coverage = None
-    if accumulator.declared_total:
+    if completion_kind in {"cap_reached", "provider_exhausted"}:
+        # A terminal cursor proves all provider-accessible L1 pages were
+        # consumed.  The raw first-page declaration remains persisted for
+        # audit, but it may include replies/filtered rows and is not a valid
+        # remaining-page denominator.
+        coverage = 100.0 if distinct_l1 else None
+    elif accumulator.declared_total:
         denom = max(int(accumulator.declared_total), distinct_l1)
         coverage = round(distinct_l1 * 100 / denom, 2) if denom else None
     elif not terminated:
         coverage = None
-    elif completion_kind == "provider_exhausted":
-        coverage = 100.0 if distinct_l1 else None
 
     return {
         "content_id": content_id,
@@ -520,11 +580,31 @@ def _finalize_run(
         "stable_identity_l1_comments": stable_l1,
         "declared_total": accumulator.declared_total,
         "comment_collection_coverage_percentage": coverage,
+        "provider_cost": round(provider_cost, 6),
     }
 
 
-class _BudgetExhausted(RuntimeError):
-    pass
+def _mark_run_fetch_failure(
+    run_id: int,
+    error: Exception,
+    *,
+    db_path: Path,
+) -> None:
+    retryable = bool(getattr(error, "retryable", False))
+    error_code = str(getattr(error, "error_code", type(error).__name__))
+    with connect(db_path) as connection, transaction(connection):
+        connection.execute(
+            """
+            UPDATE comment_capture_runs SET status=?,completion_kind=NULL,
+                stop_reason=?,completed_at=NULL,updated_at=? WHERE id=?
+            """,
+            (
+                "retryable_failed" if retryable else "terminal_failed",
+                f"page_fetch_failed:{error_code}",
+                now_utc(),
+                run_id,
+            ),
+        )
 
 
 def _dump_cursor(cursor: Optional[Mapping[str, Any]]) -> str:

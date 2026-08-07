@@ -124,9 +124,10 @@ class ClassifyWindowPersistenceTest(unittest.TestCase):
                 """
                 INSERT INTO evaluation_releases(
                     id, rule_version, taxonomy_version, matcher_rule_sha256,
-                    status, created_at, updated_at
+                    status, created_at, updated_at, activated_at
                 ) VALUES ('rel-v8', 'evaluation-v8', 'selling-points-v5.0', ?,
-                          'active', '2026-08-01T00:00:00Z', '2026-08-01T00:00:00Z')
+                          'active', '2026-08-01T00:00:00Z', '2026-08-01T00:00:00Z',
+                          '2026-08-01T00:00:00Z')
                 """,
                 ("a" * 64,),
             )
@@ -167,7 +168,13 @@ class ClassifyWindowPersistenceTest(unittest.TestCase):
                 )
 
     def _add_comment(
-        self, cid: int, raw_uid: str, body: str, published_at: str
+        self,
+        cid: int,
+        raw_uid: str,
+        body: str,
+        published_at: str,
+        *,
+        evidence_version_id: int | None = None,
     ) -> None:
         pseudonymous = self.hasher.user_key("douyin", raw_uid)
         comment = {
@@ -188,7 +195,7 @@ class ClassifyWindowPersistenceTest(unittest.TestCase):
             insert_comment_rows(
                 self.connection,
                 platform="douyin",
-                evidence_version_id=cid,
+                evidence_version_id=evidence_version_id or cid,
                 comments=[comment],
                 captured_at="2026-08-01T01:00:00Z",
             )
@@ -233,6 +240,19 @@ class ClassifyWindowPersistenceTest(unittest.TestCase):
         )
         self.assertEqual(rows_after, 3)
 
+        ac.classify_window(
+            self.connection,
+            content_ids=[1, 2],
+            evidence_window_start="2026-05-04T00:00:00+00:00",
+            evidence_window_end="2026-08-02T00:00:00+00:00",
+        )
+        shifted_rows = int(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM interaction_user_classification_versions"
+            ).fetchone()[0]
+        )
+        self.assertEqual(shifted_rows, 6)
+
     def test_out_of_window_comment_excluded_from_evidence(self) -> None:
         self._add_comment(1, "uOld", "秦L真香", "2026-01-01T10:00:00Z")
         summary = ac.classify_window(
@@ -242,6 +262,162 @@ class ClassifyWindowPersistenceTest(unittest.TestCase):
             evidence_window_end="2026-08-03T00:00:00+00:00",
         )
         self.assertEqual(summary["total_users"], 0)
+
+    def test_comment_without_stable_identity_is_not_classified(self) -> None:
+        with storage.transaction(self.connection):
+            insert_comment_rows(
+                self.connection,
+                platform="douyin",
+                evidence_version_id=1,
+                comments=[
+                    {
+                        "platform_comment_id": "unstable-1",
+                        "anonymous_user_key": "U-unstable-1",
+                        "pseudonymous_user_key": "",
+                        "body": "秦L真香",
+                        "published_at": "2026-07-20T10:00:00Z",
+                        "parent_comment_id": None,
+                        "comment_identity_key": comment_identity_key(
+                            platform_comment_id="unstable-1",
+                            pseudonymous_user_key="U-unstable-1",
+                            body="秦L真香",
+                            published_at="2026-07-20T10:00:00Z",
+                        ),
+                    }
+                ],
+                captured_at="2026-08-01T01:00:00Z",
+            )
+        summary = ac.classify_window(
+            self.connection,
+            content_ids=[1],
+            evidence_window_start="2026-05-05T00:00:00+00:00",
+            evidence_window_end="2026-08-03T00:00:00+00:00",
+            persist=False,
+        )
+        self.assertEqual(summary["total_users"], 0)
+        self.assertEqual(sum(summary["label_counts"].values()), 0)
+
+    def test_comment_without_valid_behavior_time_is_excluded(self) -> None:
+        self._add_comment(1, "uNoTime", "秦L真香", "")
+        summary = ac.classify_window(
+            self.connection,
+            content_ids=[1],
+            evidence_window_start="2026-05-05T00:00:00+00:00",
+            evidence_window_end="2026-08-03T00:00:00+00:00",
+            persist=False,
+        )
+        self.assertEqual(summary["total_users"], 0)
+
+    def test_classifier_rejects_non_90_day_window(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must equal 90 days"):
+            ac.classify_window(
+                self.connection,
+                content_ids=[1],
+                evidence_window_start="2026-05-06T00:00:00+00:00",
+                evidence_window_end="2026-08-03T00:00:00+00:00",
+                persist=False,
+            )
+
+    def test_classifier_rejects_window_ending_after_cutoff(self) -> None:
+        with self.assertRaisesRegex(ValueError, "cannot exceed report cutoff"):
+            ac.classify_window(
+                self.connection,
+                content_ids=[1],
+                evidence_window_start="2026-05-05T00:00:00Z",
+                evidence_window_end="2026-08-03T00:00:00Z",
+                report_cutoff_at="2026-08-02T12:00:00Z",
+                persist=False,
+            )
+
+    def test_classifier_uses_latest_comment_evidence_at_cutoff(self) -> None:
+        self._add_comment(
+            1, "uOld", "秦L真香", "2026-07-20T10:00:00Z"
+        )
+        with storage.transaction(self.connection):
+            self.connection.execute(
+                """
+                INSERT INTO comment_evidence_versions(
+                    id, content_id, captured_at, iso_week, source, local_path,
+                    sha256, comment_count, status, created_at
+                ) VALUES (3,1,'2026-08-02T01:00:00Z','2026-W31','douyin',
+                          'data/cache/c3.json', ?, 1, 'available',
+                          '2026-08-02T01:00:00Z')
+                """,
+                ("3" * 64,),
+            )
+        self._add_comment(
+            1,
+            "uNew",
+            "好看",
+            "2026-07-21T10:00:00Z",
+            evidence_version_id=3,
+        )
+
+        before = ac.classify_window(
+            self.connection,
+            content_ids=[1],
+            evidence_window_start="2026-05-03T12:00:00+00:00",
+            evidence_window_end="2026-08-01T12:00:00+00:00",
+            report_cutoff_at="2026-08-01T12:00:00Z",
+            persist=False,
+        )
+        after = ac.classify_window(
+            self.connection,
+            content_ids=[1],
+            evidence_window_start="2026-05-03T12:00:00+00:00",
+            evidence_window_end="2026-08-01T12:00:00+00:00",
+            report_cutoff_at="2026-08-03T00:00:00Z",
+            persist=False,
+        )
+        self.assertEqual(before["total_users"], 1)
+        self.assertEqual(before["label_counts"]["automotive"], 1)
+        self.assertEqual(after["total_users"], 1)
+        self.assertEqual(after["label_counts"]["automotive"], 0)
+        self.assertEqual(after["label_counts"]["not_identified"], 1)
+
+    def test_content_context_is_selected_at_report_cutoff(self) -> None:
+        self._add_comment(1, "uPrice", "多少钱", "2026-07-20T10:00:00Z")
+        with storage.transaction(self.connection):
+            self.connection.execute(
+                """
+                UPDATE evaluation_versions
+                SET content_automotive_score=20
+                WHERE content_id=1
+                """
+            )
+            self.connection.execute(
+                """
+                INSERT INTO evaluation_versions(
+                    content_id, release_id, rule_version, taxonomy_version,
+                    matcher_rule_sha256, evidence_sha256, evaluation_source,
+                    evaluation_status, evidence_level, content_direction,
+                    content_automotive_score, payload_json, evaluated_at
+                ) VALUES (1, 'rel-v8', 'evaluation-v8', 'selling-points-v5.0', ?, ?,
+                          'automatic', 'evaluated', 'V3', 'used_car', 80, '{}',
+                          '2026-08-02T01:00:00Z')
+                """,
+                ("a" * 64, "late-context".ljust(64, "0")),
+            )
+
+        before = ac.classify_window(
+            self.connection,
+            content_ids=[1],
+            evidence_window_start="2026-05-03T12:00:00Z",
+            evidence_window_end="2026-08-01T12:00:00Z",
+            report_cutoff_at="2026-08-01T12:00:00Z",
+            persist=False,
+        )
+        after = ac.classify_window(
+            self.connection,
+            content_ids=[1],
+            evidence_window_start="2026-05-05T00:00:00Z",
+            evidence_window_end="2026-08-03T00:00:00Z",
+            report_cutoff_at="2026-08-03T00:00:00Z",
+            persist=False,
+        )
+        self.assertEqual(before["label_counts"]["automotive"], 0)
+        self.assertEqual(before["label_counts"]["not_identified"], 1)
+        self.assertEqual(after["label_counts"]["automotive"], 1)
 
 
 class CalibrationTest(unittest.TestCase):

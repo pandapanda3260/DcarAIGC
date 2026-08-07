@@ -283,6 +283,7 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
             archive_before=self.archive_before, workers=2, compact=True,
         )
         self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["accounts_completed"], 1)
         self.assertEqual(result["inserted"], 2)
         self.assertIn("history_scopes", result)
         self.assertEqual(
@@ -294,6 +295,8 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
         account_summary = result["results"][0]
         self.assertNotIn("pages", account_summary)
         self.assertEqual(account_summary["pages_processed"], 1)
+        self.assertTrue(account_summary["completed"])
+        self.assertEqual(account_summary["completion_reason"], "provider_exhausted")
         with connect(self.db) as connection:
             groups = {
                 str(row["platform_content_id"]): str(row["source_group"])
@@ -318,6 +321,9 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
             )
             connection.commit()
         with patch(
+            "v8.range_backfill.process_content_media",
+            return_value={"status": "evidence_ready"},
+        ), patch(
             "v8.range_backfill.refresh_content_duplicates",
             return_value={"status": "succeeded"},
         ):
@@ -337,6 +343,9 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(int(evaluated), 1)
         with patch(
+            "v8.range_backfill.process_content_media",
+            return_value={"status": "evidence_ready"},
+        ), patch(
             "v8.range_backfill.refresh_content_duplicates",
             return_value={"status": "succeeded"},
         ):
@@ -346,6 +355,102 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
                 tagged_only=True,
             )
         self.assertEqual(again["candidates"], 0)
+
+    def test_local_evidence_keeps_tag_when_media_source_is_missing(self) -> None:
+        pending = self._insert_content("212121212", "2026-08-01T01:00:00Z")
+        with connect(self.db) as connection:
+            connection.execute(
+                "UPDATE content_items SET source_group=? WHERE id=?",
+                (HISTORY_BACKFILL_SOURCE_GROUP, pending),
+            )
+            connection.commit()
+
+        result = run_local_evidence_backfill(
+            start=self.start,
+            end=self.end,
+            task_id="local-evidence-no-source",
+            max_amount=1.0,
+            db_path=self.db,
+            limit=10,
+            state_root=self.state,
+            tagged_only=True,
+        )
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["failed"], 1)
+        self.assertEqual(result["tags_cleared"], 0)
+        self.assertEqual(self._source_group(pending), HISTORY_BACKFILL_SOURCE_GROUP)
+        with connect(self.db) as connection:
+            evaluated = connection.execute(
+                "SELECT COUNT(*) FROM evaluation_versions WHERE content_id=?",
+                (pending,),
+            ).fetchone()[0]
+        self.assertEqual(int(evaluated), 0)
+
+    def test_discovery_page_limit_and_missing_cursor_are_partial(self) -> None:
+        def page_limit_call(operation, identity):
+            if operation == "resolve_account":
+                return ProviderResult(
+                    {"reference": "MS4wLjAB" + "x" * 40},
+                    {"reference": "profile"},
+                    200,
+                    True,
+                )
+            item = {
+                "platform": "douyin",
+                "platform_content_id": "232323232",
+                "canonical_url": "https://www.douyin.com/video/232323232",
+                "title": "分页内容",
+                "body": "汽车内容",
+                "published_at": "2026-08-01T01:00:00Z",
+                "content_type": "video",
+                "account_uid": "99887766",
+                "account_name": "汽车号",
+            }
+            return ProviderResult(
+                {"items": [item], "next_cursor": "next", "has_more": True},
+                {"items": [item]},
+                200,
+                True,
+            )
+
+        limited = run_discovery_backfill(
+            start=self.start,
+            end=self.end,
+            task_id="page-limit-test",
+            max_amount=1.0,
+            db_path=self.db,
+            platforms=["douyin"],
+            call_override=page_limit_call,
+            state_root=self.state,
+            max_pages_per_account=1,
+        )
+        self.assertEqual(limited["status"], "partial")
+        self.assertEqual(limited["accounts_completed"], 0)
+        self.assertEqual(limited["stopped_reason"], "page_limit_reached")
+
+        def missing_cursor_call(operation, identity):
+            result = page_limit_call(operation, identity)
+            if operation == "discover_content":
+                result.data["next_cursor"] = None
+            return result
+
+        missing_end = datetime(2026, 8, 6, 0, 0, tzinfo=SHANGHAI)
+        missing_start = datetime(2010, 1, 2, 0, 0, tzinfo=SHANGHAI)
+        missing = run_discovery_backfill(
+            start=missing_start,
+            end=missing_end,
+            task_id="missing-cursor-test",
+            max_amount=1.0,
+            db_path=self.db,
+            platforms=["douyin"],
+            call_override=missing_cursor_call,
+            state_root=self.state,
+            max_pages_per_account=2,
+        )
+        self.assertEqual(missing["status"], "partial")
+        self.assertEqual(missing["accounts_completed"], 0)
+        self.assertEqual(missing["stopped_reason"], "missing_next_cursor")
 
     def test_local_evidence_default_scope_excludes_archive(self) -> None:
         archived = self._insert_content("303030303", "2026-08-01T01:00:00Z")

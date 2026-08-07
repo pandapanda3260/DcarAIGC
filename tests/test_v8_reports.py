@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import v8.reports as reports_module
 from v8.contracts import CURRENT_REPORT_VERSION
+from v8.duplicates import FINGERPRINT_VERSION
 from v8.evaluation import build_evidence_envelope, evaluate_release_content
 from v8.matcher_dsl import POINT_IDS, POINT_SCENES
 from v8.reports import (
@@ -165,6 +166,7 @@ class V8ReportTaskTest(unittest.TestCase):
                 ),
             )
             connection.commit()
+
         matcher = backfill_v5_1_matcher_rules(db_path=self.db)
         self.release_id = "evaluation-v8__selling-points-v5.1"
         with connect(self.db) as connection:
@@ -215,6 +217,51 @@ class V8ReportTaskTest(unittest.TestCase):
                 (captured_at, captured_at, self.release_id),
             )
             connection.commit()
+
+    def test_conclusion_cell_uses_cause_and_never_publishes_blocked_value(
+        self,
+    ) -> None:
+        blocked = {
+            "kind": "ratio",
+            "percentage": 88.0,
+            "status": "below_threshold",
+            "reason": "用户身份覆盖率 64.0%，低于 95% 门槛",
+        }
+        self.assertEqual(reports_module._conclusion_cell(blocked), "身份数据待补齐")
+        self.assertNotIn("88", reports_module._conclusion_cell(blocked))
+        self.assertEqual(
+            reports_module._conclusion_cell(
+                {
+                    "kind": "ratio",
+                    "percentage": None,
+                    "status": "below_threshold",
+                    "reason": "去重有效用户 29 人，低于 30 人门槛",
+                }
+            ),
+            "互动用户少于30人",
+        )
+        self.assertEqual(
+            reports_module._conclusion_cell(
+                {
+                    "kind": "ratio",
+                    "percentage": None,
+                    "status": "below_threshold",
+                    "reason": "",
+                }
+            ),
+            "暂不发布",
+        )
+        self.assertEqual(
+            reports_module._conclusion_cell(
+                {
+                    "kind": "ratio",
+                    "percentage": 12.5,
+                    "status": "sample_only",
+                    "reason": "分类器未经金标核对，数值仅供参考",
+                }
+            ),
+            "12.5%（仅样本）",
+        )
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -356,10 +403,21 @@ class V8ReportTaskTest(unittest.TestCase):
         )
         self.assertEqual(report["summary_metrics"]["estimated_leads"]["unit"], "lead")
         self.assertEqual(
-            report["summary_metrics"]["duplicate_rate"]["status"], "below_threshold"
+            report["summary_metrics"]["duplicate_rate"]["status"], "not_calculable"
         )
-        self.assertEqual(report["scope"]["period_end"], "2026-07-02T00:00:00+08:00")
+        self.assertEqual(
+            report["data_quality"]["duplicate_fingerprint_coverage"], 0.0
+        )
+        self.assertFalse(report["data_quality"]["duplicate_calibration_ready"])
+        self.assertIn(
+            "尚未完成定标",
+            report["summary_metrics"]["duplicate_rate"]["reason"],
+        )
         state = get_task(task["id"], db_path=self.db)
+        self.assertNotIn("覆盖率不足", state["message"])
+        self.assertIn("未达发布门槛", state["message"])
+        self.assertIn("重复指纹定标未通过", state["message"])
+        self.assertEqual(report["scope"]["period_end"], "2026-07-02T00:00:00+08:00")
         self.assertEqual(
             state["content_counts"], {"excluded_missing_boundary": 1, "included": 1}
         )
@@ -394,7 +452,36 @@ class V8ReportTaskTest(unittest.TestCase):
         )
         self.assertEqual(first_path.read_bytes(), first_bytes)
 
-    def test_v8_4_report_publishes_channel_conclusions_without_fabrication(
+    def test_report_keeps_actual_fingerprint_coverage_when_uncalibrated(self) -> None:
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                INSERT INTO duplicate_fingerprints(
+                    content_id,fingerprint_version,source_sha256,payload_json,created_at
+                ) VALUES (1,?,?,?,?)
+                """,
+                (FINGERPRINT_VERSION, "f" * 64, "{}", now_utc()),
+            )
+            connection.commit()
+
+        task = create_task(
+            task_type="custom",
+            period_start="2026-07-01",
+            period_end="2026-07-01",
+            creation_source="manual",
+            db_path=self.db,
+        )
+        report = run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
+        duplicate = report["summary_metrics"]["duplicate_rate"]
+        self.assertEqual(report["data_quality"]["duplicate_fingerprint_coverage"], 100.0)
+        self.assertFalse(report["data_quality"]["duplicate_calibration_ready"])
+        self.assertEqual(report["task"]["task_status"], "partial")
+        self.assertEqual(duplicate["status"], "not_calculable")
+        self.assertEqual(duplicate["coverage_percentage"], 100.0)
+        self.assertIsNone(duplicate["percentage"])
+        self.assertIn("尚未完成定标", duplicate["reason"])
+
+    def test_current_report_publishes_channel_conclusions_without_fabrication(
         self,
     ) -> None:
         task = create_task(
@@ -405,9 +492,7 @@ class V8ReportTaskTest(unittest.TestCase):
             db_path=self.db,
         )
         report = run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
-        self.assertEqual(
-            report["report_version"], "dcar-content-operations-report-v8.4"
-        )
+        self.assertEqual(report["report_version"], CURRENT_REPORT_VERSION)
         self.assertEqual(report["evidence_version"], "evidence-v2")
         channels = report["channels"]
         self.assertEqual(sorted(channels.keys()), ["douyin", "xiaohongshu"])
@@ -465,7 +550,11 @@ class V8ReportTaskTest(unittest.TestCase):
         markdown = (revision_dir / "report.md").read_text(encoding="utf-8")
         self.assertIn("## 渠道结论", markdown)
         self.assertIn("互动用户汽车兴趣占比", markdown)
-        self.assertIn("有效样本不足", markdown)
+        self.assertIn("评论未采集", markdown)
+        self.assertIn("曝光归类待补齐", markdown)
+        self.assertNotIn("覆盖不足", markdown)
+        self.assertNotIn("有效样本不足", markdown)
+        self.assertNotIn("暂不可计算%", markdown)
         svg = (revision_dir / "core_summary.svg").read_text(encoding="utf-8")
         self.assertNotIn("互动用户", svg)
         content_csv = (revision_dir / "content_details.csv").read_text(
@@ -654,12 +743,12 @@ class V8ReportTaskTest(unittest.TestCase):
                 "kind": "ratio",
                 "numerator": 2,
                 "denominator": 4,
-                "percentage": 50.0,
+                "percentage": None,
                 "unit": "percent",
                 "status": "below_threshold",
                 "eligible_count": 2,
                 "coverage_percentage": 50.0,
-                "reason": "",
+                "reason": "正式评估覆盖率为 50.00%，低于 95% 发布阈值",
             },
         )
         selling_metric = report["summary_metrics"]["selling_point_coverage_rate"]

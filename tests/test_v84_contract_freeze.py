@@ -5,6 +5,10 @@ import json
 import unittest
 
 from v8.contracts import (
+    CONTRACT_PATH,
+    CURRENT_REPORT_VERSION,
+    LEGACY_CONTRACT_PATHS,
+    REPORT_RULE_VERSIONS,
     V8ContractViolation,
     quantity_metric,
     ratio_metric,
@@ -16,6 +20,7 @@ from v8.storage import PROJECT_ROOT
 
 V8_3_CONTRACT_PATH = PROJECT_ROOT / "config" / "report_contract_v8_3.json"
 V8_4_CONTRACT_PATH = PROJECT_ROOT / "config" / "report_contract_v8_4.json"
+V8_5_CONTRACT_PATH = PROJECT_ROOT / "config" / "report_contract_v8_5.json"
 
 
 def _audience_quality() -> dict:
@@ -171,6 +176,23 @@ def _valid_v8_4_report() -> dict:
     }
 
 
+def _valid_v8_5_report() -> dict:
+    report = copy.deepcopy(_valid_v8_4_report())
+    report["report_version"] = "dcar-content-operations-report-v8.5"
+    report["data_quality"]["duplicate_calibration_ready"] = True
+    for channel in report["channels"].values():
+        groups = [channel["summary"], *channel["scenes"].values()]
+        for group in groups:
+            group["audience_quality"].update(
+                {
+                    "candidate_user_count": 300,
+                    "classified_user_count": 300,
+                    "classification_coverage_percentage": 100.0,
+                }
+            )
+    return report
+
+
 class V84ContractFreezeTest(unittest.TestCase):
     def test_frozen_fixture_versions_are_pinned(self) -> None:
         v83 = json.loads(V8_3_CONTRACT_PATH.read_text(encoding="utf-8"))
@@ -202,8 +224,40 @@ class V84ContractFreezeTest(unittest.TestCase):
         )
         self.assertNotIn("audience_verticality", v84["channel_conclusion_metrics"])
 
+        v85 = json.loads(V8_5_CONTRACT_PATH.read_text(encoding="utf-8"))
+        expected_v85 = copy.deepcopy(v84)
+        expected_v85["report_version"] = "dcar-content-operations-report-v8.5"
+        quality_keys = expected_v85["audience_quality_required_keys"]
+        identity_index = quality_keys.index("identity_coverage_percentage") + 1
+        quality_keys[identity_index:identity_index] = [
+            "candidate_user_count",
+            "classified_user_count",
+            "classification_coverage_percentage",
+        ]
+        expected_v85["required_boolean_quality_gates"] = {
+            "duplicate_calibration_ready": True
+        }
+        self.assertEqual(v85, expected_v85)
+        self.assertEqual(CURRENT_REPORT_VERSION, v85["report_version"])
+        self.assertEqual(CONTRACT_PATH, V8_5_CONTRACT_PATH)
+        self.assertEqual(
+            LEGACY_CONTRACT_PATHS["dcar-content-operations-report-v8.4"],
+            V8_4_CONTRACT_PATH,
+        )
+        self.assertEqual(
+            REPORT_RULE_VERSIONS["dcar-content-operations-report-v8.4"],
+            "evaluation-v8",
+        )
+        self.assertEqual(
+            REPORT_RULE_VERSIONS[CURRENT_REPORT_VERSION], "evaluation-v8"
+        )
+
     def test_v8_4_accepts_a_complete_report(self) -> None:
         validate_report(_valid_v8_4_report(), contract_path=V8_4_CONTRACT_PATH)
+
+    def test_v8_5_is_the_current_complete_report_contract(self) -> None:
+        validate_report(_valid_v8_5_report())
+        validate_report(_valid_v8_5_report(), contract_path=V8_5_CONTRACT_PATH)
 
     def _assert_rejected(self, report: dict, fragment: str) -> None:
         with self.assertRaises(V8ContractViolation) as context:

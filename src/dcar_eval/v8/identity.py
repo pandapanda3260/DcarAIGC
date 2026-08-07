@@ -69,6 +69,30 @@ class PlatformUserHasher:
         return "P" + hmac.new(self.salt, message, hashlib.sha256).hexdigest()
 
 
+#: Platform spellings that all mean "this comment has no parent". TikHub's
+#: douyin endpoints return ``reply_id`` as the string (or int) ``0`` for
+#: first-level comments; persisting that literal breaks every
+#: ``parent_comment_id IS NULL`` first-level filter (the interaction-user
+#: universe collapses to 0 and automotive_user_rate reports ``missing``).
+NO_PARENT_MARKERS = frozenset({"", "0"})
+
+
+def normalized_parent_comment_id(value: Any) -> Optional[str]:
+    """Map platform 'no parent' spellings (None/''/'0'/0) to NULL.
+
+    Every writer of ``comments.parent_comment_id`` must funnel through this
+    helper so the database invariant stays: first-level comment ⇔
+    ``parent_comment_id IS NULL``. Real reply ids pass through unchanged.
+    """
+
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text in NO_PARENT_MARKERS:
+        return None
+    return text
+
+
 def comment_identity_key(
     *,
     platform_comment_id: Optional[str],
@@ -177,7 +201,7 @@ def insert_comment_rows(
                 body,
                 item.get("published_at"),
                 item.get("like_count"),
-                item.get("parent_comment_id"),
+                normalized_parent_comment_id(item.get("parent_comment_id")),
                 interaction_user_id,
                 identity_key,
             ),

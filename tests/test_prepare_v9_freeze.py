@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from v8 import api
+from v8.contracts import CURRENT_REPORT_VERSION
 from v8.storage import connect, initialize_database
 
 
@@ -398,10 +399,14 @@ class ApiLifespanSwitchTest(unittest.IsolatedAsyncioTestCase):
                         taxonomy_version,report_json_path,report_sha256,created_at
                     ) VALUES ('unsafe-report',1,
                               'evaluation-v7__selling-points-v5.0',
-                              'dcar-content-operations-report-v8.3','evaluation-v7',
+                              ?,'evaluation-v7',
                               'selling-points-v5.0','reports/unsafe.json',?,?)
                     """,
-                    ("7" * 64, "2026-08-04T07:45:50Z"),
+                    (
+                        CURRENT_REPORT_VERSION,
+                        "7" * 64,
+                        "2026-08-04T07:45:50Z",
+                    ),
                 )
                 connection.commit()
             config = api.ApiConfig(

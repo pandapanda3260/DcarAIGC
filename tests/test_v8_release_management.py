@@ -11,10 +11,10 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
-from v8.evaluation import evaluate_content
+from v8.evaluation import build_evidence_envelope
 from v8.matcher_dsl import POINT_IDS, POINT_SCENES
 from v8.operations import normalize_unknown_content_directions
-from v8 import release_management as releases
+from v8 import release_management_v5_1 as releases
 from v8.storage import (
     LEGACY_V7_RELEASE_ID,
     connect,
@@ -107,8 +107,56 @@ class ReleaseManagementTest(unittest.TestCase):
                         captured_at,
                     ),
                 )
+            legacy_release = connection.execute(
+                "SELECT * FROM evaluation_releases WHERE id=?",
+                (LEGACY_V7_RELEASE_ID,),
+            ).fetchone()
+            assert legacy_release is not None
+            envelope_id, evidence_sha256, _ = build_evidence_envelope(connection, 1)
+            connection.execute(
+                """
+                INSERT INTO evaluation_versions(
+                    content_id,evidence_envelope_id,release_id,rule_version,
+                    taxonomy_version,matcher_rule_sha256,evidence_sha256,
+                    evaluation_source,evaluation_status,evidence_level,
+                    selling_point_score,selling_point_included,content_direction,
+                    pending_review,payload_json,evaluated_at
+                ) VALUES (1,?,?,?,?,?,?,'automatic','insufficient_evidence','V1',
+                          0,0,'unknown',0,?,?)
+                """,
+                (
+                    envelope_id,
+                    legacy_release["id"],
+                    legacy_release["rule_version"],
+                    legacy_release["taxonomy_version"],
+                    legacy_release["matcher_rule_sha256"],
+                    evidence_sha256,
+                    json.dumps(
+                        {
+                            "evaluation_status": "insufficient_evidence",
+                            "evidence_level": "V1",
+                            "evidence_summary": "legacy release fixture",
+                            "primary_selling_point_id": "",
+                            "selling_point_score": 0,
+                            "selling_point_included": False,
+                            "pending_review": False,
+                            "content_direction": "unknown",
+                            "content_automotive_score": None,
+                            "audience_automotive_score": None,
+                            "action_intent_score": None,
+                            "valid_unique_commenters": 0,
+                            "acquisition_potential": None,
+                            "matches": [],
+                            "evaluation_source": "automatic",
+                            "release_id": legacy_release["id"],
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    captured_at,
+                ),
+            )
             connection.commit()
-        evaluate_content(1, db_path=database)
 
     def _create_manifest(self, database: Path, *, prefix: str = "") -> Path:
         inventory_rows: list[dict[str, object]] = []

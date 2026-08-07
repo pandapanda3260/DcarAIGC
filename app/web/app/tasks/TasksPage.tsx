@@ -36,10 +36,10 @@ export default function TasksPage() {
     finally { setSaving(false); }
   }
 
-  return <AppShell active="tasks" actions={<button className="primary small" onClick={() => setModal(true)}>新建任务</button>}>
+  return <AppShell active="tasks">
     {error && <Notice tone="error">{error}</Notice>}
     {loading ? <Loading label="正在读取报告任务" /> : <section className="page-stack wide-stack">
-      <div className="detail-toolbar"><div><span className="eyebrow">IMMUTABLE REVISIONS</span><h2>日报、周报与自定义报告</h2><p>报告按发布日期闭区间生成；每次重试新增 revision，不覆盖历史产物。</p></div><span className="rule-chip">共 {tasks.length} 个任务</span></div>
+      <div className="detail-toolbar"><div><span className="eyebrow">IMMUTABLE REVISIONS</span><h2>日报、周报与自定义报告</h2><p>报告按发布日期闭区间生成；每次重试新增 revision，不覆盖历史产物。</p></div><div className="placeholder-actions"><button className="primary small" onClick={() => setModal(true)}>新建任务</button><span className="rule-chip">共 {tasks.length} 个任务</span></div></div>
       <article className="panel table-panel"><div className="table-scroll"><table><thead><tr><th>任务</th><th>类型</th><th>日期区间</th><th>状态</th><th>进度</th><th>内容数</th><th>Revision</th></tr></thead><tbody>
         {tasks.map((task) => <tr key={task.id}><td><Link href={`/tasks/${task.id}`}>{task.name}</Link><span>{task.id}</span></td><td>{label(task.task_type)}</td><td>{formatDate(task.period_start)} — {formatDate(task.period_end)}</td><td><span className={`status-badge ${task.task_status === "succeeded" ? "" : "pending"}`}>{label(task.task_status)}</span></td><td>{task.progress}%</td><td>{task.content_count}</td><td>{task.current_valid_revision ? `R${task.current_valid_revision.revision} 当前` : task.stale_display_revision ? `R${task.stale_display_revision.revision} 已过时` : "—"}<span>{task.historical_revision_count} 个历史 revision</span></td></tr>)}
       </tbody></table></div>{tasks.length === 0 && <div className="empty-state"><strong>还没有报告任务</strong><span>新建任务后会立即基于已落库数据生成。</span></div>}</article>

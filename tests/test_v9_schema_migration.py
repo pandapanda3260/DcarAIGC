@@ -428,14 +428,14 @@ class V9SchemaMigrationTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def test_fresh_schema_is_v10_and_second_initialization_is_read_only(self) -> None:
+    def test_fresh_schema_is_current_and_second_initialization_is_read_only(self) -> None:
         with storage.connect(self.db) as connection:
             storage.initialize_database(connection)
             self.assertEqual(
                 connection.execute(
                     "SELECT MAX(version) FROM schema_migrations"
                 ).fetchone()[0],
-                10,
+                storage.SCHEMA_VERSION,
             )
             self.assertIn(
                 "matcher_rule_json",
@@ -853,7 +853,7 @@ class V9SchemaMigrationTest(unittest.TestCase):
                 connection.execute(
                     "SELECT MAX(version) FROM schema_migrations"
                 ).fetchone()[0],
-                10,
+                storage.SCHEMA_VERSION,
             )
 
 

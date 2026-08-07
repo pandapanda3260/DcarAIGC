@@ -242,6 +242,76 @@ class V8RangeBackfillTest(unittest.TestCase):
         self.assertEqual(second["candidates"], 0)
         self.assertEqual(second["usage"]["amount"], 0.006)
 
+    def test_comment_pending_state_uses_capture_run_not_legacy_slot(self) -> None:
+        upsert_account(
+            {
+                "phone": "13800138011",
+                "platforms": [
+                    {"platform": "douyin", "uid": "99887771", "nickname": "汽车号"}
+                ],
+            },
+            db_path=self.db,
+        )
+        content = upsert_content(
+            {
+                "platform": "douyin",
+                "platform_content_id": "444444444",
+                "canonical_url": "https://www.douyin.com/video/444444444",
+                "title": "旧周槽",
+                "body": "汽车内容",
+                "published_at": "2026-08-02T01:00:00Z",
+                "content_type": "video",
+                "account_uid": "99887771",
+                "account_name": "汽车号",
+            },
+            db_path=self.db,
+        )
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                INSERT INTO fetch_slots(
+                    content_id,stage,window_key,provider,adapter_version,status,
+                    created_at,updated_at
+                ) VALUES (?,'comments','2026-W32','legacy-cache','legacy-cache',
+                          'succeeded','2026-08-03T00:00:00Z','2026-08-03T00:00:00Z')
+                """,
+                (content["id"],),
+            )
+            connection.commit()
+        pending = pending_content_ids(
+            start=self.start,
+            end=self.end,
+            as_of=self.end,
+            db_path=self.db,
+            stages=["comments"],
+        )
+        self.assertEqual(pending, [int(content["id"])])
+
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                INSERT INTO comment_capture_runs(
+                    content_id,window_key,provider,adapter_version,status,
+                    completion_kind,created_at,updated_at,completed_at
+                ) VALUES (?,'2026-W32','TikHub',
+                          'tikhub-comments-v8.0+paged-comments-v2','succeeded',
+                          'provider_exhausted','2026-08-03T01:00:00Z',
+                          '2026-08-03T01:00:00Z','2026-08-03T01:00:00Z')
+                """,
+                (content["id"],),
+            )
+            connection.commit()
+        self.assertEqual(
+            pending_content_ids(
+                start=self.start,
+                end=self.end,
+                as_of=self.end,
+                db_path=self.db,
+                stages=["comments"],
+            ),
+            [],
+        )
+
     def test_placeholder_metric_repair_is_dry_run_safe_and_reuses_slot(self) -> None:
         upsert_account(
             {

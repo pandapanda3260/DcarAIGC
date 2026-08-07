@@ -117,6 +117,63 @@ def formal_current_evaluations(
     return {int(row["content_id"]): dict(row) for row in rows}
 
 
+def formal_as_of_evaluations(
+    connection: sqlite3.Connection,
+    content_ids: Sequence[int],
+    *,
+    report_cutoff_at: str,
+) -> dict[int, dict[str, Any]]:
+    """Return the formal evaluation snapshot that was active at ``cutoff``.
+
+    Release activation/retirement and evaluation invalidation are both
+    interpreted temporally.  A missing historical release fails closed to an
+    empty context; overlapping releases are corrupt lineage and raise.
+    """
+
+    releases = connection.execute(
+        """
+        SELECT * FROM evaluation_releases
+        WHERE activated_at IS NOT NULL
+          AND julianday(activated_at) <= julianday(?)
+          AND (retired_at IS NULL OR julianday(retired_at) > julianday(?))
+        ORDER BY julianday(activated_at) DESC, id DESC
+        """,
+        (report_cutoff_at, report_cutoff_at),
+    ).fetchall()
+    if len(releases) > 1:
+        raise EvaluationSelectorError(
+            "multiple evaluation releases were active at report cutoff"
+        )
+    if not releases:
+        return {}
+    ids = [int(value) for value in content_ids]
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    rows = connection.execute(
+        f"""
+        SELECT * FROM (
+            SELECT ev.*,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY ev.content_id
+                       ORDER BY julianday(ev.evaluated_at) DESC, ev.id DESC
+                   ) selector_rank
+            FROM evaluation_versions ev
+            WHERE ev.release_id=?
+              AND ev.content_id IN ({placeholders})
+              AND julianday(ev.evaluated_at) <= julianday(?)
+              AND (
+                    ev.invalidated_at IS NULL
+                    OR julianday(ev.invalidated_at) > julianday(?)
+              )
+        ) WHERE selector_rank=1
+        ORDER BY content_id
+        """,
+        [str(releases[0]["id"]), *ids, report_cutoff_at, report_cutoff_at],
+    ).fetchall()
+    return {int(row["content_id"]): dict(row) for row in rows}
+
+
 def release_current_evaluations(
     connection: sqlite3.Connection,
     release_id: str,
@@ -152,6 +209,48 @@ def release_current_evaluations(
         [release_id, *ids],
     ).fetchall()
     return {int(row["content_id"]): dict(row) for row in rows}
+
+
+def formal_eligible_release_evaluations(
+    connection: sqlite3.Connection,
+    release_id: str,
+    content_ids: Sequence[int],
+) -> dict[int, dict[str, Any]]:
+    """Return report-safe evaluations for one pinned release.
+
+    Formal metrics must not consume gray-zone rows, weak V0/V1 evidence, or a
+    conclusion that is still in conflict with a human review.  Keeping this
+    filter beside the release-aware selectors prevents the overview and report
+    builders from drifting apart.
+    """
+
+    evaluations = release_current_evaluations(connection, release_id, content_ids)
+    if not evaluations:
+        return {}
+    ids = sorted(evaluations)
+    placeholders = ",".join("?" for _ in ids)
+    unresolved_conflicts = {
+        int(row["content_id"])
+        for row in connection.execute(
+            f"""
+            SELECT DISTINCT q.content_id
+            FROM review_queue q
+            JOIN evaluation_versions ev ON ev.id=q.evaluation_id
+            WHERE q.content_id IN ({placeholders})
+              AND q.reason_code='manual_conclusion_conflict'
+              AND q.status IN ('pending','manual_required','in_review')
+              AND ev.release_id=? AND ev.invalidated_at IS NULL
+            """,
+            [*ids, release_id],
+        ).fetchall()
+    }
+    return {
+        content_id: value
+        for content_id, value in evaluations.items()
+        if int(value["pending_review"]) == 0
+        and value["evidence_level"] in {"V2", "V3"}
+        and content_id not in unresolved_conflicts
+    }
 
 
 def display_effective_evaluations(

@@ -1,0 +1,45 @@
+FROM python:3.12.13-slim-bookworm
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONPATH=/app/src/dcar_eval
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install --no-install-recommends --yes ca-certificates tzdata \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 dcar \
+    && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin dcar
+
+COPY deploy/server/requirements-api.txt /tmp/requirements-api.txt
+RUN python -m pip install --requirement /tmp/requirements-api.txt \
+    && rm /tmp/requirements-api.txt
+
+COPY --chown=dcar:dcar src/dcar_eval/__init__.py /app/src/dcar_eval/__init__.py
+COPY --chown=dcar:dcar src/dcar_eval/analyze_douyin_tikhub_v6.py /app/src/dcar_eval/analyze_douyin_tikhub_v6.py
+COPY --chown=dcar:dcar src/dcar_eval/collect_tikhub_douyin_enrichment_v6.py /app/src/dcar_eval/collect_tikhub_douyin_enrichment_v6.py
+COPY --chown=dcar:dcar src/dcar_eval/probe_tikhub_douyin.py /app/src/dcar_eval/probe_tikhub_douyin.py
+COPY --chown=dcar:dcar src/dcar_eval/project_paths.py /app/src/dcar_eval/project_paths.py
+COPY --chown=dcar:dcar src/dcar_eval/rebuild_channel_evaluation_v4.py /app/src/dcar_eval/rebuild_channel_evaluation_v4.py
+COPY --chown=dcar:dcar src/dcar_eval/three_proposition_scoring.py /app/src/dcar_eval/three_proposition_scoring.py
+COPY --chown=dcar:dcar src/dcar_eval/v8 /app/src/dcar_eval/v8
+COPY --chown=dcar:dcar src/dcar_eval/workflow/__init__.py /app/src/dcar_eval/workflow/__init__.py
+COPY --chown=dcar:dcar src/dcar_eval/workflow/contracts.py /app/src/dcar_eval/workflow/contracts.py
+COPY --chown=dcar:dcar src/dcar_eval/workflow/privacy.py /app/src/dcar_eval/workflow/privacy.py
+COPY --chown=dcar:dcar config/*.json /app/config/
+
+RUN mkdir -p \
+      /app/app/data \
+      /app/data/cache/v8/media \
+      /app/reports \
+      /var/lib/dcar-aigc/runtime \
+    && chown -R dcar:dcar /app /var/lib/dcar-aigc
+
+USER dcar:dcar
+
+EXPOSE 8765
+
+CMD ["python", "-m", "uvicorn", "v8.api:app", "--app-dir", "/app/src/dcar_eval", "--host", "0.0.0.0", "--port", "8765", "--workers", "1", "--no-access-log"]

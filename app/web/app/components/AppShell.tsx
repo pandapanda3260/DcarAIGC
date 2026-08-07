@@ -2,6 +2,7 @@ import Link from "next/link";
 import Image from "next/image";
 import type { ReactNode } from "react";
 import type { Section } from "../lib/types";
+import { publicAssetPath } from "../lib/paths";
 
 const navItems: Array<{ id: Section; label: string; href: string }> = [
   { id: "overview", label: "概览", href: "/overview" },
@@ -40,7 +41,7 @@ export default function AppShell({ active, actions, children }: { active: Sectio
   return (
     <div className="app-shell insight-shell">
       <aside className="sidebar">
-        <div className="brand"><Image className="brand-mark" src="/dongchedi-app-icon.svg" alt="懂车帝 App" width={38} height={38} unoptimized /><div><strong>Dcar Sentinel</strong><span>内容运营工作台 · V1.0</span></div></div>
+        <div className="brand"><Image className="brand-mark" src={publicAssetPath("/dongchedi-app-icon.svg")} alt="懂车帝 App" width={38} height={38} unoptimized /><div><strong>Dcar Sentinel</strong><span>内容运营工作台 · V1.0</span></div></div>
         <nav aria-label="主导航">
           <p>工作台</p>
           {navItems.map((item) => (
@@ -52,10 +53,10 @@ export default function AppShell({ active, actions, children }: { active: Sectio
         <div className="sidebar-foot"><i className="live-dot online" /><div><strong>本地数据模式</strong><span>供应商调用受预算与幂等槽保护</span></div></div>
       </aside>
       <main className="main-area" data-section={active}>
-        <header className="topbar" data-section={active}>
+        {["contents", "accounts", "tasks"].includes(active) ? <h1 className="visually-hidden">{copy.title}</h1> : <header className="topbar" data-section={active}>
           <div className="topbar-copy"><span className="eyebrow">{copy.eyebrow}</span><h1>{copy.title}</h1>{copy.description && <p>{copy.description}</p>}</div>
           {actions && <div className="topbar-actions">{actions}</div>}
-        </header>
+        </header>}
         {children}
       </main>
     </div>

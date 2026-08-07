@@ -14,7 +14,11 @@ from fastapi.testclient import TestClient
 
 import v8.api as api_module
 from v8.contracts import CURRENT_REPORT_VERSION
-from v8.evaluation import evaluate_content, evaluate_release_content
+from v8.evaluation import (
+    build_evidence_envelope,
+    evaluate_content,
+    evaluate_release_content,
+)
 from v8.matcher_dsl import (
     POINT_IDS,
     canonical_json,
@@ -52,6 +56,61 @@ def _test_config(
         scheduler_enabled=False,
         startup_catchup_enabled=False,
     )
+
+
+def _insert_legacy_automatic_fixture(connection, content_id: int) -> int:
+    release = ensure_legacy_evaluation_release(
+        connection,
+        rule_version="evaluation-v7",
+        taxonomy_version="selling-points-v5.0",
+    )
+    envelope_id, evidence_sha256, _ = build_evidence_envelope(connection, content_id)
+    cursor = connection.execute(
+        """
+        INSERT INTO evaluation_versions(
+            content_id,evidence_envelope_id,release_id,rule_version,
+            taxonomy_version,matcher_rule_sha256,evidence_sha256,
+            evaluation_source,evaluation_status,evidence_level,
+            selling_point_score,selling_point_included,content_direction,
+            pending_review,payload_json,evaluated_at
+        ) VALUES (?,?,?,?,?,?,?,'automatic','insufficient_evidence','V1',
+                  0,0,'unknown',0,?,?)
+        """,
+        (
+            content_id,
+            envelope_id,
+            release["id"],
+            release["rule_version"],
+            release["taxonomy_version"],
+            release["matcher_rule_sha256"],
+            evidence_sha256,
+            json.dumps(
+                {
+                    "evaluation_status": "insufficient_evidence",
+                    "evidence_level": "V1",
+                    "evidence_summary": "legacy API fixture",
+                    "primary_selling_point_id": "",
+                    "selling_point_score": 0,
+                    "selling_point_included": False,
+                    "pending_review": False,
+                    "content_direction": "unknown",
+                    "content_automotive_score": None,
+                    "audience_automotive_score": None,
+                    "action_intent_score": None,
+                    "valid_unique_commenters": 0,
+                    "acquisition_potential": None,
+                    "matches": [],
+                    "evaluation_source": "automatic",
+                    "release_id": release["id"],
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            now_utc(),
+        ),
+    )
+    assert cursor.lastrowid is not None
+    return int(cursor.lastrowid)
 
 
 def _seed_read_model_database(db_path: Path) -> None:
@@ -346,7 +405,7 @@ class V8ApiTest(unittest.TestCase):
                         "selling_point_exposure_share",
                         "core_selling_point_exposure_share",
                         "content_verticality",
-                        "audience_verticality",
+                        "automotive_user_rate",
                         "acquisition_potential",
                     ],
                 )
@@ -360,7 +419,24 @@ class V8ApiTest(unittest.TestCase):
         self.assertIn("duplicate_fingerprint_coverage", value["data_quality"])
         self.assertIn("duplicate_calibration_ready", value["data_quality"])
 
-    def test_overview_channel_conclusions_restore_v7_denominators_and_scores(
+    def test_overview_uses_one_cutoff_for_all_audience_slices(self) -> None:
+        cutoff = "2026-08-07T06:30:00Z"
+        with patch.object(api_module, "now_utc", return_value=cutoff) as clock:
+            value = api_module.v8_overview(self.db)
+        self.assertEqual(clock.call_count, 1)
+        self.assertEqual(value["generated_at"], cutoff)
+        for window in value["windows"].values():
+            for channel in window["channels"].values():
+                self.assertEqual(
+                    channel["summary"]["audience_quality"]["report_cutoff_at"],
+                    cutoff,
+                )
+                for scene in channel["scenes"].values():
+                    self.assertEqual(
+                        scene["audience_quality"]["report_cutoff_at"], cutoff
+                    )
+
+    def test_overview_channel_conclusions_use_latest_metrics_and_valid_exposure(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -551,14 +627,17 @@ class V8ApiTest(unittest.TestCase):
                 summary["core_selling_point_count_share"]["percentage"], 33.33
             )
             self.assertEqual(
-                summary["selling_point_exposure_share"]["percentage"], 80.0
+                summary["selling_point_exposure_share"]["percentage"], 75.0
             )
             self.assertEqual(
-                summary["core_selling_point_exposure_share"]["percentage"], 20.0
+                summary["core_selling_point_exposure_share"]["percentage"], 0.0
             )
+            self.assertEqual(douyin["valid_exposure_items"], 2)
+            self.assertEqual(douyin["exposure_coverage_percentage"], 100.0)
             self.assertEqual(summary["content_verticality"]["value"], 60)
-            self.assertEqual(summary["audience_verticality"]["value"], 60)
-            self.assertEqual(summary["audience_verticality"]["status"], "sample_only")
+            self.assertEqual(summary["automotive_user_rate"]["kind"], "ratio")
+            self.assertIsNone(summary["automotive_user_rate"]["percentage"])
+            self.assertEqual(summary["automotive_user_rate"]["status"], "missing")
             self.assertEqual(summary["acquisition_potential"]["value"], 55)
 
             new_car = douyin["scenes"]["new_car"]["metrics"]
@@ -566,13 +645,13 @@ class V8ApiTest(unittest.TestCase):
             media = douyin["scenes"]["media"]["metrics"]
             self.assertEqual(new_car["selling_point_count_share"]["denominator"], 3)
             self.assertEqual(
-                new_car["selling_point_exposure_share"]["denominator"], 500
+                new_car["selling_point_exposure_share"]["denominator"], 400
             )
             self.assertEqual(
-                new_car["selling_point_exposure_share"]["percentage"], 20.0
+                new_car["selling_point_exposure_share"]["percentage"], 0.0
             )
             self.assertEqual(
-                used_car["selling_point_exposure_share"]["percentage"], 60.0
+                used_car["selling_point_exposure_share"]["percentage"], 75.0
             )
             self.assertEqual(media["selling_point_count_share"]["percentage"], 0.0)
             self.assertEqual(media["content_verticality"]["status"], "not_applicable")
@@ -839,10 +918,11 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
                 """,
                 (captured_at, captured_at, captured_at),
             )
-            connection.commit()
             self.content_id = int(content.lastrowid)
-        evaluation = evaluate_content(self.content_id, db_path=self.db)
-        self.evaluation_id = evaluation.evaluation_id
+            self.evaluation_id = _insert_legacy_automatic_fixture(
+                connection, self.content_id
+            )
+            connection.commit()
         with connect(self.db) as connection:
             queue = connection.execute(
                 """
@@ -850,7 +930,7 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
                     content_id, evaluation_id, reason_code, status, created_at, updated_at
                 ) VALUES (?, ?, 'evaluation_gray_zone', 'pending', ?, ?)
                 """,
-                (self.content_id, evaluation.evaluation_id, now_utc(), now_utc()),
+                (self.content_id, self.evaluation_id, now_utc(), now_utc()),
             )
             connection.commit()
             self.queue_id = int(queue.lastrowid)
@@ -1479,6 +1559,7 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         started = self.client.post(f"/api/v8/reviews/{self.queue_id}/start")
         self.assertEqual(started.status_code, 200)
         stale_id = started.json()["base_evaluation_id"]
+        self._activate_v8_report_release()
         with connect(self.db) as connection:
             connection.execute(
                 "UPDATE content_items SET body='保养知识已更新',updated_at=? WHERE id=?",
@@ -1720,6 +1801,7 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
                 "terminal_failed": 0,
             },
         )
+        self._activate_v8_report_release()
         existing_evidence = self.client.post(
             f"/api/v8/contents/{self.content_id}/media/retry",
             json={"allow_paid_refresh": False},

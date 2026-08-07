@@ -21,6 +21,7 @@ from v8.duplicates import (
     calibrate,
     calibration_ready,
     compare_fingerprints,
+    duplicate_metric_decision,
     fingerprint_content,
     rebuild_duplicate_relations,
     run_duplicate_fingerprint_queue,
@@ -38,6 +39,51 @@ class V8DuplicateDetectionTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def test_duplicate_metric_decision_table(self) -> None:
+        cases = (
+            (
+                "empty scope",
+                (0, 0, False, 95),
+                ("not_applicable", None, "统计范围内没有内容"),
+            ),
+            (
+                "uncalibrated even with complete fingerprints",
+                (100, 100, False, 95),
+                (
+                    "not_calculable",
+                    100.0,
+                    "重复内容感知指纹尚未完成定标，重复率暂不可计算",
+                ),
+            ),
+            (
+                "calibrated below threshold",
+                (100, 94, True, 95),
+                (
+                    "below_threshold",
+                    94.0,
+                    "感知指纹覆盖率为 94.00%，低于 95% 发布阈值",
+                ),
+            ),
+            (
+                "calibrated at threshold",
+                (100, 95, True, 95),
+                ("available", 95.0, ""),
+            ),
+            (
+                "custom threshold",
+                (200, 191, True, 96),
+                (
+                    "below_threshold",
+                    95.5,
+                    "感知指纹覆盖率为 95.50%，低于 96% 发布阈值",
+                ),
+            ),
+        )
+
+        for name, arguments, expected in cases:
+            with self.subTest(name=name):
+                self.assertEqual(duplicate_metric_decision(*arguments), expected)
 
     def _content(self, link_id: str, *, published_at: str | None = None) -> int:
         captured_at = now_utc()

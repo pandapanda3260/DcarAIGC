@@ -1,6 +1,8 @@
 @import "tailwindcss";
 
 :root {
+  --font-geist-sans: Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-geist-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   --ink: #13262d;
   --muted: #68777d;
   --line: #dfe6e8;
@@ -403,7 +405,7 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
 .selling-point-family[data-family="X"] { --family-color: #3979f6; --family-soft: #e8efff; }
 .selling-point-summary-item[data-family="M"],
 .selling-point-family[data-family="M"] { --family-color: #8557df; --family-soft: #eee7fc; }
-.selling-point-summary-item { min-width: 0; min-height: 88px; padding: 15px 23px; display: flex; align-items: center; justify-content: space-between; gap: 16px; border-right: 1px solid #edf0f4; }
+.selling-point-summary-item { min-width: 0; min-height: 88px; padding: 15px 23px; display: flex; align-items: center; gap: 16px; border-right: 1px solid #edf0f4; }
 .selling-point-summary-item:last-child { border-right: 0; }
 .selling-point-summary-copy { min-width: 0; }
 .selling-point-summary-copy span,
@@ -448,7 +450,8 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
 .selling-point-standard-copy strong { color: #1b2638; font-size: 12px; font-weight: 700; line-height: 1.45; }
 .selling-point-standard-copy span { color: #8792a1; font-size: 9px; }
 .selling-point-scope { display: flex; align-items: center; gap: 9px; }
-.selling-point-tier { flex: 0 0 auto; padding: 4px 7px; border-radius: 5px; background: var(--family-soft); color: var(--family-color); font-size: 9px; font-weight: 800; }
+.selling-point-tier { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 3px; padding: 3px 8px; border: 1px solid #dbe2ea; border-radius: 999px; background: #fff; color: #8b98a6; font-size: 9px; font-weight: 800; }
+.selling-point-tier[data-tier="core"] { border-color: var(--family-color); background: var(--family-color); color: #fff; letter-spacing: .3px; box-shadow: 0 3px 8px color-mix(in srgb, var(--family-color) 32%, transparent); }
 .selling-point-scene-list { min-width: 0; display: flex; flex-wrap: wrap; gap: 5px; }
 .selling-point-table .scene-tag { padding: 3px 6px; border-radius: 5px; background: #f1f4f7; color: #687789; font-size: 9px; font-weight: 650; }
 .selling-point-hit-value { display: grid; justify-items: end; font-variant-numeric: tabular-nums; }

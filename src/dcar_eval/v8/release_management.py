@@ -29,10 +29,9 @@ from .evaluation import (
     _evaluate_content,
     canonical_json,
 )
-from .matcher_dsl import POINT_IDS, taxonomy_matcher_sha256
+from .matcher_dsl import V5_2_POINT_SPEC, taxonomy_matcher_sha256
 from .storage import (
     CURRENT_SCHEMA_MIGRATION_NAME,
-    LEGACY_V7_RELEASE_ID,
     SCHEMA_VERSION,
     now_utc,
     transaction,
@@ -40,9 +39,12 @@ from .storage import (
 from .taxonomy import TaxonomyError, serialize_point_row
 
 
-LEGACY_TAXONOMY_VERSION = "selling-points-v5.0"
-TARGET_TAXONOMY_VERSION = "selling-points-v5.1"
-TARGET_RELEASE_ID = "evaluation-v8__selling-points-v5.1"
+SOURCE_TAXONOMY_VERSION = "selling-points-v5.1"
+SOURCE_RELEASE_ID = "evaluation-v8__selling-points-v5.1"
+SOURCE_RULE_VERSION = "evaluation-v8"
+TARGET_TAXONOMY_VERSION = "selling-points-v5.2"
+TARGET_RELEASE_ID = "evaluation-v8__selling-points-v5.2"
+POINT_IDS = frozenset(V5_2_POINT_SPEC)
 BATCH_SIZE = 250
 FREEZE_SCHEMA_VERSION = "dcar-v9-freeze-manifest-v1"
 RECEIPT_SCHEMA_VERSION = "dcar-evaluation-release-ready-v2"
@@ -698,7 +700,9 @@ def _target_taxonomy(
     ).fetchall()
     codes = {str(row["code"]) for row in rows}
     if len(rows) != len(POINT_IDS) or codes != POINT_IDS:
-        raise ReleaseManagementError("target taxonomy must contain 25 approved points")
+        raise ReleaseManagementError(
+            f"target taxonomy must contain {len(POINT_IDS)} approved points"
+        )
     if any(int(row["enabled"]) != 1 for row in rows):
         raise ReleaseManagementError("all target taxonomy points must be enabled")
     rules: dict[str, Mapping[str, Any]] = {}
@@ -713,7 +717,9 @@ def _target_taxonomy(
             rules[str(row["code"])] = matcher_rule
     except TaxonomyError as error:
         raise ReleaseManagementError(str(error)) from error
-    return taxonomy, taxonomy_matcher_sha256(rules)
+    return taxonomy, taxonomy_matcher_sha256(
+        rules, point_spec=V5_2_POINT_SPEC
+    )
 
 
 def _target_taxonomy_semantic_sha256(
@@ -818,29 +824,13 @@ def _require_manifest_identity(
 def _freeze_v1_and_current_evidence_state(
     connection: sqlite3.Connection, content_id: int
 ) -> tuple[dict[str, Any], str, dict[str, Any], str]:
-    content = connection.execute(
-        "SELECT title,body,raw_account_uid,raw_account_name FROM content_items WHERE id=?",
-        (content_id,),
-    ).fetchone()
-    if content is None:
-        raise ReleaseManagementError(f"content {content_id} does not exist")
     _, current_components, current_sha256 = _current_evidence_state(
         connection, content_id
     )
     freeze_components = dict(current_components)
-    freeze_components["text_sha256"] = _sha256_bytes(
-        canonical_json(
-            {
-                "title": content["title"],
-                "body": content["body"],
-                "account_uid": content["raw_account_uid"],
-                "account_name": content["raw_account_name"],
-            }
-        ).encode("utf-8")
-    )
     return (
         freeze_components,
-        _sha256_bytes(canonical_json(freeze_components).encode("utf-8")),
+        current_sha256,
         current_components,
         current_sha256,
     )
@@ -1011,7 +1001,7 @@ def _legacy_window(connection: sqlite3.Connection) -> tuple[sqlite3.Row, sqlite3
     taxonomy = _single_row(
         connection,
         "SELECT * FROM taxonomy_versions WHERE version=? AND status='published'",
-        (LEGACY_TAXONOMY_VERSION,),
+        (SOURCE_TAXONOMY_VERSION,),
         label="published legacy taxonomy",
     )
     release = _single_row(
@@ -1021,11 +1011,13 @@ def _legacy_window(connection: sqlite3.Connection) -> tuple[sqlite3.Row, sqlite3
         label="active evaluation release",
     )
     if (
-        str(release["id"]) != LEGACY_V7_RELEASE_ID
-        or str(release["rule_version"]) != "evaluation-v7"
-        or str(release["taxonomy_version"]) != LEGACY_TAXONOMY_VERSION
+        str(release["id"]) != SOURCE_RELEASE_ID
+        or str(release["rule_version"]) != SOURCE_RULE_VERSION
+        or str(release["taxonomy_version"]) != SOURCE_TAXONOMY_VERSION
     ):
-        raise ReleaseManagementError("legacy evaluation-v7 release must be active")
+        raise ReleaseManagementError(
+            f"source release {SOURCE_RELEASE_ID} must be active"
+        )
     return taxonomy, release
 
 
@@ -1194,7 +1186,7 @@ def _protected_state(
                 FROM evaluation_releases
                 WHERE id NOT IN (?,?) ORDER BY id
                 """,
-                (TARGET_RELEASE_ID, LEGACY_V7_RELEASE_ID),
+                (TARGET_RELEASE_ID, SOURCE_RELEASE_ID),
             )
         ]
         unmanaged_taxonomies = [
@@ -1204,7 +1196,7 @@ def _protected_state(
                 SELECT version,status,published_at FROM taxonomy_versions
                 WHERE version NOT IN (?,?) ORDER BY version
                 """,
-                (LEGACY_TAXONOMY_VERSION, TARGET_TAXONOMY_VERSION),
+                (SOURCE_TAXONOMY_VERSION, TARGET_TAXONOMY_VERSION),
             )
         ]
         payload["unmanaged_lifecycle_sha256"] = _sha256_bytes(
@@ -1456,7 +1448,7 @@ def status(*, db_path: Path, release_id: str = TARGET_RELEASE_ID) -> dict[str, A
 def create(
     *, db_path: Path, manifest_path: Path, release_id: str = TARGET_RELEASE_ID
 ) -> dict[str, Any]:
-    """Create the fixed v8/v5.1 release in draft status."""
+    """Create the fixed evaluation-v8/v5.2 release in draft status."""
 
     if release_id != TARGET_RELEASE_ID:
         raise ReleaseManagementError("only the approved target release id is allowed")
@@ -2551,12 +2543,14 @@ def _require_active_invariants(
             "activation did not leave exactly one target release"
         )
     if [str(row["version"]) for row in published] != [TARGET_TAXONOMY_VERSION]:
-        raise ReleaseManagementError("activation did not publish exactly v5.1")
-    legacy_release = _release_row(connection, LEGACY_V7_RELEASE_ID)
+        raise ReleaseManagementError(
+            f"activation did not publish exactly {TARGET_TAXONOMY_VERSION}"
+        )
+    legacy_release = _release_row(connection, SOURCE_RELEASE_ID)
     legacy_taxonomy = _single_row(
         connection,
         "SELECT * FROM taxonomy_versions WHERE version=?",
-        (LEGACY_TAXONOMY_VERSION,),
+        (SOURCE_TAXONOMY_VERSION,),
         label="legacy taxonomy",
     )
     if (
@@ -2592,7 +2586,7 @@ def activate(
     receipt_path: Path,
     release_id: str = TARGET_RELEASE_ID,
 ) -> dict[str, Any]:
-    """Atomically publish v5.1, activate v8, and refresh the direction cache."""
+    """Atomically publish v5.2, activate its v8 release, and refresh directions."""
 
     if release_id != TARGET_RELEASE_ID:
         raise ReleaseManagementError("only the approved target release id is allowed")
@@ -2632,7 +2626,7 @@ def activate(
         captured_at = now_utc()
         _cas_release_status(
             connection,
-            release_id=LEGACY_V7_RELEASE_ID,
+            release_id=SOURCE_RELEASE_ID,
             old_status="active",
             new_status="retired",
             captured_at=captured_at,
@@ -2642,7 +2636,7 @@ def activate(
         _checkpoint("activation_legacy_release_retired")
         _cas_taxonomy_status(
             connection,
-            version=LEGACY_TAXONOMY_VERSION,
+            version=SOURCE_TAXONOMY_VERSION,
             old_status="published",
             new_status="retired",
         )
@@ -2817,7 +2811,7 @@ def _refresh_direction_cache_from_legacy(
             ORDER BY e.evaluated_at DESC,e.id DESC LIMIT 1
         ),'unknown')
         """,
-        (LEGACY_V7_RELEASE_ID,),
+        (SOURCE_RELEASE_ID,),
     )
     if cursor.rowcount != expected_count:
         raise ReleaseManagementError("legacy direction-cache restore coverage mismatch")
@@ -2852,13 +2846,13 @@ def rollback_before_resume(
             raise ReleaseManagementError(
                 "only the active target release can be rolled back"
             )
-        legacy = _release_row(connection, LEGACY_V7_RELEASE_ID)
+        legacy = _release_row(connection, SOURCE_RELEASE_ID)
         if str(legacy["status"]) != "retired":
             raise ReleaseManagementError("legacy release is not in the rollback state")
         legacy_taxonomy = _single_row(
             connection,
             "SELECT * FROM taxonomy_versions WHERE version=?",
-            (LEGACY_TAXONOMY_VERSION,),
+            (SOURCE_TAXONOMY_VERSION,),
             label="legacy taxonomy",
         )
         if str(legacy_taxonomy["status"]) != "retired":
@@ -2898,14 +2892,14 @@ def rollback_before_resume(
         _checkpoint("rollback_target_taxonomy_retired")
         _cas_taxonomy_status(
             connection,
-            version=LEGACY_TAXONOMY_VERSION,
+            version=SOURCE_TAXONOMY_VERSION,
             old_status="retired",
             new_status="published",
         )
         _checkpoint("rollback_legacy_taxonomy_published")
         _cas_release_status(
             connection,
-            release_id=LEGACY_V7_RELEASE_ID,
+            release_id=SOURCE_RELEASE_ID,
             old_status="retired",
             new_status="active",
             captured_at=captured_at,
@@ -2922,9 +2916,9 @@ def rollback_before_resume(
         published = connection.execute(
             "SELECT version FROM taxonomy_versions WHERE status='published'"
         ).fetchall()
-        if [str(row["id"]) for row in active] != [LEGACY_V7_RELEASE_ID] or [
+        if [str(row["id"]) for row in active] != [SOURCE_RELEASE_ID] or [
             str(row["version"]) for row in published
-        ] != [LEGACY_TAXONOMY_VERSION]:
+        ] != [SOURCE_TAXONOMY_VERSION]:
             raise ReleaseManagementError("rollback final state is inconsistent")
         if connection.execute("PRAGMA foreign_key_check").fetchall():
             raise ReleaseManagementError("rollback introduced foreign-key violations")

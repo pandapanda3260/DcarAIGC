@@ -17,11 +17,19 @@ The status machine is fixed priority (first match wins):
 1. no published content in the window                 -> not_applicable
 2. content exists but U = 0                            -> missing
 3. classifier rejected, identity coverage < 95%,
-   or U < 30                                           -> below_threshold (no %)
-4. classifier conservative, 30 <= U < 100, or comment
-   collection coverage unknown / < 90%                 -> sample_only (shows %)
+   classification coverage < 100%, or U < 30          -> below_threshold (no %)
+4. classifier conservative or uncalibrated,
+   30 <= U < 100, or comment collection coverage
+   unknown / < 90%                                     -> sample_only (shows %)
 5. classifier approved, U >= 100, identity >= 95%,
-   comment coverage >= 90%                             -> available
+   classification = 100%, comment coverage >= 90%     -> available
+
+``uncalibrated`` (2026-08-07 owner decision, Mark): when the gold-set
+calibration record has never been created, machine estimates publish anyway,
+permanently capped at ``sample_only`` — never ``available``. A record that
+EXISTS but fails validation or fails the precision/recall gates still
+collapses to ``rejected`` and publishes nothing: a measured-bad or tampered
+classifier is worse than an unmeasured one.
 
 Identity coverage outranks headcount on purpose: missing identities are a
 systematic selection bias that more volume cannot fix.
@@ -31,6 +39,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
@@ -41,12 +50,19 @@ from .audience_classifier import (
     state_from_counts,
 )
 from .contracts import ratio_metric
+from .audience_selectors import (
+    latest_comment_rows,
+    latest_user_classifications,
+    timestamp_at_or_after,
+    timestamp_before,
+)
 from .storage import PROJECT_ROOT
 
 MIN_USERS_AVAILABLE = 100
 MIN_USERS_SAMPLE = 30
 IDENTITY_COVERAGE_GATE = 95.0
 COMMENT_COVERAGE_GATE = 90.0
+CLASSIFICATION_COVERAGE_GATE = 100.0
 COMMENT_CAP = 1000
 
 CALIBRATION_RECORD_VERSION = "audience-calibration-v1"
@@ -54,76 +70,119 @@ CALIBRATION_RECORD_PATH = PROJECT_ROOT / "config" / "audience_calibration_v1.jso
 CALIBRATION_PLATFORMS = ("douyin", "xiaohongshu")
 MIN_CALIBRATION_SAMPLE = 500
 
-_CLASSIFIER_STATES = {"approved", "conservative", "rejected"}
+_CLASSIFIER_STATES = {"approved", "conservative", "rejected", "uncalibrated"}
 _STATE_RANK = {"approved": 0, "conservative": 1, "rejected": 2}
 
 
 def _slice_user_universe(
-    connection: sqlite3.Connection, content_ids: Sequence[int]
+    connection: sqlite3.Connection,
+    content_ids: Sequence[int],
+    *,
+    report_cutoff_at: Optional[str] = None,
+    evidence_window_start: Optional[str] = None,
+    evidence_window_end: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Distinct in-slice platform users and their automotive subset."""
+    """Distinct users and classifications from one canonical as-of snapshot."""
 
-    placeholders = ",".join("?" for _ in content_ids)
-    params = tuple(int(cid) for cid in content_ids)
-    universe = connection.execute(
-        f"""
-        SELECT COUNT(DISTINCT c.interaction_user_id) AS u
-        FROM comments c
-        JOIN comment_evidence_versions cev ON cev.id=c.evidence_version_id
-        WHERE cev.content_id IN ({placeholders})
-          AND c.parent_comment_id IS NULL
-          AND c.interaction_user_id IS NOT NULL
-        """,
-        params,
-    ).fetchone()
-    total_users = int(universe["u"] or 0)
+    comments = latest_comment_rows(
+        connection,
+        content_ids,
+        report_cutoff_at=report_cutoff_at,
+        evidence_window_start=evidence_window_start,
+        evidence_window_end=evidence_window_end,
+    )
+    total_comments = len(comments)
+    stable_comments = [
+        row for row in comments if row.get("interaction_user_id") is not None
+    ]
+    stable = len(stable_comments)
+    user_ids = sorted({int(row["interaction_user_id"]) for row in stable_comments})
+    latest_evidence_by_user: Dict[int, str] = {}
+    latest_behavior_by_user: Dict[int, str] = {}
+    for row in stable_comments:
+        user_id = int(row["interaction_user_id"])
+        captured_at = str(row["evidence_captured_at"])
+        current = latest_evidence_by_user.get(user_id)
+        if current is None or timestamp_at_or_after(captured_at, current):
+            latest_evidence_by_user[user_id] = captured_at
+        published_at = str(row["published_at"])
+        current_behavior = latest_behavior_by_user.get(user_id)
+        if current_behavior is None or timestamp_at_or_after(
+            published_at, current_behavior
+        ):
+            latest_behavior_by_user[user_id] = published_at
 
-    automotive = connection.execute(
-        f"""
-        SELECT COUNT(DISTINCT c.interaction_user_id) AS a
-        FROM comments c
-        JOIN comment_evidence_versions cev ON cev.id=c.evidence_version_id
-        JOIN interaction_user_classification_versions cls
-          ON cls.interaction_user_id=c.interaction_user_id
-         AND cls.audience_definition_version=?
-         AND cls.classifier_version=?
-         AND cls.label='automotive'
-        WHERE cev.content_id IN ({placeholders})
-          AND c.parent_comment_id IS NULL
-          AND c.interaction_user_id IS NOT NULL
-        """,
-        (AUDIENCE_DEFINITION_VERSION, CLASSIFIER_VERSION, *params),
-    ).fetchone()
-    automotive_users = int(automotive["a"] or 0)
-
-    # Identity coverage: valid L1 comments with a stable platform pseudonym
-    # over all valid L1 comments.
-    coverage = connection.execute(
-        f"""
-        SELECT
-            SUM(CASE WHEN c.interaction_user_id IS NOT NULL THEN 1 ELSE 0 END) AS stable,
-            COUNT(*) AS total
-        FROM comments c
-        JOIN comment_evidence_versions cev ON cev.id=c.evidence_version_id
-        WHERE cev.content_id IN ({placeholders})
-          AND c.parent_comment_id IS NULL
-        """,
-        params,
-    ).fetchone()
-    stable = int(coverage["stable"] or 0)
-    total_comments = int(coverage["total"] or 0)
+    classifications = latest_user_classifications(
+        connection,
+        user_ids,
+        audience_definition_version=AUDIENCE_DEFINITION_VERSION,
+        classifier_version=CLASSIFIER_VERSION,
+        report_cutoff_at=report_cutoff_at,
+        evidence_window_end=evidence_window_end,
+    )
+    fresh_classifications = {
+        user_id: value
+        for user_id, value in classifications.items()
+        if timestamp_at_or_after(
+            str(value["created_at"]), latest_evidence_by_user[user_id]
+        )
+        and timestamp_before(
+            latest_behavior_by_user[user_id], str(value["evidence_window_end"])
+        )
+    }
+    candidate_users = len(user_ids)
+    classified_users = len(fresh_classifications)
+    eligible_users = {
+        user_id
+        for user_id, value in fresh_classifications.items()
+        if value.get("label") != "excluded"
+    }
+    automotive_users = sum(
+        value.get("label") == "automotive"
+        for value in fresh_classifications.values()
+    )
     identity_coverage = (
         round(stable * 100 / total_comments, 2) if total_comments else None
     )
+    classification_coverage = (
+        round(classified_users * 100 / candidate_users, 2)
+        if candidate_users
+        else None
+    )
+    evidence_contents = int(
+        connection.execute(
+            f"""
+            SELECT COUNT(DISTINCT content_id) FROM comment_evidence_versions
+            WHERE content_id IN ({",".join("?" for _ in content_ids)})
+            """,
+            tuple(int(cid) for cid in content_ids),
+        ).fetchone()[0]
+    )
+    user_key_versions = sorted(
+        {
+            str(row["interaction_user_key_version"])
+            for row in stable_comments
+            if row.get("interaction_user_key_version")
+        }
+    )
     return {
-        "total_users": total_users,
+        "candidate_users": candidate_users,
+        "total_users": len(eligible_users),
         "automotive_users": automotive_users,
+        "classified_users": classified_users,
         "identity_coverage_percentage": identity_coverage,
+        "classification_coverage_percentage": classification_coverage,
+        "first_level_comment_count": total_comments,
+        "evidence_content_count": evidence_contents,
+        "user_key_versions": user_key_versions,
     }
 
 
 def _slice_comment_coverage(
-    connection: sqlite3.Connection, content_ids: Sequence[int]
+    connection: sqlite3.Connection,
+    content_ids: Sequence[int],
+    *,
+    report_cutoff_at: str,
 ) -> Dict[str, Any]:
     """Weighted comment-collection coverage from capture runs.
 
@@ -140,20 +199,31 @@ def _slice_comment_coverage(
             "coverage_percentage": None,
             "capped_content_count": 0,
         }
-    placeholders = ",".join("?" for _ in content_ids)
+    ids = list(dict.fromkeys(int(cid) for cid in content_ids))
+    placeholders = ",".join("?" for _ in ids)
     rows = connection.execute(
         f"""
+        WITH ranked AS (
+            SELECT r.*,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY r.content_id
+                       ORDER BY julianday(COALESCE(r.completed_at,r.updated_at)) DESC,
+                                r.id DESC
+                   ) selector_rank
+            FROM comment_capture_runs r
+            WHERE r.content_id IN ({placeholders})
+              AND julianday(COALESCE(r.completed_at,r.updated_at)) <= julianday(?)
+        )
         SELECT content_id, status, completion_kind, declared_total_count,
                captured_distinct_count, comment_cap
-        FROM comment_capture_runs
-        WHERE content_id IN ({placeholders})
+        FROM ranked WHERE selector_rank=1
         """,
-        tuple(int(cid) for cid in content_ids),
+        (*ids, report_cutoff_at),
     ).fetchall()
     captured_sum = 0
     denom_sum = 0
     capped = 0
-    unknown = False
+    unknown = len(rows) != len(ids)
     for row in rows:
         captured = int(row["captured_distinct_count"] or 0)
         declared = row["declared_total_count"]
@@ -161,12 +231,14 @@ def _slice_comment_coverage(
         captured_sum += captured
         if completion == "cap_reached":
             capped += 1
-        if declared is not None:
-            denom_sum += max(int(declared), captured)
-        elif completion in {"provider_exhausted", "zero_comments", "cap_reached"}:
-            # Declared unknown but the provider is exhausted (or capped): treat
-            # the captured count as the inferred total.
             denom_sum += captured
+        elif completion in {"provider_exhausted", "zero_comments"}:
+            # These runs consumed the complete provider-accessible L1 set.
+            # Upstream declared totals can include replies/filtered rows and
+            # are retained on the run for audit, not used as missing pages.
+            denom_sum += captured
+        elif declared is not None:
+            denom_sum += max(int(declared), captured)
         else:
             unknown = True
     if unknown:
@@ -181,33 +253,101 @@ def _slice_comment_coverage(
     }
 
 
-def _decide_status(
+@dataclass(frozen=True)
+class _MetricDecision:
+    status: str
+    reason: str
+
+
+def _decide_metric(
     *,
     publication_count: int,
+    candidate_users: int,
+    classified_users: int,
     total_users: int,
     identity_coverage: Optional[float],
+    classification_coverage: Optional[float],
+    classification_complete: bool,
     comment_coverage: Optional[float],
+    capped_content_count: int,
     classifier_state: str,
-) -> str:
+    first_level_comments: int = 0,
+    evidence_contents: int = 0,
+    approximate_identity_keys: bool = False,
+) -> _MetricDecision:
+    """Resolve status and its canonical reason in one priority-ordered pass."""
+
     if publication_count == 0:
-        return "not_applicable"
+        return _MetricDecision(
+            "not_applicable", "该切片在所选窗口没有发布内容"
+        )
+    if candidate_users == 0:
+        if evidence_contents == 0:
+            reason = "评论尚未采集，无法计算互动用户"
+        elif first_level_comments == 0:
+            reason = "窗口内容没有一级评论互动"
+        else:
+            reason = "有一级评论但均无可识别的用户身份"
+        return _MetricDecision("missing", reason)
+    if identity_coverage is None or identity_coverage < IDENTITY_COVERAGE_GATE:
+        display = identity_coverage if identity_coverage is not None else "未知"
+        return _MetricDecision(
+            "below_threshold",
+            f"用户身份覆盖率 {display}%，低于 {IDENTITY_COVERAGE_GATE:.0f}% 门槛",
+        )
+    if not classification_complete:
+        display = (
+            classification_coverage
+            if classification_coverage is not None
+            else "未知"
+        )
+        return _MetricDecision(
+            "below_threshold",
+            "用户分类覆盖率 "
+            f"{display}%（{classified_users}/{candidate_users}），未覆盖全部候选用户",
+        )
     if total_users == 0:
-        return "missing"
-    if (
-        classifier_state == "rejected"
-        or identity_coverage is None
-        or identity_coverage < IDENTITY_COVERAGE_GATE
-        or total_users < MIN_USERS_SAMPLE
-    ):
-        return "below_threshold"
-    if (
-        classifier_state == "conservative"
-        or total_users < MIN_USERS_AVAILABLE
-        or comment_coverage is None
-        or comment_coverage < COMMENT_COVERAGE_GATE
-    ):
-        return "sample_only"
-    return "available"
+        return _MetricDecision(
+            "missing",
+            "候选评论用户均为排除项，没有可进入比例分母的有效用户",
+        )
+    if classifier_state == "rejected":
+        return _MetricDecision(
+            "below_threshold", "分类器定标未通过，暂不发布比例"
+        )
+    if total_users < MIN_USERS_SAMPLE:
+        return _MetricDecision(
+            "below_threshold",
+            f"去重有效用户 {total_users} 人，低于 {MIN_USERS_SAMPLE} 人门槛",
+        )
+    if classifier_state == "uncalibrated":
+        return _MetricDecision(
+            "sample_only", "分类器未经金标核对，数值仅供参考"
+        )
+    if comment_coverage is None:
+        return _MetricDecision("sample_only", "评论采集覆盖率未知，仅作样本")
+    if comment_coverage < COMMENT_COVERAGE_GATE:
+        return _MetricDecision(
+            "sample_only",
+            f"评论采集覆盖率 {comment_coverage}%，低于 90%，仅作样本",
+        )
+    if capped_content_count > 0:
+        return _MetricDecision(
+            "sample_only",
+            f"{capped_content_count} 条内容达到 {COMMENT_CAP} 条评论采集上限，仅作样本",
+        )
+    if total_users < MIN_USERS_AVAILABLE:
+        return _MetricDecision(
+            "sample_only",
+            f"去重有效用户 {total_users} 人，处于 30–99 样本区间",
+        )
+    if approximate_identity_keys:
+        return _MetricDecision(
+            "sample_only", "包含历史内容级近似身份键，仅作样本"
+        )
+    if classifier_state == "conservative":
+        return _MetricDecision("sample_only", "分类器为保守识别，仅作样本")
+    return _MetricDecision("available", "")
 
 
 def compute_slice_rate(
@@ -227,13 +367,29 @@ def compute_slice_rate(
         raise ValueError(f"unknown classifier state: {classifier_state}")
     unique_ids = list(dict.fromkeys(int(cid) for cid in content_ids))
     if unique_ids:
-        universe = _slice_user_universe(connection, unique_ids)
-        coverage = _slice_comment_coverage(connection, unique_ids)
+        universe = _slice_user_universe(
+            connection,
+            unique_ids,
+            report_cutoff_at=report_cutoff_at,
+            evidence_window_start=evidence_window_start,
+            evidence_window_end=evidence_window_end,
+        )
+        coverage = _slice_comment_coverage(
+            connection,
+            unique_ids,
+            report_cutoff_at=report_cutoff_at,
+        )
     else:
         universe = {
             "total_users": 0,
+            "candidate_users": 0,
             "automotive_users": 0,
+            "classified_users": 0,
             "identity_coverage_percentage": None,
+            "classification_coverage_percentage": None,
+            "first_level_comment_count": 0,
+            "evidence_content_count": 0,
+            "user_key_versions": [],
         }
         coverage = {
             "captured": 0,
@@ -241,73 +397,63 @@ def compute_slice_rate(
             "coverage_percentage": None,
             "capped_content_count": 0,
         }
+    candidate_users = int(universe["candidate_users"])
     total_users = int(universe["total_users"])
     automotive_users = int(universe["automotive_users"])
+    classified_users = int(universe["classified_users"])
     identity_coverage = universe["identity_coverage_percentage"]
+    classification_coverage = universe["classification_coverage_percentage"]
     comment_coverage = coverage["coverage_percentage"]
 
-    status = _decide_status(
+    classification_complete = classified_users == candidate_users
+    user_key_versions = sorted(universe["user_key_versions"], reverse=True)
+    decision = _decide_metric(
         publication_count=publication_count,
+        candidate_users=candidate_users,
+        classified_users=classified_users,
         total_users=total_users,
         identity_coverage=identity_coverage,
+        classification_coverage=classification_coverage,
+        classification_complete=classification_complete,
         comment_coverage=comment_coverage,
+        capped_content_count=int(coverage["capped_content_count"]),
         classifier_state=classifier_state,
+        first_level_comments=int(universe["first_level_comment_count"]),
+        evidence_contents=int(universe["evidence_content_count"]),
+        approximate_identity_keys=any(
+            value != "platform-user-hmac-v2" for value in user_key_versions
+        ),
     )
+    status = decision.status
     publishes_percentage = status in {"available", "sample_only"}
-    reason = _reason_for(status, total_users, identity_coverage, comment_coverage)
+    metric_denominator = total_users if classification_complete else candidate_users
     metric = ratio_metric(
         automotive_users if publishes_percentage else None,
-        total_users,
+        metric_denominator,
         status=status,
-        eligible_count=total_users,
+        eligible_count=metric_denominator,
         coverage_percentage=comment_coverage,
-        reason=reason,
+        reason=decision.reason,
     )
     audience_quality = {
         "captured_comment_count": int(coverage["captured"]),
         "declared_comment_count": int(coverage["declared"]),
         "comment_collection_coverage_percentage": comment_coverage,
         "identity_coverage_percentage": identity_coverage,
+        "candidate_user_count": candidate_users,
+        "classified_user_count": classified_users,
+        "classification_coverage_percentage": classification_coverage,
         "capped_content_count": int(coverage["capped_content_count"]),
         "audience_definition_version": AUDIENCE_DEFINITION_VERSION,
         "classifier_version": CLASSIFIER_VERSION,
-        "user_key_version": "platform-user-hmac-v2",
+        # 如实标注该切片用户实际使用的键域；含 v1 回溯键即为混合降级口径。
+        "user_key_version": "+".join(user_key_versions) or "platform-user-hmac-v2",
         "evidence_window_start": evidence_window_start,
         "evidence_window_end": evidence_window_end,
         "report_cutoff_at": report_cutoff_at,
         "warm_up": bool(warm_up),
     }
     return {"metric": metric, "audience_quality": audience_quality}
-
-
-def _reason_for(
-    status: str,
-    total_users: int,
-    identity_coverage: Optional[float],
-    comment_coverage: Optional[float],
-) -> str:
-    if status == "not_applicable":
-        return "该切片在所选窗口没有发布内容"
-    if status == "missing":
-        return "有内容但没有可识别的有效评论用户"
-    if status == "below_threshold":
-        if identity_coverage is None or identity_coverage < IDENTITY_COVERAGE_GATE:
-            return (
-                f"用户身份覆盖率 {identity_coverage if identity_coverage is not None else '未知'}%"
-                f"，低于 {IDENTITY_COVERAGE_GATE:.0f}% 门槛"
-            )
-        if total_users < MIN_USERS_SAMPLE:
-            return f"去重有效用户 {total_users} 人，低于 {MIN_USERS_SAMPLE} 人门槛"
-        return "分类器未通过定标，暂不发布比例"
-    if status == "sample_only":
-        if comment_coverage is None:
-            return "评论采集覆盖率未知，仅作样本"
-        if comment_coverage < COMMENT_COVERAGE_GATE:
-            return f"评论采集覆盖率 {comment_coverage}%，低于 90%，仅作样本"
-        if total_users < MIN_USERS_AVAILABLE:
-            return f"去重有效用户 {total_users} 人，处于 30–99 样本区间"
-        return "分类器为保守识别，仅作样本"
-    return ""
 
 
 def load_calibration_record(
@@ -331,13 +477,24 @@ def load_calibration_record(
     """
 
     path = Path(record_path) if record_path is not None else CALIBRATION_RECORD_PATH
+    if not path.exists():
+        # Never-created record: publish uncalibrated machine estimates,
+        # capped at sample_only (2026-08-07 owner decision, Mark). This is
+        # distinct from a record that exists but is defective — that stays
+        # rejected below, because it means tampering or a failed calibration.
+        return {
+            "state": "uncalibrated",
+            "platforms": {},
+            "reasons": ["定标记录尚未建立，按未定标口径发布（上限仅样本）"],
+            "record": None,
+        }
     try:
         record = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {
             "state": "rejected",
             "platforms": {},
-            "reasons": ["定标记录缺失或不可解析"],
+            "reasons": ["定标记录存在但不可解析"],
             "record": None,
         }
     reasons: List[str] = []
@@ -423,10 +580,11 @@ def active_classifier_state(
 ) -> str:
     """Return the calibrated classifier state for publication decisions.
 
-    Resolves through :func:`load_calibration_record`: without a valid
-    500-user/platform gold-set calibration record the state stays
-    ``rejected``, so ``automotive_user_rate`` never publishes a percentage
-    before calibration. The effective state is the weakest platform state
+    Resolves through :func:`load_calibration_record`. A never-created record
+    yields ``uncalibrated`` — the rate publishes machine estimates capped at
+    ``sample_only`` (2026-08-07 owner decision). A record that exists but is
+    defective or fails the gates yields ``rejected`` and publishes nothing.
+    With a valid record the effective state is the weakest platform state
     (both douyin and xiaohongshu must pass). Overview and report generation
     must both resolve the state through this single function.
     """

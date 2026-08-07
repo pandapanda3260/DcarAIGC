@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
 import v8.storage as storage
+from v8.capture import execute_content_fetch
 
 try:  # providers pulls in media/duplicates (Pillow, imagehash)
     import v8.providers as providers
@@ -179,6 +180,129 @@ class CommentPagingLiveBridgeTest(unittest.TestCase):
                     ).fetchone()[0]
                 ),
                 2,
+            )
+        finally:
+            connection.close()
+
+    def test_first_page_adopts_legacy_week_raw_without_provider_call(self) -> None:
+        page = self._pages()[0]
+        page["has_more"] = False
+        page["next_cursor"] = None
+        page["next_cursor_params"] = None
+        outcome = execute_content_fetch(
+            content_id=1,
+            stage="comments",
+            window_key="2026-W31",
+            provider="TikHub",
+            adapter_version="tikhub-comments-v8.0",
+            operation="douyin_video_comments",
+            call=lambda: providers.ProviderResult(
+                dict(page), {"stage": "comments", "data": page}, 200, True
+            ),
+            db_path=self.db,
+            raw_root=self.raw_root,
+        )
+        calls = []
+
+        def no_provider(stage: str, content: Mapping[str, Any]):
+            calls.append((stage, content))
+            raise AssertionError("legacy raw should be adopted before provider call")
+
+        result = providers.capture_content_comments_live(
+            1,
+            as_of=__import__("datetime").date(2026, 7, 31),
+            db_path=self.db,
+            call_override=no_provider,
+        )
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["completion_kind"], "provider_exhausted")
+        self.assertEqual(calls, [])
+        connection = storage.connect(self.db)
+        try:
+            page_row = connection.execute(
+                "SELECT fetch_slot_id,raw_response_id FROM comment_capture_pages"
+            ).fetchone()
+            self.assertEqual(page_row["fetch_slot_id"], outcome.slot_id)
+            self.assertEqual(page_row["raw_response_id"], outcome.raw_response_id)
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM provider_usage"
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            connection.close()
+
+    def test_cache_only_miss_keeps_historical_evidence_untouched(self) -> None:
+        result = providers.capture_content_comments_live(
+            1,
+            as_of=__import__("datetime").date(2026, 7, 31),
+            db_path=self.db,
+            cache_only=True,
+        )
+        self.assertEqual(result["status"], "incomplete")
+        self.assertEqual(result["pages_fetched"], 0)
+        self.assertIsNone(result["evidence_version_id"])
+        connection = storage.connect(self.db)
+        try:
+            run = connection.execute(
+                "SELECT status,stop_reason FROM comment_capture_runs"
+            ).fetchone()
+            self.assertEqual(tuple(run), ("retryable_failed", "cache_only_page_unavailable"))
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM comment_evidence_versions"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM provider_usage").fetchone()[0],
+                0,
+            )
+        finally:
+            connection.close()
+
+    def test_cache_only_adopts_first_page_but_does_not_fetch_missing_next_page(
+        self,
+    ) -> None:
+        page = self._pages()[0]
+        outcome = execute_content_fetch(
+            content_id=1,
+            stage="comments",
+            window_key="2026-W31",
+            provider="TikHub",
+            adapter_version="tikhub-comments-v8.0",
+            operation="douyin_video_comments",
+            call=lambda: providers.ProviderResult(
+                dict(page), {"stage": "comments", "data": page}, 200, True
+            ),
+            db_path=self.db,
+            raw_root=self.raw_root,
+        )
+        result = providers.capture_content_comments_live(
+            1,
+            as_of=__import__("datetime").date(2026, 7, 31),
+            db_path=self.db,
+            cache_only=True,
+        )
+        self.assertEqual(result["status"], "incomplete")
+        self.assertEqual(result["pages_fetched"], 1)
+        self.assertEqual(result["stop_reason"], "cache_only_page_unavailable")
+        connection = storage.connect(self.db)
+        try:
+            stored = connection.execute(
+                "SELECT fetch_slot_id FROM comment_capture_pages"
+            ).fetchone()
+            self.assertEqual(stored["fetch_slot_id"], outcome.slot_id)
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM provider_usage").fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT status FROM comment_evidence_versions"
+                ).fetchone()[0],
+                "partial",
             )
         finally:
             connection.close()

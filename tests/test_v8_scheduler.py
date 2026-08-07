@@ -15,6 +15,8 @@ from v8.matcher_dsl import POINT_IDS, POINT_SCENES
 from v8.operations import IdentityConflictError, upsert_account
 from v8.reports import ReportTaskError
 from v8.scheduler import (
+    DAILY_CAPTURE_CONTENT_LIMIT,
+    DAILY_CAPTURE_MAX_AMOUNT,
     JOBS,
     _select_due_capture_contents,
     execute_job,
@@ -162,6 +164,35 @@ class V8SchedulerTest(unittest.TestCase):
                     updated_at,
                     updated_at,
                     updated_at,
+                ),
+            )
+            connection.commit()
+
+    def _insert_comment_run(
+        self,
+        *,
+        content_id: int,
+        window_key: str,
+        status: str = "succeeded",
+    ) -> None:
+        captured_at = "2026-08-04T18:00:00Z"
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                INSERT INTO comment_capture_runs(
+                    content_id,window_key,provider,adapter_version,status,
+                    completion_kind,created_at,updated_at,completed_at
+                ) VALUES (?,?,'TikHub','tikhub-comments-v8.0+paged-comments-v2',
+                          ?,?,?,?,?)
+                """,
+                (
+                    content_id,
+                    window_key,
+                    status,
+                    "provider_exhausted" if status == "succeeded" else None,
+                    captured_at,
+                    captured_at,
+                    captured_at if status == "succeeded" else None,
                 ),
             )
             connection.commit()
@@ -363,7 +394,7 @@ class V8SchedulerTest(unittest.TestCase):
                 reports_root=self.reports,
             )
         download_queue.assert_called_once_with(
-            limit=100,
+            limit=500,
             db_path=self.db,
             published_start="2026-07-31T16:00:00Z",
             published_end="2026-08-01T18:20:00Z",
@@ -459,6 +490,61 @@ class V8SchedulerTest(unittest.TestCase):
         self.assertEqual(statuses["2026-08-01T18:20:00Z"], "failed")
         self.assertEqual(statuses["2026-08-02T18:20:00Z"], "succeeded")
         self.assertEqual(statuses["2026-08-03T18:20:00Z"], "succeeded")
+
+    def test_media_jobs_fail_when_candidate_probe_is_truncated(self) -> None:
+        truncated_download = {
+            "candidates": 500,
+            "downloaded": 500,
+            "failed": 0,
+            "retryable_failed": 0,
+            "terminal_failed": 0,
+            "truncated": True,
+            "has_more": True,
+            "results": [],
+        }
+        download_time = datetime(2026, 8, 6, 2, 20, tzinfo=SHANGHAI)
+        with patch(
+            "v8.scheduler.run_media_download_queue", return_value=truncated_download
+        ):
+            result = execute_job(
+                "daily_media_download",
+                download_time,
+                db_path=self.db,
+                reports_root=self.reports,
+            )
+        self.assertEqual(result["status"], "failed")
+        self.assertTrue(result["details"]["fresh_content"]["truncated"])
+
+        truncated_processing = {
+            "candidates": 500,
+            "evidence_ready": 500,
+            "failed": 0,
+            "retryable_failed": 0,
+            "terminal_failed": 0,
+            "truncated": True,
+            "has_more": True,
+            "results": [],
+        }
+        duplicates_ok = {"candidates": 0, "completed": 0, "failed": 0, "results": []}
+        processing_time = datetime(2026, 8, 6, 3, 0, tzinfo=SHANGHAI)
+        with (
+            patch(
+                "v8.scheduler.run_media_processing_queue",
+                return_value=truncated_processing,
+            ),
+            patch(
+                "v8.scheduler.run_duplicate_fingerprint_queue",
+                return_value=duplicates_ok,
+            ),
+        ):
+            result = execute_job(
+                "daily_media_processing",
+                processing_time,
+                db_path=self.db,
+                reports_root=self.reports,
+            )
+        self.assertEqual(result["status"], "failed")
+        self.assertTrue(result["details"]["media"]["truncated"])
 
     def test_running_occurrence_is_not_reclaimed_or_mutated(self) -> None:
         occurrence = datetime(2026, 8, 2, 8, 0, tzinfo=SHANGHAI)
@@ -580,7 +666,7 @@ class V8SchedulerTest(unittest.TestCase):
         self.assertEqual(media_failed["details"]["media"], retryable_media)
         self.assertEqual(media_failed["details"]["duplicates"], duplicates_ok)
         processing_queue.assert_called_once_with(
-            limit=100,
+            limit=500,
             db_path=self.db,
             published_start="2026-07-31T16:00:00Z",
             published_end="2026-08-01T19:00:00Z",
@@ -708,8 +794,12 @@ class V8SchedulerTest(unittest.TestCase):
         self.assertEqual(result["details"]["monitored_contents"], 1)
         self.assertEqual(result["details"]["eligible_contents"], 1)
         self.assertEqual(result["details"]["task_id"], "daily-capture-2026-08-02-bjt")
-        self.assertEqual(result["details"]["budget_max_amount"], 3.0)
-        self.assertEqual(result["details"]["content_limit"], 1200)
+        self.assertEqual(
+            result["details"]["budget_max_amount"], DAILY_CAPTURE_MAX_AMOUNT
+        )
+        self.assertEqual(
+            result["details"]["content_limit"], DAILY_CAPTURE_CONTENT_LIMIT
+        )
         self.assertEqual(result["details"]["provider_cost"], 0.005)
 
         with connect(self.db) as connection:
@@ -814,6 +904,10 @@ class V8SchedulerTest(unittest.TestCase):
                 (completed, "a" * 64),
             )
             connection.commit()
+        self._insert_comment_run(
+            content_id=completed,
+            window_key="2026-W32",
+        )
 
         selected = _select_due_capture_contents(
             datetime(2026, 8, 5, 2, 0, tzinfo=SHANGHAI),
@@ -825,6 +919,60 @@ class V8SchedulerTest(unittest.TestCase):
             [yesterday, today, current_week],
         )
         self.assertNotIn(completed, [int(item["id"]) for item in selected])
+
+    def test_comment_due_state_is_owned_by_capture_run_not_legacy_slot(self) -> None:
+        account = upsert_account(
+            {
+                "phone": "13800138122",
+                "platforms": [{"platform": "douyin", "uid": "99888122"}],
+            },
+            db_path=self.db,
+        )
+        content_id = self._insert_scheduled_content(
+            account_id=int(account["id"]),
+            link_id="C2D3E4",
+            platform_content_id="812200001",
+            published_at="2026-08-03T17:00:00Z",
+        )
+        for stage, window in (
+            ("detail", "lifetime"),
+            ("metrics", "2026-08-05"),
+            ("comments", "2026-W32"),
+        ):
+            self._insert_capture_slot(
+                content_id=content_id,
+                stage=stage,
+                window_key=window,
+                status="succeeded",
+                provider="legacy-cache",
+                updated_at="2026-08-04T18:00:00Z",
+            )
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                INSERT INTO content_metric_snapshots(
+                    content_id,captured_at,window_key,view_count,status,source
+                ) VALUES (?,'2026-08-04T18:00:00Z','2026-08-05',10,
+                          'available','douyin')
+                """,
+                (content_id,),
+            )
+            connection.commit()
+
+        due_without_run = _select_due_capture_contents(
+            datetime(2026, 8, 5, 2, 0, tzinfo=SHANGHAI),
+            db_path=self.db,
+            content_limit=10,
+        )
+        self.assertEqual([int(item["id"]) for item in due_without_run], [content_id])
+
+        self._insert_comment_run(content_id=content_id, window_key="2026-W32")
+        due_with_run = _select_due_capture_contents(
+            datetime(2026, 8, 5, 2, 0, tzinfo=SHANGHAI),
+            db_path=self.db,
+            content_limit=10,
+        )
+        self.assertEqual(due_with_run, [])
 
     def test_due_capture_selection_rotates_history_by_oldest_touch(self) -> None:
         account = upsert_account(
@@ -1037,6 +1185,83 @@ class V8SchedulerTest(unittest.TestCase):
             (slot["status"], slot["attempt_count"], slot["last_error_code"]),
             ("retryable_failed", 2, "provider_retry_requested"),
         )
+
+    def test_daily_capture_provider_cost_matches_ledger_after_billed_retries(
+        self,
+    ) -> None:
+        upsert_account(
+            {
+                "phone": "13800138085",
+                "platforms": [
+                    {"platform": "douyin", "uid": "99887785", "nickname": "费用账号"}
+                ],
+            },
+            db_path=self.db,
+        )
+        calls = {"metrics": 0}
+
+        def supplier_call(operation, record):
+            if operation == "resolve_account":
+                data = {"reference": "MS4wLjAB" + "x" * 40}
+            elif operation == "discover_content":
+                data = {
+                    "items": [
+                        {
+                            "platform": "douyin",
+                            "platform_content_id": "987654323",
+                            "canonical_url": "https://www.douyin.com/video/987654323",
+                            "title": "费用重试内容",
+                            "published_at": "2026-08-01T01:00:00Z",
+                            "content_type": "video",
+                        }
+                    ],
+                    "has_more": False,
+                }
+            elif operation == "detail":
+                data = {
+                    "title": "费用重试内容",
+                    "body": "费用重试内容完整正文",
+                    "published_at": "2026-08-01T01:00:00Z",
+                    "account_uid": "99887785",
+                    "account_name": "费用账号",
+                    "content_type": "video",
+                }
+            elif operation == "metrics":
+                calls["metrics"] += 1
+                raise CaptureError(
+                    "TikHub statistics omitted play_count for requested content",
+                    retryable=True,
+                    error_code="invalid_response",
+                    http_status=200,
+                    billed=True,
+                    raw_response={"data": {"comment_count": 2}},
+                )
+            else:
+                data = {"comment_count": 0, "comments": []}
+            return ProviderResult(
+                data, {"operation": operation, "data": data}, 200, True
+            )
+
+        result = run_due_capture(
+            datetime(2026, 8, 2, 2, 0, tzinfo=SHANGHAI),
+            db_path=self.db,
+            call_override=supplier_call,
+        )
+
+        with connect(self.db) as connection:
+            ledger_cost = float(
+                connection.execute(
+                    """
+                    SELECT COALESCE(SUM(amount), 0) FROM provider_usage
+                    WHERE task_id='daily-capture-2026-08-02-bjt'
+                      AND currency='USD'
+                    """
+                ).fetchone()[0]
+            )
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(calls["metrics"], 2)
+        self.assertGreater(ledger_cost, 0)
+        self.assertEqual(result["provider_cost"], ledger_cost)
 
     def test_xhs_block_opens_one_tikhub_circuit_and_never_uses_rnote(self) -> None:
         upsert_account(

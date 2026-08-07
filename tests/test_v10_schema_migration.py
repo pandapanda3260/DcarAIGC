@@ -86,10 +86,11 @@ class V10SchemaMigrationTest(unittest.TestCase):
                 [
                     (9, "release-bound-evaluation-schema"),
                     (10, "audience-interaction-user-domain"),
+                    (11, "interaction-user-v1-fallback-keys"),
                 ],
             )
             self.assertEqual(
-                int(connection.execute("PRAGMA user_version").fetchone()[0]), 10
+                int(connection.execute("PRAGMA user_version").fetchone()[0]), 11
             )
             tables = storage._table_names(connection)
             for table in storage._NEW_V10_TABLES:
@@ -101,7 +102,7 @@ class V10SchemaMigrationTest(unittest.TestCase):
                         "SELECT COUNT(*) FROM schema_migrations"
                     ).fetchone()[0]
                 ),
-                2,
+                3,
             )
 
     def test_migrating_v9_database_preserves_rows_and_backfills_versions(self) -> None:
@@ -131,10 +132,10 @@ class V10SchemaMigrationTest(unittest.TestCase):
                         "SELECT MAX(version) FROM schema_migrations"
                     ).fetchone()[0]
                 ),
-                10,
+                11,
             )
             self.assertEqual(
-                int(connection.execute("PRAGMA user_version").fetchone()[0]), 10
+                int(connection.execute("PRAGMA user_version").fetchone()[0]), 11
             )
             for table, columns in old_columns.items():
                 self.assertEqual(
@@ -223,13 +224,25 @@ class V10SchemaMigrationTest(unittest.TestCase):
                               'legacy-audience-action-v1','2026-08-01T03:00:00Z')
                     """,
             )
+            # v11: the v1 fallback key domain is legal (2026-08-07 owner
+            # decision) — only unknown versions are rejected.
+            with storage.transaction(connection):
+                connection.execute(
+                    """
+                    INSERT INTO interaction_users(
+                        platform, pseudonymous_user_key, key_version,
+                        first_seen_at, last_seen_at
+                    ) VALUES ('douyin','P1aaa','content-user-hmac-v1',
+                              '2026-08-01T00:00:00Z','2026-08-01T00:00:00Z')
+                    """
+                )
             self._expect_integrity_error(
                 connection,
                 """
                     INSERT INTO interaction_users(
                         platform, pseudonymous_user_key, key_version,
                         first_seen_at, last_seen_at
-                    ) VALUES ('douyin','P1aaa','content-user-hmac-v1',
+                    ) VALUES ('douyin','P9aaa','unknown-key-version',
                               '2026-08-01T00:00:00Z','2026-08-01T00:00:00Z')
                     """,
             )
@@ -436,7 +449,7 @@ class V10SchemaMigrationTest(unittest.TestCase):
                         "SELECT MAX(version) FROM schema_migrations"
                     ).fetchone()[0]
                 ),
-                10,
+                11,
             )
 
     def test_partial_v10_residue_fails_closed(self) -> None:

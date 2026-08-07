@@ -1,0 +1,104 @@
+name: dcar-aigc
+
+services:
+  api:
+    build:
+      context: ../..
+      dockerfile: deploy/server/Dockerfile.api
+    image: dcar-aigc-api:local
+    restart: unless-stopped
+    init: true
+    environment:
+      DCAR_V8_DB: /app/app/data/dcar_insight.sqlite3
+      DCAR_LEGACY_DB: /app/app/data/web_mvp.sqlite3
+      DCAR_V8_REPORTS_ROOT: /app/reports/runs/v8
+      DCAR_OPERATOR_FREEZE_LOCK: /var/lib/dcar-aigc/runtime/operator-freeze.lock
+      DCAR_SCHEDULER_ENABLED: "0"
+      DCAR_STARTUP_CATCHUP_ENABLED: "0"
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - type: bind
+        source: /var/lib/dcar-aigc/db
+        target: /app/app/data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /var/lib/dcar-aigc/reports
+        target: /app/reports
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /var/lib/dcar-aigc/cache
+        target: /app/data/cache
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /var/lib/dcar-aigc/runtime
+        target: /var/lib/dcar-aigc/runtime
+        read_only: true
+        bind:
+          create_host_path: false
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=256m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    cpus: 2.0
+    mem_limit: 3g
+    pids_limit: 256
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/api/v8/health', timeout=3).read()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+  web:
+    build:
+      context: ../..
+      dockerfile: deploy/server/Dockerfile.web
+    image: dcar-aigc-web:local
+    restart: unless-stopped
+    init: true
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:4173:4173"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    cpus: 1.0
+    mem_limit: 1g
+    pids_limit: 128
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:4173/').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"

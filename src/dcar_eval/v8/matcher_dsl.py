@@ -19,17 +19,12 @@ from typing import Any, Literal
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_BUNDLE_PATH = PROJECT_ROOT / "config" / "selling_point_matcher_v3.json"
+V4_BUNDLE_PATH = PROJECT_ROOT / "config" / "selling_point_matcher_v4.json"
 SOURCES = ("asr", "ocr", "visual", "desc")
 SCENES = {"used_car", "new_car", "media"}
 ENGINE_VERSION = "matcher-dsl-engine-v1"
 MATERIALIZED_RULE_VERSION = 1
-POINT_IDS = {
-    *(f"E{index}" for index in range(1, 8)),
-    *(f"X{index}" for index in range(1, 9)),
-    *(f"M{index}" for index in range(1, 7)),
-    *(f"C{index}" for index in range(1, 5)),
-}
-POINT_SCENES = {
+V5_1_POINT_SPEC = {
     **{f"E{index}": {"used_car"} for index in range(1, 8)},
     **{f"X{index}": {"new_car"} for index in range(1, 9)},
     **{f"M{index}": {"media"} for index in range(1, 7)},
@@ -38,6 +33,16 @@ POINT_SCENES = {
     "C3": {"media"},
     "C4": {"used_car", "new_car", "media"},
 }
+V5_2_POINT_SPEC = {
+    **{f"E{index}": {"used_car"} for index in range(1, 11)},
+    **{f"X{index}": {"new_car"} for index in range(1, 12)},
+    **{f"M{index}": {"media"} for index in range(1, 7)},
+    "M8": {"media"},
+}
+# Backward-compatible aliases for the active v5.1 runtime. Newer taxonomies must
+# pass their point spec explicitly instead of changing process-global matcher state.
+POINT_SCENES = V5_1_POINT_SPEC
+POINT_IDS = set(POINT_SCENES)
 EXPRESSION_OPS = {
     "all",
     "any",
@@ -275,12 +280,20 @@ def canonical_json(value: Any) -> str:
     )
 
 
-def bundle_sha256(bundle: Mapping[str, Any]) -> str:
-    validate_bundle(bundle)
+def bundle_sha256(
+    bundle: Mapping[str, Any],
+    *,
+    point_spec: Mapping[str, set[str]] = V5_1_POINT_SPEC,
+) -> str:
+    validate_bundle(bundle, point_spec=point_spec)
     return hashlib.sha256(canonical_json(bundle).encode("utf-8")).hexdigest()
 
 
-def load_bundle_bytes(payload: bytes) -> dict[str, Any]:
+def load_bundle_bytes(
+    payload: bytes,
+    *,
+    point_spec: Mapping[str, set[str]] = V5_1_POINT_SPEC,
+) -> dict[str, Any]:
     """Parse and validate one exact UTF-8 matcher-bundle byte payload."""
 
     try:
@@ -289,22 +302,31 @@ def load_bundle_bytes(payload: bytes) -> dict[str, Any]:
         raise MatcherDslError(f"cannot load matcher bundle: {error}") from error
     if not isinstance(value, dict):
         raise MatcherDslError("matcher bundle must be a JSON object")
-    validate_bundle(value)
+    validate_bundle(value, point_spec=point_spec)
     return value
 
 
-def load_bundle(path: Path = DEFAULT_BUNDLE_PATH) -> dict[str, Any]:
+def load_bundle(
+    path: Path = DEFAULT_BUNDLE_PATH,
+    *,
+    point_spec: Mapping[str, set[str]] = V5_1_POINT_SPEC,
+) -> dict[str, Any]:
     try:
         payload = path.read_bytes()
     except OSError as error:
         raise MatcherDslError(f"cannot load matcher bundle: {error}") from error
-    return load_bundle_bytes(payload)
+    return load_bundle_bytes(payload, point_spec=point_spec)
 
 
-def project_rule_explain(bundle: Mapping[str, Any], point_id: str) -> dict[str, Any]:
+def project_rule_explain(
+    bundle: Mapping[str, Any],
+    point_id: str,
+    *,
+    point_spec: Mapping[str, set[str]] = V5_1_POINT_SPEC,
+) -> dict[str, Any]:
     """Return the checked projection used by taxonomy authoring surfaces."""
 
-    validate_bundle(bundle)
+    validate_bundle(bundle, point_spec=point_spec)
     rule = next(
         (item for item in bundle["rules"] if item["point_id"] == point_id), None
     )
@@ -472,7 +494,12 @@ def _dependency_closed_sections(
     return views, predicates, predicate_scopes, term_sets
 
 
-def materialize_point_rule(bundle: Mapping[str, Any], point_id: str) -> dict[str, Any]:
+def materialize_point_rule(
+    bundle: Mapping[str, Any],
+    point_id: str,
+    *,
+    point_spec: Mapping[str, set[str]] = V5_1_POINT_SPEC,
+) -> dict[str, Any]:
     """Build a standalone database rule with no dependency on the bundle file.
 
     Shared normalization, views, term sets, predicates, scoring and thresholds
@@ -480,7 +507,7 @@ def materialize_point_rule(bundle: Mapping[str, Any], point_id: str) -> dict[str
     JSON can be validated and projected after the source bundle is unavailable.
     """
 
-    validate_bundle(bundle)
+    validate_bundle(bundle, point_spec=point_spec)
     rule = next(
         (item for item in bundle["rules"] if item["point_id"] == point_id), None
     )
@@ -503,7 +530,7 @@ def materialize_point_rule(bundle: Mapping[str, Any], point_id: str) -> dict[str
         "thresholds": copy.deepcopy(bundle["thresholds"]),
         "rule": copy.deepcopy(rule),
     }
-    validate_materialized_rule(materialized)
+    validate_materialized_rule(materialized, point_spec=point_spec)
     return materialized
 
 
@@ -514,7 +541,11 @@ def _materialized_as_bundle(value: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def validate_materialized_rule(value: Mapping[str, Any]) -> None:
+def validate_materialized_rule(
+    value: Mapping[str, Any],
+    *,
+    point_spec: Mapping[str, set[str]] = V5_1_POINT_SPEC,
+) -> None:
     """Validate one self-contained point rule without loading global state."""
 
     _reject_nonfinite_floats(value, "materialized_rule")
@@ -529,7 +560,7 @@ def validate_materialized_rule(value: Mapping[str, Any]) -> None:
     if not re.fullmatch(r"[A-Z][1-9][0-9]?", point_id, re.ASCII):
         raise MatcherDslError("materialized rule point_id is invalid")
     expected_scenes = (
-        POINT_SCENES[point_id] if point_id in POINT_SCENES else _rule_scene_values(rule)
+        point_spec[point_id] if point_id in point_spec else _rule_scene_values(rule)
     )
     _validate_bundle(
         _materialized_as_bundle(value),
@@ -537,19 +568,31 @@ def validate_materialized_rule(value: Mapping[str, Any]) -> None:
     )
 
 
-def canonical_materialized_rule(value: Mapping[str, Any]) -> str:
-    validate_materialized_rule(value)
+def canonical_materialized_rule(
+    value: Mapping[str, Any],
+    *,
+    point_spec: Mapping[str, set[str]] = V5_1_POINT_SPEC,
+) -> str:
+    validate_materialized_rule(value, point_spec=point_spec)
     return canonical_json(value)
 
 
-def materialized_rule_sha256(value: Mapping[str, Any]) -> str:
+def materialized_rule_sha256(
+    value: Mapping[str, Any],
+    *,
+    point_spec: Mapping[str, set[str]] = V5_1_POINT_SPEC,
+) -> str:
     return hashlib.sha256(
-        canonical_materialized_rule(value).encode("utf-8")
+        canonical_materialized_rule(value, point_spec=point_spec).encode("utf-8")
     ).hexdigest()
 
 
-def project_materialized_rule(value: Mapping[str, Any]) -> dict[str, Any]:
-    validate_materialized_rule(value)
+def project_materialized_rule(
+    value: Mapping[str, Any],
+    *,
+    point_spec: Mapping[str, set[str]] = V5_1_POINT_SPEC,
+) -> dict[str, Any]:
+    validate_materialized_rule(value, point_spec=point_spec)
     rule = value["rule"]
     explain = rule["explain"]
     return {
@@ -562,6 +605,8 @@ def project_materialized_rule(value: Mapping[str, Any]) -> dict[str, Any]:
 
 def taxonomy_matcher_sha256(
     rules: Mapping[str, Mapping[str, Any]],
+    *,
+    point_spec: Mapping[str, set[str]] = V5_1_POINT_SPEC,
 ) -> str:
     """Hash a taxonomy's canonical point rules independent of input ordering."""
 
@@ -569,13 +614,15 @@ def taxonomy_matcher_sha256(
         raise MatcherDslError("taxonomy matcher rules cannot be empty")
     canonical_rules: dict[str, Any] = {}
     for code, value in rules.items():
-        validate_materialized_rule(value)
+        validate_materialized_rule(value, point_spec=point_spec)
         point_id = str(value["rule"]["point_id"])
         if code != point_id:
             raise MatcherDslError(
                 f"taxonomy rule key {code!r} does not match point_id {point_id!r}"
             )
-        canonical_rules[code] = json.loads(canonical_materialized_rule(value))
+        canonical_rules[code] = json.loads(
+            canonical_materialized_rule(value, point_spec=point_spec)
+        )
     payload = {"rules": canonical_rules}
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
@@ -1371,8 +1418,12 @@ def _validate_bundle(
         )
 
 
-def validate_bundle(bundle: Mapping[str, Any]) -> None:
-    _validate_bundle(bundle, expected_point_scenes=POINT_SCENES)
+def validate_bundle(
+    bundle: Mapping[str, Any],
+    *,
+    point_spec: Mapping[str, set[str]] = V5_1_POINT_SPEC,
+) -> None:
+    _validate_bundle(bundle, expected_point_scenes=point_spec)
 
 
 class _Matcher:
@@ -1723,10 +1774,12 @@ def match_points(
     ocr: Mapping[str, Any],
     evidence: str,
     visual: Mapping[str, Any] | None = None,
+    *,
+    point_spec: Mapping[str, set[str]] = V5_1_POINT_SPEC,
 ) -> list[dict[str, Any]]:
     """Execute a validated matcher bundle without database or global state."""
 
-    validate_bundle(bundle)
+    validate_bundle(bundle, point_spec=point_spec)
     if evidence not in {"V0", "V1", "V2", "V3"}:
         raise MatcherDslError(f"unknown evidence level: {evidence!r}")
     return _Matcher(bundle, row, transcript, ocr, evidence, visual or {}).run()
@@ -1744,22 +1797,31 @@ class MaterializedMatcher:
         "thresholds",
     )
 
-    def __init__(self, rules: Mapping[str, Mapping[str, Any]]) -> None:
-        if set(rules) != POINT_IDS or len(rules) != len(POINT_IDS):
+    def __init__(
+        self,
+        rules: Mapping[str, Mapping[str, Any]],
+        *,
+        point_spec: Mapping[str, set[str]] = V5_1_POINT_SPEC,
+    ) -> None:
+        expected_point_ids = set(point_spec)
+        if set(rules) != expected_point_ids or len(rules) != len(expected_point_ids):
             raise MatcherDslError(
-                "materialized matcher requires exactly the approved 25 point rules"
+                "materialized matcher requires exactly the approved "
+                f"{len(expected_point_ids)} point rules"
             )
         canonical_rules: dict[str, dict[str, Any]] = {}
         common: dict[str, str] | None = None
         for code in sorted(rules):
             value = rules[code]
-            validate_materialized_rule(value)
+            validate_materialized_rule(value, point_spec=point_spec)
             point_id = str(value["rule"]["point_id"])
             if code != point_id:
                 raise MatcherDslError(
                     f"materialized rule key {code!r} does not match point_id {point_id!r}"
                 )
-            normalized = json.loads(canonical_materialized_rule(value))
+            normalized = json.loads(
+                canonical_materialized_rule(value, point_spec=point_spec)
+            )
             normalized_common = {
                 key: canonical_json(normalized[key]) for key in self._CONSISTENT_KEYS
             }
@@ -1776,7 +1838,10 @@ class MaterializedMatcher:
                 )
             canonical_rules[code] = normalized
         self._rules = canonical_rules
-        self.matcher_rule_sha256 = taxonomy_matcher_sha256(canonical_rules)
+        self.matcher_rule_sha256 = taxonomy_matcher_sha256(
+            canonical_rules,
+            point_spec=point_spec,
+        )
         first = canonical_rules[sorted(canonical_rules)[0]]
         self.thresholds = copy.deepcopy(first["thresholds"])
 
@@ -1821,9 +1886,11 @@ def match_materialized_rules(
     ocr: Mapping[str, Any],
     evidence: str,
     visual: Mapping[str, Any] | None = None,
+    *,
+    point_spec: Mapping[str, set[str]] = V5_1_POINT_SPEC,
 ) -> list[dict[str, Any]]:
     """Validate and execute the complete database matcher snapshot."""
 
-    return MaterializedMatcher(rules).match_points(
+    return MaterializedMatcher(rules, point_spec=point_spec).match_points(
         row, transcript, ocr, evidence, visual
     )

@@ -682,6 +682,105 @@ class V8MediaTest(unittest.TestCase):
             [3, 2],
         )
 
+    def test_download_queue_probes_one_extra_without_executing_it(self) -> None:
+        def downloaded(content_id: int, **_kwargs: object) -> dict[str, object]:
+            return {"content_id": content_id, "status": "downloaded"}
+
+        with (
+            patch.object(
+                media, "recover_stale_media_processing_slots", return_value={}
+            ),
+            patch.object(
+                media, "_queue_content_ids", return_value=[1, 2, 3]
+            ) as select_ids,
+            patch.object(
+                media, "process_content_media", side_effect=downloaded
+            ) as process,
+        ):
+            result = media.run_media_download_queue(
+                limit=2, max_workers=1, db_path=self.db
+            )
+
+        select_ids.assert_called_once_with(
+            stage="download",
+            limit=3,
+            db_path=self.db,
+            published_start=None,
+            published_end=None,
+        )
+        self.assertEqual([item.args[0] for item in process.call_args_list], [1, 2])
+        self.assertEqual(result["candidates"], 2)
+        self.assertTrue(result["truncated"])
+        self.assertTrue(result["has_more"])
+
+    def test_download_queue_exact_boundary_is_not_truncated(self) -> None:
+        def downloaded(content_id: int, **_kwargs: object) -> dict[str, object]:
+            return {"content_id": content_id, "status": "downloaded"}
+
+        with (
+            patch.object(
+                media, "recover_stale_media_processing_slots", return_value={}
+            ),
+            patch.object(media, "_queue_content_ids", return_value=[1, 2]),
+            patch.object(media, "process_content_media", side_effect=downloaded),
+        ):
+            result = media.run_media_download_queue(
+                limit=2, max_workers=1, db_path=self.db
+            )
+
+        self.assertEqual(result["candidates"], 2)
+        self.assertFalse(result["truncated"])
+        self.assertFalse(result["has_more"])
+
+    def test_processing_queue_probes_one_extra_without_executing_it(self) -> None:
+        def evidence_ready(content_id: int, **_kwargs: object) -> dict[str, object]:
+            return {"content_id": content_id, "status": "evidence_ready"}
+
+        with (
+            patch.object(
+                media, "recover_stale_media_processing_slots", return_value={}
+            ),
+            patch.object(
+                media, "_queue_content_ids", return_value=[1, 2, 3]
+            ) as select_ids,
+            patch.object(media, "ocr_binary_path", return_value=self.video),
+            patch.object(
+                media, "process_content_media", side_effect=evidence_ready
+            ) as process,
+        ):
+            result = media.run_media_processing_queue(limit=2, db_path=self.db)
+
+        select_ids.assert_called_once_with(
+            stage="process",
+            limit=3,
+            db_path=self.db,
+            published_start=None,
+            published_end=None,
+        )
+        self.assertEqual([item.args[0] for item in process.call_args_list], [1, 2])
+        self.assertEqual(result["candidates"], 2)
+        self.assertTrue(result["truncated"])
+        self.assertTrue(result["has_more"])
+
+    def test_media_queues_use_shared_default_batch_limit(self) -> None:
+        with (
+            patch.object(
+                media, "recover_stale_media_processing_slots", return_value={}
+            ),
+            patch.object(media, "_queue_content_ids", return_value=[]) as select_ids,
+        ):
+            result = media.run_media_download_queue(db_path=self.db)
+
+        select_ids.assert_called_once_with(
+            stage="download",
+            limit=media.MEDIA_QUEUE_BATCH_LIMIT + 1,
+            db_path=self.db,
+            published_start=None,
+            published_end=None,
+        )
+        self.assertEqual(media.MEDIA_QUEUE_BATCH_LIMIT, 500)
+        self.assertFalse(result["has_more"])
+
     def test_download_queue_stops_after_three_failures_without_starving_older_content(self) -> None:
         captured_at = now_utc()
         with connect(self.db) as connection:

@@ -10,8 +10,11 @@ from v8.contracts import (
     CURRENT_REPORT_EVIDENCE_VERSION,
     CURRENT_REPORT_RULE_VERSION,
     CURRENT_REPORT_VERSION,
+    LEGACY_CONTRACT_PATHS,
+    REPORT_RULE_VERSIONS,
     V8ContractViolation,
     expected_terminal_task_status,
+    quality_gate_failures,
     quantity_metric,
     ratio_metric,
     score_metric,
@@ -25,9 +28,12 @@ def _audience_quality() -> dict:
         "declared_comment_count": 130,
         "comment_collection_coverage_percentage": 92.31,
         "identity_coverage_percentage": 97.5,
+        "candidate_user_count": 39,
+        "classified_user_count": 39,
+        "classification_coverage_percentage": 100.0,
         "capped_content_count": 0,
         "audience_definition_version": "audience-definition-v1",
-        "classifier_version": "audience-classifier-v1",
+        "classifier_version": "audience-classifier-v2",
         "user_key_version": "platform-user-hmac-v2",
         "evidence_window_start": "2026-05-04T16:00:00Z",
         "evidence_window_end": "2026-08-02T16:00:00Z",
@@ -115,6 +121,7 @@ def valid_report() -> dict:
             "core_artifact_coverage": 100.0,
             "media_terminal_coverage": 95.0,
             "duplicate_fingerprint_coverage": 95.0,
+            "duplicate_calibration_ready": True,
             "weekly_comment_coverage": 90.0,
         },
         "summary_metrics": {
@@ -219,6 +226,20 @@ class V8ContractTest(unittest.TestCase):
         with self.assertRaisesRegex(V8ContractViolation, "rule_version"):
             validate_report(historical)
 
+    def test_frozen_v8_4_report_stays_on_evaluation_v8(self) -> None:
+        version = "dcar-content-operations-report-v8.4"
+        historical = valid_report()
+        historical["report_version"] = version
+        validate_report(historical)
+
+        self.assertEqual(
+            LEGACY_CONTRACT_PATHS[version].name, "report_contract_v8_4.json"
+        )
+        self.assertEqual(REPORT_RULE_VERSIONS[version], "evaluation-v8")
+        historical["rule_version"] = "evaluation-v7"
+        with self.assertRaisesRegex(V8ContractViolation, "rule_version"):
+            validate_report(historical)
+
     def test_v7_report_is_not_accepted_as_v8(self) -> None:
         report = valid_report()
         report["report_version"] = "dcar-dual-channel-evaluation-v7.0"
@@ -245,6 +266,26 @@ class V8ContractTest(unittest.TestCase):
         report["summary_metrics"]["verticality_rate"]["coverage_percentage"] = 70
         validate_report(report)
 
+    def test_ratio_percentage_is_only_published_for_publishing_statuses(self) -> None:
+        blocked = (
+            "below_threshold",
+            "missing",
+            "not_applicable",
+            "not_calculable",
+            "stale",
+        )
+        for status in blocked:
+            with self.subTest(status=status):
+                metric = ratio_metric(8, 10, status=status, eligible_count=8)
+                self.assertEqual(metric["numerator"], 8)
+                self.assertIsNone(metric["percentage"])
+        self.assertEqual(
+            ratio_metric(8, 10, status="available")["percentage"], 80.0
+        )
+        self.assertEqual(
+            ratio_metric(8, 10, status="sample_only")["percentage"], 80.0
+        )
+
     def test_required_coverage_controls_terminal_task_status(self) -> None:
         report = valid_report()
         report["data_quality"]["evaluation_coverage"] = 94.99
@@ -255,6 +296,38 @@ class V8ContractTest(unittest.TestCase):
             validate_report(report)
         report["task"]["task_status"] = "partial"
         validate_report(report)
+        self.assertEqual(
+            quality_gate_failures(report["data_quality"]),
+            [
+                {
+                    "key": "evaluation_coverage",
+                    "kind": "coverage",
+                    "actual": 94.99,
+                    "required": 95.0,
+                }
+            ],
+        )
+
+    def test_duplicate_calibration_is_separate_from_fingerprint_coverage(self) -> None:
+        report = valid_report()
+        report["data_quality"]["duplicate_fingerprint_coverage"] = 100.0
+        report["data_quality"]["duplicate_calibration_ready"] = False
+        self.assertEqual(
+            expected_terminal_task_status(report["data_quality"]), "partial"
+        )
+        with self.assertRaisesRegex(V8ContractViolation, "task_status must be partial"):
+            validate_report(report)
+        report["task"]["task_status"] = "partial"
+        validate_report(report)
+
+        report["data_quality"]["duplicate_calibration_ready"] = "false"
+        with self.assertRaisesRegex(V8ContractViolation, "must be boolean"):
+            validate_report(report)
+
+        report = valid_report()
+        del report["data_quality"]["duplicate_calibration_ready"]
+        with self.assertRaisesRegex(V8ContractViolation, "is required"):
+            validate_report(report)
 
     def test_ratio_denominator_is_all_publications(self) -> None:
         report = valid_report()
@@ -266,6 +339,21 @@ class V8ContractTest(unittest.TestCase):
         report = valid_report()
         report["summary_metrics"]["estimated_leads"]["value"] = 30
         with self.assertRaisesRegex(V8ContractViolation, "value must be null"):
+            validate_report(report)
+
+    def test_audience_classification_coverage_is_required_and_bounded(self) -> None:
+        report = valid_report()
+        quality = report["channels"]["douyin"]["summary"]["audience_quality"]
+        del quality["classification_coverage_percentage"]
+        with self.assertRaisesRegex(
+            V8ContractViolation, "classification_coverage_percentage"
+        ):
+            validate_report(report)
+
+        report = valid_report()
+        quality = report["channels"]["douyin"]["summary"]["audience_quality"]
+        quality["classification_coverage_percentage"] = 100.01
+        with self.assertRaisesRegex(V8ContractViolation, "between 0 and 100"):
             validate_report(report)
 
     def test_view_quantity_uses_view_not_people(self) -> None:

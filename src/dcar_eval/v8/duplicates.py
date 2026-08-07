@@ -39,6 +39,32 @@ class DuplicateDetectionError(RuntimeError):
     pass
 
 
+def duplicate_metric_decision(
+    total: int,
+    fingerprint_count: int,
+    calibration_ready: bool,
+    threshold: float = 95,
+) -> tuple[str, Optional[float], str]:
+    """Decide whether duplicate rate is publishable from explicit prerequisites."""
+
+    if total == 0:
+        return "not_applicable", None, "统计范围内没有内容"
+    coverage = round(fingerprint_count * 100 / total, 2)
+    if not calibration_ready:
+        return (
+            "not_calculable",
+            coverage,
+            "重复内容感知指纹尚未完成定标，重复率暂不可计算",
+        )
+    if coverage < threshold:
+        return (
+            "below_threshold",
+            coverage,
+            f"感知指纹覆盖率为 {coverage:.2f}%，低于 {threshold:g}% 发布阈值",
+        )
+    return "available", coverage, ""
+
+
 def _canonical_json(value: Any) -> str:
     return json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False

@@ -1,0 +1,41 @@
+[Unit]
+Description=DcarAIGC phase-1 API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dcar-aigc
+Group=dcar-aigc
+WorkingDirectory=/var/www/dcar-aigc/current
+EnvironmentFile=/etc/dcar-aigc/dcar.env
+Environment=PYTHONPATH=/var/www/dcar-aigc/current/src/dcar_eval
+ExecStart=/var/www/dcar-aigc/runtime/venv/bin/python -m uvicorn v8.api:app --app-dir /var/www/dcar-aigc/current/src/dcar_eval --host 127.0.0.1 --port 8765 --workers 1 --no-access-log
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+UMask=0027
+
+BindPaths=/var/lib/dcar-aigc/db:/var/www/dcar-aigc/current/app/data
+BindPaths=/var/lib/dcar-aigc/reports:/var/www/dcar-aigc/current/reports
+BindPaths=/var/lib/dcar-aigc/cache:/var/www/dcar-aigc/current/data/cache
+ReadWritePaths=/var/lib/dcar-aigc
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+
+CPUQuota=200%
+MemoryMax=3G
+TasksMax=256
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

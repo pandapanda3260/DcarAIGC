@@ -18,7 +18,14 @@ import {
 import AppShell from "../components/AppShell";
 import { Loading, Notice } from "../components/Feedback";
 import { readJson } from "../lib/api";
-import { formatDate, metricStatus, metricValue } from "../lib/format";
+import {
+  formatDate,
+  metricEvidence,
+  metricPublishesValue,
+  metricStatus,
+  metricValue,
+} from "../lib/format";
+import { publicAssetPath } from "../lib/paths";
 import type {
   BusinessSceneKey,
   ConclusionMetricKey,
@@ -43,10 +50,9 @@ const conclusionMetrics: Array<[ConclusionMetricKey, string]> = [
   ["automotive_user_rate", "互动用户汽车兴趣占比"],
   ["acquisition_potential", "内容拉新效果预估"],
 ];
-const numberFormat = new Intl.NumberFormat("zh-CN");
 const channelBrandAssets: Record<OverviewChannelKey, { src: string; label: string }> = {
-  douyin: { src: "/brand-douyin-tiktok.svg", label: "抖音" },
-  xiaohongshu: { src: "/brand-xiaohongshu.svg", label: "小红书" },
+  douyin: { src: publicAssetPath("/brand-douyin-tiktok.svg"), label: "抖音" },
+  xiaohongshu: { src: publicAssetPath("/brand-xiaohongshu.svg"), label: "小红书" },
 };
 const metricIcons = {
   selling_point_count_share: TagIcon,
@@ -63,33 +69,6 @@ const sceneIcons = {
   media: RobotIcon,
 } satisfies Record<BusinessSceneKey, typeof CarIcon>;
 
-function conclusionValue(metric: Metric) {
-  if (metric.kind === "score") {
-    if (metric.value != null) return `${metric.value}%`;
-  } else if (metric.percentage != null) {
-    return `${metric.percentage}%`;
-  }
-  const unavailableLabels: Record<string, string> = {
-    below_threshold: "覆盖不足",
-    missing: "有效样本不足",
-    not_applicable: "无适用内容",
-    not_calculable: "暂无模型",
-    stale: "数据已过期",
-  };
-  return unavailableLabels[metric.status] ?? metricValue(metric);
-}
-
-function metricEvidence(metric: Metric) {
-  if (metric.kind === "ratio" && metric.numerator != null && metric.denominator != null) {
-    return `${numberFormat.format(metric.numerator)}/${numberFormat.format(metric.denominator)} · ${metric.reason}`;
-  }
-  if (metric.kind === "score" && metric.total_items != null) {
-    const coverage = `可评分 ${metric.scorable_items ?? 0}/${metric.total_items} 条`;
-    return metric.reason ? `${coverage} · ${metric.reason}` : coverage;
-  }
-  return metric.reason || "当前窗口没有可发布的结论";
-}
-
 function MetricIcon({ metricKey }: { metricKey: ConclusionMetricKey }) {
   const Icon = metricIcons[metricKey];
   return <Icon className="conclusion-metric-icon" size={16} weight="regular" aria-hidden="true" />;
@@ -100,11 +79,13 @@ function SceneIcon({ sceneKey }: { sceneKey: BusinessSceneKey }) {
   return <Icon className="scene-title-icon" size={18} weight="regular" aria-hidden="true" />;
 }
 
-function SummaryMetric({ metricKey, metric, label }: { metricKey: ConclusionMetricKey; metric: Metric; label: string }) {
-  return <article className="conclusion-metric-card" aria-label={label}>
+function SummaryMetric({ metricKey, metric, label, reasonId }: { metricKey: ConclusionMetricKey; metric: Metric; label: string; reasonId: string }) {
+  const evidence = metricEvidence(metric);
+  const publishesValue = metricPublishesValue(metric);
+  return <article className="conclusion-metric-card" aria-label={label} aria-describedby={publishesValue ? undefined : reasonId} title={evidence}>
     <div><span className="conclusion-metric-label"><MetricIcon metricKey={metricKey} /><span>{label}</span></span><em className={`metric-status ${metric.status === "available" ? "available" : "limited"}`}>{metricStatus(metric)}</em></div>
-    <strong>{conclusionValue(metric)}</strong>
-    <p>{metricEvidence(metric)}</p>
+    <strong>{metricValue(metric)}</strong>
+    {publishesValue ? <p>{evidence}</p> : <span id={reasonId} className="visually-hidden">{evidence}</span>}
   </article>;
 }
 
@@ -116,9 +97,11 @@ function SceneConclusion({ channel, sceneKey }: { channel: OverviewChannel; scen
       {conclusionMetrics.map(([key, label]) => {
         const metric = scene.metrics[key];
         const evidence = metricEvidence(metric);
-        return <div className="scene-metric-row" key={key} title={evidence}>
+        const publishesValue = metricPublishesValue(metric);
+        const reasonId = `metric-reason-${channel.platform}-${sceneKey}-${key}`;
+        return <div className="scene-metric-row" key={key} aria-describedby={publishesValue ? undefined : reasonId} title={evidence}>
           <dt><MetricIcon metricKey={key} /><span>{label}</span></dt>
-          <dd><strong>{conclusionValue(metric)}</strong><em className={`metric-status ${metric.status === "available" ? "available" : "limited"}`}>{metricStatus(metric)}</em><small className="visually-hidden">{evidence}</small></dd>
+          <dd><strong>{metricValue(metric)}</strong><em className={`metric-status ${metric.status === "available" ? "available" : "limited"}`}>{metricStatus(metric)}</em>{!publishesValue && <span id={reasonId} className="visually-hidden">{evidence}</span>}</dd>
         </div>;
       })}
     </dl>
@@ -131,11 +114,11 @@ function ChannelConclusion({ channel, index }: { channel: OverviewChannel; index
   return <section className="panel channel-conclusion" data-channel={channel.platform}>
     <div className="channel-conclusion-head">
       <span className="channel-number" aria-hidden="true">{channelNumber}</span>
-      <div className="channel-heading-copy"><span className="eyebrow">CHANNEL {channelNumber}</span><div className="channel-title-row"><h3>{channel.label}渠道</h3><span className={`channel-platform-mark ${channel.platform}`} title={brand.label}><Image src={brand.src} alt="" width={17} height={17} unoptimized /></span></div><p>窗口发布 {channel.publication_count} 条 · 证据覆盖 {channel.evidence_coverage_percentage ?? "—"}% · 有效曝光内容 {channel.valid_exposure_items} 条 · 曝光交叉覆盖 {channel.exposure_coverage_percentage ?? "—"}%</p></div>
+      <div className="channel-heading-copy"><span className="eyebrow">CHANNEL {channelNumber}</span><div className="channel-title-row"><h3>{channel.label}渠道</h3><span className={`channel-platform-mark ${channel.platform}`} title={brand.label}><Image src={brand.src} alt="" width={17} height={17} unoptimized /></span></div><p>窗口发布 {channel.publication_count} 条 · 证据覆盖 {channel.evidence_coverage_percentage ?? "—"}% · 有效曝光内容 {channel.valid_exposure_items} 条 · 可归类曝光覆盖 {channel.exposure_coverage_percentage ?? "—"}%</p></div>
     </div>
-    <div className="conclusion-subhead"><b>1</b><div><h4>汇总</h4><p>条数指标以该渠道窗口全部发布为分母；曝光指标以该渠道有效总曝光为分母。</p></div></div>
+    <div className="conclusion-subhead"><b>1</b><div><h4>汇总</h4><p>条数指标以该渠道窗口全部发布为分母；曝光分母仅含 view_count&gt;0 的有效曝光，未取得有效曝光不入分母。</p></div></div>
     <div className="conclusion-summary-grid">
-      {conclusionMetrics.map(([key, label]) => <SummaryMetric key={key} metricKey={key} label={label} metric={channel.summary.metrics[key]} />)}
+      {conclusionMetrics.map(([key, label]) => <SummaryMetric key={key} metricKey={key} label={label} metric={channel.summary.metrics[key]} reasonId={`metric-reason-${channel.platform}-summary-${key}`} />)}
     </div>
     <div className="conclusion-subhead scene-subhead"><b>2</b><div><h4>三个业务场景</h4><p>固定顺序为二手车、新车、媒体-AI小懂；其他和未知内容只进入渠道汇总分母。</p></div></div>
     <div className="scene-conclusion-grid">

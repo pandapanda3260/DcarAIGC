@@ -14,6 +14,7 @@ from unittest.mock import patch
 import v8.media as media_module
 from v8.capture import CaptureError, ProviderResult, SlotUnavailable
 from v8.evaluation import evaluate_content
+from v8.matcher_dsl import POINT_IDS, POINT_SCENES
 from v8.operations import IdentityConflictError, upsert_account, upsert_content
 from v8.providers import (
     ProviderConfigurationError,
@@ -34,6 +35,7 @@ from v8.providers import (
     update_content_data,
 )
 from v8.storage import connect, initialize_database, now_utc
+from v8.taxonomy_rule_backfill import backfill_v5_1_matcher_rules
 
 
 VALID_SEC_UID = "MS4wLjAB" + "A" * 68
@@ -57,16 +59,60 @@ class V8ProviderUpdateTest(unittest.TestCase):
                 """,
                 (captured_at, captured_at),
             )
-            point = connection.execute(
+            for code in sorted(POINT_IDS):
+                point = connection.execute(
+                    """
+                    INSERT INTO selling_points(
+                        taxonomy_id, code, tier, label, positive_evidence_json
+                    ) VALUES ('taxonomy', ?, ?, ?, ?)
+                    """,
+                    (
+                        code,
+                        "core" if code == "C1" else "other",
+                        "汽车服务" if code == "C1" else f"卖点 {code}",
+                        '["保养"]' if code == "C1" else "[]",
+                    ),
+                )
+                for scene in sorted(POINT_SCENES[code]):
+                    connection.execute(
+                        """
+                        INSERT INTO selling_point_scenes(selling_point_id, scene)
+                        VALUES (?, ?)
+                        """,
+                        (point.lastrowid, scene),
+                    )
+            connection.commit()
+        matcher = backfill_v5_1_matcher_rules(db_path=self.db)
+        with connect(self.db) as connection:
+            connection.execute(
                 """
-                INSERT INTO selling_points(
-                    taxonomy_id, code, tier, label, positive_evidence_json
-                ) VALUES ('taxonomy', 'C1', 'core', '汽车服务', '["保养"]')
+                UPDATE taxonomy_versions SET status='retired'
+                WHERE version='selling-points-v5.0'
                 """
             )
             connection.execute(
-                "INSERT INTO selling_point_scenes(selling_point_id, scene) VALUES (?, 'media')",
-                (point.lastrowid,),
+                """
+                UPDATE taxonomy_versions SET status='published', published_at=?
+                WHERE version='selling-points-v5.1'
+                """,
+                (captured_at,),
+            )
+            connection.execute(
+                """
+                INSERT INTO evaluation_releases(
+                    id, rule_version, taxonomy_version, matcher_rule_sha256,
+                    status, created_at, updated_at, activated_at
+                ) VALUES (
+                    'evaluation-v8__selling-points-v5.1', 'evaluation-v8',
+                    'selling-points-v5.1', ?, 'active', ?, ?, ?
+                )
+                """,
+                (
+                    matcher["matcher_rule_sha256"],
+                    captured_at,
+                    captured_at,
+                    captured_at,
+                ),
             )
             connection.commit()
         content = upsert_content(
@@ -213,6 +259,58 @@ class V8ProviderUpdateTest(unittest.TestCase):
         self.assertTrue(raised.exception.retryable)
         self.assertEqual(raised.exception.error_code, "transport_error")
 
+    def test_complete_json_from_incomplete_read_is_recovered(self) -> None:
+        payload = {"code": 200, "data": {"comments": [], "has_more": 0}}
+        body = json.dumps(payload).encode()
+
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                raise http.client.IncompleteRead(body, len(body) + 100)
+
+        with patch("v8.providers.urllib.request.urlopen", return_value=Response()):
+            status, value = _request_json(
+                "https://api.tikhub.io/api",
+                headers={},
+                params={},
+                provider="TikHub",
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(value, payload)
+
+    def test_invalid_partial_from_response_stays_retryable_transport_error(self) -> None:
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                raise http.client.IncompleteRead(b'{"unterminated":', 20)
+
+        with (
+            patch("v8.providers.urllib.request.urlopen", return_value=Response()),
+            self.assertRaises(CaptureError) as raised,
+        ):
+            _request_json(
+                "https://api.tikhub.io/api",
+                headers={},
+                params={},
+                provider="TikHub",
+            )
+        self.assertEqual(raised.exception.error_code, "transport_error")
+        self.assertTrue(raised.exception.retryable)
+
     def test_discovery_parsers_preserve_provider_pagination(self) -> None:
         xhs_payload = {
             "code": 200,
@@ -336,6 +434,36 @@ class V8ProviderUpdateTest(unittest.TestCase):
             "metrics", "123456789", zero_payload, status=200
         )
         self.assertEqual(parsed.data["view_count"], 0)
+
+    def test_douyin_comments_rejects_invalid_pagination_cursor(self) -> None:
+        payload = {
+            "code": 200,
+            "data": {
+                "comments": [],
+                "has_more": 1,
+                "cursor": "not-a-number",
+                "total": 0,
+            },
+        }
+        with self.assertRaises(CaptureError) as raised:
+            _parse_douyin_stage_payload(
+                "comments", "123456789", payload, status=200
+            )
+        self.assertEqual(raised.exception.error_code, "invalid_response")
+        self.assertTrue(raised.exception.retryable)
+        self.assertTrue(raised.exception.billed)
+
+    def test_douyin_comments_rejects_missing_pagination_cursor(self) -> None:
+        payload = {
+            "code": 200,
+            "data": {"comments": [], "has_more": 1, "total": 20},
+        }
+        with self.assertRaises(CaptureError) as raised:
+            _parse_douyin_stage_payload(
+                "comments", "123456789", payload, status=200
+            )
+        self.assertEqual(raised.exception.error_code, "invalid_response")
+        self.assertTrue(raised.exception.retryable)
 
     def test_discovery_zero_views_does_not_close_real_statistics_slot(self) -> None:
         account = upsert_account(
@@ -643,6 +771,8 @@ class V8ProviderUpdateTest(unittest.TestCase):
                 "data": {
                     "comment_count": 2,
                     "cursor": "comment-next",
+                    "index": 1,
+                    "pageArea": "UNFOLDED",
                     "has_more": True,
                     "comments": [
                         {
@@ -685,6 +815,84 @@ class V8ProviderUpdateTest(unittest.TestCase):
         self.assertNotIn("昵称秘密", raw_text)
         self.assertNotIn("private-red-id", raw_text)
         self.assertIn("这款车保养多少钱", raw_text)
+        self.assertEqual(
+            outcome.data["next_cursor_params"],
+            {"cursor": "comment-next", "index": 1, "pageArea": "UNFOLDED"},
+        )
+        self.assertIn('"next_cursor_params"', raw_text)
+
+    def test_xhs_plain_cursor_without_continuation_context_is_rejected(self) -> None:
+        payload = {
+            "code": 200,
+            "data": {
+                "success": True,
+                "code": 0,
+                "data": {
+                    "comment_count_l1": 10,
+                    "cursor": "opaque-only",
+                    "has_more": True,
+                    "comments": [],
+                },
+            },
+        }
+        with (
+            patch("v8.providers._request_json", return_value=(200, payload)),
+            self.assertRaises(CaptureError) as raised,
+        ):
+            _xhs_call("comments", "xhs-note-1", "secret", "image")
+        self.assertEqual(raised.exception.error_code, "invalid_response")
+
+    def test_xhs_comment_cursor_json_and_l1_total_are_preserved(self) -> None:
+        cursor = {
+            "cursor": "cursor-token",
+            "index": 17,
+            "pageArea": "FOLDED",
+        }
+        payload = {
+            "code": 200,
+            "data": {
+                "success": True,
+                "code": 0,
+                "data": {
+                    "comment_count": 37,
+                    "comment_count_l1": 10,
+                    "cursor": json.dumps(cursor),
+                    "has_more": True,
+                    "comments": [],
+                },
+            },
+        }
+        with patch("v8.providers._request_json", return_value=(200, payload)):
+            first = _xhs_call("comments", "xhs-note-1", "secret", "image")
+        self.assertEqual(first.data["declared_total"], 10)
+        self.assertEqual(first.data["next_cursor_params"], cursor)
+
+        exhausted = {
+            "code": 200,
+            "data": {
+                "success": True,
+                "code": 0,
+                "data": {
+                    "comment_count_l1": 10,
+                    "has_more": False,
+                    "comments": [],
+                },
+            },
+        }
+        with patch(
+            "v8.providers._request_json", return_value=(200, exhausted)
+        ) as request:
+            _xhs_call(
+                "comments",
+                "xhs-note-1",
+                "secret",
+                "image",
+                cursor=first.data["next_cursor_params"],
+            )
+        params = request.call_args.kwargs["params"]
+        self.assertEqual(params["cursor"], "cursor-token")
+        self.assertEqual(params["index"], 17)
+        self.assertEqual(params["pageArea"], "FOLDED")
 
     @staticmethod
     def successful_call(stage, content):
@@ -1691,8 +1899,77 @@ class V8ProviderUpdateTest(unittest.TestCase):
         self.assertEqual(comments, 0)
         self.assertEqual(
             tuple(slot),
-            ("TikHub", "tikhub-metrics-zero-comments-derived-v8.1", "succeeded"),
+            ("TikHub", "tikhub-comments-v8.0+paged-comments-v2", "succeeded"),
         )
+        self.assertEqual(usage["count"], 1)
+        self.assertAlmostEqual(float(usage["amount"]), 0.001)
+
+    def test_update_comments_uses_paged_run_and_linked_evidence(self) -> None:
+        result = update_content_data(
+            self.content_id,
+            as_of=date(2026, 8, 2),
+            db_path=self.db,
+            call_override=self.successful_call,
+            stages=["comments"],
+            process_media=False,
+        )
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["stages"][0]["completion_kind"], "provider_exhausted")
+        with connect(self.db) as connection:
+            run = connection.execute(
+                "SELECT id,status,page_count FROM comment_capture_runs"
+            ).fetchone()
+            page = connection.execute(
+                "SELECT capture_run_id FROM comment_capture_pages"
+            ).fetchone()
+            evidence = connection.execute(
+                "SELECT capture_run_id,status FROM comment_evidence_versions"
+            ).fetchone()
+        self.assertEqual(run["status"], "succeeded")
+        self.assertEqual(run["page_count"], 1)
+        self.assertEqual(page["capture_run_id"], run["id"])
+        self.assertEqual(evidence["capture_run_id"], run["id"])
+        self.assertEqual(evidence["status"], "available")
+
+    def test_update_comments_derives_zero_from_metric_without_comment_call(
+        self,
+    ) -> None:
+        calls: list[str] = []
+
+        def metric_only(stage, content):
+            calls.append(stage)
+            if stage != "metrics":
+                raise AssertionError("zero metric must avoid comment provider call")
+            data = {
+                "view_count": 100,
+                "comment_count": 0,
+                "like_count": 2,
+                "share_count": 0,
+                "collect_count": 0,
+            }
+            return ProviderResult(data, {"stage": stage, "data": data}, 200, True)
+
+        result = update_content_data(
+            self.content_id,
+            as_of=date(2026, 8, 2),
+            db_path=self.db,
+            call_override=metric_only,
+            stages=["metrics", "comments"],
+            process_media=False,
+        )
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(calls, ["metrics"])
+        comments = next(item for item in result["stages"] if item["stage"] == "comments")
+        self.assertEqual(comments["completion_kind"], "zero_comments")
+        self.assertEqual(comments["amount"], 0.0)
+        with connect(self.db) as connection:
+            run = connection.execute(
+                "SELECT status,completion_kind FROM comment_capture_runs"
+            ).fetchone()
+            usage = connection.execute(
+                "SELECT COUNT(*) count,SUM(amount) amount FROM provider_usage"
+            ).fetchone()
+        self.assertEqual(tuple(run), ("succeeded", "zero_comments"))
         self.assertEqual(usage["count"], 1)
         self.assertAlmostEqual(float(usage["amount"]), 0.001)
 

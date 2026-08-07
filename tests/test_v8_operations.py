@@ -4,7 +4,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from v8.evaluation import evaluate_content
 from v8.operations import (
     CONTENT_CHILD_MERGE_POLICIES,
     IdentityConflictError,
@@ -16,7 +15,12 @@ from v8.operations import (
     upsert_account,
     upsert_content,
 )
-from v8.storage import connect, initialize_database, now_utc
+from v8.storage import (
+    connect,
+    ensure_legacy_evaluation_release,
+    initialize_database,
+    now_utc,
+)
 
 
 class V8OperationsTest(unittest.TestCase):
@@ -49,6 +53,40 @@ class V8OperationsTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def _insert_legacy_evaluation_history(self, content_id: int) -> int:
+        """Attach immutable legacy history without invoking the automatic matcher."""
+
+        with connect(self.db) as connection:
+            release = ensure_legacy_evaluation_release(
+                connection,
+                rule_version="evaluation-v7",
+                taxonomy_version="selling-points-v5.0",
+            )
+            evaluated_at = now_utc()
+            evaluation = connection.execute(
+                """
+                INSERT INTO evaluation_versions(
+                    content_id,release_id,rule_version,taxonomy_version,
+                    matcher_rule_sha256,evidence_sha256,evaluation_source,
+                    evaluation_status,evidence_level,selling_point_included,
+                    content_direction,pending_review,payload_json,evaluated_at
+                ) VALUES (?,?,?,?,?,?,'migrated_from_v5','evaluated','V1',0,
+                          'unknown',0,'{}',?)
+                """,
+                (
+                    content_id,
+                    release["id"],
+                    release["rule_version"],
+                    release["taxonomy_version"],
+                    release["matcher_rule_sha256"],
+                    f"{content_id:064x}",
+                    evaluated_at,
+                ),
+            )
+            connection.commit()
+        self.assertIsNotNone(evaluation.lastrowid)
+        return int(evaluation.lastrowid)
 
     def test_phone_is_the_account_upsert_key_and_new_import_overwrites(self) -> None:
         created = upsert_account(
@@ -560,8 +598,8 @@ class V8OperationsTest(unittest.TestCase):
             db_path=self.db,
         )
         evaluation_ids = {
-            evaluate_content(int(first["id"]), db_path=self.db).evaluation_id,
-            evaluate_content(int(second["id"]), db_path=self.db).evaluation_id,
+            self._insert_legacy_evaluation_history(int(first["id"])),
+            self._insert_legacy_evaluation_history(int(second["id"])),
         }
         with connect(self.db) as connection:
             contents_before = [
@@ -641,8 +679,8 @@ class V8OperationsTest(unittest.TestCase):
             db_path=self.db,
         )
         evaluation_ids = {
-            evaluate_content(int(url_history["id"]), db_path=self.db).evaluation_id,
-            evaluate_content(int(target["id"]), db_path=self.db).evaluation_id,
+            self._insert_legacy_evaluation_history(int(url_history["id"])),
+            self._insert_legacy_evaluation_history(int(target["id"])),
         }
         with connect(self.db) as connection:
             captured_at = now_utc()
@@ -986,8 +1024,8 @@ class V8OperationsTest(unittest.TestCase):
             },
             db_path=self.db,
         )
-        first_eval = evaluate_content(fallback["id"], db_path=self.db)
-        second_eval = evaluate_content(identified["id"], db_path=self.db)
+        first_evaluation_id = self._insert_legacy_evaluation_history(fallback["id"])
+        second_evaluation_id = self._insert_legacy_evaluation_history(identified["id"])
         with connect(self.db) as connection:
             connection.execute(
                 """
@@ -1034,7 +1072,7 @@ class V8OperationsTest(unittest.TestCase):
         self.assertEqual([row["view_count"] for row in snapshots], [10, 20])
         self.assertEqual(
             {row["id"] for row in evaluations},
-            {first_eval.evaluation_id, second_eval.evaluation_id},
+            {first_evaluation_id, second_evaluation_id},
         )
         self.assertEqual(
             {row["content_id"] for row in evaluations},
@@ -1205,7 +1243,7 @@ class V8OperationsTest(unittest.TestCase):
             },
             db_path=self.db,
         )
-        evaluation = evaluate_content(protected["id"], db_path=self.db)
+        evaluation_id = self._insert_legacy_evaluation_history(protected["id"])
         with connect(self.db) as connection:
             queue = connection.execute(
                 """
@@ -1213,7 +1251,7 @@ class V8OperationsTest(unittest.TestCase):
                     content_id,evaluation_id,reason_code,status,created_at,updated_at
                 ) VALUES (?,?,'evaluation_gray_zone','pending',?,?)
                 """,
-                (protected["id"], evaluation.evaluation_id, now_utc(), now_utc()),
+                (protected["id"], evaluation_id, now_utc(), now_utc()),
             )
             connection.execute(
                 """
@@ -1244,7 +1282,7 @@ class V8OperationsTest(unittest.TestCase):
             contents = connection.execute("SELECT id FROM content_items").fetchall()
             evaluation_row = connection.execute(
                 "SELECT * FROM evaluation_versions WHERE id=?",
-                (evaluation.evaluation_id,),
+                (evaluation_id,),
             ).fetchone()
             queue_row = connection.execute(
                 "SELECT * FROM review_queue WHERE id=?", (queue_id,)
@@ -1253,7 +1291,7 @@ class V8OperationsTest(unittest.TestCase):
         self.assertEqual([row["id"] for row in contents], [protected["id"]])
         self.assertEqual(evaluation_row["content_id"], protected["id"])
         self.assertEqual(queue_row["content_id"], protected["id"])
-        self.assertEqual(queue_row["evaluation_id"], evaluation.evaluation_id)
+        self.assertEqual(queue_row["evaluation_id"], evaluation_id)
         self.assertEqual(violations, [])
 
     def test_content_import_overwrites_by_platform_identity_and_duplicate_reminder_points_to_earliest(

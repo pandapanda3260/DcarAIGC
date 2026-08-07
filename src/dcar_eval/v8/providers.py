@@ -35,6 +35,7 @@ from .comment_paging import (
     COMMENT_CAP,
     COVERAGE_TARGET,
     PageFetch,
+    PageFetchDeferred,
     capture_content_comments,
     page_window_key,
 )
@@ -43,6 +44,7 @@ from .identity import (
     comment_identity_key,
     insert_comment_rows,
     legacy_user_score_rows,
+    normalized_parent_comment_id,
 )
 from .media import (
     get_media_source_state,
@@ -291,9 +293,18 @@ def _request_json(
     )
     try:
         with urllib.request.urlopen(request, timeout=45) as response:
-            return int(response.status), json.loads(
-                response.read().decode("utf-8", "replace")
-            )
+            try:
+                body = response.read()
+            except http.client.IncompleteRead as exc:
+                # Some upstream responses deliver a complete JSON document but
+                # advertise a larger Content-Length. Accept only when the
+                # partial bytes independently parse as complete JSON.
+                try:
+                    payload = json.loads(exc.partial.decode("utf-8", "strict"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    raise exc
+                return int(response.status), payload
+            return int(response.status), json.loads(body.decode("utf-8", "replace"))
     except urllib.error.HTTPError as exc:
         status = int(exc.code)
         try:
@@ -985,7 +996,11 @@ def _parse_douyin_stage_payload(
         if not isinstance(item, dict):
             continue
         if item.get("anonymous_user_key") and item.get("body"):
-            sanitized.append(dict(item))
+            replayed = dict(item)
+            replayed["parent_comment_id"] = normalized_parent_comment_id(
+                replayed.get("parent_comment_id")
+            )
+            sanitized.append(replayed)
             continue
         comment_user = _mapping(item.get("user"))
         raw_user = str(
@@ -1010,7 +1025,11 @@ def _parse_douyin_stage_payload(
             if item.get("create_time")
             else None,
             "like_count": _first_int(item, "digg_count"),
-            "parent_comment_id": str(item.get("reply_id") or "") or None,
+            # TikHub douyin marks first-level comments with reply_id "0";
+            # only a real reply id may survive as parent_comment_id.
+            "parent_comment_id": normalized_parent_comment_id(
+                item.get("reply_id")
+            ),
         }
         comment["comment_identity_key"] = comment_identity_key(
             platform_comment_id=comment["platform_comment_id"],
@@ -1022,9 +1041,19 @@ def _parse_douyin_stage_payload(
     declared_total = _first_int(page, "total")
     has_more = bool(page.get("has_more"))
     raw_cursor = page.get("cursor")
+    parsed_cursor = _first_int(page, "cursor")
+    if has_more and parsed_cursor is None:
+        raise CaptureError(
+            "TikHub comments returned an invalid cursor",
+            retryable=True,
+            error_code="invalid_response",
+            http_status=status,
+            billed=True,
+            raw_response=payload,
+        )
     next_cursor_params = (
-        {"cursor": int(raw_cursor)}
-        if has_more and raw_cursor not in (None, "")
+        {"cursor": parsed_cursor}
+        if has_more and parsed_cursor is not None
         else None
     )
     safe_payload = {
@@ -1093,7 +1122,11 @@ def _sanitize_xhs_comments(
         for raw_item in values:
             item = _mapping(raw_item)
             if item.get("anonymous_user_key") and item.get("body"):
-                comments.append(dict(item))
+                replayed = dict(item)
+                replayed["parent_comment_id"] = normalized_parent_comment_id(
+                    replayed.get("parent_comment_id")
+                )
+                comments.append(replayed)
                 continue
             comment_id = str(item.get("id") or item.get("comment_id") or "")
             user = _mapping(item.get("user"))
@@ -1134,6 +1167,49 @@ def _sanitize_xhs_comments(
 
     visit(raw_comments)
     return comments
+
+
+def _xhs_comment_cursor_params(
+    page: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Normalize opaque or JSON-encoded XHS pagination cursors."""
+
+    explicit = page.get("next_cursor_params")
+    raw_cursor = page.get("cursor")
+    cursor_data: Mapping[str, Any] = {}
+    if isinstance(explicit, Mapping):
+        cursor_data = explicit
+    elif isinstance(raw_cursor, Mapping):
+        cursor_data = raw_cursor
+    elif isinstance(raw_cursor, str) and raw_cursor.strip():
+        try:
+            decoded = json.loads(raw_cursor)
+        except json.JSONDecodeError:
+            decoded = None
+        cursor_data = decoded if isinstance(decoded, Mapping) else {
+            "cursor": raw_cursor
+        }
+    cursor_value = cursor_data.get("cursor")
+    if cursor_value in (None, ""):
+        return None
+    if "index" not in cursor_data and "index" not in page:
+        return None
+    if "pageArea" not in cursor_data and "pageArea" not in page:
+        return None
+    raw_index = cursor_data.get("index", page.get("index", 0))
+    try:
+        index = int(raw_index or 0)
+    except (TypeError, ValueError):
+        return None
+    return {
+        "cursor": str(cursor_value),
+        "index": index,
+        "pageArea": str(
+            cursor_data.get("pageArea")
+            or page.get("pageArea")
+            or "UNFOLDED"
+        ),
+    }
 
 
 def _xhs_call(
@@ -1200,18 +1276,19 @@ def _parse_xhs_stage_payload(
         comments = _sanitize_xhs_comments(
             page.get("comments") or page.get("comment_list"), content_id=content_id
         )
-        total = _first_int(page, "comment_count", "comment_count_l1", "total")
+        total = _first_int(page, "comment_count_l1", "comment_count", "total")
         has_more = _bool(page.get("has_more"))
         raw_cursor = page.get("cursor")
-        next_cursor_params = (
-            {
-                "cursor": str(raw_cursor),
-                "index": int(page.get("index") or 0),
-                "pageArea": str(page.get("pageArea") or "UNFOLDED"),
-            }
-            if has_more and raw_cursor not in (None, "")
-            else None
-        )
+        next_cursor_params = _xhs_comment_cursor_params(page) if has_more else None
+        if has_more and next_cursor_params is None:
+            raise CaptureError(
+                "TikHub Xiaohongshu comments omitted a valid next cursor",
+                retryable=True,
+                error_code="invalid_response",
+                http_status=status,
+                billed=True,
+                raw_response=payload,
+            )
         safe_payload = {
             "code": 200,
             "data": {
@@ -1221,6 +1298,17 @@ def _parse_xhs_stage_payload(
                     "comment_count": total,
                     "comments": comments,
                     "cursor": raw_cursor,
+                    "next_cursor_params": next_cursor_params,
+                    "index": (
+                        next_cursor_params.get("index")
+                        if next_cursor_params is not None
+                        else page.get("index")
+                    ),
+                    "pageArea": (
+                        next_cursor_params.get("pageArea")
+                        if next_cursor_params is not None
+                        else page.get("pageArea")
+                    ),
                     "has_more": has_more,
                     "privacy_note": (
                         "用户身份已按内容 HMAC-SHA256 匿名化；昵称、头像、红薯号和主页字段未保存。"
@@ -1386,8 +1474,9 @@ def _rnote_call(
                         "body": text,
                         "published_at": None,
                         "like_count": _first_int(item, "like_count", "liked_count"),
-                        "parent_comment_id": str(item.get("parent_comment_id") or "")
-                        or None,
+                        "parent_comment_id": normalized_parent_comment_id(
+                            item.get("parent_comment_id")
+                        ),
                     }
                 )
         total = _first_int(page, "total", "comment_count", "comments_count")
@@ -2326,115 +2415,25 @@ def materialize_zero_comment_evidence(
     as_of: date,
     db_path: Path = DEFAULT_DB,
 ) -> Dict[str, Any]:
-    """Turn a zero comment metric into weekly empty evidence without a paid call."""
+    """Materialize a confirmed zero through the canonical paged run."""
 
-    iso = as_of.isocalendar()
-    week_key = f"{iso.year}-W{iso.week:02d}"
-    day_key = as_of.isoformat()
     with connect(db_path) as connection:
-        content_row = connection.execute(
-            "SELECT * FROM content_items WHERE id=?", (content_id,)
+        content_exists = connection.execute(
+            "SELECT 1 FROM content_items WHERE id=?", (content_id,)
         ).fetchone()
-        snapshot = connection.execute(
-            """
-            SELECT m.id,m.captured_at,m.raw_response_id,pr.sha256
-            FROM content_metric_snapshots m
-            JOIN provider_raw_responses pr ON pr.id=m.raw_response_id
-            WHERE m.content_id=? AND m.window_key=? AND m.status='available'
-              AND m.comment_count=0
-            ORDER BY m.id DESC LIMIT 1
-            """,
-            (content_id, day_key),
-        ).fetchone()
-    if content_row is None:
+    if content_exists is None:
         raise ProviderConfigurationError("内容不存在")
-    if snapshot is None:
+    if _zero_comment_metric_result(
+        content_id,
+        metric_window_key=as_of.isoformat(),
+        db_path=db_path,
+    ) is None:
         return {
             "content_id": content_id,
             "status": "not_applicable",
             "reason": "当日指标没有确认评论数为 0",
         }
-    content = dict(content_row)
-    platform = str(content["platform"])
-    if platform not in {"douyin", "xiaohongshu"}:
-        return {
-            "content_id": content_id,
-            "status": "unsupported",
-        }
-    _, _, operation, _ = STAGE_CONFIG[(platform, "comments")]
-    data = {
-        "comment_count": 0,
-        "comments": [],
-        "_evidence_captured_at": str(snapshot["captured_at"]),
-    }
-    try:
-        outcome = execute_content_fetch(
-            content_id=content_id,
-            stage="comments",
-            window_key=week_key,
-            provider="TikHub",
-            adapter_version="tikhub-metrics-zero-comments-derived-v8.1",
-            operation=operation,
-            call=partial(
-                _derived_discovery_result,
-                stage="comments",
-                data=data,
-                discovery_operation=(
-                    f"zero_comments_from_metric_snapshot:{snapshot['id']}"
-                ),
-                source_raw_response_id=int(snapshot["raw_response_id"]),
-                source_sha256=str(snapshot["sha256"]),
-                source_captured_at=str(snapshot["captured_at"]),
-            ),
-            db_path=db_path,
-        )
-        _store_stage_result(
-            content,
-            "comments",
-            week_key,
-            outcome,
-            db_path=db_path,
-            applied_source="derived_applied",
-        )
-        return {
-            "content_id": content_id,
-            "status": "succeeded",
-            "metric_snapshot_id": int(snapshot["id"]),
-            "provider_cost": 0.0,
-        }
-    except SlotUnavailable:
-        if _stage_storage_exists(
-            content_id=content_id,
-            platform=platform,
-            stage="comments",
-            window_key=week_key,
-            db_path=db_path,
-        ):
-            return {
-                "content_id": content_id,
-                "status": "already_succeeded",
-                "provider_cost": 0.0,
-            }
-        replayed = _replay_content_stage(
-            content,
-            stage="comments",
-            window_key=week_key,
-            operation=operation,
-            db_path=db_path,
-        )
-        _store_stage_result(
-            content,
-            "comments",
-            week_key,
-            replayed,
-            db_path=db_path,
-            applied_source="derived_applied",
-        )
-        return {
-            "content_id": content_id,
-            "status": "replayed",
-            "provider_cost": 0.0,
-        }
+    return capture_content_comments_live(content_id, as_of=as_of, db_path=db_path)
 
 
 def _comment_page_call(
@@ -2457,23 +2456,169 @@ def _comment_page_call(
     )
 
 
+def _stored_comment_page(
+    content: Mapping[str, Any],
+    *,
+    window_key: str,
+    operation: str,
+    db_path: Path,
+) -> PageFetch:
+    stored = load_succeeded_raw_response(
+        stage="comments",
+        window_key=window_key,
+        content_id=int(content["id"]),
+        operation=operation,
+        db_path=db_path,
+    )
+    if str(content["platform"]) == "douyin":
+        result = _parse_douyin_stage_payload(
+            "comments",
+            str(content["platform_content_id"]),
+            stored.value,
+            status=stored.http_status or 200,
+        )
+    else:
+        result = _parse_xhs_stage_payload(
+            "comments",
+            str(content["platform_content_id"]),
+            str(content["content_type"]),
+            stored.value,
+            status=stored.http_status or 200,
+        )
+    return PageFetch(
+        raw_response_id=int(stored.raw_response_id),
+        fetch_slot_id=int(stored.slot_id),
+        result=result,
+        already_stored=True,
+    )
+
+
+def _zero_comment_metric_result(
+    content_id: int,
+    *,
+    metric_window_key: str,
+    db_path: Path,
+) -> Optional[ProviderResult]:
+    with connect(db_path) as connection:
+        snapshot = connection.execute(
+            """
+            SELECT m.id,m.captured_at,m.raw_response_id,pr.sha256
+            FROM content_metric_snapshots m
+            JOIN provider_raw_responses pr ON pr.id=m.raw_response_id
+            WHERE m.content_id=? AND m.window_key=? AND m.status='available'
+              AND m.comment_count=0
+            ORDER BY julianday(m.captured_at) DESC,m.id DESC LIMIT 1
+            """,
+            (content_id, metric_window_key),
+        ).fetchone()
+    if snapshot is None:
+        return None
+    return _derived_discovery_result(
+        stage="comments",
+        data={
+            "comment_count": 0,
+            "comments": [],
+            "declared_total": 0,
+            "has_more": False,
+            "next_cursor": None,
+            "next_cursor_params": None,
+        },
+        discovery_operation=f"zero_comments_from_metric_snapshot:{snapshot['id']}",
+        source_raw_response_id=int(snapshot["raw_response_id"]),
+        source_sha256=str(snapshot["sha256"]),
+        source_captured_at=str(snapshot["captured_at"]),
+    )
+
+
 def _live_comment_page_fetcher(
     content: Mapping[str, Any],
     *,
     base_window_key: str,
+    metric_window_key: str,
     provider: str,
     adapter_version: str,
     operation: str,
+    price: float,
     db_path: Path,
-    budget_id: Optional[str],
     task_id: Optional[str],
     task_max_amount: Optional[float],
     call_override: Optional[Callable[[str, Mapping[str, Any]], ProviderResult]],
+    cache_only: bool,
 ) -> Callable[[int, Optional[Mapping[str, Any]]], PageFetch]:
     content_id = int(content["id"])
+    budget_id: Optional[str] = None
 
     def fetch(page_number: int, cursor: Optional[Mapping[str, Any]]) -> PageFetch:
+        nonlocal budget_id
         window = page_window_key(base_window_key, cursor)
+        try:
+            return _stored_comment_page(
+                content,
+                window_key=window,
+                operation=operation,
+                db_path=db_path,
+            )
+        except SlotUnavailable:
+            pass
+        if page_number == 1 and cursor is None:
+            try:
+                return _stored_comment_page(
+                    content,
+                    window_key=base_window_key,
+                    operation=operation,
+                    db_path=db_path,
+                )
+            except SlotUnavailable:
+                pass
+            derived_zero = (
+                None
+                if cache_only
+                else _zero_comment_metric_result(
+                    content_id,
+                    metric_window_key=metric_window_key,
+                    db_path=db_path,
+                )
+            )
+            if derived_zero is not None:
+                try:
+                    outcome = execute_content_fetch(
+                        content_id=content_id,
+                        stage="comments",
+                        window_key=window,
+                        provider=provider,
+                        adapter_version=adapter_version,
+                        operation=operation,
+                        call=lambda: derived_zero,
+                        db_path=db_path,
+                    )
+                    _mark_raw_response_applied(
+                        int(outcome.raw_response_id),
+                        applied_source="derived_applied",
+                        db_path=db_path,
+                    )
+                    return PageFetch(
+                        raw_response_id=int(outcome.raw_response_id),
+                        fetch_slot_id=int(outcome.slot_id),
+                        result=outcome,
+                    )
+                except SlotUnavailable:
+                    return _stored_comment_page(
+                        content,
+                        window_key=window,
+                        operation=operation,
+                        db_path=db_path,
+                    )
+        if cache_only:
+            raise PageFetchDeferred("cache_only_page_unavailable")
+        if budget_id is None:
+            budget_id = _budget_for_call(
+                provider=provider,
+                operation=operation,
+                price=price,
+                task_id=task_id,
+                task_max_amount=task_max_amount,
+                db_path=db_path,
+            )
         try:
             outcome = execute_content_fetch(
                 content_id=content_id,
@@ -2499,28 +2644,11 @@ def _live_comment_page_fetcher(
                 result=outcome,
             )
         except SlotUnavailable:
-            stored = load_succeeded_raw_response(
-                stage="comments",
+            return _stored_comment_page(
+                content,
                 window_key=window,
-                content_id=content_id,
+                operation=operation,
                 db_path=db_path,
-            )
-            if str(content["platform"]) == "douyin":
-                result = _parse_douyin_stage_payload(
-                    "comments", str(content["platform_content_id"]), stored.value
-                )
-            else:
-                result = _parse_xhs_stage_payload(
-                    "comments",
-                    str(content["platform_content_id"]),
-                    str(content["content_type"]),
-                    stored.value,
-                )
-            return PageFetch(
-                raw_response_id=int(stored.raw_response_id),
-                fetch_slot_id=int(stored.slot_id),
-                result=result,
-                already_stored=True,
             )
 
     return fetch
@@ -2536,6 +2664,7 @@ def capture_content_comments_live(
     coverage_target: float = COVERAGE_TARGET,
     task_id: Optional[str] = None,
     task_max_amount: Optional[float] = None,
+    cache_only: bool = False,
 ) -> Dict[str, Any]:
     """Run a cursor-paged comment capture for one content (paged-comments-v2)."""
 
@@ -2556,29 +2685,19 @@ def capture_content_comments_live(
     window_key = f"{iso.year}-W{iso.week:02d}"
     provider, adapter_version, operation, price = STAGE_CONFIG[(platform, "comments")]
     adapter_version = f"{adapter_version}+paged-comments-v2"
-    budget_id = (
-        None
-        if call_override is not None
-        else _budget_for_call(
-            provider=provider,
-            operation=operation,
-            price=price,
-            task_id=task_id,
-            task_max_amount=task_max_amount,
-            db_path=db_path,
-        )
-    )
     fetcher = _live_comment_page_fetcher(
         content,
         base_window_key=window_key,
+        metric_window_key=local_date.isoformat(),
         provider=provider,
         adapter_version=adapter_version,
         operation=operation,
+        price=price,
         db_path=db_path,
-        budget_id=budget_id,
         task_id=task_id,
         task_max_amount=task_max_amount,
         call_override=call_override,
+        cache_only=cache_only,
     )
     return capture_content_comments(
         content,
@@ -2657,6 +2776,61 @@ def update_content_data(
     xhs_detail_metrics: Optional[Mapping[str, Any]] = None
     xhs_detail_raw_response_id: Optional[int] = None
     for stage, window_key in requested_stages:
+        if stage == "comments":
+            try:
+                capture_result = capture_content_comments_live(
+                    content_id,
+                    as_of=local_date,
+                    db_path=db_path,
+                    call_override=call_override,
+                    task_id=task_id,
+                    task_max_amount=task_max_amount,
+                )
+                capture_status = str(capture_result["status"])
+                amount = float(capture_result.get("provider_cost") or 0.0)
+                outcomes.append(
+                    {
+                        "stage": "comments",
+                        "status": (
+                            "failed"
+                            if capture_status == "incomplete"
+                            else capture_status
+                        ),
+                        "retryable": capture_status == "incomplete",
+                        "error_code": (
+                            "comment_capture_incomplete"
+                            if capture_status == "incomplete"
+                            else None
+                        ),
+                        "message": str(capture_result.get("stop_reason") or ""),
+                        "completion_kind": capture_result.get("completion_kind"),
+                        "stop_reason": capture_result.get("stop_reason"),
+                        "pages_fetched": int(
+                            capture_result.get("pages_fetched") or 0
+                        ),
+                        "billed": amount > 0,
+                        "amount": amount,
+                        "currency": "USD",
+                    }
+                )
+            except Exception as exc:
+                error_code = getattr(exc, "error_code", type(exc).__name__)
+                outcomes.append(
+                    {
+                        "stage": "comments",
+                        "status": "failed",
+                        "error_code": error_code,
+                        "retryable": bool(getattr(exc, "retryable", False)),
+                        "message": str(exc),
+                    }
+                )
+                if error_code in {
+                    "provider_balance_blocked",
+                    "provider_auth_blocked",
+                    "budget_blocked",
+                }:
+                    break
+            continue
         succeeded_provider = succeeded_slots.get((stage, window_key))
         raw_is_applied = succeeded_provider is not None and _slot_raw_is_applied(
             content_id=content_id,

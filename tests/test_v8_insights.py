@@ -43,9 +43,12 @@ class V8InsightsTest(unittest.TestCase):
             self.assertNotIn("audience_verticality", metrics)
         # Without a wired user aggregation the rate never fabricates a value.
         self.assertEqual(
-            summary["automotive_user_rate"]["status"], "below_threshold"
+            summary["automotive_user_rate"]["status"], "not_calculable"
         )
         self.assertIsNone(summary["automotive_user_rate"]["percentage"])
+        self.assertIn(
+            "用户聚合", summary["automotive_user_rate"]["reason"]
+        )
 
     def test_supplied_audience_rate_replaces_the_placeholder(self) -> None:
         rows = [
@@ -124,6 +127,124 @@ class V8InsightsTest(unittest.TestCase):
             self.assertIsNone(summary[key]["percentage"])
             self.assertEqual(media[key]["status"], "below_threshold")
             self.assertEqual(media[key]["denominator"], 200)
+            self.assertEqual(media[key]["eligible_count"], 1)
+
+    def test_exposure_share_uses_only_positive_exposure_as_its_data_range(self) -> None:
+        rows = [
+            {
+                "platform": "douyin", "content_direction": "new_car",
+                "evidence_level": "V3", "selling_point_included": True,
+                "primary_tier": "core", "content_automotive_score": 90,
+                "audience_automotive_score": None,
+                "acquisition_potential_score": None, "view_count": 100,
+            },
+            {
+                "platform": "douyin", "content_direction": "new_car",
+                "evidence_level": "V3", "selling_point_included": False,
+                "primary_tier": None, "content_automotive_score": 80,
+                "audience_automotive_score": None,
+                "acquisition_potential_score": None, "view_count": 300,
+            },
+            {
+                "platform": "douyin", "content_direction": "other",
+                "evidence_level": None, "selling_point_included": False,
+                "primary_tier": None, "content_automotive_score": None,
+                "audience_automotive_score": None,
+                "acquisition_potential_score": None, "view_count": None,
+            },
+            {
+                "platform": "douyin", "content_direction": "other",
+                "evidence_level": None, "selling_point_included": False,
+                "primary_tier": None, "content_automotive_score": None,
+                "audience_automotive_score": None,
+                "acquisition_potential_score": None, "view_count": 0,
+            },
+        ]
+
+        channel = build_channel_conclusions(rows)["douyin"]
+        selling = channel["summary"]["metrics"]["selling_point_exposure_share"]
+        core = channel["summary"]["metrics"]["core_selling_point_exposure_share"]
+
+        self.assertEqual(channel["publication_count"], 4)
+        self.assertEqual(channel["valid_exposure_items"], 2)
+        self.assertEqual(channel["exposure_coverage_percentage"], 100.0)
+        self.assertEqual(selling["status"], "available")
+        self.assertEqual(selling["numerator"], 100)
+        self.assertEqual(selling["denominator"], 400)
+        self.assertEqual(selling["percentage"], 25.0)
+        self.assertEqual(selling["eligible_count"], 2)
+        self.assertEqual(core, selling)
+
+    def test_unclassified_high_exposure_keeps_share_below_threshold(self) -> None:
+        rows = [
+            {
+                "platform": "douyin", "content_direction": "new_car",
+                "evidence_level": "V3", "selling_point_included": True,
+                "primary_tier": "core", "content_automotive_score": 90,
+                "audience_automotive_score": None,
+                "acquisition_potential_score": None, "view_count": 10,
+            },
+            {
+                "platform": "douyin", "content_direction": "other",
+                "evidence_level": None, "selling_point_included": False,
+                "primary_tier": None, "content_automotive_score": None,
+                "audience_automotive_score": None,
+                "acquisition_potential_score": None, "view_count": 990,
+            },
+        ]
+
+        channel = build_channel_conclusions(rows)["douyin"]
+        metric = channel["summary"]["metrics"]["selling_point_exposure_share"]
+        self.assertEqual(channel["exposure_coverage_percentage"], 1.0)
+        self.assertEqual(metric["status"], "below_threshold")
+        self.assertIsNone(metric["numerator"])
+        self.assertIsNone(metric["percentage"])
+        self.assertIn("10/1000", metric["reason"])
+
+    def test_no_positive_exposure_is_missing_instead_of_zero_or_coverage(self) -> None:
+        # douyin exposes view counts: zero positive exposure stays an honest
+        # data gap (missing), never a fabricated 0% or coverage number.
+        rows = [
+            {
+                "platform": "douyin", "content_direction": "media",
+                "evidence_level": "V3", "selling_point_included": True,
+                "primary_tier": "core", "content_automotive_score": 80,
+                "audience_automotive_score": None,
+                "acquisition_potential_score": None, "view_count": 0,
+            },
+        ]
+
+        channel = build_channel_conclusions(rows)["douyin"]
+        metric = channel["summary"]["metrics"]["selling_point_exposure_share"]
+        self.assertEqual(channel["valid_exposure_items"], 0)
+        self.assertIsNone(channel["exposure_coverage_percentage"])
+        self.assertEqual(metric["status"], "missing")
+        self.assertEqual(metric["denominator"], 0)
+        self.assertIsNone(metric["percentage"])
+
+    def test_platform_without_view_source_is_not_applicable(self) -> None:
+        # 2026-08-07: TikHub's xiaohongshu statistics endpoint returns no read
+        # counts (view_count always 0, pre_view_count=-1). The exposure pair
+        # reports a structural platform gap, not a data defect.
+        rows = [
+            {
+                "platform": "xiaohongshu", "content_direction": "media",
+                "evidence_level": "V3", "selling_point_included": True,
+                "primary_tier": "core", "content_automotive_score": 80,
+                "audience_automotive_score": None,
+                "acquisition_potential_score": None, "view_count": 0,
+            },
+        ]
+
+        channel = build_channel_conclusions(rows)["xiaohongshu"]
+        for key in ("selling_point_exposure_share", "core_selling_point_exposure_share"):
+            metric = channel["summary"]["metrics"][key]
+            self.assertEqual(metric["status"], "not_applicable")
+            self.assertIn("未提供阅读数", metric["reason"])
+            self.assertIsNone(metric["percentage"])
+        scene = channel["scenes"]["media"]["metrics"]["selling_point_exposure_share"]
+        self.assertEqual(scene["status"], "not_applicable")
+        self.assertIn("未提供阅读数", scene["reason"])
 
 
 if __name__ == "__main__":

@@ -33,11 +33,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
+from .audience_selectors import latest_comment_rows
+from .evaluation_selectors import formal_as_of_evaluations
 from .storage import now_utc, transaction
 
 
 AUDIENCE_DEFINITION_VERSION = "audience-definition-v1"
-CLASSIFIER_VERSION = "audience-classifier-v1"
+CLASSIFIER_VERSION = "audience-classifier-v2"
 EVIDENCE_WINDOW_DAYS = 90
 SUBSTANTIVE_MIN_COMMENTS = 2
 SUBSTANTIVE_MIN_CONTENTS = 2
@@ -92,6 +94,9 @@ class CommentEvidence:
     content_id: int
     body: str
     published_at: Optional[str]
+    source_evidence_version_id: Optional[int] = None
+    source_evidence_sha256: Optional[str] = None
+    source_evidence_captured_at: Optional[str] = None
     is_author_reply: bool = False
     context_automotive: bool = False  # explicit: content is automotive AND relevant
 
@@ -177,6 +182,8 @@ def _evidence_sha256(user: UserEvidence) -> str:
         "comments": sorted(
             (
                 int(comment.content_id),
+                str(comment.source_evidence_sha256 or ""),
+                str(comment.source_evidence_captured_at or ""),
                 str(comment.published_at or ""),
                 comment.body,
                 bool(comment.is_author_reply),
@@ -252,13 +259,11 @@ def _window_bounds(evidence_window_end: str) -> tuple[str, str]:
 
 def _within_window(published_at: Optional[str], start: str, end: str) -> bool:
     if not published_at:
-        # No behavior time: usable as in-window interaction but cannot back a
-        # cross-content 90-day argument. Callers gate that separately.
-        return True
+        return False
     try:
         ts = datetime.fromisoformat(str(published_at).replace("Z", "+00:00"))
     except ValueError:
-        return True
+        return False
     return (
         datetime.fromisoformat(start) <= ts < datetime.fromisoformat(end)
     )
@@ -269,39 +274,47 @@ def gather_user_evidence(
     *,
     content_ids: Sequence[int],
     evidence_window_end: str,
+    evidence_window_start: Optional[str] = None,
+    report_cutoff_at: Optional[str] = None,
 ) -> List[UserEvidence]:
     """Aggregate in-window comment evidence per platform interaction user."""
 
     if not content_ids:
         return []
-    start, end = _window_bounds(evidence_window_end)
-    placeholders = ",".join("?" for _ in content_ids)
-    rows = connection.execute(
-        f"""
-        SELECT c.interaction_user_id, iu.platform, cev.content_id,
-               c.body, c.published_at, c.parent_comment_id
-        FROM comments c
-        JOIN comment_evidence_versions cev ON cev.id=c.evidence_version_id
-        JOIN interaction_users iu ON iu.id=c.interaction_user_id
-        WHERE cev.content_id IN ({placeholders})
-          AND c.interaction_user_id IS NOT NULL
-          AND c.parent_comment_id IS NULL
-        """,
-        tuple(int(cid) for cid in content_ids),
-    ).fetchall()
+    default_start, end = _window_bounds(evidence_window_end)
+    start = evidence_window_start or default_start
+    rows = latest_comment_rows(
+        connection,
+        content_ids,
+        report_cutoff_at=report_cutoff_at,
+        evidence_window_start=start,
+        evidence_window_end=end,
+    )
 
-    directions = _content_context(connection, content_ids)
+    directions = _content_context(
+        connection,
+        content_ids,
+        report_cutoff_at=report_cutoff_at or now_utc(),
+    )
     grouped: Dict[int, Dict[str, Any]] = {}
     for row in rows:
+        if row.get("interaction_user_id") is None:
+            continue
         user_id = int(row["interaction_user_id"])
         entry = grouped.setdefault(
-            user_id, {"platform": str(row["platform"]), "comments": []}
+            user_id,
+            {"platform": str(row["interaction_user_platform"]), "comments": []},
         )
         entry["comments"].append(
             CommentEvidence(
                 content_id=int(row["content_id"]),
                 body=str(row["body"] or ""),
                 published_at=row["published_at"],
+                source_evidence_version_id=int(
+                    row["selected_evidence_version_id"]
+                ),
+                source_evidence_sha256=str(row["selected_evidence_sha256"]),
+                source_evidence_captured_at=str(row["evidence_captured_at"]),
                 is_author_reply=False,
                 context_automotive=directions.get(int(row["content_id"]), False),
             )
@@ -325,19 +338,18 @@ def gather_user_evidence(
 
 
 def _content_context(
-    connection: sqlite3.Connection, content_ids: Sequence[int]
+    connection: sqlite3.Connection,
+    content_ids: Sequence[int],
+    *,
+    report_cutoff_at: str,
 ) -> Dict[int, bool]:
-    """Explicit automotive context per content, from the current evaluation."""
+    """Explicit automotive context from the formal as-of evaluation."""
 
-    placeholders = ",".join("?" for _ in content_ids)
-    rows = connection.execute(
-        f"""
-        SELECT content_id, content_automotive_score
-        FROM evaluation_versions
-        WHERE content_id IN ({placeholders}) AND invalidated_at IS NULL
-        """,
-        tuple(int(cid) for cid in content_ids),
-    ).fetchall()
+    rows = formal_as_of_evaluations(
+        connection,
+        content_ids,
+        report_cutoff_at=report_cutoff_at,
+    ).values()
     context: Dict[int, bool] = {}
     for row in rows:
         score = row["content_automotive_score"]
@@ -352,14 +364,39 @@ def classify_window(
     content_ids: Sequence[int],
     evidence_window_start: str,
     evidence_window_end: str,
+    report_cutoff_at: Optional[str] = None,
     persist: bool = True,
 ) -> Dict[str, Any]:
     """Classify every in-window user and append idempotent version rows."""
 
+    try:
+        window_start = datetime.fromisoformat(
+            evidence_window_start.replace("Z", "+00:00")
+        )
+        window_end = datetime.fromisoformat(
+            evidence_window_end.replace("Z", "+00:00")
+        )
+    except ValueError as exc:
+        raise ValueError("audience evidence window must use ISO timestamps") from exc
+    if window_end - window_start != timedelta(days=EVIDENCE_WINDOW_DAYS):
+        raise ValueError(
+            f"audience evidence window must equal {EVIDENCE_WINDOW_DAYS} days"
+        )
+
+    effective_cutoff = report_cutoff_at or now_utc()
+    try:
+        cutoff = datetime.fromisoformat(effective_cutoff.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("report cutoff must use an ISO timestamp") from exc
+    if window_end > cutoff:
+        raise ValueError("audience evidence window end cannot exceed report cutoff")
+
     users = gather_user_evidence(
         connection,
         content_ids=content_ids,
+        evidence_window_start=evidence_window_start,
         evidence_window_end=evidence_window_end,
+        report_cutoff_at=effective_cutoff,
     )
     counts = {label: 0 for label in _LABELS}
     classifications: List[tuple[int, Classification]] = []
@@ -372,6 +409,17 @@ def classify_window(
         created_at = now_utc()
         with transaction(connection):
             for user_id, classification in classifications:
+                windowed_evidence_sha = hashlib.sha256(
+                    json.dumps(
+                        {
+                            "base_evidence_sha256": classification.evidence_sha256,
+                            "evidence_window_start": evidence_window_start,
+                            "evidence_window_end": evidence_window_end,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
                 connection.execute(
                     """
                     INSERT INTO interaction_user_classification_versions(
@@ -390,7 +438,7 @@ def classify_window(
                         CLASSIFIER_VERSION,
                         evidence_window_start,
                         evidence_window_end,
-                        classification.evidence_sha256,
+                        windowed_evidence_sha,
                         classification.label,
                         classification.confidence,
                         classification.as_reason_json(),

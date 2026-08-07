@@ -13,6 +13,8 @@ from v8.evaluation_selectors import (
     display_effective_evaluations,
     effective_direction,
     effective_direction_sql,
+    formal_as_of_evaluations,
+    formal_eligible_release_evaluations,
     formal_current_evaluations,
     release_current_evaluations,
     review_anchor_evaluation,
@@ -161,6 +163,7 @@ class EvaluationSelectorsTest(unittest.TestCase):
         matcher_hash: str,
         direction: str,
         evaluated_at: str,
+        evidence_sha256: str | None = None,
     ) -> int:
         cursor = connection.execute(
             """
@@ -177,7 +180,8 @@ class EvaluationSelectorsTest(unittest.TestCase):
                 rule_version,
                 taxonomy_version,
                 matcher_hash,
-                f"{content_id}{release_id}".encode().hex().ljust(64, "0")[:64],
+                evidence_sha256
+                or f"{content_id}{release_id}".encode().hex().ljust(64, "0")[:64],
                 direction,
                 json.dumps({"content_direction": direction}),
                 evaluated_at,
@@ -230,6 +234,105 @@ class EvaluationSelectorsTest(unittest.TestCase):
                 display_effective_evaluation(connection, 1)
             with self.assertRaisesRegex(EvaluationSelectorError, "no active"):
                 formal_current_evaluations(connection, [1])
+
+    def test_formal_as_of_selector_respects_release_and_invalidation_time(
+        self,
+    ) -> None:
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                UPDATE evaluation_releases
+                SET retired_at='2026-08-01T04:00:00Z'
+                WHERE id='release-v7'
+                """
+            )
+            connection.execute(
+                """
+                UPDATE evaluation_releases
+                SET status='retired',activated_at='2026-08-01T04:00:00Z',
+                    retired_at='2026-08-01T06:00:00Z'
+                WHERE id='release-v8'
+                """
+            )
+            connection.commit()
+            before_switch = formal_as_of_evaluations(
+                connection,
+                [1, 2],
+                report_cutoff_at='2026-08-01T03:00:00Z',
+            )
+            after_switch = formal_as_of_evaluations(
+                connection,
+                [1, 2],
+                report_cutoff_at='2026-08-01T04:30:00Z',
+            )
+            after_invalidation = formal_as_of_evaluations(
+                connection,
+                [1, 2],
+                report_cutoff_at='2026-08-01T05:30:00Z',
+            )
+
+        self.assertEqual(before_switch[1]["release_id"], "release-v7")
+        self.assertEqual(after_switch[1]["release_id"], "release-v8")
+        self.assertEqual(after_switch[2]["release_id"], "release-v8")
+        self.assertNotIn(2, after_invalidation)
+
+    def test_formal_eligible_selector_excludes_gray_weak_and_manual_conflicts(
+        self,
+    ) -> None:
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                UPDATE evaluation_versions SET pending_review=1
+                WHERE content_id=1 AND release_id='release-v8'
+                """
+            )
+            weak_id = self._insert_evaluation(
+                connection,
+                2,
+                "release-v8",
+                "evaluation-v8",
+                "selling-points-v5.1",
+                "8" * 64,
+                "new_car",
+                "2026-08-01T06:00:00Z",
+                "f" * 64,
+            )
+            connection.execute(
+                "UPDATE evaluation_versions SET evidence_level='V1' WHERE id=?",
+                (weak_id,),
+            )
+            conflict_evaluation = connection.execute(
+                """
+                SELECT id FROM evaluation_versions
+                WHERE content_id=3 AND release_id='release-v8'
+                  AND invalidated_at IS NULL
+                """
+            ).fetchone()
+            assert conflict_evaluation is not None
+            connection.execute(
+                """
+                INSERT INTO review_queue(
+                    content_id,evaluation_id,reason_code,priority,status,
+                    created_at,updated_at
+                ) VALUES (3,?,'manual_conclusion_conflict',90,'manual_required',?,?)
+                """,
+                (
+                    conflict_evaluation["id"],
+                    "2026-08-01T07:00:00Z",
+                    "2026-08-01T07:00:00Z",
+                ),
+            )
+            connection.commit()
+
+            eligible_v8 = formal_eligible_release_evaluations(
+                connection, "release-v8", [1, 2, 3]
+            )
+            eligible_v6 = formal_eligible_release_evaluations(
+                connection, "release-v6", [2]
+            )
+
+        self.assertEqual(eligible_v8, {})
+        self.assertEqual(set(eligible_v6), {2})
 
     def test_effective_direction_skips_unknown_and_sql_matches_python_order(
         self,

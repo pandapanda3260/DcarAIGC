@@ -19,7 +19,7 @@ from v8.legacy_scene_repair import (  # type: ignore[import-not-found,import-unt
     LegacySceneRepairError,
     repair_legacy_illegal_scene_chains,
 )
-from v8.release_management import (  # type: ignore[import-not-found,import-untyped] # noqa: E402
+from v8.release_management_v5_1 import (  # type: ignore[import-not-found,import-untyped] # noqa: E402
     ReleaseManagementError,
 )
 

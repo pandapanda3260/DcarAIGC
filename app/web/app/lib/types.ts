@@ -16,6 +16,9 @@ export type AudienceQuality = {
   declared_comment_count: number;
   comment_collection_coverage_percentage: number | null;
   identity_coverage_percentage: number | null;
+  candidate_user_count: number;
+  classified_user_count: number;
+  classification_coverage_percentage: number | null;
   capped_content_count: number;
   audience_definition_version: string;
   classifier_version: string;
@@ -26,6 +29,15 @@ export type AudienceQuality = {
   warm_up: boolean;
 };
 
+export type MetricStatus =
+  | "available"
+  | "below_threshold"
+  | "sample_only"
+  | "not_applicable"
+  | "not_calculable"
+  | "missing"
+  | "stale";
+
 export type Metric = {
   kind: "quantity" | "ratio" | "score";
   value?: number | null;
@@ -33,7 +45,7 @@ export type Metric = {
   denominator?: number;
   percentage?: number | null;
   unit: string;
-  status: string;
+  status: MetricStatus;
   eligible_count?: number | null;
   scale?: number;
   scorable_items?: number;
@@ -120,7 +132,7 @@ export type TaskDetail = Task & {
 
 export type ReportView = {
   task: { task_status: string; name: string };
-  data_quality: Record<string, number>;
+  data_quality: Record<string, number | boolean>;
   summary_metrics: Record<string, Metric>;
   channels?: Record<OverviewChannelKey, OverviewChannel> | null;
   platform_dimensions: Array<Record<string, string | number | null>>;

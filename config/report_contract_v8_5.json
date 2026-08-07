@@ -1,0 +1,174 @@
+{
+  "report_version": "dcar-content-operations-report-v8.5",
+  "rule_version": "evaluation-v8",
+  "taxonomy_version_pattern": "^selling-points-v[1-9][0-9]*\\.[0-9]+$",
+  "evidence_version": "evidence-v2",
+  "timezone": "Asia/Shanghai",
+  "metric_statuses": [
+    "available",
+    "below_threshold",
+    "sample_only",
+    "not_applicable",
+    "not_calculable",
+    "missing",
+    "stale"
+  ],
+  "task_statuses": [
+    "queued",
+    "running",
+    "succeeded",
+    "partial",
+    "failed",
+    "cancel_requested",
+    "cancelled",
+    "interrupted"
+  ],
+  "quantity_units": [
+    "content",
+    "account",
+    "view",
+    "comment",
+    "person",
+    "lead",
+    "request",
+    "currency"
+  ],
+  "summary_metrics": {
+    "publication_count": {
+      "kind": "quantity",
+      "unit": "content"
+    },
+    "active_account_count": {
+      "kind": "quantity",
+      "unit": "account"
+    },
+    "view_count": {
+      "kind": "quantity",
+      "unit": "view"
+    },
+    "comment_count": {
+      "kind": "quantity",
+      "unit": "comment"
+    },
+    "verticality_rate": {
+      "kind": "ratio",
+      "unit": "percent"
+    },
+    "selling_point_coverage_rate": {
+      "kind": "ratio",
+      "unit": "percent"
+    },
+    "duplicate_rate": {
+      "kind": "ratio",
+      "unit": "percent"
+    },
+    "estimated_new_users": {
+      "kind": "quantity",
+      "unit": "person"
+    },
+    "estimated_reactivated_users": {
+      "kind": "quantity",
+      "unit": "person"
+    },
+    "estimated_leads": {
+      "kind": "quantity",
+      "unit": "lead"
+    }
+  },
+  "required_coverage_thresholds": {
+    "discovery_coverage": 100.0,
+    "detail_coverage": 98.0,
+    "metrics_freshness": 90.0,
+    "evaluation_coverage": 95.0,
+    "core_artifact_coverage": 100.0,
+    "media_terminal_coverage": 95.0,
+    "duplicate_fingerprint_coverage": 95.0,
+    "weekly_comment_coverage": 90.0
+  },
+  "required_boolean_quality_gates": {
+    "duplicate_calibration_ready": true
+  },
+  "required_top_level_keys": [
+    "report_version",
+    "rule_version",
+    "taxonomy_version",
+    "evidence_version",
+    "metadata",
+    "scope",
+    "task",
+    "data_quality",
+    "summary_metrics",
+    "platform_dimensions",
+    "account_type_dimensions",
+    "content_direction_dimensions",
+    "selling_point_dimensions",
+    "duplicates",
+    "review_summary",
+    "capture_summary",
+    "provider_costs",
+    "content_details",
+    "files",
+    "channels"
+  ],
+  "channel_conclusion_metrics": {
+    "selling_point_count_share": {
+      "kind": "ratio",
+      "unit": "percent"
+    },
+    "core_selling_point_count_share": {
+      "kind": "ratio",
+      "unit": "percent"
+    },
+    "selling_point_exposure_share": {
+      "kind": "ratio",
+      "unit": "percent"
+    },
+    "core_selling_point_exposure_share": {
+      "kind": "ratio",
+      "unit": "percent"
+    },
+    "content_verticality": {
+      "kind": "score",
+      "unit": "point"
+    },
+    "automotive_user_rate": {
+      "kind": "ratio",
+      "unit": "percent"
+    },
+    "acquisition_potential": {
+      "kind": "score",
+      "unit": "point"
+    }
+  },
+  "channels": {
+    "platforms": [
+      "douyin",
+      "xiaohongshu"
+    ],
+    "scenes": [
+      "used_car",
+      "new_car",
+      "media"
+    ]
+  },
+  "audience_quality_required_keys": [
+    "captured_comment_count",
+    "declared_comment_count",
+    "comment_collection_coverage_percentage",
+    "identity_coverage_percentage",
+    "candidate_user_count",
+    "classified_user_count",
+    "classification_coverage_percentage",
+    "capped_content_count",
+    "audience_definition_version",
+    "classifier_version",
+    "user_key_version",
+    "evidence_window_start",
+    "evidence_window_end",
+    "report_cutoff_at",
+    "warm_up"
+  ],
+  "audience_definition_version": "audience-definition-v1",
+  "user_key_version": "platform-user-hmac-v2",
+  "comment_collection_version": "paged-comments-v2"
+}

@@ -5,7 +5,14 @@ import { useEffect, useState } from "react";
 import AppShell from "../../components/AppShell";
 import { Feedback, Loading } from "../../components/Feedback";
 import { API_BASE, readJson } from "../../lib/api";
-import { formatDate, label, metricValue } from "../../lib/format";
+import {
+  formatDate,
+  label,
+  metricCompactValue,
+  metricEvidence,
+  metricPublishesValue,
+  metricValue,
+} from "../../lib/format";
 import type { BusinessSceneKey, ConclusionMetricKey, Metric, OverviewChannelKey, ReportView, TaskDetail } from "../../lib/types";
 
 const tabs = [["summary", "报告概览"], ["platforms", "平台维度"], ["dimensions", "账号 / 方向"], ["contents", "内容明细"], ["files", "文件与日志"]] as const;
@@ -21,19 +28,9 @@ const conclusionMetrics: Array<[ConclusionMetricKey, string]> = [
   ["automotive_user_rate", "互动用户汽车兴趣占比"],
   ["acquisition_potential", "内容拉新效果预估"],
 ];
-const unavailableConclusionLabels: Record<string, string> = {
-  below_threshold: "覆盖不足",
-  missing: "有效样本不足",
-  not_applicable: "无适用内容",
-  not_calculable: "暂无模型",
-  stale: "数据已过期",
-};
-
-function conclusionCell(metric?: Metric) {
-  if (!metric) return "—";
-  const published = metric.kind === "score" ? metric.value : metric.percentage;
-  if (published != null) return metric.status === "sample_only" ? `${published}%（仅样本）` : `${published}%`;
-  return unavailableConclusionLabels[metric.status] ?? "暂不可计算";
+function MetricText({ metric, compact = false }: { metric?: Metric; compact?: boolean }) {
+  const text = compact ? metricCompactValue(metric) : metricValue(metric);
+  return <>{text}{metric && !metricPublishesValue(metric) && <span className="visually-hidden">。完整原因：{metricEvidence(metric)}</span>}</>;
 }
 
 export default function TaskDetailPage({ taskId }: { taskId: string }) {
@@ -82,7 +79,7 @@ export default function TaskDetailPage({ taskId }: { taskId: string }) {
       </div></div>
       <article className="panel">
         <div className="task-tabs" role="tablist">{tabs.map(([id, name]) => <button key={id} className={tab === id ? "active" : ""} onClick={() => setTab(id)}>{name}</button>)}</div>
-        {tab === "summary" && <div className="task-tab-body">{detail.display_effective_revision?.revision_state === "stale" && <p className="status-badge stale-evaluation">当前展示的是历史规则报告，已过时；请生成新 revision。</p>}<div className="quality-grid"><div><strong>{report ? metricValue(report.summary_metrics.publication_count) : "—"}</strong><span>发布内容</span></div><div><strong>{report ? metricValue(report.summary_metrics.verticality_rate) : "—"}</strong><span>内容垂直度</span></div><div><strong>{report ? metricValue(report.summary_metrics.selling_point_coverage_rate) : "—"}</strong><span>卖点覆盖率</span></div><div><strong>{report ? metricValue(report.summary_metrics.duplicate_rate) : "—"}</strong><span>重复内容率</span></div></div><dl className="definition-list">{Object.entries(report?.data_quality ?? {}).map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{value}</dd></div>)}</dl>{!report && <p className="empty-explanation">当前没有可读取的有效 revision。</p>}</div>}
+        {tab === "summary" && <div className="task-tab-body">{detail.display_effective_revision?.revision_state === "stale" && <p className="status-badge stale-evaluation">当前展示的是历史规则报告，已过时；请生成新 revision。</p>}<div className="quality-grid"><div><strong><MetricText metric={report?.summary_metrics.publication_count} /></strong><span>发布内容</span></div><div><strong><MetricText metric={report?.summary_metrics.verticality_rate} /></strong><span>内容垂直度</span></div><div><strong><MetricText metric={report?.summary_metrics.selling_point_coverage_rate} /></strong><span>卖点覆盖率</span></div><div><strong><MetricText metric={report?.summary_metrics.duplicate_rate} /></strong><span>重复内容率</span></div></div><dl className="definition-list">{Object.entries(report?.data_quality ?? {}).map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{value}</dd></div>)}</dl>{!report && <p className="empty-explanation">当前没有可读取的有效 revision。</p>}</div>}
         {tab === "platforms" && <div className="task-tab-body">
           {report?.channels ? <>
             {channelOrder.map((channelKey) => {
@@ -92,7 +89,7 @@ export default function TaskDetailPage({ taskId }: { taskId: string }) {
                 <h4>{channel.label}渠道 · 窗口发布 {channel.publication_count} 条</h4>
                 <table>
                   <thead><tr><th scope="col">指标</th><th scope="col">汇总</th>{sceneOrder.map((sceneKey) => <th scope="col" key={sceneKey}>{channel.scenes[sceneKey]?.label ?? sceneKey}</th>)}</tr></thead>
-                  <tbody>{conclusionMetrics.map(([metricKey, name]) => <tr key={metricKey}><th scope="row">{name}</th><td>{conclusionCell(channel.summary.metrics[metricKey])}</td>{sceneOrder.map((sceneKey) => <td key={sceneKey}>{conclusionCell(channel.scenes[sceneKey]?.metrics[metricKey])}</td>)}</tr>)}</tbody>
+                  <tbody>{conclusionMetrics.map(([metricKey, name]) => <tr key={metricKey}><th scope="row">{name}</th><td><MetricText metric={channel.summary.metrics[metricKey]} compact /></td>{sceneOrder.map((sceneKey) => <td key={sceneKey}><MetricText metric={channel.scenes[sceneKey]?.metrics[metricKey]} compact /></td>)}</tr>)}</tbody>
                 </table>
               </div>;
             })}

@@ -315,6 +315,8 @@ def _compact_discovery_results(
                 "updated": sum(int(page.get("updated") or 0) for page in pages),
                 "failed_pages": failed[:COMPACT_FAILURE_LIMIT],
                 "failed_pages_truncated": len(failed) > COMPACT_FAILURE_LIMIT,
+                "completed": bool(item.get("completed")),
+                "completion_reason": item.get("completion_reason"),
                 "stopped_reason": item.get("stopped_reason"),
             }
         )
@@ -468,6 +470,7 @@ def run_discovery_backfill(
         seen_cursors: set[str] = set()
         pages: List[Dict[str, Any]] = []
         local_stop: Optional[str] = None
+        completion_reason: Optional[str] = None
         for page_number in range(1, max_pages_per_account + 1):
             if blocking_stop.is_set():
                 break
@@ -506,12 +509,30 @@ def run_discovery_backfill(
                 for value in page.get("page_published_at") or []
             ]
             if published_values and min(published_values) <= start_utc:
+                completion_reason = "range_start_reached"
                 break
             next_cursor = page.get("next_cursor")
-            if not page.get("has_more") or next_cursor in (None, ""):
+            if not page.get("has_more"):
+                completion_reason = "provider_exhausted"
+                break
+            if next_cursor in (None, ""):
+                local_stop = "missing_next_cursor"
                 break
             cursor = next_cursor
-        return {**identity, "pages": pages, "stopped_reason": local_stop}
+        else:
+            # Reaching the safety cap while the provider still advertises more
+            # pages is not a completed account.  Callers must raise the cap (or
+            # add a continuation strategy) instead of silently claiming full
+            # history coverage.
+            if pages and pages[-1].get("has_more"):
+                local_stop = "page_limit_reached"
+        return {
+            **identity,
+            "pages": pages,
+            "completed": completion_reason is not None,
+            "completion_reason": completion_reason,
+            "stopped_reason": local_stop,
+        }
 
     results: List[Dict[str, Any]] = []
     if workers == 1:
@@ -546,11 +567,12 @@ def run_discovery_backfill(
         page.get("status") in {"failed", "partial"}
         for item in results for page in item["pages"]
     )
+    accounts_completed = sum(bool(item.get("completed")) for item in results)
     status = (
         "blocked"
         if stopped_reason in BLOCKING_CODES
         else "partial"
-        if failed_pages
+        if failed_pages or stopped_reason or accounts_completed != len(identities)
         else "succeeded"
     )
     output = {
@@ -560,6 +582,7 @@ def run_discovery_backfill(
         "end": _iso(end),
         "accounts_considered": len(identities),
         "accounts_processed": sum(1 for item in results if item["pages"]),
+        "accounts_completed": accounts_completed,
         "pages_processed": sum(len(item["pages"]) for item in results),
         "failed_pages": failed_pages,
         "inserted": sum(
@@ -1000,6 +1023,11 @@ def run_local_evidence_backfill(
         was_tagged = str(row["source_group"] or "") == HISTORY_BACKFILL_SOURCE_GROUP
         try:
             media = process_content_media(content_id, db_path=db_path)
+            if str(media.get("status") or "") != "evidence_ready":
+                raise RangeBackfillError(
+                    "媒体证据尚未就绪："
+                    f"{media.get('status') or 'unknown'}"
+                )
             evaluation = evaluate_content(content_id, db_path=db_path)
             duplicates = refresh_content_duplicates(content_id, db_path=db_path)
             tag_released = False

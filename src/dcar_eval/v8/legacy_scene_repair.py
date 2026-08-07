@@ -14,7 +14,7 @@ from typing import Any
 
 from .evaluation import canonical_json
 from .evaluation_selectors import review_anchor_evaluation
-from .release_management import (
+from .release_management_v5_1 import (
     FreezeManifest,
     ReleaseManagementError,
     TARGET_RELEASE_ID,

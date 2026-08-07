@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from v8.evaluation import (
     EvaluationError,
-    RULE_VERSION,
+    V8_RULE_VERSION,
     apply_gray_review_queue_sync,
     evaluate_content,
     evaluate_incremental,
@@ -21,7 +21,9 @@ from v8.evaluation import (
     upgrade_evaluations_to_current_rule,
     upsert_comment_user_scores,
 )
+from v8.matcher_dsl import POINT_IDS, POINT_SCENES
 from v8.storage import connect, initialize_database, now_utc
+from v8.taxonomy_rule_backfill import backfill_v5_1_matcher_rules
 
 
 class V8EvaluationTest(unittest.TestCase):
@@ -39,17 +41,23 @@ class V8EvaluationTest(unittest.TestCase):
                 """,
                 (now_utc(), now_utc()),
             )
-            point = connection.execute(
-                """
-                INSERT INTO selling_points(
-                    taxonomy_id, code, tier, label, positive_evidence_json
-                ) VALUES ('taxonomy', 'C1', 'other', '汽车知识', '["保养","维修"]')
-                """
-            )
-            connection.execute(
-                "INSERT INTO selling_point_scenes(selling_point_id, scene) VALUES (?, 'media')",
-                (point.lastrowid,),
-            )
+            for code in sorted(POINT_IDS):
+                point = connection.execute(
+                    """
+                    INSERT INTO selling_points(
+                        taxonomy_id,code,tier,label,definition,matcher_rule_json
+                    ) VALUES ('taxonomy',?,'other',?,?,'{}')
+                    """,
+                    (code, f"卖点 {code}", f"定义 {code}"),
+                )
+                for scene in sorted(POINT_SCENES[code]):
+                    connection.execute(
+                        """
+                        INSERT INTO selling_point_scenes(selling_point_id,scene)
+                        VALUES (?,?)
+                        """,
+                        (point.lastrowid, scene),
+                    )
             captured_at = "2026-08-01T00:00:00Z"
             for index in (1, 2):
                 connection.execute(
@@ -75,6 +83,37 @@ class V8EvaluationTest(unittest.TestCase):
                     suffix="initial",
                     created_at="2026-08-02T00:00:00Z",
                 )
+            connection.commit()
+        matcher = backfill_v5_1_matcher_rules(db_path=self.db)
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                UPDATE taxonomy_versions SET status='retired'
+                WHERE version='selling-points-v5.0'
+                """
+            )
+            connection.execute(
+                """
+                UPDATE taxonomy_versions SET status='published',published_at=?
+                WHERE version='selling-points-v5.1'
+                """,
+                (captured_at,),
+            )
+            connection.execute(
+                """
+                INSERT INTO evaluation_releases(
+                    id,rule_version,taxonomy_version,matcher_rule_sha256,status,
+                    created_at,updated_at,activated_at
+                ) VALUES ('evaluation-v8__selling-points-v5.1','evaluation-v8',
+                          'selling-points-v5.1',?,'active',?,?,?)
+                """,
+                (
+                    matcher["matcher_rule_sha256"],
+                    captured_at,
+                    captured_at,
+                    captured_at,
+                ),
+            )
             connection.commit()
 
     def tearDown(self) -> None:
@@ -137,6 +176,44 @@ class V8EvaluationTest(unittest.TestCase):
                 ),
             )
 
+    def _review_as_no_selling_point(self, evaluation_id: int) -> tuple[int, int]:
+        with connect(self.db) as connection:
+            queue = connection.execute(
+                """
+                INSERT INTO review_queue(
+                    content_id,evaluation_id,reason_code,status,created_at,updated_at
+                ) VALUES (1,?,'manual_fixture','pending',?,?)
+                """,
+                (evaluation_id, now_utc(), now_utc()),
+            )
+            connection.commit()
+            queue_id = int(queue.lastrowid)
+        reviewed = resolve_review(
+            queue_id,
+            decision="override",
+            reason="人工确认当前内容不构成卖点",
+            reviewer="测试复核员",
+            evidence_type="visual_summary",
+            evidence_text="画面证据确认当前内容没有可复用的汽车卖点",
+            base_evaluation_id=evaluation_id,
+            overrides={
+                "primary_selling_point_code": None,
+                "selling_point_score": 0,
+                "selling_point_included": False,
+                "content_automotive_score": 0,
+                "content_direction": "other",
+            },
+            db_path=self.db,
+        )
+        with connect(self.db) as connection:
+            review_id = int(
+                connection.execute(
+                    "SELECT review_id FROM evaluation_versions WHERE id=?",
+                    (reviewed.evaluation_id,),
+                ).fetchone()[0]
+            )
+        return queue_id, review_id
+
     def test_evaluation_is_append_only_and_idempotent_for_same_evidence(self) -> None:
         first = evaluate_content(1, db_path=self.db)
         second = evaluate_content(1, db_path=self.db)
@@ -150,7 +227,7 @@ class V8EvaluationTest(unittest.TestCase):
             ).fetchone()
             matches = connection.execute("SELECT * FROM evaluation_matches").fetchall()
         self.assertEqual(evaluation["evaluation_source"], "automatic")
-        self.assertEqual(evaluation["taxonomy_version"], "selling-points-v5.0")
+        self.assertEqual(evaluation["taxonomy_version"], "selling-points-v5.1")
         self.assertEqual(matches[0]["selling_point_code"], "C1")
 
     def test_automatic_gray_evaluation_materializes_one_idempotent_queue(self) -> None:
@@ -158,10 +235,11 @@ class V8EvaluationTest(unittest.TestCase):
             "id": "C1",
             "score": 70,
             "reason": "测试灰区",
+            "scene": "media",
             "source": "test",
         }
         with patch(
-            "label_douyin_video_evidence_v3.match_points",
+            "v8.evaluation.MaterializedMatcher.match_points",
             return_value=[gray_match],
         ):
             first = evaluate_content(1, db_path=self.db)
@@ -185,10 +263,11 @@ class V8EvaluationTest(unittest.TestCase):
             "id": "C1",
             "score": 70,
             "reason": "测试灰区",
+            "scene": "media",
             "source": "test",
         }
         with patch(
-            "label_douyin_video_evidence_v3.match_points",
+            "v8.evaluation.MaterializedMatcher.match_points",
             return_value=[gray_match],
         ):
             first = evaluate_content(1, db_path=self.db)
@@ -209,7 +288,7 @@ class V8EvaluationTest(unittest.TestCase):
             )
             connection.commit()
         with patch(
-            "label_douyin_video_evidence_v3.match_points",
+            "v8.evaluation.MaterializedMatcher.match_points",
             return_value=[gray_match],
         ):
             second = evaluate_content(1, db_path=self.db)
@@ -238,10 +317,11 @@ class V8EvaluationTest(unittest.TestCase):
             "id": "C1",
             "score": 70,
             "reason": "测试灰区",
+            "scene": "media",
             "source": "test",
         }
         with patch(
-            "label_douyin_video_evidence_v3.match_points",
+            "v8.evaluation.MaterializedMatcher.match_points",
             return_value=[gray_match],
         ):
             first = evaluate_content(1, db_path=self.db)
@@ -278,10 +358,11 @@ class V8EvaluationTest(unittest.TestCase):
             "id": "C1",
             "score": 70,
             "reason": "测试灰区",
+            "scene": "media",
             "source": "test",
         }
         with patch(
-            "label_douyin_video_evidence_v3.match_points",
+            "v8.evaluation.MaterializedMatcher.match_points",
             return_value=[gray_match],
         ):
             evaluation = evaluate_content(1, db_path=self.db)
@@ -317,10 +398,11 @@ class V8EvaluationTest(unittest.TestCase):
             "id": "C1",
             "score": 70,
             "reason": "测试灰区",
+            "scene": "media",
             "source": "test",
         }
         with patch(
-            "label_douyin_video_evidence_v3.match_points",
+            "v8.evaluation.MaterializedMatcher.match_points",
             return_value=[gray_match],
         ):
             evaluate_content(1, db_path=self.db)
@@ -344,10 +426,11 @@ class V8EvaluationTest(unittest.TestCase):
             "id": "C1",
             "score": 85,
             "reason": "测试明确命中",
+            "scene": "media",
             "source": "test",
         }
         with patch(
-            "label_douyin_video_evidence_v3.match_points",
+            "v8.evaluation.MaterializedMatcher.match_points",
             return_value=[included_match],
         ):
             included = evaluate_content(1, db_path=self.db)
@@ -371,6 +454,168 @@ class V8EvaluationTest(unittest.TestCase):
             ["system:evaluation", "system:evaluation"],
         )
 
+    def test_high_confidence_automatic_conflict_reopens_human_conclusion(self) -> None:
+        high_match = {
+            "id": "C1",
+            "score": 87,
+            "reason": "测试高置信命中",
+            "scene": "media",
+            "source": "test",
+        }
+        with patch(
+            "v8.evaluation.MaterializedMatcher.match_points",
+            return_value=[high_match],
+        ):
+            automatic = evaluate_content(1, db_path=self.db)
+        manual_queue_id, manual_review_id = self._review_as_no_selling_point(
+            automatic.evaluation_id
+        )
+
+        with patch(
+            "v8.evaluation.MaterializedMatcher.match_points",
+            return_value=[high_match],
+        ):
+            conflicting = evaluate_content(1, db_path=self.db)
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                UPDATE review_queue SET priority=1
+                WHERE content_id=1 AND reason_code='manual_conclusion_conflict'
+                """
+            )
+            connection.commit()
+        with patch(
+            "v8.evaluation.MaterializedMatcher.match_points",
+            return_value=[high_match],
+        ):
+            reused = evaluate_content(1, db_path=self.db)
+
+        with connect(self.db) as connection:
+            manual_queue = connection.execute(
+                "SELECT * FROM review_queue WHERE id=?", (manual_queue_id,)
+            ).fetchone()
+            conflict_queue = connection.execute(
+                """
+                SELECT * FROM review_queue
+                WHERE content_id=1 AND reason_code='manual_conclusion_conflict'
+                """
+            ).fetchone()
+            reopen_events = connection.execute(
+                "SELECT * FROM review_reopen_events WHERE queue_id=?",
+                (conflict_queue["id"],),
+            ).fetchall()
+        self.assertTrue(conflicting.created)
+        self.assertFalse(reused.created)
+        self.assertEqual(reused.evaluation_id, conflicting.evaluation_id)
+        self.assertEqual(manual_queue["status"], "resolved")
+        self.assertEqual(conflict_queue["status"], "manual_required")
+        self.assertEqual(conflict_queue["priority"], 100)
+        self.assertEqual(conflict_queue["evaluation_id"], conflicting.evaluation_id)
+        self.assertEqual(len(reopen_events), 1)
+        self.assertEqual(reopen_events[0]["previous_review_id"], manual_review_id)
+        self.assertEqual(
+            reopen_events[0]["base_evaluation_id"], conflicting.evaluation_id
+        )
+
+        with connect(self.db) as connection:
+            connection.execute(
+                "UPDATE content_items SET body='人工结论一致的新证据' WHERE id=1"
+            )
+            connection.commit()
+        with patch(
+            "v8.evaluation.MaterializedMatcher.match_points", return_value=[]
+        ):
+            matching = evaluate_content(1, db_path=self.db)
+        with connect(self.db) as connection:
+            closed = connection.execute(
+                "SELECT * FROM review_queue WHERE id=?", (conflict_queue["id"],)
+            ).fetchone()
+        self.assertTrue(matching.created)
+        self.assertEqual(closed["status"], "resolved")
+        self.assertEqual(closed["evaluation_id"], matching.evaluation_id)
+        self.assertEqual(closed["assigned_to"], "system:evaluation")
+
+    def test_gray_automatic_result_does_not_duplicate_human_conflict_queue(self) -> None:
+        high_match = {
+            "id": "C1",
+            "score": 87,
+            "reason": "测试高置信命中",
+            "scene": "media",
+            "source": "test",
+        }
+        with patch(
+            "v8.evaluation.MaterializedMatcher.match_points",
+            return_value=[high_match],
+        ):
+            automatic = evaluate_content(1, db_path=self.db)
+        self._review_as_no_selling_point(automatic.evaluation_id)
+        gray_match = {**high_match, "score": 70, "reason": "测试灰区命中"}
+        with patch(
+            "v8.evaluation.MaterializedMatcher.match_points",
+            return_value=[gray_match],
+        ):
+            evaluate_content(1, db_path=self.db)
+        with connect(self.db) as connection:
+            reasons = {
+                str(row["reason_code"]): str(row["status"])
+                for row in connection.execute(
+                    "SELECT reason_code,status FROM review_queue WHERE content_id=1"
+                )
+            }
+        self.assertEqual(reasons["evaluation_gray_zone"], "pending")
+        self.assertNotIn("manual_conclusion_conflict", reasons)
+
+    def test_automatic_result_matching_human_conclusion_needs_no_conflict_queue(
+        self,
+    ) -> None:
+        high_match = {
+            "id": "C1",
+            "score": 87,
+            "reason": "测试高置信命中",
+            "scene": "media",
+            "source": "test",
+        }
+        with patch(
+            "v8.evaluation.MaterializedMatcher.match_points",
+            return_value=[high_match],
+        ):
+            automatic = evaluate_content(1, db_path=self.db)
+        with connect(self.db) as connection:
+            queue = connection.execute(
+                """
+                INSERT INTO review_queue(
+                    content_id,evaluation_id,reason_code,status,created_at,updated_at
+                ) VALUES (1,?,'manual_fixture','pending',?,?)
+                """,
+                (automatic.evaluation_id, now_utc(), now_utc()),
+            )
+            connection.commit()
+        resolve_review(
+            int(queue.lastrowid),
+            decision="confirm",
+            reason="人工确认自动结论",
+            reviewer="测试复核员",
+            evidence_type="review_note",
+            evidence_text="人工证据确认 C1 媒体场景结论",
+            base_evaluation_id=automatic.evaluation_id,
+            db_path=self.db,
+        )
+        with patch(
+            "v8.evaluation.MaterializedMatcher.match_points",
+            return_value=[high_match],
+        ):
+            evaluate_content(1, db_path=self.db)
+        with connect(self.db) as connection:
+            conflict_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM review_queue
+                    WHERE reason_code='manual_conclusion_conflict'
+                    """
+                ).fetchone()[0]
+            )
+        self.assertEqual(conflict_count, 0)
+
     def test_gray_queue_sync_requires_plan_hash_and_converges_idempotently(
         self,
     ) -> None:
@@ -378,10 +623,11 @@ class V8EvaluationTest(unittest.TestCase):
             "id": "C1",
             "score": 70,
             "reason": "测试灰区",
+            "scene": "media",
             "source": "test",
         }
         with patch(
-            "label_douyin_video_evidence_v3.match_points",
+            "v8.evaluation.MaterializedMatcher.match_points",
             return_value=[gray_match],
         ):
             evaluation = evaluate_content(1, db_path=self.db)
@@ -434,10 +680,11 @@ class V8EvaluationTest(unittest.TestCase):
             "id": "C1",
             "score": 70,
             "reason": "测试灰区",
+            "scene": "media",
             "source": "test",
         }
         with patch(
-            "label_douyin_video_evidence_v3.match_points",
+            "v8.evaluation.MaterializedMatcher.match_points",
             return_value=[gray_match],
         ):
             evaluation = evaluate_content(1, db_path=self.db)
@@ -781,14 +1028,14 @@ class V8EvaluationTest(unittest.TestCase):
                 SELECT audience_automotive_score,acquisition_potential_score,payload_json
                 FROM evaluation_versions WHERE content_id=1 AND rule_version=?
                 """,
-                (RULE_VERSION,),
+                (V8_RULE_VERSION,),
             ).fetchone()
             four = connection.execute(
                 """
                 SELECT audience_automotive_score,acquisition_potential_score,payload_json
                 FROM evaluation_versions WHERE content_id=2 AND rule_version=?
                 """,
-                (RULE_VERSION,),
+                (V8_RULE_VERSION,),
             ).fetchone()
         self.assertEqual(five["audience_automotive_score"], 60)
         self.assertIsNotNone(five["acquisition_potential_score"])

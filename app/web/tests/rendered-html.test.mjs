@@ -9,6 +9,66 @@ import {
   toShanghaiDateTimeLocal,
 } from "../app/contents/contentForm.ts";
 import { jsonRequest } from "../app/lib/api.ts";
+import {
+  metricCompactValue,
+  metricEvidence,
+  metricPublishesValue,
+  metricStatus,
+  metricUnavailableLabel,
+  metricValue,
+} from "../app/lib/format.ts";
+
+function ratioMetric(status, reason, percentage = 62.05) {
+  return {
+    kind: "ratio",
+    numerator: 62,
+    denominator: 100,
+    percentage,
+    unit: "percent",
+    status,
+    eligible_count: 100,
+    coverage_percentage: 62,
+    reason,
+  };
+}
+
+test("metric presentation uses causes and never publishes a gated number", () => {
+  const belowCases = [
+    ["用户身份覆盖率 37.48%，低于 95% 门槛", "身份数据待补齐"],
+    ["用户分类覆盖率 0.0%，低于 100% 门槛", "用户分类未完成"],
+    ["去重有效用户 6 人，低于 30 人门槛", "互动用户少于30人"],
+    ["分类器定标未通过，暂不发布比例", "分类器未通过定标"],
+    ["可归类有效曝光 10/1000，覆盖 1%：低于 90% 发布门槛", "曝光归类待补齐"],
+    ["用户级汽车兴趣占比尚未接入用户聚合，暂不发布", "用户聚合未接入"],
+    ["", "暂不发布"],
+  ];
+  for (const [reason, expected] of belowCases) {
+    const metric = ratioMetric("below_threshold", reason);
+    assert.equal(metricPublishesValue(metric), false);
+    assert.equal(metricUnavailableLabel(metric), expected);
+    assert.equal(metricValue(metric), expected);
+    assert.equal(metricCompactValue(metric), expected);
+    assert.equal(metricStatus(metric), "暂不发布");
+    assert.doesNotMatch(`${metricValue(metric)} ${metricStatus(metric)}`, /覆盖不足/);
+  }
+
+  const available = ratioMetric("available", "", 62.05);
+  assert.equal(metricPublishesValue(available), true);
+  assert.equal(metricValue(available), "62.05%");
+  assert.equal(metricCompactValue(available), "62.05%");
+  assert.equal(metricEvidence(available), "62/100");
+
+  const sample = ratioMetric("sample_only", "分类器未经金标核对，数值仅供参考", 62.05);
+  assert.equal(metricPublishesValue(sample), true);
+  assert.equal(metricCompactValue(sample), "62.05%（仅样本）");
+
+  const missingWithValue = { kind: "quantity", value: 1234, unit: "view", status: "missing", coverage_percentage: 0, reason: "" };
+  assert.equal(metricPublishesValue(missingWithValue), false);
+  assert.equal(metricValue(missingWithValue), "无数据");
+
+  const availableQuantity = { ...missingWithValue, status: "available" };
+  assert.equal(metricValue(availableQuantity), "1,234");
+});
 
 async function render(path = "/overview") {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
@@ -55,7 +115,7 @@ test("sidebar uses the bundled Dongchedi app mark and brand colors", async () =>
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
     readFile(new URL("../public/dongchedi-app-icon.svg", import.meta.url), "utf8"),
   ]);
-  assert.match(shell, /src="\/dongchedi-app-icon\.svg"/);
+  assert.match(shell, /src=\{publicAssetPath\("\/dongchedi-app-icon\.svg"\)\}/);
   assert.match(shell, /alt="懂车帝 App"/);
   assert.match(shell, /<strong>Dcar Sentinel<\/strong>/);
   assert.match(shell, /内容运营工作台 · V1\.0/);
@@ -88,8 +148,9 @@ test("sidebar navigation uses semantic graphical icons instead of character mark
 });
 
 test("overview keeps time windows outside the fixed channel conclusion structure", async () => {
-  const [source, shell, styles, automotiveLines, douyinBrand, xiaohongshuBrand] = await Promise.all([
+  const [source, formatSource, shell, styles, automotiveLines, douyinBrand, xiaohongshuBrand] = await Promise.all([
     readFile(new URL("../app/overview/OverviewPage.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/lib/format.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/components/AppShell.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
     readFile(new URL("../public/overview-automotive-lines.webp", import.meta.url)),
@@ -114,6 +175,20 @@ test("overview keeps time windows outside the fixed channel conclusion structure
   assert.match(source, /<h3>\{channel\.label\}渠道<\/h3>/);
   assert.match(source, /<h4>汇总<\/h4>/);
   assert.match(source, /<h4>三个业务场景<\/h4>/);
+  assert.match(source, /可归类曝光覆盖 \{channel\.exposure_coverage_percentage/);
+  assert.doesNotMatch(source, /曝光交叉覆盖/);
+  assert.match(source, /曝光分母仅含 view_count&gt;0 的有效曝光，未取得有效曝光不入分母/);
+  // 未发布数值由统一 presenter 给短语，完整原因同时提供给辅助技术。
+  assert.doesNotMatch(source, /coverage-limitation-reason/);
+  assert.doesNotMatch(source, /whiteSpace: "normal"/);
+  assert.match(source, /title=\{evidence\}/);
+  assert.match(source, /aria-describedby=\{publishesValue \? undefined : reasonId\}/);
+  assert.match(source, /publishesValue \? <p>\{evidence\}<\/p> : <span id=\{reasonId\} className="visually-hidden">\{evidence\}<\/span>/);
+  assert.match(source, /!publishesValue && <span id=\{reasonId\} className="visually-hidden">\{evidence\}<\/span>/);
+  assert.doesNotMatch(source, /unavailableReasonLabels|unavailableStatusLabels|function conclusionValue|function metricEvidence/);
+  assert.match(formatSource, /const unavailableReasonLabels/);
+  assert.match(formatSource, /below_threshold:\s*"暂不发布"/);
+  assert.doesNotMatch(`${source}\n${formatSource}`, /有效样本不足|"覆盖不足"/);
   assert.match(source, /activeWindow\.channels\[key\]/);
   assert.match(source, /className="channel-switch" role="group" aria-label="统计窗口"/);
   assert.match(source, /type="button" aria-pressed=\{windowKey === key\}/);
@@ -195,7 +270,7 @@ test("selling point standards use E/X/M scenes, scene-local hits, and matcher-on
   assert.doesNotMatch(source, /\/api\/v8\/selling-points\/publish|发布标准/);
   assert.match(source, /草稿须完成评估回填与验收后，由发布流程原子激活/);
   assert.match(source, /<AppShell active="selling-points" actions=\{shellActions\}>/);
-  assert.match(source, /PencilSimpleIcon/);
+  assert.match(source, /PlusIcon/);
   assert.match(source, /role="region" aria-label=\{`\$\{family\.code\} \$\{family\.title\}卖点标准表格`\} tabIndex=\{0\}/);
   assert.match(shell, /围绕 E、X、M 三个业务场景/);
   assert.doesNotMatch(shell, /E、X、M、C|四类标准系列/);
@@ -298,11 +373,14 @@ test("routes preserve operations and expose evidence-backed review controls", as
 });
 
 test("task detail renders channel conclusions in the platforms tab without fabricating rates", async () => {
-  const [taskDetail, types] = await Promise.all([
+  const [taskDetail, types, formatSource] = await Promise.all([
     readFile(new URL("../app/tasks/[id]/TaskDetailPage.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/lib/types.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/lib/format.ts", import.meta.url), "utf8"),
   ]);
   assert.match(types, /channels\?: Record<OverviewChannelKey, OverviewChannel> \| null;/);
+  assert.match(types, /export type MetricStatus =[\s\S]*"available"[\s\S]*"below_threshold"[\s\S]*"sample_only"[\s\S]*"stale";/);
+  assert.match(types, /status: MetricStatus;/);
   assert.match(taskDetail, /channelOrder[^=]*=\s*\["douyin",\s*"xiaohongshu"\]/);
   assert.match(taskDetail, /sceneOrder[^=]*=\s*\["used_car",\s*"new_car",\s*"media"\]/);
   const labels = [
@@ -318,10 +396,14 @@ test("task detail renders channel conclusions in the platforms tab without fabri
   assert.match(taskDetail, /report\?\.channels \? </);
   assert.match(taskDetail, /channel-conclusion-table/);
   assert.match(taskDetail, /data-channel=\{channelKey\}/);
-  assert.match(taskDetail, /below_threshold:\s*"覆盖不足"/);
-  assert.match(taskDetail, /missing:\s*"有效样本不足"/);
-  assert.match(taskDetail, /not_applicable:\s*"无适用内容"/);
-  assert.match(taskDetail, /（仅样本）/);
+  assert.match(taskDetail, /metricCompactValue\(metric\)/);
+  assert.match(taskDetail, /!metricPublishesValue\(metric\) && <span className="visually-hidden">。完整原因：\{metricEvidence\(metric\)\}<\/span>/);
+  assert.doesNotMatch(taskDetail, /unavailableReasonLabels|unavailableConclusionLabels|function conclusionCell/);
+  assert.doesNotMatch(`${taskDetail}\n${formatSource}`, /有效样本不足|"覆盖不足"/);
+  assert.match(formatSource, /身份数据待补齐/);
+  assert.match(formatSource, /用户分类未完成/);
+  assert.match(formatSource, /互动用户少于30人/);
+  assert.match(formatSource, /metric\.status === "sample_only" \? `\$\{value\}（仅样本）` : value/);
   assert.match(taskDetail, /用户级去重口径/);
   assert.match(taskDetail, /channel_conclusions\.csv/);
   assert.match(taskDetail, /没有渠道\/场景结论/);
