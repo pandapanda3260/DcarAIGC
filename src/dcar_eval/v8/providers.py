@@ -626,9 +626,44 @@ def _collect_media_urls(value: Any, media_kind: str) -> List[str]:
     return output
 
 
+def _douyin_image_url_groups(item: Mapping[str, Any]) -> List[List[str]]:
+    """Preserve TikHub's one-``images[]``-entry-per-logical-image grouping.
+
+    Douyin exposes several format and CDN candidates for each logical image.
+    The frozen media source remains the same flat URL list; callers that have
+    the discovery payload can additionally retain these candidate boundaries.
+    """
+
+    raw_images = item.get("images")
+    images = raw_images if isinstance(raw_images, list) else []
+    groups: List[List[str]] = []
+    for raw_image in images:
+        image = _mapping(raw_image)
+        candidates = _collect_media_urls(
+            {
+                "images": [
+                    {
+                        "download_url_list": image.get("download_url_list"),
+                        "url_list": image.get("url_list"),
+                    }
+                ]
+            },
+            "image",
+        )
+        if candidates:
+            groups.append(candidates)
+    return groups
+
+
 def _douyin_media_urls(item: Mapping[str, Any], content_type: str) -> List[str]:
     if content_type == "image":
-        return _collect_media_urls({"images": item.get("images")}, "image")
+        return list(
+            dict.fromkeys(
+                url
+                for group in _douyin_image_url_groups(item)
+                for url in group
+            )
+        )
     video = _mapping(item.get("video"))
     return _collect_media_urls(
         {
@@ -1595,6 +1630,7 @@ def _store_stage_result(
     db_path: Path,
     applied_source: str = "live_applied",
     mark_raw_applied: bool = True,
+    media_root: Optional[Path] = None,
 ) -> None:
     data = outcome.data
     mutation_at = now_utc()
@@ -1734,6 +1770,9 @@ def _store_stage_result(
                 captured_at=evidence_captured_at,
             )
     if stage == "detail":
+        media_kwargs: Dict[str, Any] = {}
+        if media_root is not None:
+            media_kwargs["media_root"] = media_root
         store_media_source_manifest(
             int(content["id"]),
             media_kind="video" if data.get("content_type") == "video" else "image",
@@ -1744,6 +1783,7 @@ def _store_stage_result(
             ],
             raw_response_id=int(outcome.raw_response_id),
             db_path=db_path,
+            **media_kwargs,
         )
     if stage == "comments" and evidence_id is not None:
         upsert_comment_user_scores(
@@ -1835,6 +1875,9 @@ def _materialize_discovery_stages(
     source_raw_response_id: int,
     db_path: Path,
     materialize_detail: bool = True,
+    materialize_metrics: bool = True,
+    derived_raw_root: Optional[Path] = None,
+    media_root: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Persist fields already present in a paid discovery response at zero extra cost."""
 
@@ -1880,54 +1923,55 @@ def _materialize_discovery_stages(
     # returning a placeholder zero for views.  That zero is not authoritative
     # exposure and must not close the paid daily statistics slot; otherwise the
     # dedicated statistics endpoint is skipped for the whole window.
-    discovery_view_count = metrics.get("view_count")
-    has_authoritative_discovery_exposure = (
-        isinstance(discovery_view_count, (int, float))
-        and not isinstance(discovery_view_count, bool)
-        and discovery_view_count > 0
-    )
-    if has_authoritative_discovery_exposure:
-        stage_values.append(("metrics", metrics_window_key, metrics))
-    elif any(value is not None for value in metrics.values()):
-        metadata = json.dumps(
-            {
-                "derived_from_operation": discovery_operation,
-                "exposure_observation": "missing_or_placeholder",
-                "reported_view_count": discovery_view_count,
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
+    if materialize_metrics:
+        discovery_view_count = metrics.get("view_count")
+        has_authoritative_discovery_exposure = (
+            isinstance(discovery_view_count, (int, float))
+            and not isinstance(discovery_view_count, bool)
+            and discovery_view_count > 0
         )
-        with connect(db_path) as connection, transaction(connection):
-            connection.execute(
-                """
-                INSERT INTO content_metric_snapshots(
-                    content_id, captured_at, window_key, view_count, comment_count,
-                    like_count, share_count, collect_count, status, source,
-                    raw_response_id, metadata_json
-                ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, 'missing', ?, ?, ?)
-                ON CONFLICT(content_id, window_key, source) DO UPDATE SET
-                    captured_at=excluded.captured_at, view_count=NULL,
-                    comment_count=excluded.comment_count, like_count=excluded.like_count,
-                    share_count=excluded.share_count, collect_count=excluded.collect_count,
-                    status=excluded.status, raw_response_id=excluded.raw_response_id,
-                    metadata_json=excluded.metadata_json
-                WHERE content_metric_snapshots.view_count IS NULL
-                """,
-                (
-                    content_id,
-                    str(source_raw["captured_at"]),
-                    metrics_window_key,
-                    metrics.get("comment_count"),
-                    metrics.get("like_count"),
-                    metrics.get("share_count"),
-                    metrics.get("collect_count"),
-                    platform,
-                    source_raw_response_id,
-                    metadata,
-                ),
+        if has_authoritative_discovery_exposure:
+            stage_values.append(("metrics", metrics_window_key, metrics))
+        elif any(value is not None for value in metrics.values()):
+            metadata = json.dumps(
+                {
+                    "derived_from_operation": discovery_operation,
+                    "exposure_observation": "missing_or_placeholder",
+                    "reported_view_count": discovery_view_count,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
             )
+            with connect(db_path) as connection, transaction(connection):
+                connection.execute(
+                    """
+                    INSERT INTO content_metric_snapshots(
+                        content_id, captured_at, window_key, view_count, comment_count,
+                        like_count, share_count, collect_count, status, source,
+                        raw_response_id, metadata_json
+                    ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, 'missing', ?, ?, ?)
+                    ON CONFLICT(content_id, window_key, source) DO UPDATE SET
+                        captured_at=excluded.captured_at, view_count=NULL,
+                        comment_count=excluded.comment_count, like_count=excluded.like_count,
+                        share_count=excluded.share_count, collect_count=excluded.collect_count,
+                        status=excluded.status, raw_response_id=excluded.raw_response_id,
+                        metadata_json=excluded.metadata_json
+                    WHERE content_metric_snapshots.view_count IS NULL
+                    """,
+                    (
+                        content_id,
+                        str(source_raw["captured_at"]),
+                        metrics_window_key,
+                        metrics.get("comment_count"),
+                        metrics.get("like_count"),
+                        metrics.get("share_count"),
+                        metrics.get("collect_count"),
+                        platform,
+                        source_raw_response_id,
+                        metadata,
+                    ),
+                )
 
     output: Dict[str, Any] = {
         "created": [],
@@ -1943,6 +1987,9 @@ def _materialize_discovery_stages(
     for stage, window_key, data in stage_values:
         _, _, operation, _ = STAGE_CONFIG[(platform, stage)]
         try:
+            fetch_kwargs: Dict[str, Any] = {}
+            if derived_raw_root is not None:
+                fetch_kwargs["raw_root"] = derived_raw_root
             outcome = execute_content_fetch(
                 content_id=content_id,
                 stage=stage,
@@ -1961,6 +2008,7 @@ def _materialize_discovery_stages(
                 ),
                 db_path=db_path,
                 allow_terminal_retry=True,
+                **fetch_kwargs,
             )
             _store_stage_result(
                 content,
@@ -1969,6 +2017,7 @@ def _materialize_discovery_stages(
                 outcome,
                 db_path=db_path,
                 applied_source="derived_applied",
+                media_root=media_root,
             )
             output["created"].append(stage)
         except SlotUnavailable:
@@ -2018,6 +2067,7 @@ def _materialize_discovery_stages(
                         synthetic,
                         db_path=db_path,
                         mark_raw_applied=False,
+                        media_root=media_root,
                     )
                     output["replayed"].append(stage)
                 except Exception as exc:
@@ -2046,6 +2096,7 @@ def _materialize_discovery_stages(
                     replayed,
                     db_path=db_path,
                     applied_source="derived_applied",
+                    media_root=media_root,
                 )
                 output["replayed"].append(stage)
             except Exception as exc:
@@ -3244,7 +3295,9 @@ def retry_content_media(
 ) -> Dict[str, Any]:
     """Retry local processing first, then one explicit paid lifetime source refresh."""
 
-    stale_recovery = recover_stale_media_processing_slots(db_path=db_path)
+    stale_recovery = recover_stale_media_processing_slots(
+        db_path=db_path, content_ids=(content_id,)
+    )
     source_before = get_media_source_state(content_id, db_path=db_path)
     download_before = (
         source_before.get("download_slot") if source_before is not None else None

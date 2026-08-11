@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import stat
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+import v8.capture as capture_module
 from v8.capture import (
     BudgetBlocked,
     CaptureError,
@@ -22,6 +24,50 @@ from v8.capture import (
     recover_stale_fetch_slots,
 )
 from v8.storage import connect, initialize_database, now_utc
+
+
+def _tree_metadata_inventory(root: Path) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    if not root.exists():
+        digest.update(b"missing\n")
+        return digest.hexdigest(), 0
+    pending = [root]
+    entries = 0
+    while pending:
+        path = pending.pop()
+        metadata = path.lstat()
+        relative = "." if path == root else path.relative_to(root).as_posix()
+        if stat.S_ISDIR(metadata.st_mode):
+            kind = "directory"
+            pending.extend(
+                reversed(sorted(path.iterdir(), key=lambda child: child.name))
+            )
+        elif stat.S_ISREG(metadata.st_mode):
+            kind = "file"
+        elif stat.S_ISLNK(metadata.st_mode):
+            kind = "symlink"
+        else:
+            kind = "other"
+        digest.update(
+            json.dumps(
+                {
+                    "relative_path": relative,
+                    "kind": kind,
+                    "mode": metadata.st_mode,
+                    "device": metadata.st_dev,
+                    "inode": metadata.st_ino,
+                    "nlink": metadata.st_nlink,
+                    "byte_size": metadata.st_size,
+                    "mtime_ns": metadata.st_mtime_ns,
+                    "ctime_ns": metadata.st_ctime_ns,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        digest.update(b"\n")
+        entries += 1
+    return digest.hexdigest(), entries
 
 
 class V8CaptureTest(unittest.TestCase):
@@ -68,6 +114,36 @@ class V8CaptureTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def test_runtime_default_raw_root_isolated_without_canonical_drift(self) -> None:
+        canonical_before = _tree_metadata_inventory(capture_module.RAW_ROOT)
+        isolated_raw_root = self.root / "runtime-default-raw"
+        with patch.object(capture_module, "RAW_ROOT", isolated_raw_root):
+            outcome = execute_content_fetch(
+                content_id=1,
+                stage="detail",
+                window_key="lifetime",
+                provider="TestProvider",
+                adapter_version="test-provider-v1",
+                operation="runtime_default_raw_root",
+                db_path=self.db,
+                call=lambda: ProviderResult(
+                    data={"ok": True},
+                    raw_response={"fixture": "isolated"},
+                    http_status=200,
+                    billed=False,
+                ),
+            )
+        canonical_after = _tree_metadata_inventory(capture_module.RAW_ROOT)
+        self.assertEqual(canonical_after, canonical_before)
+        with connect(self.db) as connection:
+            raw = connection.execute(
+                "SELECT local_path FROM provider_raw_responses WHERE id=?",
+                (outcome.raw_response_id,),
+            ).fetchone()
+        stored_path = Path(str(raw["local_path"]))
+        self.assertEqual(stored_path.parents[3], isolated_raw_root)
+        self.assertTrue(stored_path.is_file())
 
     def test_startup_recovery_releases_only_stale_running_fetch_slots(self) -> None:
         with connect(self.db) as connection:

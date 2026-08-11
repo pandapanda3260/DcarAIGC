@@ -43,7 +43,7 @@ export default function AppShell({ active, actions, children }: { active: Sectio
       <aside className="sidebar">
         <div className="brand"><Image className="brand-mark" src={publicAssetPath("/dongchedi-app-icon.svg")} alt="懂车帝 App" width={38} height={38} unoptimized /><div><strong>Dcar Sentinel</strong><span>内容运营工作台 · V1.0</span></div></div>
         <nav aria-label="主导航">
-          <p>工作台</p>
+          <p>数据统计</p>
           {navItems.map((item) => (
             <Link key={item.id} href={item.href} className={active === item.id ? "active" : ""} aria-current={active === item.id ? "page" : undefined}>
               <NavIcon section={item.id} />{item.label}

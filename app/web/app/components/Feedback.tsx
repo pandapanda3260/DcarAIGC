@@ -1,7 +1,18 @@
-import type { ReactNode } from "react";
+"use client";
+
+import { useEffect, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 
 export function Loading({ label = "正在读取 v8 运营数据" }: { label?: string }) {
-  return <div className="loading-screen" role="status" aria-live="polite"><div className="loading-mark">D</div><p>{label}</p></div>;
+  // Portal to <body>: .main-area 的 container-type 会产生 layout containment，
+  // 使内部 position:fixed 相对容器而非视口定位；挂到 body 才能真正全屏居中。
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+  if (!mounted) return null;
+  return createPortal(
+    <div className="loading-screen" role="status" aria-live="polite"><div className="loading-mark">D</div><p>{label}</p></div>,
+    document.body,
+  );
 }
 
 export function Notice({ tone = "success", children }: { tone?: "success" | "error"; children: ReactNode }) {

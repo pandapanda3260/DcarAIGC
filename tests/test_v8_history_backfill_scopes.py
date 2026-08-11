@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+import v8.capture as capture_module
 from v8.capture import ProviderResult
 from v8.evaluation import evaluate_content, incremental_candidates
 from v8.matcher_dsl import POINT_IDS, POINT_SCENES
@@ -45,6 +46,10 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.db = self.root / "history.sqlite3"
         self.state = self.root / "state"
+        self.raw_root = self.root / "raw"
+        raw_root_patch = patch.object(capture_module, "RAW_ROOT", self.raw_root)
+        raw_root_patch.start()
+        self.addCleanup(raw_root_patch.stop)
         with connect(self.db) as connection:
             initialize_database(connection)
             captured_at = now_utc()

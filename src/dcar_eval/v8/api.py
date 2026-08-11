@@ -173,12 +173,16 @@ class AccountSearchRequest(BaseModel):
     page_size: int = Field(default=50, ge=1, le=100)
 
 
+SELLING_POINT_NONE = "__none__"
+
+
 class ContentSearchRequest(BaseModel):
     query: str = Field(default="", max_length=200)
     platform: Optional[str] = Field(default=None, max_length=32)
     account_type: Optional[str] = Field(default=None, max_length=32)
     content_direction: Optional[str] = Field(default=None, max_length=32)
     review_status: Optional[str] = Field(default=None, max_length=32)
+    selling_point: Optional[str] = Field(default=None, max_length=8)
     page: int = Field(default=1, ge=1)
     page_size: int = Field(default=50, ge=1, le=100)
 
@@ -958,6 +962,11 @@ def _content_search(payload: ContentSearchRequest, *, db_path: Path) -> Dict[str
     if payload.content_direction:
         where.append(f"{direction_sql}=?")
         parameters.append(payload.content_direction)
+    if payload.selling_point == SELLING_POINT_NONE:
+        where.append("ev.primary_selling_point_code IS NULL")
+    elif payload.selling_point:
+        where.append("ev.primary_selling_point_code=?")
+        parameters.append(payload.selling_point)
     if payload.review_status == "pending":
         where.append("rq.pending_count > 0")
     elif payload.review_status == "terminal_failed":
@@ -1037,6 +1046,136 @@ def _content_search(payload: ContentSearchRequest, *, db_path: Path) -> Dict[str
     }
 
 
+_SELLING_POINT_STAT_CHANNELS = ("douyin", "xiaohongshu")
+_SELLING_POINT_STAT_SCENES = ("used_car", "new_car", "media")
+_LATEST_METRICS_CTE = """
+latest_metrics AS (
+    SELECT ms.content_id, ms.view_count
+    FROM content_metric_snapshots ms
+    WHERE ms.id=(
+        SELECT ms2.id FROM content_metric_snapshots ms2
+        WHERE ms2.content_id=ms.content_id
+        ORDER BY ms2.captured_at DESC, ms2.id DESC LIMIT 1
+    )
+)
+""".strip()
+
+
+def _selling_point_window_stats(
+    connection: sqlite3.Connection,
+) -> tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
+    """Per-window selling point hit/exposure stats plus scene/channel denominators.
+
+    Windows reuse the overview boundaries (Asia/Shanghai). Count denominators are
+    all publications in the window; exposure denominators only include contents
+    with a positive latest view_count snapshot (valid exposure), mirroring the
+    overview conclusion rules.
+    """
+
+    direction_sql = effective_direction_sql()
+    windows_meta: Dict[str, Any] = {}
+    point_windows: Dict[str, Dict[str, Any]] = {}
+    for window_key, (start, end) in _windows().items():
+        start_utc, end_utc = _utc_text(start), _utc_text(end)
+        scene_denominators: Dict[str, Any] = {
+            scene: {
+                channel: {"publication_count": 0, "valid_exposure_views": 0}
+                for channel in _SELLING_POINT_STAT_CHANNELS
+            }
+            for scene in _SELLING_POINT_STAT_SCENES
+        }
+        # Correlated indexed lookups instead of joining the materialized
+        # formal/latest CTEs: SQLite nest-loops those materializations without
+        # an index (full scan per content row), which made each window query
+        # take seconds on a ~60k-content library.  Semantics are unchanged:
+        # latest valid active-release evaluation and latest metric snapshot.
+        denominator_rows = connection.execute(
+            f"""
+            SELECT {direction_sql} direction, c.platform,
+                   COUNT(*) publication_count,
+                   SUM(CASE WHEN COALESCE(lm.view_count,0)>0 THEN lm.view_count ELSE 0 END) valid_exposure_views
+            FROM content_items c
+            LEFT JOIN accounts a ON a.id=c.account_id
+            LEFT JOIN evaluation_versions ev ON ev.id=(
+                SELECT ev2.id FROM evaluation_versions ev2
+                WHERE ev2.content_id=c.id
+                  AND ev2.release_id=(
+                    SELECT id FROM evaluation_releases WHERE status='active'
+                  )
+                  AND ev2.invalidated_at IS NULL
+                ORDER BY ev2.evaluated_at DESC, ev2.id DESC LIMIT 1
+            )
+            LEFT JOIN content_metric_snapshots lm ON lm.id=(
+                SELECT ms2.id FROM content_metric_snapshots ms2
+                WHERE ms2.content_id=c.id
+                ORDER BY ms2.captured_at DESC, ms2.id DESC LIMIT 1
+            )
+            WHERE c.published_at >= ? AND c.published_at < ?
+            GROUP BY direction, c.platform
+            """,
+            (start_utc, end_utc),
+        ).fetchall()
+        for row in denominator_rows:
+            scene, channel = str(row["direction"]), str(row["platform"])
+            if scene not in scene_denominators or channel not in _SELLING_POINT_STAT_CHANNELS:
+                continue
+            scene_denominators[scene][channel] = {
+                "publication_count": int(row["publication_count"] or 0),
+                "valid_exposure_views": int(row["valid_exposure_views"] or 0),
+            }
+        windows_meta[window_key] = {
+            "period_start": start.isoformat(),
+            "period_end": end.isoformat(),
+            "scene_denominators": scene_denominators,
+        }
+        hit_rows = connection.execute(
+            f"""
+            WITH {FORMAL_CURRENT_EVALUATIONS_CTE},
+            {_LATEST_METRICS_CTE},
+            matched AS (
+                SELECT DISTINCT em.selling_point_code code, em.scene, em.match_role,
+                       ev.content_id, c.platform
+                FROM formal_current_evaluations ev
+                JOIN evaluation_matches em ON em.evaluation_id=ev.id
+                JOIN content_items c ON c.id=ev.content_id
+                WHERE c.published_at >= ? AND c.published_at < ?
+            )
+            SELECT m.code, m.scene, m.platform,
+                   COUNT(DISTINCT CASE WHEN m.match_role='primary' THEN m.content_id END) primary_hits,
+                   COUNT(DISTINCT m.content_id) total_hits,
+                   SUM(CASE WHEN m.match_role='primary' AND COALESCE(lm.view_count,0)>0 THEN lm.view_count ELSE 0 END) primary_views
+            FROM matched m
+            LEFT JOIN latest_metrics lm ON lm.content_id=m.content_id
+            GROUP BY m.code, m.scene, m.platform
+            """,
+            (start_utc, end_utc),
+        ).fetchall()
+        for row in hit_rows:
+            scene, channel = str(row["scene"]), str(row["platform"])
+            if scene not in _SELLING_POINT_STAT_SCENES:
+                continue
+            scene_map = point_windows.setdefault(str(row["code"]), {}).setdefault(window_key, {})
+            entry = scene_map.setdefault(
+                scene,
+                {
+                    "primary_hits": 0,
+                    "total_hits": 0,
+                    "channels": {
+                        key: {"primary_hits": 0, "primary_views": 0}
+                        for key in _SELLING_POINT_STAT_CHANNELS
+                    },
+                },
+            )
+            entry["primary_hits"] += int(row["primary_hits"] or 0)
+            entry["total_hits"] += int(row["total_hits"] or 0)
+            if channel in entry["channels"]:
+                entry["channels"][channel] = {
+                    "primary_hits": int(row["primary_hits"] or 0),
+                    "primary_views": int(row["primary_views"] or 0),
+                }
+    return windows_meta, point_windows
+
+
 def _selling_point_list(*, db_path: Path) -> Dict[str, Any]:
     with connect(db_path) as connection:
         taxonomies = connection.execute(
@@ -1085,6 +1224,7 @@ def _selling_point_list(*, db_path: Path) -> Dict[str, Any]:
             """,
             (taxonomy["id"],),
         ).fetchall()
+        windows_meta, point_windows = _selling_point_window_stats(connection)
         items: List[Dict[str, Any]] = []
         for row in rows:
             point = serialize_point_row(connection, taxonomy, row)
@@ -1094,6 +1234,7 @@ def _selling_point_list(*, db_path: Path) -> Dict[str, Any]:
                     "enabled": bool(row["enabled"]),
                     "primary_hits": row["primary_hits"],
                     "total_hits": row["total_hits"],
+                    "window_hits": point_windows.get(str(row["code"]), {}),
                     "scene_hits": {
                         scene: {
                             "primary_hits": row[f"{scene}_primary_hits"],
@@ -1110,6 +1251,7 @@ def _selling_point_list(*, db_path: Path) -> Dict[str, Any]:
             "status": taxonomy["status"],
             "published_at": taxonomy["published_at"],
         },
+        "windows": windows_meta,
         "items": items,
     }
 

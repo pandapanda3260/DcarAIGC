@@ -2233,6 +2233,74 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         self.assertIn("999999999", export_text)
         self.assertIn("evaluation_freshness", export_text.splitlines()[0])
 
+    def test_content_search_filters_by_selling_point(self) -> None:
+        started = self.client.post(f"/api/v8/reviews/{self.queue_id}/start")
+        self.assertEqual(started.status_code, 200)
+        resolved = self.client.post(
+            f"/api/v8/reviews/{self.queue_id}/resolve",
+            json={
+                "base_evaluation_id": started.json()["base_evaluation_id"],
+                "decision": "override",
+                "reason": "画面明确展示汽车保养流程",
+                "reviewer": "测试复核员",
+                "evidence_type": "visual_summary",
+                "evidence_text": "连续画面展示机油更换和车辆保养操作",
+                "primary_selling_point_code": "C1",
+                "selling_point_score": 92,
+                "selling_point_included": True,
+                "content_automotive_score": 95,
+                "content_direction": "media",
+            },
+        )
+        self.assertEqual(resolved.status_code, 200)
+        imported = self.client.post(
+            "/api/v8/contents/import",
+            json={
+                "source_name": "input.csv",
+                "rows": [
+                    {
+                        "platform": "douyin",
+                        "canonical_url": "https://www.douyin.com/video/888888888",
+                        "title": "尚未评估的内容",
+                        "body": "尚未评估的内容完整正文",
+                        "published_at": "2026-07-04T08:00:00+08:00",
+                    }
+                ],
+            },
+        )
+        self.assertEqual(imported.status_code, 200)
+        self.assertEqual(imported.json()["inserted_rows"], 1)
+
+        matched = self.client.post(
+            "/api/v8/contents/search",
+            json={"selling_point": "C1", "page_size": 10},
+        )
+        self.assertEqual(matched.status_code, 200)
+        self.assertEqual(matched.json()["total"], 1)
+        self.assertEqual(matched.json()["items"][0]["link_id"], "A2BC3D")
+        self.assertEqual(matched.json()["items"][0]["primary_selling_point_code"], "C1")
+
+        missing = self.client.post(
+            "/api/v8/contents/search",
+            json={"selling_point": "__none__", "page_size": 10},
+        )
+        self.assertEqual(missing.status_code, 200)
+        self.assertEqual(missing.json()["total"], 1)
+        self.assertIsNone(missing.json()["items"][0]["primary_selling_point_code"])
+
+        unmatched = self.client.post(
+            "/api/v8/contents/search",
+            json={"selling_point": "E9", "page_size": 10},
+        )
+        self.assertEqual(unmatched.status_code, 200)
+        self.assertEqual(unmatched.json()["total"], 0)
+        combined = self.client.post(
+            "/api/v8/contents/search",
+            json={"selling_point": "C1", "platform": "xiaohongshu", "page_size": 10},
+        )
+        self.assertEqual(combined.status_code, 200)
+        self.assertEqual(combined.json()["total"], 0)
+
     def test_update_data_route_returns_provider_execution_result(self) -> None:
         expected = {
             "content_id": self.content_id,

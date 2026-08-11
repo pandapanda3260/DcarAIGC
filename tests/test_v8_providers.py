@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from urllib.error import HTTPError
 from unittest.mock import patch
 
+import v8.capture as capture_module
 import v8.media as media_module
 from v8.capture import CaptureError, ProviderResult, SlotUnavailable
 from v8.evaluation import evaluate_content
@@ -20,6 +21,8 @@ from v8.providers import (
     ProviderConfigurationError,
     _collect_media_urls,
     _douyin_discovery_call,
+    _douyin_image_url_groups,
+    _douyin_media_urls,
     _douyin_reference_call,
     _parse_douyin_discovery_payload,
     _parse_douyin_stage_payload,
@@ -46,8 +49,14 @@ class V8ProviderUpdateTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.db = self.root / "providers.sqlite3"
+        self.raw_root_patch = patch.object(
+            capture_module, "RAW_ROOT", self.root / "raw"
+        )
+        self.raw_root_patch.start()
+        self.addCleanup(self.raw_root_patch.stop)
         self.media_root_patch = patch("v8.media.MEDIA_ROOT", self.root / "media")
         self.media_root_patch.start()
+        self.addCleanup(self.media_root_patch.stop)
         with connect(self.db) as connection:
             initialize_database(connection)
             captured_at = now_utc()
@@ -127,7 +136,6 @@ class V8ProviderUpdateTest(unittest.TestCase):
         self.content_id = content["id"]
 
     def tearDown(self) -> None:
-        self.media_root_patch.stop()
         self.temp.cleanup()
 
     def test_retired_rnote_private_adapters_fail_before_request(self) -> None:
@@ -164,6 +172,89 @@ class V8ProviderUpdateTest(unittest.TestCase):
         self.assertEqual(
             _collect_media_urls(payload, "image"),
             ["https://cdn.example/image-1.jpg", "https://cdn.example/image-2.jpg"],
+        )
+
+    def test_douyin_image_urls_preserve_original_images_candidate_groups(self) -> None:
+        standard = {
+            "download_url_list": [
+                "https://p3-sign.douyinpic.com/water/standard.webp",
+                "https://p3-sign.douyinpic.com/water/standard.jpeg",
+            ],
+            "height": 1920,
+            "url_list": [
+                "https://p3-sign.douyinpic.com/aweme-images-v2/standard.heic",
+                "https://p3-sign.douyinpic.com/aweme-images-v2/standard.jpeg",
+            ],
+            "width": 1080,
+        }
+        vvic = {
+            "download_url_list": [
+                "https://p3-sign.douyinpic.com/water/vvic.webp",
+                "https://p3-sign.douyinpic.com/water/vvic.jpeg",
+            ],
+            "url_list": [
+                "https://p11-sign.douyinpic.com/tos-cn-i/vvic-origin",
+                "https://p3-sign.douyinpic.com/tos-cn-i/vvic-origin",
+                "https://p3-sign.douyinpic.com/tos-cn-i/vvic-origin~tplv.jpeg",
+            ],
+        }
+        kuchen = {
+            "download_url_list": [
+                "https://p3-sign.douyinpic.com/kuchen-v1-water/special.webp",
+                "https://p3-sign.douyinpic.com/kuchen-v1-water/special.jpeg",
+            ],
+            "url_list": [
+                "https://p26-sign.douyinpic.com/tos-cn-i/vvic-special",
+                "https://p3-sign.douyinpic.com/tos-cn-i/vvic-special",
+                "https://p3-sign.douyinpic.com/tos-cn-i/vvic-special~tplv.jpeg",
+            ],
+        }
+        item = {"images": [standard, vvic, kuchen]}
+
+        expected = [
+            [*standard["download_url_list"], *standard["url_list"]],
+            [*vvic["download_url_list"], *vvic["url_list"]],
+            [*kuchen["download_url_list"], *kuchen["url_list"]],
+        ]
+        self.assertEqual(_douyin_image_url_groups(item), expected)
+        self.assertEqual(
+            _douyin_media_urls(item, "image"),
+            [url for group in expected for url in group],
+        )
+
+    def test_douyin_image_groups_deduplicate_only_within_each_original_image(
+        self,
+    ) -> None:
+        shared = "https://p3-sign.douyinpic.com/water/shared.jpeg"
+        item = {
+            "images": [
+                {
+                    "download_url_list": [shared, shared],
+                    "url_list": [
+                        "https://p3-sign.douyinpic.com/aweme-images-v2/one.jpeg"
+                    ],
+                },
+                {
+                    "download_url_list": [shared],
+                    "url_list": [
+                        "https://p3-sign.douyinpic.com/aweme-images-v2/two.jpeg"
+                    ],
+                },
+            ]
+        }
+
+        self.assertEqual(
+            _douyin_image_url_groups(item),
+            [
+                [
+                    shared,
+                    "https://p3-sign.douyinpic.com/aweme-images-v2/one.jpeg",
+                ],
+                [
+                    shared,
+                    "https://p3-sign.douyinpic.com/aweme-images-v2/two.jpeg",
+                ],
+            ],
         )
 
     def test_xhs_video_media_extraction_uses_streams_not_subtitles_or_frames(
@@ -2498,6 +2589,38 @@ class V8ProviderUpdateTest(unittest.TestCase):
         self.assertEqual(old_download["attempt_count"], 1)
         self.assertEqual(usage["count"], 1)
         self.assertAlmostEqual(float(usage["amount"]), 0.001)
+
+    def test_retry_content_media_scopes_stale_recovery_to_target_content(
+        self,
+    ) -> None:
+        recovery = {
+            "stale_candidates": 0,
+            "recovered": 0,
+            "retryable_failed": 0,
+            "terminal_failed": 0,
+            "cas_conflicts": 0,
+            "exhausted_normalized": 0,
+        }
+        with (
+            patch(
+                "v8.providers.recover_stale_media_processing_slots",
+                return_value=recovery,
+            ) as recover,
+            patch(
+                "v8.providers.process_content_media",
+                return_value={
+                    "content_id": self.content_id,
+                    "status": "evidence_ready",
+                },
+            ),
+        ):
+            result = retry_content_media(self.content_id, db_path=self.db)
+
+        recover.assert_called_once_with(
+            db_path=self.db,
+            content_ids=(self.content_id,),
+        )
+        self.assertEqual(result["stale_recovery"], recovery)
 
     def test_expired_download_without_paid_authorization_never_calls_provider(
         self,

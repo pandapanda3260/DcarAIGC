@@ -232,6 +232,26 @@ export type EvidenceBundle = {
   review: { id: number; reason_code: string; status: string } | null;
 };
 
+export type SellingPointChannelWindowHits = {
+  primary_hits: number;
+  primary_views: number;
+};
+
+export type SellingPointWindowSceneHits = {
+  primary_hits: number;
+  total_hits: number;
+  channels: Partial<Record<OverviewChannelKey, SellingPointChannelWindowHits>>;
+};
+
+export type SellingPointWindowMeta = {
+  period_start: string;
+  period_end: string;
+  scene_denominators: Partial<Record<BusinessSceneKey, Partial<Record<OverviewChannelKey, {
+    publication_count: number;
+    valid_exposure_views: number;
+  }>>>>;
+};
+
 export type SellingPoint = {
   code: string;
   tier: string;
@@ -246,9 +266,11 @@ export type SellingPoint = {
   primary_hits?: number;
   total_hits?: number;
   readonly scene_hits?: Partial<Record<BusinessSceneKey, { primary_hits: number; total_hits: number }>>;
+  readonly window_hits?: Partial<Record<WindowKey, Partial<Record<BusinessSceneKey, SellingPointWindowSceneHits>>>>;
 };
 
 export type SellingPointResponse = {
   taxonomy: { version: string; status: string } | null;
+  windows?: Partial<Record<WindowKey, SellingPointWindowMeta>>;
   items: SellingPoint[];
 };

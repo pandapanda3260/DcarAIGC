@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
+import v8.capture as capture_module
 from v8.capture import CaptureError, ProviderResult
 from v8.matcher_dsl import POINT_IDS, POINT_SCENES
 from v8.operations import IdentityConflictError, upsert_account
@@ -40,6 +41,11 @@ class V8SchedulerTest(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.db = self.root / "scheduler.sqlite3"
         self.reports = self.root / "reports"
+        raw_root_patch = patch.object(
+            capture_module, "RAW_ROOT", self.root / "raw"
+        )
+        raw_root_patch.start()
+        self.addCleanup(raw_root_patch.stop)
         with connect(self.db) as connection:
             initialize_database(connection)
             captured_at = now_utc()

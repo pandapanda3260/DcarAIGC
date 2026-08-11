@@ -793,11 +793,12 @@ def _execute_claimed_fetch(
     operation: str,
     call: Callable[[], ProviderResult],
     db_path: Path = DEFAULT_DB,
-    raw_root: Path = RAW_ROOT,
+    raw_root: Optional[Path] = None,
     budget_id: Optional[str] = None,
     task_id: Optional[str] = None,
     task_max_amount: Optional[float] = None,
 ) -> CaptureOutcome:
+    resolved_raw_root = RAW_ROOT if raw_root is None else raw_root
     provider = claim.provider
     usage_id: Optional[int] = None
     unit_price = 0.0
@@ -843,7 +844,7 @@ def _execute_claimed_fetch(
                 operation=operation,
                 value=result.raw_response,
                 http_status=result.http_status,
-                raw_root=raw_root,
+                raw_root=resolved_raw_root,
             )
             if budget_id is not None and usage_id is not None:
                 _settle_budget(
@@ -908,7 +909,7 @@ def _execute_claimed_fetch(
                     operation=operation,
                     value=failure.raw_response,
                     http_status=failure.http_status,
-                    raw_root=raw_root,
+                    raw_root=resolved_raw_root,
                 )
             if budget_id is not None and usage_id is not None:
                 _settle_budget(
@@ -970,7 +971,7 @@ def execute_content_fetch(
     operation: str,
     call: Callable[[], ProviderResult],
     db_path: Path = DEFAULT_DB,
-    raw_root: Path = RAW_ROOT,
+    raw_root: Optional[Path] = None,
     budget_id: Optional[str] = None,
     task_id: Optional[str] = None,
     task_max_amount: Optional[float] = None,
@@ -1012,7 +1013,7 @@ def execute_account_fetch(
     operation: str,
     call: Callable[[], ProviderResult],
     db_path: Path = DEFAULT_DB,
-    raw_root: Path = RAW_ROOT,
+    raw_root: Optional[Path] = None,
     budget_id: Optional[str] = None,
     task_id: Optional[str] = None,
     task_max_amount: Optional[float] = None,

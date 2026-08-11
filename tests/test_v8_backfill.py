@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import v8.backfill as backfill_module
+import v8.capture as capture_module
 from v8.backfill import (
     BUDGET_ID,
     OPERATION,
@@ -55,6 +56,10 @@ class V8BackfillTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.db = self.root / "backfill.sqlite3"
+        self.raw_root = self.root / "raw"
+        raw_root_patch = patch.object(capture_module, "RAW_ROOT", self.raw_root)
+        raw_root_patch.start()
+        self.addCleanup(raw_root_patch.stop)
         captured_at = now_utc()
         with connect(self.db) as connection:
             initialize_database(connection)

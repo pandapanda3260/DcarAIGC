@@ -4,8 +4,10 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+import v8.capture as capture_module
 from v8.capture import CaptureError, ProviderResult
 from v8.operations import upsert_account, upsert_content
 from v8.range_backfill import (
@@ -28,6 +30,10 @@ class V8RangeBackfillTest(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.db = self.root / "range.sqlite3"
         self.state = self.root / "state"
+        self.raw_root = self.root / "raw"
+        raw_root_patch = patch.object(capture_module, "RAW_ROOT", self.raw_root)
+        raw_root_patch.start()
+        self.addCleanup(raw_root_patch.stop)
         with connect(self.db) as connection:
             initialize_database(connection)
             connection.commit()

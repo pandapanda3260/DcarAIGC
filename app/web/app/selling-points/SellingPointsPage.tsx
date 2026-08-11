@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import {
   CarIcon,
   GameControllerIcon,
@@ -12,7 +12,13 @@ import AppShell from "../components/AppShell";
 import { Feedback, Loading } from "../components/Feedback";
 import { jsonRequest, readJson } from "../lib/api";
 import { label } from "../lib/format";
-import type { BusinessSceneKey, SellingPoint, SellingPointResponse } from "../lib/types";
+import type {
+  BusinessSceneKey,
+  OverviewChannelKey,
+  SellingPoint,
+  SellingPointResponse,
+  WindowKey,
+} from "../lib/types";
 
 type PointForm = {
   code: string;
@@ -44,6 +50,22 @@ const standardFamilies = [
   { code: "M", title: "媒体", description: "媒体内容、服务与 AI 小懂标准", scene: "media" },
 ] as const satisfies ReadonlyArray<StandardFamily>;
 
+const statWindowLabels: Record<WindowKey, string> = {
+  yesterday: "昨天",
+  this_week: "本周",
+  last_week: "上周",
+};
+
+const statChannels = [
+  { key: "douyin", label: "抖音" },
+  { key: "xiaohongshu", label: "小红书" },
+] as const satisfies ReadonlyArray<{ key: OverviewChannelKey; label: string }>;
+
+function formatShare(numerator: number, denominator: number | undefined) {
+  if (!denominator) return null;
+  return `${((numerator * 100) / denominator).toFixed(1)}%`;
+}
+
 function pointsForFamily(items: SellingPoint[], scene: BusinessSceneKey) {
   return items
     .filter((point) => point.scenes.includes(scene))
@@ -63,6 +85,7 @@ function FamilyIcon({ code, size = 22 }: { code: StandardFamilyCode; size?: numb
 
 export default function SellingPointsPage() {
   const [data, setData] = useState<SellingPointResponse>({ taxonomy: null, items: [] });
+  const [statWindow, setStatWindow] = useState<WindowKey>("yesterday");
   const [draftMode, setDraftMode] = useState(false);
   const [form, setForm] = useState<PointForm | null>(null);
   const [editingCode, setEditingCode] = useState<string | null>(null);
@@ -181,7 +204,7 @@ export default function SellingPointsPage() {
   return (
     <AppShell active="selling-points" actions={shellActions}>
       <Feedback error={error} message={message} onClose={() => { setError(""); setMessage(""); }} />
-      {loading ? <Loading label="正在读取卖点标准" /> : (
+      {loading ? <Loading label="正在读取卖点标准……" /> : (
         <section className="page-stack selling-points-page">
           <section className="selling-point-summary" aria-labelledby="selling-point-summary-title">
             <header className="selling-point-summary-head">
@@ -223,6 +246,11 @@ export default function SellingPointsPage() {
                 (sum, point) => sum + (sceneHits(point, family.scene)?.primary_hits ?? 0),
                 0,
               );
+              const windowPrimaryHits = familyPoints.reduce(
+                (sum, point) => sum + (point.window_hits?.[statWindow]?.[family.scene]?.primary_hits ?? 0),
+                0,
+              );
+              const sceneDenominators = data.windows?.[statWindow]?.scene_denominators?.[family.scene];
               return (
                 <section className="selling-point-family" data-family={family.code} key={family.code} aria-labelledby={`selling-point-family-${family.code}`}>
                   <header className="selling-point-family-head">
@@ -232,11 +260,32 @@ export default function SellingPointsPage() {
                         <h2 id={`selling-point-family-${family.code}`}><b>{family.code}</b> {family.title}</h2>
                       </div>
                     </div>
-                    <p className="selling-point-family-meta">
-                      {familyPoints.length} 个一级类目
-                      <span aria-hidden>·</span>
-                      {draftMode ? "草稿版本" : familyHasHits ? `${primaryHits.toLocaleString("zh-CN")} 次 primary 命中` : "暂无命中统计"}
-                    </p>
+                    <div className="selling-point-family-side">
+                      <p className="selling-point-family-meta">
+                        {familyPoints.length} 个一级类目
+                        <span aria-hidden>·</span>
+                        {draftMode
+                          ? "草稿版本"
+                          : data.windows
+                            ? `${statWindowLabels[statWindow]} ${windowPrimaryHits.toLocaleString("zh-CN")} 次 primary 命中`
+                            : familyHasHits
+                              ? `${primaryHits.toLocaleString("zh-CN")} 次 primary 命中`
+                              : "暂无命中统计"}
+                      </p>
+                      <span className="selling-point-window-control">
+                        <label htmlFor={`selling-point-window-${family.code}`}>统计窗口</label>
+                        <select
+                          id={`selling-point-window-${family.code}`}
+                          className="selling-point-window-select"
+                          value={statWindow}
+                          onChange={(event) => setStatWindow(event.target.value as WindowKey)}
+                        >
+                          {(Object.keys(statWindowLabels) as WindowKey[]).map((key) => (
+                            <option key={key} value={key}>{statWindowLabels[key]}</option>
+                          ))}
+                        </select>
+                      </span>
+                    </div>
                   </header>
                   <div className="selling-point-table-wrap" role="region" aria-label={`${family.code} ${family.title}卖点标准表格`} tabIndex={0}>
                     <table className="selling-point-table">
@@ -246,6 +295,12 @@ export default function SellingPointsPage() {
                         <col className="selling-point-label-col" />
                         <col className="selling-point-scope-col" />
                         <col className="selling-point-hit-col" />
+                        {statChannels.map((channel) => (
+                          <Fragment key={channel.key}>
+                            <col className="selling-point-share-col" />
+                            <col className="selling-point-share-col" />
+                          </Fragment>
+                        ))}
                         <col className="selling-point-action-col" />
                       </colgroup>
                       <thead>
@@ -254,12 +309,20 @@ export default function SellingPointsPage() {
                           <th scope="col">卖点标准</th>
                           <th scope="col">层级与适用范围</th>
                           <th scope="col">命中统计</th>
+                          {statChannels.map((channel) => (
+                            <Fragment key={channel.key}>
+                              <th scope="col">{channel.label}条数占比</th>
+                              <th scope="col">{channel.label}曝光占比</th>
+                            </Fragment>
+                          ))}
                           <th scope="col">操作</th>
                         </tr>
                       </thead>
                       <tbody>
                         {familyPoints.map((point) => {
                           const pointSceneHits = sceneHits(point, family.scene);
+                          const pointWindowHits = point.window_hits?.[statWindow]?.[family.scene];
+                          const statsReady = !draftMode && Boolean(data.windows);
                           return (
                             <tr key={point.code}>
                               <th scope="row"><span className="selling-point-code-pill">{point.code}</span></th>
@@ -281,13 +344,52 @@ export default function SellingPointsPage() {
                                 </div>
                               </td>
                               <td>
-                                {draftMode || !pointSceneHits ? <span className="selling-point-hit-empty">—</span> : (
+                                {statsReady ? (
+                                  <span className="selling-point-hit-value">
+                                    <strong>{(pointWindowHits?.primary_hits ?? 0).toLocaleString("zh-CN")}</strong>
+                                    <small>全部 {(pointWindowHits?.total_hits ?? 0).toLocaleString("zh-CN")}</small>
+                                  </span>
+                                ) : !draftMode && pointSceneHits ? (
                                   <span className="selling-point-hit-value">
                                     <strong>{pointSceneHits.primary_hits.toLocaleString("zh-CN")}</strong>
                                     <small>全部 {pointSceneHits.total_hits.toLocaleString("zh-CN")}</small>
                                   </span>
-                                )}
+                                ) : <span className="selling-point-hit-empty">—</span>}
                               </td>
+                              {statChannels.map((channel) => {
+                                const channelHits = pointWindowHits?.channels?.[channel.key];
+                                const channelDenominator = sceneDenominators?.[channel.key];
+                                const countShare = statsReady
+                                  ? formatShare(channelHits?.primary_hits ?? 0, channelDenominator?.publication_count)
+                                  : null;
+                                const exposureShare = statsReady
+                                  ? formatShare(channelHits?.primary_views ?? 0, channelDenominator?.valid_exposure_views)
+                                  : null;
+                                return (
+                                  <Fragment key={channel.key}>
+                                    <td>
+                                      <span
+                                        className={countShare ? "selling-point-share-value" : "selling-point-hit-empty"}
+                                        title={statsReady && channelDenominator?.publication_count
+                                          ? `${(channelHits?.primary_hits ?? 0).toLocaleString("zh-CN")} / ${channelDenominator.publication_count.toLocaleString("zh-CN")} 条发布`
+                                          : statsReady ? `${channel.label}窗口内无发布` : undefined}
+                                      >
+                                        {countShare ?? "—"}
+                                      </span>
+                                    </td>
+                                    <td>
+                                      <span
+                                        className={exposureShare ? "selling-point-share-value" : "selling-point-hit-empty"}
+                                        title={statsReady && channelDenominator?.valid_exposure_views
+                                          ? `${(channelHits?.primary_views ?? 0).toLocaleString("zh-CN")} / ${channelDenominator.valid_exposure_views.toLocaleString("zh-CN")} 次有效曝光`
+                                          : statsReady ? `${channel.label}窗口内无有效曝光` : undefined}
+                                      >
+                                        {exposureShare ?? "—"}
+                                      </span>
+                                    </td>
+                                  </Fragment>
+                                );
+                              })}
                               <td>
                                 <span className="selling-point-row-actions">
                                   <button className="text-button" disabled={saving} onClick={() => void beginPoint(point)}>编辑</button>

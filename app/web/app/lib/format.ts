@@ -23,6 +23,24 @@ export function formatDate(value: string | null | undefined) {
   }).format(new Date(value));
 }
 
+export function formatDateTime(value: string | null | undefined) {
+  if (!value) return "缺失";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "缺失";
+  const parts = new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+  }).formatToParts(date);
+  const get = (type: Intl.DateTimeFormatPartTypes) => parts.find((part) => part.type === type)?.value ?? "";
+  const day = `${get("year")}/${get("month")}/${get("day")}`;
+  const hour = get("hour") === "24" ? "00" : get("hour");
+  const minute = get("minute");
+  const second = get("second");
+  if (`${hour}${minute}${second}` === "000000") return day;
+  if (second === "00") return `${day} ${hour}:${minute}`;
+  return `${day} ${hour}:${minute}:${second}`;
+}
+
 const publishingStatuses = new Set<Metric["status"]>(["available", "sample_only"]);
 const numberFormat = new Intl.NumberFormat("zh-CN");
 
