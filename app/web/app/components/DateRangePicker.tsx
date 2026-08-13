@@ -92,17 +92,14 @@ export default function DateRangePicker({ start, end, onChange, disabled }: {
 
   const today = todayInShanghai();
   const presets = useMemo(() => buildPresets(today), [today]);
+  const visibleOpen = open && !disabled;
 
   useEffect(() => () => {
     if (closeTimer.current) clearTimeout(closeTimer.current);
   }, []);
 
   useEffect(() => {
-    if (disabled && open) setOpen(false);
-  }, [disabled, open]);
-
-  useEffect(() => {
-    if (!open) return;
+    if (!visibleOpen) return;
     function onPointerDown(event: MouseEvent) {
       if (rootRef.current && event.target instanceof Node && !rootRef.current.contains(event.target)) {
         setAnchor(null);
@@ -126,7 +123,7 @@ export default function DateRangePicker({ start, end, onChange, disabled }: {
       document.removeEventListener("mousedown", onPointerDown);
       document.removeEventListener("keydown", onKeyDown, true);
     };
-  }, [open, anchor]);
+  }, [visibleOpen, anchor]);
 
   function toggle() {
     if (disabled) return;
@@ -211,16 +208,16 @@ export default function DateRangePicker({ start, end, onChange, disabled }: {
     </div>;
   }
 
-  return <div className={`drp${open ? " open" : ""}`} ref={rootRef}>
-    <button type="button" className="drp-field" onClick={toggle} disabled={disabled} aria-expanded={open} aria-haspopup="dialog">
+  return <div className={`drp${visibleOpen ? " open" : ""}`} ref={rootRef}>
+    <button type="button" className="drp-field" onClick={toggle} disabled={disabled} aria-expanded={visibleOpen} aria-haspopup="dialog">
       <span className="drp-field-value">
         <svg className="drp-field-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" aria-hidden="true"><rect x="3" y="4.5" width="14" height="12.5" rx="2" /><path d="M3 8.5h14M7 2.5v3.5M13 2.5v3.5" /></svg>
         {formatDate(start)}<span className="drp-field-sep">—</span>{formatDate(end)}
         <span className="drp-field-days">共 {dayCount(start, end)} 天</span>
       </span>
-      <span className="drp-field-caret" aria-hidden="true">{open ? "▴" : "▾"}</span>
+      <span className="drp-field-caret" aria-hidden="true">{visibleOpen ? "▴" : "▾"}</span>
     </button>
-    {open && <div className="drp-panel" role="dialog" aria-label="选择报告日期区间">
+    {visibleOpen && <div className="drp-panel" role="dialog" aria-label="选择报告日期区间">
       <div className="drp-body">
         <div className="drp-presets" role="listbox" aria-label="快捷区间">
           {presets.map((preset) => <button

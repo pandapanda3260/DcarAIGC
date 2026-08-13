@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
-from passlib.hash import sha512_crypt
+from passlib.hash import sha512_crypt  # type: ignore[import-untyped]
 from starlette.background import BackgroundTask
 from starlette.responses import Response
 
@@ -636,8 +636,8 @@ def create_app(
             if await username_for(request):
                 return _no_store(RedirectResponse(return_to, status_code=303))
             html = resolved.login_template_path.read_text(encoding="utf-8")
-            response = HTMLResponse(html)
-            response.headers.update(
+            login_page_response = HTMLResponse(html)
+            login_page_response.headers.update(
                 {
                     "Content-Security-Policy": (
                         "default-src 'self'; style-src 'unsafe-inline'; "
@@ -650,7 +650,7 @@ def create_app(
                     "X-Frame-Options": "DENY",
                 }
             )
-            return _no_store(response)
+            return _no_store(login_page_response)
 
         if stripped == "/auth/login":
             if request.method != "POST":
@@ -712,8 +712,8 @@ def create_app(
             token = await asyncio.to_thread(
                 sessions.create, username, fingerprint, ttl
             )
-            response = JSONResponse({"redirect_to": return_to})
-            response.set_cookie(
+            login_success_response = JSONResponse({"redirect_to": return_to})
+            login_success_response.set_cookie(
                 SESSION_COOKIE,
                 token,
                 max_age=ttl if remember else None,
@@ -722,7 +722,7 @@ def create_app(
                 httponly=True,
                 samesite="lax",
             )
-            return _no_store(response)
+            return _no_store(login_success_response)
 
         if stripped == "/auth/logout":
             if request.method != "POST":
@@ -735,25 +735,27 @@ def create_app(
                 )
             token = request.cookies.get(SESSION_COOKIE, "")
             await asyncio.to_thread(sessions.revoke, token)
-            response = JSONResponse({"redirect_to": resolved.route("/login")})
-            _delete_session_cookie(response, resolved)
-            return _no_store(response)
+            logout_response = JSONResponse({"redirect_to": resolved.route("/login")})
+            _delete_session_cookie(logout_response, resolved)
+            return _no_store(logout_response)
 
         if stripped == "/auth/session":
             if request.method != "GET":
                 return Response(status_code=405)
-            username = await username_for(request)
-            if not username:
+            authenticated_username = await username_for(request)
+            if not authenticated_username:
                 return unauthenticated(request, "/api/auth/session")
             return _no_store(
-                JSONResponse({"authenticated": True, "username": username})
+                JSONResponse(
+                    {"authenticated": True, "username": authenticated_username}
+                )
             )
 
         if stripped.startswith("/auth/"):
             return Response(status_code=404)
 
-        username = await username_for(request)
-        if not username:
+        authenticated_username = await username_for(request)
+        if not authenticated_username:
             return unauthenticated(request, stripped)
 
         if stripped == "/api" or stripped.startswith("/api/"):
@@ -762,14 +764,14 @@ def create_app(
                 upstream_base=resolved.api_upstream,
                 upstream_path=stripped,
                 client=request.app.state.api_client,
-                username=username,
+                username=authenticated_username,
             )
         return await proxy_request(
             request,
             upstream_base=resolved.web_upstream,
             upstream_path=request.url.path,
             client=request.app.state.web_client,
-            username=username,
+            username=authenticated_username,
         )
 
     return application

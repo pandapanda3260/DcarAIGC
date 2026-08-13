@@ -1,2 +1,1 @@
 """Dcar Sentinel authentication gateway."""
-

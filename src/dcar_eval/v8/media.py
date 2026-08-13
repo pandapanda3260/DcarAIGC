@@ -2847,19 +2847,19 @@ def _download_images(
                 MediaProcessingError,
             ) as exc:
                 response_size = 0
-                response_sha256: Optional[str] = None
+                failure_response_sha256: Optional[str] = None
                 partial_spool = getattr(exc, "_media_response_spool", None)
                 if isinstance(partial_spool, _SpooledResponse):
                     failure_spool = partial_spool
                     _after_bounded_response_write(temporary)
                     response_size = partial_spool.byte_size
-                    response_sha256 = partial_spool.sha256
+                    failure_response_sha256 = partial_spool.sha256
                 if os.path.lexists(temporary):
                     raise MediaProcessingError(
                         "failed image response candidate path is occupied or aliased"
                     ) from exc
-                if response_sha256 is None and response_opened:
-                    response_sha256 = hashlib.sha256(b"").hexdigest()
+                if failure_response_sha256 is None and response_opened:
+                    failure_response_sha256 = hashlib.sha256(b"").hexdigest()
                 attempts.append(
                     {
                         "attempt_index": attempt_index,
@@ -2867,7 +2867,7 @@ def _download_images(
                         "profile": str(candidate["profile"]),
                         "url_sha256": str(candidate["url_sha256"]),
                         "outcome": "request_failed",
-                        "response_sha256": response_sha256,
+                        "response_sha256": failure_response_sha256,
                         "byte_size": response_size,
                         "error": type(exc).__name__,
                     }
@@ -4625,6 +4625,9 @@ def process_image_evidence(
             validated_frame_paths=validated_frame_paths,
         )
 
+    def revalidate_without_result(connection: sqlite3.Connection) -> None:
+        revalidate(connection)
+
     def validate_cached_ocr(
         _connection: sqlite3.Connection,
         _artifact: Artifact,
@@ -4647,8 +4650,8 @@ def process_image_evidence(
         processor_version=versions["ocr"],
         artifact_type="ocr",
         produce=produce_ocr,
-        claim_validator=lambda connection: revalidate(connection),
-        commit_validator=lambda connection: revalidate(connection),
+        claim_validator=revalidate_without_result,
+        commit_validator=revalidate_without_result,
         expected_output_path=target,
         expected_output_root=effective_media_root,
         cached_validator=validate_cached_ocr,

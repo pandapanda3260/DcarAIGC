@@ -1030,7 +1030,7 @@ def rollback_snapshot(
                 config,
                 source,
                 names,
-                remove_absent=DATABASE_NAMES,
+                remove_absent=tuple(sorted(DATABASE_NAMES)),
             )
             _restore_artifacts(config, source, source_artifact_changes)
             service_action("start")
@@ -1046,7 +1046,7 @@ def rollback_snapshot(
                         config,
                         safety_backup,
                         current_names,
-                        remove_absent=DATABASE_NAMES,
+                        remove_absent=tuple(sorted(DATABASE_NAMES)),
                     )
                     _restore_artifacts(
                         config,

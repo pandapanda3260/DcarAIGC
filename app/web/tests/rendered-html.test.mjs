@@ -309,7 +309,7 @@ test("selling point standards use E/X/M scenes, scene-local hits, and matcher-on
   assert.match(styles, /selling-points-hero-bg\.png/);
   assert.match(styles, /\.selling-point-summary-grid\s*\{[^}]*grid-template-columns:\s*repeat\(3,/);
   assert.doesNotMatch(styles, /data-family="C"|data-family="OTHER"/);
-  assert.match(styles, /\.selling-point-table\s*\{[^}]*min-width:\s*940px;/);
+  assert.match(styles, /\.selling-point-table\s*\{[^}]*min-width:\s*1080px;/);
   assert.match(styles, /@media \(max-width:\s*480px\)/);
   const response = await render("/selling-points");
   const html = await response.text();
@@ -347,7 +347,7 @@ test("routes preserve operations and expose evidence-backed review controls", as
   assert.match(accounts, /<PlatformHeaderMark platformKey=\{key\} \/>/);
   assert.match(accounts, /data-platform-columns=\{key\}/);
   assert.match(formatSource, /platformKeys = \["douyin", "xiaohongshu", "wechat_channels", "kuaishou"\]/);
-  assert.match(accounts, /<th className="account-platform-start" scope="col">UID<\/th><th scope="col">是否实名<\/th><th scope="col">昵称<\/th><th scope="col">粉丝量<\/th><th scope="col">关联内容量<\/th>/);
+  assert.match(accounts, /<th className="account-platform-start" scope="col">UID<\/th><th scope="col">是否实名<\/th><th scope="col">昵称<\/th><th className="account-number-cell" scope="col">粉丝量<\/th><th className="account-number-cell" scope="col">关联内容量<\/th>/);
   assert.match(accounts, /<th className="account-sticky account-phone" scope="row"><strong>\{item\.phone\}<\/strong><\/th>/);
   assert.match(accounts, /<AccountPlatformCells account=\{item\} \/>/);
   assert.match(apiSource, /NULL follower_count/);

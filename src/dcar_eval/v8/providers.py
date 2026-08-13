@@ -1095,7 +1095,7 @@ def _parse_douyin_stage_payload(
         text = " ".join(str(item.get("text") or "").split())[:2000]
         if not text:
             continue
-        comment = {
+        comment: Dict[str, Any] = {
             "platform_comment_id": str(item.get("cid") or ""),
             "anonymous_user_key": hasher.user_key("douyin", content_id, raw_user),
             "pseudonymous_user_key": platform_hasher.user_key("douyin", raw_user),
@@ -1224,7 +1224,7 @@ def _sanitize_xhs_comments(
                 :2000
             ]
             if body:
-                comment = {
+                comment: Dict[str, Any] = {
                     "platform_comment_id": comment_id,
                     "anonymous_user_key": hasher.user_key(
                         "xiaohongshu", content_id, raw_user
