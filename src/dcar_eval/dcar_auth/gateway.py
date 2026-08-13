@@ -368,6 +368,28 @@ def _stripped_path(path: str, base_path: str) -> Optional[str]:
     return None
 
 
+def _web_upstream_path(
+    path: str, stripped_path: str, raw_path: bytes
+) -> Optional[str]:
+    # Vinext keeps page and public-file routes under the configured base path,
+    # but serves generated Vite bundles from its root-level /assets directory.
+    if stripped_path == "/assets" or stripped_path.startswith("/assets/"):
+        segments = stripped_path.split("/")
+        if (
+            raw_path != path.encode("utf-8")
+            or any(segment in {"", ".", ".."} for segment in segments[2:])
+            or "\\" in stripped_path
+            or "%" in stripped_path
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in stripped_path
+            )
+        ):
+            return None
+        return stripped_path
+    return path
+
+
 def _safe_return_to(value: str, config: AuthGatewayConfig) -> str:
     fallback = config.route("/overview")
     if not value or not value.startswith("/") or value.startswith("//"):
@@ -588,7 +610,7 @@ def create_app(
                 JSONResponse({"detail": "上游服务暂时不可用"}, status_code=502)
             )
         response = StreamingResponse(
-            upstream.aiter_bytes(),
+            upstream.aiter_raw(),
             status_code=upstream.status_code,
             background=BackgroundTask(upstream.aclose),
         )
@@ -766,10 +788,17 @@ def create_app(
                 client=request.app.state.api_client,
                 username=authenticated_username,
             )
+        web_upstream_path = _web_upstream_path(
+            request.url.path,
+            stripped,
+            request.scope.get("raw_path", request.url.path.encode("utf-8")),
+        )
+        if web_upstream_path is None:
+            return Response(status_code=404)
         return await proxy_request(
             request,
             upstream_base=resolved.web_upstream,
-            upstream_path=request.url.path,
+            upstream_path=web_upstream_path,
             client=request.app.state.web_client,
             username=authenticated_username,
         )

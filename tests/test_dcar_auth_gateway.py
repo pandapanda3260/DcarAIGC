@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import hashlib
 import sqlite3
 import sys
@@ -11,7 +12,7 @@ from typing import Iterator
 from unittest.mock import patch
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.testclient import TestClient
 from httpx import ASGITransport
 from passlib.hash import sha512_crypt
@@ -26,6 +27,7 @@ from dcar_auth import gateway as auth_gateway  # noqa: E402
 ORIGIN = "https://dcar.test"
 USERNAME = "operator"
 PASSWORD = "correct-password"
+COMPRESSED_BODY = b"compressed proxy response\n" * 128
 REAL_VALIDATE_SOURCE = auth_gateway.HtpasswdVerifier.validate_source
 REAL_VERIFY = auth_gateway.HtpasswdVerifier.verify
 REAL_CREDENTIAL_IS_CURRENT = auth_gateway.HtpasswdVerifier.credential_is_current
@@ -43,6 +45,24 @@ def _echo_upstream(name: str) -> FastAPI:
         methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     )
     async def echo(request: Request, path: str) -> JSONResponse:
+        if request.url.path.endswith("/compressed.txt"):
+            return Response(
+                gzip.compress(COMPRESSED_BODY),
+                media_type="text/plain",
+                headers={"Content-Encoding": "gzip", "ETag": '"compressed"'},
+            )
+        if request.url.path.endswith("/range.bin"):
+            if request.headers.get("range") != "bytes=0-3":
+                return Response(status_code=400)
+            return Response(
+                b"0123",
+                status_code=206,
+                media_type="application/octet-stream",
+                headers={
+                    "Accept-Ranges": "bytes",
+                    "Content-Range": "bytes 0-3/10",
+                },
+            )
         del path
         body = await request.body()
         return JSONResponse(
@@ -433,6 +453,72 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
                 self.assertEqual(api.json()["authenticated_user"], USERNAME)
                 self.assertIsNone(api.json()["authorization"])
                 self.assertIsNone(api.json()["cookie"])
+
+    def test_proxy_strips_base_path_only_for_generated_web_assets(self) -> None:
+        with self._client("/dcar") as (client, _config):
+            self.assertEqual(self._login(client, "/dcar").status_code, 200)
+
+            generated_asset = client.get("/dcar/assets/app.css?v=1")
+            self.assertEqual(generated_asset.status_code, 200)
+            self.assertEqual(generated_asset.json()["upstream"], "web")
+            self.assertEqual(generated_asset.json()["path"], "/assets/app.css")
+            self.assertEqual(generated_asset.json()["query"], "v=1")
+
+            public_asset = client.get("/dcar/dongchedi-app-icon.svg")
+            self.assertEqual(public_asset.status_code, 200)
+            self.assertEqual(public_asset.json()["upstream"], "web")
+            self.assertEqual(
+                public_asset.json()["path"], "/dcar/dongchedi-app-icon.svg"
+            )
+
+            for path in ("/dcar/assets2/app.css", "/dcar/_vinext/image"):
+                with self.subTest(path=path):
+                    response = client.get(path)
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.json()["path"], path)
+
+            for unsafe_path in (
+                "/dcar/assets/%2e%2e/secret",
+                "/dcar/assets%2F..%2Fsecret",
+                "/dcar/assets/%25252e%25252e/secret",
+                "/dcar/assets/foo%5cbar.js",
+                "/dcar/assets/foo%3fbar.js",
+                "/dcar/assets/foo%23bar.js",
+                "/dcar/assets/foo%7fbar.js",
+                "/dcar/%61ssets/app.css",
+                "/dcar/assets/foo%25bar.js",
+                "/dcar/assets/foo//bar.js",
+            ):
+                with self.subTest(unsafe_path=unsafe_path):
+                    self.assertEqual(client.get(unsafe_path).status_code, 404)
+
+        with self._client("") as (client, _config):
+            self.assertEqual(self._login(client, "").status_code, 200)
+            root_asset = client.get("/assets/app.css")
+            self.assertEqual(root_asset.status_code, 200)
+            self.assertEqual(root_asset.json()["path"], "/assets/app.css")
+
+    def test_proxy_preserves_encoded_and_partial_response_bytes(self) -> None:
+        with self._client("/dcar") as (client, _config):
+            self.assertEqual(self._login(client, "/dcar").status_code, 200)
+
+            compressed = client.get("/dcar/compressed.txt")
+            self.assertEqual(compressed.status_code, 200)
+            self.assertEqual(compressed.content, COMPRESSED_BODY)
+            self.assertEqual(compressed.headers.get("content-encoding"), "gzip")
+            self.assertEqual(compressed.headers.get("etag"), '"compressed"')
+            self.assertEqual(
+                int(compressed.headers["content-length"]),
+                len(gzip.compress(COMPRESSED_BODY)),
+            )
+
+            partial = client.get(
+                "/dcar/range.bin", headers={"Range": "bytes=0-3"}
+            )
+            self.assertEqual(partial.status_code, 206)
+            self.assertEqual(partial.content, b"0123")
+            self.assertEqual(partial.headers.get("accept-ranges"), "bytes")
+            self.assertEqual(partial.headers.get("content-range"), "bytes 0-3/10")
 
     def test_sha512_htpasswd_verification_and_credential_rotation(self) -> None:
         stored = sha512_crypt.using(salt="testauthsalt", rounds=5000).hash(PASSWORD)
