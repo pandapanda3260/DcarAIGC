@@ -6,6 +6,7 @@ import hashlib
 import http.client
 import json
 import math
+import os
 import socket
 import ssl
 import urllib.error
@@ -49,6 +50,7 @@ from .identity import (
 from .media import (
     get_media_source_state,
     is_supported_media_url,
+    processor_versions,
     process_content_media,
     recover_stale_media_processing_slots,
     store_media_source_manifest,
@@ -120,6 +122,12 @@ class ProviderConfigurationError(RuntimeError):
 
 
 def _load_key(path: Path, variable: str) -> str:
+    direct_value = os.environ.get(variable, "").strip()
+    if direct_value:
+        return direct_value
+    configured_path = os.environ.get(f"{variable}_FILE", "").strip()
+    if configured_path:
+        path = Path(configured_path).expanduser()
     if not path.is_file():
         raise ProviderConfigurationError(f"供应商凭据文件不存在：{path}")
     text = path.read_text(encoding="utf-8-sig").strip()
@@ -3296,7 +3304,9 @@ def retry_content_media(
     """Retry local processing first, then one explicit paid lifetime source refresh."""
 
     stale_recovery = recover_stale_media_processing_slots(
-        db_path=db_path, content_ids=(content_id,)
+        db_path=db_path,
+        processor_version_by_type=processor_versions(),
+        content_ids=(content_id,),
     )
     source_before = get_media_source_state(content_id, db_path=db_path)
     download_before = (

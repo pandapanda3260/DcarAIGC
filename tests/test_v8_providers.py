@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import http.client
+import os
 import tempfile
 import unittest
 from datetime import date
@@ -19,6 +20,7 @@ from v8.matcher_dsl import POINT_IDS, POINT_SCENES
 from v8.operations import IdentityConflictError, upsert_account, upsert_content
 from v8.providers import (
     ProviderConfigurationError,
+    _load_key,
     _collect_media_urls,
     _douyin_discovery_call,
     _douyin_image_url_groups,
@@ -42,6 +44,39 @@ from v8.taxonomy_rule_backfill import backfill_v5_1_matcher_rules
 
 
 VALID_SEC_UID = "MS4wLjAB" + "A" * 68
+
+
+class ProviderCredentialLoadingTest(unittest.TestCase):
+    def test_direct_environment_value_takes_precedence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            configured = Path(temp) / "configured.key"
+            configured.write_text("file-value\n", encoding="utf-8")
+            with patch.dict(
+                os.environ,
+                {
+                    "TEST_PROVIDER_KEY": "  direct-value  ",
+                    "TEST_PROVIDER_KEY_FILE": str(configured),
+                },
+                clear=True,
+            ):
+                self.assertEqual(
+                    _load_key(Path(temp) / "default.key", "TEST_PROVIDER_KEY"),
+                    "direct-value",
+                )
+
+    def test_environment_file_path_overrides_local_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            configured = Path(temp) / "configured.key"
+            configured.write_text("file-value\n", encoding="utf-8")
+            with patch.dict(
+                os.environ,
+                {"TEST_PROVIDER_KEY_FILE": str(configured)},
+                clear=True,
+            ):
+                self.assertEqual(
+                    _load_key(Path(temp) / "missing-default.key", "TEST_PROVIDER_KEY"),
+                    "file-value",
+                )
 
 
 class V8ProviderUpdateTest(unittest.TestCase):
@@ -2618,6 +2653,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
 
         recover.assert_called_once_with(
             db_path=self.db,
+            processor_version_by_type=media_module.processor_versions(),
             content_ids=(self.content_id,),
         )
         self.assertEqual(result["stale_recovery"], recovery)

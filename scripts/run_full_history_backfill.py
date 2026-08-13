@@ -335,7 +335,7 @@ def gate_environment() -> None:
 
 
 def gate_services_stopped() -> None:
-    for port in (4173, 8765):
+    for port in (4173, 4174, 8765):
         with socket.socket() as probe:
             probe.settimeout(0.2)
             if probe.connect_ex(("127.0.0.1", port)) == 0:
@@ -549,10 +549,13 @@ def phase_recover_stale_slots(state: Dict[str, Any]) -> None:
     if source_root not in sys.path:
         sys.path.insert(0, source_root)
     from v8.capture import recover_stale_fetch_slots
-    from v8.media import recover_stale_media_processing_slots
+    from v8.media import processor_versions, recover_stale_media_processing_slots
 
     fetch = recover_stale_fetch_slots(db_path=DB)
-    media = recover_stale_media_processing_slots(db_path=DB)
+    media = recover_stale_media_processing_slots(
+        db_path=DB,
+        processor_version_by_type=processor_versions(),
+    )
     connection = open_readonly_database(DB)
     try:
         fresh_fetch = int(

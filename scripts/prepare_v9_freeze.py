@@ -496,7 +496,7 @@ def create_freeze_bundle(
     database: Path,
     output_root: Path,
     freeze_lock: Path,
-    protected_ports: Iterable[int] = (4173, 8765),
+    protected_ports: Iterable[int] = (4173, 4174, 8765),
     require_no_writer_handles: bool = True,
 ) -> Path:
     database = database.resolve()

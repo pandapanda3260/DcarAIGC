@@ -79,7 +79,17 @@ export type OverviewWindow = {
   unassociated_content_count: number;
   metrics: Record<string, Metric>;
   channels: Record<OverviewChannelKey, OverviewChannel>;
-  empty_explanation: string;
+};
+
+export type DataFreshness = {
+  status: "current" | "stale" | "unknown";
+  latest_published_at: string | null;
+  last_successful_capture_at: string | null;
+  latest_capture_run: {
+    scheduled_for: string;
+    status: "running" | "succeeded" | "failed" | "skipped";
+    completed_at: string | null;
+  } | null;
 };
 
 export type Overview = {
@@ -88,6 +98,7 @@ export type Overview = {
   generated_at: string;
   timezone: string;
   windows: Record<WindowKey, OverviewWindow>;
+  data_freshness: DataFreshness;
   data_quality: {
     missing_published_at: number;
     pending_reviews: number;
@@ -211,6 +222,7 @@ export type EvidenceBundle = {
   evaluation_is_stale: boolean;
   evaluation: Record<string, unknown> | null;
   media: Array<{ artifact_id: number; index: number; kind: "video" | "image"; name: string; url: string }>;
+  media_availability: { status: "available" | "omitted" | "missing"; reason: string };
   asr: { status: string; model: string | null; text: string };
   ocr: { status: string; observation_count: number; text: string };
   comments: {

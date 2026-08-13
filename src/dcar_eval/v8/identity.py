@@ -20,6 +20,7 @@ import importlib
 import os
 import secrets
 import sqlite3
+import stat
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
@@ -45,12 +46,18 @@ class PlatformUserHasher:
     def _load_or_create(self) -> bytes:
         self.salt_path.parent.mkdir(parents=True, exist_ok=True)
         if self.salt_path.exists():
+            if self.salt_path.is_symlink() or not self.salt_path.is_file():
+                raise ValueError("platform user salt must be a regular file")
             value = self.salt_path.read_bytes()
             if len(value) < 32:
                 raise ValueError(
                     "platform user salt must contain at least 32 bytes"
                 )
-            os.chmod(self.salt_path, 0o600)
+            mode = stat.S_IMODE(self.salt_path.stat().st_mode)
+            if mode not in {0o600, 0o640}:
+                if os.environ.get("DCAR_READ_ONLY") == "1":
+                    raise PermissionError("platform user salt permissions are unsafe")
+                os.chmod(self.salt_path, 0o600)
             return value
         value = secrets.token_bytes(32)
         descriptor = os.open(

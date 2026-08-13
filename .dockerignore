@@ -18,6 +18,8 @@
 !src/dcar_eval/three_proposition_scoring.py
 !src/dcar_eval/v8/
 !src/dcar_eval/v8/**
+!src/dcar_eval/dcar_auth/
+!src/dcar_eval/dcar_auth/**
 !src/dcar_eval/workflow/
 !src/dcar_eval/workflow/__init__.py
 !src/dcar_eval/workflow/contracts.py

@@ -3,13 +3,14 @@ import Image from "next/image";
 import type { ReactNode } from "react";
 import type { Section } from "../lib/types";
 import { publicAssetPath } from "../lib/paths";
+import LogoutButton from "./LogoutButton";
 
 const navItems: Array<{ id: Section; label: string; href: string }> = [
   { id: "overview", label: "概览", href: "/overview" },
-  { id: "tasks", label: "任务", href: "/tasks" },
-  { id: "accounts", label: "账号", href: "/accounts" },
   { id: "contents", label: "内容", href: "/contents" },
+  { id: "accounts", label: "账号", href: "/accounts" },
   { id: "selling-points", label: "卖点", href: "/selling-points" },
+  { id: "tasks", label: "任务", href: "/tasks" },
 ];
 
 const navIconShapes: Record<Section, ReactNode> = {
@@ -50,7 +51,7 @@ export default function AppShell({ active, actions, children }: { active: Sectio
             </Link>
           ))}
         </nav>
-        <div className="sidebar-foot"><i className="live-dot online" /><div><strong>本地数据模式</strong><span>供应商调用受预算与幂等槽保护</span></div></div>
+        <div className="sidebar-foot"><i className="live-dot online" /><div><strong>数据服务正常</strong></div><LogoutButton /></div>
       </aside>
       <main className="main-area" data-section={active}>
         {["contents", "accounts", "tasks"].includes(active) ? <h1 className="visually-hidden">{copy.title}</h1> : <header className="topbar" data-section={active}>

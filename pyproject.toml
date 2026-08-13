@@ -9,6 +9,7 @@ dependencies = [
   "imagehash==4.3.2",
   "mlx==0.32.0",
   "mlx-whisper==0.4.3",
+  "passlib==1.7.4",
   "pillow==12.3.0",
   "pydantic==2.11.8",
   "uvicorn==0.34.0",

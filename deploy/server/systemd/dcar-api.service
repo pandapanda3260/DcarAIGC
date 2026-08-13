@@ -1,7 +1,8 @@
 [Unit]
-Description=DcarAIGC phase-1 API
+Description=DcarAIGC read-replica API
 After=network-online.target
 Wants=network-online.target
+ConditionFileNotEmpty=/var/lib/dcar-aigc/db/dcar_insight.sqlite3
 
 [Service]
 Type=simple
@@ -10,17 +11,17 @@ Group=dcar-aigc
 WorkingDirectory=/var/www/dcar-aigc/current
 EnvironmentFile=/etc/dcar-aigc/dcar.env
 Environment=PYTHONPATH=/var/www/dcar-aigc/current/src/dcar_eval
-ExecStart=/var/www/dcar-aigc/runtime/venv/bin/python -m uvicorn v8.api:app --app-dir /var/www/dcar-aigc/current/src/dcar_eval --host 127.0.0.1 --port 8765 --workers 1 --no-access-log
+ExecStart=/var/www/dcar-aigc/current/.venv/bin/python -m uvicorn v8.api:app --app-dir /var/www/dcar-aigc/current/src/dcar_eval --host 127.0.0.1 --port 8765 --workers 1 --no-access-log
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s
 KillSignal=SIGTERM
 UMask=0027
 
-BindPaths=/var/lib/dcar-aigc/db:/var/www/dcar-aigc/current/app/data
-BindPaths=/var/lib/dcar-aigc/reports:/var/www/dcar-aigc/current/reports
-BindPaths=/var/lib/dcar-aigc/cache:/var/www/dcar-aigc/current/data/cache
-ReadWritePaths=/var/lib/dcar-aigc
+BindReadOnlyPaths=/var/lib/dcar-aigc/db:/var/www/dcar-aigc/current/app/data
+BindReadOnlyPaths=/var/lib/dcar-aigc/reports:/var/www/dcar-aigc/current/reports
+BindReadOnlyPaths=/var/lib/dcar-aigc/cache:/var/www/dcar-aigc/current/data/cache
+ReadOnlyPaths=/var/lib/dcar-aigc/db /var/lib/dcar-aigc/reports /var/lib/dcar-aigc/cache /var/lib/dcar-aigc/runtime
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true

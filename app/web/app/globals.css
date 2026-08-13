@@ -42,12 +42,17 @@ button:disabled { cursor: not-allowed; opacity: .55; transform: none !important;
 .sidebar nav a .nav-icon { width: 20px; height: 20px; flex: 0 0 20px; display: block; }
 .sidebar nav a:hover { background: #173b45; color: #fff; }
 .sidebar nav a.active { background: var(--dcd-brand); color: var(--dcd-on-brand); }
-.sidebar-foot { margin-top: auto; padding: 15px 10px 6px; border-top: 1px solid rgba(255,255,255,.09); display: flex; align-items: flex-start; gap: 9px; }
+.sidebar-foot { position: relative; margin-top: auto; padding: 15px 10px 6px; border-top: 1px solid rgba(255,255,255,.09); display: flex; align-items: center; gap: 9px; }
 .sidebar-foot strong, .sidebar-foot span { display: block; }
 .sidebar-foot strong { color: #d8e5e8; font-size: 11px; }
 .sidebar-foot div span { margin-top: 4px; color: #759098; font-size: 10px; }
-.live-dot { width: 8px; height: 8px; margin-top: 3px; border-radius: 50%; background: #d29a45; box-shadow: 0 0 0 4px rgba(210,154,69,.13); }
+.live-dot { width: 8px; height: 8px; flex: 0 0 8px; border-radius: 50%; background: #d29a45; box-shadow: 0 0 0 4px rgba(210,154,69,.13); }
 .live-dot.online { background: #5dd9a7; box-shadow: 0 0 0 4px rgba(93,217,167,.13); }
+.sidebar-logout { margin-left: auto; align-self: center; width: 30px; height: 30px; flex: 0 0 30px; display: inline-flex; align-items: center; justify-content: center; padding: 0; border: 0; border-radius: 9px; background: transparent; color: #7d99a1; transition: .18s ease; }
+.sidebar-logout:hover { background: #173b45; color: #fff; }
+.sidebar-logout:focus-visible { outline: 2px solid var(--dcd-brand); outline-offset: 1px; }
+.sidebar-logout svg { width: 17px; height: 17px; display: block; }
+.sidebar-logout-error { position: absolute; right: 0; bottom: 48px; width: 190px; padding: 8px 10px; border: 1px solid rgba(255,173,173,.3); border-radius: 8px; background: #173b45; color: #ffd0d0; box-shadow: 0 8px 20px rgba(0, 0, 0, .22); font-size: 10px; line-height: 1.5; }
 
 .main-area { min-width: 0; padding: 0 34px 56px; }
 .topbar { min-height: 86px; display: flex; align-items: center; justify-content: space-between; gap: 24px; border-bottom: 1px solid var(--line); }
@@ -249,9 +254,13 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
 .guardrail-icon { width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center; background: var(--orange-soft); color: var(--orange); font-weight: 900; }
 .guardrail h3 { margin: 0 0 5px; font-size: 12px; }
 .guardrail p { margin: 0; color: #7c6c63; font-size: 10px; line-height: 1.6; }
-.loading-screen { position: fixed; inset: 0; z-index: 40; display: grid; place-content: start center; padding-top: 20vh; gap: 12px; text-align: center; color: #728187; pointer-events: none; }
-.loading-mark { width: 44px; height: 44px; margin: auto; border-radius: 13px; display: grid; place-items: center; background: var(--navy); color: #d9ff57; font-weight: 900; }
-.loading-screen p { font-size: 12px; }
+/* 加载态居中于正在加载的内容区（main-area），而非整个视口：侧边栏是已就绪的导航，不参与居中参照。
+   加载期间 main-area 只有 topbar + loading-screen，flex 让 loading-screen 撑满剩余可视高度；
+   padding-bottom 6vh 做光学居中——人眼感知的中心比几何中心高约 3~5%。 */
+.main-area:has(> .loading-screen) { display: flex; flex-direction: column; min-height: 100vh; min-height: 100dvh; }
+.loading-screen { flex: 1; display: grid; place-content: center; justify-items: center; gap: 12px; padding-bottom: 6vh; text-align: center; color: #728187; }
+.loading-mark { width: 44px; height: 44px; border-radius: 13px; display: grid; place-items: center; background: var(--navy); color: #d9ff57; font-weight: 900; }
+.loading-screen p { margin: 0; font-size: 12px; }
 
 .insight-shell .page-stack { max-width: 1360px; }
 .wide-stack { max-width: 1600px !important; }
@@ -610,6 +619,7 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
   .sidebar nav a { justify-content: center; gap: 0; padding: 11px; }
   .sidebar-foot div { display: none; }
   .sidebar-foot { justify-content: center; }
+  .sidebar-logout { margin-left: 0; }
   .metric-grid, .report-grid, .vertical-grid, .asset-grid { grid-template-columns: repeat(2, 1fr); }
   .hero-panel { grid-template-columns: 1fr; }
   .hero-summary { grid-template-columns: repeat(3, 1fr); border: 0; border-top: 1px solid rgba(255,255,255,.14); padding: 24px 0 0; }

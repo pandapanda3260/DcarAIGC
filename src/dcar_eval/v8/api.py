@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import json
 import logging
 import os
 import re
 import sqlite3
 import threading
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import unquote
@@ -45,7 +48,11 @@ from .evaluation_selectors import (
 )
 from .audience_rate import active_classifier_state, build_channel_audience_rates
 from .insights import CHANNELS, SCENES, build_channel_conclusions
-from .media import MediaProcessingError, recover_stale_media_processing_slots
+from .media import (
+    MediaProcessingError,
+    processor_versions,
+    recover_stale_media_processing_slots,
+)
 from .operations import (
     OperationError,
     content_identity,
@@ -100,6 +107,7 @@ from .taxonomy import (
 LOGGER = logging.getLogger("dcar.api")
 DEFAULT_LEGACY_DB = PROJECT_ROOT / "app" / "data" / "web_mvp.sqlite3"
 DEFAULT_OPERATOR_FREEZE_LOCK = PROJECT_ROOT / "runtime" / "operator-freeze.lock"
+DEFAULT_WRITER_LOCK = PROJECT_ROOT / "runtime" / "writer-worker.lock"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 LEGACY_REPORT_VERSION = "channel-structured-conclusions-v7.0"
 LEGACY_EXPORTS = {
@@ -124,8 +132,10 @@ class ApiConfig:
     reports_root: Path
     legacy_db_path: Path
     operator_freeze_lock: Path
+    writer_lock: Path = DEFAULT_WRITER_LOCK
     scheduler_enabled: bool = False
     startup_catchup_enabled: bool = False
+    read_only: bool = False
 
     @classmethod
     def from_env(cls) -> "ApiConfig":
@@ -143,8 +153,12 @@ class ApiConfig:
             operator_freeze_lock=Path(
                 freeze_value or str(DEFAULT_OPERATOR_FREEZE_LOCK)
             ),
+            writer_lock=Path(
+                os.environ.get("DCAR_WRITER_LOCK", str(DEFAULT_WRITER_LOCK))
+            ),
             scheduler_enabled=_enabled("DCAR_SCHEDULER_ENABLED"),
             startup_catchup_enabled=_enabled("DCAR_STARTUP_CATCHUP_ENABLED"),
+            read_only=_enabled("DCAR_READ_ONLY"),
         )
 
     @property
@@ -157,6 +171,11 @@ def _request_config(request: Request) -> ApiConfig:
     if not isinstance(config, ApiConfig):
         raise RuntimeError("FastAPI application is missing ApiConfig")
     return config
+
+
+def _connect_for_request(request: Request) -> sqlite3.Connection:
+    config = _request_config(request)
+    return connect(config.db_path, read_only=config.read_only)
 
 
 class InputValidationRequest(BaseModel):
@@ -286,7 +305,19 @@ class MediaProcessingSearchRequest(BaseModel):
 
 
 def _legacy_connect(legacy_db_path: Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(legacy_db_path, timeout=10)
+    if _enabled("DCAR_READ_ONLY"):
+        if not legacy_db_path.is_file():
+            raise RuntimeError(
+                f"read-only legacy SQLite database is missing: {legacy_db_path}"
+            )
+        connection = sqlite3.connect(
+            f"{legacy_db_path.resolve().as_uri()}?mode=ro&immutable=1",
+            uri=True,
+            timeout=10,
+        )
+        connection.execute("PRAGMA query_only = ON")
+    else:
+        connection = sqlite3.connect(legacy_db_path, timeout=10)
     connection.row_factory = sqlite3.Row
     return connection
 
@@ -551,9 +582,7 @@ def _window_summary(
             {
                 "content_id": content_id,
                 "platform": str(content["platform"]),
-                "content_direction": effective_direction(
-                    formal_content, evaluation
-                ),
+                "content_direction": effective_direction(formal_content, evaluation),
                 "evidence_level": evaluation.get("evidence_level"),
                 "selling_point_included": bool(
                     evaluation.get("selling_point_included")
@@ -583,9 +612,7 @@ def _window_summary(
         1 for row in evaluation_values if int(row["selling_point_included"]) == 1
     )
     view_values = [
-        int(row["view_count"])
-        for row in metric_values
-        if row["view_count"] is not None
+        int(row["view_count"]) for row in metric_values if row["view_count"] is not None
     ]
     comment_values = [
         int(row["comment_count"])
@@ -593,9 +620,7 @@ def _window_summary(
         if row["comment_count"] is not None
     ]
     view_coverage = round(len(view_values) * 100 / total, 2) if total else None
-    comment_coverage = (
-        round(len(comment_values) * 100 / total, 2) if total else None
-    )
+    comment_coverage = round(len(comment_values) * 100 / total, 2) if total else None
     views = sum(view_values)
     comments = sum(comment_values)
     ratio_status = (
@@ -605,20 +630,16 @@ def _window_summary(
         if eligible * 100 / total >= 95
         else "below_threshold"
     )
-    evaluation_coverage = (
-        round(eligible * 100 / total, 2) if total else None
-    )
+    evaluation_coverage = round(eligible * 100 / total, 2) if total else None
     evaluation_reason = (
         f"正式评估覆盖率为 {evaluation_coverage:.2f}%，低于 95% 发布阈值"
         if ratio_status == "below_threshold" and evaluation_coverage is not None
         else ""
     )
-    duplicate_status, duplicate_coverage, duplicate_reason = (
-        duplicate_metric_decision(
-            total,
-            fingerprint_count,
-            duplicate_calibrated,
-        )
+    duplicate_status, duplicate_coverage, duplicate_reason = duplicate_metric_decision(
+        total,
+        fingerprint_count,
+        duplicate_calibrated,
     )
     return {
         "period_start": start.isoformat(),
@@ -720,11 +741,6 @@ def _window_summary(
                 report_cutoff_at=report_cutoff_at,
             ),
         ),
-        "empty_explanation": (
-            "所选窗口没有进入有效监控范围的已发布内容，并非抓取故障。"
-            if total == 0
-            else ""
-        ),
     }
 
 
@@ -762,10 +778,105 @@ def _active_classifier_state(connection: sqlite3.Connection) -> str:
     return active_classifier_state(connection)
 
 
-def v8_overview(db_path: Path) -> Dict[str, Any]:
+def _parse_timestamp(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _data_freshness(
+    connection: sqlite3.Connection,
+    *,
+    current_at: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Summarize daily-capture freshness without treating backfills as daily runs."""
+
+    latest_published_at = connection.execute(
+        """
+        SELECT MAX(published_at) FROM content_items
+        WHERE platform IN ('douyin','xiaohongshu')
+        """
+    ).fetchone()[0]
+    last_successful_capture_at = connection.execute(
+        """
+        SELECT MAX(finished_at) FROM fetch_slots
+        WHERE stage='discovery' AND status='succeeded'
+          AND window_key GLOB
+              '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*'
+        """
+    ).fetchone()[0]
+    latest_capture_row = connection.execute(
+        """
+        SELECT scheduled_for,status,completed_at
+        FROM scheduler_runs
+        WHERE job_id='daily_capture'
+        ORDER BY scheduled_for DESC,id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+
+    captured_at = _parse_timestamp(last_successful_capture_at)
+    reference = current_at or datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    reference = reference.astimezone(timezone.utc)
+    if captured_at is not None:
+        status = (
+            "current" if reference - captured_at <= timedelta(hours=36) else "stale"
+        )
+    elif latest_published_at:
+        status = "stale"
+    else:
+        status = "unknown"
+
+    return {
+        "status": status,
+        "latest_published_at": latest_published_at,
+        "last_successful_capture_at": last_successful_capture_at,
+        "latest_capture_run": dict(latest_capture_row)
+        if latest_capture_row is not None
+        else None,
+    }
+
+
+def _database_state(connection: sqlite3.Connection) -> Dict[str, Any]:
+    """Return cheap snapshot identity fields used by deployment smoke checks."""
+
+    return {
+        "content_count": int(
+            connection.execute("SELECT COUNT(*) FROM content_items").fetchone()[0]
+        ),
+        "latest_published_at": connection.execute(
+            "SELECT MAX(published_at) FROM content_items"
+        ).fetchone()[0],
+        "user_version": int(connection.execute("PRAGMA user_version").fetchone()[0]),
+    }
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+@lru_cache(maxsize=2048)
+def _cached_file_sha256(path_value: str, byte_size: int, mtime_ns: int) -> str:
+    del byte_size, mtime_ns
+    return _file_sha256(Path(path_value))
+
+
+def v8_overview(db_path: Path, *, read_only: bool = False) -> Dict[str, Any]:
     overview_now = datetime.now(SHANGHAI)
     report_cutoff_at = now_utc()
-    with connect(db_path) as connection:
+    with connect(db_path, read_only=read_only) as connection:
         windows = {
             key: _window_summary(
                 connection,
@@ -831,6 +942,10 @@ def v8_overview(db_path: Path) -> Dict[str, Any]:
                 ).fetchone()[0]
             ),
         }
+        data_freshness = _data_freshness(
+            connection,
+            current_at=overview_now,
+        )
     return {
         "status": "ready",
         "report_version": CURRENT_REPORT_VERSION,
@@ -838,10 +953,13 @@ def v8_overview(db_path: Path) -> Dict[str, Any]:
         "timezone": "Asia/Shanghai",
         "windows": windows,
         "data_quality": quality,
+        "data_freshness": data_freshness,
     }
 
 
-def _account_search(payload: AccountSearchRequest, *, db_path: Path) -> Dict[str, Any]:
+def _account_search(
+    payload: AccountSearchRequest, *, db_path: Path, read_only: bool = False
+) -> Dict[str, Any]:
     where: List[str] = []
     parameters: List[Any] = []
     if payload.query:
@@ -868,7 +986,7 @@ def _account_search(payload: AccountSearchRequest, *, db_path: Path) -> Dict[str
         parameters.append(payload.platform)
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
     offset = (payload.page - 1) * payload.page_size
-    with connect(db_path) as connection:
+    with connect(db_path, read_only=read_only) as connection:
         active_release(connection)
         total = int(
             connection.execute(
@@ -942,7 +1060,9 @@ def _account_search(payload: AccountSearchRequest, *, db_path: Path) -> Dict[str
     }
 
 
-def _content_search(payload: ContentSearchRequest, *, db_path: Path) -> Dict[str, Any]:
+def _content_search(
+    payload: ContentSearchRequest, *, db_path: Path, read_only: bool = False
+) -> Dict[str, Any]:
     where: List[str] = []
     parameters: List[Any] = []
     direction_sql = effective_direction_sql()
@@ -1004,7 +1124,7 @@ def _content_search(payload: ContentSearchRequest, *, db_path: Path) -> Dict[str
         LEFT JOIN content_items original ON original.id=duplicate.original_content_id
     """
     offset = (payload.page - 1) * payload.page_size
-    with connect(db_path) as connection:
+    with connect(db_path, read_only=read_only) as connection:
         total = int(
             connection.execute(
                 f"WITH {DISPLAY_EFFECTIVE_EVALUATIONS_CTE} "
@@ -1117,7 +1237,10 @@ def _selling_point_window_stats(
         ).fetchall()
         for row in denominator_rows:
             scene, channel = str(row["direction"]), str(row["platform"])
-            if scene not in scene_denominators or channel not in _SELLING_POINT_STAT_CHANNELS:
+            if (
+                scene not in scene_denominators
+                or channel not in _SELLING_POINT_STAT_CHANNELS
+            ):
                 continue
             scene_denominators[scene][channel] = {
                 "publication_count": int(row["publication_count"] or 0),
@@ -1154,7 +1277,9 @@ def _selling_point_window_stats(
             scene, channel = str(row["scene"]), str(row["platform"])
             if scene not in _SELLING_POINT_STAT_SCENES:
                 continue
-            scene_map = point_windows.setdefault(str(row["code"]), {}).setdefault(window_key, {})
+            scene_map = point_windows.setdefault(str(row["code"]), {}).setdefault(
+                window_key, {}
+            )
             entry = scene_map.setdefault(
                 scene,
                 {
@@ -1176,8 +1301,8 @@ def _selling_point_window_stats(
     return windows_meta, point_windows
 
 
-def _selling_point_list(*, db_path: Path) -> Dict[str, Any]:
-    with connect(db_path) as connection:
+def _selling_point_list(*, db_path: Path, read_only: bool = False) -> Dict[str, Any]:
+    with connect(db_path, read_only=read_only) as connection:
         taxonomies = connection.execute(
             """
             SELECT * FROM taxonomy_versions WHERE status='published'
@@ -1267,11 +1392,61 @@ def _read_local_json(local_path: str) -> Dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _artifact_media_paths(row: sqlite3.Row) -> List[Path]:
-    path = _safe_project_path(str(row["local_path"]))
+def _replica_artifact_path(value: str, *, read_only: bool) -> Path:
+    try:
+        return _safe_project_path(value)
+    except HTTPException:
+        if not read_only or not Path(value).is_absolute():
+            raise
+        normalized = value.replace("\\", "/")
+        for marker in ("/data/cache/", "/reports/"):
+            if marker in normalized:
+                suffix = normalized.split(marker, 1)[1]
+                return _safe_project_path(marker.strip("/") + "/" + suffix)
+        raise
+
+
+def _artifact_media_paths(
+    row: sqlite3.Row, *, read_only: bool = False
+) -> List[Path]:
+    try:
+        path = _replica_artifact_path(str(row["local_path"]), read_only=read_only)
+    except (HTTPException, OSError):
+        return []
     if path.suffix.lower() != ".json":
-        return [path] if path.is_file() else []
-    value = _read_local_json(str(row["local_path"]))
+        if not path.is_file():
+            return []
+        if read_only:
+            expected_sha = str(row["sha256"] or "")
+            expected_size = row["byte_size"]
+            try:
+                metadata = path.stat()
+                if re.fullmatch(r"[0-9a-f]{64}", expected_sha) is None:
+                    return []
+                if expected_size is not None and metadata.st_size != int(
+                    expected_size
+                ):
+                    return []
+                if (
+                    _cached_file_sha256(
+                        str(path), metadata.st_size, metadata.st_mtime_ns
+                    )
+                    != expected_sha
+                ):
+                    return []
+            except OSError:
+                return []
+        return [path]
+    # Legacy media manifests do not register per-child hashes in SQLite. The
+    # read replica must not serve a same-path but stale child file as evidence.
+    if read_only:
+        return []
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return []
+    if not isinstance(value, dict):
+        return []
     candidates: List[str] = []
     if value.get("video_path"):
         candidates.append(str(value["video_path"]))
@@ -1280,9 +1455,12 @@ def _artifact_media_paths(row: sqlite3.Row) -> List[Path]:
     )
     paths: List[Path] = []
     for candidate in candidates:
-        resolved = _safe_project_path(candidate)
-        if resolved.is_file():
-            paths.append(resolved)
+        try:
+            resolved = _replica_artifact_path(candidate, read_only=read_only)
+            if resolved.is_file():
+                paths.append(resolved)
+        except (HTTPException, OSError):
+            continue
     return paths
 
 
@@ -1303,8 +1481,10 @@ def _ocr_payload_text(payload: Dict[str, Any]) -> str:
     return "\n".join(texts)
 
 
-def _content_evidence(content_id: int, *, db_path: Path) -> Dict[str, Any]:
-    with connect(db_path) as connection:
+def _content_evidence(
+    content_id: int, *, db_path: Path, read_only: bool = False
+) -> Dict[str, Any]:
+    with connect(db_path, read_only=read_only) as connection:
         content = connection.execute(
             "SELECT * FROM content_items WHERE id=?", (content_id,)
         ).fetchone()
@@ -1387,8 +1567,13 @@ def _content_evidence(content_id: int, *, db_path: Path) -> Dict[str, Any]:
             (content_id,),
         ).fetchone()
     media_items: List[Dict[str, Any]] = []
+    media_availability = {
+        "status": "missing",
+        "reason": "数据库没有可用的媒体证据记录。",
+    }
     if media_row is not None:
-        for index, path in enumerate(_artifact_media_paths(media_row)):
+        media_paths = _artifact_media_paths(media_row, read_only=read_only)
+        for index, path in enumerate(media_paths):
             suffix = path.suffix.lower()
             media_items.append(
                 {
@@ -1401,6 +1586,18 @@ def _content_evidence(content_id: int, *, db_path: Path) -> Dict[str, Any]:
                     "url": f"/api/v8/contents/{content_id}/evidence/files/{media_row['id']}/{index}",
                 }
             )
+        if media_paths:
+            media_availability = {"status": "available", "reason": ""}
+        elif read_only:
+            media_availability = {
+                "status": "omitted",
+                "reason": "大媒体未随线上薄快照发布，现网也没有可安全复用的同路径同哈希文件。",
+            }
+        else:
+            media_availability = {
+                "status": "missing",
+                "reason": "本地媒体证据文件缺失。",
+            }
     asr_payload = _read_local_json(str(asr_row["local_path"])) if asr_row else {}
     ocr_payload = _read_local_json(str(ocr_row["local_path"])) if ocr_row else {}
     evaluation_payload = (
@@ -1436,6 +1633,7 @@ def _content_evidence(content_id: int, *, db_path: Path) -> Dict[str, Any]:
         else False,
         "evaluation": evaluation_payload,
         "media": media_items,
+        "media_availability": media_availability,
         "asr": {
             "status": asr_payload.get("status")
             or ("missing" if asr_row is None else "available"),
@@ -1497,8 +1695,37 @@ def _run_startup_catchup(
         app.state.catchup_status = "succeeded"
 
 
+@contextmanager
+def _writer_process_lock(path: Path, *, enabled: bool):
+    """Hold the single-writer lock for the scheduler process lifetime."""
+
+    if not enabled:
+        yield
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise RuntimeError(f"writer lock path must not be a symlink: {path}")
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(
+                f"another Dcar scheduler already holds the writer lock: {path}"
+            ) from exc
+        os.ftruncate(descriptor, 0)
+        os.write(descriptor, f"pid={os.getpid()}\n".encode("ascii"))
+        os.fsync(descriptor)
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def _lifespan_runtime(app: FastAPI):
     config = getattr(app.state, "config", None)
     if not isinstance(config, ApiConfig):
         raise RuntimeError("FastAPI application is missing ApiConfig")
@@ -1510,13 +1737,51 @@ async def lifespan(app: FastAPI):
             "production startup blocked by operator freeze lock: "
             f"{config.operator_freeze_lock}"
         )
-    with connect(config.db_path) as connection:
-        initialize_database(connection)
-    app.state.recovered_fetch_slots = recover_stale_fetch_slots(db_path=config.db_path)
-    app.state.recovered_media_slots = recover_stale_media_processing_slots(
-        db_path=config.db_path
-    )
-    app.state.recovered_tasks = _recover_interrupted_tasks(db_path=config.db_path)
+    if config.read_only and (
+        config.scheduler_enabled or config.startup_catchup_enabled
+    ):
+        raise RuntimeError(
+            "read-only replica cannot enable scheduler or startup catch-up"
+        )
+    if config.read_only:
+        if not config.db_path.is_file():
+            raise RuntimeError(
+                f"read-only replica database is missing: {config.db_path}"
+            )
+        with sqlite3.connect(
+            f"{config.db_path.resolve().as_uri()}?mode=ro&immutable=1",
+            uri=True,
+        ) as connection:
+            connection.execute("PRAGMA query_only = ON")
+            connection.execute("SELECT 1 FROM content_items LIMIT 1").fetchone()
+        app.state.database_sha256 = _file_sha256(config.db_path)
+        app.state.recovered_fetch_slots = {
+            "stale_candidates": 0,
+            "recovered": 0,
+            "skipped": "read_only",
+        }
+        app.state.recovered_media_slots = {
+            "stale_candidates": 0,
+            "recovered": 0,
+            "retryable_failed": 0,
+            "terminal_failed": 0,
+            "cas_conflicts": 0,
+            "exhausted_normalized": 0,
+            "skipped": "read_only",
+        }
+        app.state.recovered_tasks = 0
+    else:
+        with connect(config.db_path) as connection:
+            initialize_database(connection)
+        app.state.recovered_fetch_slots = recover_stale_fetch_slots(
+            db_path=config.db_path
+        )
+        app.state.recovered_media_slots = recover_stale_media_processing_slots(
+            db_path=config.db_path,
+            processor_version_by_type=processor_versions(),
+        )
+        app.state.recovered_tasks = _recover_interrupted_tasks(db_path=config.db_path)
+        app.state.database_sha256 = None
     app.state.scheduler_requested = config.scheduler_enabled
     app.state.scheduler_enabled = False
     app.state.startup_catchup_requested = config.startup_catchup_enabled
@@ -1524,19 +1789,19 @@ async def lifespan(app: FastAPI):
     app.state.report_runtime_ready = None
     app.state.report_runtime_error = None
     scheduler: Optional[BackgroundScheduler] = None
-    report_runtime_ready = False
     if config.scheduler_enabled:
         try:
             with connect(config.db_path) as connection:
                 assert_report_runtime_ready(connection)
         except Exception as exc:
-            LOGGER.error("scheduler blocked by report runtime gate: %s", exc)
+            LOGGER.error(
+                "automatic report jobs blocked by report runtime gate: %s", exc
+            )
             app.state.report_runtime_ready = False
             app.state.report_runtime_error = str(exc)
         else:
-            report_runtime_ready = True
             app.state.report_runtime_ready = True
-    if config.scheduler_enabled and report_runtime_ready:
+    if config.scheduler_enabled:
         scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
         install_jobs(
             scheduler,
@@ -1545,7 +1810,7 @@ async def lifespan(app: FastAPI):
         )
         scheduler.start()
         app.state.scheduler_enabled = True
-    if config.effective_startup_catchup_enabled and report_runtime_ready:
+    if config.effective_startup_catchup_enabled:
         app.state.startup_catchup_enabled = True
         app.state.catchup_status = "running"
         app.state.catchup_results = []
@@ -1563,17 +1828,9 @@ async def lifespan(app: FastAPI):
         app.state.catchup_thread = catchup_thread
         catchup_thread.start()
     else:
-        app.state.catchup_status = (
-            "blocked"
-            if config.effective_startup_catchup_enabled and not report_runtime_ready
-            else "disabled"
-        )
+        app.state.catchup_status = "disabled"
         app.state.catchup_results = []
-        app.state.catchup_error = (
-            app.state.report_runtime_error
-            if app.state.catchup_status == "blocked"
-            else None
-        )
+        app.state.catchup_error = None
     app.state.scheduler = scheduler
     try:
         yield
@@ -1582,13 +1839,54 @@ async def lifespan(app: FastAPI):
             scheduler.shutdown(wait=False)
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    config = getattr(app.state, "config", None)
+    if not isinstance(config, ApiConfig):
+        raise RuntimeError("FastAPI application is missing ApiConfig")
+    app.state.writer_lock_path = str(config.writer_lock)
+    app.state.writer_lock_held = False
+    with _writer_process_lock(config.writer_lock, enabled=config.scheduler_enabled):
+        app.state.writer_lock_held = config.scheduler_enabled
+        try:
+            async with _lifespan_runtime(app):
+                yield
+        finally:
+            app.state.writer_lock_held = False
+
+
 router = APIRouter()
+
+READ_ONLY_POST_PATHS = frozenset(
+    {
+        "/api/v8/accounts/search",
+        "/api/v8/contents/search",
+        "/api/v8/contents/validate",
+        "/api/v8/media-processing/search",
+        "/api/inputs/validate",
+    }
+)
 
 
 async def privacy_safe_request_log(request: Request, call_next):
     response = await call_next(request)
     LOGGER.info("%s %s %s", request.method, request.url.path, response.status_code)
     return response
+
+
+async def read_only_replica_guard(request: Request, call_next):
+    config = _request_config(request)
+    allowed = request.method in {"GET", "HEAD", "OPTIONS"} or (
+        request.method == "POST" and request.url.path in READ_ONLY_POST_PATHS
+    )
+    if config.read_only and not allowed:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "detail": "线上只读副本禁止写入；请在本地唯一写入端操作后重新发布快照。"
+            },
+        )
+    return await call_next(request)
 
 
 def create_app(config: Optional[ApiConfig] = None) -> FastAPI:
@@ -1602,6 +1900,7 @@ def create_app(config: Optional[ApiConfig] = None) -> FastAPI:
         allow_headers=["Content-Type"],
     )
     application.middleware("http")(privacy_safe_request_log)
+    application.middleware("http")(read_only_replica_guard)
     application.include_router(router)
     return application
 
@@ -1609,17 +1908,25 @@ def create_app(config: Optional[ApiConfig] = None) -> FastAPI:
 @router.get("/api/v8/health")
 def v8_health(request: Request) -> Dict[str, Any]:
     config = _request_config(request)
+    with connect(config.db_path, read_only=config.read_only) as connection:
+        data_freshness = _data_freshness(connection)
+        database_state = _database_state(connection)
+        database_state["sha256"] = getattr(request.app.state, "database_sha256", None)
     return {
         "status": "ok",
-        "mode": "local_v8",
+        "mode": "read_only_replica" if config.read_only else "local_v8",
+        "read_only": config.read_only,
         "report_version": CURRENT_REPORT_VERSION,
         "database": config.db_path.name,
+        "database_state": database_state,
+        "data_freshness": data_freshness,
     }
 
 
 @router.get("/api/v8/overview")
 def get_v8_overview(request: Request) -> Dict[str, Any]:
-    return v8_overview(_request_config(request).db_path)
+    config = _request_config(request)
+    return v8_overview(config.db_path, read_only=config.read_only)
 
 
 @router.get("/api/v8/tasks")
@@ -1631,7 +1938,7 @@ def get_v8_tasks(request: Request) -> Dict[str, Any]:
 @router.get("/api/v8/scheduler")
 def get_v8_scheduler_status(request: Request) -> Dict[str, Any]:
     config = _request_config(request)
-    with connect(config.db_path) as connection:
+    with connect(config.db_path, read_only=config.read_only) as connection:
         rows = connection.execute(
             """
             SELECT sr.* FROM scheduler_runs sr
@@ -1642,9 +1949,15 @@ def get_v8_scheduler_status(request: Request) -> Dict[str, Any]:
             ORDER BY sr.job_id
             """
         ).fetchall()
+        data_freshness = _data_freshness(connection)
     return {
+        "read_only": config.read_only,
         "requested": bool(getattr(request.app.state, "scheduler_requested", False)),
         "enabled": bool(getattr(request.app.state, "scheduler_enabled", False)),
+        "writer_lock": {
+            "path": getattr(request.app.state, "writer_lock_path", None),
+            "held": bool(getattr(request.app.state, "writer_lock_held", False)),
+        },
         "report_runtime": {
             "ready": getattr(request.app.state, "report_runtime_ready", None),
             "error": getattr(request.app.state, "report_runtime_error", None),
@@ -1660,6 +1973,7 @@ def get_v8_scheduler_status(request: Request) -> Dict[str, Any]:
             "error": getattr(request.app.state, "catchup_error", None),
             "results": getattr(request.app.state, "catchup_results", []),
         },
+        "data_freshness": data_freshness,
         "jobs": [dict(row) for row in rows],
         "media_slot_recovery": getattr(
             request.app.state,
@@ -1738,7 +2052,7 @@ def resume_v8_task(request: Request, task_id: str) -> Dict[str, Any]:
 
 @router.get("/api/v8/tasks/{task_id}/revisions/{revision}/report")
 def get_v8_task_report(request: Request, task_id: str, revision: int) -> Dict[str, Any]:
-    with connect(_request_config(request).db_path) as connection:
+    with _connect_for_request(request) as connection:
         row = connection.execute(
             "SELECT report_json_path FROM report_revisions WHERE task_id=? AND revision=?",
             (task_id, revision),
@@ -1759,7 +2073,7 @@ def download_v8_task_file(
         ["summary-png", "summary-svg"] if file_kind == "summary-image" else [file_kind]
     )
     placeholders = ",".join("?" for _ in kinds)
-    with connect(_request_config(request).db_path) as connection:
+    with _connect_for_request(request) as connection:
         rows = connection.execute(
             f"""
             SELECT * FROM report_files
@@ -1793,7 +2107,12 @@ def download_v8_task_file(
 def search_v8_accounts(
     request: Request, payload: AccountSearchRequest
 ) -> Dict[str, Any]:
-    return _account_search(payload, db_path=_request_config(request).db_path)
+    config = _request_config(request)
+    return _account_search(
+        payload,
+        db_path=config.db_path,
+        read_only=config.read_only,
+    )
 
 
 @router.post("/api/v8/accounts")
@@ -1844,7 +2163,12 @@ def export_v8_accounts(request: Request) -> Response:
 def search_v8_contents(
     request: Request, payload: ContentSearchRequest
 ) -> Dict[str, Any]:
-    return _content_search(payload, db_path=_request_config(request).db_path)
+    config = _request_config(request)
+    return _content_search(
+        payload,
+        db_path=config.db_path,
+        read_only=config.read_only,
+    )
 
 
 @router.post("/api/v8/contents/validate")
@@ -1918,14 +2242,19 @@ def update_v8_content_data(request: Request, content_id: int) -> Dict[str, Any]:
 
 @router.get("/api/v8/contents/{content_id}/evidence")
 def get_v8_content_evidence(request: Request, content_id: int) -> Dict[str, Any]:
-    return _content_evidence(content_id, db_path=_request_config(request).db_path)
+    config = _request_config(request)
+    return _content_evidence(
+        content_id,
+        db_path=config.db_path,
+        read_only=config.read_only,
+    )
 
 
 @router.get("/api/v8/contents/{content_id}/evidence/files/{artifact_id}/{index}")
 def get_v8_content_evidence_file(
     request: Request, content_id: int, artifact_id: int, index: int
 ) -> FileResponse:
-    with connect(_request_config(request).db_path) as connection:
+    with _connect_for_request(request) as connection:
         row = connection.execute(
             """
             SELECT * FROM evidence_artifacts
@@ -1936,7 +2265,15 @@ def get_v8_content_evidence_file(
         ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="媒体证据不存在")
-    paths = _artifact_media_paths(row)
+    config = _request_config(request)
+    paths = _artifact_media_paths(row, read_only=config.read_only)
+    if not paths:
+        if config.read_only:
+            raise HTTPException(
+                status_code=410,
+                detail="媒体证据未随线上薄快照发布，且现网没有同路径同哈希文件可复用",
+            )
+        raise HTTPException(status_code=404, detail="媒体证据文件不存在")
     if index < 0 or index >= len(paths):
         raise HTTPException(status_code=404, detail="媒体证据文件不存在")
     return FileResponse(paths[index])
@@ -1979,7 +2316,7 @@ def search_v8_media_processing(
         parameters.append(payload.content_id)
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
     offset = (payload.page - 1) * payload.page_size
-    with connect(_request_config(request).db_path) as connection:
+    with _connect_for_request(request) as connection:
         total = int(
             connection.execute(
                 f"SELECT COUNT(*) FROM media_processing_slots m {where_sql}", parameters
@@ -2038,7 +2375,11 @@ def export_v8_contents(request: Request) -> Response:
 @router.get("/api/v8/selling-points")
 def get_v8_selling_points(request: Request) -> Dict[str, Any]:
     try:
-        return _selling_point_list(db_path=_request_config(request).db_path)
+        config = _request_config(request)
+        return _selling_point_list(
+            db_path=config.db_path,
+            read_only=config.read_only,
+        )
     except TaxonomyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -2051,7 +2392,7 @@ def get_v8_reviews(
         raise HTTPException(status_code=422, detail="limit 必须在 1 到 500 之间")
     where = "WHERE rq.status=?" if status else ""
     parameters: List[Any] = [status] if status else []
-    with connect(_request_config(request).db_path) as connection:
+    with _connect_for_request(request) as connection:
         active_release(connection)
         rows = connection.execute(
             f"""
@@ -2093,7 +2434,7 @@ def get_v8_reviews(
 @router.post("/api/v8/reviews/{queue_id}/start")
 def start_v8_review(request: Request, queue_id: int) -> Dict[str, Any]:
     with (
-        connect(_request_config(request).db_path) as connection,
+        _connect_for_request(request) as connection,
         transaction(connection),
     ):
         row = connection.execute(

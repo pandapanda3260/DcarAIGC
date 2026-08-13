@@ -26,10 +26,12 @@ COPY --chown=dcar:dcar src/dcar_eval/project_paths.py /app/src/dcar_eval/project
 COPY --chown=dcar:dcar src/dcar_eval/rebuild_channel_evaluation_v4.py /app/src/dcar_eval/rebuild_channel_evaluation_v4.py
 COPY --chown=dcar:dcar src/dcar_eval/three_proposition_scoring.py /app/src/dcar_eval/three_proposition_scoring.py
 COPY --chown=dcar:dcar src/dcar_eval/v8 /app/src/dcar_eval/v8
+COPY --chown=dcar:dcar src/dcar_eval/dcar_auth /app/src/dcar_eval/dcar_auth
 COPY --chown=dcar:dcar src/dcar_eval/workflow/__init__.py /app/src/dcar_eval/workflow/__init__.py
 COPY --chown=dcar:dcar src/dcar_eval/workflow/contracts.py /app/src/dcar_eval/workflow/contracts.py
 COPY --chown=dcar:dcar src/dcar_eval/workflow/privacy.py /app/src/dcar_eval/workflow/privacy.py
 COPY --chown=dcar:dcar config/*.json /app/config/
+COPY --chown=dcar:dcar deploy/server/nginx/login.html /app/deploy/server/nginx/login.html
 
 RUN mkdir -p \
       /app/app/data \

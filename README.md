@@ -39,6 +39,6 @@ npm --prefix app/web ci
 scripts/start_web_mvp.sh
 ```
 
-打开 `http://127.0.0.1:4173`；本地 API 固定使用 `http://127.0.0.1:8765`。调度器默认启用，启动时执行有界补跑；临时禁用可在启动命令前设置 `DCAR_SCHEDULER_ENABLED=0`。
+首次启动会在终端创建本地登录账号。打开 `http://127.0.0.1:4173` 后先登录；浏览器 API 也走同一个认证入口。内部端口为 Web 4174、API 8765，不应直接作为日常入口。调度器和启动补跑都默认关闭，避免一次普通启动意外产生供应商费用。确认成本后，可用 `DCAR_SCHEDULER_ENABLED=1 scripts/start_web_mvp.sh` 开启后续日调度；启动补跑仍需另外显式设置 `DCAR_STARTUP_CATCHUP_ENABLED=1`。
 
 完整验证和备份流程见 `docs/v8/运行与备份手册.md`。

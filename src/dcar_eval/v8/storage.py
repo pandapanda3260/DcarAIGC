@@ -45,14 +45,29 @@ def now_utc() -> str:
     )
 
 
-def connect(path: Path = DEFAULT_DB) -> sqlite3.Connection:
+def connect(
+    path: Path = DEFAULT_DB, *, read_only: bool | None = None
+) -> sqlite3.Connection:
     if (
         os.environ.get("DCAR_TEST_DENY_FORMAL_DB") == "1"
         and path.resolve() == DEFAULT_DB.resolve()
     ):
-        raise RuntimeError(
-            "test process attempted to open the formal DCar database"
+        raise RuntimeError("test process attempted to open the formal DCar database")
+    if read_only is None:
+        read_only = os.environ.get("DCAR_READ_ONLY", "0").strip() == "1"
+    if read_only:
+        if not path.is_file():
+            raise RuntimeError(f"read-only SQLite database is missing: {path}")
+        connection = sqlite3.connect(
+            f"{path.resolve().as_uri()}?mode=ro&immutable=1",
+            uri=True,
+            timeout=10,
         )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only = ON")
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 10000")
+        return connection
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path, timeout=10)
     connection.row_factory = sqlite3.Row
@@ -1641,9 +1656,7 @@ def _validate_v10(connection: sqlite3.Connection) -> None:
     tables = _table_names(connection)
     missing = set(_NEW_V10_TABLES) - tables
     if missing:
-        raise SchemaMigrationError(
-            f"schema v10 is missing tables: {sorted(missing)}"
-        )
+        raise SchemaMigrationError(f"schema v10 is missing tables: {sorted(missing)}")
     comment_columns = set(_table_columns(connection, "comments"))
     required_comment_columns = {
         "capture_page_id",
@@ -1665,8 +1678,7 @@ def _validate_v10(connection: sqlite3.Connection) -> None:
             "schema v10 is missing comment_evidence_versions.capture_run_id"
         )
     indexes = {
-        str(row["name"])
-        for row in connection.execute("PRAGMA index_list(comments)")
+        str(row["name"]) for row in connection.execute("PRAGMA index_list(comments)")
     }
     if "uq_comments_identity_per_evidence" not in indexes:
         raise SchemaMigrationError(

@@ -177,6 +177,7 @@ class ApiConfigTest(unittest.TestCase):
         self.assertFalse(config.scheduler_enabled)
         self.assertFalse(config.startup_catchup_enabled)
         self.assertFalse(config.effective_startup_catchup_enabled)
+        self.assertFalse(config.read_only)
 
     def test_environment_paths_and_two_key_catchup_are_explicit(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -186,8 +187,10 @@ class ApiConfigTest(unittest.TestCase):
                 "DCAR_V8_REPORTS_ROOT": str(root / "reports"),
                 "DCAR_LEGACY_DB": str(root / "legacy.sqlite3"),
                 "DCAR_OPERATOR_FREEZE_LOCK": str(root / "freeze.lock"),
+                "DCAR_WRITER_LOCK": str(root / "writer.lock"),
                 "DCAR_SCHEDULER_ENABLED": "1",
                 "DCAR_STARTUP_CATCHUP_ENABLED": "1",
+                "DCAR_READ_ONLY": "1",
             }
             with patch.dict(os.environ, values, clear=True):
                 config = api.ApiConfig.from_env()
@@ -195,7 +198,18 @@ class ApiConfigTest(unittest.TestCase):
         self.assertEqual(config.reports_root, root / "reports")
         self.assertEqual(config.legacy_db_path, root / "legacy.sqlite3")
         self.assertEqual(config.operator_freeze_lock, root / "freeze.lock")
+        self.assertEqual(config.writer_lock, root / "writer.lock")
         self.assertTrue(config.effective_startup_catchup_enabled)
+        self.assertTrue(config.read_only)
+
+    def test_local_start_script_keeps_paid_jobs_fail_closed(self) -> None:
+        source = (ROOT / "scripts" / "start_web_mvp.sh").read_text(encoding="utf-8")
+        self.assertIn('scheduler_enabled="${DCAR_SCHEDULER_ENABLED:-0}"', source)
+        self.assertIn(
+            'startup_catchup_enabled="${DCAR_STARTUP_CATCHUP_ENABLED:-0}"',
+            source,
+        )
+        self.assertIn("DCar 自动调度：", source)
 
     def test_catchup_cannot_bypass_disabled_scheduler(self) -> None:
         config = api.ApiConfig(
@@ -265,6 +279,7 @@ class ApiLifespanSwitchTest(unittest.IsolatedAsyncioTestCase):
                     reports_root=root / "reports",
                     legacy_db_path=root / "legacy.sqlite3",
                     operator_freeze_lock=root / "freeze.lock",
+                    writer_lock=root / "writer.lock",
                     scheduler_enabled=scheduler_enabled,
                     startup_catchup_enabled=catchup_enabled,
                 )
@@ -305,7 +320,49 @@ class ApiLifespanSwitchTest(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(scheduler.start.called, expect_scheduler)
                     self.assertEqual(catchup_thread.start.called, expect_thread)
 
-    async def test_unready_runtime_blocks_scheduler_and_catchup_but_not_api(
+    async def test_second_scheduler_process_is_rejected_by_writer_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            database = root / "current.sqlite3"
+            self._seed_report_runtime(database)
+            common = {
+                "db_path": database,
+                "reports_root": root / "reports",
+                "legacy_db_path": root / "legacy.sqlite3",
+                "operator_freeze_lock": root / "freeze.lock",
+                "writer_lock": root / "writer.lock",
+                "scheduler_enabled": True,
+                "startup_catchup_enabled": False,
+            }
+            first = api.create_app(api.ApiConfig(**common))
+            second = api.create_app(api.ApiConfig(**common))
+            scheduler = MagicMock()
+            with (
+                patch.object(api, "BackgroundScheduler", return_value=scheduler),
+                patch.object(api, "install_jobs"),
+                patch.object(
+                    api,
+                    "recover_stale_fetch_slots",
+                    return_value={"stale_candidates": 0, "recovered": 0},
+                ),
+                patch.object(
+                    api,
+                    "recover_stale_media_processing_slots",
+                    return_value={"stale_candidates": 0, "recovered": 0},
+                ),
+                patch.object(api, "_recover_interrupted_tasks", return_value=0),
+            ):
+                async with api.lifespan(first):
+                    self.assertTrue(first.state.writer_lock_held)
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "already holds the writer lock",
+                    ):
+                        async with api.lifespan(second):
+                            pass
+                self.assertFalse(first.state.writer_lock_held)
+
+    async def test_unready_report_runtime_does_not_block_non_report_jobs(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -315,6 +372,7 @@ class ApiLifespanSwitchTest(unittest.IsolatedAsyncioTestCase):
                 reports_root=root / "reports",
                 legacy_db_path=root / "legacy.sqlite3",
                 operator_freeze_lock=root / "freeze.lock",
+                writer_lock=root / "writer.lock",
                 scheduler_enabled=True,
                 startup_catchup_enabled=True,
             )
@@ -339,19 +397,19 @@ class ApiLifespanSwitchTest(unittest.IsolatedAsyncioTestCase):
             ):
                 async with api.lifespan(application):
                     self.assertTrue(application.state.scheduler_requested)
-                    self.assertFalse(application.state.scheduler_enabled)
-                    self.assertFalse(application.state.startup_catchup_enabled)
+                    self.assertTrue(application.state.scheduler_enabled)
+                    self.assertTrue(application.state.startup_catchup_enabled)
                     self.assertFalse(application.state.report_runtime_ready)
                     self.assertIn(
                         "active evaluation release",
                         application.state.report_runtime_error,
                     )
-                    self.assertEqual(application.state.catchup_status, "blocked")
-                install_jobs.assert_not_called()
-                scheduler.start.assert_not_called()
-                catchup_thread.start.assert_not_called()
+                    self.assertEqual(application.state.catchup_status, "running")
+                install_jobs.assert_called_once()
+                scheduler.start.assert_called_once_with()
+                catchup_thread.start.assert_called_once_with()
 
-    async def test_unsafe_legacy_automatic_report_blocks_scheduler_start(
+    async def test_unsafe_legacy_report_does_not_block_non_report_jobs(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -414,6 +472,7 @@ class ApiLifespanSwitchTest(unittest.IsolatedAsyncioTestCase):
                 reports_root=root / "reports",
                 legacy_db_path=root / "legacy.sqlite3",
                 operator_freeze_lock=root / "freeze.lock",
+                writer_lock=root / "writer.lock",
                 scheduler_enabled=True,
                 startup_catchup_enabled=True,
             )
@@ -437,14 +496,17 @@ class ApiLifespanSwitchTest(unittest.IsolatedAsyncioTestCase):
                 patch.object(api, "_recover_interrupted_tasks", return_value=0),
             ):
                 async with api.lifespan(application):
-                    self.assertFalse(application.state.scheduler_enabled)
+                    self.assertTrue(application.state.scheduler_enabled)
+                    self.assertTrue(application.state.startup_catchup_enabled)
+                    self.assertFalse(application.state.report_runtime_ready)
                     self.assertIn(
                         "outside the active release",
                         application.state.report_runtime_error,
                     )
-                install_jobs.assert_not_called()
-                scheduler.start.assert_not_called()
-                catchup_thread.start.assert_not_called()
+                    self.assertEqual(application.state.catchup_status, "running")
+                install_jobs.assert_called_once()
+                scheduler.start.assert_called_once_with()
+                catchup_thread.start.assert_called_once_with()
 
 
 if __name__ == "__main__":

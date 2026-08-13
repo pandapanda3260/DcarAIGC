@@ -13,24 +13,29 @@ services:
       DCAR_LEGACY_DB: /app/app/data/web_mvp.sqlite3
       DCAR_V8_REPORTS_ROOT: /app/reports/runs/v8
       DCAR_OPERATOR_FREEZE_LOCK: /var/lib/dcar-aigc/runtime/operator-freeze.lock
+      DCAR_READ_ONLY: "1"
       DCAR_SCHEDULER_ENABLED: "0"
       DCAR_STARTUP_CATCHUP_ENABLED: "0"
-    ports:
-      - "127.0.0.1:8765:8765"
+    expose:
+      - "8765"
     volumes:
       - type: bind
         source: /var/lib/dcar-aigc/db
         target: /app/app/data
+        # The replica opens SQLite with mode=ro, immutable=1, and query_only.
+        read_only: true
         bind:
           create_host_path: false
       - type: bind
         source: /var/lib/dcar-aigc/reports
         target: /app/reports
+        read_only: true
         bind:
           create_host_path: false
       - type: bind
         source: /var/lib/dcar-aigc/cache
         target: /app/data/cache
+        read_only: true
         bind:
           create_host_path: false
       - type: bind
@@ -54,7 +59,7 @@ services:
         - CMD
         - python
         - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/api/v8/health', timeout=3).read()"
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/api/v8/overview', timeout=10).read()"
       interval: 30s
       timeout: 5s
       retries: 3
@@ -69,14 +74,17 @@ services:
     build:
       context: ../..
       dockerfile: deploy/server/Dockerfile.web
+      args:
+        DCAR_WEB_BASE_PATH: ${DCAR_WEB_BASE_PATH:-/dcar}
+        NEXT_PUBLIC_DCAR_API_BASE: ${NEXT_PUBLIC_DCAR_API_BASE:-/dcar}
     image: dcar-aigc-web:local
     restart: unless-stopped
     init: true
     depends_on:
       api:
         condition: service_healthy
-    ports:
-      - "127.0.0.1:4173:4173"
+    expose:
+      - "4174"
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=128m
@@ -92,11 +100,85 @@ services:
         - CMD
         - node
         - -e
-        - "fetch('http://127.0.0.1:4173/').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"
+        - "fetch('http://127.0.0.1:4174/dcar/').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+  auth:
+    build:
+      context: ../..
+      dockerfile: deploy/server/Dockerfile.api
+    image: dcar-aigc-api:local
+    restart: unless-stopped
+    init: true
+    command:
+      - python
+      - -m
+      - uvicorn
+      - dcar_auth.gateway:app
+      - --app-dir
+      - /app/src/dcar_eval
+      - --host
+      - 0.0.0.0
+      - --port
+      - "4173"
+      - --workers
+      - "1"
+      - --no-access-log
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+    environment:
+      DCAR_AUTH_BASE_PATH: /dcar
+      DCAR_AUTH_WEB_UPSTREAM: http://web:4174
+      DCAR_AUTH_API_UPSTREAM: http://api:8765
+      DCAR_AUTH_HTPASSWD: /run/secrets/dcar-htpasswd
+      DCAR_AUTH_SESSION_DB: /var/lib/dcar-aigc/auth/sessions.sqlite3
+      DCAR_AUTH_LOGIN_TEMPLATE: /app/deploy/server/nginx/login.html
+      DCAR_AUTH_SECURE_COOKIE: "1"
+    ports:
+      - "127.0.0.1:4173:4173"
+    volumes:
+      - type: bind
+        source: ${DCAR_AUTH_CREDENTIAL_ROOT:-/var/lib/dcar-aigc/auth-compose-credentials}/users.htpasswd
+        target: /run/secrets/dcar-htpasswd
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${DCAR_AUTH_SESSION_ROOT:-/var/lib/dcar-aigc/auth-compose-sessions}
+        target: /var/lib/dcar-aigc/auth
+        bind:
+          create_host_path: false
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    cpus: 1.0
+    mem_limit: 512m
+    pids_limit: 128
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4173/dcar/auth/health', timeout=5).read()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     logging:
       driver: json-file
       options:

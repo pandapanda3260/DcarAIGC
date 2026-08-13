@@ -6,6 +6,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import v8.evaluation as evaluation
 import v8.identity as identity
@@ -50,6 +51,13 @@ class PlatformUserHasherTest(unittest.TestCase):
         key = first.user_key("douyin", "raw-uid-1")
         self.assertTrue(key.startswith("P"))
         self.assertEqual(key, second.user_key("douyin", "raw-uid-1"))
+
+    def test_read_only_replica_accepts_preprovisioned_group_read_salt(self) -> None:
+        self.salt_path.write_bytes(b"s" * 32)
+        self.salt_path.chmod(0o640)
+        with patch.dict(identity.os.environ, {"DCAR_READ_ONLY": "1"}):
+            identity.PlatformUserHasher(salt_path=self.salt_path)
+        self.assertEqual(self.salt_path.stat().st_mode & 0o777, 0o640)
 
     def test_platforms_do_not_share_keys(self) -> None:
         hasher = identity.PlatformUserHasher(salt_path=self.salt_path)

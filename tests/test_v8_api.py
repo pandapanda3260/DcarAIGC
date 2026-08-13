@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import logging
+import os
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -354,6 +357,80 @@ class V8ApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["report_version"], CURRENT_REPORT_VERSION)
         self.assertEqual(response.json()["database"], "dcar_insight.sqlite3")
+        self.assertIn("data_freshness", response.json())
+
+    def test_daily_capture_freshness_excludes_backfill_slots(self) -> None:
+        reference = datetime(2026, 8, 11, tzinfo=timezone.utc)
+        daily_finished = reference - timedelta(hours=37)
+        backfill_finished = reference - timedelta(hours=1)
+        with connect(self.db) as connection:
+            account_id = int(
+                connection.execute(
+                    "SELECT id FROM accounts ORDER BY id LIMIT 1"
+                ).fetchone()[0]
+            )
+            connection.executemany(
+                """
+                INSERT INTO fetch_slots(
+                    account_id,content_id,stage,window_key,provider,adapter_version,
+                    status,attempt_count,finished_at,created_at,updated_at
+                ) VALUES (?,NULL,'discovery',?,'fixture','fixture-v1','succeeded',
+                          1,?,?,?)
+                """,
+                [
+                    (
+                        account_id,
+                        "range:2010-01-01:20260811T000000:douyin:fixture",
+                        backfill_finished.isoformat().replace("+00:00", "Z"),
+                        backfill_finished.isoformat().replace("+00:00", "Z"),
+                        backfill_finished.isoformat().replace("+00:00", "Z"),
+                    ),
+                    (
+                        account_id,
+                        "2026-08-10:douyin:page:1",
+                        daily_finished.isoformat().replace("+00:00", "Z"),
+                        daily_finished.isoformat().replace("+00:00", "Z"),
+                        daily_finished.isoformat().replace("+00:00", "Z"),
+                    ),
+                ],
+            )
+            connection.execute(
+                """
+                INSERT INTO scheduler_runs(
+                    job_id,scheduled_for,status,started_at,completed_at,details_json
+                ) VALUES ('daily_capture','2026-08-10T18:00:00Z','failed',
+                          '2026-08-10T18:00:00Z','2026-08-10T18:30:00Z','{}')
+                """
+            )
+            connection.commit()
+
+            freshness = api_module._data_freshness(
+                connection,
+                current_at=reference,
+            )
+            self.assertEqual(freshness["status"], "stale")
+            self.assertEqual(
+                freshness["last_successful_capture_at"],
+                daily_finished.isoformat().replace("+00:00", "Z"),
+            )
+            self.assertEqual(freshness["latest_capture_run"]["status"], "failed")
+
+            current_finished = reference - timedelta(hours=35)
+            connection.execute(
+                """
+                UPDATE fetch_slots SET finished_at=?,updated_at=?
+                WHERE window_key='2026-08-10:douyin:page:1'
+                """,
+                (
+                    current_finished.isoformat().replace("+00:00", "Z"),
+                    current_finished.isoformat().replace("+00:00", "Z"),
+                ),
+            )
+            connection.commit()
+            self.assertEqual(
+                api_module._data_freshness(connection, current_at=reference)["status"],
+                "current",
+            )
 
     def test_startup_catchup_worker_records_results(self) -> None:
         fake_app = SimpleNamespace(
@@ -382,6 +459,86 @@ class V8ApiTest(unittest.TestCase):
         )
         self.assertEqual(response.json()["startup_catchup"]["status"], "disabled")
         self.assertIn("fetch_slot_recovery", response.json())
+        self.assertIn("data_freshness", response.json())
+
+    def test_freshness_is_consistent_across_operational_endpoints(self) -> None:
+        health = self.client.get("/api/v8/health").json()["data_freshness"]
+        overview = self.client.get("/api/v8/overview").json()["data_freshness"]
+        scheduler = self.client.get("/api/v8/scheduler").json()["data_freshness"]
+        self.assertEqual(overview, health)
+        self.assertEqual(scheduler, health)
+
+    def test_read_only_replica_allows_search_and_blocks_writes(self) -> None:
+        replica_config = api_module.ApiConfig(
+            db_path=self.config.db_path,
+            reports_root=self.config.reports_root,
+            legacy_db_path=self.config.legacy_db_path,
+            operator_freeze_lock=self.config.operator_freeze_lock,
+            scheduler_enabled=False,
+            startup_catchup_enabled=False,
+            read_only=True,
+        )
+        replica = api_module.create_app(replica_config)
+        with TestClient(replica) as replica_client:
+            health = replica_client.get("/api/v8/health")
+            self.assertEqual(health.status_code, 200)
+            self.assertEqual(health.json()["mode"], "read_only_replica")
+            self.assertTrue(health.json()["read_only"])
+            self.assertEqual(
+                replica_client.post("/api/v8/accounts/search", json={}).status_code,
+                200,
+            )
+            blocked = replica_client.post("/api/v8/tasks", json={})
+            self.assertEqual(blocked.status_code, 403)
+            self.assertIn("只读副本禁止写入", blocked.json()["detail"])
+            self.assertEqual(
+                replica_client.patch("/api/v8/accounts/1", json={}).status_code,
+                403,
+            )
+
+    def test_read_only_replica_never_changes_sqlite_or_creates_sidecars(self) -> None:
+        with connect(self.db) as connection:
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        sidecars = [
+            self.db.with_name(self.db.name + suffix) for suffix in ("-wal", "-shm")
+        ]
+        for sidecar in sidecars:
+            sidecar.unlink(missing_ok=True)
+        before = hashlib.sha256(self.db.read_bytes()).hexdigest()
+        replica_config = api_module.ApiConfig(
+            db_path=self.config.db_path,
+            reports_root=self.config.reports_root,
+            legacy_db_path=self.config.legacy_db_path,
+            operator_freeze_lock=self.config.operator_freeze_lock,
+            scheduler_enabled=False,
+            startup_catchup_enabled=False,
+            read_only=True,
+        )
+        with patch.dict(os.environ, {"DCAR_READ_ONLY": "1"}):
+            replica = api_module.create_app(replica_config)
+            with TestClient(replica) as replica_client:
+                health = replica_client.get("/api/v8/health")
+                self.assertEqual(health.status_code, 200)
+                self.assertEqual(health.json()["database_state"]["sha256"], before)
+                self.assertEqual(
+                    replica_client.get("/api/v8/overview").status_code,
+                    200,
+                )
+                self.assertEqual(
+                    replica_client.get("/api/v8/scheduler").status_code,
+                    200,
+                )
+                self.assertEqual(
+                    replica_client.get("/api/v8/tasks").status_code,
+                    200,
+                )
+                self.assertEqual(
+                    replica_client.post("/api/v8/contents/search", json={}).status_code,
+                    200,
+                )
+        after = hashlib.sha256(self.db.read_bytes()).hexdigest()
+        self.assertEqual(after, before)
+        self.assertFalse(any(sidecar.exists() for sidecar in sidecars))
 
     def test_overview_has_three_shanghai_windows_and_no_fake_forecast(self) -> None:
         response = self.client.get("/api/v8/overview")
@@ -389,7 +546,9 @@ class V8ApiTest(unittest.TestCase):
         value = response.json()
         self.assertEqual(set(value["windows"]), {"yesterday", "this_week", "last_week"})
         self.assertEqual(value["timezone"], "Asia/Shanghai")
+        self.assertNotIn("并非抓取故障", json.dumps(value, ensure_ascii=False))
         for window in value["windows"].values():
+            self.assertNotIn("empty_explanation", window)
             metrics = window["metrics"]
             self.assertEqual(metrics["estimated_new_users"]["value"], None)
             self.assertEqual(metrics["estimated_new_users"]["unit"], "person")
@@ -647,9 +806,7 @@ class V8ApiTest(unittest.TestCase):
             self.assertEqual(
                 new_car["selling_point_exposure_share"]["denominator"], 400
             )
-            self.assertEqual(
-                new_car["selling_point_exposure_share"]["percentage"], 0.0
-            )
+            self.assertEqual(new_car["selling_point_exposure_share"]["percentage"], 0.0)
             self.assertEqual(
                 used_car["selling_point_exposure_share"]["percentage"], 75.0
             )
@@ -1766,6 +1923,7 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         self.assertEqual(value["ocr"]["text"], "关键帧文字证据\n车辆保养流程")
         self.assertEqual(value["comments"]["stored_count"], 1)
         self.assertEqual(len(value["media"]), 1)
+        self.assertEqual(value["media_availability"]["status"], "available")
         media = self.client.get(value["media"][0]["url"])
         self.assertEqual(media.status_code, 200)
         self.assertEqual(media.content, b"local-image-evidence")
@@ -1809,6 +1967,46 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         self.assertEqual(existing_evidence.status_code, 200)
         self.assertEqual(existing_evidence.json()["status"], "evidence_ready")
         self.assertEqual(existing_evidence.json()["provider_cost"], 0.0)
+
+        with connect(self.db) as connection:
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        read_only_app = api_module.create_app(replace(self.config, read_only=True))
+        with TestClient(read_only_app) as read_only_client:
+            replica_evidence = read_only_client.get(
+                f"/api/v8/contents/{self.content_id}/evidence"
+            )
+            self.assertEqual(replica_evidence.status_code, 200)
+            self.assertEqual(replica_evidence.json()["media"], [])
+            self.assertEqual(
+                replica_evidence.json()["media_availability"]["status"], "omitted"
+            )
+            omitted_file = read_only_client.get(
+                f"/api/v8/contents/{self.content_id}/evidence/files/"
+                f"{artifact_ids[0]}/0"
+            )
+            self.assertEqual(omitted_file.status_code, 410)
+            self.assertIn("薄快照", omitted_file.json()["detail"])
+
+        with connect(self.db) as connection:
+            connection.execute(
+                "UPDATE evidence_artifacts SET sha256=? WHERE id=?",
+                (hashlib.sha256(media_path.read_bytes()).hexdigest(), artifact_ids[0]),
+            )
+            connection.commit()
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        verified_read_only_app = api_module.create_app(
+            replace(self.config, read_only=True)
+        )
+        with TestClient(verified_read_only_app) as verified_client:
+            verified_evidence = verified_client.get(
+                f"/api/v8/contents/{self.content_id}/evidence"
+            ).json()
+            self.assertEqual(
+                verified_evidence["media_availability"]["status"], "available"
+            )
+            verified_file = verified_client.get(verified_evidence["media"][0]["url"])
+            self.assertEqual(verified_file.status_code, 200)
+            self.assertEqual(verified_file.content, b"local-image-evidence")
 
     def test_task_cancel_and_resume_routes_preserve_revision_history(self) -> None:
         resolved = self.client.post(
@@ -2377,11 +2575,11 @@ class V8MediaRecoveryApiTest(unittest.TestCase):
         self.client_context.__exit__(None, None, None)
         self.temp.cleanup()
 
-    def test_startup_recovers_only_stale_media_slots_and_reports_result(self) -> None:
+    def test_startup_does_not_recover_stale_media_slot_without_upstream(self) -> None:
         recovery = self.app.state.recovered_media_slots
         self.assertEqual(recovery["stale_candidates"], 1)
-        self.assertEqual(recovery["recovered"], 1)
-        self.assertEqual(recovery["retryable_failed"], 1)
+        self.assertEqual(recovery["recovered"], 0)
+        self.assertEqual(recovery["retryable_failed"], 0)
         self.assertEqual(recovery["terminal_failed"], 0)
         with connect(self.db) as connection:
             statuses = {
@@ -2390,7 +2588,7 @@ class V8MediaRecoveryApiTest(unittest.TestCase):
                     "SELECT processor_version,status FROM media_processing_slots"
                 )
             }
-        self.assertEqual(statuses["stale-frames"], "retryable_failed")
+        self.assertEqual(statuses["stale-frames"], "running")
         self.assertEqual(statuses["fresh-frames"], "running")
 
         response = self.client.get("/api/v8/scheduler")

@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from workflow.privacy import CommentHasher
 
@@ -20,6 +21,15 @@ class CommentHasherTest(unittest.TestCase):
             self.assertNotEqual(key, first.user_key("xiaohongshu", "content-a", "raw-user"))
             self.assertNotIn("raw-user", key)
             self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    def test_read_only_replica_accepts_preprovisioned_group_read_salt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "salt"
+            path.write_bytes(b"s" * 32)
+            path.chmod(0o640)
+            with patch.dict(os.environ, {"DCAR_READ_ONLY": "1"}):
+                CommentHasher(path)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o640)
 
 
 if __name__ == "__main__":

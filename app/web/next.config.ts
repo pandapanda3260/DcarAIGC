@@ -7,7 +7,6 @@ if (
 ) {
   throw new Error("DCAR_WEB_BASE_PATH must start with '/' and must not end with '/'");
 }
-
 const nextConfig: NextConfig = {
   basePath: configuredBasePath,
   env: {

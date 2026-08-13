@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>cn.tj.dcar.snapshot-publisher</string>
+
+  <!-- Rendering this template does not enable or load the job. -->
+  <key>Disabled</key>
+  <true/>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>9</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+
+  <key>WorkingDirectory</key>
+  <string>__PROJECT_ROOT_XML__</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PROJECT_ROOT_XML__/deploy/macos/run_snapshot_publisher.sh</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__PROJECT_ROOT_XML__/.venv/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+    <key>DCAR_PROJECT_ROOT</key>
+    <string>__PROJECT_ROOT_XML__</string>
+    <key>DCAR_PUBLISHER_ENV_FILE</key>
+    <string>__HOME_XML__/Library/Application Support/DcarAIGC/publisher.env</string>
+    <key>DCAR_V8_DB</key>
+    <string>__PROJECT_ROOT_XML__/app/data/dcar_insight.sqlite3</string>
+    <key>DCAR_LEGACY_DB</key>
+    <string>__PROJECT_ROOT_XML__/app/data/web_mvp.sqlite3</string>
+    <key>DCAR_READ_ONLY</key>
+    <string>1</string>
+    <key>DCAR_SCHEDULER_ENABLED</key>
+    <string>0</string>
+    <key>DCAR_STARTUP_CATCHUP_ENABLED</key>
+    <string>0</string>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>__HOME_XML__/Library/Logs/DcarAIGC/snapshot-publisher.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME_XML__/Library/Logs/DcarAIGC/snapshot-publisher.stderr.log</string>
+</dict>
+</plist>

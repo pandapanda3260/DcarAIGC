@@ -1,18 +1,12 @@
 "use client";
 
-import { useEffect, useState, type ReactNode } from "react";
-import { createPortal } from "react-dom";
+import type { ReactNode } from "react";
 
 export function Loading({ label = "正在读取 v8 运营数据" }: { label?: string }) {
-  // Portal to <body>: .main-area 的 container-type 会产生 layout containment，
-  // 使内部 position:fixed 相对容器而非视口定位；挂到 body 才能真正全屏居中。
-  const [mounted, setMounted] = useState(false);
-  useEffect(() => setMounted(true), []);
-  if (!mounted) return null;
-  return createPortal(
-    <div className="loading-screen" role="status" aria-live="polite"><div className="loading-mark">D</div><p>{label}</p></div>,
-    document.body,
-  );
+  // 行内渲染在 .main-area 内：加载指示器居中于"正在加载的内容区"，而不是整个视口
+  //（侧边栏仍可用，不属于加载区域；参见 Carbon/Red Hat 设计系统的 loading 规范）。
+  // 居中由 globals.css 的 .main-area:has(> .loading-screen) 布局完成，无需 portal/fixed。
+  return <div className="loading-screen" role="status" aria-live="polite"><div className="loading-mark">D</div><p>{label}</p></div>;
 }
 
 export function Notice({ tone = "success", children }: { tone?: "success" | "error"; children: ReactNode }) {

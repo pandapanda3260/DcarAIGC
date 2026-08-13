@@ -1,7 +1,8 @@
 [Unit]
-Description=DcarAIGC phase-1 web
+Description=DcarAIGC read-replica web
 After=network-online.target dcar-api.service
 Wants=network-online.target dcar-api.service
+ConditionPathIsDirectory=/var/www/dcar-aigc/current/app/web/dist
 
 [Service]
 Type=simple
@@ -10,12 +11,10 @@ Group=dcar-aigc
 WorkingDirectory=/var/www/dcar-aigc/current/app/web
 Environment=NODE_ENV=production
 Environment=NEXT_TELEMETRY_DISABLED=1
-Environment=DCAR_WEB_BASE_PATH=/dcar
-Environment=NEXT_PUBLIC_DCAR_API_BASE=/dcar
 Environment=WRANGLER_WRITE_LOGS=false
 Environment=WRANGLER_LOG_PATH=/tmp/dcar-wrangler.log
 Environment=MINIFLARE_REGISTRY_PATH=/tmp/dcar-miniflare-registry
-ExecStart=/var/www/dcar-aigc/runtime/node-v22.13.1-linux-x64/bin/node ./node_modules/vinext/dist/cli.js start --hostname 127.0.0.1 --port 4173
+ExecStart=/var/www/dcar-aigc/runtime/node-v22.13.1-linux-x64/bin/node ./node_modules/vinext/dist/cli.js start --hostname 127.0.0.1 --port 4174
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s

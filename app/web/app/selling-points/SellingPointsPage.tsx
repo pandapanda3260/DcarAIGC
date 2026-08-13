@@ -85,7 +85,7 @@ function FamilyIcon({ code, size = 22 }: { code: StandardFamilyCode; size?: numb
 
 export default function SellingPointsPage() {
   const [data, setData] = useState<SellingPointResponse>({ taxonomy: null, items: [] });
-  const [statWindow, setStatWindow] = useState<WindowKey>("yesterday");
+  const [statWindow, setStatWindow] = useState<WindowKey>("last_week");
   const [draftMode, setDraftMode] = useState(false);
   const [form, setForm] = useState<PointForm | null>(null);
   const [editingCode, setEditingCode] = useState<string | null>(null);

@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>cn.tj.dcar.writer-worker</string>
+
+  <!-- Rendering this template does not enable or load the job. -->
+  <key>Disabled</key>
+  <true/>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>300</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>WorkingDirectory</key>
+  <string>__PROJECT_ROOT_XML__</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PROJECT_ROOT_XML__/deploy/macos/run_writer_worker.sh</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__PROJECT_ROOT_XML__/.venv/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+    <key>PYTHONPATH</key>
+    <string>__PROJECT_ROOT_XML__/src/dcar_eval</string>
+    <key>DCAR_PROJECT_ROOT</key>
+    <string>__PROJECT_ROOT_XML__</string>
+    <key>DCAR_WRITER_ENV_FILE</key>
+    <string>__HOME_XML__/Library/Application Support/DcarAIGC/writer.env</string>
+    <key>DCAR_V8_DB</key>
+    <string>__PROJECT_ROOT_XML__/app/data/dcar_insight.sqlite3</string>
+    <key>DCAR_LEGACY_DB</key>
+    <string>__PROJECT_ROOT_XML__/app/data/web_mvp.sqlite3</string>
+    <key>DCAR_V8_REPORTS_ROOT</key>
+    <string>__PROJECT_ROOT_XML__/reports/runs/v8</string>
+    <key>DCAR_OPERATOR_FREEZE_LOCK</key>
+    <string>__PROJECT_ROOT_XML__/runtime/operator-freeze.lock</string>
+    <key>DCAR_WRITER_LOCK</key>
+    <string>__PROJECT_ROOT_XML__/runtime/writer-worker.lock</string>
+    <key>DCAR_READ_ONLY</key>
+    <string>0</string>
+    <key>DCAR_SCHEDULER_ENABLED</key>
+    <string>1</string>
+    <key>DCAR_STARTUP_CATCHUP_ENABLED</key>
+    <string>0</string>
+    <key>DCAR_WORKER_HOST</key>
+    <string>127.0.0.1</string>
+    <key>DCAR_WORKER_PORT</key>
+    <string>8766</string>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>__HOME_XML__/Library/Logs/DcarAIGC/writer-worker.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME_XML__/Library/Logs/DcarAIGC/writer-worker.stderr.log</string>
+</dict>
+</plist>

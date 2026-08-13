@@ -8,7 +8,7 @@ RUN npm ci
 COPY app/web/ ./
 
 ARG DCAR_WEB_BASE_PATH=""
-ARG NEXT_PUBLIC_DCAR_API_BASE=http://127.0.0.1:8765
+ARG NEXT_PUBLIC_DCAR_API_BASE=""
 
 ENV NODE_ENV=production \
     NEXT_TELEMETRY_DISABLED=1 \
@@ -22,7 +22,7 @@ FROM node:22.13.1-bookworm-slim AS runtime
 
 ENV NODE_ENV=production \
     NEXT_TELEMETRY_DISABLED=1 \
-    PORT=4173 \
+    PORT=4174 \
     WRANGLER_WRITE_LOGS=false
 
 WORKDIR /app
@@ -33,6 +33,6 @@ COPY --from=build --chown=node:node /app/dist /app/dist
 
 USER node:node
 
-EXPOSE 4173
+EXPOSE 4174
 
-CMD ["node", "./node_modules/vinext/dist/cli.js", "start", "--hostname", "0.0.0.0", "--port", "4173"]
+CMD ["node", "./node_modules/vinext/dist/cli.js", "start", "--hostname", "0.0.0.0", "--port", "4174"]

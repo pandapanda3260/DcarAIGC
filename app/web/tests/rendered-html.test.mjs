@@ -129,6 +129,28 @@ test("sidebar uses the bundled Dongchedi app mark and brand colors", async () =>
   assert.match(icon, /fill="#1F2129"/);
 });
 
+test("logout posts to the session gateway and follows its login redirect", async () => {
+  const [component, shell] = await Promise.all([
+    readFile(new URL("../app/components/LogoutButton.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/components/AppShell.tsx", import.meta.url), "utf8"),
+  ]);
+  assert.match(shell, /<LogoutButton \/>/);
+  assert.match(component, /fetch\(publicAssetPath\("\/auth\/logout"\)/);
+  assert.match(component, /method:\s*"POST"/);
+  assert.match(component, /"X-Dcar-Request":\s*"logout"/);
+  assert.match(component, /credentials:\s*"same-origin"/);
+  assert.match(component, /cache:\s*"no-store"/);
+  assert.match(component, /await response\.json\(\)/);
+  assert.match(component, /payload\.redirect_to/);
+  assert.match(component, /window\.location\.replace/);
+  assert.match(component, /publicAssetPath\("\/login"\)/);
+  assert.doesNotMatch(component, /XMLHttpRequest|\bxhr\b|BASIC_AUTH|NEXT_PUBLIC_DCAR_AUTH_MODE|__logout__|api\/v8\/health|location\.reload|本地环境未启用登录/);
+
+  const response = await render("/accounts");
+  const html = await response.text();
+  assert.match(html, /aria-label="退出登录"/);
+});
+
 test("sidebar navigation uses semantic graphical icons instead of character marks", async () => {
   const [shell, styles] = await Promise.all([
     readFile(new URL("../app/components/AppShell.tsx", import.meta.url), "utf8"),
@@ -203,7 +225,9 @@ test("overview keeps time windows outside the fixed channel conclusion structure
   assert.match(shell, /多渠道内容运营核心指标总览与场景分析/);
   assert.match(shell, /data-section=\{active\}/);
   assert.doesNotMatch(source, /CHANNEL CONCLUSIONS BY WINDOW|时间窗口筛选，渠道结构保持不变|每个窗口固定输出|以下仍保留完整渠道与场景结构/);
-  assert.doesNotMatch(source, /activeWindow\?\.empty_explanation|window-empty-explanation/);
+  assert.doesNotMatch(source, /data_freshness|数据已停止更新|自动更新异常|latestCaptureFailed|最近一次账号抓取成功|最新内容发布|最近一次日抓取失败/);
+  assert.doesNotMatch(source, /activeWindowIsEmpty|empty_explanation|window-empty-explanation|所选窗口暂无已发布内容/);
+  assert.doesNotMatch(source, /并非抓取故障/);
   assert.match(source, /className="page-stack overview-dashboard"/);
   assert.match(source, /data-channel=\{channel\.platform\}/);
   assert.match(source, /data-scene=\{sceneKey\}/);
@@ -223,6 +247,14 @@ test("overview keeps time windows outside the fixed channel conclusion structure
   assert.match(douyinBrand, /fill="#ff004f"/i);
   assert.match(douyinBrand, /fill="#00f2ea"/i);
   assert.match(xiaohongshuBrand, /viewBox="0 0 24 24"/);
+});
+
+test("selling point statistics default to last week", async () => {
+  const source = await readFile(
+    new URL("../app/selling-points/SellingPointsPage.tsx", import.meta.url),
+    "utf8",
+  );
+  assert.match(source, /useState<WindowKey>\("last_week"\)/);
 });
 
 test("selling point standards use E/X/M scenes, scene-local hits, and matcher-only editing", async () => {
