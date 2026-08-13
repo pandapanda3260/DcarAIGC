@@ -51,8 +51,15 @@ data/processed/
 reports/current/
 reports/archive/
 reports/runs/
+/reports/review_audits/
 app/web/public/data/
 app/web/public/exports/
+
+# Local migration inventories and audit evidence
+/docs/migration/*.json
+/docs/migration/*.xlsx
+/docs/migration/*.png
+/docs/migration/文件资产清单与迁移方案_*.md
 
 # Local web task state and secrets
 .env
