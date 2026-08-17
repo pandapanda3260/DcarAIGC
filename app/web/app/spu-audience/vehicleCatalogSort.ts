@@ -1,3 +1,5 @@
+import { pinyin } from "pinyin-pro";
+
 // 懂车帝品牌接口的 hot_brand 数组顺序（2026-08-16 快照）。
 // 页面只使用本地快照，避免渲染时依赖未公开的远程接口。
 const dongchediHotBrands = [
@@ -86,7 +88,7 @@ type VehicleSeriesGroup = {
 
 export type VehicleSeriesMatch = {
   rank: number;
-  kind: "brand" | "series" | "series_alias" | "trim";
+  kind: "brand" | "series" | "series_alias" | "pinyin" | "trim";
   matchedTrimLabel?: string;
   matchedTrimCount?: number;
 };
@@ -104,8 +106,9 @@ const MATCH_RANK = {
   aliasOrTrimExact: 1,
   canonicalBoundary: 2,
   aliasOrTrimBoundary: 3,
-  substringOrMultiTerm: 4,
-  ambiguousAlias: 5,
+  pinyin: 4,
+  substringOrMultiTerm: 5,
+  ambiguousAlias: 6,
 } as const;
 
 function normalizeSearchText(value: string | number | null | undefined) {
@@ -119,6 +122,22 @@ function normalizeSearchText(value: string | number | null | undefined) {
 
 function compactSearchText(value: string) {
   return value.replace(/\s+/g, "");
+}
+
+const pinyinFormsCache = new Map<string, readonly string[]>();
+const searchCandidatesCache = new WeakMap<VehicleSeriesGroup, readonly SearchCandidate[]>();
+
+function pinyinSearchForms(rawValue: string | null | undefined) {
+  const source = String(rawValue ?? "").normalize("NFKC").trim();
+  if (!source || !/\p{Script=Han}/u.test(source)) return [];
+  const cached = pinyinFormsCache.get(source);
+  if (cached) return cached;
+  const forms = [...new Set([
+    pinyin(source, { toneType: "none", nonZh: "consecutive" }),
+    pinyin(source, { pattern: "first", toneType: "none", nonZh: "removed" }),
+  ].map(normalizeSearchText).filter(Boolean))];
+  pinyinFormsCache.set(source, forms);
+  return forms;
 }
 
 function isAsciiLetterOrDigit(value: string | undefined) {
@@ -149,6 +168,7 @@ function candidateRank(candidate: SearchCandidate, query: string, compactQuery: 
   const prefix = candidate.value.startsWith(query) || candidate.compact.startsWith(compactQuery);
   const boundary = hasAsciiTokenBoundary(candidate.value, query) || hasAsciiTokenBoundary(candidate.compact, compactQuery);
   const substring = candidate.value.includes(query) || candidate.compact.includes(compactQuery);
+  if (candidate.kind === "pinyin") return exact || prefix || boundary ? MATCH_RANK.pinyin : null;
   if (!exact && !prefix && !boundary && !substring) return null;
   if (candidate.ambiguous) return MATCH_RANK.ambiguousAlias;
   if (candidate.kind === "brand" || candidate.kind === "series") {
@@ -177,6 +197,8 @@ function rankTermsInContext(candidates: readonly SearchCandidate[], terms: reado
 }
 
 function buildSearchCandidates(group: VehicleSeriesGroup) {
+  const cached = searchCandidatesCache.get(group);
+  if (cached) return cached;
   const candidates: SearchCandidate[] = [];
   const seen = new Set<string>();
   function append(
@@ -193,12 +215,20 @@ function buildSearchCandidates(group: VehicleSeriesGroup) {
     seen.add(key);
     candidates.push({ value, compact, kind, ambiguous, trimLabel });
   }
+  function appendPinyin(rawValue: string | null | undefined) {
+    for (const form of pinyinSearchForms(rawValue)) append(form, "pinyin");
+  }
 
   const { seriesNode } = group;
   append(seriesNode.brand, "brand");
   append(seriesNode.series, "series");
   append(`${seriesNode.brand} ${seriesNode.series}`, "series");
-  for (const alias of seriesNode.aliases ?? []) append(alias.alias, "series_alias", alias.ambiguous);
+  appendPinyin(seriesNode.brand);
+  appendPinyin(seriesNode.series);
+  for (const alias of seriesNode.aliases ?? []) {
+    append(alias.alias, "series_alias", alias.ambiguous);
+    if (!alias.ambiguous) appendPinyin(alias.alias);
+  }
   for (const trim of group.trims ?? []) {
     const trimLabel = trim.trim_label?.trim();
     append(trimLabel, "trim", false, trimLabel || undefined);
@@ -208,6 +238,7 @@ function buildSearchCandidates(group: VehicleSeriesGroup) {
     }
     for (const alias of trim.aliases ?? []) append(alias.alias, "trim", alias.ambiguous, trimLabel || undefined);
   }
+  searchCandidatesCache.set(group, candidates);
   return candidates;
 }
 

@@ -413,8 +413,8 @@ test("spu audience page keeps rule assets, association and 3D stats together", a
   // 大车系库先搜索再分页；改查询回到第1页，空结果给出明确反馈且不显示伪造的第1/1页
   assert.match(page, /filterVehicleSeriesGroups\(seriesGroups, catalogQuery\)/);
   assert.match(page, /total=\{filteredSeriesTotal\}/);
-  assert.match(page, /aria-label="搜索品牌、车系、款型或别名"/);
-  assert.match(page, /placeholder="搜索品牌、车系、款型或别名"/);
+  assert.match(page, /aria-label="搜索品牌、车系、款型、别名或拼音"/);
+  assert.match(page, /placeholder="搜索品牌、车系、款型、别名或拼音"/);
   assert.match(page, /spellCheck=\{false\}/);
   assert.match(page, /setCatalogQuery\(event\.target\.value\); setCatalogPage\(1\)/);
   assert.match(page, /未找到匹配“\$\{catalogQuery\.trim\(\)\}”的车型/);

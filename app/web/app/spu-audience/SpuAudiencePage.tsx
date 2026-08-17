@@ -548,9 +548,9 @@ export default function SpuAudiencePage() {
                   <input
                     type="search"
                     value={catalogQuery}
-                    aria-label="搜索品牌、车系、款型或别名"
+                    aria-label="搜索品牌、车系、款型、别名或拼音"
                     aria-describedby="spu-catalog-search-status"
-                    placeholder="搜索品牌、车系、款型或别名"
+                    placeholder="搜索品牌、车系、款型、别名或拼音"
                     autoComplete="off"
                     spellCheck={false}
                     onChange={(event) => { setCatalogQuery(event.target.value); setCatalogPage(1); }}

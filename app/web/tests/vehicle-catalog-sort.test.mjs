@@ -85,7 +85,7 @@ test("vehicle catalog search filters brand or series without changing group orde
   assert.deepEqual(filterVehicleSeriesGroups(groups, "  ").map((group) => group.slug), ["benz-c", "benz-glc", "bmw-3"]);
 });
 
-test("vehicle catalog search uses series aliases and NFKC-normalized input", () => {
+test("vehicle catalog search uses aliases, NFKC, and scoped series pinyin", () => {
   const groups = [
     seriesGroup("aito-m8", "AITO问界", "问界M8", [vehicleAlias("赛力斯汽车问界M8")]),
     seriesGroup("aito-m6", "AITO问界", "问界M6", [vehicleAlias("赛力斯汽车问界M6")]),
@@ -103,7 +103,22 @@ test("vehicle catalog search uses series aliases and NFKC-normalized input", () 
   ]);
   assert.deepEqual(filterVehicleSeriesGroups(groups, "ＡＩＴＯ　Ｍ７").map((group) => group.slug), ["aito-m7"]);
   assert.deepEqual(filterVehicleSeriesGroups(groups, "赛力斯 M7").map((group) => group.slug), ["aito-m7"]);
-  assert.deepEqual(filterVehicleSeriesGroups(groups, "wenjie"), []);
+  const latinNoise = seriesGroup("latin-noise", "示例", "newenjiex");
+  assert.deepEqual(filterVehicleSeriesGroups([latinNoise, ...groups], "wenjie").map((group) => group.slug), [
+    "aito-m8", "aito-m6", "aito-m5", "aito-m7", "aito-m9", "latin-noise",
+  ]);
+  assert.deepEqual(filterVehicleSeriesGroups(groups, "wen jie").map((group) => group.slug), [
+    "aito-m8", "aito-m6", "aito-m5", "aito-m7", "aito-m9",
+  ]);
+  assert.deepEqual(filterVehicleSeriesGroups(groups, "wenjiem7").map((group) => group.slug), ["aito-m7"]);
+  assert.deepEqual(filterVehicleSeriesGroups(groups, "sailisi").map((group) => group.slug), [
+    "aito-m8", "aito-m6", "aito-m5", "aito-m7",
+  ]);
+  assert.deepEqual(filterVehicleSeriesGroups(groups, "wj").map((group) => group.slug), [
+    "aito-m8", "aito-m6", "aito-m5", "aito-m7", "aito-m9",
+  ]);
+  assert.deepEqual(filterVehicleSeriesGroups(groups, "wjm7"), []);
+  assert.deepEqual(filterVehicleSeriesGroups(groups, "BMW"), []);
 });
 
 test("vehicle catalog search preserves semantic symbols in model names", () => {
@@ -161,6 +176,7 @@ test("vehicle catalog search returns parent series and trim match metadata", () 
   ]);
   assert.deepEqual(filterVehicleSeriesGroups([specialEditions], "50周年 2026"), []);
   assert.deepEqual(filterVehicleSeriesGroups([specialEditions], "马年 2025"), []);
+  assert.deepEqual(filterVehicleSeriesGroups([specialEditions], "wushizhounian"), []);
 });
 
 test("vehicle catalog search ranks real M9 boundaries before EM90 and M90 substrings", () => {
