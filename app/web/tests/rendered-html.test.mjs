@@ -405,17 +405,21 @@ test("spu audience page keeps rule assets, association and 3D stats together", a
   assert.match(page, /统计读取失败/);
   // 车型库翻页：复用全站 Pagination 组件、放在表格上方（账号页同款），前端切片+末页夹紧
   assert.match(page, /import \{ Pagination \} from "\.\.\/components\/Pagination"/);
-  assert.match(page, /import \{ filterVehicleSeriesGroups, sortVehicleCatalogRows \} from "\.\/vehicleCatalogSort"/);
-  assert.match(page, /<Pagination page=\{catalogSafePage\} pageSize=\{catalogPageSize\} total=\{filteredSeriesTotal\} busy=\{saving\} ariaLabel="车型库分页" unitLabel="个车系" placement="top"/);
+  assert.match(page, /import \{\s*filterVehicleSeriesGroups,\s*matchVehicleSeriesGroup,\s*sortVehicleCatalogRows,\s*\} from "\.\/vehicleCatalogSort"/);
+  assert.match(page, /filteredSeriesTotal > 0 && <Pagination page=\{catalogSafePage\} pageSize=\{catalogPageSize\} total=\{filteredSeriesTotal\} busy=\{saving\} ariaLabel="车型库分页" unitLabel="个车系" placement="top"/);
   assert.match(page, /const catalogRows = useMemo\(\(\) => sortVehicleCatalogRows\(assets\?\.spu \?\? \[\]\), \[assets\]\)/);
   assert.match(page, /热门品牌优先/);
   assert.match(page, /Math\.min\(catalogPage, catalogLastPage\)/);
-  // 大车系库先按品牌/车系搜索再分页；改查询回到第1页，空结果给出明确反馈
+  // 大车系库先搜索再分页；改查询回到第1页，空结果给出明确反馈且不显示伪造的第1/1页
   assert.match(page, /filterVehicleSeriesGroups\(seriesGroups, catalogQuery\)/);
   assert.match(page, /total=\{filteredSeriesTotal\}/);
-  assert.match(page, /aria-label="搜索品牌或车系"/);
+  assert.match(page, /aria-label="搜索品牌、车系、款型或别名"/);
+  assert.match(page, /placeholder="搜索品牌、车系、款型或别名"/);
+  assert.match(page, /spellCheck=\{false\}/);
   assert.match(page, /setCatalogQuery\(event\.target\.value\); setCatalogPage\(1\)/);
-  assert.match(page, /未找到匹配“\$\{catalogQuery\.trim\(\)\}”的品牌或车系/);
+  assert.match(page, /未找到匹配“\$\{catalogQuery\.trim\(\)\}”的车型/);
+  assert.match(page, /matchVehicleSeriesGroup\(group, catalogQuery\)/);
+  assert.match(page, /匹配款型：\$\{catalogMatch\.matchedTrimLabel\}/);
   assert.match(styles, /\.spu-catalog-search:focus-within\s*\{[^}]*border-color:\s*var\(--teal\);/);
   assert.doesNotMatch(page, /function pageWindow/);
   // 车型库带"经人群推导"的核心场景列，回应"车型库看不到场景"的反馈
@@ -653,6 +657,11 @@ test("routes preserve operations and expose evidence-backed review controls", as
   assert.match(taskDetail, /\/cancel/);
   assert.match(taskDetail, /\/resume/);
   assert.match(taskDetail, /文件与日志/);
+  assert.match(taskDetail, /detail\.display_effective_revision && <a className="primary button-link report-download-button"/);
+  assert.match(taskDetail, /encodeURIComponent\(detail\.id\)[\s\S]*detail\.display_effective_revision\.revision[\s\S]*\/download/);
+  assert.match(taskDetail, />下载报告<\/a>/);
+  assert.match(taskDetail, /download title=\{`下载当前展示的第/);
+  assert.doesNotMatch(taskDetail, /report-download-button[^>]*target="_blank"/);
   assert.match(sellingPoints, /\/api\/v8\/selling-points\/draft/);
   assert.doesNotMatch(sellingPoints, /\/api\/v8\/selling-points\/publish/);
   assert.match(sellingPoints, /\/api\/v8\/selling-points\/items\/\$\{editingCode\}/);
@@ -689,6 +698,8 @@ test("task list shows background generation progress on cards instead of jumping
   assert.match(taskDetail, /setInterval\(/);
   assert.match(styles, /\.task-card \{/);
   assert.match(styles, /\.task-card \.progress-track i \{ background: var\(--teal\); transition: width \.4s ease; \}/);
+  assert.match(styles, /\.detail-toolbar > div:last-child \{[^}]*flex-wrap: wrap;[^}]*\}/);
+  assert.match(styles, /\.detail-toolbar > div:last-child > \* \{ white-space: nowrap; \}/);
   assert.doesNotMatch(styles, /\.main-area\[data-section="tasks"\] \.table-panel/);
   // 生成跑在请求之外，创建接口只返回排队中的任务
   assert.match(apiSource, /background\.add_task\(/);

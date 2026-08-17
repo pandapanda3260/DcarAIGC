@@ -25,7 +25,11 @@ import { Feedback, Loading } from "../components/Feedback";
 import { Pagination } from "../components/Pagination";
 import { jsonRequest, readJson } from "../lib/api";
 import { VehicleBrandLogo } from "./VehicleBrandLogo";
-import { filterVehicleSeriesGroups, sortVehicleCatalogRows } from "./vehicleCatalogSort";
+import {
+  filterVehicleSeriesGroups,
+  matchVehicleSeriesGroup,
+  sortVehicleCatalogRows,
+} from "./vehicleCatalogSort";
 import type {
   SpuAssetRow,
   SpuAssociationRun,
@@ -544,10 +548,11 @@ export default function SpuAudiencePage() {
                   <input
                     type="search"
                     value={catalogQuery}
-                    aria-label="搜索品牌或车系"
+                    aria-label="搜索品牌、车系、款型或别名"
                     aria-describedby="spu-catalog-search-status"
-                    placeholder="搜索品牌或车系"
+                    placeholder="搜索品牌、车系、款型或别名"
                     autoComplete="off"
+                    spellCheck={false}
                     onChange={(event) => { setCatalogQuery(event.target.value); setCatalogPage(1); }}
                   />
                 </label>
@@ -555,7 +560,7 @@ export default function SpuAudiencePage() {
                   {catalogQuery.trim() ? `${filteredSeriesTotal} 个结果` : ""}
                 </span>
               </div>
-              <Pagination page={catalogSafePage} pageSize={catalogPageSize} total={filteredSeriesTotal} busy={saving} ariaLabel="车型库分页" unitLabel="个车系" placement="top" onChange={(next) => { setCatalogPage(next.page); if (next.pageSize) setCatalogPageSize(next.pageSize); }} />
+              {filteredSeriesTotal > 0 && <Pagination page={catalogSafePage} pageSize={catalogPageSize} total={filteredSeriesTotal} busy={saving} ariaLabel="车型库分页" unitLabel="个车系" placement="top" onChange={(next) => { setCatalogPage(next.page); if (next.pageSize) setCatalogPageSize(next.pageSize); }} />}
             </div>
             <div className="spu-table-wrap" role="region" aria-label="车系与款型库表格" tabIndex={0}>
               <table className="spu-catalog-table">
@@ -563,11 +568,12 @@ export default function SpuAudiencePage() {
                 <tbody>
                   {catalogPageGroups.length === 0 && (
                     <tr className="spu-catalog-empty">
-                      <td colSpan={11}>{catalogQuery.trim() ? `未找到匹配“${catalogQuery.trim()}”的品牌或车系` : "暂无车系数据"}</td>
+                      <td colSpan={11}>{catalogQuery.trim() ? `未找到匹配“${catalogQuery.trim()}”的车型` : "暂无车系数据"}</td>
                     </tr>
                   )}
                   {catalogPageGroups.map((group) => {
                     const seriesNode = group.seriesNode;
+                    const catalogMatch = catalogQuery.trim() ? matchVehicleSeriesGroup(group, catalogQuery) : null;
                     const expanded = expandedSeries.has(group.slug);
                     const aggregate = seriesAggregate(group);
                     const seriesCoreScenes = seriesNode.audience_primary ? coreScenesByAudience.get(seriesNode.audience_primary) ?? [] : [];
@@ -595,7 +601,11 @@ export default function SpuAudiencePage() {
                                 {group.trims.length} 个款型
                               </button>
                             ) : <span className="spu-series-node">暂无款型</span>}
-                            <span className="cell-subline">{formatVehicleMeta(seriesNode)}</span>
+                            <span className="cell-subline">
+                              {catalogMatch?.kind === "trim" && catalogMatch.matchedTrimLabel
+                                ? `匹配款型：${catalogMatch.matchedTrimLabel}${(catalogMatch.matchedTrimCount ?? 0) > 1 ? ` 等 ${catalogMatch.matchedTrimCount} 个` : ""}`
+                                : formatVehicleMeta(seriesNode)}
+                            </span>
                           </td>
                           <td className="spu-audience-cell">{renderAudience(seriesNode.audience_primary, seriesNode.audience_secondary)}</td>
                           <td className="spu-alias-cell">{seriesCoreScenes.length === 0 ? "—" : seriesCoreScenes.map((code) => <span className="scene-tag" key={code}>{sceneLabelByCode.get(code) ?? code}</span>)}</td>
