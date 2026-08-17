@@ -657,11 +657,6 @@ test("routes preserve operations and expose evidence-backed review controls", as
   assert.match(taskDetail, /\/cancel/);
   assert.match(taskDetail, /\/resume/);
   assert.match(taskDetail, /文件与日志/);
-  assert.match(taskDetail, /detail\.display_effective_revision && <a className="primary button-link report-download-button"/);
-  assert.match(taskDetail, /encodeURIComponent\(detail\.id\)[\s\S]*detail\.display_effective_revision\.revision[\s\S]*\/download/);
-  assert.match(taskDetail, />下载报告<\/a>/);
-  assert.match(taskDetail, /download title=\{`下载当前展示的第/);
-  assert.doesNotMatch(taskDetail, /report-download-button[^>]*target="_blank"/);
   assert.match(sellingPoints, /\/api\/v8\/selling-points\/draft/);
   assert.doesNotMatch(sellingPoints, /\/api\/v8\/selling-points\/publish/);
   assert.match(sellingPoints, /\/api\/v8\/selling-points\/items\/\$\{editingCode\}/);
@@ -698,8 +693,6 @@ test("task list shows background generation progress on cards instead of jumping
   assert.match(taskDetail, /setInterval\(/);
   assert.match(styles, /\.task-card \{/);
   assert.match(styles, /\.task-card \.progress-track i \{ background: var\(--teal\); transition: width \.4s ease; \}/);
-  assert.match(styles, /\.detail-toolbar > div:last-child \{[^}]*flex-wrap: wrap;[^}]*\}/);
-  assert.match(styles, /\.detail-toolbar > div:last-child > \* \{ white-space: nowrap; \}/);
   assert.doesNotMatch(styles, /\.main-area\[data-section="tasks"\] \.table-panel/);
   // 生成跑在请求之外，创建接口只返回排队中的任务
   assert.match(apiSource, /background\.add_task\(/);

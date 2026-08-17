@@ -264,8 +264,9 @@ export function matchVehicleSeriesGroup(group: VehicleSeriesGroup, rawQuery: str
   for (const trimLabel of new Set(candidates.map((candidate) => candidate.trimLabel).filter(Boolean) as string[])) {
     const trimCandidates = candidates.filter((candidate) => candidate.trimLabel === trimLabel);
     const rank = rankTermsInContext([...nonTrimCandidates, ...trimCandidates], terms);
-    if (rank != null) matchingTrimContexts.push({ label: trimLabel, rank });
+    if (rank != null && (nonTrimRank == null || rank < nonTrimRank)) matchingTrimContexts.push({ label: trimLabel, rank });
   }
+  matchingTrimContexts.sort((left, right) => left.rank - right.rank);
   const bestContextRank = [nonTrimRank, ...matchingTrimContexts.map(({ rank }) => rank)]
     .filter((rank): rank is number => rank != null)
     .reduce<number | null>((best, rank) => best == null || rank < best ? rank : best, null);

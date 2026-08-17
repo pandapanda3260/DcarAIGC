@@ -179,6 +179,35 @@ test("vehicle catalog search returns parent series and trim match metadata", () 
   assert.deepEqual(filterVehicleSeriesGroups([specialEditions], "wushizhounian"), []);
 });
 
+test("vehicle catalog trim metadata excludes trims satisfied only by a shared series alias", () => {
+  const bmw3 = seriesGroup(
+    "bmw-3",
+    "宝马",
+    "宝马3系",
+    [vehicleAlias("325", true)],
+    [
+      searchRow({ brand: "宝马", series: "宝马3系", trimLabel: "2025款 330Li 尊享型 M运动曜夜套装", modelYear: 2025 }),
+      searchRow({ brand: "宝马", series: "宝马3系", trimLabel: "2025款 325i M运动套装", modelYear: 2025 }),
+      searchRow({ brand: "宝马", series: "宝马3系", trimLabel: "2025款 325Li M运动套装", modelYear: 2025 }),
+      searchRow({ brand: "宝马", series: "宝马3系", trimLabel: "2024款 325i M运动曜夜套装", modelYear: 2024 }),
+      searchRow({ brand: "宝马", series: "宝马3系", trimLabel: "2024款 325Li xDrive M运动套装", modelYear: 2024 }),
+    ],
+  );
+
+  assert.deepEqual(matchVehicleSeriesGroup(bmw3, "325"), {
+    rank: 5,
+    kind: "trim",
+    matchedTrimLabel: "2025款 325i M运动套装",
+    matchedTrimCount: 4,
+  });
+  assert.deepEqual(matchVehicleSeriesGroup(bmw3, "330Li"), {
+    rank: 3,
+    kind: "trim",
+    matchedTrimLabel: "2025款 330Li 尊享型 M运动曜夜套装",
+    matchedTrimCount: 1,
+  });
+});
+
 test("vehicle catalog search ranks real M9 boundaries before EM90 and M90 substrings", () => {
   const groups = [
     seriesGroup("byd-m9", "比亚迪", "比亚迪M9"),
