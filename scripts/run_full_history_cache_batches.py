@@ -25,9 +25,11 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
 if __package__ in {None, ""}:
-    repository_root = str(Path(__file__).resolve().parents[1])
-    if repository_root not in sys.path:
-        sys.path.insert(0, repository_root)
+    repository_root = Path(__file__).resolve().parents[1]
+    for candidate in (repository_root, repository_root / "src/dcar_eval"):
+        value = str(candidate)
+        if value not in sys.path:
+            sys.path.insert(0, value)
 
 from scripts import materialize_full_history_discovery_cache as replay
 from v8 import capture as capture_module
@@ -378,6 +380,20 @@ def _immutable_connection(db_path: Path) -> sqlite3.Connection:
         f"file:{db_path.resolve()}?mode=ro&immutable=1", uri=True
     )
     connection.row_factory = sqlite3.Row
+    return connection
+
+
+def _writable_connection(
+    db_path: Path, *, row_factory: bool = False
+) -> sqlite3.Connection:
+    connection = sqlite3.connect(db_path, timeout=30)
+    if row_factory:
+        connection.row_factory = sqlite3.Row
+    try:
+        storage_module.configure_connection_safety(connection)
+    except Exception:
+        connection.close()
+        raise
     return connection
 
 
@@ -1623,12 +1639,10 @@ def _recover_interrupted_detail_slots(
     if not values:
         return []
     placeholders = ",".join("?" for _ in values)
-    connection = sqlite3.connect(db_path, timeout=30)
-    connection.row_factory = sqlite3.Row
+    connection = _writable_connection(db_path, row_factory=True)
     recovered: list[Mapping[str, Any]] = []
     captured_at = _now_text()
     try:
-        connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=30000")
         connection.execute("BEGIN IMMEDIATE")
         rows = connection.execute(
@@ -1768,7 +1782,7 @@ def _recover_pending_live_raw_with_artifact(
         media_root=media_root,
         allow_live_raw_content_ids=set(candidate_ids),
     )
-    connection = sqlite3.connect(db_path, timeout=30)
+    connection = _writable_connection(db_path)
     try:
         connection.execute("PRAGMA busy_timeout=30000")
         connection.execute("BEGIN IMMEDIATE")

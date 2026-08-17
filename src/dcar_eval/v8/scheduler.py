@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import threading
 import time as time_module
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional
 from zoneinfo import ZoneInfo
@@ -16,14 +17,15 @@ from apscheduler.schedulers.background import BackgroundScheduler  # type: ignor
 from apscheduler.triggers.cron import CronTrigger  # type: ignore[import-untyped]
 
 from .capture import ProviderResult, ensure_content_slot
+from .contracts import load_contract
 from .duplicates import run_duplicate_fingerprint_queue
-from .evaluation import evaluate_incremental
-from .evaluation_selectors import review_anchor_evaluation
+from .evaluation import evaluate_content
 from .media import (
     MEDIA_QUEUE_BATCH_LIMIT,
     run_media_download_queue,
     run_media_processing_queue,
 )
+from .media_state import media_terminal_state_details
 from .providers import STAGE_CONFIG, discover_account_content, update_content_data
 from .reports import (
     REPORTS_ROOT,
@@ -75,10 +77,23 @@ JOBS = (
     JobDefinition("weekly_report", 8, 30, "mon"),
 )
 REPORT_JOB_IDS = frozenset({"daily_report", "weekly_report"})
+TERMINAL_RUN_STATUSES = frozenset({"succeeded", "partial", "skipped"})
+RETRYABLE_RUN_STATUSES = frozenset({"failed", "interrupted"})
+ATTEMPT_TERMINAL_STATUSES = TERMINAL_RUN_STATUSES | RETRYABLE_RUN_STATUSES
+INVOCATION_SOURCES = frozenset(
+    {"scheduled", "startup_report_catchup", "operator_retry"}
+)
 
 
 class SchedulerJobError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class RunClaim:
+    scheduler_run_id: int
+    attempt_id: int
+    attempt_number: int
 
 
 def _require_report_job_runtime_ready(*, db_path: Path) -> Dict[str, Any]:
@@ -106,49 +121,188 @@ def latest_occurrence(job: JobDefinition, now: datetime) -> datetime:
     return candidate
 
 
-def _claim_run(job_id: str, scheduled_for: datetime, *, db_path: Path) -> bool:
+def _claim_run(
+    job_id: str,
+    scheduled_for: datetime,
+    *,
+    db_path: Path,
+    allow_retry: bool,
+    invocation_source: str,
+) -> Optional[RunClaim]:
     key = _scheduled_iso(scheduled_for)
     started_at = now_utc()
-    with connect(db_path) as connection, transaction(connection):
-        cursor = connection.execute(
-            """
-            INSERT INTO scheduler_runs(
-                job_id, scheduled_for, status, started_at, details_json
-            ) VALUES (?, ?, 'running', ?, '{}')
-            ON CONFLICT(job_id, scheduled_for) DO NOTHING
-            """,
-            (job_id, key, started_at),
+    if invocation_source not in INVOCATION_SOURCES:
+        raise SchedulerJobError(
+            f"unsupported scheduler invocation source: {invocation_source}"
         )
-        return cursor.rowcount == 1
+    with connect(db_path) as connection, transaction(connection):
+        existing = connection.execute(
+            """
+            SELECT id,status FROM scheduler_runs
+            WHERE job_id=? AND scheduled_for=?
+            """,
+            (job_id, key),
+        ).fetchone()
+        if existing is None:
+            cursor = connection.execute(
+                """
+                INSERT INTO scheduler_runs(
+                    job_id, scheduled_for, status, started_at, details_json
+                ) VALUES (?, ?, 'running', ?, '{}')
+                """,
+                (job_id, key, started_at),
+            )
+            if cursor.lastrowid is None:
+                raise SchedulerJobError("scheduler occurrence insert returned no id")
+            scheduler_run_id = int(cursor.lastrowid)
+            attempt_number = 1
+        else:
+            scheduler_run_id = int(existing["id"])
+            current_status = str(existing["status"])
+            if current_status == "running" or current_status in TERMINAL_RUN_STATUSES:
+                return None
+            if current_status not in RETRYABLE_RUN_STATUSES:
+                raise SchedulerJobError(
+                    f"unsupported scheduler run status: {current_status}"
+                )
+            if not allow_retry:
+                return None
+            attempt_number = int(
+                connection.execute(
+                    """
+                    SELECT COALESCE(MAX(attempt_number),0)+1
+                    FROM scheduler_run_attempts WHERE scheduler_run_id=?
+                    """,
+                    (scheduler_run_id,),
+                ).fetchone()[0]
+            )
+            updated = connection.execute(
+                """
+                UPDATE scheduler_runs
+                SET status='running',started_at=?,completed_at=NULL,details_json='{}'
+                WHERE id=? AND status IN ('failed','interrupted')
+                """,
+                (started_at, scheduler_run_id),
+            )
+            if updated.rowcount != 1:
+                return None
+        attempt = connection.execute(
+            """
+            INSERT INTO scheduler_run_attempts(
+                scheduler_run_id,attempt_number,invocation_source,status,
+                started_at,details_json
+            ) VALUES (?, ?, ?, 'running', ?, '{}')
+            """,
+            (scheduler_run_id, attempt_number, invocation_source, started_at),
+        )
+        if attempt.lastrowid is None:
+            raise SchedulerJobError("scheduler attempt insert returned no id")
+        return RunClaim(
+            scheduler_run_id=scheduler_run_id,
+            attempt_id=int(attempt.lastrowid),
+            attempt_number=attempt_number,
+        )
 
 
 def _finish_run(
-    job_id: str,
-    scheduled_for: datetime,
+    claim: RunClaim,
     *,
     status: str,
     details: Dict[str, Any],
     db_path: Path,
 ) -> None:
+    if status not in ATTEMPT_TERMINAL_STATUSES:
+        raise SchedulerJobError(f"unsupported scheduler terminal status: {status}")
+    completed_at = now_utc()
+    details_json = json.dumps(details, ensure_ascii=False, sort_keys=True)
     with connect(db_path) as connection, transaction(connection):
-        connection.execute(
+        attempt = connection.execute(
             """
-            UPDATE scheduler_runs SET status=?, completed_at=?, details_json=?
-            WHERE job_id=? AND scheduled_for=? AND status='running'
+            UPDATE scheduler_run_attempts
+            SET status=?,completed_at=?,details_json=?
+            WHERE id=? AND scheduler_run_id=? AND status='running'
             """,
             (
                 status,
-                now_utc(),
-                json.dumps(details, ensure_ascii=False, sort_keys=True),
-                job_id,
-                _scheduled_iso(scheduled_for),
+                completed_at,
+                details_json,
+                claim.attempt_id,
+                claim.scheduler_run_id,
             ),
         )
-        if connection.execute("SELECT changes()").fetchone()[0] != 1:
+        if attempt.rowcount != 1:
             raise SchedulerJobError(
-                f"scheduler run is no longer active: {job_id} "
-                f"{_scheduled_iso(scheduled_for)}"
+                f"scheduler attempt is no longer active: {claim.attempt_id}"
             )
+        run = connection.execute(
+            """
+            UPDATE scheduler_runs SET status=?, completed_at=?, details_json=?
+            WHERE id=? AND status='running'
+            """,
+            (
+                status,
+                completed_at,
+                details_json,
+                claim.scheduler_run_id,
+            ),
+        )
+        if run.rowcount != 1:
+            raise SchedulerJobError(
+                f"scheduler run is no longer active: {claim.scheduler_run_id}"
+            )
+
+
+def recover_interrupted_scheduler_runs(*, db_path: Path = DEFAULT_DB) -> int:
+    """Fence attempts left running by a previous single-writer process."""
+
+    completed_at = now_utc()
+    details_json = json.dumps(
+        {"reason": "writer_process_restarted"},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    with connect(db_path) as connection, transaction(connection):
+        attempts = connection.execute(
+            """
+            SELECT id,scheduler_run_id FROM scheduler_run_attempts
+            WHERE status='running' ORDER BY id
+            """
+        ).fetchall()
+        running_run_ids = {
+            int(row["id"])
+            for row in connection.execute(
+                "SELECT id FROM scheduler_runs WHERE status='running'"
+            )
+        }
+        running_attempt_run_ids = {
+            int(attempt["scheduler_run_id"]) for attempt in attempts
+        }
+        if running_run_ids != running_attempt_run_ids:
+            raise SchedulerJobError(
+                "running scheduler occurrences and attempts are inconsistent"
+            )
+        for attempt in attempts:
+            updated_attempt = connection.execute(
+                """
+                UPDATE scheduler_run_attempts
+                SET status='interrupted',completed_at=?,details_json=?
+                WHERE id=? AND status='running'
+                """,
+                (completed_at, details_json, int(attempt["id"])),
+            )
+            updated_run = connection.execute(
+                """
+                UPDATE scheduler_runs
+                SET status='interrupted',completed_at=?,details_json=?
+                WHERE id=? AND status='running'
+                """,
+                (completed_at, details_json, int(attempt["scheduler_run_id"])),
+            )
+            if updated_attempt.rowcount != 1 or updated_run.rowcount != 1:
+                raise SchedulerJobError(
+                    "scheduler interruption recovery lost its active attempt"
+                )
+        return len(attempts)
 
 
 def prepare_due_capture_slots(
@@ -476,6 +630,7 @@ def run_due_capture(
             )
             if cursor_key in seen_cursors:
                 stopped_reason = "cursor_repeated"
+                account_status = "partial"
                 break
             seen_cursors.add(cursor_key)
             window_key = (
@@ -546,8 +701,12 @@ def run_due_capture(
             if published_values and min(published_values) <= discovery_start:
                 break
             next_cursor = page.get("next_cursor")
-            if not page.get("has_more") or next_cursor in (None, ""):
+            if not page.get("has_more"):
                 stopped_reason = "provider_exhausted"
+                break
+            if next_cursor in (None, ""):
+                stopped_reason = "missing_next_cursor"
+                account_status = "partial"
                 break
             cursor = next_cursor
         else:
@@ -844,7 +1003,7 @@ def run_media_cutoff(
     *,
     db_path: Path = DEFAULT_DB,
 ) -> Dict[str, Any]:
-    """Route unfinished same-day media to review, then evaluate only final evidence state."""
+    """Evaluate completed media DAGs, then retire legacy media review rows."""
 
     local_day = scheduled_for.astimezone(SHANGHAI).date()
     start = datetime.combine(local_day, time.min, SHANGHAI).astimezone(timezone.utc)
@@ -852,22 +1011,9 @@ def run_media_cutoff(
     start_iso = start.isoformat(timespec="seconds").replace("+00:00", "Z")
     end_iso = end.isoformat(timespec="seconds").replace("+00:00", "Z")
     with connect(db_path) as connection:
-        rows = connection.execute(
+        coverage_rows = connection.execute(
             """
-            SELECT c.id, c.content_type,
-              EXISTS(
-                SELECT 1 FROM evidence_artifacts ea
-                WHERE ea.content_id=c.id AND ea.artifact_type IN ('media','media_manifest')
-                  AND ea.status='available'
-              ) media_ready,
-              EXISTS(
-                SELECT 1 FROM evidence_artifacts ea
-                WHERE ea.content_id=c.id AND ea.artifact_type='asr' AND ea.status='available'
-              ) asr_ready,
-              EXISTS(
-                SELECT 1 FROM evidence_artifacts ea
-                WHERE ea.content_id=c.id AND ea.artifact_type='ocr' AND ea.status='available'
-              ) ocr_ready
+            SELECT c.id
             FROM content_items c
             WHERE c.platform IN ('douyin','xiaohongshu')
               AND c.content_type IN ('video','image')
@@ -888,58 +1034,129 @@ def run_media_cutoff(
             """,
             (*BACKFILL_SOURCE_GROUPS, start_iso, end_iso, start_iso, end_iso),
         ).fetchall()
-    complete_ids: List[int] = []
-    incomplete_ids: List[int] = []
-    for row in rows:
-        complete = bool(row["media_ready"] and row["ocr_ready"])
-        if row["content_type"] == "video":
-            complete = bool(complete and row["asr_ready"])
-        (complete_ids if complete else incomplete_ids).append(int(row["id"]))
+        backlog_rows = connection.execute(
+            """
+            SELECT DISTINCT c.id
+            FROM content_items c
+            JOIN evidence_artifacts ea ON ea.content_id=c.id
+            WHERE c.platform IN ('douyin','xiaohongshu')
+              AND c.content_type IN ('video','image')
+              AND COALESCE(c.source_group,'') NOT IN (?,?)
+              AND ea.artifact_type='media_source'
+              AND ea.status='available'
+            ORDER BY c.id
+            """,
+            BACKFILL_SOURCE_GROUPS,
+        ).fetchall()
+        releases = connection.execute(
+            "SELECT id FROM evaluation_releases WHERE status='active' ORDER BY id"
+        ).fetchall()
+        if len(releases) != 1:
+            raise SchedulerJobError(
+                "daily media cutoff requires exactly one active evaluation release"
+            )
+        release_id = str(releases[0]["id"])
+        coverage_content_ids = [int(row["id"]) for row in coverage_rows]
+        backlog_content_ids = [int(row["id"]) for row in backlog_rows]
+        state_content_ids = list(
+            dict.fromkeys([*coverage_content_ids, *backlog_content_ids])
+        )
+        initial_states = media_terminal_state_details(
+            connection, release_id, state_content_ids
+        )
+
+    evaluation_results: List[Dict[str, Any]] = []
+    evaluation_content_ids = [
+        content_id
+        for content_id in backlog_content_ids
+        if initial_states[content_id].reason == "evaluation_pending"
+    ]
+    for content_id in evaluation_content_ids:
+        evaluation = evaluate_content(
+            content_id,
+            db_path=db_path,
+            expected_active_release_id=release_id,
+        )
+        evaluation_results.append(
+            {
+                "content_id": content_id,
+                "evaluation_id": evaluation.evaluation_id,
+                "evidence_level": evaluation.evidence_level,
+                "created": evaluation.created,
+            }
+        )
+
+    resolved_queue_rows = 0
     with connect(db_path) as connection, transaction(connection):
-        for content_id in incomplete_ids:
-            queue_evaluation = review_anchor_evaluation(connection, content_id)
-            connection.execute(
-                """
-                INSERT INTO review_queue(
-                    content_id, evaluation_id, reason_code, priority, status,
-                    created_at, updated_at
-                ) VALUES (?, ?, 'media_processing_incomplete', 90, 'manual_required', ?, ?)
-                ON CONFLICT(content_id, reason_code) DO UPDATE SET
-                    evaluation_id=excluded.evaluation_id,
-                    status=CASE
-                        WHEN review_queue.status IN ('resolved','terminal_failed')
-                        THEN review_queue.status ELSE 'manual_required' END,
-                    updated_at=excluded.updated_at
-                """,
-                (
-                    content_id,
-                    queue_evaluation["id"] if queue_evaluation is not None else None,
-                    now_utc(),
-                    now_utc(),
-                ),
+        active_releases = connection.execute(
+            "SELECT id FROM evaluation_releases WHERE status='active' ORDER BY id"
+        ).fetchall()
+        if len(active_releases) != 1 or str(active_releases[0]["id"]) != release_id:
+            raise SchedulerJobError(
+                "active evaluation release changed during daily media cutoff"
             )
-        for content_id in complete_ids:
-            connection.execute(
-                """
-                UPDATE review_queue SET status='resolved', resolved_at=?, updated_at=?
-                WHERE content_id=? AND reason_code='media_processing_incomplete'
-                  AND status NOT IN ('resolved','terminal_failed')
+        final_state_content_ids = list(
+            dict.fromkeys([*coverage_content_ids, *evaluation_content_ids])
+        )
+        final_states = media_terminal_state_details(
+            connection, release_id, final_state_content_ids
+        )
+        if final_state_content_ids:
+            placeholders = ",".join("?" for _ in final_state_content_ids)
+            resolved_at = now_utc()
+            updated = connection.execute(
+                f"""
+                UPDATE review_queue
+                SET status='resolved',resolved_at=COALESCE(resolved_at,?),updated_at=?
+                WHERE content_id IN ({placeholders})
+                  AND reason_code IN (
+                    'media_processing_incomplete','media_evidence_missing',
+                    'stale_local_evidence','legacy_content_unavailable'
+                  )
+                  AND status<>'resolved'
                 """,
-                (now_utc(), now_utc(), content_id),
+                (resolved_at, resolved_at, *final_state_content_ids),
             )
-    evaluation = evaluate_incremental(db_path=db_path)
-    total = len(rows)
-    coverage = round(len(complete_ids) / total, 4) if total else 1.0
+            resolved_queue_rows = int(updated.rowcount)
+
+    state_counts = Counter(
+        final_states[content_id].state for content_id in coverage_content_ids
+    )
+    normalized_state_counts = {
+        "complete": int(state_counts["complete"]),
+        "terminal_insufficient": int(state_counts["terminal_insufficient"]),
+        "terminal_failed": int(state_counts["terminal_failed"]),
+        "pending": int(state_counts["pending"]),
+    }
+    terminal = (
+        normalized_state_counts["complete"]
+        + normalized_state_counts["terminal_insufficient"]
+        + normalized_state_counts["terminal_failed"]
+    )
+    total = len(coverage_content_ids)
+    coverage = round(terminal * 100 / total, 2) if total else 100.0
+    threshold = float(
+        load_contract()["required_coverage_thresholds"]["media_terminal_coverage"]
+    )
     return {
         "window_start": start_iso,
         "window_end": end_iso,
         "candidates": total,
-        "complete": len(complete_ids),
-        "manual_required": len(incomplete_ids),
+        "state_counts": normalized_state_counts,
+        "pending": normalized_state_counts["pending"],
+        "terminal": terminal,
         "terminal_coverage": coverage,
-        "threshold": 0.95,
-        "threshold_status": "available" if coverage >= 0.95 else "below_threshold",
-        "evaluation": evaluation,
+        "threshold": threshold,
+        "threshold_status": (
+            "available" if coverage >= threshold else "below_threshold"
+        ),
+        "evaluation": {
+            "candidates": len(evaluation_results),
+            "created": sum(int(item["created"]) for item in evaluation_results),
+            "reused": sum(int(not item["created"]) for item in evaluation_results),
+            "results": evaluation_results,
+        },
+        "resolved_media_queue_rows": resolved_queue_rows,
     }
 
 
@@ -956,9 +1173,6 @@ def _run_job_action(
     if job_id in REPORT_JOB_IDS:
         _require_report_job_runtime_ready(db_path=db_path)
     local_date = scheduled_for.astimezone(SHANGHAI).date()
-    fresh_start = datetime.combine(local_date - timedelta(days=1), time.min, SHANGHAI)
-    fresh_start_iso = _scheduled_iso(fresh_start)
-    fresh_end_iso = _scheduled_iso(scheduled_for)
     if job_id == "daily_capture":
         details = run_due_capture(
             scheduled_for, db_path=db_path, call_override=capture_call_override
@@ -968,8 +1182,6 @@ def _run_job_action(
         fresh_content = run_media_download_queue(
             limit=MEDIA_QUEUE_BATCH_LIMIT,
             db_path=db_path,
-            published_start=fresh_start_iso,
-            published_end=fresh_end_iso,
         )
         status = (
             "failed"
@@ -982,8 +1194,6 @@ def _run_job_action(
         media = run_media_processing_queue(
             limit=MEDIA_QUEUE_BATCH_LIMIT,
             db_path=db_path,
-            published_start=fresh_start_iso,
-            published_end=fresh_end_iso,
         )
         duplicates = run_duplicate_fingerprint_queue(limit=500, db_path=db_path)
         status = (
@@ -1006,7 +1216,12 @@ def _run_job_action(
             db_path=db_path,
             reports_root=reports_root,
         )
-        return "succeeded", {"task_id": task["id"], "task_status": task["task_status"]}
+        task_status = str(task["task_status"])
+        if task_status not in {"succeeded", "partial"}:
+            raise SchedulerJobError(
+                f"daily report returned non-terminal task status: {task_status}"
+            )
+        return task_status, {"task_id": task["id"], "task_status": task_status}
     if job_id == "weekly_report":
         end = local_date - timedelta(days=1)
         start = end - timedelta(days=6)
@@ -1018,7 +1233,12 @@ def _run_job_action(
             db_path=db_path,
             reports_root=reports_root,
         )
-        return "succeeded", {"task_id": task["id"], "task_status": task["task_status"]}
+        task_status = str(task["task_status"])
+        if task_status not in {"succeeded", "partial"}:
+            raise SchedulerJobError(
+                f"weekly report returned non-terminal task status: {task_status}"
+            )
+        return task_status, {"task_id": task["id"], "task_status": task_status}
     raise SchedulerJobError(f"unknown scheduler job: {job_id}")
 
 
@@ -1031,9 +1251,28 @@ def execute_job(
     capture_call_override: Optional[
         Callable[[str, Mapping[str, Any]], ProviderResult]
     ] = None,
+    allow_retry: bool = False,
+    invocation_source: str = "scheduled",
 ) -> Dict[str, Any]:
     if job_id not in {job.job_id for job in JOBS}:
         raise SchedulerJobError(f"unknown scheduler job: {job_id}")
+    if invocation_source not in INVOCATION_SOURCES:
+        raise SchedulerJobError(
+            f"unsupported scheduler invocation source: {invocation_source}"
+        )
+    if invocation_source == "startup_report_catchup":
+        if job_id not in REPORT_JOB_IDS:
+            raise SchedulerJobError("startup_report_catchup is report-only")
+        if not allow_retry:
+            raise SchedulerJobError(
+                "startup_report_catchup requires allow_retry=True"
+            )
+    if allow_retry and job_id not in REPORT_JOB_IDS and invocation_source != "operator_retry":
+        raise SchedulerJobError(
+            "non-report scheduler retries require operator_retry authorization"
+        )
+    if invocation_source == "operator_retry" and not allow_retry:
+        raise SchedulerJobError("operator_retry requires allow_retry=True")
     if job_id in REPORT_JOB_IDS:
         try:
             _require_report_job_runtime_ready(db_path=db_path)
@@ -1044,7 +1283,14 @@ def execute_job(
                 "reason": "report_runtime_not_ready",
                 "error": str(error),
             }
-    if not _claim_run(job_id, scheduled_for, db_path=db_path):
+    claim = _claim_run(
+        job_id,
+        scheduled_for,
+        db_path=db_path,
+        allow_retry=allow_retry,
+        invocation_source=invocation_source,
+    )
+    if claim is None:
         return {"job_id": job_id, "status": "skipped_duplicate"}
     try:
         status, details = _run_job_action(
@@ -1056,15 +1302,19 @@ def execute_job(
         )
     except Exception as exc:
         _finish_run(
-            job_id,
-            scheduled_for,
+            claim,
             status="failed",
             details={"error": str(exc)},
             db_path=db_path,
         )
         raise
-    _finish_run(job_id, scheduled_for, status=status, details=details, db_path=db_path)
-    return {"job_id": job_id, "status": status, "details": details}
+    _finish_run(claim, status=status, details=details, db_path=db_path)
+    return {
+        "job_id": job_id,
+        "status": status,
+        "attempt_number": claim.attempt_number,
+        "details": details,
+    }
 
 
 def _live_job(
@@ -1106,50 +1356,179 @@ def install_jobs(
         )
 
 
+def _report_occurrence(
+    job_id: str,
+    *,
+    period_start: date,
+    period_end: date,
+) -> datetime:
+    if job_id == "daily_report":
+        return datetime.combine(period_end + timedelta(days=1), time(8, 0), SHANGHAI)
+    if job_id == "weekly_report":
+        return datetime.combine(period_end + timedelta(days=1), time(8, 30), SHANGHAI)
+    raise SchedulerJobError(f"not a report job: {job_id}")
+
+
+def _report_catchup_occurrences(
+    *, current: datetime, db_path: Path
+) -> List[tuple[str, datetime]]:
+    """Return every due failed/interrupted or content-backed missing report slot."""
+
+    current = current.astimezone(SHANGHAI)
+    candidates: set[tuple[str, datetime]] = set()
+    with connect(db_path) as connection:
+        for row in connection.execute(
+            """
+            SELECT job_id,scheduled_for FROM scheduler_runs
+            WHERE job_id IN ('daily_report','weekly_report')
+              AND status IN ('failed','interrupted')
+            ORDER BY scheduled_for,job_id
+            """
+        ):
+            occurrence = datetime.fromisoformat(
+                str(row["scheduled_for"]).replace("Z", "+00:00")
+            ).astimezone(SHANGHAI)
+            if occurrence <= current:
+                candidates.add((str(row["job_id"]), occurrence))
+
+        automatic_tasks = connection.execute(
+            """
+            SELECT task_type,period_start,period_end FROM report_tasks
+            WHERE creation_source='automatic' AND task_type IN ('daily','weekly')
+            ORDER BY period_start,period_end
+            """
+        ).fetchall()
+        daily_anchor: Optional[date] = None
+        weekly_anchor: Optional[date] = None
+        for task in automatic_tasks:
+            task_type = str(task["task_type"])
+            start = date.fromisoformat(str(task["period_start"]))
+            end = date.fromisoformat(str(task["period_end"]))
+            job_id = "daily_report" if task_type == "daily" else "weekly_report"
+            occurrence = _report_occurrence(
+                job_id, period_start=start, period_end=end
+            )
+            if occurrence <= current:
+                candidates.add((job_id, occurrence))
+            if task_type == "daily" and (daily_anchor is None or start < daily_anchor):
+                daily_anchor = start
+            if task_type == "weekly" and (
+                weekly_anchor is None or start < weekly_anchor
+            ):
+                weekly_anchor = start
+
+        latest_daily = latest_occurrence(
+            next(job for job in JOBS if job.job_id == "daily_report"), current
+        )
+        if daily_anchor is None:
+            daily_anchor = latest_daily.date() - timedelta(days=1)
+        content_days = [
+            date.fromisoformat(str(row["report_day"]))
+            for row in connection.execute(
+                """
+                SELECT DISTINCT date(datetime(published_at), '+8 hours') report_day
+                FROM content_items
+                WHERE published_at IS NOT NULL
+                  AND date(datetime(published_at), '+8 hours')>=?
+                ORDER BY report_day
+                """,
+                (daily_anchor.isoformat(),),
+            )
+            if row["report_day"] is not None
+        ]
+        existing = {
+            (str(row["job_id"]), str(row["scheduled_for"]))
+            for row in connection.execute(
+                """
+                SELECT job_id,scheduled_for FROM scheduler_runs
+                WHERE job_id IN ('daily_report','weekly_report')
+                """
+            )
+        }
+        for report_day in content_days:
+            occurrence = _report_occurrence(
+                "daily_report", period_start=report_day, period_end=report_day
+            )
+            if (
+                occurrence <= current
+                and ("daily_report", _scheduled_iso(occurrence)) not in existing
+            ):
+                candidates.add(("daily_report", occurrence))
+
+        if weekly_anchor is None:
+            weekly_anchor = daily_anchor + timedelta(
+                days=(-daily_anchor.weekday()) % 7
+            )
+        if weekly_anchor is not None:
+            weeks = {
+                report_day - timedelta(days=report_day.weekday())
+                for report_day in content_days
+                if report_day >= weekly_anchor
+            }
+            for week_start in weeks:
+                week_end = week_start + timedelta(days=6)
+                occurrence = _report_occurrence(
+                    "weekly_report", period_start=week_start, period_end=week_end
+                )
+                if (
+                    occurrence <= current
+                    and ("weekly_report", _scheduled_iso(occurrence)) not in existing
+                ):
+                    candidates.add(("weekly_report", occurrence))
+
+    terminal: set[tuple[str, str]] = set()
+    with connect(db_path) as connection:
+        terminal = {
+            (str(row["job_id"]), str(row["scheduled_for"]))
+            for row in connection.execute(
+                """
+                SELECT job_id,scheduled_for FROM scheduler_runs
+                WHERE job_id IN ('daily_report','weekly_report')
+                  AND status IN ('running','succeeded','partial','skipped')
+                """
+            )
+        }
+    return sorted(
+        (
+            (job_id, occurrence)
+            for job_id, occurrence in candidates
+            if (job_id, _scheduled_iso(occurrence)) not in terminal
+        ),
+        key=lambda item: (item[1], item[0]),
+    )
+
+
 def startup_catchup(
     *,
     now: Optional[datetime] = None,
     db_path: Path = DEFAULT_DB,
     reports_root: Path = REPORTS_ROOT,
 ) -> List[Dict[str, Any]]:
-    current = now or datetime.now(SHANGHAI)
+    """Catch up report-only occurrences; this path never runs provider/media jobs."""
+
+    current = (now or datetime.now(SHANGHAI)).astimezone(SHANGHAI)
     results: List[Dict[str, Any]] = []
-    for job in JOBS:
-        latest = latest_occurrence(job, current)
-        with connect(db_path) as connection:
-            previous = connection.execute(
-                """
-                SELECT scheduled_for FROM scheduler_runs
-                WHERE job_id=? AND status IN ('succeeded','skipped')
-                ORDER BY scheduled_for DESC LIMIT 1
-                """,
-                (job.job_id,),
-            ).fetchone()
-        occurrences = [latest]
-        if previous is not None:
-            previous_dt = datetime.fromisoformat(
-                str(previous["scheduled_for"]).replace("Z", "+00:00")
-            ).astimezone(SHANGHAI)
-            step = timedelta(days=7 if job.day_of_week else 1)
-            occurrences = []
-            candidate = previous_dt + step
-            lower_bound = current - timedelta(days=28 if job.day_of_week else 7)
-            while candidate <= latest:
-                if candidate >= lower_bound:
-                    occurrences.append(candidate)
-                candidate += step
-        for occurrence in occurrences:
-            try:
-                results.append(
-                    execute_job(
-                        job.job_id,
-                        occurrence,
-                        db_path=db_path,
-                        reports_root=reports_root,
-                    )
-                )
-            except Exception as exc:
-                results.append(
-                    {"job_id": job.job_id, "status": "failed", "error": str(exc)}
-                )
+    for job_id, occurrence in _report_catchup_occurrences(
+        current=current, db_path=db_path
+    ):
+        try:
+            result = execute_job(
+                job_id,
+                occurrence,
+                db_path=db_path,
+                reports_root=reports_root,
+                allow_retry=True,
+                invocation_source="startup_report_catchup",
+            )
+            result["scheduled_for"] = _scheduled_iso(occurrence)
+            results.append(result)
+        except Exception as exc:
+            results.append(
+                {
+                    "job_id": job_id,
+                    "scheduled_for": _scheduled_iso(occurrence),
+                    "status": "failed",
+                    "error": str(exc),
+                }
+            )
     return results

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import unittest
 
@@ -21,6 +22,7 @@ from v8.storage import PROJECT_ROOT
 V8_3_CONTRACT_PATH = PROJECT_ROOT / "config" / "report_contract_v8_3.json"
 V8_4_CONTRACT_PATH = PROJECT_ROOT / "config" / "report_contract_v8_4.json"
 V8_5_CONTRACT_PATH = PROJECT_ROOT / "config" / "report_contract_v8_5.json"
+V8_6_CONTRACT_PATH = PROJECT_ROOT / "config" / "report_contract_v8_6.json"
 
 
 def _audience_quality() -> dict:
@@ -238,8 +240,67 @@ class V84ContractFreezeTest(unittest.TestCase):
             "duplicate_calibration_ready": True
         }
         self.assertEqual(v85, expected_v85)
-        self.assertEqual(CURRENT_REPORT_VERSION, v85["report_version"])
-        self.assertEqual(CONTRACT_PATH, V8_5_CONTRACT_PATH)
+        self.assertEqual(
+            hashlib.sha256(V8_5_CONTRACT_PATH.read_bytes()).hexdigest(),
+            "56c50464a8ed75ba0ebef2dbf13df3fa8c17baec5bc7bdc1cde2e5348673839b",
+        )
+        self.assertEqual(
+            LEGACY_CONTRACT_PATHS["dcar-content-operations-report-v8.5"],
+            V8_5_CONTRACT_PATH,
+        )
+
+        v86 = json.loads(V8_6_CONTRACT_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(
+            v86["report_version"], "dcar-content-operations-report-v8.6"
+        )
+        self.assertEqual(v86["task_statuses"], ["succeeded", "partial"])
+        self.assertEqual(v86["rule_version"], "evaluation-v9")
+        self.assertNotIn(
+            "metrics_freshness", v86["required_coverage_thresholds"]
+        )
+        self.assertNotIn(
+            "discovery_coverage", v86["required_coverage_thresholds"]
+        )
+        self.assertEqual(
+            v86["required_coverage_thresholds"],
+            {
+                "detail_coverage": 90.0,
+                "evaluation_coverage": 90.0,
+                "media_terminal_coverage": 90.0,
+                "duplicate_fingerprint_coverage": 90.0,
+                "weekly_comment_coverage": 90.0,
+            },
+        )
+        self.assertNotIn(
+            "core_artifact_coverage", v86["required_coverage_thresholds"]
+        )
+        self.assertEqual(
+            v86["metric_display_coverage_thresholds"],
+            {"view_count": 90.0, "comment_count": 90.0},
+        )
+        self.assertEqual(
+            v86["required_quality_details"]["discovery_coverage"],
+            {
+                "minimum_percentage": 90.0,
+                "allow_not_applicable_when_empty": True,
+                "eligible_basis": "scheduled_daily_capture_identity_occurrences",
+            },
+        )
+        self.assertEqual(
+            v86["required_quality_details"]["metrics_freshness"],
+            {
+                "minimum_percentage": 90.0,
+                "allow_not_applicable_when_empty": True,
+                "window_hours": 36,
+                "eligible_basis": "all_window_contents",
+            },
+        )
+        self.assertEqual(v86["required_boolean_quality_gates"], {})
+        self.assertEqual(
+            v86["boolean_quality_fields"], ["duplicate_calibration_ready"]
+        )
+        self.assertEqual(CURRENT_REPORT_VERSION, v86["report_version"])
+        self.assertEqual(CONTRACT_PATH, V8_6_CONTRACT_PATH)
         self.assertEqual(
             LEGACY_CONTRACT_PATHS["dcar-content-operations-report-v8.4"],
             V8_4_CONTRACT_PATH,
@@ -249,13 +310,13 @@ class V84ContractFreezeTest(unittest.TestCase):
             "evaluation-v8",
         )
         self.assertEqual(
-            REPORT_RULE_VERSIONS[CURRENT_REPORT_VERSION], "evaluation-v8"
+            REPORT_RULE_VERSIONS[CURRENT_REPORT_VERSION], "evaluation-v9"
         )
 
     def test_v8_4_accepts_a_complete_report(self) -> None:
         validate_report(_valid_v8_4_report(), contract_path=V8_4_CONTRACT_PATH)
 
-    def test_v8_5_is_the_current_complete_report_contract(self) -> None:
+    def test_v8_5_remains_exact_and_valid_without_v8_6_freshness_fields(self) -> None:
         validate_report(_valid_v8_5_report())
         validate_report(_valid_v8_5_report(), contract_path=V8_5_CONTRACT_PATH)
 

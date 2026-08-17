@@ -5517,8 +5517,6 @@ def _queue_content_ids(
     stage: str,
     limit: int,
     db_path: Path,
-    published_start: Optional[str] = None,
-    published_end: Optional[str] = None,
 ) -> List[int]:
     if stage not in {"download", "process"}:
         raise ValueError(f"unknown media queue stage: {stage}")
@@ -5538,11 +5536,8 @@ def _queue_content_ids(
                 WHERE source.content_id=c.id AND source.artifact_type='media_source'
                   AND source.status='available'
             )
-              AND (? IS NULL OR c.published_at>=?)
-              AND (? IS NULL OR c.published_at<?)
             ORDER BY (c.published_at IS NULL) ASC, c.published_at DESC, c.id DESC
             """,
-            (published_start, published_start, published_end, published_end),
         ).fetchall()
         slot_rows = connection.execute(
             """
@@ -5694,8 +5689,6 @@ def _queue_recovery_scope_content_ids(
     stage: str,
     limit: int,
     db_path: Path,
-    published_start: Optional[str],
-    published_end: Optional[str],
 ) -> List[int]:
     processor_types = (
         ("download",) if stage == "download" else ("frames", "asr", "ocr")
@@ -5715,17 +5708,11 @@ def _queue_recovery_scope_content_ids(
                     AND source.artifact_type='media_source'
                     AND source.status='available'
               )
-              AND (? IS NULL OR c.published_at>=?)
-              AND (? IS NULL OR c.published_at<?)
             ORDER BY (c.published_at IS NULL) ASC,c.published_at DESC,c.id DESC
             LIMIT ?
             """,
             (
                 *processor_types,
-                published_start,
-                published_start,
-                published_end,
-                published_end,
                 limit,
             ),
         ).fetchall()
@@ -5737,8 +5724,6 @@ def run_media_download_queue(
     limit: int = MEDIA_QUEUE_BATCH_LIMIT,
     max_workers: int = MEDIA_DOWNLOAD_WORKERS,
     db_path: Path = DEFAULT_DB,
-    published_start: Optional[str] = None,
-    published_end: Optional[str] = None,
 ) -> Dict[str, Any]:
     if limit < 0:
         raise ValueError("media queue limit must be non-negative")
@@ -5758,8 +5743,6 @@ def run_media_download_queue(
         stage="download",
         limit=limit,
         db_path=db_path,
-        published_start=published_start,
-        published_end=published_end,
     )
     stale_recovery = recover_stale_media_processing_slots(
         db_path=db_path,
@@ -5768,7 +5751,6 @@ def run_media_download_queue(
     )
     probed_content_ids = _queue_content_ids(
         stage="download", limit=limit + 1, db_path=db_path,
-        published_start=published_start, published_end=published_end,
     )
     truncated = len(probed_content_ids) > limit
     content_ids = probed_content_ids[:limit]
@@ -5812,8 +5794,6 @@ def run_media_processing_queue(
     *,
     limit: int = MEDIA_QUEUE_BATCH_LIMIT,
     db_path: Path = DEFAULT_DB,
-    published_start: Optional[str] = None,
-    published_end: Optional[str] = None,
 ) -> Dict[str, Any]:
     if limit < 0:
         raise ValueError("media queue limit must be non-negative")
@@ -5834,8 +5814,6 @@ def run_media_processing_queue(
         stage="process",
         limit=limit,
         db_path=db_path,
-        published_start=published_start,
-        published_end=published_end,
     )
     stale_recovery = recover_stale_media_processing_slots(
         db_path=db_path,
@@ -5849,7 +5827,6 @@ def run_media_processing_queue(
     )
     probed_content_ids = _queue_content_ids(
         stage="process", limit=limit + 1, db_path=db_path,
-        published_start=published_start, published_end=published_end,
     )
     truncated = len(probed_content_ids) > limit
     content_ids = probed_content_ids[:limit]

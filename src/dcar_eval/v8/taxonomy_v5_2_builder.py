@@ -28,7 +28,16 @@ from .matcher_dsl import (
     taxonomy_matcher_sha256,
     validate_materialized_rule,
 )
-from .storage import DEFAULT_DB, PROJECT_ROOT, SCHEMA_VERSION, now_utc, transaction
+from .storage import (
+    DEFAULT_DB,
+    PROJECT_ROOT,
+    SCHEMA_VERSION,
+    SchemaMigrationError,
+    configure_connection_safety,
+    now_utc,
+    require_schema_compatibility,
+    transaction,
+)
 
 
 BASE_TAXONOMY_VERSION = "selling-points-v5.1"
@@ -57,7 +66,7 @@ def _connect(path: Path, *, read_only: bool) -> Iterator[sqlite3.Connection]:
             f"file:{path.resolve()}?mode={mode}", uri=True, timeout=10
         )
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys=ON")
+        configure_connection_safety(connection)
         connection.execute("PRAGMA busy_timeout=10000")
         if read_only:
             connection.execute("PRAGMA query_only=ON")
@@ -198,12 +207,14 @@ def _matcher_rules(
 
 
 def _require_schema(connection: sqlite3.Connection) -> None:
-    row = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
-    version = int(row[0]) if row is not None and row[0] is not None else 0
-    if version != SCHEMA_VERSION:
-        raise TaxonomyV52BuilderError(
-            f"schema v{SCHEMA_VERSION} is required, found v{version}"
+    try:
+        require_schema_compatibility(
+            connection, supported_versions=frozenset({SCHEMA_VERSION})
         )
+    except SchemaMigrationError as error:
+        raise TaxonomyV52BuilderError(
+            f"complete schema v{SCHEMA_VERSION} is required"
+        ) from error
     if connection.execute("PRAGMA foreign_key_check").fetchall():
         raise TaxonomyV52BuilderError("database has foreign-key violations")
 

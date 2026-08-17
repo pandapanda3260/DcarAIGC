@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,10 +10,12 @@ from unittest.mock import patch
 import v8.reports as reports_module
 from v8.contracts import CURRENT_REPORT_VERSION
 from v8.duplicates import FINGERPRINT_VERSION
-from v8.evaluation import build_evidence_envelope, evaluate_release_content
+from v8.evaluation import build_evidence_envelope
 from v8.matcher_dsl import POINT_IDS, POINT_SCENES
+from v8.metric_observations import persist_metric_observation
 from v8.reports import (
     ReportTaskError,
+    advance_task_progress,
     assert_report_runtime_ready,
     create_and_run_task,
     create_task,
@@ -29,8 +32,9 @@ from v8.storage import (
     ensure_legacy_evaluation_release,
     initialize_database,
     now_utc,
+    transaction,
 )
-from v8.taxonomy_rule_backfill import backfill_v5_1_matcher_rules
+from tests.v9_report_fixture import activate_v9_report_fixture
 
 
 class V8ReportTaskTest(unittest.TestCase):
@@ -100,6 +104,15 @@ class V8ReportTaskTest(unittest.TestCase):
             content_id = int(content.lastrowid)
             connection.execute(
                 """
+                INSERT INTO content_identities(
+                    content_id,identity_kind,identity_value,
+                    platform_identity_key,is_primary,created_at
+                ) VALUES (?,'platform_content_id','1','douyin:1',1,?)
+                """,
+                (content_id, captured_at),
+            )
+            connection.execute(
+                """
                 INSERT INTO fetch_slots(
                     content_id, stage, window_key, provider, adapter_version,
                     status, attempt_count, created_at, updated_at
@@ -107,21 +120,31 @@ class V8ReportTaskTest(unittest.TestCase):
                 """,
                 (content_id, captured_at, captured_at),
             )
-            connection.execute(
-                """
-                INSERT INTO content_metric_snapshots(
-                    content_id, captured_at, window_key, view_count, status, source
-                ) VALUES (?, '2026-07-02T00:00:00Z', 'historical', 1234,
-                          'available', 'migrated_historical')
-                """,
-                (content_id,),
+            persist_metric_observation(
+                connection,
+                content_id=content_id,
+                captured_at=captured_at,
+                window_key="historical",
+                view_count=1234,
+                comment_count=None,
+                like_count=None,
+                share_count=None,
+                collect_count=None,
+                status="available",
+                source="migrated_historical",
+                raw_response_id=None,
+                metadata_json="{}",
             )
             legacy_release = ensure_legacy_evaluation_release(
                 connection,
                 rule_version="evaluation-v7",
                 taxonomy_version="selling-points-v5.0",
             )
-            envelope_id, evidence_sha256, _ = build_evidence_envelope(connection, 1)
+            envelope_id, evidence_sha256, _ = build_evidence_envelope(
+                connection,
+                1,
+                rule_version=str(legacy_release["rule_version"]),
+            )
             connection.execute(
                 """
                 INSERT INTO evaluation_versions(
@@ -167,56 +190,7 @@ class V8ReportTaskTest(unittest.TestCase):
             )
             connection.commit()
 
-        matcher = backfill_v5_1_matcher_rules(db_path=self.db)
-        self.release_id = "evaluation-v8__selling-points-v5.1"
-        with connect(self.db) as connection:
-            connection.execute(
-                """
-                INSERT INTO evaluation_releases(
-                    id,rule_version,taxonomy_version,matcher_rule_sha256,status,
-                    created_at,updated_at
-                ) VALUES (?,'evaluation-v8','selling-points-v5.1',?,'backfilling',?,?)
-                """,
-                (
-                    self.release_id,
-                    matcher["matcher_rule_sha256"],
-                    captured_at,
-                    captured_at,
-                ),
-            )
-            connection.commit()
-        evaluate_release_content(1, release_id=self.release_id, db_path=self.db)
-        with connect(self.db) as connection:
-            connection.execute(
-                """
-                UPDATE evaluation_releases
-                SET status='retired',retired_at=?,updated_at=?
-                WHERE status='active' AND id<>?
-                """,
-                (captured_at, captured_at, self.release_id),
-            )
-            connection.execute(
-                """
-                UPDATE taxonomy_versions SET status='retired'
-                WHERE status='published' AND version<>'selling-points-v5.1'
-                """
-            )
-            connection.execute(
-                """
-                UPDATE taxonomy_versions
-                SET status='published',published_at=?
-                WHERE version='selling-points-v5.1'
-                """,
-                (captured_at,),
-            )
-            connection.execute(
-                """
-                UPDATE evaluation_releases
-                SET status='active',activated_at=?,updated_at=? WHERE id=?
-                """,
-                (captured_at, captured_at, self.release_id),
-            )
-            connection.commit()
+        self.release_id = activate_v9_report_fixture(self.db, [1])
 
     def test_conclusion_cell_uses_cause_and_never_publishes_blocked_value(
         self,
@@ -262,9 +236,407 @@ class V8ReportTaskTest(unittest.TestCase):
             ),
             "12.5%（仅样本）",
         )
+        self.assertEqual(
+            reports_module._conclusion_cell(
+                {
+                    "kind": "ratio",
+                    "percentage": None,
+                    "status": "not_calculable",
+                    "reason": "重复内容感知指纹尚未完成定标，重复率暂不可计算",
+                }
+            ),
+            "重复指纹待校验",
+        )
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def test_metric_freshness_uses_fixed_cutoff_and_immutable_observations(
+        self,
+    ) -> None:
+        task = {
+            "task_type": "daily",
+            "creation_source": "automatic",
+            "period_end": "2026-08-04",
+        }
+        cutoff = reports_module._collection_cutoff_at(
+            task, generated_at="2099-01-01T00:00:00Z"
+        )
+        self.assertEqual(cutoff, "2026-08-05T00:00:00Z")
+        self.assertEqual(
+            reports_module._collection_cutoff_at(
+                task, generated_at="2026-08-05T00:00:01Z"
+            ),
+            cutoff,
+        )
+        self.assertEqual(
+            reports_module._collection_cutoff_at(
+                {
+                    "task_type": "custom",
+                    "creation_source": "manual",
+                    "period_end": "2026-08-04",
+                    "created_at": "2026-08-20T12:34:56Z",
+                },
+                generated_at="2026-09-20T12:34:56Z",
+            ),
+            "2026-08-20T12:34:56Z",
+        )
+
+        captured_values = (
+            "2026-08-05T00:00:00Z",
+            "2026-08-03T12:00:00Z",
+            "2026-08-03T11:59:59Z",
+            "2026-08-05T00:00:00.500000Z",
+        )
+        content_ids: list[int] = []
+        with connect(self.db) as connection, transaction(connection):
+            for index in range(6):
+                link_id = f"FR{index:04d}"
+                cursor = connection.execute(
+                    """
+                    INSERT INTO content_items(
+                        link_id,platform,platform_content_id,canonical_url,
+                        published_at,title,content_type,imported_at,created_at,updated_at
+                    ) VALUES (?,'douyin',?,?, '2026-08-04T04:00:00Z',
+                              'freshness fixture','video',?,?,?)
+                    """,
+                    (
+                        link_id,
+                        f"freshness-{index}",
+                        f"https://www.douyin.com/video/freshness-{index}",
+                        "2026-08-04T05:00:00Z",
+                        "2026-08-04T05:00:00Z",
+                        "2026-08-04T05:00:00Z",
+                    ),
+                )
+                content_id = int(cursor.lastrowid)
+                content_ids.append(content_id)
+                connection.execute(
+                    """
+                    INSERT INTO content_identities(
+                        content_id,identity_kind,identity_value,
+                        platform_identity_key,is_primary,created_at
+                    ) VALUES (?,'platform_content_id',?,?,1,'2026-08-04T05:00:00Z')
+                    """,
+                    (content_id, f"freshness-{index}", f"douyin:freshness-{index}"),
+                )
+                if index < len(captured_values):
+                    persist_metric_observation(
+                        connection,
+                        content_id=content_id,
+                        captured_at=captured_values[index],
+                        window_key="2026-08-04",
+                        view_count=100 + index,
+                        comment_count=None,
+                        like_count=None,
+                        share_count=None,
+                        collect_count=None,
+                        status="available",
+                        source="douyin",
+                        raw_response_id=None,
+                        metadata_json="{}",
+                    )
+                elif index == 5:
+                    persist_metric_observation(
+                        connection,
+                        content_id=content_id,
+                        captured_at="2026-08-04T00:00:00Z",
+                        window_key="old-available",
+                        view_count=105,
+                        comment_count=None,
+                        like_count=None,
+                        share_count=None,
+                        collect_count=None,
+                        status="available",
+                        source="douyin",
+                        raw_response_id=None,
+                        metadata_json="{}",
+                    )
+                    persist_metric_observation(
+                        connection,
+                        content_id=content_id,
+                        captured_at="2026-08-04T23:00:00Z",
+                        window_key="newer-missing",
+                        view_count=None,
+                        comment_count=None,
+                        like_count=None,
+                        share_count=None,
+                        collect_count=None,
+                        status="missing",
+                        source="douyin",
+                        raw_response_id=None,
+                        metadata_json="{}",
+                    )
+            detail = reports_module._metric_freshness_detail(
+                connection,
+                content_ids,
+                cutoff_at=cutoff,
+                minimum_percentage=90.0,
+            )
+        self.assertEqual(
+            detail,
+            {
+                "status": "below_threshold",
+                "fresh_count": 2,
+                "as_of_snapshot_count": 4,
+                "eligible_count": 6,
+                "percentage": 33.33,
+                "window_hours": 36,
+                "eligible_basis": "all_window_contents",
+                "reason": (
+                    "固定采集截止点前 36 小时内的新鲜指标覆盖率为 "
+                    "33.33%，低于 90% 发布门槛"
+                ),
+            },
+        )
+
+        with connect(self.db) as connection, transaction(connection):
+            persist_metric_observation(
+                connection,
+                content_id=content_ids[4],
+                captured_at="2026-08-05T00:00:00.500000Z",
+                window_key="late",
+                view_count=999,
+                comment_count=None,
+                like_count=None,
+                share_count=None,
+                collect_count=None,
+                status="available",
+                source="douyin",
+                raw_response_id=None,
+                metadata_json="{}",
+            )
+            unchanged = reports_module._metric_freshness_detail(
+                connection,
+                content_ids,
+                cutoff_at=cutoff,
+                minimum_percentage=90.0,
+            )
+            as_of = reports_module._latest_metric_observations_at(
+                connection, content_ids, cutoff_at=cutoff
+            )
+        self.assertEqual(unchanged, detail)
+        self.assertEqual(as_of[content_ids[0]]["captured_at"], cutoff)
+        self.assertNotIn(content_ids[3], as_of)
+        self.assertNotIn(content_ids[4], as_of)
+        self.assertEqual(as_of[content_ids[5]]["status"], "missing")
+        self.assertIsNone(as_of[content_ids[5]]["view_count"])
+
+    def test_empty_metric_freshness_is_not_applicable_not_one_hundred(self) -> None:
+        with connect(self.db) as connection:
+            detail = reports_module._metric_freshness_detail(
+                connection,
+                [],
+                cutoff_at="2026-08-05T00:00:00Z",
+                minimum_percentage=90.0,
+            )
+        self.assertEqual(detail["status"], "not_applicable")
+        self.assertIsNone(detail["percentage"])
+        self.assertEqual(detail["eligible_count"], 0)
+
+    def test_report_id_batches_respect_live_sqlite_variable_limit(self) -> None:
+        with connect(self.db) as connection:
+            previous_limit = connection.setlimit(
+                sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 12
+            )
+            try:
+                batches = list(
+                    reports_module._report_id_batches(
+                        connection,
+                        list(range(1, 32)),
+                        reserved_parameters=2,
+                    )
+                )
+            finally:
+                connection.setlimit(
+                    sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, previous_limit
+                )
+        self.assertEqual([value for batch in batches for value in batch], list(range(1, 32)))
+        self.assertTrue(all(1 <= len(batch) <= 10 for batch in batches))
+
+    def test_report_build_aggregates_every_id_batch(self) -> None:
+        with connect(self.db) as connection:
+            content_ids = [
+                self._insert_report_content(
+                    connection, suffix=f"{chr(65 + index)}{index}"
+                )
+                for index in range(5)
+            ]
+            for content_id in content_ids:
+                self._insert_report_evaluation(
+                    connection,
+                    content_id=content_id,
+                    evidence_level="V3",
+                    pending_review=0,
+                    included=1,
+                    direction="media",
+                    code="M1",
+                )
+            connection.commit()
+        task = create_task(
+            task_type="custom",
+            period_start="2026-07-03",
+            period_end="2026-07-03",
+            creation_source="manual",
+            db_path=self.db,
+        )
+        with patch.object(reports_module, "_REPORT_ID_BATCH_SIZE", 2):
+            report = run_task(
+                task["id"], db_path=self.db, reports_root=self.reports_root
+            )
+        self.assertEqual(report["summary_metrics"]["publication_count"]["value"], 5)
+        self.assertEqual(report["data_quality"]["evaluation_coverage"], 100.0)
+        self.assertEqual(
+            {row["content_id"] for row in report["content_details"]},
+            set(content_ids),
+        )
+
+    def test_automatic_custom_report_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ReportTaskError, "automatic report creation supports daily or weekly only"
+        ):
+            create_task(
+                task_type="custom",
+                period_start="2026-08-01",
+                period_end="2026-08-31",
+                creation_source="automatic",
+                db_path=self.db,
+            )
+
+    def test_manual_future_period_is_rejected_before_task_creation(self) -> None:
+        with (
+            patch.object(
+                reports_module, "now_utc", return_value="2026-08-15T00:00:00Z"
+            ),
+            self.assertRaisesRegex(
+                ReportTaskError, "manual report period must be closed before creation"
+            ),
+        ):
+            create_task(
+                task_type="custom",
+                period_start="2026-08-15",
+                period_end="2026-08-15",
+                creation_source="manual",
+                db_path=self.db,
+            )
+        with connect(self.db) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM report_tasks WHERE period_start='2026-08-15'"
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_v8_0_and_v8_1_without_contracts_are_historical_only(self) -> None:
+        with connect(self.db) as connection:
+            retired_release = ensure_legacy_evaluation_release(
+                connection,
+                rule_version="evaluation-v6",
+                taxonomy_version="selling-points-v5.0",
+            )
+        for offset, contract_version in enumerate(
+            (
+                "dcar-content-operations-report-v8.0",
+                "dcar-content-operations-report-v8.1",
+            ),
+            start=1,
+        ):
+            with self.subTest(contract_version=contract_version):
+                task = create_task(
+                    task_type="custom",
+                    period_start=f"2026-07-0{offset}",
+                    period_end=f"2026-07-0{offset}",
+                    creation_source="manual",
+                    db_path=self.db,
+                )
+                with connect(self.db) as connection:
+                    connection.execute(
+                        """
+                        INSERT INTO report_revisions(
+                            task_id,revision,release_id,contract_version,rule_version,
+                            taxonomy_version,report_json_path,report_sha256,created_at
+                        ) VALUES (?,1,?,?,'evaluation-v6','selling-points-v5.0',
+                                  ?,?,'2026-08-14T00:00:00Z')
+                        """,
+                        (
+                            task["id"],
+                            retired_release["id"],
+                            contract_version,
+                            f"reports/runs/v8/{task['id']}/revision_001/report.json",
+                            "5" * 64,
+                        ),
+                    )
+                    connection.commit()
+                state = get_task(task["id"], db_path=self.db)
+                self.assertIsNone(state["current_valid_revision"])
+                self.assertIsNone(state["stale_display_revision"])
+                self.assertIsNone(state["display_effective_revision"])
+                self.assertEqual(state["historical_revision_count"], 1)
+                self.assertEqual(
+                    state["revisions"][0]["revision_state"], "historical"
+                )
+
+    def test_v8_5_on_same_active_release_is_stale_under_current_v8_6(self) -> None:
+        task = create_task(
+            task_type="custom",
+            period_start="2026-07-01",
+            period_end="2026-07-01",
+            creation_source="manual",
+            db_path=self.db,
+        )
+        with connect(self.db) as connection:
+            active_v9 = connection.execute(
+                "SELECT * FROM evaluation_releases WHERE id=?",
+                (self.release_id,),
+            ).fetchone()
+            assert active_v9 is not None
+            captured_at = now_utc()
+            connection.execute(
+                """
+                UPDATE evaluation_releases
+                SET status='retired',retired_at=?,updated_at=? WHERE id=?
+                """,
+                (captured_at, captured_at, self.release_id),
+            )
+            active_v8_id = "evaluation-v8-read-model-test"
+            connection.execute(
+                """
+                INSERT INTO evaluation_releases(
+                    id,rule_version,taxonomy_version,matcher_rule_sha256,status,
+                    created_at,updated_at,activated_at
+                ) VALUES (?,'evaluation-v8','selling-points-v5.2',?,'active',?,?,?)
+                """,
+                (
+                    active_v8_id,
+                    active_v9["matcher_rule_sha256"],
+                    captured_at,
+                    captured_at,
+                    captured_at,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO report_revisions(
+                    task_id,revision,release_id,contract_version,rule_version,
+                    taxonomy_version,report_json_path,report_sha256,created_at
+                ) VALUES (?,1,?,'dcar-content-operations-report-v8.5',
+                          'evaluation-v8','selling-points-v5.2',?,?,?)
+                """,
+                (
+                    task["id"],
+                    active_v8_id,
+                    f"reports/runs/v8/{task['id']}/revision_001/report.json",
+                    "8" * 64,
+                    captured_at,
+                ),
+            )
+            connection.commit()
+
+        state = get_task(task["id"], db_path=self.db)
+        self.assertIsNone(state["current_valid_revision"])
+        self.assertEqual(state["stale_display_revision"]["revision"], 1)
+        self.assertEqual(state["display_effective_revision"]["revision"], 1)
+        self.assertEqual(state["revisions"][0]["revision_state"], "stale")
 
     def _insert_report_content(
         self,
@@ -390,10 +762,13 @@ class V8ReportTaskTest(unittest.TestCase):
             db_path=self.db,
         )
         report = run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
-        self.assertEqual(report["rule_version"], "evaluation-v8")
-        self.assertEqual(report["taxonomy_version"], "selling-points-v5.1")
+        self.assertEqual(report["rule_version"], "evaluation-v9")
+        self.assertEqual(report["taxonomy_version"], "selling-points-v5.2")
         self.assertEqual(report["task"]["task_status"], "partial")
         self.assertEqual(report["summary_metrics"]["publication_count"]["value"], 1)
+        self.assertEqual(
+            report["metadata"]["collection_cutoff_at"], task["created_at"]
+        )
         self.assertEqual(report["summary_metrics"]["view_count"]["status"], "stale")
         self.assertEqual(
             report["summary_metrics"]["comment_count"]["status"], "missing"
@@ -416,16 +791,16 @@ class V8ReportTaskTest(unittest.TestCase):
         state = get_task(task["id"], db_path=self.db)
         self.assertNotIn("覆盖率不足", state["message"])
         self.assertIn("未达发布门槛", state["message"])
-        self.assertIn("重复指纹定标未通过", state["message"])
+        self.assertNotIn("重复指纹定标未通过", state["message"])
         self.assertEqual(report["scope"]["period_end"], "2026-07-02T00:00:00+08:00")
         self.assertEqual(
             state["content_counts"], {"excluded_missing_boundary": 1, "included": 1}
         )
         self.assertEqual(len(state["revisions"]), 1)
         self.assertEqual(state["revisions"][0]["release_id"], self.release_id)
-        self.assertEqual(state["revisions"][0]["rule_version"], "evaluation-v8")
+        self.assertEqual(state["revisions"][0]["rule_version"], "evaluation-v9")
         self.assertEqual(
-            state["revisions"][0]["taxonomy_version"], "selling-points-v5.1"
+            state["revisions"][0]["taxonomy_version"], "selling-points-v5.2"
         )
         first_path = PROJECT_ROOT / state["revisions"][0]["report_json_path"]
         first_bytes = first_path.read_bytes()
@@ -438,8 +813,20 @@ class V8ReportTaskTest(unittest.TestCase):
             )
         )
 
-        second = run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
+        with patch.object(
+            reports_module, "now_utc", return_value="2099-01-01T00:00:00Z"
+        ):
+            second = run_task(
+                task["id"], db_path=self.db, reports_root=self.reports_root
+            )
         self.assertEqual(second["metadata"]["revision"], 2)
+        self.assertNotEqual(
+            second["metadata"]["generated_at"], report["metadata"]["generated_at"]
+        )
+        self.assertEqual(
+            second["metadata"]["collection_cutoff_at"],
+            report["metadata"]["collection_cutoff_at"],
+        )
         state = get_task(task["id"], db_path=self.db)
         self.assertEqual(len(state["revisions"]), 2)
         self.assertEqual(state["current_valid_revision"]["revision"], 2)
@@ -480,6 +867,66 @@ class V8ReportTaskTest(unittest.TestCase):
         self.assertEqual(duplicate["coverage_percentage"], 100.0)
         self.assertIsNone(duplicate["percentage"])
         self.assertIn("尚未完成定标", duplicate["reason"])
+
+    def test_view_coverage_counts_only_non_null_view_observations(self) -> None:
+        captured_at = now_utc()
+        with connect(self.db) as connection, transaction(connection):
+            cursor = connection.execute(
+                """
+                INSERT INTO content_items(
+                    link_id,platform,platform_content_id,canonical_url,published_at,
+                    title,content_type,imported_at,created_at,updated_at
+                ) VALUES (
+                    'VM0001','douyin','view-missing',
+                    'https://www.douyin.com/video/view-missing',
+                    '2026-07-01T05:00:00Z','missing view fixture','video',?,?,?
+                )
+                """,
+                (captured_at, captured_at, captured_at),
+            )
+            content_id = int(cursor.lastrowid)
+            connection.execute(
+                """
+                INSERT INTO content_identities(
+                    content_id,identity_kind,identity_value,
+                    platform_identity_key,is_primary,created_at
+                ) VALUES (?,'platform_content_id','view-missing',
+                          'douyin:view-missing',1,?)
+                """,
+                (content_id, captured_at),
+            )
+            persist_metric_observation(
+                connection,
+                content_id=content_id,
+                captured_at=captured_at,
+                window_key="2026-07-01",
+                view_count=None,
+                comment_count=3,
+                like_count=None,
+                share_count=None,
+                collect_count=None,
+                status="missing",
+                source="test",
+                raw_response_id=None,
+                metadata_json="{}",
+            )
+
+        task = create_task(
+            task_type="custom",
+            period_start="2026-07-01",
+            period_end="2026-07-01",
+            creation_source="manual",
+            db_path=self.db,
+        )
+        report = run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
+
+        view_metric = report["summary_metrics"]["view_count"]
+        self.assertEqual(view_metric["status"], "below_threshold")
+        self.assertEqual(view_metric["coverage_percentage"], 50.0)
+        self.assertEqual(
+            view_metric["reason"],
+            "曝光量快照覆盖率为 50.00%，低于 90% 发布阈值",
+        )
 
     def test_current_report_publishes_channel_conclusions_without_fabrication(
         self,
@@ -748,7 +1195,7 @@ class V8ReportTaskTest(unittest.TestCase):
                 "status": "below_threshold",
                 "eligible_count": 2,
                 "coverage_percentage": 50.0,
-                "reason": "正式评估覆盖率为 50.00%，低于 95% 发布阈值",
+                "reason": "正式评估覆盖率为 50.00%，低于 90% 发布阈值",
             },
         )
         selling_metric = report["summary_metrics"]["selling_point_coverage_rate"]
@@ -779,6 +1226,150 @@ class V8ReportTaskTest(unittest.TestCase):
         self.assertTrue(details[included]["evaluation_current"])
         self.assertEqual(details[included]["primary_selling_point_code"], "X2")
         self.assertEqual(details[included]["content_direction"], "new_car")
+
+    def test_media_terminal_coverage_is_independent_of_review_queue_rows(
+        self,
+    ) -> None:
+        def generate() -> dict[str, object]:
+            task = create_task(
+                task_type="custom",
+                period_start="2026-07-01",
+                period_end="2026-07-01",
+                creation_source="manual",
+                db_path=self.db,
+            )
+            return run_task(
+                task["id"], db_path=self.db, reports_root=self.reports_root
+            )
+
+        with patch(
+            "v8.reports.media_terminal_states", return_value={1: "pending"}
+        ):
+            self.assertEqual(
+                generate()["data_quality"]["media_terminal_coverage"], 0.0
+            )
+            with connect(self.db) as connection:
+                evaluation_id = connection.execute(
+                    """
+                    SELECT id FROM evaluation_versions
+                    WHERE content_id=1 AND release_id=?
+                    ORDER BY evaluated_at DESC,id DESC LIMIT 1
+                    """,
+                    (self.release_id,),
+                ).fetchone()[0]
+                connection.execute(
+                    """
+                    INSERT INTO review_queue(
+                        content_id,evaluation_id,reason_code,status,created_at,updated_at
+                    ) VALUES (1,?,'media_processing_incomplete','pending',?,?)
+                    """,
+                    (evaluation_id, now_utc(), now_utc()),
+                )
+                connection.commit()
+
+            for reason_code, status in (
+                ("media_processing_incomplete", "pending"),
+                ("media_evidence_missing", "manual_required"),
+                ("legacy_content_unavailable", "resolved"),
+                ("media_processing_incomplete", "terminal_failed"),
+            ):
+                with connect(self.db) as connection:
+                    connection.execute(
+                        """
+                        UPDATE review_queue SET reason_code=?,status=?,updated_at=?
+                        WHERE content_id=1
+                        """,
+                        (reason_code, status, now_utc()),
+                    )
+                    connection.commit()
+                self.assertEqual(
+                    generate()["data_quality"]["media_terminal_coverage"], 0.0
+                )
+
+            with connect(self.db) as connection:
+                connection.execute("DELETE FROM review_queue WHERE content_id=1")
+                connection.commit()
+            self.assertEqual(
+                generate()["data_quality"]["media_terminal_coverage"], 0.0
+            )
+
+    def test_pending_v3_can_be_media_complete_but_not_formal_evaluation_eligible(
+        self,
+    ) -> None:
+        with patch(
+            "v8.reports.media_terminal_states",
+            side_effect=lambda _connection, _release_id, content_ids: {
+                content_id: "complete" for content_id in content_ids
+            },
+        ):
+            first = create_task(
+                task_type="custom",
+                period_start="2026-07-01",
+                period_end="2026-07-01",
+                creation_source="manual",
+                db_path=self.db,
+            )
+            run_task(first["id"], db_path=self.db, reports_root=self.reports_root)
+            with connect(self.db) as connection:
+                content_id = self._insert_report_content(
+                    connection, suffix="pending-media"
+                )
+                self._insert_report_evaluation(
+                    connection,
+                    content_id=content_id,
+                    evidence_level="V3",
+                    pending_review=1,
+                    included=1,
+                    direction="media",
+                    code="M1",
+                )
+                connection.commit()
+            task = create_task(
+                task_type="custom",
+                period_start="2026-07-03",
+                period_end="2026-07-03",
+                creation_source="manual",
+                db_path=self.db,
+            )
+            report = run_task(
+                task["id"], db_path=self.db, reports_root=self.reports_root
+            )
+
+        self.assertEqual(report["data_quality"]["media_terminal_coverage"], 100.0)
+        self.assertEqual(report["data_quality"]["evaluation_coverage"], 0.0)
+        self.assertEqual(
+            report["summary_metrics"]["verticality_rate"]["eligible_count"], 0
+        )
+
+    def test_non_media_contents_are_excluded_from_media_coverage_denominator(
+        self,
+    ) -> None:
+        with connect(self.db) as connection:
+            video_id = self._insert_report_content(connection, suffix="video-media")
+            non_media_id = self._insert_report_content(connection, suffix="normal-media")
+            connection.execute(
+                "UPDATE content_items SET content_type='normal' WHERE id=?",
+                (non_media_id,),
+            )
+            connection.commit()
+        with patch(
+            "v8.reports.media_terminal_states",
+            return_value={video_id: "complete"},
+        ) as selector:
+            task = create_task(
+                task_type="custom",
+                period_start="2026-07-03",
+                period_end="2026-07-03",
+                creation_source="manual",
+                db_path=self.db,
+            )
+            report = run_task(
+                task["id"], db_path=self.db, reports_root=self.reports_root
+            )
+
+        self.assertEqual(report["data_quality"]["media_terminal_coverage"], 100.0)
+        selector.assert_called_once()
+        self.assertEqual(selector.call_args.args[2], [video_id])
 
     def test_report_fails_closed_when_active_release_is_not_current(self) -> None:
         task = create_task(
@@ -836,7 +1427,7 @@ class V8ReportTaskTest(unittest.TestCase):
             connection.execute(
                 """
                 UPDATE evaluation_releases SET status='active'
-                WHERE rule_version IN ('evaluation-v7','evaluation-v8')
+                WHERE rule_version IN ('evaluation-v7','evaluation-v9')
                 """
             )
             connection.commit()
@@ -877,7 +1468,7 @@ class V8ReportTaskTest(unittest.TestCase):
                 connection.execute(
                     """
                     UPDATE taxonomy_versions SET status='retired'
-                    WHERE version='selling-points-v5.1'
+                    WHERE version='selling-points-v5.2'
                     """
                 )
                 connection.execute(
@@ -918,7 +1509,7 @@ class V8ReportTaskTest(unittest.TestCase):
         task_root = self.reports_root / task["id"]
         self.assertEqual(list(task_root.iterdir()) if task_root.exists() else [], [])
 
-    def test_gray_created_during_render_is_rechecked_before_registration(
+    def test_gray_created_during_render_does_not_destroy_completed_revision(
         self,
     ) -> None:
         task = create_task(
@@ -943,23 +1534,38 @@ class V8ReportTaskTest(unittest.TestCase):
                 )
                 connection.commit()
 
-        with (
-            patch.object(
-                reports_module,
-                "validate_report",
-                side_effect=validate_then_create_gray,
-            ),
-            self.assertRaisesRegex(ReportTaskError, "1 条灰区内容"),
+        with patch.object(
+            reports_module,
+            "validate_report",
+            side_effect=validate_then_create_gray,
         ):
-            run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
+            report = run_task(
+                task["id"], db_path=self.db, reports_root=self.reports_root
+            )
         state = get_task(task["id"], db_path=self.db)
-        self.assertEqual(state["task_status"], "failed")
-        self.assertEqual(state["revisions"], [])
-        self.assertEqual(state["events"][-1]["event_type"], "review_gate_blocked")
+        self.assertEqual(report["metadata"]["revision"], 1)
+        self.assertEqual(state["task_status"], "partial")
+        self.assertEqual(len(state["revisions"]), 1)
+        self.assertEqual(state["events"][-1]["event_type"], "completed")
         task_root = self.reports_root / task["id"]
-        self.assertEqual(list(task_root.iterdir()) if task_root.exists() else [], [])
+        self.assertTrue((task_root / "revision_001" / "report.json").is_file())
 
-    def test_discovery_coverage_requires_platform_user_posts_slots(self) -> None:
+        later = create_task(
+            task_type="custom",
+            period_start="2026-07-01",
+            period_end="2026-07-01",
+            creation_source="manual",
+            db_path=self.db,
+        )
+        later_report = run_task(
+            later["id"], db_path=self.db, reports_root=self.reports_root
+        )
+        self.assertEqual(later_report["task"]["task_status"], "partial")
+        self.assertEqual(later_report["data_quality"]["evaluation_coverage"], 0.0)
+
+    def test_discovery_coverage_uses_window_receipts_and_missing_occurrences(
+        self,
+    ) -> None:
         captured_at = now_utc()
         with connect(self.db) as connection:
             douyin = connection.execute(
@@ -994,28 +1600,50 @@ class V8ReportTaskTest(unittest.TestCase):
                 """,
                 (xiaohongshu.lastrowid, captured_at, captured_at),
             )
+            receipt = {
+                "monitored_accounts": 2,
+                "discovery": [
+                    {
+                        "account_id": douyin.lastrowid,
+                        "platform": "douyin",
+                        "status": "succeeded",
+                        "stopped_reason": "window_start_reached",
+                        "pages": [{"page": 1, "status": "succeeded"}],
+                    },
+                    {
+                        "account_id": xiaohongshu.lastrowid,
+                        "platform": "xiaohongshu",
+                        "status": "failed",
+                        "stopped_reason": "transport",
+                        "pages": [{"page": 1, "status": "failed"}],
+                    },
+                ],
+            }
             connection.execute(
                 """
-                INSERT INTO fetch_slots(
-                    account_id, stage, window_key, provider, adapter_version,
-                    status, attempt_count, created_at, updated_at
-                ) VALUES (?, 'discovery', 'profile:lifetime', 'TikHub',
-                          'tikhub-user-profile-v8.1', 'succeeded', 1, ?, ?)
+                INSERT INTO scheduler_runs(
+                    job_id,scheduled_for,status,started_at,completed_at,details_json
+                ) VALUES ('daily_capture','2026-07-03T18:00:00Z','failed',
+                          '2026-07-03T18:00:00Z','2026-07-03T19:00:00Z',?)
                 """,
-                (douyin.lastrowid, captured_at, captured_at),
-            )
-            connection.execute(
-                """
-                INSERT INTO fetch_slots(
-                    account_id, stage, window_key, provider, adapter_version,
-                    status, attempt_count, created_at, updated_at
-                ) VALUES (?, 'discovery', '2026-07-03', 'TikHub',
-                          'tikhub-xhs-app-v2-user-posts-v8.1',
-                          'succeeded', 1, ?, ?)
-                """,
-                (xiaohongshu.lastrowid, captured_at, captured_at),
+                (json.dumps(receipt, ensure_ascii=False, sort_keys=True),),
             )
             connection.commit()
+
+        with connect(self.db) as connection:
+            before_receipt_completion = reports_module._discovery_coverage_detail(
+                connection,
+                {
+                    "task_type": "custom",
+                    "creation_source": "manual",
+                    "period_start": "2026-07-03",
+                    "period_end": "2026-07-03",
+                },
+                generated_at="2026-07-03T18:30:00Z",
+                minimum_percentage=90.0,
+            )
+        self.assertEqual(before_receipt_completion["observed_occurrence_count"], 0)
+        self.assertEqual(before_receipt_completion["percentage"], 0.0)
 
         task = create_task(
             task_type="custom",
@@ -1026,6 +1654,16 @@ class V8ReportTaskTest(unittest.TestCase):
         )
         partial = run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
         self.assertEqual(partial["data_quality"]["discovery_coverage"], 50.0)
+        self.assertEqual(
+            partial["data_quality_details"]["discovery_coverage"]
+            ["covered_identity_occurrence_count"],
+            1,
+        )
+        self.assertEqual(
+            partial["data_quality_details"]["discovery_coverage"]
+            ["eligible_identity_occurrence_count"],
+            2,
+        )
         self.assertEqual(partial["task"]["task_status"], "partial")
 
         with connect(self.db) as connection:
@@ -1034,16 +1672,93 @@ class V8ReportTaskTest(unittest.TestCase):
                 INSERT INTO fetch_slots(
                     account_id, stage, window_key, provider, adapter_version,
                     status, attempt_count, created_at, updated_at
-                ) VALUES (?, 'discovery', '2026-07-03', 'TikHub',
-                          'tikhub-user-posts-v8.1', 'succeeded', 1, ?, ?)
+                ) VALUES (?, 'discovery',
+                          'range:2010-01-01:20260705T000000:douyin:test',
+                          'TikHub','tikhub-user-posts-v8.1',
+                          'succeeded', 1, ?, ?)
                 """,
                 (douyin.lastrowid, captured_at, captured_at),
             )
             connection.commit()
 
-        complete = run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
-        self.assertEqual(complete["data_quality"]["discovery_coverage"], 100.0)
-        self.assertEqual(complete["task"]["task_status"], "succeeded")
+        missing_task = create_task(
+            task_type="custom",
+            period_start="2026-07-04",
+            period_end="2026-07-04",
+            creation_source="manual",
+            db_path=self.db,
+        )
+        missing = run_task(
+            missing_task["id"], db_path=self.db, reports_root=self.reports_root
+        )
+        missing_discovery = missing["data_quality_details"]["discovery_coverage"]
+        self.assertEqual(missing["data_quality"]["discovery_coverage"], 0.0)
+        self.assertEqual(missing_discovery["eligible_identity_occurrence_count"], 2)
+        self.assertEqual(missing_discovery["observed_occurrence_count"], 0)
+        self.assertEqual(missing_discovery["missing_occurrence_dates"], ["2026-07-04"])
+
+        two_day_task = create_task(
+            task_type="custom",
+            period_start="2026-07-03",
+            period_end="2026-07-04",
+            creation_source="manual",
+            db_path=self.db,
+        )
+        two_day = run_task(
+            two_day_task["id"], db_path=self.db, reports_root=self.reports_root
+        )
+        self.assertEqual(two_day["data_quality"]["discovery_coverage"], 25.0)
+        self.assertEqual(
+            two_day["data_quality_details"]["discovery_coverage"]
+            ["eligible_identity_occurrence_count"],
+            4,
+        )
+
+    def test_discovery_receipt_rejects_invalid_terminal_or_roster(self) -> None:
+        invalid_terminal = reports_module._parse_daily_capture_receipt(
+            json.dumps(
+                {
+                    "monitored_accounts": 1,
+                    "discovery": [
+                        {
+                            "account_id": 1,
+                            "platform": "douyin",
+                            "status": "succeeded",
+                            "stopped_reason": "cursor_repeated",
+                            "pages": [{"page": 1, "status": "succeeded"}],
+                        }
+                    ],
+                }
+            )
+        )
+        self.assertEqual(invalid_terminal["covered"], 0)
+        self.assertTrue(invalid_terminal["roster_matches_monitored"])
+
+        duplicate_roster = reports_module._parse_daily_capture_receipt(
+            json.dumps(
+                {
+                    "monitored_accounts": 2,
+                    "discovery": [
+                        {
+                            "account_id": 1,
+                            "platform": "douyin",
+                            "status": "succeeded",
+                            "stopped_reason": "provider_exhausted",
+                            "pages": [{"page": 1, "status": "succeeded"}],
+                        },
+                        {
+                            "account_id": 1,
+                            "platform": "douyin",
+                            "status": "succeeded",
+                            "stopped_reason": "provider_exhausted",
+                            "pages": [{"page": 1, "status": "succeeded"}],
+                        },
+                    ],
+                }
+            )
+        )
+        self.assertEqual(duplicate_roster["covered"], 0)
+        self.assertFalse(duplicate_roster["roster_matches_monitored"])
 
     def test_relative_reports_root_resolves_under_project_without_leaking_temp_dirs(
         self,
@@ -1213,6 +1928,74 @@ class V8ReportTaskTest(unittest.TestCase):
             "retry_requested", [event["event_type"] for event in state["events"]]
         )
 
+    def test_run_publishes_intermediate_progress_stages(self) -> None:
+        task = create_task(
+            task_type="custom",
+            period_start="2026-07-01",
+            period_end="2026-07-01",
+            creation_source="manual",
+            db_path=self.db,
+        )
+        stages: list[tuple[int, str]] = []
+        published = reports_module.advance_task_progress
+
+        def record(task_id: str, *, progress: int, message: str, db_path: Path) -> None:
+            stages.append((progress, message))
+            published(task_id, progress=progress, message=message, db_path=db_path)
+
+        with patch.object(reports_module, "advance_task_progress", record):
+            run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
+
+        self.assertEqual([progress for progress, _ in stages], [35, 65, 85])
+        state = get_task(task["id"], db_path=self.db)
+        self.assertEqual(state["progress"], 100)
+
+    def test_progress_stage_never_overwrites_a_task_that_is_not_running(self) -> None:
+        task = create_task(
+            task_type="custom",
+            period_start="2026-07-01",
+            period_end="2026-07-01",
+            creation_source="manual",
+            db_path=self.db,
+        )
+        advance_task_progress(
+            task["id"], progress=65, message="正在写出报告文件", db_path=self.db
+        )
+        state = get_task(task["id"], db_path=self.db)
+        self.assertEqual(
+            (state["task_status"], state["progress"], state["message"]),
+            ("queued", 0, "等待生成报告"),
+        )
+
+    def test_create_and_run_does_not_implicitly_retry_partial_task(self) -> None:
+        first = create_and_run_task(
+            task_type="daily",
+            period_start="2026-07-01",
+            period_end="2026-07-01",
+            creation_source="automatic",
+            db_path=self.db,
+            reports_root=self.reports_root,
+        )
+        self.assertEqual(first["task_status"], "partial")
+        self.assertEqual(len(first["revisions"]), 1)
+        unchanged = create_and_run_task(
+            task_type="daily",
+            period_start="2026-07-01",
+            period_end="2026-07-01",
+            creation_source="automatic",
+            db_path=self.db,
+            reports_root=self.reports_root,
+        )
+        self.assertEqual(unchanged["id"], first["id"])
+        self.assertEqual(unchanged["task_status"], "partial")
+        self.assertEqual(len(unchanged["revisions"]), 1)
+
+        retry_task(first["id"], db_path=self.db)
+        run_task(first["id"], db_path=self.db, reports_root=self.reports_root)
+        self.assertEqual(
+            len(get_task(first["id"], db_path=self.db)["revisions"]), 2
+        )
+
     def test_cancelled_task_can_resume_and_create_a_new_revision(self) -> None:
         task = create_task(
             task_type="custom",
@@ -1236,17 +2019,19 @@ class V8ReportTaskTest(unittest.TestCase):
             ["cancelled", "resumed"],
         )
 
-    def test_pending_gray_review_blocks_first_report_without_creating_revision(
+    def test_pending_gray_review_is_disclosed_in_first_report_without_blocking(
         self,
     ) -> None:
         with connect(self.db) as connection:
-            evaluation_id = connection.execute(
-                """
-                SELECT id FROM evaluation_versions
-                WHERE content_id=1 AND release_id=? ORDER BY id DESC
-                """,
-                (self.release_id,),
-            ).fetchone()[0]
+            evaluation_id = self._insert_report_evaluation(
+                connection,
+                content_id=1,
+                evidence_level="V3",
+                pending_review=0,
+                included=1,
+                direction="media",
+                code="M1",
+            )
             connection.execute(
                 """
                 INSERT INTO review_queue(
@@ -1263,14 +2048,19 @@ class V8ReportTaskTest(unittest.TestCase):
             creation_source="manual",
             db_path=self.db,
         )
-        with self.assertRaisesRegex(ReportTaskError, "1 条灰区内容"):
-            run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
+        report = run_task(
+            task["id"], db_path=self.db, reports_root=self.reports_root
+        )
         state = get_task(task["id"], db_path=self.db)
-        self.assertEqual(state["task_status"], "failed")
-        self.assertEqual(state["revisions"], [])
-        self.assertEqual(state["events"][-1]["event_type"], "review_gate_blocked")
+        self.assertEqual(report["task"]["task_status"], "partial")
+        self.assertEqual(report["data_quality"]["evaluation_coverage"], 100.0)
+        self.assertEqual(report["review_summary"], [{"status": "pending", "count": 1}])
+        self.assertEqual(len(state["revisions"]), 1)
+        self.assertEqual(state["events"][-1]["event_type"], "completed")
 
-    def test_pending_manual_conclusion_conflict_blocks_first_report(self) -> None:
+    def test_pending_manual_conclusion_conflict_is_disclosed_without_v9_authority(
+        self,
+    ) -> None:
         with connect(self.db) as connection:
             evaluation_id = self._insert_report_evaluation(
                 connection,
@@ -1297,14 +2087,21 @@ class V8ReportTaskTest(unittest.TestCase):
             creation_source="manual",
             db_path=self.db,
         )
-        with self.assertRaisesRegex(ReportTaskError, "人工结论冲突"):
-            run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
+        report = run_task(
+            task["id"], db_path=self.db, reports_root=self.reports_root
+        )
         state = get_task(task["id"], db_path=self.db)
-        self.assertEqual(state["task_status"], "failed")
-        self.assertEqual(state["revisions"], [])
-        self.assertEqual(state["events"][-1]["event_type"], "review_gate_blocked")
+        self.assertEqual(report["task"]["task_status"], "partial")
+        self.assertEqual(report["data_quality"]["evaluation_coverage"], 100.0)
+        self.assertEqual(
+            report["review_summary"], [{"status": "manual_required", "count": 1}]
+        )
+        self.assertEqual(len(state["revisions"]), 1)
+        self.assertEqual(state["events"][-1]["event_type"], "completed")
 
-    def test_manual_conclusion_conflict_is_excluded_after_first_report(self) -> None:
+    def test_manual_conclusion_conflict_does_not_change_v9_selector_after_first_report(
+        self,
+    ) -> None:
         with connect(self.db) as connection:
             evaluation_id = self._insert_report_evaluation(
                 connection,
@@ -1348,13 +2145,18 @@ class V8ReportTaskTest(unittest.TestCase):
         second_report = run_task(
             second["id"], db_path=self.db, reports_root=self.reports_root
         )
-        self.assertEqual(second_report["data_quality"]["evaluation_coverage"], 0.0)
+        self.assertEqual(second_report["task"]["task_status"], "partial")
+        self.assertEqual(second_report["data_quality"]["evaluation_coverage"], 100.0)
+        self.assertEqual(
+            second_report["review_summary"],
+            [{"status": "manual_required", "count": 1}],
+        )
         verticality = second_report["summary_metrics"]["verticality_rate"]
         self.assertEqual(verticality["denominator"], 1)
-        self.assertEqual(verticality["eligible_count"], 0)
-        self.assertEqual(verticality["numerator"], 0)
+        self.assertEqual(verticality["eligible_count"], 1)
+        self.assertEqual(verticality["numerator"], 1)
 
-    def test_pending_gray_evaluation_blocks_first_report_without_queue(
+    def test_pending_gray_evaluation_is_excluded_from_first_report_without_queue(
         self,
     ) -> None:
         with connect(self.db) as connection:
@@ -1374,12 +2176,15 @@ class V8ReportTaskTest(unittest.TestCase):
             creation_source="manual",
             db_path=self.db,
         )
-        with self.assertRaisesRegex(ReportTaskError, "1 条灰区内容"):
-            run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
+        report = run_task(
+            task["id"], db_path=self.db, reports_root=self.reports_root
+        )
         state = get_task(task["id"], db_path=self.db)
-        self.assertEqual(state["task_status"], "failed")
-        self.assertEqual(state["revisions"], [])
-        self.assertEqual(state["events"][-1]["event_type"], "review_gate_blocked")
+        self.assertEqual(report["task"]["task_status"], "partial")
+        self.assertEqual(report["data_quality"]["evaluation_coverage"], 0.0)
+        self.assertEqual(report["review_summary"], [])
+        self.assertEqual(len(state["revisions"]), 1)
+        self.assertEqual(state["events"][-1]["event_type"], "completed")
 
     def test_pending_gray_review_is_reported_but_does_not_block_after_first_release(
         self,
@@ -1418,6 +2223,7 @@ class V8ReportTaskTest(unittest.TestCase):
         )
         report = run_task(later["id"], db_path=self.db, reports_root=self.reports_root)
         self.assertEqual(report["metadata"]["revision"], 1)
+        self.assertEqual(report["task"]["task_status"], "partial")
         self.assertEqual(report["review_summary"][0]["status"], "pending")
 
     def test_unsafe_automatic_current_contract_report_blocks_without_new_task(
@@ -1543,8 +2349,57 @@ class V8ReportTaskTest(unittest.TestCase):
         )
         report = run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
         self.assertEqual(report["metadata"]["revision"], 1)
+        self.assertEqual(report["review_summary"], [])
 
-    def test_retired_release_report_does_not_release_current_gray_gate(self) -> None:
+    def test_review_summary_excludes_invalidated_active_release_evaluation(
+        self,
+    ) -> None:
+        with connect(self.db) as connection:
+            content_id = self._insert_report_content(
+                connection, suffix="invalidated-review"
+            )
+            evaluation_id = self._insert_report_evaluation(
+                connection,
+                content_id=content_id,
+                evidence_level="V3",
+                pending_review=0,
+                included=1,
+                direction="media",
+                code="M1",
+            )
+            connection.execute(
+                """
+                UPDATE evaluation_versions
+                SET invalidated_at=?,invalidation_reason='test invalidation'
+                WHERE id=?
+                """,
+                (now_utc(), evaluation_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO review_queue(
+                    content_id,evaluation_id,reason_code,status,created_at,updated_at
+                ) VALUES (?,?,'evaluation_gray_zone','pending',?,?)
+                """,
+                (content_id, evaluation_id, now_utc(), now_utc()),
+            )
+            connection.commit()
+        task = create_task(
+            task_type="custom",
+            period_start="2026-07-03",
+            period_end="2026-07-03",
+            creation_source="manual",
+            db_path=self.db,
+        )
+        report = run_task(
+            task["id"], db_path=self.db, reports_root=self.reports_root
+        )
+        self.assertEqual(report["task"]["task_status"], "partial")
+        self.assertEqual(report["review_summary"], [])
+
+    def test_retired_release_report_does_not_hide_current_pending_evaluation(
+        self,
+    ) -> None:
         self._insert_unsafe_legacy_report(creation_source="manual")
         with connect(self.db) as connection:
             current_evaluation = connection.execute(
@@ -1564,6 +2419,14 @@ class V8ReportTaskTest(unittest.TestCase):
                 """,
                 (current_evaluation["id"], now_utc(), now_utc()),
             )
+            connection.execute(
+                """
+                UPDATE evaluation_versions
+                SET pending_review=1,evidence_level='V3'
+                WHERE id=?
+                """,
+                (current_evaluation["id"],),
+            )
             connection.commit()
         task = create_task(
             task_type="custom",
@@ -1572,8 +2435,15 @@ class V8ReportTaskTest(unittest.TestCase):
             creation_source="manual",
             db_path=self.db,
         )
-        with self.assertRaisesRegex(ReportTaskError, "1 条灰区内容"):
-            run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
+        report = run_task(
+            task["id"], db_path=self.db, reports_root=self.reports_root
+        )
+        self.assertEqual(report["task"]["task_status"], "partial")
+        self.assertEqual(report["data_quality"]["evaluation_coverage"], 0.0)
+        self.assertEqual(report["review_summary"], [{"status": "pending", "count": 1}])
+        self.assertEqual(
+            len(get_task(task["id"], db_path=self.db)["revisions"]), 1
+        )
 
     def test_current_schema_initialization_does_not_rewrite_reports(self) -> None:
         task = create_task(

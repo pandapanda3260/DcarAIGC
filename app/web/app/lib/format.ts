@@ -6,6 +6,7 @@ const enumLabels: Record<string, string> = {
   douyin: "抖音", xiaohongshu: "小红书", wechat_channels: "视频号", kuaishou: "快手",
   boutique_ip: "精品 IP", original: "原创", mixed_edit: "混剪", unknown: "未知",
   new_car: "新车", used_car: "二手车", media: "媒体", other: "其他",
+  content_explicit: "内容显式", rule_prior: "规则推断", llm: "大模型补充", series: "车系", trim: "款型",
   yes: "是", no: "否", succeeded: "已完成", partial: "部分完成", failed: "失败",
   interrupted: "已中断", queued: "排队中", running: "运行中",
   cancel_requested: "取消中", cancelled: "已取消", daily: "日报", weekly: "周报", custom: "自定义",
@@ -58,7 +59,7 @@ const unavailableReasonLabels: ReadonlyArray<readonly [string, string]> = [
   ["分类器定标未通过", "分类器未通过定标"],
   ["用户级汽车兴趣占比尚未接入用户聚合", "用户聚合未接入"],
   ["可归类有效曝光", "曝光归类待补齐"],
-  ["感知指纹定标未通过", "重复识别待补齐"],
+  ["感知指纹尚未完成定标", "重复识别待补齐"],
   ["评分证据门槛", "暂无可评分内容"],
 ];
 
@@ -138,4 +139,24 @@ export function metricEvidence(metric: Metric): string {
     return metric.reason ? `${coverage} · ${metric.reason}` : coverage;
   }
   return metric.reason || "当前窗口没有可发布的结论";
+}
+
+export function formatBytes(size: number): string {
+  if (!Number.isFinite(size) || size < 0) return "—";
+  if (size < 1024) return `${numberFormat.format(size)} 字节`;
+  const kb = size / 1024;
+  if (kb < 1024) return `${kb >= 100 ? Math.round(kb) : kb.toFixed(1)} KB`;
+  return `${(kb / 1024).toFixed(1)} MB`;
+}
+
+// 老版本任务里存过带 revision 的英文事件文案；展示层统一翻成中文（新写入的事件已直接是中文）。
+const legacyMessageRules: ReadonlyArray<readonly [RegExp, string]> = [
+  [/revision (\d+) 已生成/g, "第 $1 版报告已生成"],
+  [/已请求生成新 revision/g, "已请求重新生成报告"],
+  [/等待生成新 revision/g, "等待重新生成报告"],
+];
+
+export function humanizeTaskMessage(value: string | null | undefined): string {
+  if (!value) return "";
+  return legacyMessageRules.reduce((text, [pattern, replacement]) => text.replace(pattern, replacement), value);
 }

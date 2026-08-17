@@ -139,12 +139,7 @@
   form { margin-top: 24px; }
 
   .field { margin-bottom: 16px; }
-  .label-row {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 12px;
-  }
+  #password-field { margin-bottom: 10px; }
   .field label {
     display: inline-block;
     margin-bottom: 7px;
@@ -226,7 +221,7 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin: 2px 0 18px;
+    margin: 0 0 18px;
   }
   .remember {
     display: inline-flex;
@@ -360,10 +355,7 @@
       </div>
 
       <div class="field" id="password-field">
-        <div class="label-row">
-          <label for="password">密码</label>
-          <button type="button" class="hint-link" id="forgot-btn">忘记密码？</button>
-        </div>
+        <label for="password">密码</label>
         <div class="control">
           <svg class="lead-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="8.6" width="12" height="8" rx="2"/><path d="M6.8 8.6V6.4a3.2 3.2 0 0 1 6.4 0v2.2"/></svg>
           <input id="password" name="password" type="password" autocomplete="current-password" placeholder="请输入密码" required aria-describedby="caps-hint password-error">
@@ -384,9 +376,10 @@
 
       <div class="options-row">
         <label class="remember" for="remember">
-          <input type="checkbox" id="remember" name="remember">
+          <input type="checkbox" id="remember" name="remember" checked>
           <span>保持登录</span>
         </label>
+        <button type="button" class="hint-link" id="forgot-btn">忘记密码？</button>
       </div>
 
       <div class="banner" id="banner" role="alert" hidden>

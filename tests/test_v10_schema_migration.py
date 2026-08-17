@@ -87,10 +87,13 @@ class V10SchemaMigrationTest(unittest.TestCase):
                     (9, "release-bound-evaluation-schema"),
                     (10, "audience-interaction-user-domain"),
                     (11, "interaction-user-v1-fallback-keys"),
+                    (12, "append-only-metric-observations"),
+                    (13, "scheduler-run-attempt-history"),
                 ],
             )
             self.assertEqual(
-                int(connection.execute("PRAGMA user_version").fetchone()[0]), 11
+                int(connection.execute("PRAGMA user_version").fetchone()[0]),
+                storage.SCHEMA_VERSION,
             )
             tables = storage._table_names(connection)
             for table in storage._NEW_V10_TABLES:
@@ -102,7 +105,7 @@ class V10SchemaMigrationTest(unittest.TestCase):
                         "SELECT COUNT(*) FROM schema_migrations"
                     ).fetchone()[0]
                 ),
-                3,
+                5,
             )
 
     def test_migrating_v9_database_preserves_rows_and_backfills_versions(self) -> None:
@@ -132,10 +135,11 @@ class V10SchemaMigrationTest(unittest.TestCase):
                         "SELECT MAX(version) FROM schema_migrations"
                     ).fetchone()[0]
                 ),
-                11,
+                storage.SCHEMA_VERSION,
             )
             self.assertEqual(
-                int(connection.execute("PRAGMA user_version").fetchone()[0]), 11
+                int(connection.execute("PRAGMA user_version").fetchone()[0]),
+                storage.SCHEMA_VERSION,
             )
             for table, columns in old_columns.items():
                 self.assertEqual(
@@ -449,7 +453,7 @@ class V10SchemaMigrationTest(unittest.TestCase):
                         "SELECT MAX(version) FROM schema_migrations"
                     ).fetchone()[0]
                 ),
-                11,
+                storage.SCHEMA_VERSION,
             )
 
     def test_partial_v10_residue_fails_closed(self) -> None:

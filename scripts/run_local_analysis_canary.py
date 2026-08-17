@@ -1877,6 +1877,10 @@ def _validate_step3_batch_files(
         applied = receipt.get("apply")
         artifacts = receipt.get("artifacts")
         after_database = receipt.get("after_database")
+        if not isinstance(applied, Mapping) or not isinstance(artifacts, Mapping):
+            raise LocalAnalysisCanaryError(
+                "Step3 batch receipt apply/artifact证据无效"
+            )
         try:
             applied_provider_calls = int(applied["provider_calls"])
             applied_processed = int(applied["processed"])
@@ -3419,7 +3423,7 @@ def _validate_prewrite_outputs(
             )
         )
         release = connection.execute(
-            "SELECT id FROM evaluation_releases WHERE status='active'"
+            "SELECT id,rule_version FROM evaluation_releases WHERE status='active'"
         ).fetchone()
         if release is None:
             raise LocalAnalysisCanaryError("写前检查缺少active release")
@@ -3529,6 +3533,7 @@ def _validate_prewrite_outputs(
                     connection,
                     content_id=content_id,
                     release_id=str(release["id"]),
+                    rule_version=str(release["rule_version"]),
                 )
             if "duplicate_fingerprint" in names and not active:
                 raise LocalAnalysisCanaryError("写前fingerprint缺少active evaluation")
@@ -3598,6 +3603,13 @@ def _validate_content_processing(
     slot_by_type = {str(row["processor_type"]): row for row in slots}
     media_artifact = artifacts["media" if media_kind == "video" else "media_manifest"]
     frames_artifact = artifacts.get("frames_manifest")
+    ocr_source_artifact = (
+        frames_artifact if media_kind == "video" else media_artifact
+    )
+    if ocr_source_artifact is None:
+        raise LocalAnalysisCanaryError(
+            f"content {content_id} OCR source artifact缺失"
+        )
     with contextlib.suppress(Exception):
         _, fingerprint_sha = duplicates_module._current_source_state(
             connection, content_id
@@ -3621,11 +3633,7 @@ def _validate_content_processing(
             int(media_artifact["id"]),
         ),
         "ocr": (
-            str(
-                (frames_artifact if media_kind == "video" else media_artifact)[
-                    "sha256"
-                ]
-            ),
+            str(ocr_source_artifact["sha256"]),
             str(versions["ocr"]),
             int(artifacts["ocr"]["id"]),
         ),
@@ -3815,7 +3823,7 @@ def _normalize_slot_attempt_expectations(
     for raw in rows:
         if not isinstance(raw, Mapping) or set(raw) != expected_keys:
             raise LocalAnalysisCanaryError("running recovery attempt证据形状不精确")
-        row = {
+        row: dict[str, Any] = {
             "slot_id": int(raw["slot_id"]),
             "content_id": int(raw["content_id"]),
             "source_sha256": str(raw["source_sha256"]),
@@ -3860,7 +3868,18 @@ def _validate_current_evaluation(
     *,
     content_id: int,
     release_id: str,
+    rule_version: str,
 ) -> sqlite3.Row:
+    try:
+        artifacts, components, evidence_sha256 = (
+            evaluation_module._current_evidence_state(
+                connection, content_id, rule_version=rule_version
+            )
+        )
+    except Exception as exc:
+        raise LocalAnalysisCanaryError(
+            f"content {content_id} 无法重算current evidence state"
+        ) from exc
     rows = connection.execute(
         """
         SELECT ev.*,ee.content_id envelope_content_id
@@ -3873,17 +3892,9 @@ def _validate_current_evaluation(
     ).fetchall()
     if len(rows) != 1:
         raise LocalAnalysisCanaryError(
-            f"content {content_id} active evaluation集合不精确"
+            f"content {content_id} current-evidence evaluation集合不精确"
         )
     evaluation = rows[0]
-    try:
-        artifacts, components, evidence_sha256 = (
-            evaluation_module._current_evidence_state(connection, content_id)
-        )
-    except Exception as exc:
-        raise LocalAnalysisCanaryError(
-            f"content {content_id} 无法重算current evidence state"
-        ) from exc
     envelope = connection.execute(
         "SELECT * FROM evidence_envelopes WHERE id=?",
         (int(evaluation["evidence_envelope_id"]),),
@@ -4004,6 +4015,7 @@ def _validate_current_evaluation(
     )
     if (
         str(evaluation["release_id"]) != release_id
+        or str(evaluation["rule_version"]) != rule_version
         or str(evaluation["evaluation_source"]) != "automatic"
         or str(evaluation["evaluation_status"]) != "evaluated"
         or int(evaluation["pending_review"]) != 0
@@ -4041,6 +4053,13 @@ def _validate_current_evaluation(
         or str(envelope["evidence_sha256"]) != evidence_sha256
         or components_body != components
         or any(envelope[column] != components[column] for column in component_columns)
+        or (
+            rule_version == evaluation_module.V9_RULE_VERSION
+            and (
+                components["manual_evidence_sha256"] is not None
+                or envelope["manual_evidence_sha256"] is not None
+            )
+        )
         or str(content["evaluation_content_direction"] or "")
         != str(evaluation["content_direction"] or "")
     ):
@@ -4060,7 +4079,7 @@ def _validate_processed_results(
         raise LocalAnalysisCanaryError("processed result顺序未绑定冻结IDs")
     with closing(_immutable_connection(paths.database)) as connection:
         release = connection.execute(
-            "SELECT id FROM evaluation_releases WHERE status='active'"
+            "SELECT id,rule_version FROM evaluation_releases WHERE status='active'"
         ).fetchone()
         if release is None:
             raise LocalAnalysisCanaryError("processed result缺少active release")
@@ -4107,6 +4126,7 @@ def _validate_processed_results(
                 connection,
                 content_id=content_id,
                 release_id=str(release["id"]),
+                rule_version=str(release["rule_version"]),
             )
             evaluation_result = result["evaluation"]
             if (
@@ -4237,7 +4257,7 @@ def _validate_target_success(
         if sources != contract.get("sources"):
             raise LocalAnalysisCanaryError("成功后source_group或media_source发生变化")
         release = connection.execute(
-            "SELECT id FROM evaluation_releases WHERE status='active'"
+            "SELECT id,rule_version FROM evaluation_releases WHERE status='active'"
         ).fetchone()
         if release is None:
             raise LocalAnalysisCanaryError("成功后缺少active release")
@@ -4255,6 +4275,7 @@ def _validate_target_success(
                 connection,
                 content_id=content_id,
                 release_id=str(release["id"]),
+                rule_version=str(release["rule_version"]),
             )
             active_evaluation_ids.add(int(current_evaluation["id"]))
         artifacts_by_content, media_files, fingerprint_files = (
@@ -4412,6 +4433,8 @@ def _recover_owned_running_slots(
                 latest["from_attempt_count"]
             )
             if already_frozen:
+                if latest is None:
+                    raise LocalAnalysisCanaryError("attempt recovery冻结记录缺失")
                 _assert_frozen_running_slot_identity(row, latest)
                 _validate_owned_running_slot(
                     connection,
@@ -4752,7 +4775,7 @@ def _validate_running_recovery_record(
         contract=contract,
         content_ids=content_ids,
     )
-    normalized_rows = [
+    normalized_rows: list[Mapping[str, Any]] = [
         dict(normalized[key]) for key in sorted(normalized)
     ]
     if sorted(
@@ -5178,6 +5201,17 @@ def _after_output_recovery_writer_lock(
     """Test seam after the writer reservation and before recovery validation."""
 
 
+def _writable_connection(path: Path) -> sqlite3.Connection:
+    connection = sqlite3.connect(path, timeout=30)
+    connection.row_factory = sqlite3.Row
+    try:
+        storage_module.configure_connection_safety(connection)
+    except Exception:
+        connection.close()
+        raise
+    return connection
+
+
 def _recover_owned_output_partials(
     paths: CanaryPaths,
     *,
@@ -5186,10 +5220,8 @@ def _recover_owned_output_partials(
     slot_attempt_expectations: Sequence[Mapping[str, Any]],
     network_ledger: "_NetworkLedger",
 ) -> Mapping[str, Any]:
-    guard = sqlite3.connect(paths.database, timeout=30)
-    guard.row_factory = sqlite3.Row
+    guard = _writable_connection(paths.database)
     try:
-        guard.execute("PRAGMA foreign_keys=ON")
         guard.execute("PRAGMA busy_timeout=30000")
         guard.execute("BEGIN IMMEDIATE")
         _after_output_recovery_writer_lock(guard, paths)
@@ -5385,11 +5417,11 @@ def _recover_owned_output_partials_under_writer_lock(
         ).fetchall()
         for slot in incomplete:
             key = (int(slot["content_id"]), str(slot["processor_type"]))
-            expectation = expectations.get(key)
+            incomplete_expectation = expectations.get(key)
             if (
-                expectation is None
-                or int(expectation["slot_id"]) != int(slot["id"])
-                or int(expectation["from_attempt_count"])
+                incomplete_expectation is None
+                or int(incomplete_expectation["slot_id"]) != int(slot["id"])
+                or int(incomplete_expectation["from_attempt_count"])
                 != int(slot["attempt_count"])
             ):
                 raise LocalAnalysisCanaryError(
@@ -6726,6 +6758,7 @@ class _CumulativeResponse:
             )
             self._finished = True
             if incomplete:
+                assert error is not None
                 raise error
 
     def __getattr__(self, name: str) -> Any:

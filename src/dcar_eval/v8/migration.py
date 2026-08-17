@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
 
+from .metric_observations import persist_metric_observation
 from .storage import (
     DEFAULT_DB,
     PROJECT_ROOT,
@@ -538,23 +539,28 @@ def migrate(
                     ),
                 )
                 if row["exposure_value"] is not None:
-                    destination.execute(
-                        """
-                        INSERT INTO content_metric_snapshots(
-                            content_id, captured_at, window_key, view_count, status, source, metadata_json
-                        ) VALUES (?, ?, 'legacy', ?, 'available', 'migrated_historical', ?)
-                        """,
-                        (
-                            new_id,
-                            imported_at,
-                            int(row["exposure_value"]),
-                            canonical_json(
-                                {
-                                    "trend_eligible": False,
-                                    "original_status": row["exposure_status"],
-                                }
-                            ),
+                    persist_metric_observation(
+                        destination,
+                        content_id=new_id,
+                        captured_at=imported_at,
+                        window_key="legacy",
+                        view_count=int(row["exposure_value"]),
+                        comment_count=None,
+                        like_count=None,
+                        share_count=None,
+                        collect_count=None,
+                        status="available",
+                        source="migrated_historical",
+                        raw_response_id=None,
+                        metadata_json=canonical_json(
+                            {
+                                "trend_eligible": False,
+                                "original_status": row["exposure_status"],
+                            }
                         ),
+                        observation_origin="legacy_snapshot_baseline",
+                        snapshot_mode="replace",
+                        recorded_at=captured_at,
                     )
 
                 comments_captured_at, comments_path = _captured_at_for_comments(

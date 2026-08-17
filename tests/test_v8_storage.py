@@ -10,9 +10,13 @@ from v8.storage import (
     DEFAULT_DB,
     LEGACY_MATCHER_RULE_SHA256,
     SCHEMA_VERSION,
+    SchemaMigrationError,
+    configure_connection_safety,
     connect,
     ensure_legacy_evaluation_release,
     initialize_database,
+    require_schema_compatibility,
+    schema_compatibility_state,
 )
 
 
@@ -21,6 +25,87 @@ class V8StorageTest(unittest.TestCase):
         with patch.dict("os.environ", {"DCAR_TEST_DENY_FORMAL_DB": "1"}):
             with self.assertRaisesRegex(RuntimeError, "formal DCar database"):
                 connect(DEFAULT_DB)
+
+    def test_connect_enables_recursive_triggers_for_writable_and_read_only(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "v8.sqlite3"
+            with connect(database) as connection:
+                self.assertEqual(
+                    int(connection.execute("PRAGMA foreign_keys").fetchone()[0]), 1
+                )
+                self.assertEqual(
+                    int(
+                        connection.execute("PRAGMA recursive_triggers").fetchone()[0]
+                    ),
+                    1,
+                )
+                initialize_database(connection)
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            with connect(database, read_only=True) as connection:
+                self.assertEqual(
+                    int(connection.execute("PRAGMA foreign_keys").fetchone()[0]), 1
+                )
+                self.assertEqual(
+                    int(
+                        connection.execute("PRAGMA recursive_triggers").fetchone()[0]
+                    ),
+                    1,
+                )
+                self.assertTrue(schema_compatibility_state(connection)["compatible"])
+
+    def test_connection_safety_fails_closed_when_foreign_keys_cannot_be_enabled(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "v8.sqlite3"
+            raw = sqlite3.connect(database)
+            try:
+                raw.execute("BEGIN")
+                with self.assertRaisesRegex(RuntimeError, "foreign keys"):
+                    configure_connection_safety(raw)
+                self.assertEqual(
+                    int(raw.execute("PRAGMA foreign_keys").fetchone()[0]), 0
+                )
+            finally:
+                raw.rollback()
+                raw.close()
+
+    def test_initialize_and_compatibility_reject_recursive_triggers_off(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "v8.sqlite3"
+            raw = sqlite3.connect(database)
+            raw.row_factory = sqlite3.Row
+            try:
+                self.assertEqual(
+                    int(raw.execute("PRAGMA recursive_triggers").fetchone()[0]), 0
+                )
+                with self.assertRaisesRegex(
+                    SchemaMigrationError, "recursive_triggers=ON"
+                ):
+                    initialize_database(raw)
+                self.assertEqual(
+                    raw.execute(
+                        """
+                        SELECT COUNT(*) FROM sqlite_master
+                        WHERE type='table' AND name NOT LIKE 'sqlite_%'
+                        """
+                    ).fetchone()[0],
+                    0,
+                )
+                raw.execute("PRAGMA recursive_triggers=ON")
+                initialize_database(raw)
+                raw.execute("PRAGMA recursive_triggers=OFF")
+                state = schema_compatibility_state(raw)
+                self.assertFalse(state["compatible"])
+                self.assertFalse(state["recursive_triggers_enabled"])
+                with self.assertRaisesRegex(
+                    SchemaMigrationError, "recursive_triggers=False"
+                ):
+                    require_schema_compatibility(raw)
+            finally:
+                raw.close()
 
     def test_initial_schema_is_complete_and_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -52,6 +137,7 @@ class V8StorageTest(unittest.TestCase):
                     "provider_usage",
                     "provider_budget_batches",
                     "content_metric_snapshots",
+                    "content_metric_observations",
                     "comment_evidence_versions",
                     "comments",
                     "comment_user_scores",
@@ -77,6 +163,7 @@ class V8StorageTest(unittest.TestCase):
                     "report_revisions",
                     "report_files",
                     "scheduler_runs",
+                    "scheduler_run_attempts",
                     "migration_audit",
                     "migration_row_audit",
                 }
@@ -138,8 +225,112 @@ class V8StorageTest(unittest.TestCase):
                     ],
                     evaluation_indexes.values(),
                 )
+                metric_indexes = {
+                    str(row["name"])
+                    for row in connection.execute(
+                        "PRAGMA index_list(content_metric_observations)"
+                    )
+                }
+                self.assertIn(
+                    "idx_metric_observations_content_capture", metric_indexes
+                )
+                self.assertIsNotNone(
+                    connection.execute(
+                        """
+                        SELECT 1 FROM sqlite_master
+                        WHERE type='trigger'
+                          AND name='trg_metric_observations_immutable_payload'
+                        """
+                    ).fetchone()
+                )
+                self.assertIsNotNone(
+                    connection.execute(
+                        """
+                        SELECT 1 FROM sqlite_master
+                        WHERE type='trigger'
+                          AND name='trg_metric_observations_no_delete'
+                        """
+                    ).fetchone()
+                )
                 violations = connection.execute("PRAGMA foreign_key_check").fetchall()
                 self.assertEqual(violations, [])
+            finally:
+                connection.close()
+
+    def test_runtime_schema_compatibility_accepts_complete_v11_v12_and_v13(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            connection = connect(Path(temporary) / "v8.sqlite3")
+            try:
+                initialize_database(connection)
+                self.assertEqual(require_schema_compatibility(connection), 13)
+                self.assertTrue(schema_compatibility_state(connection)["compatible"])
+
+                connection.execute("DROP TABLE scheduler_run_attempts")
+                connection.execute("DELETE FROM schema_migrations WHERE version=13")
+                connection.execute("PRAGMA user_version=12")
+                connection.commit()
+                self.assertEqual(require_schema_compatibility(connection), 12)
+                self.assertTrue(schema_compatibility_state(connection)["compatible"])
+
+                connection.execute("DROP TABLE content_metric_observations")
+                connection.execute("DROP INDEX idx_content_identities_content_primary")
+                connection.execute("DELETE FROM schema_migrations WHERE version=12")
+                connection.execute("PRAGMA user_version=11")
+                connection.commit()
+                self.assertEqual(require_schema_compatibility(connection), 11)
+            finally:
+                connection.close()
+
+    def test_runtime_schema_compatibility_rejects_incomplete_manifests(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            connection = connect(Path(temporary) / "v8.sqlite3")
+            try:
+                initialize_database(connection)
+                connection.execute("DROP TABLE scheduler_run_attempts")
+                with self.assertRaisesRegex(
+                    SchemaMigrationError, "incompatible or incomplete schema"
+                ):
+                    require_schema_compatibility(connection)
+
+                connection.execute(
+                    """
+                    CREATE TABLE scheduler_run_attempts(id INTEGER PRIMARY KEY)
+                    """,
+                )
+                with self.assertRaisesRegex(
+                    SchemaMigrationError, "incompatible or incomplete schema"
+                ):
+                    require_schema_compatibility(connection)
+            finally:
+                connection.close()
+
+    def test_runtime_schema_compatibility_rejects_counterfeit_v11(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            connection = connect(Path(temporary) / "v8.sqlite3")
+            try:
+                connection.executescript(
+                    """
+                    CREATE TABLE schema_migrations(
+                        version INTEGER PRIMARY KEY,
+                        name TEXT NOT NULL UNIQUE,
+                        applied_at TEXT NOT NULL
+                    );
+                    INSERT INTO schema_migrations(version,name,applied_at)
+                    VALUES (11,'interaction-user-v1-fallback-keys',
+                            '2026-08-15T00:00:00Z');
+                    CREATE TABLE content_items(id INTEGER PRIMARY KEY);
+                    PRAGMA user_version=11;
+                    """
+                )
+                self.assertFalse(
+                    schema_compatibility_state(connection)["compatible"]
+                )
+                with self.assertRaisesRegex(
+                    SchemaMigrationError, "incompatible or incomplete schema"
+                ):
+                    require_schema_compatibility(connection)
             finally:
                 connection.close()
 

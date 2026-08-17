@@ -32,6 +32,7 @@ from v8.providers import (
     _rnote_call,
     _rnote_discovery_call,
     _request_json,
+    _store_stage_result,
     _xhs_call,
     _xhs_media_urls,
     discover_account_content,
@@ -680,6 +681,13 @@ class V8ProviderUpdateTest(unittest.TestCase):
                 """,
                 (content["id"],),
             ).fetchone()
+            observations = connection.execute(
+                """
+                SELECT view_count,status FROM content_metric_observations
+                WHERE content_id=? ORDER BY id
+                """,
+                (content["id"],),
+            ).fetchall()
         self.assertIsNone(metrics_slot)
         self.assertIsNone(snapshot["view_count"])
         self.assertEqual(snapshot["comment_count"], 3)
@@ -689,6 +697,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
             json.loads(snapshot["metadata_json"])["exposure_observation"],
             "missing_or_placeholder",
         )
+        self.assertEqual([tuple(row) for row in observations], [(None, "missing")])
 
         calls = []
 
@@ -721,6 +730,13 @@ class V8ProviderUpdateTest(unittest.TestCase):
                 """,
                 (content["id"],),
             ).fetchone()
+            observation_count = connection.execute(
+                """
+                SELECT COUNT(*) FROM content_metric_observations
+                WHERE content_id=?
+                """,
+                (content["id"],),
+            ).fetchone()[0]
         self.assertEqual(snapshot["view_count"], 321)
         self.assertEqual(snapshot["comment_count"], 3)
         self.assertEqual(snapshot["like_count"], 20)
@@ -729,6 +745,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
             json.loads(snapshot["metadata_json"])["exposure_observation"],
             "observed",
         )
+        self.assertEqual(observation_count, 2)
 
         def repeated_discovery_call(operation, identity):
             self.assertEqual(operation, "discover_content")
@@ -777,6 +794,13 @@ class V8ProviderUpdateTest(unittest.TestCase):
                 """,
                 (content["id"],),
             ).fetchone()
+            observation_count = connection.execute(
+                """
+                SELECT COUNT(*) FROM content_metric_observations
+                WHERE content_id=?
+                """,
+                (content["id"],),
+            ).fetchone()[0]
         self.assertEqual(preserved["view_count"], 321)
         self.assertEqual(preserved["comment_count"], 3)
         self.assertEqual(preserved["like_count"], 20)
@@ -785,6 +809,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
             json.loads(preserved["metadata_json"])["exposure_observation"],
             "observed",
         )
+        self.assertEqual(observation_count, 3)
 
         def missing_statistics_call(stage, content_row):
             return ProviderResult(
@@ -811,12 +836,20 @@ class V8ProviderUpdateTest(unittest.TestCase):
                 """,
                 (content["id"],),
             ).fetchone()
+            observation_count = connection.execute(
+                """
+                SELECT COUNT(*) FROM content_metric_observations
+                WHERE content_id=?
+                """,
+                (content["id"],),
+            ).fetchone()[0]
         self.assertIsNone(missing_snapshot["view_count"])
         self.assertEqual(missing_snapshot["status"], "missing")
         self.assertEqual(
             json.loads(missing_snapshot["metadata_json"])["exposure_observation"],
             "missing_from_statistics_response",
         )
+        self.assertEqual(observation_count, 4)
 
     def test_douyin_numeric_uid_resolves_through_profile_endpoint(self) -> None:
         payload = {
@@ -1105,6 +1138,15 @@ class V8ProviderUpdateTest(unittest.TestCase):
             snapshot = connection.execute(
                 "SELECT * FROM content_metric_snapshots"
             ).fetchone()
+            observation = connection.execute(
+                "SELECT * FROM content_metric_observations"
+            ).fetchone()
+            metric_raw = connection.execute(
+                """
+                SELECT * FROM provider_raw_responses
+                WHERE operation='douyin_video_statistics'
+                """
+            ).fetchone()
             comment_version = connection.execute(
                 "SELECT * FROM comment_evidence_versions"
             ).fetchone()
@@ -1118,12 +1160,88 @@ class V8ProviderUpdateTest(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(content["title"], "汽车保养完整内容")
         self.assertEqual(snapshot["view_count"], 1000)
+        self.assertEqual(observation["view_count"], 1000)
+        self.assertEqual(observation["raw_response_id"], metric_raw["id"])
+        self.assertEqual(observation["captured_at"], metric_raw["captured_at"])
+        self.assertEqual(snapshot["captured_at"], metric_raw["captured_at"])
         self.assertEqual(comment_version["comment_count"], 1)
         self.assertEqual(len(comments), 1)
         self.assertEqual(len(scores), 1)
         self.assertEqual(raw_count, 3)
         self.assertAlmostEqual(usage, 0.003)
         self.assertTrue(all(row["status"] == "succeeded" for row in slots))
+
+    def test_duplicate_comment_business_write_reuses_existing_evidence(self) -> None:
+        first = update_content_data(
+            self.content_id,
+            as_of=date(2026, 8, 2),
+            db_path=self.db,
+            call_override=self.successful_call,
+            stages=["comments"],
+            process_media=False,
+        )
+        self.assertEqual(first["status"], "succeeded")
+        with connect(self.db) as connection:
+            content = connection.execute(
+                "SELECT * FROM content_items WHERE id=?", (self.content_id,)
+            ).fetchone()
+            raw = connection.execute(
+                """
+                SELECT id,sha256 FROM provider_raw_responses
+                WHERE content_id=? AND operation='douyin_video_comments'
+                """,
+                (self.content_id,),
+            ).fetchone()
+            evidence = connection.execute(
+                "SELECT id,iso_week,sha256 FROM comment_evidence_versions"
+            ).fetchone()
+
+        replay_data = self.successful_call("comments", content).data
+        _store_stage_result(
+            content,
+            "comments",
+            str(evidence["iso_week"]),
+            SimpleNamespace(data=replay_data, raw_response_id=int(raw["id"])),
+            db_path=self.db,
+            mark_raw_applied=False,
+        )
+        with connect(self.db) as connection:
+            evidence_before_duplicate = connection.execute(
+                "SELECT id FROM comment_evidence_versions ORDER BY id"
+            ).fetchall()
+            matching_evidence = connection.execute(
+                """
+                SELECT id FROM comment_evidence_versions
+                WHERE content_id=? AND iso_week=? AND sha256=?
+                """,
+                (self.content_id, evidence["iso_week"], raw["sha256"]),
+            ).fetchone()
+        self.assertIsNotNone(matching_evidence)
+
+        _store_stage_result(
+            content,
+            "comments",
+            str(evidence["iso_week"]),
+            SimpleNamespace(data=replay_data, raw_response_id=int(raw["id"])),
+            db_path=self.db,
+            mark_raw_applied=False,
+        )
+        with connect(self.db) as connection:
+            evidence_after = connection.execute(
+                "SELECT id FROM comment_evidence_versions ORDER BY id"
+            ).fetchall()
+            matching_after = connection.execute(
+                """
+                SELECT id FROM comment_evidence_versions
+                WHERE content_id=? AND iso_week=? AND sha256=?
+                """,
+                (self.content_id, evidence["iso_week"], raw["sha256"]),
+            ).fetchone()
+        self.assertEqual(
+            [row["id"] for row in evidence_after],
+            [row["id"] for row in evidence_before_duplicate],
+        )
+        self.assertEqual(matching_after["id"], matching_evidence["id"])
 
     def test_failed_unbilled_provider_call_stays_retryable_and_cost_is_released(
         self,
@@ -1921,6 +2039,15 @@ class V8ProviderUpdateTest(unittest.TestCase):
             usage_before = connection.execute(
                 "SELECT COUNT(*) count, SUM(amount) amount FROM provider_usage"
             ).fetchone()
+            observation_before = connection.execute(
+                """
+                SELECT id,captured_at,raw_response_id,observation_sha256
+                FROM content_metric_observations
+                WHERE content_id=?
+                """,
+                (content["id"],),
+            ).fetchone()
+            self.assertIsNotNone(observation_before)
             connection.execute(
                 "DELETE FROM evidence_artifacts WHERE content_id=?", (content["id"],)
             )
@@ -1971,9 +2098,20 @@ class V8ProviderUpdateTest(unittest.TestCase):
                 (content["id"],),
             ).fetchall()
             restored_snapshot = connection.execute(
-                "SELECT view_count FROM content_metric_snapshots WHERE content_id=?",
+                """
+                SELECT view_count,captured_at,raw_response_id
+                FROM content_metric_snapshots WHERE content_id=?
+                """,
                 (content["id"],),
             ).fetchone()
+            observations_after = connection.execute(
+                """
+                SELECT id,captured_at,raw_response_id,observation_sha256
+                FROM content_metric_observations
+                WHERE content_id=?
+                """,
+                (content["id"],),
+            ).fetchall()
             restored_media = connection.execute(
                 "SELECT 1 FROM evidence_artifacts WHERE content_id=? AND artifact_type='media_source'",
                 (content["id"],),
@@ -1985,6 +2123,14 @@ class V8ProviderUpdateTest(unittest.TestCase):
             [("detail", "succeeded"), ("metrics", "succeeded")],
         )
         self.assertEqual(restored_snapshot["view_count"], 2000)
+        self.assertEqual(len(observations_after), 1)
+        self.assertEqual(tuple(observations_after[0]), tuple(observation_before))
+        self.assertEqual(
+            restored_snapshot["captured_at"], observation_before["captured_at"]
+        )
+        self.assertEqual(
+            restored_snapshot["raw_response_id"], observation_before["raw_response_id"]
+        )
         self.assertIsNotNone(restored_media)
 
     def test_successful_metrics_raw_replays_without_second_paid_call(self) -> None:
@@ -2001,6 +2147,23 @@ class V8ProviderUpdateTest(unittest.TestCase):
             usage_before = connection.execute(
                 "SELECT COUNT(*) count, SUM(amount) amount FROM provider_usage"
             ).fetchone()
+            observation_before = connection.execute(
+                """
+                SELECT id,captured_at,raw_response_id,observation_sha256
+                FROM content_metric_observations
+                WHERE content_id=?
+                """,
+                (self.content_id,),
+            ).fetchone()
+            raw_before = connection.execute(
+                """
+                SELECT id,captured_at FROM provider_raw_responses
+                WHERE operation='douyin_video_statistics'
+                """
+            ).fetchone()
+            self.assertIsNotNone(observation_before)
+            self.assertEqual(observation_before["captured_at"], raw_before["captured_at"])
+            self.assertEqual(observation_before["raw_response_id"], raw_before["id"])
             connection.execute("DELETE FROM content_metric_snapshots")
             connection.execute(
                 "UPDATE provider_raw_responses SET source='live' WHERE operation='douyin_video_statistics'"
@@ -2025,10 +2188,21 @@ class V8ProviderUpdateTest(unittest.TestCase):
                 "SELECT COUNT(*) count, SUM(amount) amount FROM provider_usage"
             ).fetchone()
             snapshot = connection.execute(
-                "SELECT view_count FROM content_metric_snapshots"
+                "SELECT view_count,captured_at,raw_response_id FROM content_metric_snapshots"
             ).fetchone()
+            observations_after = connection.execute(
+                """
+                SELECT id,captured_at,raw_response_id,observation_sha256
+                FROM content_metric_observations WHERE content_id=?
+                """,
+                (self.content_id,),
+            ).fetchall()
         self.assertEqual(tuple(usage_after), tuple(usage_before))
         self.assertEqual(snapshot["view_count"], 1000)
+        self.assertEqual(len(observations_after), 1)
+        self.assertEqual(tuple(observations_after[0]), tuple(observation_before))
+        self.assertEqual(snapshot["captured_at"], raw_before["captured_at"])
+        self.assertEqual(snapshot["raw_response_id"], raw_before["id"])
 
     def test_zero_comment_metric_creates_weekly_evidence_without_provider_cost(
         self,
@@ -2313,6 +2487,10 @@ class V8ProviderUpdateTest(unittest.TestCase):
                 "SELECT * FROM provider_raw_responses WHERE content_id=? ORDER BY id",
                 (content["id"],),
             ).fetchall()
+            observation = connection.execute(
+                "SELECT * FROM content_metric_observations WHERE content_id=?",
+                (content["id"],),
+            ).fetchone()
             usage = connection.execute(
                 "SELECT SUM(amount) amount FROM provider_usage",
             ).fetchone()
@@ -2325,6 +2503,9 @@ class V8ProviderUpdateTest(unittest.TestCase):
             ],
         )
         self.assertEqual([row["provider"] for row in raws], ["TikHub", "TikHub"])
+        self.assertEqual(observation["raw_response_id"], raws[1]["id"])
+        self.assertEqual(observation["captured_at"], raws[0]["captured_at"])
+        self.assertEqual(snapshot["captured_at"], raws[0]["captured_at"])
         self.assertAlmostEqual(float(usage["amount"]), 0.01)
 
     def test_xhs_metrics_resume_replays_successful_detail_without_second_call(
@@ -2390,13 +2571,32 @@ class V8ProviderUpdateTest(unittest.TestCase):
         )
         with connect(self.db) as connection:
             snapshot = connection.execute(
-                "SELECT view_count FROM content_metric_snapshots WHERE content_id=?",
+                """
+                SELECT view_count,captured_at,raw_response_id
+                FROM content_metric_snapshots WHERE content_id=?
+                """,
                 (content["id"],),
             ).fetchone()
+            observation = connection.execute(
+                "SELECT * FROM content_metric_observations WHERE content_id=?",
+                (content["id"],),
+            ).fetchone()
+            raws = connection.execute(
+                "SELECT * FROM provider_raw_responses WHERE content_id=? ORDER BY id",
+                (content["id"],),
+            ).fetchall()
             usage = connection.execute(
                 "SELECT COUNT(*) count,SUM(amount) amount FROM provider_usage"
             ).fetchone()
         self.assertEqual(snapshot["view_count"], 321)
+        self.assertEqual(
+            [row["operation"] for row in raws],
+            ["xiaohongshu_note_detail", "xiaohongshu_note_statistics"],
+        )
+        self.assertEqual(observation["raw_response_id"], raws[1]["id"])
+        self.assertEqual(observation["captured_at"], raws[0]["captured_at"])
+        self.assertEqual(snapshot["captured_at"], raws[0]["captured_at"])
+        self.assertEqual(snapshot["raw_response_id"], raws[1]["id"])
         self.assertEqual(usage["count"], 1)
         self.assertAlmostEqual(float(usage["amount"]), 0.01)
 

@@ -15,8 +15,16 @@ from typing import Iterator
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_DB = PROJECT_ROOT / "app" / "data" / "dcar_insight.sqlite3"
-SCHEMA_VERSION = 11
-CURRENT_SCHEMA_MIGRATION_NAME = "interaction-user-v1-fallback-keys"
+SCHEMA_VERSION = 15
+CURRENT_SCHEMA_MIGRATION_NAME = "spu-llm-assist"
+SCHEMA_MIGRATION_NAMES = {
+    11: "interaction-user-v1-fallback-keys",
+    12: "append-only-metric-observations",
+    13: "scheduler-run-attempt-history",
+    14: "spu-audience-scene-domain",
+    15: CURRENT_SCHEMA_MIGRATION_NAME,
+}
+RUNTIME_COMPATIBLE_SCHEMA_VERSIONS = frozenset(SCHEMA_MIGRATION_NAMES)
 LEGACY_TAXONOMY_VERSION = "selling-points-v5.0"
 LEGACY_V6_RELEASE_ID = "evaluation-v6__selling-points-v5.0"
 LEGACY_V7_RELEASE_ID = "evaluation-v7__selling-points-v5.0"
@@ -45,6 +53,23 @@ def now_utc() -> str:
     )
 
 
+def enable_recursive_triggers(connection: sqlite3.Connection) -> None:
+    """Enable the SQLite setting required by append-only DELETE triggers."""
+
+    connection.execute("PRAGMA recursive_triggers = ON")
+    if int(connection.execute("PRAGMA recursive_triggers").fetchone()[0]) != 1:
+        raise RuntimeError("SQLite recursive triggers could not be enabled")
+
+
+def configure_connection_safety(connection: sqlite3.Connection) -> None:
+    """Enable and verify the connection-local relational safety settings."""
+
+    enable_recursive_triggers(connection)
+    connection.execute("PRAGMA foreign_keys = ON")
+    if int(connection.execute("PRAGMA foreign_keys").fetchone()[0]) != 1:
+        raise RuntimeError("SQLite foreign keys could not be enabled")
+
+
 def connect(
     path: Path = DEFAULT_DB, *, read_only: bool | None = None
 ) -> sqlite3.Connection:
@@ -64,14 +89,22 @@ def connect(
             timeout=10,
         )
         connection.row_factory = sqlite3.Row
+        try:
+            configure_connection_safety(connection)
+        except Exception:
+            connection.close()
+            raise
         connection.execute("PRAGMA query_only = ON")
-        connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 10000")
         return connection
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path, timeout=10)
     connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
+    try:
+        configure_connection_safety(connection)
+    except Exception:
+        connection.close()
+        raise
     connection.execute("PRAGMA journal_mode = WAL")
     connection.execute("PRAGMA busy_timeout = 10000")
     return connection
@@ -199,6 +232,9 @@ CREATE TABLE IF NOT EXISTS content_identities (
     created_at TEXT NOT NULL,
     UNIQUE(platform_identity_key)
 );
+
+CREATE INDEX IF NOT EXISTS idx_content_identities_content_primary
+ON content_identities(content_id, is_primary DESC, id);
 
 CREATE TABLE IF NOT EXISTS content_aliases (
     alias_link_id TEXT PRIMARY KEY CHECK(length(alias_link_id)=6),
@@ -340,6 +376,56 @@ CREATE TABLE IF NOT EXISTS content_metric_snapshots (
     metadata_json TEXT NOT NULL DEFAULT '{}',
     UNIQUE(content_id, window_key, source)
 );
+
+CREATE TABLE IF NOT EXISTS content_metric_observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
+    subject_key TEXT NOT NULL,
+    captured_at TEXT NOT NULL,
+    window_key TEXT NOT NULL,
+    view_count INTEGER,
+    comment_count INTEGER,
+    like_count INTEGER,
+    share_count INTEGER,
+    collect_count INTEGER,
+    status TEXT NOT NULL CHECK(status IN ('available','missing','stale')),
+    source TEXT NOT NULL,
+    raw_response_id INTEGER REFERENCES provider_raw_responses(id),
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    observation_origin TEXT NOT NULL CHECK(observation_origin IN (
+        'provider_capture','legacy_snapshot_baseline','system_correction'
+    )),
+    legacy_snapshot_id INTEGER UNIQUE,
+    observation_sha256 TEXT NOT NULL UNIQUE CHECK(length(observation_sha256)=64),
+    recorded_at TEXT NOT NULL,
+    CHECK(
+        (observation_origin='legacy_snapshot_baseline'
+         AND legacy_snapshot_id IS NOT NULL)
+        OR
+        (observation_origin<>'legacy_snapshot_baseline'
+         AND legacy_snapshot_id IS NULL)
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_metric_observations_content_capture
+ON content_metric_observations(content_id, captured_at DESC, id DESC);
+
+CREATE TRIGGER IF NOT EXISTS trg_metric_observations_immutable_payload
+BEFORE UPDATE OF
+    id,subject_key,captured_at,window_key,view_count,comment_count,
+    like_count,share_count,collect_count,status,source,raw_response_id,
+    metadata_json,observation_origin,legacy_snapshot_id,
+    observation_sha256,recorded_at
+ON content_metric_observations
+BEGIN
+    SELECT RAISE(ABORT, 'content metric observation payload is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_metric_observations_no_delete
+BEFORE DELETE ON content_metric_observations
+BEGIN
+    SELECT RAISE(ABORT, 'content metric observations are append-only');
+END;
 
 CREATE TABLE IF NOT EXISTS interaction_users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -863,12 +949,60 @@ CREATE TABLE IF NOT EXISTS scheduler_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id TEXT NOT NULL,
     scheduled_for TEXT NOT NULL,
-    status TEXT NOT NULL CHECK(status IN ('running','succeeded','failed','skipped')),
+    status TEXT NOT NULL
+        CHECK(status IN ('running','succeeded','failed','skipped','partial','interrupted')),
     started_at TEXT NOT NULL,
     completed_at TEXT,
     details_json TEXT NOT NULL DEFAULT '{}',
     UNIQUE(job_id, scheduled_for)
 );
+
+CREATE TABLE IF NOT EXISTS scheduler_run_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scheduler_run_id INTEGER NOT NULL
+        REFERENCES scheduler_runs(id) ON DELETE RESTRICT,
+    attempt_number INTEGER NOT NULL CHECK(attempt_number >= 1),
+    invocation_source TEXT NOT NULL CHECK(invocation_source IN (
+        'legacy_migration','scheduled','startup_report_catchup','operator_retry'
+    )),
+    status TEXT NOT NULL
+        CHECK(status IN ('running','succeeded','failed','skipped','partial','interrupted')),
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    UNIQUE(scheduler_run_id, attempt_number),
+    CHECK(
+        (status='running' AND completed_at IS NULL)
+        OR (status!='running' AND completed_at IS NOT NULL)
+    )
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_scheduler_run_attempts_active
+ON scheduler_run_attempts(scheduler_run_id)
+WHERE status='running';
+
+CREATE TRIGGER IF NOT EXISTS trg_scheduler_run_attempts_terminal_update
+BEFORE UPDATE ON scheduler_run_attempts
+WHEN NOT (
+    OLD.status='running'
+    AND OLD.completed_at IS NULL
+    AND NEW.status IN ('succeeded','failed','skipped','partial','interrupted')
+    AND NEW.completed_at IS NOT NULL
+    AND NEW.id IS OLD.id
+    AND NEW.scheduler_run_id IS OLD.scheduler_run_id
+    AND NEW.attempt_number IS OLD.attempt_number
+    AND NEW.invocation_source IS OLD.invocation_source
+    AND NEW.started_at IS OLD.started_at
+)
+BEGIN
+    SELECT RAISE(ABORT, 'scheduler attempt permits one running-to-terminal update');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_scheduler_run_attempts_no_delete
+BEFORE DELETE ON scheduler_run_attempts
+BEGIN
+    SELECT RAISE(ABORT, 'scheduler attempts are append-only');
+END;
 
 CREATE TABLE IF NOT EXISTS migration_audit (
     id TEXT PRIMARY KEY,
@@ -893,11 +1027,272 @@ CREATE TABLE IF NOT EXISTS migration_row_audit (
     reason TEXT NOT NULL DEFAULT '',
     UNIQUE(migration_id, source_table, source_pk, field_name)
 );
+
+CREATE TABLE IF NOT EXISTS spu_catalog (
+    spu_id TEXT PRIMARY KEY,
+    brand TEXT NOT NULL,
+    series TEXT NOT NULL,
+    series_slug TEXT NOT NULL,
+    trim_label TEXT,
+    is_series_node INTEGER NOT NULL DEFAULT 0 CHECK(is_series_node IN (0,1)),
+    model_year INTEGER,
+    powertrain TEXT NOT NULL DEFAULT '',
+    body_style TEXT NOT NULL DEFAULT '',
+    price_low REAL,
+    price_high REAL,
+    external_ref TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK(
+        (is_series_node=1 AND trim_label IS NULL)
+        OR (is_series_node=0 AND trim_label IS NOT NULL)
+    )
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_spu_catalog_series_node
+ON spu_catalog(series_slug) WHERE is_series_node=1;
+
+CREATE TABLE IF NOT EXISTS spu_alias (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    alias TEXT NOT NULL,
+    alias_type TEXT NOT NULL DEFAULT 'official'
+        CHECK(alias_type IN ('official','nickname','slang','model_code')),
+    spu_scope TEXT NOT NULL CHECK(spu_scope IN ('series','trim')),
+    spu_id TEXT NOT NULL REFERENCES spu_catalog(spu_id) ON DELETE CASCADE,
+    ambiguous INTEGER NOT NULL DEFAULT 0 CHECK(ambiguous IN (0,1)),
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+    UNIQUE(alias, spu_id)
+);
+
+CREATE TABLE IF NOT EXISTS audience_dim (
+    code TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    definition TEXT NOT NULL DEFAULT '',
+    explicit_signals_json TEXT NOT NULL DEFAULT '[]',
+    ref_mapping_json TEXT NOT NULL DEFAULT '{}',
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1))
+);
+
+CREATE TABLE IF NOT EXISTS scene_dim (
+    code TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    definition TEXT NOT NULL DEFAULT '',
+    trigger_words_json TEXT NOT NULL DEFAULT '[]',
+    negative_words_json TEXT NOT NULL DEFAULT '[]',
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1))
+);
+
+CREATE TABLE IF NOT EXISTS spu_audience_map (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope TEXT NOT NULL CHECK(scope IN ('series','trim')),
+    scope_key TEXT NOT NULL,
+    audience_code TEXT NOT NULL REFERENCES audience_dim(code) ON DELETE RESTRICT,
+    role TEXT NOT NULL CHECK(role IN ('primary','secondary')),
+    weight REAL NOT NULL DEFAULT 1.0,
+    basis TEXT NOT NULL DEFAULT '',
+    UNIQUE(scope, scope_key, audience_code)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_spu_audience_primary
+ON spu_audience_map(scope, scope_key) WHERE role='primary';
+
+CREATE TABLE IF NOT EXISTS audience_scene_map (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    audience_code TEXT NOT NULL REFERENCES audience_dim(code) ON DELETE RESTRICT,
+    scene_code TEXT NOT NULL REFERENCES scene_dim(code) ON DELETE RESTRICT,
+    tier TEXT NOT NULL CHECK(tier IN ('core','related')),
+    basis TEXT NOT NULL DEFAULT '',
+    UNIQUE(audience_code, scene_code)
+);
+
+CREATE TABLE IF NOT EXISTS content_spu_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
+    spu_id TEXT NOT NULL REFERENCES spu_catalog(spu_id) ON DELETE RESTRICT,
+    resolved_level TEXT NOT NULL CHECK(resolved_level IN ('series','trim')),
+    is_primary INTEGER NOT NULL DEFAULT 0 CHECK(is_primary IN (0,1)),
+    status TEXT NOT NULL CHECK(status IN ('confirmed','gray')),
+    score INTEGER NOT NULL CHECK(score BETWEEN 0 AND 100),
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    rule_version TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    invalidated_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_content_spu_links_content
+ON content_spu_links(content_id) WHERE invalidated_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_content_spu_links_spu
+ON content_spu_links(spu_id) WHERE invalidated_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS content_scene_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
+    scene_code TEXT NOT NULL REFERENCES scene_dim(code) ON DELETE RESTRICT,
+    score INTEGER NOT NULL CHECK(score BETWEEN 0 AND 100),
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    rule_version TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    invalidated_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_content_scene_links_content
+ON content_scene_links(content_id) WHERE invalidated_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS content_audience_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
+    audience_code TEXT NOT NULL REFERENCES audience_dim(code) ON DELETE RESTRICT,
+    source TEXT NOT NULL CHECK(source IN ('content_explicit','rule_prior','llm')),
+    conflict_flag INTEGER NOT NULL DEFAULT 0 CHECK(conflict_flag IN (0,1)),
+    consistency_flag INTEGER NOT NULL DEFAULT 0 CHECK(consistency_flag IN (0,1)),
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    rule_version TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    invalidated_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_content_audience_links_content
+ON content_audience_links(content_id) WHERE invalidated_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS llm_judgements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
+    text_sha256 TEXT NOT NULL,
+    model TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('accepted','rejected','error')),
+    response_json TEXT NOT NULL DEFAULT '{}',
+    verdict_json TEXT NOT NULL DEFAULT '{}',
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_llm_judgements_key
+ON llm_judgements(content_id, text_sha256, model, prompt_version);
+
+CREATE TABLE IF NOT EXISTS spu_association_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    status TEXT NOT NULL CHECK(status IN ('running','succeeded','failed')),
+    rule_version TEXT NOT NULL,
+    contents_total INTEGER NOT NULL DEFAULT 0,
+    spu_linked INTEGER NOT NULL DEFAULT 0,
+    trim_resolved INTEGER NOT NULL DEFAULT 0,
+    gray_count INTEGER NOT NULL DEFAULT 0,
+    scene_linked INTEGER NOT NULL DEFAULT 0,
+    audience_linked INTEGER NOT NULL DEFAULT 0,
+    insufficient_evidence INTEGER NOT NULL DEFAULT 0,
+    summary_json TEXT NOT NULL DEFAULT '{}'
+);
 """
 
 
 class SchemaMigrationError(RuntimeError):
     pass
+
+
+def schema_compatibility_state(
+    connection: sqlite3.Connection,
+    *,
+    supported_versions: frozenset[int] = RUNTIME_COMPATIBLE_SCHEMA_VERSIONS,
+) -> dict[str, object]:
+    """Return a fail-closed runtime compatibility verdict for one database.
+
+    ``PRAGMA user_version`` is application-owned, so it is not sufficient on
+    its own.  A compatible database must also have exactly one matching
+    migration manifest row and no newer migration row hidden behind an older
+    pragma value.
+    """
+
+    user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    recursive_triggers_enabled = (
+        int(connection.execute("PRAGMA recursive_triggers").fetchone()[0]) == 1
+    )
+    has_manifest = (
+        connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type='table' AND name='schema_migrations'
+            """
+        ).fetchone()
+        is not None
+    )
+    expected_name = SCHEMA_MIGRATION_NAMES.get(user_version)
+    actual_name: str | None = None
+    max_migration_version: int | None = None
+    manifest_row_count = 0
+    if has_manifest:
+        rows = connection.execute(
+            "SELECT name FROM schema_migrations WHERE version=?", (user_version,)
+        ).fetchall()
+        manifest_row_count = len(rows)
+        if len(rows) == 1:
+            actual_name = str(rows[0]["name"])
+        maximum = connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0]
+        if maximum is not None:
+            max_migration_version = int(maximum)
+    compatible = bool(
+        recursive_triggers_enabled
+        and user_version in supported_versions
+        and expected_name is not None
+        and has_manifest
+        and manifest_row_count == 1
+        and actual_name == expected_name
+        and max_migration_version == user_version
+    )
+    if compatible and user_version in {11, 12, 13, 14, 15}:
+        try:
+            _validate_v9_structure(connection)
+            _validate_v10_structure(connection)
+            _validate_v11(connection)
+            if user_version >= 12:
+                _validate_v12_structure(connection)
+            if user_version >= 13:
+                _validate_v13_structure(connection)
+            if user_version >= 14:
+                _validate_v14_structure(connection)
+            if user_version >= 15:
+                _validate_v15_structure(connection)
+        except SchemaMigrationError:
+            compatible = False
+    return {
+        "compatible": compatible,
+        "user_version": user_version,
+        "supported_versions": sorted(supported_versions),
+        "expected_migration_name": expected_name,
+        "actual_migration_name": actual_name,
+        "max_migration_version": max_migration_version,
+        "recursive_triggers_enabled": recursive_triggers_enabled,
+    }
+
+
+def require_schema_compatibility(
+    connection: sqlite3.Connection,
+    *,
+    supported_versions: frozenset[int] = RUNTIME_COMPATIBLE_SCHEMA_VERSIONS,
+) -> int:
+    state = schema_compatibility_state(
+        connection, supported_versions=supported_versions
+    )
+    if not bool(state["compatible"]):
+        raise SchemaMigrationError(
+            "incompatible or incomplete schema: "
+            f"user_version={state['user_version']}, "
+            f"migration={state['actual_migration_name']!r}, "
+            f"max_migration_version={state['max_migration_version']!r}, "
+            f"recursive_triggers={state['recursive_triggers_enabled']!r}, "
+            f"supported={state['supported_versions']}"
+        )
+    user_version = state["user_version"]
+    if not isinstance(user_version, int):
+        raise SchemaMigrationError("schema compatibility returned a non-integer version")
+    return user_version
 
 
 _REBUILT_V9_TABLES = (
@@ -1450,6 +1845,34 @@ def _create_fresh_schema(connection: sqlite3.Connection) -> None:
             """,
             (captured_at,),
         )
+        connection.execute(
+            """
+            INSERT INTO schema_migrations(version,name,applied_at)
+            VALUES (12,'append-only-metric-observations',?)
+            """,
+            (captured_at,),
+        )
+        connection.execute(
+            """
+            INSERT INTO schema_migrations(version,name,applied_at)
+            VALUES (13,'scheduler-run-attempt-history',?)
+            """,
+            (captured_at,),
+        )
+        connection.execute(
+            """
+            INSERT INTO schema_migrations(version,name,applied_at)
+            VALUES (14,'spu-audience-scene-domain',?)
+            """,
+            (captured_at,),
+        )
+        connection.execute(
+            """
+            INSERT INTO schema_migrations(version,name,applied_at)
+            VALUES (15,'spu-llm-assist',?)
+            """,
+            (captured_at,),
+        )
         connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         connection.commit()
     except Exception:
@@ -1457,7 +1880,7 @@ def _create_fresh_schema(connection: sqlite3.Connection) -> None:
         raise
 
 
-def _validate_v9(connection: sqlite3.Connection) -> None:
+def _validate_v9_structure(connection: sqlite3.Connection) -> None:
     columns = set(_table_columns(connection, "evaluation_versions"))
     required = {
         "release_id",
@@ -1480,6 +1903,10 @@ def _validate_v9(connection: sqlite3.Connection) -> None:
     }
     if required_indexes - indexes or "uq_evaluation_idempotency" in indexes:
         raise SchemaMigrationError("schema v9 evaluation indexes are inconsistent")
+
+
+def _validate_v9(connection: sqlite3.Connection) -> None:
+    _validate_v9_structure(connection)
     if connection.execute("PRAGMA foreign_key_check").fetchall():
         raise SchemaMigrationError("schema v9 has foreign-key violations")
 
@@ -1652,7 +2079,7 @@ def _migrate_v9_to_v10(connection: sqlite3.Connection) -> None:
         raise SchemaMigrationError(f"v10 integrity check failed: {integrity}")
 
 
-def _validate_v10(connection: sqlite3.Connection) -> None:
+def _validate_v10_structure(connection: sqlite3.Connection) -> None:
     tables = _table_names(connection)
     missing = set(_NEW_V10_TABLES) - tables
     if missing:
@@ -1684,6 +2111,10 @@ def _validate_v10(connection: sqlite3.Connection) -> None:
         raise SchemaMigrationError(
             "schema v10 is missing the comment identity uniqueness index"
         )
+
+
+def _validate_v10(connection: sqlite3.Connection) -> None:
+    _validate_v10_structure(connection)
     if connection.execute("PRAGMA foreign_key_check").fetchall():
         raise SchemaMigrationError("schema v10 has foreign-key violations")
 
@@ -1825,18 +2256,1055 @@ def _validate_v11(connection: sqlite3.Connection) -> None:
         )
 
 
+def metric_observation_sha256(
+    *,
+    observation_origin: str,
+    legacy_snapshot_id: int | None,
+    subject_key: str,
+    captured_at: str,
+    window_key: str,
+    view_count: int | None,
+    comment_count: int | None,
+    like_count: int | None,
+    share_count: int | None,
+    collect_count: int | None,
+    status: str,
+    source: str,
+    raw_response_id: int | None,
+    metadata_json: str,
+) -> str:
+    payload = {
+        "schema": "content-metric-observation-v1",
+        "observation_origin": observation_origin,
+        "legacy_snapshot_id": legacy_snapshot_id,
+        "subject_key": subject_key,
+        "captured_at": captured_at,
+        "window_key": window_key,
+        "view_count": view_count,
+        "comment_count": comment_count,
+        "like_count": like_count,
+        "share_count": share_count,
+        "collect_count": collect_count,
+        "status": status,
+        "source": source,
+        "raw_response_id": raw_response_id,
+        "metadata_json": metadata_json,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _migrate_v11_to_v12(connection: sqlite3.Connection) -> None:
+    """Create and backfill immutable metric observations without changing snapshots."""
+
+    if connection.in_transaction:
+        raise SchemaMigrationError("v12 migration requires no active transaction")
+    if int(connection.execute("PRAGMA foreign_keys").fetchone()[0]) != 1:
+        raise SchemaMigrationError("v12 migration requires PRAGMA foreign_keys=ON")
+    state = schema_compatibility_state(
+        connection, supported_versions=frozenset({11})
+    )
+    if not bool(state["compatible"]):
+        raise SchemaMigrationError("v12 migration requires complete schema v11")
+    required_tables = {
+        "content_items",
+        "content_identities",
+        "provider_raw_responses",
+        "content_metric_snapshots",
+    }
+    missing_tables = required_tables - _table_names(connection)
+    if missing_tables:
+        raise SchemaMigrationError(
+            "v12 migration is missing metric source tables: "
+            f"{sorted(missing_tables)}"
+        )
+    required_columns = {
+        "content_items": {"id", "link_id"},
+        "content_identities": {
+            "id",
+            "content_id",
+            "platform_identity_key",
+            "is_primary",
+        },
+        "provider_raw_responses": {"id"},
+        "content_metric_snapshots": {
+            "id",
+            "content_id",
+            "captured_at",
+            "window_key",
+            "view_count",
+            "comment_count",
+            "like_count",
+            "share_count",
+            "collect_count",
+            "status",
+            "source",
+            "raw_response_id",
+            "metadata_json",
+        },
+    }
+    for table, required in required_columns.items():
+        missing_columns = required - set(_table_columns(connection, table))
+        if missing_columns:
+            raise SchemaMigrationError(
+                f"v12 migration source table {table} is incomplete: "
+                f"{sorted(missing_columns)}"
+            )
+    existing_objects = {
+        str(row["name"])
+        for row in connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE name IN (
+                'idx_content_identities_content_primary',
+                'content_metric_observations',
+                'idx_metric_observations_content_capture',
+                'trg_metric_observations_immutable_payload',
+                'trg_metric_observations_no_delete'
+            )
+            """
+        ).fetchall()
+    }
+    if existing_objects:
+        raise SchemaMigrationError(
+            f"v12 metric objects already exist before migration: {sorted(existing_objects)}"
+        )
+
+    snapshot_columns = _table_columns(connection, "content_metric_snapshots")
+    snapshot_count = int(
+        connection.execute("SELECT COUNT(*) FROM content_metric_snapshots").fetchone()[0]
+    )
+    snapshot_hash = _table_projection_sha256(
+        connection, "content_metric_snapshots", snapshot_columns
+    )
+    statements = _schema_statements()
+    metric_statements = [
+        statement
+        for statement in statements
+        if statement.startswith("CREATE TABLE IF NOT EXISTS content_metric_observations ")
+        or statement.startswith(
+            "CREATE INDEX IF NOT EXISTS idx_content_identities_content_primary"
+        )
+        or statement.startswith(
+            "CREATE INDEX IF NOT EXISTS idx_metric_observations_content_capture"
+        )
+        or statement.startswith(
+            "CREATE TRIGGER IF NOT EXISTS trg_metric_observations_immutable_payload"
+        )
+        or statement.startswith(
+            "CREATE TRIGGER IF NOT EXISTS trg_metric_observations_no_delete"
+        )
+    ]
+    if len(metric_statements) != 5:
+        raise SchemaMigrationError("v12 metric schema template is incomplete")
+
+    applied_at = now_utc()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        for statement in metric_statements:
+            connection.execute(statement)
+        _migration_checkpoint("v12_metric_table_created")
+
+        rows = connection.execute(
+            """
+            SELECT s.*,
+                   COALESCE(
+                       (
+                           SELECT ci.platform_identity_key
+                           FROM content_identities ci
+                           WHERE ci.content_id=s.content_id
+                           ORDER BY ci.is_primary DESC,ci.id
+                           LIMIT 1
+                       ),
+                       'link:' || c.link_id
+                   ) subject_key
+            FROM content_metric_snapshots s
+            JOIN content_items c ON c.id=s.content_id
+            ORDER BY s.id
+            """
+        ).fetchall()
+        for row in rows:
+            values = {
+                "observation_origin": "legacy_snapshot_baseline",
+                "legacy_snapshot_id": int(row["id"]),
+                "subject_key": str(row["subject_key"]),
+                "captured_at": str(row["captured_at"]),
+                "window_key": str(row["window_key"]),
+                "view_count": row["view_count"],
+                "comment_count": row["comment_count"],
+                "like_count": row["like_count"],
+                "share_count": row["share_count"],
+                "collect_count": row["collect_count"],
+                "status": str(row["status"]),
+                "source": str(row["source"]),
+                "raw_response_id": row["raw_response_id"],
+                "metadata_json": str(row["metadata_json"]),
+            }
+            digest = metric_observation_sha256(**values)
+            connection.execute(
+                """
+                INSERT INTO content_metric_observations(
+                    content_id,subject_key,captured_at,window_key,
+                    view_count,comment_count,like_count,share_count,collect_count,
+                    status,source,raw_response_id,metadata_json,observation_origin,
+                    legacy_snapshot_id,observation_sha256,recorded_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    row["content_id"],
+                    values["subject_key"],
+                    values["captured_at"],
+                    values["window_key"],
+                    values["view_count"],
+                    values["comment_count"],
+                    values["like_count"],
+                    values["share_count"],
+                    values["collect_count"],
+                    values["status"],
+                    values["source"],
+                    values["raw_response_id"],
+                    values["metadata_json"],
+                    values["observation_origin"],
+                    values["legacy_snapshot_id"],
+                    digest,
+                    applied_at,
+                ),
+            )
+        _migration_checkpoint("v12_metric_observations_backfilled")
+
+        baseline_count = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM content_metric_observations
+                WHERE observation_origin='legacy_snapshot_baseline'
+                """
+            ).fetchone()[0]
+        )
+        if baseline_count != snapshot_count:
+            raise SchemaMigrationError(
+                "v12 metric baseline count changed: "
+                f"snapshots={snapshot_count},observations={baseline_count}"
+            )
+        mismatches = int(
+            connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM content_metric_snapshots s
+                JOIN content_metric_observations o ON o.legacy_snapshot_id=s.id
+                WHERE o.content_id IS NOT s.content_id
+                   OR o.captured_at IS NOT s.captured_at
+                   OR o.window_key IS NOT s.window_key
+                   OR o.view_count IS NOT s.view_count
+                   OR o.comment_count IS NOT s.comment_count
+                   OR o.like_count IS NOT s.like_count
+                   OR o.share_count IS NOT s.share_count
+                   OR o.collect_count IS NOT s.collect_count
+                   OR o.status IS NOT s.status
+                   OR o.source IS NOT s.source
+                   OR o.raw_response_id IS NOT s.raw_response_id
+                   OR o.metadata_json IS NOT s.metadata_json
+                """
+            ).fetchone()[0]
+        )
+        if mismatches:
+            raise SchemaMigrationError(
+                f"v12 metric baseline differs from {mismatches} snapshots"
+            )
+        if (
+            _table_projection_sha256(
+                connection, "content_metric_snapshots", snapshot_columns
+            )
+            != snapshot_hash
+        ):
+            raise SchemaMigrationError("v12 migration changed metric snapshots")
+        violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise SchemaMigrationError(
+                f"v12 foreign-key violations before commit: {len(violations)}"
+            )
+        connection.execute(
+            """
+            INSERT INTO schema_migrations(version,name,applied_at)
+            VALUES (12,'append-only-metric-observations',?)
+            """,
+            (applied_at,),
+        )
+        connection.execute("PRAGMA user_version=12")
+        _migration_checkpoint("v12_metric_schema_stamped")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        raise SchemaMigrationError("v12 foreign-key check failed after commit")
+    integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
+    if integrity != "ok":
+        raise SchemaMigrationError(f"v12 integrity check failed: {integrity}")
+
+
+def _normalized_schema_sql(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip())
+
+
+def _validate_v12_structure(connection: sqlite3.Connection) -> None:
+    required = {
+        "id",
+        "content_id",
+        "subject_key",
+        "captured_at",
+        "window_key",
+        "view_count",
+        "comment_count",
+        "like_count",
+        "share_count",
+        "collect_count",
+        "status",
+        "source",
+        "raw_response_id",
+        "metadata_json",
+        "observation_origin",
+        "legacy_snapshot_id",
+        "observation_sha256",
+        "recorded_at",
+    }
+    columns = set(_table_columns(connection, "content_metric_observations"))
+    if required - columns:
+        raise SchemaMigrationError(
+            "schema v12 is missing metric observation columns: "
+            f"{sorted(required - columns)}"
+        )
+    indexes = {
+        str(row["name"])
+        for row in connection.execute(
+            "PRAGMA index_list(content_metric_observations)"
+        ).fetchall()
+    }
+    if "idx_metric_observations_content_capture" not in indexes:
+        raise SchemaMigrationError("schema v12 is missing metric capture index")
+    trigger = connection.execute(
+        """
+        SELECT 1 FROM sqlite_master
+        WHERE type='trigger' AND name='trg_metric_observations_immutable_payload'
+        """
+    ).fetchone()
+    if trigger is None:
+        raise SchemaMigrationError("schema v12 is missing metric immutability trigger")
+    no_delete_trigger = connection.execute(
+        """
+        SELECT 1 FROM sqlite_master
+        WHERE type='trigger' AND name='trg_metric_observations_no_delete'
+        """
+    ).fetchone()
+    if no_delete_trigger is None:
+        raise SchemaMigrationError("schema v12 is missing metric no-delete trigger")
+
+    object_prefixes = {
+        ("index", "idx_content_identities_content_primary"):
+            "CREATE INDEX IF NOT EXISTS idx_content_identities_content_primary",
+        ("table", "content_metric_observations"):
+            "CREATE TABLE IF NOT EXISTS content_metric_observations ",
+        ("index", "idx_metric_observations_content_capture"):
+            "CREATE INDEX IF NOT EXISTS idx_metric_observations_content_capture",
+        ("trigger", "trg_metric_observations_immutable_payload"):
+            "CREATE TRIGGER IF NOT EXISTS trg_metric_observations_immutable_payload",
+        ("trigger", "trg_metric_observations_no_delete"):
+            "CREATE TRIGGER IF NOT EXISTS trg_metric_observations_no_delete",
+    }
+    statements = _schema_statements()
+    for (object_type, name), prefix in object_prefixes.items():
+        expected_candidates = [
+            statement for statement in statements if statement.startswith(prefix)
+        ]
+        if len(expected_candidates) != 1:
+            raise SchemaMigrationError(f"schema v12 template is missing {name}")
+        expected = expected_candidates[0].replace(" IF NOT EXISTS", "", 1)
+        actual_row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type=? AND name=?",
+            (object_type, name),
+        ).fetchone()
+        if actual_row is None or actual_row[0] is None:
+            raise SchemaMigrationError(f"schema v12 is missing {name}")
+        if _normalized_schema_sql(str(actual_row[0])) != _normalized_schema_sql(
+            expected
+        ):
+            raise SchemaMigrationError(f"schema v12 object definition drifted: {name}")
+
+
+def _validate_v12(connection: sqlite3.Connection) -> None:
+    _validate_v12_structure(connection)
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        raise SchemaMigrationError("schema v12 has foreign-key violations")
+
+
+_V12_SCHEDULER_RUNS_SQL = """
+CREATE TABLE scheduler_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    scheduled_for TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('running','succeeded','failed','skipped')),
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    UNIQUE(job_id, scheduled_for)
+)
+"""
+
+
+def _schema_object_sql(*, object_type: str, name: str, prefix: str) -> str:
+    candidates = [
+        statement for statement in _schema_statements() if statement.startswith(prefix)
+    ]
+    if len(candidates) != 1:
+        raise SchemaMigrationError(f"schema template is missing {name}")
+    expected = candidates[0].replace(" IF NOT EXISTS", "", 1)
+    if object_type not in {"table", "index", "trigger"}:
+        raise SchemaMigrationError(f"unsupported schema object type: {object_type}")
+    return expected
+
+
+def _require_exact_schema_object(
+    connection: sqlite3.Connection,
+    *,
+    object_type: str,
+    name: str,
+    prefix: str,
+) -> None:
+    expected = _schema_object_sql(
+        object_type=object_type,
+        name=name,
+        prefix=prefix,
+    )
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type=? AND name=?",
+        (object_type, name),
+    ).fetchone()
+    if row is None or row[0] is None:
+        raise SchemaMigrationError(f"schema v13 is missing {name}")
+    if _normalized_schema_sql(str(row[0])) != _normalized_schema_sql(expected):
+        raise SchemaMigrationError(f"schema v13 object definition drifted: {name}")
+
+
+def _migrate_v12_to_v13(connection: sqlite3.Connection) -> None:
+    """Add immutable per-occurrence scheduler attempt history."""
+
+    if connection.in_transaction:
+        raise SchemaMigrationError("v13 migration requires no active transaction")
+    if int(connection.execute("PRAGMA foreign_keys").fetchone()[0]) != 1:
+        raise SchemaMigrationError("v13 migration requires PRAGMA foreign_keys=ON")
+    state = schema_compatibility_state(
+        connection, supported_versions=frozenset({12})
+    )
+    if not bool(state["compatible"]):
+        raise SchemaMigrationError("v13 migration requires complete schema v12")
+
+    scheduler_sql = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='scheduler_runs'"
+    ).fetchone()
+    if scheduler_sql is None or scheduler_sql[0] is None:
+        raise SchemaMigrationError("v13 migration is missing scheduler_runs")
+    if _normalized_schema_sql(str(scheduler_sql[0])) != _normalized_schema_sql(
+        _V12_SCHEDULER_RUNS_SQL
+    ):
+        raise SchemaMigrationError("v13 migration source scheduler_runs drifted")
+
+    residue = {
+        str(row["name"])
+        for row in connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE name IN (
+                'scheduler_runs_v12_legacy',
+                'scheduler_run_attempts',
+                'uq_scheduler_run_attempts_active',
+                'trg_scheduler_run_attempts_terminal_update',
+                'trg_scheduler_run_attempts_no_delete'
+            )
+            """
+        ).fetchall()
+    }
+    if residue:
+        raise SchemaMigrationError(
+            f"v13 scheduler objects already exist before migration: {sorted(residue)}"
+        )
+
+    run_columns = _table_columns(connection, "scheduler_runs")
+    expected_run_columns = [
+        "id",
+        "job_id",
+        "scheduled_for",
+        "status",
+        "started_at",
+        "completed_at",
+        "details_json",
+    ]
+    if run_columns != expected_run_columns:
+        raise SchemaMigrationError(
+            f"v13 scheduler source columns drifted: {run_columns}"
+        )
+    run_count = int(connection.execute("SELECT COUNT(*) FROM scheduler_runs").fetchone()[0])
+    run_hash = _table_projection_sha256(
+        connection, "scheduler_runs", run_columns
+    )
+
+    statements = _schema_statements()
+    scheduler_run_statement = [
+        statement
+        for statement in statements
+        if statement.startswith("CREATE TABLE IF NOT EXISTS scheduler_runs ")
+    ]
+    attempt_statements = [
+        statement
+        for statement in statements
+        if statement.startswith("CREATE TABLE IF NOT EXISTS scheduler_run_attempts ")
+        or statement.startswith(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_scheduler_run_attempts_active"
+        )
+        or statement.startswith(
+            "CREATE TRIGGER IF NOT EXISTS trg_scheduler_run_attempts_terminal_update"
+        )
+        or statement.startswith(
+            "CREATE TRIGGER IF NOT EXISTS trg_scheduler_run_attempts_no_delete"
+        )
+    ]
+    if len(scheduler_run_statement) != 1 or len(attempt_statements) != 4:
+        raise SchemaMigrationError("v13 scheduler schema template is incomplete")
+
+    applied_at = now_utc()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            "ALTER TABLE scheduler_runs RENAME TO scheduler_runs_v12_legacy"
+        )
+        connection.execute(scheduler_run_statement[0])
+        columns_sql = ",".join(f'"{column}"' for column in run_columns)
+        connection.execute(
+            f"INSERT INTO scheduler_runs({columns_sql}) "
+            f"SELECT {columns_sql} FROM scheduler_runs_v12_legacy"
+        )
+        connection.execute("DROP TABLE scheduler_runs_v12_legacy")
+        _migration_checkpoint("v13_scheduler_runs_rebuilt")
+
+        for statement in attempt_statements:
+            connection.execute(statement)
+        connection.execute(
+            """
+            INSERT INTO scheduler_run_attempts(
+                scheduler_run_id,attempt_number,invocation_source,status,
+                started_at,completed_at,details_json
+            )
+            SELECT id,1,'legacy_migration',status,started_at,completed_at,details_json
+            FROM scheduler_runs
+            ORDER BY id
+            """
+        )
+        _migration_checkpoint("v13_scheduler_attempts_backfilled")
+
+        if int(connection.execute("SELECT COUNT(*) FROM scheduler_runs").fetchone()[0]) != run_count:
+            raise SchemaMigrationError("v13 migration changed scheduler run count")
+        if (
+            _table_projection_sha256(connection, "scheduler_runs", run_columns)
+            != run_hash
+        ):
+            raise SchemaMigrationError("v13 migration changed scheduler run projection")
+        attempt_count = int(
+            connection.execute("SELECT COUNT(*) FROM scheduler_run_attempts").fetchone()[0]
+        )
+        if attempt_count != run_count:
+            raise SchemaMigrationError(
+                "v13 scheduler attempt baseline count changed: "
+                f"runs={run_count},attempts={attempt_count}"
+            )
+        mismatches = int(
+            connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM scheduler_runs r
+                JOIN scheduler_run_attempts a ON a.scheduler_run_id=r.id
+                WHERE a.attempt_number!=1
+                   OR a.invocation_source!='legacy_migration'
+                   OR a.status IS NOT r.status
+                   OR a.started_at IS NOT r.started_at
+                   OR a.completed_at IS NOT r.completed_at
+                   OR a.details_json IS NOT r.details_json
+                """
+            ).fetchone()[0]
+        )
+        if mismatches:
+            raise SchemaMigrationError(
+                f"v13 scheduler attempt baseline differs from {mismatches} runs"
+            )
+        violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise SchemaMigrationError(
+                f"v13 foreign-key violations before commit: {len(violations)}"
+            )
+        connection.execute(
+            """
+            INSERT INTO schema_migrations(version,name,applied_at)
+            VALUES (13,'scheduler-run-attempt-history',?)
+            """,
+            (applied_at,),
+        )
+        connection.execute("PRAGMA user_version=13")
+        _migration_checkpoint("v13_scheduler_schema_stamped")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        raise SchemaMigrationError("v13 foreign-key check failed after commit")
+    quick = str(connection.execute("PRAGMA quick_check").fetchone()[0])
+    if quick != "ok":
+        raise SchemaMigrationError(f"v13 quick check failed: {quick}")
+    integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
+    if integrity != "ok":
+        raise SchemaMigrationError(f"v13 integrity check failed: {integrity}")
+
+
+def _validate_v13_structure(connection: sqlite3.Connection) -> None:
+    expected_run_columns = [
+        "id",
+        "job_id",
+        "scheduled_for",
+        "status",
+        "started_at",
+        "completed_at",
+        "details_json",
+    ]
+    if _table_columns(connection, "scheduler_runs") != expected_run_columns:
+        raise SchemaMigrationError("schema v13 scheduler_runs columns drifted")
+    expected_attempt_columns = [
+        "id",
+        "scheduler_run_id",
+        "attempt_number",
+        "invocation_source",
+        "status",
+        "started_at",
+        "completed_at",
+        "details_json",
+    ]
+    if _table_columns(connection, "scheduler_run_attempts") != expected_attempt_columns:
+        raise SchemaMigrationError("schema v13 scheduler attempt columns drifted")
+
+    object_specs = (
+        (
+            "table",
+            "scheduler_runs",
+            "CREATE TABLE IF NOT EXISTS scheduler_runs ",
+        ),
+        (
+            "table",
+            "scheduler_run_attempts",
+            "CREATE TABLE IF NOT EXISTS scheduler_run_attempts ",
+        ),
+        (
+            "index",
+            "uq_scheduler_run_attempts_active",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_scheduler_run_attempts_active",
+        ),
+        (
+            "trigger",
+            "trg_scheduler_run_attempts_terminal_update",
+            "CREATE TRIGGER IF NOT EXISTS trg_scheduler_run_attempts_terminal_update",
+        ),
+        (
+            "trigger",
+            "trg_scheduler_run_attempts_no_delete",
+            "CREATE TRIGGER IF NOT EXISTS trg_scheduler_run_attempts_no_delete",
+        ),
+    )
+    for object_type, name, prefix in object_specs:
+        _require_exact_schema_object(
+            connection,
+            object_type=object_type,
+            name=name,
+            prefix=prefix,
+        )
+
+    run_unique_indexes = [
+        str(row["name"])
+        for row in connection.execute("PRAGMA index_list(scheduler_runs)").fetchall()
+        if int(row["unique"]) == 1
+        and [
+            str(column["name"])
+            for column in connection.execute(
+                f"PRAGMA index_info('{str(row['name'])}')"
+            ).fetchall()
+        ]
+        == ["job_id", "scheduled_for"]
+    ]
+    if len(run_unique_indexes) != 1:
+        raise SchemaMigrationError("schema v13 occurrence uniqueness drifted")
+    attempt_unique_indexes = [
+        str(row["name"])
+        for row in connection.execute(
+            "PRAGMA index_list(scheduler_run_attempts)"
+        ).fetchall()
+        if int(row["unique"]) == 1
+        and [
+            str(column["name"])
+            for column in connection.execute(
+                f"PRAGMA index_info('{str(row['name'])}')"
+            ).fetchall()
+        ]
+        == ["scheduler_run_id", "attempt_number"]
+    ]
+    if len(attempt_unique_indexes) != 1:
+        raise SchemaMigrationError("schema v13 attempt uniqueness drifted")
+    foreign_keys = connection.execute(
+        "PRAGMA foreign_key_list(scheduler_run_attempts)"
+    ).fetchall()
+    if len(foreign_keys) != 1:
+        raise SchemaMigrationError("schema v13 scheduler attempt FK drifted")
+    foreign_key = foreign_keys[0]
+    if (
+        str(foreign_key["table"]) != "scheduler_runs"
+        or str(foreign_key["from"]) != "scheduler_run_id"
+        or str(foreign_key["to"]) != "id"
+        or str(foreign_key["on_delete"]).upper() != "RESTRICT"
+    ):
+        raise SchemaMigrationError("schema v13 scheduler attempt FK drifted")
+
+
+def _validate_v13(connection: sqlite3.Connection) -> None:
+    _validate_v13_structure(connection)
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        raise SchemaMigrationError("schema v13 has foreign-key violations")
+
+
+_V14_NEW_TABLES = (
+    "spu_catalog",
+    "spu_alias",
+    "audience_dim",
+    "scene_dim",
+    "spu_audience_map",
+    "audience_scene_map",
+    "content_spu_links",
+    "content_scene_links",
+    "content_audience_links",
+    "spu_association_runs",
+)
+
+_V14_NEW_INDEXES = (
+    ("uq_spu_catalog_series_node", "CREATE UNIQUE INDEX IF NOT EXISTS uq_spu_catalog_series_node"),
+    ("uq_spu_audience_primary", "CREATE UNIQUE INDEX IF NOT EXISTS uq_spu_audience_primary"),
+    ("idx_content_spu_links_content", "CREATE INDEX IF NOT EXISTS idx_content_spu_links_content"),
+    ("idx_content_spu_links_spu", "CREATE INDEX IF NOT EXISTS idx_content_spu_links_spu"),
+    ("idx_content_scene_links_content", "CREATE INDEX IF NOT EXISTS idx_content_scene_links_content"),
+    ("idx_content_audience_links_content", "CREATE INDEX IF NOT EXISTS idx_content_audience_links_content"),
+)
+
+
+def _migrate_v13_to_v14(connection: sqlite3.Connection) -> None:
+    """新增 SPU×人群×用车场景 关联域（纯增量建表，不改动既有表）。
+
+    设计基线见 `docs/SPU人群场景关联与统计方案_v0.1.md`。维度种子由
+    `spu_audience.ensure_assets` 幂等补齐，迁移本身只负责结构。
+    """
+
+    if connection.in_transaction:
+        raise SchemaMigrationError("v14 migration requires no active transaction")
+    if int(connection.execute("PRAGMA foreign_keys").fetchone()[0]) != 1:
+        raise SchemaMigrationError("v14 migration requires PRAGMA foreign_keys=ON")
+    state = schema_compatibility_state(
+        connection, supported_versions=frozenset({13})
+    )
+    if not bool(state["compatible"]):
+        raise SchemaMigrationError("v14 migration requires complete schema v13")
+    residue = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table','index')"
+        )
+    } & set(_V14_NEW_TABLES)
+    if residue:
+        raise SchemaMigrationError(
+            f"v14 migration found leftover objects: {sorted(residue)}"
+        )
+    captured_at = now_utc()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        for table in _V14_NEW_TABLES:
+            statement = _schema_table_statement(table, {})
+            connection.execute(statement)
+        for name, prefix in _V14_NEW_INDEXES:
+            connection.execute(
+                _schema_object_sql(object_type="index", name=name, prefix=prefix)
+            )
+        from .spu_audience import ensure_assets  # 函数级导入避免循环依赖
+
+        ensure_assets(connection)
+        connection.execute(
+            """
+            INSERT INTO schema_migrations(version,name,applied_at)
+            VALUES (14,'spu-audience-scene-domain',?)
+            """,
+            (captured_at,),
+        )
+        connection.execute("PRAGMA user_version=14")
+        violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise SchemaMigrationError(
+                f"v14 foreign-key violations before commit: {len(violations)}"
+            )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
+    if integrity != "ok":
+        raise SchemaMigrationError(f"v14 integrity check failed: {integrity}")
+
+
+#: v14 时代的 content_audience_links 定义（v15 重建该表扩充 source 取值并加
+#: evidence_json）。v14 库在升级前用这份冻结定义校验，升级后按 SCHEMA_SQL 现行
+#: 模板校验，两者其一匹配即可——其余对象仍然严格对齐现行模板。
+_V14_CONTENT_AUDIENCE_LINKS_SQL = """
+CREATE TABLE content_audience_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
+    audience_code TEXT NOT NULL REFERENCES audience_dim(code) ON DELETE RESTRICT,
+    source TEXT NOT NULL CHECK(source IN ('content_explicit','rule_prior')),
+    conflict_flag INTEGER NOT NULL DEFAULT 0 CHECK(conflict_flag IN (0,1)),
+    consistency_flag INTEGER NOT NULL DEFAULT 0 CHECK(consistency_flag IN (0,1)),
+    rule_version TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    invalidated_at TEXT
+)
+""".strip()
+
+
+def _validate_v14_structure(connection: sqlite3.Connection) -> None:
+    for table in _V14_NEW_TABLES:
+        expected = _schema_object_sql(
+            object_type="table",
+            name=table,
+            prefix=f"CREATE TABLE IF NOT EXISTS {table} ",
+        )
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+        if row is None or row[0] is None:
+            raise SchemaMigrationError(f"schema v14 is missing {table}")
+        actual = _normalized_schema_sql(str(row[0]))
+        allowed = {_normalized_schema_sql(expected)}
+        if table == "content_audience_links":
+            allowed.add(_normalized_schema_sql(_V14_CONTENT_AUDIENCE_LINKS_SQL))
+        if actual not in allowed:
+            raise SchemaMigrationError(f"schema v14 object definition drifted: {table}")
+    for name, prefix in _V14_NEW_INDEXES:
+        expected = _schema_object_sql(object_type="index", name=name, prefix=prefix)
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+            (name,),
+        ).fetchone()
+        if row is None or row[0] is None:
+            raise SchemaMigrationError(f"schema v14 is missing {name}")
+        if _normalized_schema_sql(str(row[0])) != _normalized_schema_sql(expected):
+            raise SchemaMigrationError(f"schema v14 object definition drifted: {name}")
+
+
+def _validate_v14(connection: sqlite3.Connection) -> None:
+    _validate_v14_structure(connection)
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        raise SchemaMigrationError("schema v14 has foreign-key violations")
+
+
+_V15_NEW_TABLES = ("llm_judgements",)
+
+_V15_NEW_INDEXES = (
+    (
+        "uq_llm_judgements_key",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_llm_judgements_key",
+    ),
+)
+
+_V15_AUDIENCE_COPY_COLUMNS = (
+    "id",
+    "content_id",
+    "audience_code",
+    "source",
+    "conflict_flag",
+    "consistency_flag",
+    "rule_version",
+    "created_at",
+    "invalidated_at",
+)
+
+
+def _migrate_v14_to_v15(connection: sqlite3.Connection) -> None:
+    """SPU 关联域接入 LLM 辅助（B 链，无人工复核版）。
+
+    - 重建 ``content_audience_links``：source 允许 'llm'，新增 evidence_json
+      （既有行取默认 '{}'，数据逐列拷贝并做 count+hash 对账）；
+    - 新增 ``llm_judgements`` 判定缓存表：content+文本哈希幂等，规则重算后
+      重放已验收判定，不重复调用大模型付费。
+    """
+
+    if connection.in_transaction:
+        raise SchemaMigrationError("v15 migration requires no active transaction")
+    if int(connection.execute("PRAGMA foreign_keys").fetchone()[0]) != 1:
+        raise SchemaMigrationError("v15 migration requires PRAGMA foreign_keys=ON")
+    state = schema_compatibility_state(
+        connection, supported_versions=frozenset({14})
+    )
+    if not bool(state["compatible"]):
+        raise SchemaMigrationError("v15 migration requires complete schema v14")
+    residue = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table','index')"
+        )
+    } & (set(_V15_NEW_TABLES) | {"content_audience_links_v14_old"})
+    if residue:
+        raise SchemaMigrationError(
+            f"v15 migration found leftover objects: {sorted(residue)}"
+        )
+    copy_columns = list(_V15_AUDIENCE_COPY_COLUMNS)
+    old_count = int(
+        connection.execute("SELECT COUNT(*) FROM content_audience_links").fetchone()[0]
+    )
+    old_hash = _table_projection_sha256(
+        connection, "content_audience_links", copy_columns
+    )
+    captured_at = now_utc()
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        # 顺序保证最终表/索引的 sqlite_master DDL 与 SCHEMA_SQL 模板逐字一致
+        # （若反过来"建新表再 RENAME"，SQLite 会把表名改写成带引号形式，
+        # 过不了 _validate_v15_structure 的逐字校验——真库拷贝实测踩过）。
+        connection.execute(
+            "ALTER TABLE content_audience_links RENAME TO content_audience_links_v14_old"
+        )
+        connection.execute(_schema_table_statement("content_audience_links", {}))
+        names = ",".join(copy_columns)
+        connection.execute(
+            f"INSERT INTO content_audience_links({names}) "
+            f"SELECT {names} FROM content_audience_links_v14_old"
+        )
+        connection.execute("DROP TABLE content_audience_links_v14_old")
+        connection.execute(
+            _schema_object_sql(
+                object_type="index",
+                name="idx_content_audience_links_content",
+                prefix="CREATE INDEX IF NOT EXISTS idx_content_audience_links_content",
+            )
+        )
+        for table in _V15_NEW_TABLES:
+            connection.execute(_schema_table_statement(table, {}))
+        for name, prefix in _V15_NEW_INDEXES:
+            connection.execute(
+                _schema_object_sql(object_type="index", name=name, prefix=prefix)
+            )
+        connection.execute(
+            """
+            INSERT INTO schema_migrations(version,name,applied_at)
+            VALUES (15,'spu-llm-assist',?)
+            """,
+            (captured_at,),
+        )
+        connection.execute("PRAGMA user_version=15")
+        new_count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM content_audience_links"
+            ).fetchone()[0]
+        )
+        new_hash = _table_projection_sha256(
+            connection, "content_audience_links", copy_columns
+        )
+        if new_count != old_count or new_hash != old_hash:
+            raise SchemaMigrationError(
+                "v15 content_audience_links rebuild lost or altered rows: "
+                f"count {old_count}->{new_count}"
+            )
+        violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise SchemaMigrationError(
+                f"v15 foreign-key violations before commit: {len(violations)}"
+            )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        connection.execute("PRAGMA foreign_keys=ON")
+        raise
+    connection.execute("PRAGMA foreign_keys=ON")
+    integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
+    if integrity != "ok":
+        raise SchemaMigrationError(f"v15 integrity check failed: {integrity}")
+
+
+def _validate_v15_structure(connection: sqlite3.Connection) -> None:
+    for table in ("content_audience_links",) + _V15_NEW_TABLES:
+        expected = _schema_object_sql(
+            object_type="table",
+            name=table,
+            prefix=f"CREATE TABLE IF NOT EXISTS {table} ",
+        )
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+        if row is None or row[0] is None:
+            raise SchemaMigrationError(f"schema v15 is missing {table}")
+        if _normalized_schema_sql(str(row[0])) != _normalized_schema_sql(expected):
+            raise SchemaMigrationError(f"schema v15 object definition drifted: {table}")
+    for name, prefix in _V15_NEW_INDEXES:
+        expected = _schema_object_sql(object_type="index", name=name, prefix=prefix)
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+            (name,),
+        ).fetchone()
+        if row is None or row[0] is None:
+            raise SchemaMigrationError(f"schema v15 is missing {name}")
+        if _normalized_schema_sql(str(row[0])) != _normalized_schema_sql(expected):
+            raise SchemaMigrationError(f"schema v15 object definition drifted: {name}")
+
+
+def _validate_v15(connection: sqlite3.Connection) -> None:
+    _validate_v15_structure(connection)
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        raise SchemaMigrationError("schema v15 has foreign-key violations")
+
+
 def initialize_database(connection: sqlite3.Connection) -> None:
+    if int(connection.execute("PRAGMA recursive_triggers").fetchone()[0]) != 1:
+        raise SchemaMigrationError(
+            "database initialization requires PRAGMA recursive_triggers=ON"
+        )
     tables = _table_names(connection)
     if not tables:
         _create_fresh_schema(connection)
         _validate_v9(connection)
         _validate_v10(connection)
         _validate_v11(connection)
+        _validate_v12(connection)
+        _validate_v13(connection)
+        _validate_v14(connection)
+        _validate_v15(connection)
+        require_schema_compatibility(
+            connection, supported_versions=frozenset({SCHEMA_VERSION})
+        )
         return
     if "schema_migrations" not in tables:
         raise SchemaMigrationError("database has tables but no schema_migrations")
     row = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
     version = int(row[0]) if row is not None and row[0] is not None else 0
+    pragma_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    if pragma_version != version:
+        raise SchemaMigrationError(
+            "schema manifest and PRAGMA user_version disagree: "
+            f"manifest={version},pragma={pragma_version}"
+        )
     if version == 8:
         _migrate_v8_to_v9(connection)
         version = 9
@@ -1846,8 +3314,27 @@ def initialize_database(connection: sqlite3.Connection) -> None:
     if version == 10:
         _migrate_v10_to_v11(connection)
         version = 11
+    if version == 11:
+        _migrate_v11_to_v12(connection)
+        version = 12
+    if version == 12:
+        _migrate_v12_to_v13(connection)
+        version = 13
+    if version == 13:
+        _migrate_v13_to_v14(connection)
+        version = 14
+    if version == 14:
+        _migrate_v14_to_v15(connection)
+        version = 15
     if version != SCHEMA_VERSION:
         raise SchemaMigrationError(f"unsupported schema version: {version}")
     _validate_v9(connection)
     _validate_v10(connection)
     _validate_v11(connection)
+    _validate_v12(connection)
+    _validate_v13(connection)
+    _validate_v14(connection)
+    _validate_v15(connection)
+    require_schema_compatibility(
+        connection, supported_versions=frozenset({SCHEMA_VERSION})
+    )

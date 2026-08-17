@@ -37,6 +37,29 @@ ARTIFACT_POLICY = {
 DATABASE_NAMES = frozenset({"dcar_insight.sqlite3", "web_mvp.sqlite3"})
 SNAPSHOT_ID_RE = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
+RUNTIME_IDENTITY_SCHEMA = "dcar-runtime-identity-v1"
+EXPECTED_REPORT_VERSION = "dcar-content-operations-report-v8.6"
+EXPECTED_DATABASE_SCHEMA_VERSION = 13
+EXPECTED_DATABASE_SCHEMA_MIGRATION = "scheduler-run-attempt-history"
+EXPECTED_ACTIVE_RELEASE_ID = "evaluation-v9__selling-points-v5.2"
+EXPECTED_ACTIVE_RELEASE_STATUS = "active"
+EXPECTED_RULE_VERSION = "evaluation-v9"
+EXPECTED_TAXONOMY_VERSION = "selling-points-v5.2"
+EXPECTED_TAXONOMY_STATUS = "published"
+RUNTIME_IDENTITY_KEYS = frozenset(
+    {
+        "schema",
+        "report_version",
+        "database_schema_version",
+        "database_schema_migration",
+        "active_release_id",
+        "active_release_status",
+        "rule_version",
+        "taxonomy_version",
+        "taxonomy_status",
+        "matcher_rule_sha256",
+    }
+)
 ServiceAction = Callable[[str], None]
 SmokeCheck = Callable[[], None]
 
@@ -85,6 +108,90 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _validate_runtime_identity(
+    value: object, *, label: str
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != RUNTIME_IDENTITY_KEYS:
+        raise SnapshotInstallError(f"{label} runtime identity has an invalid shape")
+    expected = {
+        "schema": RUNTIME_IDENTITY_SCHEMA,
+        "report_version": EXPECTED_REPORT_VERSION,
+        "database_schema_version": EXPECTED_DATABASE_SCHEMA_VERSION,
+        "database_schema_migration": EXPECTED_DATABASE_SCHEMA_MIGRATION,
+        "active_release_id": EXPECTED_ACTIVE_RELEASE_ID,
+        "active_release_status": EXPECTED_ACTIVE_RELEASE_STATUS,
+        "rule_version": EXPECTED_RULE_VERSION,
+        "taxonomy_version": EXPECTED_TAXONOMY_VERSION,
+        "taxonomy_status": EXPECTED_TAXONOMY_STATUS,
+    }
+    for key, expected_value in expected.items():
+        if value.get(key) != expected_value:
+            raise SnapshotInstallError(
+                f"{label} runtime identity mismatch for {key}: "
+                f"{value.get(key)!r}, expected {expected_value!r}"
+            )
+    matcher_sha = value.get("matcher_rule_sha256")
+    if not isinstance(matcher_sha, str) or SHA256_RE.fullmatch(matcher_sha) is None:
+        raise SnapshotInstallError(
+            f"{label} runtime identity has an invalid matcher_rule_sha256"
+        )
+    return dict(value)
+
+
+def _database_runtime_identity(path: Path) -> dict[str, Any]:
+    connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        migration_rows = connection.execute(
+            "SELECT name FROM schema_migrations WHERE version=?", (user_version,)
+        ).fetchall()
+        max_migration = connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0]
+        release_rows = connection.execute(
+            """
+            SELECT er.id,er.rule_version,er.taxonomy_version,
+                   er.matcher_rule_sha256,er.status release_status,
+                   tv.status taxonomy_status
+            FROM evaluation_releases er
+            JOIN taxonomy_versions tv ON tv.version=er.taxonomy_version
+            WHERE er.status='active'
+            ORDER BY er.id
+            """
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise SnapshotInstallError(
+            "snapshot database lacks the required runtime identity tables"
+        ) from exc
+    finally:
+        connection.close()
+    if len(migration_rows) != 1 or max_migration != user_version:
+        raise SnapshotInstallError(
+            "snapshot database has an ambiguous schema migration identity"
+        )
+    if len(release_rows) != 1:
+        raise SnapshotInstallError(
+            "snapshot database must have exactly one active evaluation release"
+        )
+    release = release_rows[0]
+    return _validate_runtime_identity(
+        {
+            "schema": RUNTIME_IDENTITY_SCHEMA,
+            "report_version": EXPECTED_REPORT_VERSION,
+            "database_schema_version": user_version,
+            "database_schema_migration": str(migration_rows[0]["name"]),
+            "active_release_id": str(release["id"]),
+            "active_release_status": str(release["release_status"]),
+            "rule_version": str(release["rule_version"]),
+            "taxonomy_version": str(release["taxonomy_version"]),
+            "taxonomy_status": str(release["taxonomy_status"]),
+            "matcher_rule_sha256": str(release["matcher_rule_sha256"]),
+        },
+        label="snapshot database",
+    )
 
 
 def _fsync_file(path: Path) -> None:
@@ -279,6 +386,9 @@ def verify_bundle(
 ) -> dict[str, Any]:
     bundle = bundle.resolve()
     manifest = _read_manifest(bundle)
+    expected_runtime_identity = _validate_runtime_identity(
+        manifest.get("runtime_identity"), label="snapshot manifest"
+    )
     if manifest.get("artifact_policy") != ARTIFACT_POLICY:
         raise SnapshotInstallError("snapshot artifact policy is missing or unsupported")
     raw_databases = manifest.get("databases")
@@ -319,6 +429,12 @@ def verify_bundle(
             != validation["foreign_key_violations"]
         ):
             raise SnapshotInstallError(f"database validation manifest drifted: {name}")
+        if name == "dcar_insight.sqlite3":
+            database_runtime_identity = _database_runtime_identity(source)
+            if database_runtime_identity != expected_runtime_identity:
+                raise SnapshotInstallError(
+                    "snapshot database runtime identity does not match the manifest"
+                )
     if "dcar_insight.sqlite3" not in seen_names:
         raise SnapshotInstallError("snapshot omits dcar_insight.sqlite3")
     raw_files = manifest.get("files")
@@ -467,6 +583,13 @@ def _default_smoke_check(
     config: InstallConfig, manifest: Optional[Mapping[str, Any]] = None
 ) -> SmokeCheck:
     expected_freshness = manifest.get("freshness", {}) if manifest else {}
+    expected_runtime_identity = (
+        _validate_runtime_identity(
+            manifest.get("runtime_identity"), label="snapshot manifest"
+        )
+        if manifest
+        else None
+    )
     expected_main = (
         next(
             (
@@ -543,6 +666,13 @@ def _default_smoke_check(
                     ) != expected_freshness.get("latest_published_at"):
                         raise SnapshotInstallError(
                             "replica freshness is not the staged snapshot"
+                        )
+                    if (
+                        database_state.get("runtime_identity")
+                        != expected_runtime_identity
+                    ):
+                        raise SnapshotInstallError(
+                            "replica runtime identity is not the staged snapshot"
                         )
                 return
             except Exception as exc:  # retry during a bounded service startup window
@@ -942,6 +1072,7 @@ def install_bundle(
             "database_sha256": {
                 str(item["name"]): str(item["sha256"]) for item in manifest["databases"]
             },
+            "runtime_identity": manifest["runtime_identity"],
             "previous_databases": old_names,
             "artifact_changes": len(artifact_changes),
             "artifact_policy": manifest["artifact_policy"],

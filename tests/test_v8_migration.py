@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
 from v8.migration import _encode_link_material, migrate
-from v8.storage import initialize_database
+from v8.storage import connect, initialize_database
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BASELINE = json.loads(
@@ -21,8 +20,7 @@ class V8MigrationTest(unittest.TestCase):
         cls.temporary = tempfile.TemporaryDirectory()
         cls.database = Path(cls.temporary.name) / "migrated.sqlite3"
         migrate(target_db=cls.database)
-        cls.connection = sqlite3.connect(cls.database)
-        cls.connection.row_factory = sqlite3.Row
+        cls.connection = connect(cls.database)
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -192,6 +190,8 @@ class V8MigrationTest(unittest.TestCase):
             table: self.scalar(f"SELECT COUNT(*) FROM {table}")
             for table in (
                 "content_items",
+                "content_metric_snapshots",
+                "content_metric_observations",
                 "fetch_slots",
                 "evaluation_versions",
                 "review_queue",
@@ -203,6 +203,23 @@ class V8MigrationTest(unittest.TestCase):
         }
         self.assertEqual(before, after)
         self.assertEqual(summary["content_items"], BASELINE["content"]["total"])
+        self.assertEqual(
+            self.scalar("SELECT COUNT(*) FROM content_metric_observations"),
+            self.scalar("SELECT COUNT(*) FROM content_metric_snapshots"),
+        )
+        self.assertEqual(
+            self.scalar(
+                """
+                SELECT COUNT(*)
+                FROM content_metric_snapshots ms
+                LEFT JOIN content_metric_observations mo
+                  ON mo.legacy_snapshot_id=ms.id
+                 AND mo.observation_origin='legacy_snapshot_baseline'
+                WHERE mo.id IS NULL
+                """
+            ),
+            0,
+        )
         self.assertEqual(
             self.connection.execute("PRAGMA foreign_key_check").fetchall(), []
         )

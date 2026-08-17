@@ -43,7 +43,8 @@ def duplicate_metric_decision(
     total: int,
     fingerprint_count: int,
     calibration_ready: bool,
-    threshold: float = 95,
+    *,
+    threshold: float,
 ) -> tuple[str, Optional[float], str]:
     """Decide whether duplicate rate is publishable from explicit prerequisites."""
 

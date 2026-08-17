@@ -69,6 +69,13 @@ class LocalAnalysisCanaryControllerTest(unittest.TestCase):
         self.analysis_root = self.root / "analysis"
         self.step3_root.mkdir()
         self.analysis_root.mkdir()
+        self.global_claim_patch = patch.object(
+            canary,
+            "_global_claim_path",
+            return_value=self.analysis_root / "global.claim",
+        )
+        self.global_claim_patch.start()
+        self.addCleanup(self.global_claim_patch.stop)
         self.source_db = self.step3_root / "step3-final.sqlite3"
         self.step3_run = self.step3_root / "run"
         self.step3_batches = self.step3_run / "batches"
@@ -910,8 +917,15 @@ class LocalAnalysisCanaryControllerTest(unittest.TestCase):
         self.calls["evaluation"] += 1
         captured_at = now_utc()
         with closing(connect(db_path)) as connection:
+            releases = connection.execute(
+                "SELECT * FROM evaluation_releases WHERE status='active' ORDER BY id"
+            ).fetchall()
+            self.assertEqual(len(releases), 1)
+            release = releases[0]
             artifacts, components, evidence_sha = evaluation._current_evidence_state(
-                connection, content_id
+                connection,
+                content_id,
+                rule_version=str(release["rule_version"]),
             )
             content = connection.execute(
                 "SELECT * FROM content_items WHERE id=?", (content_id,)
@@ -955,15 +969,15 @@ class LocalAnalysisCanaryControllerTest(unittest.TestCase):
                 "acquisition_potential": None,
                 "matches": [],
                 "evaluation_source": "automatic",
-                "release_id": "canary-release",
+                "release_id": str(release["id"]),
             }
             existing = connection.execute(
                 """
                 SELECT * FROM evaluation_versions
-                WHERE content_id=? AND release_id='canary-release'
+                WHERE content_id=? AND release_id=?
                   AND evidence_sha256=? AND evaluation_source='automatic'
                 """,
-                (content_id, evidence_sha),
+                (content_id, release["id"], evidence_sha),
             ).fetchone()
             if existing is not None:
                 evaluation_id = int(existing["id"])
@@ -1007,13 +1021,16 @@ class LocalAnalysisCanaryControllerTest(unittest.TestCase):
                         evaluation_source,evaluation_status,evidence_level,
                         content_direction,selling_point_included,pending_review,
                         payload_json,evaluated_at
-                    ) VALUES (?,?,'canary-release','evaluation-v8','canary-v1',?,?,'automatic',
+                    ) VALUES (?,?,?,?,?,?,?,'automatic',
                               'evaluated',?,'media',0,?,?,?)
                     """,
                     (
                         content_id,
                         envelope_id,
-                        "a" * 64,
+                        release["id"],
+                        release["rule_version"],
+                        release["taxonomy_version"],
+                        release["matcher_rule_sha256"],
                         evidence_sha,
                         evidence_level,
                         pending_review,
@@ -1214,6 +1231,32 @@ class LocalAnalysisCanaryControllerTest(unittest.TestCase):
         self.assertFalse(self.db.exists())
         self.assertFalse(self.media_root.exists())
         self.assertFalse(self.run_root.exists())
+
+    def test_active_v9_canary_uses_v9_evidence_without_manual_hash(self) -> None:
+        with closing(connect(self.source_db)) as connection:
+            connection.execute(
+                "UPDATE evaluation_releases SET rule_version='evaluation-v9' "
+                "WHERE id='canary-release'"
+            )
+            connection.commit()
+        self._finalize(self.source_db)
+        self._refresh_step3_proof()
+
+        result = self._run()
+
+        self.assertEqual(result["status"], "succeeded")
+        with closing(canary._immutable_connection(self.db)) as connection:
+            row = connection.execute(
+                """
+                SELECT ev.rule_version,ee.manual_evidence_sha256
+                FROM evaluation_versions ev
+                JOIN evidence_envelopes ee ON ee.id=ev.evidence_envelope_id
+                WHERE ev.content_id=1 AND ev.invalidated_at IS NULL
+                """
+            ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row["rule_version"], evaluation.V9_RULE_VERSION)
+            self.assertIsNone(row["manual_evidence_sha256"])
 
     def test_step3_batch_receipt_requires_real_v1_semantic_chain(self) -> None:
         intent_path = self.step3_batches / "batch-000001.intent.json"

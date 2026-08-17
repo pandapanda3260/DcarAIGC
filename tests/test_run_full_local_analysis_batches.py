@@ -113,13 +113,22 @@ class FullLocalAnalysisBatchesMilestoneTest(unittest.TestCase):
         db_path: Path,
         pending_content_ids: frozenset[int] = frozenset({2}),
     ):
-        pending_review = content_id in pending_content_ids
+        with closing(local._immutable_connection(db_path)) as connection:
+            release = connection.execute(
+                "SELECT * FROM evaluation_releases WHERE status='active'"
+            ).fetchone()
+        self.assertIsNotNone(release)
+        gray_candidate = content_id in pending_content_ids
+        pending_review = (
+            gray_candidate
+            and release["rule_version"] == evaluation.V8_RULE_VERSION
+        )
         result = self.fixture._fake_evaluation(
             content_id,
             db_path=db_path,
             pending_review=int(pending_review),
         )
-        if pending_review:
+        if gray_candidate:
             captured_at = "2026-08-11T00:00:00+00:00"
             connection = sqlite3.connect(db_path)
             connection.row_factory = sqlite3.Row
@@ -129,7 +138,11 @@ class FullLocalAnalysisBatchesMilestoneTest(unittest.TestCase):
                     (result.evaluation_id,),
                 ).fetchone()
                 artifacts, _components, _evidence_sha = (
-                    evaluation._current_evidence_state(connection, content_id)
+                    evaluation._current_evidence_state(
+                        connection,
+                        content_id,
+                        rule_version=str(evaluation_row["rule_version"]),
+                    )
                 )
                 content = connection.execute(
                     "SELECT * FROM content_items WHERE id=?",
@@ -177,7 +190,7 @@ class FullLocalAnalysisBatchesMilestoneTest(unittest.TestCase):
                         "primary_selling_point_id": "X10",
                         "selling_point_score": 72,
                         "selling_point_included": False,
-                        "pending_review": True,
+                        "pending_review": pending_review,
                         "content_direction": "media",
                         "content_automotive_score": content_score,
                         "audience_automotive_score": audience_score,
@@ -193,13 +206,14 @@ class FullLocalAnalysisBatchesMilestoneTest(unittest.TestCase):
                     SET primary_selling_point_code='X10',selling_point_score=72,
                         selling_point_included=0,content_direction='media',
                         content_automotive_score=?,audience_automotive_score=?,
-                        acquisition_potential_score=?,payload_json=?
+                        acquisition_potential_score=?,pending_review=?,payload_json=?
                     WHERE id=?
                     """,
                     (
                         content_score,
                         audience_score,
                         acquisition_score,
+                        int(pending_review),
                         json.dumps(
                             payload,
                             ensure_ascii=False,
@@ -226,20 +240,21 @@ class FullLocalAnalysisBatchesMilestoneTest(unittest.TestCase):
                         ),
                     ),
                 )
-                connection.execute(
-                    """
-                    INSERT INTO review_queue(
-                        content_id,evaluation_id,reason_code,priority,status,
-                        assigned_to,created_at,updated_at,resolved_at
-                    ) VALUES (?,?,'evaluation_gray_zone',50,'pending',NULL,?,?,NULL)
-                    """,
-                    (
-                        content_id,
-                        result.evaluation_id,
-                        captured_at,
-                        captured_at,
-                    ),
-                )
+                if pending_review:
+                    connection.execute(
+                        """
+                        INSERT INTO review_queue(
+                            content_id,evaluation_id,reason_code,priority,status,
+                            assigned_to,created_at,updated_at,resolved_at
+                        ) VALUES (?,?,'evaluation_gray_zone',50,'pending',NULL,?,?,NULL)
+                        """,
+                        (
+                            content_id,
+                            result.evaluation_id,
+                            captured_at,
+                            captured_at,
+                        ),
+                    )
                 connection.commit()
             finally:
                 connection.close()
@@ -350,8 +365,16 @@ class FullLocalAnalysisBatchesMilestoneTest(unittest.TestCase):
         connection = sqlite3.connect(db_path)
         connection.row_factory = sqlite3.Row
         try:
+            release = connection.execute(
+                "SELECT * FROM evaluation_releases WHERE status='active'"
+            ).fetchone()
+            self.assertIsNotNone(release)
             artifacts, _components, evidence_sha = (
-                evaluation._current_evidence_state(connection, content_id)
+                evaluation._current_evidence_state(
+                    connection,
+                    content_id,
+                    rule_version=str(release["rule_version"]),
+                )
             )
             content = connection.execute(
                 "SELECT * FROM content_items WHERE id=?", (content_id,)
@@ -386,6 +409,9 @@ class FullLocalAnalysisBatchesMilestoneTest(unittest.TestCase):
             acquisition_score = evaluation._acquisition_score(
                 None, audience_score, None, action_score
             )
+            pending_review = int(
+                release["rule_version"] == evaluation.V8_RULE_VERSION
+            )
             payload = {
                 "evaluation_status": "insufficient_evidence",
                 "evidence_level": evidence_level,
@@ -393,7 +419,7 @@ class FullLocalAnalysisBatchesMilestoneTest(unittest.TestCase):
                 "primary_selling_point_id": "",
                 "selling_point_score": None,
                 "selling_point_included": False,
-                "pending_review": True,
+                "pending_review": bool(pending_review),
                 "content_direction": "unknown",
                 "content_automotive_score": None,
                 "audience_automotive_score": audience_score,
@@ -402,7 +428,7 @@ class FullLocalAnalysisBatchesMilestoneTest(unittest.TestCase):
                 "acquisition_potential": acquisition_score,
                 "matches": [],
                 "evaluation_source": "automatic",
-                "release_id": "canary-release",
+                "release_id": str(release["id"]),
             }
             connection.execute(
                 "DELETE FROM evaluation_matches WHERE evaluation_id=?",
@@ -418,13 +444,14 @@ class FullLocalAnalysisBatchesMilestoneTest(unittest.TestCase):
                     primary_selling_point_code=NULL,selling_point_score=NULL,
                     selling_point_included=0,content_direction='unknown',
                     content_automotive_score=NULL,audience_automotive_score=?,
-                    acquisition_potential_score=?,pending_review=1,payload_json=?
+                    acquisition_potential_score=?,pending_review=?,payload_json=?
                 WHERE id=?
                 """,
                 (
                     evidence_level,
                     audience_score,
                     acquisition_score,
+                    pending_review,
                     json.dumps(
                         payload,
                         ensure_ascii=False,
@@ -478,6 +505,17 @@ class FullLocalAnalysisBatchesMilestoneTest(unittest.TestCase):
             connection.commit()
         finally:
             connection.close()
+        self.fixture._refresh_step3_proof()
+
+    def _activate_v9_source_release(self) -> None:
+        with closing(sqlite3.connect(self.source_db)) as connection:
+            connection.execute(
+                "UPDATE evaluation_releases SET rule_version=? "
+                "WHERE status='active'",
+                (evaluation.V9_RULE_VERSION,),
+            )
+            connection.commit()
+        self.fixture._finalize(self.source_db)
         self.fixture._refresh_step3_proof()
 
     def _make_source_non_https(self, content_id: int) -> None:
@@ -1274,6 +1312,87 @@ class FullLocalAnalysisBatchesMilestoneTest(unittest.TestCase):
         self.assertEqual(
             self.fixture._tree_state(self.analysis_root), stable_tree
         )
+
+    def test_v9_gray_evaluation_is_succeeded_without_review_queue(self) -> None:
+        self._activate_v9_source_release()
+        with self._pipeline_patches(), patch.object(
+            evaluation,
+            "evaluate_content",
+            side_effect=self._fake_review_pending_evaluation,
+        ):
+            result = batches.run_batches(**self._batch_arguments())
+
+        self.assertEqual(result["status"], "eligible_complete")
+        receipt = json.loads(
+            (self.run_root / "items/000002.receipt.json").read_text()
+        )
+        self.assertEqual(receipt["status"], "succeeded")
+        with closing(local._immutable_connection(self.db)) as connection:
+            row = connection.execute(
+                "SELECT rule_version,selling_point_score,pending_review "
+                "FROM evaluation_versions WHERE content_id=2"
+            ).fetchone()
+            queue_count = connection.execute(
+                "SELECT COUNT(*) FROM review_queue WHERE content_id=2"
+            ).fetchone()[0]
+        self.assertEqual(row["rule_version"], evaluation.V9_RULE_VERSION)
+        self.assertEqual(row["selling_point_score"], 72)
+        self.assertEqual(row["pending_review"], 0)
+        self.assertEqual(queue_count, 0)
+
+    def test_v9_insufficient_evidence_is_terminal_with_pending_zero(self) -> None:
+        self._clear_source_text(2)
+        self._activate_v9_source_release()
+
+        def media_effect(content_id: int, **kwargs):
+            if content_id == 2:
+                return self._fake_insufficient_media(content_id, **kwargs)
+            return self.fixture._fake_media(content_id, **kwargs)
+
+        def evaluation_effect(content_id: int, *, db_path: Path):
+            if content_id == 2:
+                return self._fake_insufficient_evaluation(
+                    content_id, db_path=db_path
+                )
+            return self.fixture._fake_evaluation(content_id, db_path=db_path)
+
+        def fingerprint_effect(content_id: int, *, db_path: Path):
+            self.assertNotEqual(content_id, 2)
+            return self.fixture._fake_fingerprint(content_id, db_path=db_path)
+
+        with self._pipeline_patches(media_side_effect=media_effect), patch.object(
+            evaluation, "evaluate_content", side_effect=evaluation_effect
+        ), patch.object(
+            duplicates, "fingerprint_content", side_effect=fingerprint_effect
+        ), patch.object(
+            evaluation,
+            "_load_release_runtime",
+            side_effect=self._fake_review_pending_runtime,
+        ):
+            result = batches.run_batches(**self._batch_arguments())
+
+        self.assertEqual(result["status"], "partial")
+        receipt = json.loads(
+            (self.run_root / "items/000002.receipt.json").read_text()
+        )
+        self.assertEqual(receipt["status"], "insufficient_evidence")
+        with closing(local._immutable_connection(self.db)) as connection:
+            row = connection.execute(
+                """
+                SELECT ev.rule_version,ev.pending_review,
+                       ee.manual_evidence_sha256
+                FROM evaluation_versions ev
+                JOIN evidence_envelopes ee ON ee.id=ev.evidence_envelope_id
+                WHERE ev.content_id=2
+                """
+            ).fetchone()
+            queue_count = connection.execute(
+                "SELECT COUNT(*) FROM review_queue WHERE content_id=2"
+            ).fetchone()[0]
+        self.assertEqual(row["rule_version"], evaluation.V9_RULE_VERSION)
+        self.assertEqual(row["pending_review"], 0)
+        self.assertIsNone(row["manual_evidence_sha256"])
+        self.assertEqual(queue_count, 0)
 
     def test_v0_insufficient_evidence_is_same_stable_terminal(self) -> None:
         self._clear_source_text(2)
@@ -6593,6 +6712,9 @@ class FullLocalAnalysisBatchesMilestoneTest(unittest.TestCase):
     Path("/private/tmp/dcar-step3-canary-v2.xVXN0Y/clone.sqlite3").is_file()
     and Path(
         "/private/tmp/dcar-step3-canary-v2.xVXN0Y/run/completion.json"
+    ).is_file()
+    and Path(
+        "/private/tmp/dcar-step3-canary-v2.xVXN0Y/run/run-contract.json"
     ).is_file(),
     "frozen real Step3 proof is not present",
 )

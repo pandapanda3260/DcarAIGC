@@ -44,23 +44,25 @@ import argparse
 import json
 import shutil
 import sqlite3
+import sys
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Sequence
 from zoneinfo import ZoneInfo
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PACKAGE_ROOT = PROJECT_ROOT / "src" / "dcar_eval"
+if str(PACKAGE_ROOT) not in sys.path:
+    sys.path.insert(0, str(PACKAGE_ROOT))
+
+from v8.storage import connect as storage_connect  # type: ignore[import-untyped]  # noqa: E402
+
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 NO_PARENT_MARKERS = ("", "0")
 
 
 def _connect(db_path: Path, *, read_only: bool) -> sqlite3.Connection:
-    if read_only:
-        connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    else:
-        connection = sqlite3.connect(db_path)
-    connection.row_factory = sqlite3.Row
-    return connection
+    return storage_connect(db_path, read_only=read_only)
 
 
 def _utc_text(value: datetime) -> str:

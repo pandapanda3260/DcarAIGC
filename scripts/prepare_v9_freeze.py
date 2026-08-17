@@ -23,7 +23,7 @@ PACKAGE_ROOT = PROJECT_ROOT / "src" / "dcar_eval"
 if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
-from v8.evaluation import _current_evidence_state  # noqa: E402
+from v8.evaluation import V8_RULE_VERSION, _current_evidence_state  # noqa: E402
 
 
 DEFAULT_DB = PROJECT_ROOT / "app" / "data" / "dcar_insight.sqlite3"
@@ -344,6 +344,23 @@ def _database_summary(connection: sqlite3.Connection) -> dict[str, Any]:
     return summary
 
 
+def _require_active_v8_release(
+    connection: sqlite3.Connection,
+) -> dict[str, Any]:
+    if "evaluation_releases" not in set(_table_names(connection)):
+        raise FreezeError(
+            "historical v9 freeze requires an active evaluation-v8 release"
+        )
+    releases = connection.execute(
+        "SELECT * FROM evaluation_releases WHERE status='active' ORDER BY id"
+    ).fetchall()
+    if len(releases) != 1 or str(releases[0]["rule_version"]) != V8_RULE_VERSION:
+        raise FreezeError(
+            "historical v9 freeze requires exactly one active evaluation-v8 release"
+        )
+    return dict(releases[0])
+
+
 def _write_content_evidence_inventory(
     connection: sqlite3.Connection, path: Path
 ) -> dict[str, Any]:
@@ -355,7 +372,7 @@ def _write_content_evidence_inventory(
     with path.open("w", encoding="utf-8") as handle:
         for content_id in content_ids:
             _, components, evidence_sha256 = _current_evidence_state(
-                connection, content_id
+                connection, content_id, rule_version=V8_RULE_VERSION
             )
             envelopes = {
                 str(row[0])
@@ -519,6 +536,7 @@ def create_freeze_bundle(
     source = _connect_read_only(database)
     try:
         before_changes = source.total_changes
+        active_release = _require_active_v8_release(source)
         started_at = _utc_now()
         before = _logical_snapshot(source)
         logical_sha = _snapshot_sha256(before)
@@ -563,6 +581,7 @@ def create_freeze_bundle(
             "logical_snapshot_sha256": logical_sha,
             "table_snapshot": before,
             "database_summary": _database_summary(source),
+            "active_evaluation_release": active_release,
             "content_evidence_inventory": {
                 "path": content_path.name,
                 **content_summary,

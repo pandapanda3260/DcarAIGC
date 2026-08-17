@@ -55,6 +55,7 @@ from .media import (
     recover_stale_media_processing_slots,
     store_media_source_manifest,
 )
+from .metric_observations import persist_metric_observation
 from .operations import (
     IdentityConflictError,
     reconcile_content_account_identity,
@@ -1177,19 +1178,38 @@ def _xhs_metrics(note: Mapping[str, Any]) -> Dict[str, Optional[int]]:
 
 
 def _derived_xhs_metrics_result(
-    metrics: Mapping[str, Any], source_raw_response_id: Optional[int]
+    metrics: Mapping[str, Any],
+    source_raw_response_id: Optional[int],
+    source_captured_at: str,
 ) -> ProviderResult:
-    normalized = dict(metrics)
+    normalized = {
+        **dict(metrics),
+        "_evidence_captured_at": source_captured_at,
+    }
     return ProviderResult(
         normalized,
         {
             "derived_from_operation": "xiaohongshu_note_detail",
             "source_raw_response_id": source_raw_response_id,
+            "source_captured_at": source_captured_at,
             "metrics": normalized,
         },
         200,
         False,
     )
+
+
+def _raw_response_captured_at(raw_response_id: int, *, db_path: Path) -> str:
+    with connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT captured_at FROM provider_raw_responses WHERE id=?",
+            (raw_response_id,),
+        ).fetchone()
+    if row is None:
+        raise ProviderConfigurationError(
+            f"原始供应商响应不存在：{raw_response_id}"
+        )
+    return str(row["captured_at"])
 
 
 def _sanitize_xhs_comments(
@@ -1642,8 +1662,19 @@ def _store_stage_result(
 ) -> None:
     data = outcome.data
     mutation_at = now_utc()
-    evidence_captured_at = str(data.get("_evidence_captured_at") or mutation_at)
     with connect(db_path) as connection, transaction(connection):
+        source_raw = connection.execute(
+            """
+            SELECT captured_at,local_path,sha256
+            FROM provider_raw_responses WHERE id=?
+            """,
+            (outcome.raw_response_id,),
+        ).fetchone()
+        if source_raw is None:
+            raise RuntimeError("stage raw response is missing")
+        evidence_captured_at = str(
+            data.get("_evidence_captured_at") or source_raw["captured_at"]
+        )
         if stage == "detail":
             previous_identity = connection.execute(
                 "SELECT platform,raw_account_uid FROM content_items WHERE id=?",
@@ -1698,52 +1729,22 @@ def _store_stage_result(
                 sort_keys=True,
                 separators=(",", ":"),
             )
-            connection.execute(
-                """
-                INSERT INTO content_metric_snapshots(
-                    content_id, captured_at, window_key, view_count, comment_count,
-                    like_count, share_count, collect_count, status, source,
-                    raw_response_id, metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(content_id, window_key, source) DO UPDATE SET
-                    captured_at=excluded.captured_at, view_count=excluded.view_count,
-                    comment_count=COALESCE(
-                        excluded.comment_count,content_metric_snapshots.comment_count
-                    ),
-                    like_count=COALESCE(
-                        excluded.like_count,content_metric_snapshots.like_count
-                    ),
-                    share_count=COALESCE(
-                        excluded.share_count,content_metric_snapshots.share_count
-                    ),
-                    collect_count=COALESCE(
-                        excluded.collect_count,content_metric_snapshots.collect_count
-                    ),
-                    status=excluded.status, raw_response_id=excluded.raw_response_id,
-                    metadata_json=excluded.metadata_json
-                """,
-                (
-                    content["id"],
-                    evidence_captured_at,
-                    window_key,
-                    data.get("view_count"),
-                    data.get("comment_count"),
-                    data.get("like_count"),
-                    data.get("share_count"),
-                    data.get("collect_count"),
-                    metrics_status,
-                    content["platform"],
-                    outcome.raw_response_id,
-                    metrics_metadata,
-                ),
+            persist_metric_observation(
+                connection,
+                content_id=int(content["id"]),
+                captured_at=evidence_captured_at,
+                window_key=window_key,
+                view_count=data.get("view_count"),
+                comment_count=data.get("comment_count"),
+                like_count=data.get("like_count"),
+                share_count=data.get("share_count"),
+                collect_count=data.get("collect_count"),
+                status=metrics_status,
+                source=str(content["platform"]),
+                raw_response_id=int(outcome.raw_response_id),
+                metadata_json=metrics_metadata,
             )
         elif stage == "comments":
-            raw = connection.execute(
-                "SELECT local_path, sha256 FROM provider_raw_responses WHERE id=?",
-                (outcome.raw_response_id,),
-            ).fetchone()
-            if raw is None:
-                raise RuntimeError("comment raw response is missing")
             cursor = connection.execute(
                 """
                 INSERT INTO comment_evidence_versions(
@@ -1757,18 +1758,20 @@ def _store_stage_result(
                     evidence_captured_at,
                     window_key,
                     content["platform"],
-                    raw["local_path"],
-                    raw["sha256"],
+                    source_raw["local_path"],
+                    source_raw["sha256"],
                     data.get("comment_count"),
                     mutation_at,
                 ),
             )
-            evidence_id = cursor.lastrowid
+            evidence_id = cursor.lastrowid if cursor.rowcount > 0 else None
             if evidence_id is None:
                 row = connection.execute(
                     "SELECT id FROM comment_evidence_versions WHERE content_id=? AND iso_week=? AND sha256=?",
-                    (content["id"], window_key, raw["sha256"]),
+                    (content["id"], window_key, source_raw["sha256"]),
                 ).fetchone()
+                if row is None:
+                    raise RuntimeError("comment evidence was not materialized")
                 evidence_id = row["id"]
             insert_comment_rows(
                 connection,
@@ -1952,33 +1955,21 @@ def _materialize_discovery_stages(
                 separators=(",", ":"),
             )
             with connect(db_path) as connection, transaction(connection):
-                connection.execute(
-                    """
-                    INSERT INTO content_metric_snapshots(
-                        content_id, captured_at, window_key, view_count, comment_count,
-                        like_count, share_count, collect_count, status, source,
-                        raw_response_id, metadata_json
-                    ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, 'missing', ?, ?, ?)
-                    ON CONFLICT(content_id, window_key, source) DO UPDATE SET
-                        captured_at=excluded.captured_at, view_count=NULL,
-                        comment_count=excluded.comment_count, like_count=excluded.like_count,
-                        share_count=excluded.share_count, collect_count=excluded.collect_count,
-                        status=excluded.status, raw_response_id=excluded.raw_response_id,
-                        metadata_json=excluded.metadata_json
-                    WHERE content_metric_snapshots.view_count IS NULL
-                    """,
-                    (
-                        content_id,
-                        str(source_raw["captured_at"]),
-                        metrics_window_key,
-                        metrics.get("comment_count"),
-                        metrics.get("like_count"),
-                        metrics.get("share_count"),
-                        metrics.get("collect_count"),
-                        platform,
-                        source_raw_response_id,
-                        metadata,
-                    ),
+                persist_metric_observation(
+                    connection,
+                    content_id=content_id,
+                    captured_at=str(source_raw["captured_at"]),
+                    window_key=metrics_window_key,
+                    view_count=None,
+                    comment_count=metrics.get("comment_count"),
+                    like_count=metrics.get("like_count"),
+                    share_count=metrics.get("share_count"),
+                    collect_count=metrics.get("collect_count"),
+                    status="missing",
+                    source=platform,
+                    raw_response_id=source_raw_response_id,
+                    metadata_json=metadata,
+                    snapshot_mode="preserve_existing_exposure",
                 )
 
     output: Dict[str, Any] = {
@@ -2546,11 +2537,30 @@ def _replay_content_stage(
             stored.value,
             status=stored.http_status or 200,
         )
+    replayed_data = dict(parsed.data)
+    stored_payload = _mapping(stored.value)
+    stored_data = _mapping(stored_payload.get("data"))
+    stored_metrics = _mapping(stored_payload.get("metrics"))
+    source_captured_at = next(
+        (
+            str(value)
+            for value in (
+                replayed_data.get("_evidence_captured_at"),
+                stored_data.get("_evidence_captured_at"),
+                stored_metrics.get("_evidence_captured_at"),
+                stored_payload.get("source_captured_at"),
+                stored.captured_at,
+            )
+            if value not in (None, "")
+        ),
+        stored.captured_at,
+    )
+    replayed_data["_evidence_captured_at"] = source_captured_at
     return CaptureOutcome(
         slot_id=stored.slot_id,
         attempt_id=0,
         raw_response_id=stored.raw_response_id,
-        data=parsed.data,
+        data=replayed_data,
         billed=False,
         amount=0.0,
         currency="USD",
@@ -3122,8 +3132,16 @@ def update_content_data(
             if derived_xhs_metrics:
                 adapter_version = "tikhub-xhs-app-v2-statistics-derived-v8.1"
                 metrics = dict(xhs_detail_metrics or {})
+                if xhs_detail_raw_response_id is None:
+                    raise ProviderConfigurationError("小红书详情指标缺少原始响应")
+                source_captured_at = _raw_response_captured_at(
+                    xhs_detail_raw_response_id, db_path=db_path
+                )
                 call = partial(
-                    _derived_xhs_metrics_result, metrics, xhs_detail_raw_response_id
+                    _derived_xhs_metrics_result,
+                    metrics,
+                    xhs_detail_raw_response_id,
+                    source_captured_at,
                 )
             elif call_override is not None:
                 call = partial(call_override, stage, content)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unittest
 from pathlib import Path
 
@@ -8,6 +9,34 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class AuthDeploymentContractTestCase(unittest.TestCase):
+    def test_login_template_defaults_to_remember_and_aligns_password_actions(
+        self,
+    ) -> None:
+        login = (ROOT / "deploy/server/nginx/login.html").read_text(encoding="utf-8")
+        options = re.search(
+            r'<div class="options-row">(?P<body>.*?)</div>', login, re.DOTALL
+        )
+        self.assertIsNotNone(options)
+        options_body = options.group("body") if options else ""
+        self.assertIn(
+            '<input type="checkbox" id="remember" name="remember" checked>',
+            options_body,
+        )
+        self.assertIn("<span>保持登录</span>", options_body)
+        self.assertIn(
+            '<button type="button" class="hint-link" id="forgot-btn">忘记密码？</button>',
+            options_body,
+        )
+        self.assertGreater(
+            options.start() if options else -1, login.index('id="password"')
+        )
+        self.assertNotIn('class="label-row"', login)
+        self.assertRegex(
+            login,
+            r"\.options-row\s*\{[^}]*display:\s*flex;[^}]*align-items:\s*center;"
+            r"[^}]*justify-content:\s*space-between;",
+        )
+
     def test_compose_uses_the_gateway_as_the_only_published_entry(self) -> None:
         compose = (ROOT / "deploy/server/compose.yml").read_text(encoding="utf-8")
         self.assertIn("  auth:\n", compose)

@@ -14,6 +14,10 @@ from types import ModuleType
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+from v8.contracts import CURRENT_REPORT_RULE_VERSION, CURRENT_REPORT_VERSION
+from v8.release_management_v9 import TARGET_RELEASE_ID, TAXONOMY_VERSION
+from v8.storage import CURRENT_SCHEMA_MIGRATION_NAME, SCHEMA_VERSION
+
 
 ROOT = Path(__file__).resolve().parents[1]
 MACOS_DEPLOY = ROOT / "deploy/macos"
@@ -34,6 +38,21 @@ publisher = _load_module(
 )
 
 
+def _runtime_identity(*, matcher_sha256: str = "a" * 64) -> dict[str, object]:
+    return {
+        "schema": "dcar-runtime-identity-v1",
+        "report_version": "dcar-content-operations-report-v8.6",
+        "database_schema_version": 13,
+        "database_schema_migration": "scheduler-run-attempt-history",
+        "active_release_id": "evaluation-v9__selling-points-v5.2",
+        "active_release_status": "active",
+        "rule_version": "evaluation-v9",
+        "taxonomy_version": "selling-points-v5.2",
+        "taxonomy_status": "published",
+        "matcher_rule_sha256": matcher_sha256,
+    }
+
+
 def _writer_database(
     path: Path,
     *,
@@ -45,21 +64,66 @@ def _writer_database(
         connection.executescript(
             """
             CREATE TABLE scheduler_runs(
+                id INTEGER PRIMARY KEY,
                 job_id TEXT,
                 scheduled_for TEXT,
                 status TEXT,
                 completed_at TEXT
             );
+            CREATE TABLE scheduler_run_attempts(
+                id INTEGER PRIMARY KEY,
+                scheduler_run_id INTEGER,
+                attempt_number INTEGER,
+                status TEXT,
+                completed_at TEXT
+            );
             CREATE TABLE content_items(id INTEGER, published_at TEXT);
+            CREATE TABLE schema_migrations(version INTEGER, name TEXT);
+            CREATE TABLE taxonomy_versions(version TEXT, status TEXT);
+            CREATE TABLE evaluation_releases(
+                id TEXT,
+                rule_version TEXT,
+                taxonomy_version TEXT,
+                matcher_rule_sha256 TEXT,
+                status TEXT
+            );
             INSERT INTO scheduler_runs VALUES(
-                'daily_capture','2026-08-10T18:00:00Z','failed',
+                1,'daily_capture','2026-08-10T18:00:00Z','failed',
                 '2026-08-10T18:30:00Z'
+            );
+            INSERT INTO scheduler_runs VALUES(
+                2,'daily_report','2026-08-11T00:00:00Z','partial',
+                '2026-08-11T00:01:00Z'
+            );
+            INSERT INTO scheduler_runs VALUES(
+                3,'weekly_report','2026-08-10T00:30:00Z','succeeded',
+                '2026-08-10T00:31:00Z'
+            );
+            INSERT INTO scheduler_run_attempts VALUES(
+                1,2,1,'partial','2026-08-11T00:01:00Z'
+            );
+            INSERT INTO scheduler_run_attempts VALUES(
+                2,3,1,'succeeded','2026-08-10T00:31:00Z'
+            );
+            INSERT INTO schema_migrations VALUES(
+                13,'scheduler-run-attempt-history'
+            );
+            INSERT INTO taxonomy_versions VALUES(
+                'selling-points-v5.2','published'
+            );
+            INSERT INTO evaluation_releases VALUES(
+                'evaluation-v9__selling-points-v5.2','evaluation-v9',
+                'selling-points-v5.2',
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                'active'
             );
             """
         )
+        connection.execute("PRAGMA user_version=13")
         connection.execute(
-            "INSERT INTO scheduler_runs VALUES(?,?,?,?)",
+            "INSERT INTO scheduler_runs VALUES(?,?,?,?,?)",
             (
+                4,
                 "daily_media_cutoff",
                 "2026-08-10T23:30:00Z",
                 cutoff_status,
@@ -83,13 +147,32 @@ def _fetch_writer(url: str) -> dict[str, object]:
         return {
             "status": "ok",
             "database": "dcar_insight.sqlite3",
+            "database_state": {"runtime_identity": _runtime_identity()},
         }
     if url.endswith("/scheduler"):
         return {
             "requested": True,
             "enabled": True,
             "writer_lock": {"held": True},
-            "startup_catchup": {"requested": False, "enabled": False},
+            "startup_catchup": {
+                "mode": "report_only",
+                "requested": True,
+                "enabled": True,
+                "status": "succeeded",
+                "error": None,
+                "results": [
+                    {
+                        "job_id": "daily_report",
+                        "scheduled_for": "2026-08-11T00:00:00Z",
+                        "status": "partial",
+                    },
+                    {
+                        "job_id": "weekly_report",
+                        "scheduled_for": "2026-08-10T00:30:00Z",
+                        "status": "succeeded",
+                    },
+                ],
+            },
         }
     raise AssertionError(url)
 
@@ -165,7 +248,7 @@ class MacOSSnapshotPublisherTest(unittest.TestCase):
                     "DCAR_PUBLISH_REMOTE_PYTHON=/var/www/dcar-aigc/current/.venv/bin/python",
                     f"DCAR_PUBLISH_SNAPSHOT_ROOT={self.snapshot_root}",
                     "DCAR_PUBLISH_MIN_REMOTE_FREE_BYTES=5368709120",
-                    "DCAR_PUBLISH_EXPECTED_USER_VERSION=11",
+                    "DCAR_PUBLISH_EXPECTED_USER_VERSION=13",
                     "DCAR_PUBLISH_MAX_CONTENT_LAG_DAYS=1",
                     "",
                 ]
@@ -188,6 +271,7 @@ class MacOSSnapshotPublisherTest(unittest.TestCase):
         (output / "reports-files-from0").write_bytes(b"")
         return {
             "snapshot_id": "20260811T010000Z-aaaaaaaaaaaa",
+            "runtime_identity": _runtime_identity(),
             "databases": [
                 {
                     "name": "dcar_insight.sqlite3",
@@ -242,6 +326,22 @@ class MacOSSnapshotPublisherTest(unittest.TestCase):
         with self.assertRaises(publisher.SnapshotPublishError):
             self.config()
 
+    def test_external_environment_pins_schema_13(self) -> None:
+        self.assertEqual(self.config().expected_user_version, 13)
+
+    def test_publisher_identity_constants_match_current_runtime_contracts(self) -> None:
+        self.assertEqual(publisher.EXPECTED_REPORT_VERSION, CURRENT_REPORT_VERSION)
+        self.assertEqual(publisher.EXPECTED_DATABASE_SCHEMA_VERSION, SCHEMA_VERSION)
+        self.assertEqual(
+            publisher.EXPECTED_DATABASE_SCHEMA_MIGRATION,
+            CURRENT_SCHEMA_MIGRATION_NAME,
+        )
+        self.assertEqual(publisher.EXPECTED_ACTIVE_RELEASE_ID, TARGET_RELEASE_ID)
+        self.assertEqual(
+            publisher.EXPECTED_RULE_VERSION, CURRENT_REPORT_RULE_VERSION
+        )
+        self.assertEqual(publisher.EXPECTED_TAXONOMY_VERSION, TAXONOMY_VERSION)
+
     def test_external_environment_rejects_symlink(self) -> None:
         symlink = self.root / "publisher-link.env"
         symlink.symlink_to(self.env_file)
@@ -274,6 +374,7 @@ class MacOSSnapshotPublisherTest(unittest.TestCase):
         self.assertNotIn("PASSWORD=", example)
         self.assertNotIn("PRIVATE_KEY=", example)
         self.assertIn("40,739,188,944", example)
+        self.assertIn("DCAR_PUBLISH_EXPECTED_USER_VERSION=13", example)
 
     def test_writer_freshness_accepts_today_terminal_failure_but_rejects_stale_content(
         self,
@@ -341,6 +442,197 @@ class MacOSSnapshotPublisherTest(unittest.TestCase):
                 now=current,
                 maximum_content_lag_days=1,
                 fetch_json=unlocked_writer,
+            )
+
+    def test_writer_freshness_rejects_health_or_database_identity_drift(self) -> None:
+        current = datetime(2026, 8, 11, 9, 0, tzinfo=SHANGHAI)
+
+        def drifted_health(url: str) -> dict[str, object]:
+            value = _fetch_writer(url)
+            if url.endswith("/health"):
+                value = {
+                    **value,
+                    "database_state": {
+                        "runtime_identity": _runtime_identity(
+                            matcher_sha256="b" * 64
+                        )
+                    },
+                }
+            return value
+
+        with self.assertRaisesRegex(
+            publisher.SnapshotPublishError, "does not match the formal database"
+        ):
+            publisher.check_writer_freshness(
+                self.database,
+                now=current,
+                maximum_content_lag_days=1,
+                fetch_json=drifted_health,
+            )
+
+        wrong_release = self.root / "wrong-release.sqlite3"
+        _writer_database(
+            wrong_release, latest_published_at="2026-08-10T12:00:00Z"
+        )
+        with sqlite3.connect(wrong_release) as connection:
+            connection.execute(
+                """
+                UPDATE evaluation_releases
+                SET id='evaluation-v8__selling-points-v5.2',rule_version='evaluation-v8'
+                """
+            )
+            connection.commit()
+
+        def wrong_release_health(url: str) -> dict[str, object]:
+            value = _fetch_writer(url)
+            if url.endswith("/health"):
+                identity = _runtime_identity()
+                identity["active_release_id"] = (
+                    "evaluation-v8__selling-points-v5.2"
+                )
+                identity["rule_version"] = "evaluation-v8"
+                value = {
+                    **value,
+                    "database": wrong_release.name,
+                    "database_state": {"runtime_identity": identity},
+                }
+            return value
+
+        with self.assertRaisesRegex(
+            publisher.SnapshotPublishError, "active_release_id"
+        ):
+            publisher.check_writer_freshness(
+                wrong_release,
+                now=current,
+                maximum_content_lag_days=1,
+                fetch_json=wrong_release_health,
+            )
+
+    def test_writer_freshness_rejects_incomplete_or_non_report_startup_catchup(
+        self,
+    ) -> None:
+        current = datetime(2026, 8, 11, 9, 0, tzinfo=SHANGHAI)
+
+        def catchup_status(status: str) -> object:
+            def fetch(url: str) -> dict[str, object]:
+                value = _fetch_writer(url)
+                if url.endswith("/scheduler"):
+                    catchup = dict(value["startup_catchup"])
+                    catchup["status"] = status
+                    value = {**value, "startup_catchup": catchup}
+                return value
+
+            return fetch
+
+        with self.assertRaisesRegex(
+            publisher.SnapshotPublishError, "has not succeeded"
+        ):
+            publisher.check_writer_freshness(
+                self.database,
+                now=current,
+                maximum_content_lag_days=1,
+                fetch_json=catchup_status("running"),
+            )
+
+        def malicious_capture(url: str) -> dict[str, object]:
+            value = _fetch_writer(url)
+            if url.endswith("/scheduler"):
+                catchup = dict(value["startup_catchup"])
+                catchup["results"] = [
+                    {
+                        "job_id": "daily_capture",
+                        "scheduled_for": "2026-08-10T18:00:00Z",
+                        "status": "succeeded",
+                    }
+                ]
+                value = {**value, "startup_catchup": catchup}
+            return value
+
+        with self.assertRaisesRegex(
+            publisher.SnapshotPublishError, "contains a non-report job"
+        ):
+            publisher.check_writer_freshness(
+                self.database,
+                now=current,
+                maximum_content_lag_days=1,
+                fetch_json=malicious_capture,
+            )
+
+        runner = FakeRunner()
+        with (
+            patch.object(publisher.Path, "home", return_value=self.fake_home),
+            self.assertRaisesRegex(
+                publisher.SnapshotPublishError, "contains a non-report job"
+            ),
+        ):
+            publisher.publish_snapshot(
+                project_root=self.project,
+                database=self.database,
+                legacy_database=None,
+                config=self.config(),
+                now=current,
+                runner=runner,
+                fetch_json=malicious_capture,
+                build_snapshot=lambda **_arguments: self.fail(
+                    "snapshot build must not run after malicious catch-up"
+                ),
+            )
+        self.assertEqual(runner.commands, [])
+
+        for bad_result in (
+            {
+                "job_id": "daily_report",
+                "scheduled_for": "2026-08-11T00:00:00Z",
+                "status": "deferred",
+            },
+            {
+                "job_id": "daily_report",
+                "scheduled_for": "2026-08-11T00:00:00Z",
+                "status": "failed",
+            },
+        ):
+            def non_terminal_report(
+                url: str, *, result: dict[str, str] = bad_result
+            ) -> dict[str, object]:
+                value = _fetch_writer(url)
+                if url.endswith("/scheduler"):
+                    catchup = dict(value["startup_catchup"])
+                    catchup["results"] = [result]
+                    value = {**value, "startup_catchup": catchup}
+                return value
+
+            with self.assertRaisesRegex(
+                publisher.SnapshotPublishError, "non-terminal report result"
+            ):
+                publisher.check_writer_freshness(
+                    self.database,
+                    now=current,
+                    maximum_content_lag_days=1,
+                    fetch_json=non_terminal_report,
+                )
+
+        def mismatched_report(url: str) -> dict[str, object]:
+            value = _fetch_writer(url)
+            if url.endswith("/scheduler"):
+                catchup = dict(value["startup_catchup"])
+                catchup["results"] = [
+                    {
+                        "job_id": "daily_report",
+                        "scheduled_for": "2026-08-11T00:00:00Z",
+                        "status": "succeeded",
+                    }
+                ]
+                value = {**value, "startup_catchup": catchup}
+            return value
+
+        with self.assertRaisesRegex(
+            publisher.SnapshotPublishError, "does not match the database"
+        ):
+            publisher.check_writer_freshness(
+                self.database,
+                now=current,
+                maximum_content_lag_days=1,
+                fetch_json=mismatched_report,
             )
 
     def test_database_symlinks_are_rejected_before_network_or_snapshot(self) -> None:
@@ -470,6 +762,37 @@ class MacOSSnapshotPublisherTest(unittest.TestCase):
             self.snapshot_root / "snapshot-20260811T010000Z/publisher-receipt.json"
         )
         self.assertTrue(receipt_path.is_file())
+
+    def test_publish_refuses_snapshot_identity_drift_before_remote_staging(self) -> None:
+        runner = FakeRunner()
+        current = datetime(2026, 8, 11, 9, 0, tzinfo=SHANGHAI)
+
+        def drifted_builder(**arguments: object) -> dict[str, object]:
+            manifest = self.fake_builder(**arguments)
+            manifest["runtime_identity"] = _runtime_identity(
+                matcher_sha256="b" * 64
+            )
+            return manifest
+
+        with (
+            patch.object(publisher.Path, "home", return_value=self.fake_home),
+            self.assertRaisesRegex(
+                publisher.SnapshotPublishError, "drifted from the verified writer"
+            ),
+        ):
+            publisher.publish_snapshot(
+                project_root=self.project,
+                database=self.database,
+                legacy_database=None,
+                config=self.config(),
+                now=current,
+                runner=runner,
+                fetch_json=_fetch_writer,
+                build_snapshot=drifted_builder,
+            )
+        rendered = [" ".join(command) for command in runner.commands]
+        self.assertFalse(any("install -d" in command for command in rendered))
+        self.assertFalse(any(command.startswith("rsync ") for command in rendered))
 
     def test_manifest_space_gate_stops_before_remote_staging_or_rsync(self) -> None:
         runner = FakeRunner(free_bytes=5_400_000_000)

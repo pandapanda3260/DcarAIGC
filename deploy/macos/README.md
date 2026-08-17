@@ -14,8 +14,10 @@ templates are disabled by default. Each renderer never calls `launchctl`.
 - There must be exactly one scheduled writer. The Ubuntu read replica keeps
   `DCAR_SCHEDULER_ENABLED=0` and `DCAR_STARTUP_CATCHUP_ENABLED=0`.
 - The writer uses `DCAR_SCHEDULER_ENABLED=1` and
-  `DCAR_STARTUP_CATCHUP_ENABLED=0`. Starting it never performs missed-run
-  catch-up. Catch-up remains a separate, manual, cost-reviewed operation.
+  `DCAR_STARTUP_CATCHUP_ENABLED=1`, but the only supported startup mode is
+  `report_only`. Startup catch-up may create or retry due `daily_report` and
+  `weekly_report` occurrences. It never runs `daily_capture`, media download,
+  media processing, or `daily_media_cutoff`, so it cannot spend provider money.
 - The current `daily_capture` provider ceiling is **USD 8 per scheduled day**.
   Do not enable the LaunchAgent until the operator has explicitly authorized
   that recurring ceiling and added the acknowledgement to `writer.env`.
@@ -122,10 +124,12 @@ curl -fsS http://127.0.0.1:8766/api/v8/scheduler | python3 -m json.tool
 launchctl print "gui/$(id -u)/cn.tj.dcar.writer-worker"
 ```
 
-The worker scheduler must report requested and enabled, while startup catch-up
-must report unrequested/disabled. Do not manually execute `daily_capture` as a
-smoke test; wait for the authorized scheduled window or use existing mocked
-tests.
+The worker scheduler must report requested and enabled. Startup catch-up must
+report `mode=report_only`, requested/enabled, and eventually `status=succeeded`;
+every result must be a `daily_report` or `weekly_report`. A capture or media job
+in that result list is a deployment-blocking safety violation. Do not manually
+execute `daily_capture` as a smoke test; wait for the authorized scheduled
+window or use existing mocked tests.
 
 ### Deliberate restart of an already loaded worker
 
@@ -170,8 +174,12 @@ daily report window. It does not run a scheduler or provider call. Before it can
 publish, it requires all of the following:
 
 1. the loopback writer on port 8766 is healthy and points at the formal DB;
+   its health identity must exactly match the DB and must be report v8.6,
+   schema 13 / `scheduler-run-attempt-history`, active evaluation-v9 on the
+   published selling-points-v5.2 taxonomy, including the DB-frozen matcher SHA;
 2. the writer scheduler is enabled and holds the single-writer lock, while
-   startup catch-up remains disabled;
+   startup catch-up has succeeded in `report_only` mode and returned only
+   `daily_report`/`weekly_report` results;
 3. today's 02:00 `daily_capture` row has a terminal status and completion time;
 4. today's 07:30 `daily_media_cutoff` succeeded with a valid completion time;
 5. the DB/WAL storage and newest content pass the configured freshness gates;
@@ -197,6 +205,8 @@ It never rsyncs directly into the active cache or report roots and never uses
 `--delete`. The server verifier hashes the staged version first. With the API
 stopped, the installer backs up every differing active artifact before replacing
 it and restores those exact bytes together with the DB on failure or rollback.
+An identity mismatch in the installed API health response is an install failure
+and triggers that same automatic DB/artifact rollback.
 The installer is the only component allowed to promote a verified generation.
 For unchanged bytes, rsync may hard-link from the active root into staging via
 `--link-dest`; active files are only references and are never changed by rsync.
@@ -297,9 +307,11 @@ launchctl enable "$domain/$label"
 launchctl bootstrap "$domain" "$plist"
 ```
 
-The writer keeps `DCAR_STARTUP_CATCHUP_ENABLED=0`. The publisher and Ubuntu
-replica both keep scheduler and catch-up set to `0`; enabling the publisher
-does not broaden provider authorization.
+The writer keeps `DCAR_STARTUP_CATCHUP_ENABLED=1` exclusively for report-only
+catch-up. The publisher and Ubuntu replica both keep scheduler and catch-up set
+to `0`; enabling the publisher does not broaden provider authorization. Paid
+capture and media processing remain scheduled or explicitly operator-invoked
+writer work and are never triggered by startup catch-up.
 
 ### Failure handling and monitoring
 

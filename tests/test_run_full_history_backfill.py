@@ -29,6 +29,41 @@ class FullHistoryWrapperTest(unittest.TestCase):
             "content_manifest": {},
         }
 
+    @staticmethod
+    def _seed_contract_database(database: Path, *, rule_version: str) -> None:
+        captured_at = "2026-08-07T12:00:00Z"
+        with connect(database) as connection:
+            initialize_database(connection)
+            connection.execute(
+                """
+                INSERT INTO taxonomy_versions(
+                    id,version,status,definition,created_at,published_at
+                ) VALUES (
+                    'taxonomy-test','selling-points-v5.2','published','{}',?,?
+                )
+                """,
+                (captured_at, captured_at),
+            )
+            connection.execute(
+                """
+                INSERT INTO evaluation_releases(
+                    id,rule_version,taxonomy_version,matcher_rule_sha256,status,
+                    created_at,updated_at,activated_at
+                ) VALUES (
+                    'release-test',?,'selling-points-v5.2',?,
+                    'active',?,?,?
+                )
+                """,
+                (
+                    rule_version,
+                    "a" * 64,
+                    captured_at,
+                    captured_at,
+                    captured_at,
+                ),
+            )
+            connection.commit()
+
     def test_discovery_extension_only_handles_task_budget_block(self) -> None:
         state = {"phases": {}}
         with patch.object(
@@ -99,39 +134,14 @@ class FullHistoryWrapperTest(unittest.TestCase):
                 runner.phase_preflight()
 
         request = urlopen.call_args.args[0]
-        self.assertEqual(request.get_header("User-agent"), "DCar-Insight-v8/1.0")
+        self.assertEqual(request.get_header("User-agent"), "DCar-Insight/1.0")
         self.assertEqual(request.get_header("Accept"), "application/json")
         self.assertNotIn("12.34", " ".join(str(call) for call in log.call_args_list))
 
     def test_campaign_contract_loads_complete_active_release_row(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             db = Path(temporary) / "contract.sqlite3"
-            captured_at = "2026-08-07T12:00:00Z"
-            with connect(db) as connection:
-                initialize_database(connection)
-                connection.execute(
-                    """
-                    INSERT INTO taxonomy_versions(
-                        id,version,status,definition,created_at,published_at
-                    ) VALUES (
-                        'taxonomy-test','selling-points-v5.2','published','{}',?,?
-                    )
-                    """,
-                    (captured_at, captured_at),
-                )
-                connection.execute(
-                    """
-                    INSERT INTO evaluation_releases(
-                        id,rule_version,taxonomy_version,matcher_rule_sha256,status,
-                        created_at,updated_at,activated_at
-                    ) VALUES (
-                        'release-test','evaluation-v8','selling-points-v5.2',?,
-                        'active',?,?,?
-                    )
-                    """,
-                    ("a" * 64, captured_at, captured_at, captured_at),
-                )
-                connection.commit()
+            self._seed_contract_database(db, rule_version="evaluation-v8")
 
             state: dict = {}
             with patch.object(runner, "DB", db), patch.object(
@@ -148,10 +158,59 @@ class FullHistoryWrapperTest(unittest.TestCase):
 
         release = load_runtime.call_args.args[1]
         self.assertEqual(release["status"], "active")
-        self.assertEqual(release["activated_at"], captured_at)
+        self.assertEqual(release["activated_at"], "2026-08-07T12:00:00Z")
         self.assertEqual(
             state["campaign_contract"]["active_release"]["status"], "active"
         )
+
+    def test_campaign_contract_accepts_active_v9_materialized_release(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            db = Path(temporary) / "contract.sqlite3"
+            self._seed_contract_database(db, rule_version="evaluation-v9")
+            state: dict = {}
+            with patch.object(runner, "DB", db), patch.object(
+                runner, "save_state"
+            ), patch(
+                "v8.evaluation._load_release_runtime",
+                return_value=SimpleNamespace(matcher=object()),
+            ):
+                runner.bind_campaign_contract(
+                    state,
+                    end="2026-08-07T23:00:00+08:00",
+                    archive_before="2026-02-07T00:00:00+08:00",
+                )
+        self.assertEqual(
+            state["campaign_contract"]["active_release"]["rule_version"],
+            "evaluation-v9",
+        )
+
+    def test_existing_v8_campaign_fails_closed_after_v9_switch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            db = Path(temporary) / "contract.sqlite3"
+            self._seed_contract_database(db, rule_version="evaluation-v8")
+            state: dict = {}
+            with patch.object(runner, "DB", db), patch.object(
+                runner, "save_state"
+            ), patch(
+                "v8.evaluation._load_release_runtime",
+                return_value=SimpleNamespace(matcher=object()),
+            ):
+                runner.bind_campaign_contract(
+                    state,
+                    end="2026-08-07T23:00:00+08:00",
+                    archive_before="2026-02-07T00:00:00+08:00",
+                )
+                with connect(db) as connection:
+                    connection.execute(
+                        "UPDATE evaluation_releases SET rule_version='evaluation-v9'"
+                    )
+                    connection.commit()
+                with self.assertRaisesRegex(runner.AbortRun, "不得在同一战役"):
+                    runner.bind_campaign_contract(
+                        state,
+                        end="2026-08-07T23:00:00+08:00",
+                        archive_before="2026-02-07T00:00:00+08:00",
+                    )
 
     def test_campaign_scope_baseline_rejects_preexisting_queue(self) -> None:
         state: dict = {}

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import threading
 import unittest
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
@@ -13,22 +15,31 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import v8.capture as capture_module
 from v8.capture import CaptureError, ProviderResult
 from v8.matcher_dsl import POINT_IDS, POINT_SCENES
+from v8.media_state import MediaTerminalDetail
 from v8.operations import IdentityConflictError, upsert_account
 from v8.reports import ReportTaskError
 from v8.scheduler import (
     DAILY_CAPTURE_CONTENT_LIMIT,
     DAILY_CAPTURE_MAX_AMOUNT,
     JOBS,
+    SchedulerJobError,
+    _claim_run,
+    _finish_run,
     _select_due_capture_contents,
     execute_job,
     install_jobs,
     latest_occurrence,
+    recover_interrupted_scheduler_runs,
     run_due_capture,
     run_media_cutoff,
     startup_catchup,
 )
 from v8.storage import PROJECT_ROOT, connect, initialize_database, now_utc
 from v8.taxonomy_rule_backfill import backfill_v5_1_matcher_rules
+from tests.v9_report_fixture import (
+    V9_FIXTURE_RELEASE_ID,
+    activate_v9_report_fixture,
+)
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -106,6 +117,7 @@ class V8SchedulerTest(unittest.TestCase):
                 ),
             )
             connection.commit()
+        activate_v9_report_fixture(self.db, [])
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -174,6 +186,58 @@ class V8SchedulerTest(unittest.TestCase):
             )
             connection.commit()
 
+    def _insert_media_cutoff_content(
+        self,
+        index: int,
+        *,
+        source_group: str = "",
+    ) -> int:
+        captured_at = "2026-08-02T00:00:00Z"
+        platform_content_id = f"cutoff-{index}"
+        with connect(self.db) as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO content_items(
+                    link_id,platform,platform_content_id,canonical_url,title,body,
+                    content_type,source_group,imported_at,created_at,updated_at
+                ) VALUES (?, 'douyin', ?, ?, '媒体截止内容', '汽车内容',
+                          'video', ?, ?, ?, ?)
+                """,
+                (
+                    f"C{index:05d}",
+                    platform_content_id,
+                    f"https://www.douyin.com/video/{platform_content_id}",
+                    source_group,
+                    captured_at,
+                    captured_at,
+                    captured_at,
+                ),
+            )
+            connection.commit()
+        assert cursor.lastrowid is not None
+        return int(cursor.lastrowid)
+
+    def _insert_media_source_artifact(self, content_id: int) -> None:
+        captured_at = "2026-08-02T01:00:00Z"
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                INSERT INTO evidence_artifacts(
+                    content_id,artifact_type,local_path,status,byte_size,sha256,
+                    captured_at,processor_version,metadata_json,created_at
+                ) VALUES (?,'media_source',?,'available',1,?,?,
+                          'media-source-v1','{}',?)
+                """,
+                (
+                    content_id,
+                    str(self.root / f"media-source-{content_id}.json"),
+                    f"{content_id:064x}",
+                    captured_at,
+                    captured_at,
+                ),
+            )
+            connection.commit()
+
     def _insert_comment_run(
         self,
         *,
@@ -232,9 +296,24 @@ class V8SchedulerTest(unittest.TestCase):
             run_count = connection.execute(
                 "SELECT COUNT(*) FROM scheduler_runs"
             ).fetchone()[0]
+            attempt_count = connection.execute(
+                "SELECT COUNT(*) FROM scheduler_run_attempts"
+            ).fetchone()[0]
+            revision = connection.execute(
+                """
+                SELECT report_json_path FROM report_revisions
+                WHERE task_id=? ORDER BY revision DESC LIMIT 1
+                """,
+                (task["id"],),
+            ).fetchone()
         self.assertEqual(task["period_start"], "2026-08-01")
         self.assertEqual(task["period_end"], "2026-08-01")
         self.assertEqual(run_count, 1)
+        self.assertEqual(attempt_count, 1)
+        report = json.loads((PROJECT_ROOT / revision["report_json_path"]).read_text())
+        self.assertEqual(
+            report["metadata"]["collection_cutoff_at"], "2026-08-02T00:00:00Z"
+        )
 
     def test_unready_report_is_deferred_without_claim_then_same_slot_can_run(
         self,
@@ -269,9 +348,9 @@ class V8SchedulerTest(unittest.TestCase):
                 """
                 UPDATE evaluation_releases
                 SET status='active',retired_at=NULL,activated_at=?,updated_at=?
-                WHERE id='evaluation-v8__selling-points-v5.1'
+                WHERE id=?
                 """,
-                (now_utc(), now_utc()),
+                (now_utc(), now_utc(), V9_FIXTURE_RELEASE_ID),
             )
             connection.commit()
         completed = execute_job(
@@ -305,42 +384,90 @@ class V8SchedulerTest(unittest.TestCase):
                 0,
             )
 
-    def test_first_startup_runs_latest_due_slot_and_records_honest_capture_skip(
-        self,
-    ) -> None:
+    def test_first_startup_is_report_only_and_never_claims_supplier_jobs(self) -> None:
         now = datetime(2026, 8, 2, 9, 0, tzinfo=SHANGHAI)
-        results = startup_catchup(now=now, db_path=self.db, reports_root=self.reports)
-        self.assertEqual(
-            {item["job_id"] for item in results}, {job.job_id for job in JOBS}
-        )
-        capture = next(item for item in results if item["job_id"] == "daily_capture")
-        self.assertEqual(capture["status"], "skipped")
-        self.assertIn("没有已启用", capture["details"]["reason"])
-        weekly = next(item for item in results if item["job_id"] == "weekly_report")
-        media_processing = next(
-            item for item in results if item["job_id"] == "daily_media_processing"
-        )
-        self.assertEqual(weekly["status"], "succeeded")
-        self.assertEqual(set(media_processing["details"]), {"media", "duplicates"})
-        self.assertEqual(media_processing["details"]["duplicates"]["failed"], 0)
+        with (
+            patch("v8.scheduler.run_due_capture") as capture,
+            patch("v8.scheduler.run_media_download_queue") as download,
+            patch("v8.scheduler.run_media_processing_queue") as processing,
+            patch("v8.scheduler.run_media_cutoff") as cutoff,
+        ):
+            results = startup_catchup(
+                now=now, db_path=self.db, reports_root=self.reports
+            )
+        self.assertEqual(results, [])
+        capture.assert_not_called()
+        download.assert_not_called()
+        processing.assert_not_called()
+        cutoff.assert_not_called()
         with connect(self.db) as connection:
-            statuses = {
-                row["job_id"]: row["status"]
-                for row in connection.execute(
-                    "SELECT job_id, status FROM scheduler_runs"
-                )
-            }
-        self.assertEqual(statuses["daily_capture"], "skipped")
-        self.assertEqual(statuses["daily_media_download"], "succeeded")
-        self.assertEqual(statuses["daily_media_processing"], "succeeded")
-        self.assertEqual(statuses["daily_media_cutoff"], "succeeded")
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM scheduler_runs").fetchone()[0],
+                0,
+            )
 
-        media_download = next(
-            item for item in results if item["job_id"] == "daily_media_download"
+    def test_startup_report_source_rejects_every_supplier_job_before_claim(self) -> None:
+        occurrence = datetime(2026, 8, 2, 2, 0, tzinfo=SHANGHAI)
+        supplier_jobs = (
+            "daily_capture",
+            "daily_media_download",
+            "daily_media_processing",
+            "daily_media_cutoff",
         )
-        self.assertEqual(set(media_download["details"]), {"fresh_content"})
+        with patch("v8.scheduler._run_job_action") as action:
+            for job_id in supplier_jobs:
+                for allow_retry in (False, True):
+                    with self.subTest(job_id=job_id, allow_retry=allow_retry):
+                        with self.assertRaisesRegex(
+                            SchedulerJobError,
+                            "startup_report_catchup is report-only",
+                        ):
+                            execute_job(
+                                job_id,
+                                occurrence,
+                                db_path=self.db,
+                                reports_root=self.reports,
+                                allow_retry=allow_retry,
+                                invocation_source="startup_report_catchup",
+                            )
+            with self.assertRaisesRegex(
+                SchedulerJobError,
+                "startup_report_catchup requires allow_retry=True",
+            ):
+                execute_job(
+                    "daily_report",
+                    occurrence,
+                    db_path=self.db,
+                    reports_root=self.reports,
+                    invocation_source="startup_report_catchup",
+                )
+        action.assert_not_called()
+        with connect(self.db) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM scheduler_runs").fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM scheduler_run_attempts"
+                ).fetchone()[0],
+                0,
+            )
 
     def test_startup_catchup_defers_report_jobs_without_claiming_them(self) -> None:
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                INSERT INTO content_items(
+                    link_id,platform,platform_content_id,canonical_url,content_type,
+                    published_at,imported_at,created_at,updated_at
+                ) VALUES ('CU0001','douyin','catchup-01',
+                          'https://www.douyin.com/video/catchup-01','video',
+                          '2026-08-01T01:00:00Z',?,?,?)
+                """,
+                (now_utc(), now_utc(), now_utc()),
+            )
+            connection.commit()
         with connect(self.db) as connection:
             connection.execute(
                 "UPDATE evaluation_releases SET status='retired' WHERE status='active'"
@@ -358,7 +485,7 @@ class V8SchedulerTest(unittest.TestCase):
         ]
         self.assertEqual(
             [(item["job_id"], item["status"]) for item in report_results],
-            [("daily_report", "deferred"), ("weekly_report", "deferred")],
+            [("daily_report", "deferred")],
         )
         with connect(self.db) as connection:
             self.assertEqual(
@@ -371,13 +498,8 @@ class V8SchedulerTest(unittest.TestCase):
                 0,
             )
             self.assertEqual(
-                connection.execute(
-                    """
-                    SELECT COUNT(*) FROM scheduler_runs
-                    WHERE job_id NOT IN ('daily_report','weekly_report')
-                    """
-                ).fetchone()[0],
-                4,
+                connection.execute("SELECT COUNT(*) FROM scheduler_runs").fetchone()[0],
+                0,
             )
 
     def test_media_download_job_fails_only_for_retryable_failures(self) -> None:
@@ -402,8 +524,6 @@ class V8SchedulerTest(unittest.TestCase):
         download_queue.assert_called_once_with(
             limit=500,
             db_path=self.db,
-            published_start="2026-07-31T16:00:00Z",
-            published_end="2026-08-01T18:20:00Z",
         )
         self.assertEqual(retryable["status"], "failed")
         self.assertEqual(retryable["details"]["fresh_content"], retryable_result)
@@ -451,6 +571,21 @@ class V8SchedulerTest(unittest.TestCase):
             )
         self.assertEqual(unchanged_failed, original_failed)
 
+        with patch(
+            "v8.scheduler.run_media_download_queue", return_value=recovered_result
+        ) as recovered_queue:
+            retried = execute_job(
+                "daily_media_download",
+                retryable_time,
+                db_path=self.db,
+                reports_root=self.reports,
+                allow_retry=True,
+                invocation_source="operator_retry",
+            )
+        self.assertEqual(retried["status"], "succeeded")
+        self.assertEqual(retried["attempt_number"], 2)
+        recovered_queue.assert_called_once()
+
         recovered_time = datetime(2026, 8, 3, 2, 20, tzinfo=SHANGHAI)
         with patch(
             "v8.scheduler.run_media_download_queue", return_value=recovered_result
@@ -493,9 +628,24 @@ class V8SchedulerTest(unittest.TestCase):
                     "WHERE job_id='daily_media_download'"
                 )
             }
-        self.assertEqual(statuses["2026-08-01T18:20:00Z"], "failed")
+        self.assertEqual(statuses["2026-08-01T18:20:00Z"], "succeeded")
         self.assertEqual(statuses["2026-08-02T18:20:00Z"], "succeeded")
         self.assertEqual(statuses["2026-08-03T18:20:00Z"], "succeeded")
+        with connect(self.db) as connection:
+            attempts = connection.execute(
+                """
+                SELECT sra.attempt_number,sra.invocation_source,sra.status
+                FROM scheduler_run_attempts sra
+                JOIN scheduler_runs sr ON sr.id=sra.scheduler_run_id
+                WHERE sr.job_id='daily_media_download'
+                  AND sr.scheduled_for='2026-08-01T18:20:00Z'
+                ORDER BY sra.attempt_number
+                """
+            ).fetchall()
+        self.assertEqual(
+            [tuple(row) for row in attempts],
+            [(1, "scheduled", "failed"), (2, "operator_retry", "succeeded")],
+        )
 
     def test_media_jobs_fail_when_candidate_probe_is_truncated(self) -> None:
         truncated_download = {
@@ -640,6 +790,237 @@ class V8SchedulerTest(unittest.TestCase):
                 ).fetchone()[0],
                 1,
             )
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM scheduler_run_attempts sra
+                    JOIN scheduler_runs sr ON sr.id=sra.scheduler_run_id
+                    WHERE sr.job_id='daily_report' AND sr.scheduled_for=?
+                    """,
+                    ("2026-08-05T00:00:00Z",),
+                ).fetchone()[0],
+                1,
+            )
+
+    def test_interrupted_attempt_is_retriable_and_late_owner_is_fenced(self) -> None:
+        occurrence = datetime(2026, 6, 1, 8, 0, tzinfo=SHANGHAI)
+        old_claim = _claim_run(
+            "daily_report",
+            occurrence,
+            db_path=self.db,
+            allow_retry=False,
+            invocation_source="scheduled",
+        )
+        self.assertIsNotNone(old_claim)
+        self.assertEqual(recover_interrupted_scheduler_runs(db_path=self.db), 1)
+        new_claim = _claim_run(
+            "daily_report",
+            occurrence,
+            db_path=self.db,
+            allow_retry=True,
+            invocation_source="startup_report_catchup",
+        )
+        self.assertIsNotNone(new_claim)
+        assert old_claim is not None
+        assert new_claim is not None
+        self.assertEqual(new_claim.attempt_number, 2)
+        with self.assertRaisesRegex(
+            Exception, "scheduler attempt is no longer active"
+        ):
+            _finish_run(
+                old_claim,
+                status="succeeded",
+                details={"owner": "stale"},
+                db_path=self.db,
+            )
+        _finish_run(
+            new_claim,
+            status="succeeded",
+            details={"owner": "current"},
+            db_path=self.db,
+        )
+        with connect(self.db) as connection:
+            run = connection.execute(
+                "SELECT status,details_json FROM scheduler_runs"
+            ).fetchone()
+            attempts = connection.execute(
+                """
+                SELECT attempt_number,status FROM scheduler_run_attempts
+                ORDER BY attempt_number
+                """
+            ).fetchall()
+        self.assertEqual(run["status"], "succeeded")
+        self.assertEqual(json.loads(run["details_json"]), {"owner": "current"})
+        self.assertEqual(
+            [tuple(row) for row in attempts],
+            [(1, "interrupted"), (2, "succeeded")],
+        )
+
+    def test_interruption_recovery_rejects_mismatched_running_ownership(self) -> None:
+        with connect(self.db) as connection:
+            ownerless_run_id = int(
+                connection.execute(
+                    """
+                    INSERT INTO scheduler_runs(
+                        job_id,scheduled_for,status,started_at,details_json
+                    ) VALUES ('daily_report','2026-06-01T00:00:00Z','running',?,'{}')
+                    """,
+                    (now_utc(),),
+                ).lastrowid
+            )
+            terminal_run_id = int(
+                connection.execute(
+                    """
+                    INSERT INTO scheduler_runs(
+                        job_id,scheduled_for,status,started_at,completed_at,details_json
+                    ) VALUES (
+                        'weekly_report','2026-06-01T00:30:00Z','succeeded',?,?, '{}'
+                    )
+                    """,
+                    (now_utc(), now_utc()),
+                ).lastrowid
+            )
+            connection.execute(
+                """
+                INSERT INTO scheduler_run_attempts(
+                    scheduler_run_id,attempt_number,invocation_source,status,
+                    started_at,details_json
+                ) VALUES (?,1,'scheduled','running',?,'{}')
+                """,
+                (terminal_run_id, now_utc()),
+            )
+            connection.commit()
+        with self.assertRaisesRegex(
+            SchedulerJobError,
+            "running scheduler occurrences and attempts are inconsistent",
+        ):
+            recover_interrupted_scheduler_runs(db_path=self.db)
+        with connect(self.db) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT status FROM scheduler_runs WHERE id=?",
+                    (ownerless_run_id,),
+                ).fetchone()[0],
+                "running",
+            )
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT status FROM scheduler_run_attempts
+                    WHERE scheduler_run_id=?
+                    """,
+                    (terminal_run_id,),
+                ).fetchone()[0],
+                "running",
+            )
+
+    def test_report_catchup_retries_failure_older_than_seven_days_only(self) -> None:
+        occurrence = datetime(2026, 6, 1, 8, 0, tzinfo=SHANGHAI)
+        with (
+            patch("v8.scheduler._run_job_action", side_effect=RuntimeError("boom")),
+            self.assertRaisesRegex(RuntimeError, "boom"),
+        ):
+            execute_job(
+                "daily_report",
+                occurrence,
+                db_path=self.db,
+                reports_root=self.reports,
+            )
+        with (
+            patch(
+                "v8.scheduler._run_job_action",
+                return_value=("partial", {"task_id": "old", "task_status": "partial"}),
+            ) as report_action,
+            patch("v8.scheduler.run_due_capture") as capture,
+            patch("v8.scheduler.run_media_download_queue") as download,
+            patch("v8.scheduler.run_media_processing_queue") as processing,
+            patch("v8.scheduler.run_media_cutoff") as cutoff,
+        ):
+            results = startup_catchup(
+                now=datetime(2026, 8, 15, 9, 0, tzinfo=SHANGHAI),
+                db_path=self.db,
+                reports_root=self.reports,
+            )
+        self.assertEqual(
+            [(item["job_id"], item["status"], item["attempt_number"]) for item in results],
+            [("daily_report", "partial", 2)],
+        )
+        report_action.assert_called_once()
+        capture.assert_not_called()
+        download.assert_not_called()
+        processing.assert_not_called()
+        cutoff.assert_not_called()
+
+    def test_missing_august_fifth_and_seventh_reports_are_partial_once(self) -> None:
+        from v8.reports import create_task, get_task
+
+        create_task(
+            task_type="daily",
+            period_start="2026-08-01",
+            period_end="2026-08-01",
+            creation_source="automatic",
+            db_path=self.db,
+        )
+        captured_at = now_utc()
+        with connect(self.db) as connection:
+            connection.executemany(
+                """
+                INSERT INTO content_items(
+                    link_id,platform,platform_content_id,canonical_url,content_type,
+                    published_at,imported_at,created_at,updated_at
+                ) VALUES (?, 'douyin', ?, ?, 'video', ?, ?, ?, ?)
+                """,
+                (
+                    (
+                        "CU0805",
+                        "catchup-0805",
+                        "https://www.douyin.com/video/catchup-0805",
+                        "2026-08-05T01:00:00Z",
+                        captured_at,
+                        captured_at,
+                        captured_at,
+                    ),
+                    (
+                        "CU0807",
+                        "catchup-0807",
+                        "https://www.douyin.com/video/catchup-0807",
+                        "2026-08-07T01:00:00Z",
+                        captured_at,
+                        captured_at,
+                        captured_at,
+                    ),
+                ),
+            )
+            connection.commit()
+        first = startup_catchup(
+            now=datetime(2026, 8, 15, 9, 0, tzinfo=SHANGHAI),
+            db_path=self.db,
+            reports_root=self.reports,
+        )
+        statuses = {
+            str(item["scheduled_for"]): str(item["status"])
+            for item in first
+            if item["job_id"] == "daily_report"
+        }
+        self.assertEqual(statuses["2026-08-06T00:00:00Z"], "partial")
+        self.assertEqual(statuses["2026-08-08T00:00:00Z"], "partial")
+        weekly = [item for item in first if item["job_id"] == "weekly_report"]
+        self.assertEqual(
+            [(item["scheduled_for"], item["status"]) for item in weekly],
+            [("2026-08-10T00:30:00Z", "partial")],
+        )
+        for task_id in ("D8-D-20260805-20260805", "D8-D-20260807-20260807"):
+            task = get_task(task_id, db_path=self.db)
+            self.assertEqual(task["task_status"], "partial")
+            self.assertEqual(len(task["revisions"]), 1)
+        second = startup_catchup(
+            now=datetime(2026, 8, 15, 9, 0, tzinfo=SHANGHAI),
+            db_path=self.db,
+            reports_root=self.reports,
+        )
+        self.assertEqual(second, [])
+        for task_id in ("D8-D-20260805-20260805", "D8-D-20260807-20260807"):
+            self.assertEqual(len(get_task(task_id, db_path=self.db)["revisions"]), 1)
 
     def test_media_processing_job_reports_media_and_duplicate_failures(self) -> None:
         retryable_media = {
@@ -674,8 +1055,6 @@ class V8SchedulerTest(unittest.TestCase):
         processing_queue.assert_called_once_with(
             limit=500,
             db_path=self.db,
-            published_start="2026-07-31T16:00:00Z",
-            published_end="2026-08-01T19:00:00Z",
         )
 
         media_ok = {
@@ -815,6 +1194,15 @@ class V8SchedulerTest(unittest.TestCase):
             snapshot = connection.execute(
                 "SELECT * FROM content_metric_snapshots"
             ).fetchone()
+            observation = connection.execute(
+                "SELECT * FROM content_metric_observations"
+            ).fetchone()
+            raw = connection.execute(
+                """
+                SELECT id,captured_at FROM provider_raw_responses
+                WHERE operation='douyin_video_statistics'
+                """
+            ).fetchone()
             slots = connection.execute("SELECT status FROM fetch_slots").fetchall()
             task_ids = {
                 row["task_id"]
@@ -822,6 +1210,10 @@ class V8SchedulerTest(unittest.TestCase):
             }
         self.assertEqual(content["title"], "新车内容详情")
         self.assertEqual(snapshot["view_count"], 100)
+        self.assertEqual(observation["view_count"], 100)
+        self.assertEqual(observation["raw_response_id"], raw["id"])
+        self.assertEqual(observation["captured_at"], raw["captured_at"])
+        self.assertEqual(snapshot["captured_at"], raw["captured_at"])
         self.assertTrue(all(row["status"] == "succeeded" for row in slots))
         self.assertEqual(task_ids, {"daily-capture-2026-08-02-bjt"})
 
@@ -1425,6 +1817,58 @@ class V8SchedulerTest(unittest.TestCase):
         self.assertIn("2026-08-02:douyin:page:1", discovery_windows)
         self.assertIn("2026-08-02:douyin:page:2", discovery_windows)
 
+    def test_daily_capture_marks_missing_or_repeated_cursor_partial(self) -> None:
+        upsert_account(
+            {
+                "phone": "13800138013",
+                "platforms": [
+                    {
+                        "platform": "douyin",
+                        "uid": "99887713",
+                        "nickname": "游标异常账号",
+                    }
+                ],
+            },
+            db_path=self.db,
+        )
+        mode = {"value": "missing"}
+
+        def supplier_call(operation, record):
+            if operation == "resolve_account":
+                data = {"reference": "MS4wLjAB" + "x" * 40}
+            elif operation == "discover_content":
+                data = {"items": [], "has_more": True}
+                if mode["value"] == "repeated":
+                    data["next_cursor"] = "same-cursor"
+            else:
+                raise AssertionError(f"unexpected operation: {operation}")
+            return ProviderResult(
+                data, {"operation": operation, "data": data}, 200, True
+            )
+
+        missing = run_due_capture(
+            datetime(2026, 8, 2, 2, 0, tzinfo=SHANGHAI),
+            db_path=self.db,
+            call_override=supplier_call,
+        )
+        self.assertEqual(missing["status"], "failed")
+        self.assertEqual(missing["discovery"][0]["status"], "partial")
+        self.assertEqual(
+            missing["discovery"][0]["stopped_reason"], "missing_next_cursor"
+        )
+
+        mode["value"] = "repeated"
+        repeated = run_due_capture(
+            datetime(2026, 8, 3, 2, 0, tzinfo=SHANGHAI),
+            db_path=self.db,
+            call_override=supplier_call,
+        )
+        self.assertEqual(repeated["status"], "failed")
+        self.assertEqual(repeated["discovery"][0]["status"], "partial")
+        self.assertEqual(
+            repeated["discovery"][0]["stopped_reason"], "cursor_repeated"
+        )
+
     def test_daily_discovery_slots_are_isolated_by_platform(self) -> None:
         upsert_account(
             {
@@ -1595,45 +2039,280 @@ class V8SchedulerTest(unittest.TestCase):
             ["succeeded"] * 4,
         )
 
-    def test_media_cutoff_routes_only_new_unfinished_content(self) -> None:
-        captured_at = "2026-08-02T00:00:00Z"
-        with connect(self.db) as connection:
-            connection.execute(
-                """
-                INSERT INTO content_items(
-                    link_id, platform, platform_content_id, canonical_url, title, body,
-                    content_type, source_group, imported_at, created_at, updated_at
-                ) VALUES ('A2BC3D','douyin','111111111','https://www.douyin.com/video/111111111',
-                          '新内容','汽车新内容','video','',?,?,?)
-                """,
-                (captured_at, captured_at, captured_at),
-            )
-            connection.execute(
-                """
-                INSERT INTO content_items(
-                    link_id, platform, platform_content_id, canonical_url, title, body,
-                    content_type, source_group, imported_at, created_at, updated_at
-                ) VALUES ('A2BC3E','douyin','222222222','https://www.douyin.com/video/222222222',
-                          '迁移内容','汽车迁移内容','video','30-account-random-sample',?,?,?)
-                """,
-                (captured_at, captured_at, captured_at),
-            )
-            connection.commit()
+    def test_media_cutoff_keeps_scope_without_creating_manual_review(self) -> None:
+        self._insert_media_cutoff_content(1)
+        self._insert_media_cutoff_content(
+            2, source_group="30-account-random-sample"
+        )
 
         result = run_media_cutoff(
             datetime(2026, 8, 2, 7, 30, tzinfo=SHANGHAI), db_path=self.db
         )
         self.assertEqual(result["candidates"], 1)
-        self.assertEqual(result["manual_required"], 1)
+        self.assertEqual(
+            result["state_counts"],
+            {
+                "complete": 0,
+                "terminal_insufficient": 0,
+                "terminal_failed": 0,
+                "pending": 1,
+            },
+        )
+        self.assertEqual(result["pending"], 1)
+        self.assertEqual(result["terminal"], 0)
+        self.assertEqual(result["terminal_coverage"], 0.0)
+        self.assertEqual(result["threshold"], 90.0)
         self.assertEqual(result["threshold_status"], "below_threshold")
+        self.assertNotIn("manual_required", result)
         with connect(self.db) as connection:
-            queue = connection.execute(
-                "SELECT content_id,reason_code,status FROM review_queue"
+            queue_count = connection.execute(
+                "SELECT COUNT(*) FROM review_queue"
+            ).fetchone()[0]
+        self.assertEqual(queue_count, 0)
+
+    def test_media_cutoff_evaluates_only_pending_evaluations_and_uses_ninety(
+        self,
+    ) -> None:
+        content_ids = [
+            self._insert_media_cutoff_content(index) for index in range(1, 11)
+        ]
+        self._insert_media_source_artifact(content_ids[8])
+        initial_states = {
+            content_id: MediaTerminalDetail("complete", "complete")
+            for content_id in content_ids[:8]
+        }
+        initial_states[content_ids[8]] = MediaTerminalDetail(
+            "pending", "evaluation_pending"
+        )
+        initial_states[content_ids[9]] = MediaTerminalDetail(
+            "pending", "source_missing"
+        )
+        final_states = dict(initial_states)
+        final_states[content_ids[8]] = MediaTerminalDetail(
+            "terminal_insufficient", "terminal_insufficient"
+        )
+        queue_reasons = (
+            "media_processing_incomplete",
+            "media_evidence_missing",
+            "stale_local_evidence",
+            "legacy_content_unavailable",
+        )
+        captured_at = "2026-08-02T01:00:00Z"
+        with connect(self.db) as connection:
+            for content_id, reason in zip(content_ids, queue_reasons):
+                connection.execute(
+                    """
+                    INSERT INTO review_queue(
+                        content_id,reason_code,status,created_at,updated_at
+                    ) VALUES (?,?,'manual_required',?,?)
+                    """,
+                    (content_id, reason, captured_at, captured_at),
+                )
+            connection.commit()
+
+        with (
+            patch(
+                "v8.scheduler.media_terminal_state_details",
+                side_effect=(initial_states, final_states),
+            ) as state_details,
+            patch(
+                "v8.scheduler.evaluate_content",
+                return_value=SimpleNamespace(
+                    evaluation_id=901,
+                    evidence_level="V1",
+                    created=True,
+                ),
+            ) as evaluate,
+        ):
+            result = run_media_cutoff(
+                datetime(2026, 8, 2, 7, 30, tzinfo=SHANGHAI),
+                db_path=self.db,
+            )
+
+        self.assertEqual(state_details.call_count, 2)
+        evaluate.assert_called_once_with(
+            content_ids[8],
+            db_path=self.db,
+            expected_active_release_id=V9_FIXTURE_RELEASE_ID,
+        )
+        self.assertEqual(
+            result["state_counts"],
+            {
+                "complete": 8,
+                "terminal_insufficient": 1,
+                "terminal_failed": 0,
+                "pending": 1,
+            },
+        )
+        self.assertEqual(result["pending"], 1)
+        self.assertEqual(result["terminal"], 9)
+        self.assertEqual(result["terminal_coverage"], 90.0)
+        self.assertEqual(result["threshold"], 90.0)
+        self.assertEqual(result["threshold_status"], "available")
+        self.assertEqual(result["evaluation"]["candidates"], 1)
+        self.assertEqual(result["evaluation"]["created"], 1)
+        self.assertEqual(result["evaluation"]["reused"], 0)
+        self.assertEqual(result["resolved_media_queue_rows"], 4)
+        with connect(self.db) as connection:
+            queues = connection.execute(
+                "SELECT status,resolved_at FROM review_queue ORDER BY id"
             ).fetchall()
         self.assertEqual(
-            [(row["content_id"], row["reason_code"], row["status"]) for row in queue],
-            [(1, "media_processing_incomplete", "manual_required")],
+            [(row["status"], row["resolved_at"] is not None) for row in queues],
+            [("resolved", True)] * 4,
         )
+
+    def test_media_cutoff_evaluates_completed_dag_on_the_next_day(self) -> None:
+        content_id = self._insert_media_cutoff_content(20)
+        self._insert_media_source_artifact(content_id)
+        processing = {content_id: MediaTerminalDetail("pending", "frames_pending")}
+        evaluation_pending = {
+            content_id: MediaTerminalDetail("pending", "evaluation_pending")
+        }
+        evaluated = {
+            content_id: MediaTerminalDetail(
+                "terminal_insufficient", "terminal_insufficient"
+            )
+        }
+
+        with (
+            patch(
+                "v8.scheduler.media_terminal_state_details",
+                side_effect=(
+                    processing,
+                    processing,
+                    evaluation_pending,
+                    evaluated,
+                ),
+            ),
+            patch(
+                "v8.scheduler.evaluate_content",
+                return_value=SimpleNamespace(
+                    evaluation_id=902,
+                    evidence_level="V1",
+                    created=True,
+                ),
+            ) as evaluate,
+        ):
+            first = run_media_cutoff(
+                datetime(2026, 8, 2, 7, 30, tzinfo=SHANGHAI),
+                db_path=self.db,
+            )
+            second = run_media_cutoff(
+                datetime(2026, 8, 3, 7, 30, tzinfo=SHANGHAI),
+                db_path=self.db,
+            )
+
+        self.assertEqual(first["candidates"], 1)
+        self.assertEqual(first["evaluation"]["candidates"], 0)
+        self.assertEqual(first["terminal_coverage"], 0.0)
+        self.assertEqual(second["candidates"], 0)
+        self.assertEqual(second["evaluation"]["candidates"], 1)
+        self.assertEqual(second["terminal_coverage"], 100.0)
+        evaluate.assert_called_once_with(
+            content_id,
+            db_path=self.db,
+            expected_active_release_id=V9_FIXTURE_RELEASE_ID,
+        )
+
+    def test_media_cutoff_does_not_evaluate_unrelated_global_content(self) -> None:
+        evaluation_pending_id = self._insert_media_cutoff_content(30)
+        processing_id = self._insert_media_cutoff_content(31)
+        no_source_id = self._insert_media_cutoff_content(32)
+        self._insert_media_source_artifact(evaluation_pending_id)
+        self._insert_media_source_artifact(processing_id)
+        initial_states = {
+            evaluation_pending_id: MediaTerminalDetail("pending", "evaluation_pending"),
+            processing_id: MediaTerminalDetail("pending", "ocr_pending"),
+        }
+        final_states = {
+            evaluation_pending_id: MediaTerminalDetail("complete", "complete")
+        }
+
+        with (
+            patch(
+                "v8.scheduler.media_terminal_state_details",
+                side_effect=(initial_states, final_states),
+            ) as state_details,
+            patch(
+                "v8.scheduler.evaluate_content",
+                return_value=SimpleNamespace(
+                    evaluation_id=903,
+                    evidence_level="V2",
+                    created=True,
+                ),
+            ) as evaluate,
+        ):
+            result = run_media_cutoff(
+                datetime(2026, 8, 3, 7, 30, tzinfo=SHANGHAI),
+                db_path=self.db,
+            )
+
+        self.assertEqual(result["candidates"], 0)
+        self.assertEqual(result["evaluation"]["candidates"], 1)
+        self.assertEqual(
+            state_details.call_args_list[0].args[2],
+            [evaluation_pending_id, processing_id],
+        )
+        self.assertNotIn(no_source_id, state_details.call_args_list[0].args[2])
+        evaluate.assert_called_once_with(
+            evaluation_pending_id,
+            db_path=self.db,
+            expected_active_release_id=V9_FIXTURE_RELEASE_ID,
+        )
+
+    def test_media_cutoff_evaluation_failure_preserves_legacy_media_queue(
+        self,
+    ) -> None:
+        content_id = self._insert_media_cutoff_content(1)
+        self._insert_media_source_artifact(content_id)
+        captured_at = "2026-08-02T01:00:00Z"
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                INSERT INTO review_queue(
+                    content_id,reason_code,status,created_at,updated_at
+                ) VALUES (?,'media_processing_incomplete','manual_required',?,?)
+                """,
+                (content_id, captured_at, captured_at),
+            )
+            connection.commit()
+        states = {content_id: MediaTerminalDetail("pending", "evaluation_pending")}
+        occurrence = datetime(2026, 8, 2, 7, 30, tzinfo=SHANGHAI)
+        with (
+            patch("v8.scheduler.media_terminal_state_details", return_value=states),
+            patch(
+                "v8.scheduler.evaluate_content",
+                side_effect=RuntimeError("evaluation failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "evaluation failed"),
+        ):
+            execute_job(
+                "daily_media_cutoff",
+                occurrence,
+                db_path=self.db,
+                reports_root=self.reports,
+            )
+
+        with connect(self.db) as connection:
+            queue = connection.execute(
+                """
+                SELECT status,resolved_at,updated_at FROM review_queue
+                WHERE content_id=? AND reason_code='media_processing_incomplete'
+                """,
+                (content_id,),
+            ).fetchone()
+            run = connection.execute(
+                """
+                SELECT status FROM scheduler_runs
+                WHERE job_id='daily_media_cutoff' ORDER BY id DESC LIMIT 1
+                """
+            ).fetchone()
+        self.assertEqual(
+            (queue["status"], queue["resolved_at"], queue["updated_at"]),
+            ("manual_required", None, captured_at),
+        )
+        self.assertEqual(run["status"], "failed")
 
 
 if __name__ == "__main__":

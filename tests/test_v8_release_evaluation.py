@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from v8.evaluation import (
     EvaluationError,
+    V8_RULE_VERSION,
     build_evidence_envelope,
     evaluate_content,
     evaluate_release_content,
@@ -382,7 +383,8 @@ class V8ReleaseEvaluationTest(unittest.TestCase):
                 connection.commit()
             before = self._business_counts()
             with self.assertRaisesRegex(
-                EvaluationError, "requires an evaluation-v8 release in backfilling"
+                EvaluationError,
+                "requires an evaluation-v8 or evaluation-v9 release in backfilling",
             ):
                 evaluate_release_content(
                     self.content_id, release_id=self.release_id, db_path=self.db
@@ -412,7 +414,8 @@ class V8ReleaseEvaluationTest(unittest.TestCase):
             connection.commit()
         before = self._business_counts()
         with self.assertRaisesRegex(
-            EvaluationError, "requires an evaluation-v8 release in backfilling"
+            EvaluationError,
+            "requires an evaluation-v8 or evaluation-v9 release in backfilling",
         ):
             evaluate_release_content(
                 self.content_id, release_id=self.release_id, db_path=self.db
@@ -431,7 +434,8 @@ class V8ReleaseEvaluationTest(unittest.TestCase):
             connection.commit()
         before = self._business_counts()
         with self.assertRaisesRegex(
-            EvaluationError, "requires an evaluation-v8 release in backfilling"
+            EvaluationError,
+            "requires an evaluation-v8 or evaluation-v9 release in backfilling",
         ):
             evaluate_release_content(
                 self.content_id, release_id=legacy_release_id, db_path=self.db
@@ -536,7 +540,7 @@ class V8ReleaseEvaluationTest(unittest.TestCase):
     def test_automatic_legacy_release_fails_before_idempotent_reuse(self) -> None:
         with connect(self.db) as connection:
             envelope_id, evidence_sha256, _ = build_evidence_envelope(
-                connection, self.content_id
+                connection, self.content_id, rule_version=V8_RULE_VERSION
             )
             release = connection.execute(
                 "SELECT * FROM evaluation_releases WHERE status='active'"

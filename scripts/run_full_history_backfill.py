@@ -130,18 +130,26 @@ def bind_campaign_contract(
         ).fetchall()
         if release is None:
             raise AbortRun("没有 active evaluation release；禁止先付费后才发现无法评估")
-        if str(release["rule_version"]) != "evaluation-v8":
-            raise AbortRun(
-                "active evaluation release 不是 evaluation-v8；"
-                "禁止进入全量付费回溯"
-            )
         matcher_sha = str(release["matcher_rule_sha256"] or "")
         if len(matcher_sha) != 64:
             raise AbortRun("active release 缺少有效 matcher hash；禁止付费回溯")
         source_root = str(REPO / "src" / "dcar_eval")
         if source_root not in sys.path:
             sys.path.insert(0, source_root)
-        from v8.evaluation import _load_release_runtime
+        from v8.evaluation import (
+            V8_RULE_VERSION,
+            V9_RULE_VERSION,
+            _load_release_runtime,
+        )
+
+        if str(release["rule_version"]) not in {
+            V8_RULE_VERSION,
+            V9_RULE_VERSION,
+        }:
+            raise AbortRun(
+                "active evaluation release 不是受支持的物化规则；"
+                "禁止进入全量付费回溯"
+            )
 
         try:
             runtime = _load_release_runtime(connection, release)
@@ -443,7 +451,7 @@ def phase_preflight() -> None:
         headers={
             "Authorization": f"Bearer {key}",
             "Accept": "application/json",
-            "User-Agent": "DCar-Insight-v8/1.0",
+            "User-Agent": "DCar-Insight/1.0",
         },
     )
     try:
@@ -989,9 +997,16 @@ def phase_postflight(state: Dict[str, Any], *, campaign: str) -> None:
     connection.row_factory = sqlite3.Row
     try:
         active = connection.execute(
-            "SELECT id FROM evaluation_releases WHERE status='active' "
+            "SELECT * FROM evaluation_releases WHERE status='active' "
             "ORDER BY activated_at DESC,id DESC LIMIT 1"
         ).fetchone()
+        expected_release = state.get("campaign_contract", {}).get(
+            "active_release"
+        )
+        if active is None or dict(active) != expected_release:
+            raise AbortRun(
+                "active evaluation release已偏离战役合同；禁止跨规则继续回溯"
+            )
         active_release_id = str(active["id"]) if active is not None else ""
         ids = sorted(inserted)
         for offset in range(0, len(ids), 400):
@@ -1373,7 +1388,7 @@ def main(argv: List[str] | None = None) -> int:
         phase_postflight(state, campaign=campaign)
         log(
             "=== 全量历史采集、当前快照与证据推进完成；"
-            "人工复核和新报告版本仍需独立验收 ==="
+            "质量披露和新报告版本仍需独立验收 ==="
         )
         return 0
     except AbortRun as abort:

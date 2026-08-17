@@ -133,7 +133,11 @@ Run this only after today's 02:00 capture has reached a terminal state and the
 07:30 media cutoff has succeeded. The script uses SQLite's online backup API,
 so it never copies a live WAL database directly. It then requires
 `quick_check=ok`, zero foreign key violations, the expected schema, and exact
-hashes for report and visible evidence files.
+hashes for report and visible evidence files. It also freezes one
+`dcar-runtime-identity-v1` value from the backup DB and refuses to build unless
+that identity is report v8.6, schema 13 / `scheduler-run-attempt-history`, and
+the active `evaluation-v9__selling-points-v5.2` release on the published v5.2
+taxonomy. The matcher SHA-256 is read from that release row, never hard-coded.
 
 ```sh
 cd /Users/mark/Documents/DcarAIGC
@@ -143,7 +147,7 @@ snapshot_dir="/private/tmp/dcar-snapshot-$(date -u +%Y%m%dT%H%M%SZ)"
   --project-root "$PWD" \
   --db app/data/dcar_insight.sqlite3 \
   --legacy-db app/data/web_mvp.sqlite3 \
-  --expected-user-version 11 \
+  --expected-user-version 13 \
   --output "$snapshot_dir"
 ```
 
@@ -151,6 +155,7 @@ The output contains:
 
 - consistent `databases/dcar_insight.sqlite3` and optional legacy DB backups;
 - `manifest.json` plus its separate SHA-256;
+- the exact report/schema/release/taxonomy/matcher runtime identity;
 - NUL-delimited `cache-files-from0` and `reports-files-from0` lists.
 
 The manifest uses the explicit `thin-server-v1` policy. Databases, legacy DB,
@@ -260,9 +265,9 @@ sudo /var/www/dcar-aigc/current/.venv/bin/python \
 
 Successful installation writes a non-secret receipt to
 `/var/lib/dcar-aigc/runtime/active-snapshot.json`. The API smoke check compares
-the active DB SHA-256, schema version, content count, and latest published date
-with the manifest. It also requires read-only mode, scheduler requested/enabled
-both false, and startup catch-up unrequested.
+the active DB SHA-256, schema version, content count, latest published date, and
+the full runtime identity with the manifest. It also requires read-only mode,
+scheduler requested/enabled both false, and startup catch-up unrequested.
 
 Restart the authentication gateway and Web together when the code release
 changed; a data-only snapshot does not require rebuilding the Web bundle or

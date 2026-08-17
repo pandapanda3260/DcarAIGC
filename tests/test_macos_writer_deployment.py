@@ -29,7 +29,7 @@ class MacOSWriterDeploymentTest(unittest.TestCase):
         self.assertTrue(value["KeepAlive"])
         self.assertEqual(environment["DCAR_READ_ONLY"], "0")
         self.assertEqual(environment["DCAR_SCHEDULER_ENABLED"], "1")
-        self.assertEqual(environment["DCAR_STARTUP_CATCHUP_ENABLED"], "0")
+        self.assertEqual(environment["DCAR_STARTUP_CATCHUP_ENABLED"], "1")
         self.assertEqual(environment["DCAR_WORKER_HOST"], "127.0.0.1")
         self.assertEqual(environment["DCAR_WORKER_PORT"], "8766")
         self.assertEqual(
@@ -67,6 +67,8 @@ class MacOSWriterDeploymentTest(unittest.TestCase):
 
         self.assertIn("I_ACKNOWLEDGE_DAILY_PROVIDER_LIMIT_USD_8", wrapper)
         self.assertIn("TIKHUB_API_KEY_FILE", wrapper)
+        self.assertIn("export DCAR_STARTUP_CATCHUP_ENABLED=1", wrapper)
+        self.assertIn("catchup=report_only", wrapper)
         self.assertIn("caffeinate -s", wrapper)
         self.assertIn("--host 127.0.0.1", wrapper)
         self.assertIn("--port 8766", wrapper)
@@ -81,6 +83,8 @@ class MacOSWriterDeploymentTest(unittest.TestCase):
         self.assertIn("USD 8", readme)
         self.assertIn("must stay powered, connected to the network, and awake", readme)
         self.assertIn("never calls `launchctl`", readme)
+        self.assertIn("It never runs `daily_capture`", readme)
+        self.assertIn("never triggered by startup catch-up", readme)
 
     def test_first_start_bootstraps_once_then_waits_for_run_at_load(self) -> None:
         readme = (MACOS_DEPLOY / "README.md").read_text(encoding="utf-8")

@@ -32,6 +32,15 @@ REQUIRED_RUNTIME_ARTIFACTS = (
     "data/cache/.platform_user_salt",
 )
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
+RUNTIME_IDENTITY_SCHEMA = "dcar-runtime-identity-v1"
+EXPECTED_REPORT_VERSION = "dcar-content-operations-report-v8.6"
+EXPECTED_DATABASE_SCHEMA_VERSION = 13
+EXPECTED_DATABASE_SCHEMA_MIGRATION = "scheduler-run-attempt-history"
+EXPECTED_ACTIVE_RELEASE_ID = "evaluation-v9__selling-points-v5.2"
+EXPECTED_ACTIVE_RELEASE_STATUS = "active"
+EXPECTED_RULE_VERSION = "evaluation-v9"
+EXPECTED_TAXONOMY_VERSION = "selling-points-v5.2"
+EXPECTED_TAXONOMY_STATUS = "published"
 
 
 class SnapshotBuildError(RuntimeError):
@@ -78,6 +87,80 @@ def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
         ).fetchone()
         is not None
     )
+
+
+def _runtime_identity(snapshot_db: Path) -> dict[str, Any]:
+    """Freeze the exact report/schema/release identity from the backup DB."""
+
+    with _connect_read_only(snapshot_db) as connection:
+        user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        try:
+            migration_rows = connection.execute(
+                "SELECT name FROM schema_migrations WHERE version=?",
+                (user_version,),
+            ).fetchall()
+            max_migration = connection.execute(
+                "SELECT MAX(version) FROM schema_migrations"
+            ).fetchone()[0]
+            release_rows = connection.execute(
+                """
+                SELECT er.id,er.rule_version,er.taxonomy_version,
+                       er.matcher_rule_sha256,er.status release_status,
+                       tv.status taxonomy_status
+                FROM evaluation_releases er
+                JOIN taxonomy_versions tv ON tv.version=er.taxonomy_version
+                WHERE er.status='active'
+                ORDER BY er.id
+                """
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise SnapshotBuildError(
+                "snapshot database lacks the required runtime identity tables"
+            ) from exc
+    if len(migration_rows) != 1 or max_migration != user_version:
+        raise SnapshotBuildError(
+            "snapshot database has an ambiguous schema migration identity"
+        )
+    if len(release_rows) != 1:
+        raise SnapshotBuildError(
+            "snapshot database must have exactly one active evaluation release"
+        )
+    release = release_rows[0]
+    matcher_rule_sha256 = str(release["matcher_rule_sha256"])
+    identity = {
+        "schema": RUNTIME_IDENTITY_SCHEMA,
+        "report_version": EXPECTED_REPORT_VERSION,
+        "database_schema_version": user_version,
+        "database_schema_migration": str(migration_rows[0]["name"]),
+        "active_release_id": str(release["id"]),
+        "active_release_status": str(release["release_status"]),
+        "rule_version": str(release["rule_version"]),
+        "taxonomy_version": str(release["taxonomy_version"]),
+        "taxonomy_status": str(release["taxonomy_status"]),
+        "matcher_rule_sha256": matcher_rule_sha256,
+    }
+    expected = {
+        "schema": RUNTIME_IDENTITY_SCHEMA,
+        "report_version": EXPECTED_REPORT_VERSION,
+        "database_schema_version": EXPECTED_DATABASE_SCHEMA_VERSION,
+        "database_schema_migration": EXPECTED_DATABASE_SCHEMA_MIGRATION,
+        "active_release_id": EXPECTED_ACTIVE_RELEASE_ID,
+        "active_release_status": EXPECTED_ACTIVE_RELEASE_STATUS,
+        "rule_version": EXPECTED_RULE_VERSION,
+        "taxonomy_version": EXPECTED_TAXONOMY_VERSION,
+        "taxonomy_status": EXPECTED_TAXONOMY_STATUS,
+    }
+    for key, value in expected.items():
+        if identity.get(key) != value:
+            raise SnapshotBuildError(
+                f"snapshot runtime identity mismatch for {key}: "
+                f"{identity.get(key)!r}, expected {value!r}"
+            )
+    if SHA256_RE.fullmatch(matcher_rule_sha256) is None:
+        raise SnapshotBuildError(
+            "snapshot active release has an invalid matcher_rule_sha256"
+        )
+    return identity
 
 
 def _validate_database(
@@ -506,6 +589,9 @@ def build_snapshot(
                     expected_user_version=None,
                 )
             )
+        runtime_identity = _runtime_identity(
+            database_dir / "dcar_insight.sqlite3"
+        )
         files, optional_reuse_files = _collect_artifacts(
             database_dir / "dcar_insight.sqlite3", project_root=project_root
         )
@@ -520,6 +606,7 @@ def build_snapshot(
             "schema": BUNDLE_SCHEMA,
             "snapshot_id": snapshot_id,
             "created_at": _utc_now(),
+            "runtime_identity": runtime_identity,
             "databases": databases,
             "freshness": _freshness(database_dir / "dcar_insight.sqlite3"),
             "artifact_policy": {

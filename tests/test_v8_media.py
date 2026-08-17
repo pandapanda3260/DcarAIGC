@@ -4622,7 +4622,7 @@ class V8MediaTest(unittest.TestCase):
         self.assertEqual(result["candidates"], 0)
         compile_ocr.assert_not_called()
 
-    def test_media_queue_prioritizes_newest_published_content(self) -> None:
+    def test_media_queue_orders_newest_first_without_excluding_old_content(self) -> None:
         captured_at = now_utc()
         with connect(self.db) as connection:
             connection.execute(
@@ -4663,14 +4663,6 @@ class V8MediaTest(unittest.TestCase):
             media._queue_content_ids(stage="download", limit=3, db_path=self.db),
             [3, 2, 1],
         )
-        self.assertEqual(
-            media._queue_content_ids(
-                stage="download", limit=3, db_path=self.db,
-                published_start="2026-07-31T16:00:00Z",
-                published_end="2026-08-02T18:00:00Z",
-            ),
-            [3, 2],
-        )
 
     def test_download_queue_probes_one_extra_without_executing_it(self) -> None:
         def downloaded(content_id: int, **_kwargs: object) -> dict[str, object]:
@@ -4695,8 +4687,6 @@ class V8MediaTest(unittest.TestCase):
             stage="download",
             limit=3,
             db_path=self.db,
-            published_start=None,
-            published_end=None,
         )
         self.assertEqual([item.args[0] for item in process.call_args_list], [1, 2])
         self.assertEqual(result["candidates"], 2)
@@ -4744,8 +4734,6 @@ class V8MediaTest(unittest.TestCase):
             stage="process",
             limit=3,
             db_path=self.db,
-            published_start=None,
-            published_end=None,
         )
         self.assertEqual([item.args[0] for item in process.call_args_list], [1, 2])
         self.assertEqual(result["candidates"], 2)
@@ -4765,8 +4753,6 @@ class V8MediaTest(unittest.TestCase):
             stage="download",
             limit=media.MEDIA_QUEUE_BATCH_LIMIT + 1,
             db_path=self.db,
-            published_start=None,
-            published_end=None,
         )
         self.assertEqual(media.MEDIA_QUEUE_BATCH_LIMIT, 500)
         self.assertFalse(result["has_more"])
@@ -5022,7 +5008,7 @@ class V8MediaTest(unittest.TestCase):
             }
         self.assertEqual(statuses["f" * 64], "running")
 
-    def test_queue_recovery_never_writes_outside_limit_date_scope(self) -> None:
+    def test_queue_recovery_includes_old_content_with_current_work_slots(self) -> None:
         media_root = self.root / "recovery-window"
         captured_at = "2000-01-01T00:00:00Z"
         versions = media.processor_versions()
@@ -5063,15 +5049,12 @@ class V8MediaTest(unittest.TestCase):
                     (artifact["sha256"], versions["asr"], captured_at, captured_at),
                 )
                 connection.commit()
-            with patch.object(media, "compile_ocr_binary") as compile_ocr:
-                result = media.run_media_processing_queue(
-                    limit=1,
-                    db_path=self.db,
-                    published_start="2099-01-01T00:00:00Z",
-                )
-            compile_ocr.assert_not_called()
-        self.assertEqual(result["candidates"], 0)
-        self.assertEqual(result["stale_recovery"]["recovered"], 0)
+            selected = media._queue_recovery_scope_content_ids(
+                stage="process",
+                limit=1,
+                db_path=self.db,
+            )
+        self.assertEqual(selected, [1])
         with connect(self.db) as connection:
             status = connection.execute(
                 "SELECT status FROM media_processing_slots WHERE processor_type='asr'"

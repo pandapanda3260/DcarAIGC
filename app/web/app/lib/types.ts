@@ -1,4 +1,4 @@
-export type Section = "overview" | "tasks" | "accounts" | "contents" | "selling-points";
+export type Section = "overview" | "tasks" | "accounts" | "contents" | "selling-points" | "spu-audience";
 export type WindowKey = "yesterday" | "this_week" | "last_week";
 export type OverviewChannelKey = "douyin" | "xiaohongshu";
 export type BusinessSceneKey = "used_car" | "new_car" | "media";
@@ -141,9 +141,35 @@ export type TaskDetail = Task & {
   content_counts: Record<string, number>;
 };
 
+export type MetricsFreshnessDetail = {
+  status: "available" | "below_threshold" | "not_applicable";
+  fresh_count: number;
+  as_of_snapshot_count: number;
+  eligible_count: number;
+  percentage: number | null;
+  reason: string;
+};
+
+export type DiscoveryCoverageDetail = {
+  status: "available" | "below_threshold" | "not_applicable";
+  covered_identity_occurrence_count: number;
+  eligible_identity_occurrence_count: number;
+  observed_occurrence_count: number;
+  expected_occurrence_count: number;
+  percentage: number | null;
+  reason: string;
+};
+
 export type ReportView = {
   task: { task_status: string; name: string };
-  data_quality: Record<string, number | boolean>;
+  metadata?: {
+    collection_cutoff_at?: string | null;
+  };
+  data_quality: Record<string, unknown>;
+  data_quality_details?: {
+    discovery_coverage?: DiscoveryCoverageDetail | null;
+    metrics_freshness?: MetricsFreshnessDetail | null;
+  } | null;
   summary_metrics: Record<string, Metric>;
   channels?: Record<OverviewChannelKey, OverviewChannel> | null;
   platform_dimensions: Array<Record<string, string | number | null>>;
@@ -183,6 +209,24 @@ export type Account = {
   platforms: PlatformIdentity[];
 };
 
+export type ContentTagSpu = {
+  spu_id: string;
+  series: string;
+  brand: string;
+  trim_label: string | null;
+  resolved_level: "series" | "trim";
+  score: number;
+  matched_aliases: string[];
+};
+
+export type ContentTagAudience = {
+  code: string;
+  label: string;
+  source: "content_explicit" | "rule_prior" | "llm";
+};
+
+export type ContentTagScene = { code: string; label: string };
+
 export type ContentItem = {
   id: number;
   link_id: string;
@@ -212,6 +256,11 @@ export type ContentItem = {
   comment_count: number | null;
   metrics_captured_at: string | null;
   duplicate_original_link_id: string | null;
+  spu: ContentTagSpu | null;
+  spu_secondary_count: number;
+  spu_gray_count: number;
+  audience: ContentTagAudience | null;
+  scenes: ContentTagScene[];
 };
 
 export type EvidenceBundle = {
@@ -285,4 +334,134 @@ export type SellingPointResponse = {
   taxonomy: { version: string; status: string } | null;
   windows?: Partial<Record<WindowKey, SellingPointWindowMeta>>;
   items: SellingPoint[];
+};
+
+export type SpuAliasEntry = { alias: string; alias_type: string; ambiguous: boolean };
+
+export type SpuAssetRow = {
+  spu_id: string;
+  brand: string;
+  series: string;
+  series_slug: string;
+  trim_label: string | null;
+  is_series_node: boolean;
+  model_year: number | null;
+  powertrain: string;
+  body_style: string;
+  price_low: number | null;
+  price_high: number | null;
+  audience_primary: string | null;
+  audience_secondary: string | null;
+  aliases: SpuAliasEntry[];
+};
+
+export type SpuAudienceDim = { code: string; label: string; definition: string; signals: string[] };
+
+export type SpuSceneDim = {
+  code: string;
+  label: string;
+  definition: string;
+  triggers: string[];
+  negatives: string[];
+};
+
+export type SpuLlmSummary = {
+  enabled?: boolean;
+  targets?: number;
+  called?: number;
+  cache_hits?: number;
+  accepted?: number;
+  rejected?: number;
+  errors?: number;
+  spu_filled?: number;
+  gray_upgraded?: number;
+  gray_overridden?: number;
+  trim_refined?: number;
+  scene_filled?: number;
+  audience_filled?: number;
+  out_of_catalog?: number;
+  aborted?: string | null;
+  error?: string;
+  note?: string;
+};
+
+export type SpuAssociationRun = {
+  id: number;
+  started_at: string;
+  finished_at: string | null;
+  status: "running" | "succeeded" | "failed";
+  rule_version: string;
+  contents_total: number;
+  spu_linked: number;
+  trim_resolved: number;
+  gray_count: number;
+  scene_linked: number;
+  audience_linked: number;
+  insufficient_evidence: number;
+  summary?: { processed?: number; eligible?: number; published_total?: number; mode?: string; note?: string; phase?: string; llm_processed?: number; llm_total?: number; llm?: SpuLlmSummary | null } | null;
+};
+
+export type SpuAudienceAssets = {
+  ready: boolean;
+  rule_version?: string;
+  seed_version?: string;
+  spu: SpuAssetRow[];
+  audiences: SpuAudienceDim[];
+  scenes: SpuSceneDim[];
+  audience_scene_map: Array<{ audience_code: string; core: string[]; related: string[] }>;
+  last_run: SpuAssociationRun | null;
+  stale_content_count?: number;
+};
+
+export type SpuStatsKey = { code: string; label: string };
+
+export type SpuStatsDetailRow = {
+  spu: { spu_id: string; label: string; series: string | null; trim_label: string | null };
+  audience: SpuStatsKey;
+  scene: SpuStatsKey;
+  posts: number;
+  views: number | null;
+  low_sample: boolean;
+};
+
+export type SpuChannelShare = {
+  posts: number;
+  views: number | null;
+  post_share: number | null;
+  view_share: number | null;
+  post_denominator: number;
+  view_denominator: number;
+};
+
+export type SpuRollupRow = {
+  key: string;
+  label: string;
+  posts: number;
+  views: number | null;
+  channels?: Record<string, SpuChannelShare>;
+};
+
+export type SpuAudienceStats = {
+  ready: boolean;
+  window?: string;
+  platform?: string;
+  rule_version?: string;
+  totals?: { posts: number; valid_exposure_views: number };
+  coverage?: {
+    spu_percentage: number | null;
+    audience_percentage: number | null;
+    scene_percentage: number | null;
+    trim_percentage: number | null;
+  };
+  exposure_gate?: { classified_share: number | null; threshold: number; status: string };
+  channel_totals?: Record<string, { posts: number; valid_views: number; classified_share: number | null; views_published: boolean }>;
+  detail?: SpuStatsDetailRow[];
+  spu_rollup?: SpuRollupRow[];
+  audience_rollup?: SpuRollupRow[];
+  scene_rollup?: SpuRollupRow[];
+  gaps?: {
+    missing: Array<{ series: string; series_posts: number; audience: SpuStatsKey; scene: SpuStatsKey }>;
+    overflow: Array<{ audience: SpuStatsKey; scene: SpuStatsKey; posts: number }>;
+  };
+  footnotes?: string[];
 };

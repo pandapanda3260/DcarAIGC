@@ -20,10 +20,12 @@ from .release_management import (
     _require_production_receipt_chain,
 )
 from .storage import (
-    CURRENT_SCHEMA_MIGRATION_NAME,
     LEGACY_V7_RELEASE_ID,
     SCHEMA_VERSION,
+    SchemaMigrationError,
+    configure_connection_safety,
     now_utc,
+    require_schema_compatibility,
     transaction,
 )
 
@@ -139,7 +141,7 @@ def _existing_connection(
             f"{path.resolve().as_uri()}?mode={mode}", uri=True, timeout=30
         )
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys=ON")
+        configure_connection_safety(connection)
         connection.execute("PRAGMA busy_timeout=30000")
         if read_only:
             connection.execute("PRAGMA query_only=ON")
@@ -364,16 +366,14 @@ def _load_manifest_boundary(manifest_path: Path) -> ReportRepairBoundary:
 
 
 def _require_v9(connection: sqlite3.Connection) -> None:
-    user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    migration = connection.execute(
-        "SELECT name FROM schema_migrations WHERE version=?", (SCHEMA_VERSION,)
-    ).fetchall()
-    if (
-        user_version != SCHEMA_VERSION
-        or len(migration) != 1
-        or str(migration[0]["name"]) != CURRENT_SCHEMA_MIGRATION_NAME
-    ):
-        raise ReportRepairError(f"complete schema v{SCHEMA_VERSION} is required")
+    try:
+        require_schema_compatibility(
+            connection, supported_versions=frozenset({SCHEMA_VERSION})
+        )
+    except SchemaMigrationError as error:
+        raise ReportRepairError(
+            f"complete schema v{SCHEMA_VERSION} is required"
+        ) from error
     revision_columns = {
         str(row[1]) for row in connection.execute("PRAGMA table_info(report_revisions)")
     }

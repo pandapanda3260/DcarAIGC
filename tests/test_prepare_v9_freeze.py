@@ -65,8 +65,19 @@ class PrepareV9FreezeTest(unittest.TestCase):
             CREATE TABLE evidence_envelopes(
                 id INTEGER PRIMARY KEY, content_id INTEGER, evidence_sha256 TEXT
             );
+            CREATE TABLE evaluation_releases(
+                id TEXT PRIMARY KEY, rule_version TEXT, taxonomy_version TEXT,
+                matcher_rule_sha256 TEXT, status TEXT, created_at TEXT,
+                updated_at TEXT, activated_at TEXT
+            );
             INSERT INTO content_items
             VALUES (1, 'title', 'body', 'uid', 'name', 'video', NULL);
+            INSERT INTO evaluation_releases VALUES (
+                'freeze-v8', 'evaluation-v8', 'selling-points-v5.2',
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                'active', '2026-08-04T00:00:00Z',
+                '2026-08-04T00:00:00Z', '2026-08-04T00:00:00Z'
+            );
             """
         )
         payload = artifact.read_bytes()
@@ -118,6 +129,10 @@ class PrepareV9FreezeTest(unittest.TestCase):
         manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["source_total_changes"], 0)
         self.assertEqual(
+            manifest["active_evaluation_release"]["rule_version"],
+            "evaluation-v8",
+        )
+        self.assertEqual(
             manifest["content_evidence_inventory"]["envelope_states"],
             {"absent": 1},
         )
@@ -135,6 +150,26 @@ class PrepareV9FreezeTest(unittest.TestCase):
             )
         finally:
             copied.close()
+
+    def test_active_non_v8_release_fails_closed(self) -> None:
+        connection = sqlite3.connect(self.db)
+        try:
+            connection.execute(
+                "UPDATE evaluation_releases SET rule_version='evaluation-v9'"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaisesRegex(
+            freeze.FreezeError, "active evaluation-v8 release"
+        ):
+            freeze.create_freeze_bundle(
+                database=self.db,
+                output_root=self.root / "backups",
+                freeze_lock=self.lock,
+                protected_ports=(),
+                require_no_writer_handles=False,
+            )
 
     def test_missing_operator_lock_fails_before_output(self) -> None:
         self.lock.unlink()
@@ -241,7 +276,7 @@ class ApiLifespanSwitchTest(unittest.IsolatedAsyncioTestCase):
                 INSERT INTO evaluation_releases(
                     id,rule_version,taxonomy_version,matcher_rule_sha256,status,
                     created_at,updated_at,activated_at
-                ) VALUES ('evaluation-v8__selling-points-v5.1','evaluation-v8',
+                ) VALUES ('evaluation-v9__selling-points-v5.1','evaluation-v9',
                           'selling-points-v5.1',?,'active',?,?,?)
                 """,
                 (

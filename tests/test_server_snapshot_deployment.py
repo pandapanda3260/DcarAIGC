@@ -10,9 +10,17 @@ import stat
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
 from unittest.mock import patch
+
+from v8.contracts import CURRENT_REPORT_RULE_VERSION, CURRENT_REPORT_VERSION
+from v8.release_management_v9 import (
+    TARGET_RELEASE_ID,
+    TAXONOMY_VERSION,
+)
+from v8.storage import CURRENT_SCHEMA_MIGRATION_NAME, SCHEMA_VERSION
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +47,17 @@ installer = _load_module(
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_bundle_manifest(bundle: Path, value: dict[str, object]) -> None:
+    payload = (
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    (bundle / "manifest.json").write_bytes(payload)
+    (bundle / "manifest.sha256").write_text(
+        hashlib.sha256(payload).hexdigest() + "  manifest.json\n",
+        encoding="ascii",
+    )
 
 
 def _create_main_database(path: Path, project_root: Path) -> None:
@@ -69,7 +88,7 @@ def _create_main_database(path: Path, project_root: Path) -> None:
     try:
         connection.executescript(
             """
-            PRAGMA user_version=11;
+            PRAGMA user_version=13;
             CREATE TABLE content_items(
                 id INTEGER PRIMARY KEY,
                 published_at TEXT,
@@ -80,6 +99,15 @@ def _create_main_database(path: Path, project_root: Path) -> None:
                 scheduled_for TEXT,
                 status TEXT,
                 completed_at TEXT
+            );
+            CREATE TABLE schema_migrations(version INTEGER, name TEXT);
+            CREATE TABLE taxonomy_versions(version TEXT, status TEXT);
+            CREATE TABLE evaluation_releases(
+                id TEXT,
+                rule_version TEXT,
+                taxonomy_version TEXT,
+                matcher_rule_sha256 TEXT,
+                status TEXT
             );
             CREATE TABLE evidence_artifacts(
                 local_path TEXT,
@@ -104,6 +132,18 @@ def _create_main_database(path: Path, project_root: Path) -> None:
             INSERT INTO scheduler_runs VALUES(
                 'daily_capture','2026-08-10T18:00:00Z','succeeded',
                 '2026-08-10T18:10:00Z'
+            );
+            INSERT INTO schema_migrations VALUES(
+                13,'scheduler-run-attempt-history'
+            );
+            INSERT INTO taxonomy_versions VALUES(
+                'selling-points-v5.2','published'
+            );
+            INSERT INTO evaluation_releases VALUES(
+                'evaluation-v9__selling-points-v5.2','evaluation-v9',
+                'selling-points-v5.2',
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                'active'
             );
             """
         )
@@ -151,7 +191,7 @@ def _create_old_active_database(path: Path) -> None:
     connection = sqlite3.connect(path)
     try:
         connection.executescript(
-            "PRAGMA user_version=11; CREATE TABLE active_marker(value TEXT);"
+            "PRAGMA user_version=13; CREATE TABLE active_marker(value TEXT);"
             "INSERT INTO active_marker VALUES('old');"
         )
         connection.commit()
@@ -181,7 +221,7 @@ class ServerSnapshotDeploymentTest(unittest.TestCase):
             database=self.database,
             legacy_database=self.legacy_database,
             output=self.bundle,
-            expected_user_version=11,
+            expected_user_version=13,
         )
 
     def server_config(self) -> object:
@@ -204,6 +244,21 @@ class ServerSnapshotDeploymentTest(unittest.TestCase):
     def test_builder_creates_online_backups_and_hash_lists(self) -> None:
         manifest = self.build_bundle()
         self.assertEqual(manifest["schema"], builder.BUNDLE_SCHEMA)
+        self.assertEqual(
+            manifest["runtime_identity"],
+            {
+                "schema": "dcar-runtime-identity-v1",
+                "report_version": "dcar-content-operations-report-v8.6",
+                "database_schema_version": 13,
+                "database_schema_migration": "scheduler-run-attempt-history",
+                "active_release_id": "evaluation-v9__selling-points-v5.2",
+                "active_release_status": "active",
+                "rule_version": "evaluation-v9",
+                "taxonomy_version": "selling-points-v5.2",
+                "taxonomy_status": "published",
+                "matcher_rule_sha256": "a" * 64,
+            },
+        )
         self.assertEqual(manifest["artifact_policy"]["name"], "thin-server-v1")
         self.assertEqual(manifest["file_count"], 4)
         self.assertEqual(
@@ -229,13 +284,199 @@ class ServerSnapshotDeploymentTest(unittest.TestCase):
         )
         snapshot = sqlite3.connect(self.bundle / "databases/dcar_insight.sqlite3")
         try:
-            self.assertEqual(snapshot.execute("PRAGMA user_version").fetchone()[0], 11)
+            self.assertEqual(snapshot.execute("PRAGMA user_version").fetchone()[0], 13)
             self.assertEqual(
                 snapshot.execute("SELECT COUNT(*) FROM content_items").fetchone()[0],
                 1,
             )
         finally:
             snapshot.close()
+
+    def test_server_runbook_pins_schema_13(self) -> None:
+        runbook = (REPOSITORY_ROOT / "deploy/server/README.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("--expected-user-version 13", runbook)
+
+    def test_deployment_identity_constants_match_current_runtime_contracts(
+        self,
+    ) -> None:
+        for module in (builder, installer):
+            self.assertEqual(module.EXPECTED_REPORT_VERSION, CURRENT_REPORT_VERSION)
+            self.assertEqual(
+                module.EXPECTED_DATABASE_SCHEMA_VERSION, SCHEMA_VERSION
+            )
+            self.assertEqual(
+                module.EXPECTED_DATABASE_SCHEMA_MIGRATION,
+                CURRENT_SCHEMA_MIGRATION_NAME,
+            )
+            self.assertEqual(module.EXPECTED_ACTIVE_RELEASE_ID, TARGET_RELEASE_ID)
+            self.assertEqual(module.EXPECTED_RULE_VERSION, CURRENT_REPORT_RULE_VERSION)
+            self.assertEqual(module.EXPECTED_TAXONOMY_VERSION, TAXONOMY_VERSION)
+
+    def test_builder_refuses_wrong_release_or_schema_migration_identity(self) -> None:
+        for statement in (
+            """
+            UPDATE evaluation_releases
+            SET id='evaluation-v8__selling-points-v5.2',rule_version='evaluation-v8'
+            """,
+            """
+            UPDATE schema_migrations
+            SET name='interaction-user-v1-fallback-keys' WHERE version=13
+            """,
+        ):
+            candidate = self.root / f"candidate-{len(list(self.root.glob('candidate-*')))}.sqlite3"
+            shutil.copy2(self.database, candidate)
+            with sqlite3.connect(candidate) as connection:
+                connection.execute(statement)
+                connection.commit()
+            output = candidate.with_suffix(".bundle")
+            with self.assertRaisesRegex(
+                builder.SnapshotBuildError, "runtime identity mismatch"
+            ):
+                builder.build_snapshot(
+                    project_root=self.project,
+                    database=candidate,
+                    output=output,
+                    expected_user_version=13,
+                )
+            self.assertFalse(output.exists())
+
+    def test_installer_rejects_self_consistent_wrong_release_before_service_stop(
+        self,
+    ) -> None:
+        self.build_bundle()
+        config = self.server_config()
+        database_path = self.bundle / "databases/dcar_insight.sqlite3"
+        with sqlite3.connect(database_path) as connection:
+            connection.execute(
+                """
+                UPDATE evaluation_releases
+                SET id='evaluation-v8__selling-points-v5.2',rule_version='evaluation-v8'
+                """
+            )
+            connection.commit()
+        manifest_path = self.bundle / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["runtime_identity"]["active_release_id"] = (
+            "evaluation-v8__selling-points-v5.2"
+        )
+        manifest["runtime_identity"]["rule_version"] = "evaluation-v8"
+        main = next(
+            item
+            for item in manifest["databases"]
+            if item["name"] == "dcar_insight.sqlite3"
+        )
+        main["byte_size"] = database_path.stat().st_size
+        main["sha256"] = _sha256(database_path)
+        _write_bundle_manifest(self.bundle, manifest)
+        actions: list[str] = []
+        with self.assertRaisesRegex(
+            installer.SnapshotInstallError, "active_release_id"
+        ):
+            installer.install_bundle(
+                self.bundle,
+                config,
+                service_action=actions.append,
+                smoke_check=lambda: None,
+            )
+        self.assertEqual(actions, [])
+
+    def test_installer_rejects_legacy_bundle_without_runtime_identity(self) -> None:
+        self.build_bundle()
+        config = self.server_config()
+        manifest = json.loads(
+            (self.bundle / "manifest.json").read_text(encoding="utf-8")
+        )
+        manifest.pop("runtime_identity")
+        _write_bundle_manifest(self.bundle, manifest)
+        actions: list[str] = []
+        with self.assertRaisesRegex(
+            installer.SnapshotInstallError, "runtime identity has an invalid shape"
+        ):
+            installer.install_bundle(
+                self.bundle,
+                config,
+                service_action=actions.append,
+                smoke_check=lambda: None,
+            )
+        self.assertEqual(actions, [])
+
+    def test_installer_rejects_self_consistent_wrong_schema_before_service_stop(
+        self,
+    ) -> None:
+        self.build_bundle()
+        config = self.server_config()
+        database_path = self.bundle / "databases/dcar_insight.sqlite3"
+        with sqlite3.connect(database_path) as connection:
+            connection.execute("DELETE FROM schema_migrations")
+            connection.execute(
+                "INSERT INTO schema_migrations VALUES(12,'append-only-metric-observations')"
+            )
+            connection.execute("PRAGMA user_version=12")
+            connection.commit()
+        manifest = json.loads(
+            (self.bundle / "manifest.json").read_text(encoding="utf-8")
+        )
+        manifest["runtime_identity"]["database_schema_version"] = 12
+        manifest["runtime_identity"]["database_schema_migration"] = (
+            "append-only-metric-observations"
+        )
+        main = next(
+            item
+            for item in manifest["databases"]
+            if item["name"] == "dcar_insight.sqlite3"
+        )
+        main["user_version"] = 12
+        main["byte_size"] = database_path.stat().st_size
+        main["sha256"] = _sha256(database_path)
+        _write_bundle_manifest(self.bundle, manifest)
+        actions: list[str] = []
+        with self.assertRaisesRegex(
+            installer.SnapshotInstallError, "database_schema_version"
+        ):
+            installer.install_bundle(
+                self.bundle,
+                config,
+                service_action=actions.append,
+                smoke_check=lambda: None,
+            )
+        self.assertEqual(actions, [])
+
+    def test_installer_rejects_database_identity_drift_from_signed_manifest(
+        self,
+    ) -> None:
+        self.build_bundle()
+        config = self.server_config()
+        database_path = self.bundle / "databases/dcar_insight.sqlite3"
+        with sqlite3.connect(database_path) as connection:
+            connection.execute(
+                "UPDATE evaluation_releases SET matcher_rule_sha256=?",
+                ("b" * 64,),
+            )
+            connection.commit()
+        manifest = json.loads(
+            (self.bundle / "manifest.json").read_text(encoding="utf-8")
+        )
+        main = next(
+            item
+            for item in manifest["databases"]
+            if item["name"] == "dcar_insight.sqlite3"
+        )
+        main["byte_size"] = database_path.stat().st_size
+        main["sha256"] = _sha256(database_path)
+        _write_bundle_manifest(self.bundle, manifest)
+        actions: list[str] = []
+        with self.assertRaisesRegex(
+            installer.SnapshotInstallError, "does not match the manifest"
+        ):
+            installer.install_bundle(
+                self.bundle,
+                config,
+                service_action=actions.append,
+                smoke_check=lambda: None,
+            )
+        self.assertEqual(actions, [])
 
     def test_compose_keeps_replica_database_and_artifacts_read_only(self) -> None:
         compose = (REPOSITORY_ROOT / "deploy/server/compose.yml").read_text(
@@ -479,6 +720,44 @@ class ServerSnapshotDeploymentTest(unittest.TestCase):
         finally:
             active.close()
 
+    def test_runtime_identity_smoke_drift_automatically_restores_previous_snapshot(
+        self,
+    ) -> None:
+        manifest = self.build_bundle()
+        config = self.server_config()
+        config.database_root.mkdir(parents=True)
+        _create_old_active_database(config.database_root / "dcar_insight.sqlite3")
+        self.stage_artifacts(manifest, config)
+        actions: list[str] = []
+        smoke_calls = 0
+
+        def smoke() -> None:
+            nonlocal smoke_calls
+            smoke_calls += 1
+            if smoke_calls == 1:
+                raise installer.SnapshotInstallError(
+                    "replica runtime identity is not the staged snapshot"
+                )
+
+        with self.assertRaisesRegex(
+            installer.SnapshotInstallError, "previous databases were restored"
+        ):
+            installer.install_bundle(
+                self.bundle,
+                config,
+                service_action=actions.append,
+                smoke_check=smoke,
+            )
+        self.assertEqual(actions, ["stop", "start", "stop", "start"])
+        self.assertEqual(smoke_calls, 2)
+        with sqlite3.connect(
+            config.database_root / "dcar_insight.sqlite3"
+        ) as active:
+            self.assertEqual(
+                active.execute("SELECT value FROM active_marker").fetchone()[0],
+                "old",
+            )
+
     def test_failed_smoke_restores_overwritten_artifact_bytes(self) -> None:
         manifest = self.build_bundle()
         config = self.server_config()
@@ -550,6 +829,7 @@ class ServerSnapshotDeploymentTest(unittest.TestCase):
                     "user_version": main_database["user_version"],
                     "content_count": manifest["freshness"]["content_count"],
                     "latest_published_at": manifest["freshness"]["latest_published_at"],
+                    "runtime_identity": manifest["runtime_identity"],
                 },
             },
             config.overview_url: {
@@ -573,6 +853,27 @@ class ServerSnapshotDeploymentTest(unittest.TestCase):
             side_effect=lambda url, _timeout: responses[url],
         ):
             installer._default_smoke_check(config, manifest)()
+
+        drifted_health = dict(responses[config.health_url])
+        drifted_database_state = dict(drifted_health["database_state"])
+        drifted_identity = dict(drifted_database_state["runtime_identity"])
+        drifted_identity["matcher_rule_sha256"] = "b" * 64
+        drifted_database_state["runtime_identity"] = drifted_identity
+        drifted_health["database_state"] = drifted_database_state
+        drifted_responses = {**responses, config.health_url: drifted_health}
+        short_config = replace(config, start_wait_seconds=0.01)
+        with (
+            patch.object(
+                installer,
+                "_read_json_url",
+                side_effect=lambda url, _timeout: drifted_responses[url],
+            ),
+            patch.object(installer.time, "sleep", return_value=None),
+            self.assertRaisesRegex(
+                installer.SnapshotInstallError, "runtime identity"
+            ),
+        ):
+            installer._default_smoke_check(short_config, manifest)()
 
 
 if __name__ == "__main__":

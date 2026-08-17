@@ -51,7 +51,7 @@
     <key>DCAR_SCHEDULER_ENABLED</key>
     <string>1</string>
     <key>DCAR_STARTUP_CATCHUP_ENABLED</key>
-    <string>0</string>
+    <string>1</string>
     <key>DCAR_WORKER_HOST</key>
     <string>127.0.0.1</string>
     <key>DCAR_WORKER_PORT</key>

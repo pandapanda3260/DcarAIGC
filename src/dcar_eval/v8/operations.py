@@ -46,6 +46,7 @@ CONTENT_CHILD_REKEY_TABLES = (
     "fetch_slots",
     "provider_raw_responses",
     "content_metric_snapshots",
+    "content_metric_observations",
     "comment_evidence_versions",
     "comment_capture_runs",
     "evidence_artifacts",

@@ -218,16 +218,33 @@ def formal_eligible_release_evaluations(
 ) -> dict[int, dict[str, Any]]:
     """Return report-safe evaluations for one pinned release.
 
-    Formal metrics must not consume gray-zone rows, weak V0/V1 evidence, or a
-    conclusion that is still in conflict with a human review.  Keeping this
-    filter beside the release-aware selectors prevents the overview and report
-    builders from drifting apart.
+    Every rule excludes weak V0/V1 evidence and rows still marked pending.
+    Historical rules also exclude unresolved human conflicts.  Evaluation-v9
+    has no authoritative human-review queue, so its V2/V3 rows remain formal
+    regardless of legacy queue state.
     """
 
+    release = connection.execute(
+        "SELECT rule_version FROM evaluation_releases WHERE id=?", (release_id,)
+    ).fetchone()
+    if release is None:
+        raise EvaluationSelectorError(
+            f"evaluation release does not exist: {release_id}"
+        )
     evaluations = release_current_evaluations(connection, release_id, content_ids)
     if not evaluations:
         return {}
-    ids = sorted(evaluations)
+    base_eligible = {
+        content_id: value
+        for content_id, value in evaluations.items()
+        if int(value["pending_review"]) == 0
+        and value["evidence_level"] in {"V2", "V3"}
+    }
+    if str(release["rule_version"]) == "evaluation-v9":
+        return base_eligible
+    ids = sorted(base_eligible)
+    if not ids:
+        return {}
     placeholders = ",".join("?" for _ in ids)
     unresolved_conflicts = {
         int(row["content_id"])
@@ -246,10 +263,8 @@ def formal_eligible_release_evaluations(
     }
     return {
         content_id: value
-        for content_id, value in evaluations.items()
-        if int(value["pending_review"]) == 0
-        and value["evidence_level"] in {"V2", "V3"}
-        and content_id not in unresolved_conflicts
+        for content_id, value in base_eligible.items()
+        if content_id not in unresolved_conflicts
     }
 
 

@@ -31,7 +31,7 @@ def render_plist(project_root: Path, home: Path) -> bytes:
     expected = {
         "DCAR_READ_ONLY": "0",
         "DCAR_SCHEDULER_ENABLED": "1",
-        "DCAR_STARTUP_CATCHUP_ENABLED": "0",
+        "DCAR_STARTUP_CATCHUP_ENABLED": "1",
         "DCAR_WORKER_HOST": "127.0.0.1",
         "DCAR_WORKER_PORT": "8766",
     }

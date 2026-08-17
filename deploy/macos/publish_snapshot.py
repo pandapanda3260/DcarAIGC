@@ -28,9 +28,35 @@ from zoneinfo import ZoneInfo
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 TERMINAL_CAPTURE_STATUSES = frozenset({"succeeded", "failed", "skipped"})
+REPORT_CATCHUP_JOB_IDS = frozenset({"daily_report", "weekly_report"})
+REPORT_CATCHUP_TERMINAL_STATUSES = frozenset({"succeeded", "partial", "skipped"})
 SAFE_ALIAS_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 SAFE_REMOTE_PATH_RE = re.compile(r"/[A-Za-z0-9_./-]+")
 SNAPSHOT_ID_RE = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}")
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
+RUNTIME_IDENTITY_SCHEMA = "dcar-runtime-identity-v1"
+EXPECTED_REPORT_VERSION = "dcar-content-operations-report-v8.6"
+EXPECTED_DATABASE_SCHEMA_VERSION = 13
+EXPECTED_DATABASE_SCHEMA_MIGRATION = "scheduler-run-attempt-history"
+EXPECTED_ACTIVE_RELEASE_ID = "evaluation-v9__selling-points-v5.2"
+EXPECTED_ACTIVE_RELEASE_STATUS = "active"
+EXPECTED_RULE_VERSION = "evaluation-v9"
+EXPECTED_TAXONOMY_VERSION = "selling-points-v5.2"
+EXPECTED_TAXONOMY_STATUS = "published"
+RUNTIME_IDENTITY_KEYS = frozenset(
+    {
+        "schema",
+        "report_version",
+        "database_schema_version",
+        "database_schema_migration",
+        "active_release_id",
+        "active_release_status",
+        "rule_version",
+        "taxonomy_version",
+        "taxonomy_status",
+        "matcher_rule_sha256",
+    }
+)
 ARTIFACT_POLICY = {
     "name": "thin-server-v1",
     "included": "reports-and-small-text-evidence",
@@ -94,6 +120,7 @@ class WriterFreshness:
     media_cutoff_completed_at: str
     latest_published_at: str
     content_count: int
+    runtime_identity: dict[str, Any]
 
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
@@ -104,6 +131,86 @@ BuildSnapshot = Callable[..., dict[str, Any]]
 def _utc_now() -> str:
     return (
         datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    )
+
+
+def _validate_runtime_identity(
+    value: object, *, label: str
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != RUNTIME_IDENTITY_KEYS:
+        raise SnapshotPublishError(f"{label} runtime identity has an invalid shape")
+    expected = {
+        "schema": RUNTIME_IDENTITY_SCHEMA,
+        "report_version": EXPECTED_REPORT_VERSION,
+        "database_schema_version": EXPECTED_DATABASE_SCHEMA_VERSION,
+        "database_schema_migration": EXPECTED_DATABASE_SCHEMA_MIGRATION,
+        "active_release_id": EXPECTED_ACTIVE_RELEASE_ID,
+        "active_release_status": EXPECTED_ACTIVE_RELEASE_STATUS,
+        "rule_version": EXPECTED_RULE_VERSION,
+        "taxonomy_version": EXPECTED_TAXONOMY_VERSION,
+        "taxonomy_status": EXPECTED_TAXONOMY_STATUS,
+    }
+    for key, expected_value in expected.items():
+        if value.get(key) != expected_value:
+            raise SnapshotPublishError(
+                f"{label} runtime identity mismatch for {key}: "
+                f"{value.get(key)!r}, expected {expected_value!r}"
+            )
+    matcher_sha = value.get("matcher_rule_sha256")
+    if not isinstance(matcher_sha, str) or SHA256_RE.fullmatch(matcher_sha) is None:
+        raise SnapshotPublishError(
+            f"{label} runtime identity has an invalid matcher_rule_sha256"
+        )
+    return dict(value)
+
+
+def _database_runtime_identity(connection: sqlite3.Connection) -> dict[str, Any]:
+    user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    try:
+        migration_rows = connection.execute(
+            "SELECT name FROM schema_migrations WHERE version=?", (user_version,)
+        ).fetchall()
+        max_migration = connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0]
+        release_rows = connection.execute(
+            """
+            SELECT er.id,er.rule_version,er.taxonomy_version,
+                   er.matcher_rule_sha256,er.status release_status,
+                   tv.status taxonomy_status
+            FROM evaluation_releases er
+            JOIN taxonomy_versions tv ON tv.version=er.taxonomy_version
+            WHERE er.status='active'
+            ORDER BY er.id
+            """
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise SnapshotPublishError(
+            "writer database lacks the required runtime identity tables"
+        ) from exc
+    if len(migration_rows) != 1 or max_migration != user_version:
+        raise SnapshotPublishError(
+            "writer database has an ambiguous schema migration identity"
+        )
+    if len(release_rows) != 1:
+        raise SnapshotPublishError(
+            "writer database must have exactly one active evaluation release"
+        )
+    release = release_rows[0]
+    return _validate_runtime_identity(
+        {
+            "schema": RUNTIME_IDENTITY_SCHEMA,
+            "report_version": EXPECTED_REPORT_VERSION,
+            "database_schema_version": user_version,
+            "database_schema_migration": str(migration_rows[0]["name"]),
+            "active_release_id": str(release["id"]),
+            "active_release_status": str(release["release_status"]),
+            "rule_version": str(release["rule_version"]),
+            "taxonomy_version": str(release["taxonomy_version"]),
+            "taxonomy_status": str(release["taxonomy_status"]),
+            "matcher_rule_sha256": str(release["matcher_rule_sha256"]),
+        },
+        label="writer database",
     )
 
 
@@ -286,6 +393,12 @@ def check_writer_freshness(
     health = fetch_json("http://127.0.0.1:8766/api/v8/health")
     if health.get("status") != "ok" or health.get("database") != database.name:
         raise SnapshotPublishError("writer health does not match the formal database")
+    health_database_state = health.get("database_state")
+    if not isinstance(health_database_state, dict):
+        raise SnapshotPublishError("writer health omitted database identity")
+    health_runtime_identity = _validate_runtime_identity(
+        health_database_state.get("runtime_identity"), label="writer health"
+    )
     scheduler = fetch_json("http://127.0.0.1:8766/api/v8/scheduler")
     catchup = scheduler.get("startup_catchup")
     writer_lock = scheduler.get("writer_lock")
@@ -297,15 +410,77 @@ def check_writer_freshness(
         raise SnapshotPublishError(
             "designated writer does not hold the single-writer lock"
         )
-    if (
-        not isinstance(catchup, dict)
-        or catchup.get("requested")
-        or catchup.get("enabled")
-    ):
-        raise SnapshotPublishError("writer startup catch-up must remain disabled")
+    if not isinstance(catchup, dict) or catchup.get("mode") != "report_only":
+        raise SnapshotPublishError("writer startup catch-up is not report-only")
+    if catchup.get("requested") is not True or catchup.get("enabled") is not True:
+        raise SnapshotPublishError("writer report-only startup catch-up is not enabled")
+    if catchup.get("status") != "succeeded":
+        raise SnapshotPublishError(
+            "writer report-only startup catch-up has not succeeded"
+        )
+    catchup_results = catchup.get("results")
+    if not isinstance(catchup_results, list):
+        raise SnapshotPublishError("writer startup catch-up results are invalid")
+    report_occurrences: list[tuple[str, str, str]] = []
+    seen_report_occurrences: set[tuple[str, str]] = set()
+    for result in catchup_results:
+        if not isinstance(result, dict):
+            raise SnapshotPublishError("writer startup catch-up result is invalid")
+        job_id = result.get("job_id")
+        if job_id not in REPORT_CATCHUP_JOB_IDS:
+            raise SnapshotPublishError(
+                "writer startup catch-up contains a non-report job"
+            )
+        status = result.get("status")
+        if status not in REPORT_CATCHUP_TERMINAL_STATUSES:
+            raise SnapshotPublishError(
+                "writer startup catch-up contains a non-terminal report result"
+            )
+        scheduled_for = result.get("scheduled_for")
+        if not isinstance(scheduled_for, str) or not scheduled_for:
+            raise SnapshotPublishError(
+                "writer startup catch-up report result lacks scheduled_for"
+            )
+        occurrence_key = (str(job_id), scheduled_for)
+        if occurrence_key in seen_report_occurrences:
+            raise SnapshotPublishError(
+                "writer startup catch-up contains a duplicate report occurrence"
+            )
+        seen_report_occurrences.add(occurrence_key)
+        report_occurrences.append((str(job_id), scheduled_for, str(status)))
     connection = sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
     try:
+        runtime_identity = _database_runtime_identity(connection)
+        if runtime_identity != health_runtime_identity:
+            raise SnapshotPublishError(
+                "writer health runtime identity does not match the formal database"
+            )
+        for job_id, scheduled_for, reported_status in report_occurrences:
+            occurrence = connection.execute(
+                """
+                SELECT r.status,r.completed_at,a.status attempt_status,
+                       a.completed_at attempt_completed_at
+                FROM scheduler_runs r
+                JOIN scheduler_run_attempts a ON a.scheduler_run_id=r.id
+                WHERE r.job_id=? AND r.scheduled_for=?
+                ORDER BY a.attempt_number DESC LIMIT 1
+                """,
+                (job_id, scheduled_for),
+            ).fetchone()
+            if occurrence is None:
+                raise SnapshotPublishError(
+                    "writer startup catch-up report occurrence is absent from the database"
+                )
+            if (
+                occurrence["status"] != reported_status
+                or occurrence["attempt_status"] != reported_status
+                or occurrence["completed_at"] is None
+                or occurrence["attempt_completed_at"] is None
+            ):
+                raise SnapshotPublishError(
+                    "writer startup catch-up report result does not match the database"
+                )
         capture = connection.execute(
             """
             SELECT scheduled_for,status,completed_at FROM scheduler_runs
@@ -384,6 +559,7 @@ def check_writer_freshness(
         media_cutoff_completed_at=str(media_cutoff["completed_at"]),
         latest_published_at=str(content["latest_published_at"]),
         content_count=content_count,
+        runtime_identity=runtime_identity,
     )
 
 
@@ -633,6 +809,13 @@ def publish_snapshot(
             output=output,
             expected_user_version=config.expected_user_version,
         )
+        manifest_runtime_identity = _validate_runtime_identity(
+            manifest.get("runtime_identity"), label="snapshot manifest"
+        )
+        if manifest_runtime_identity != freshness.runtime_identity:
+            raise SnapshotPublishError(
+                "snapshot runtime identity drifted from the verified writer"
+            )
         snapshot_id = str(manifest.get("snapshot_id") or "")
         if not SNAPSHOT_ID_RE.fullmatch(snapshot_id):
             raise SnapshotPublishError(
@@ -782,6 +965,7 @@ def publish_snapshot(
             "latest_published_at": freshness.latest_published_at,
             "content_count": freshness.content_count,
             "database_sha256": str(manifest["databases"][0]["sha256"]),
+            "runtime_identity": manifest_runtime_identity,
             "remote_free_bytes_before": free_bytes_before,
             "remote_free_bytes_after_dry_run": free_bytes_after_dry_run,
             "remote_free_bytes_before_install": free_bytes_before_install,

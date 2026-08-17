@@ -91,9 +91,9 @@ done
 export TIKHUB_API_KEY_FILE="$key_file_path"
 export DCAR_READ_ONLY=0
 export DCAR_SCHEDULER_ENABLED=1
-export DCAR_STARTUP_CATCHUP_ENABLED=0
+export DCAR_STARTUP_CATCHUP_ENABLED=1
 
-echo "Dcar writer worker starting on 127.0.0.1:8766; scheduler=1 catchup=0"
+echo "Dcar writer worker starting on 127.0.0.1:8766; scheduler=1 catchup=report_only"
 exec /usr/bin/caffeinate -s \
   "$python_bin" -m uvicorn v8.api:app \
   --app-dir "$project_root/src/dcar_eval" \

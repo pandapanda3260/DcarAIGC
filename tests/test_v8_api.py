@@ -15,12 +15,15 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+# 测试环境一律关闭 LLM 补空：Mac 上 key 真实存在，associate/update-data 相关
+# 用例若不关会真实调用豆包付费（TestClient 会同步执行 BackgroundTasks）。
+os.environ.setdefault("DCAR_LLM_DISABLED", "1")
+
 import v8.api as api_module
 from v8.contracts import CURRENT_REPORT_VERSION
 from v8.evaluation import (
+    RULE_VERSION,
     build_evidence_envelope,
-    evaluate_content,
-    evaluate_release_content,
 )
 from v8.matcher_dsl import (
     POINT_IDS,
@@ -32,14 +35,18 @@ from v8.matcher_dsl import (
 )
 from v8.reports import create_task
 from v8.storage import (
+    CURRENT_SCHEMA_MIGRATION_NAME,
     LEGACY_MATCHER_RULE_SHA256,
     PROJECT_ROOT,
+    RUNTIME_COMPATIBLE_SCHEMA_VERSIONS,
+    SCHEMA_VERSION,
     connect,
     ensure_legacy_evaluation_release,
     initialize_database,
     now_utc,
 )
 from v8.taxonomy_rule_backfill import backfill_v5_1_matcher_rules
+from tests.v9_report_fixture import activate_v9_report_fixture
 from workflow.storage import connect as legacy_connect
 from workflow.storage import migrate as migrate_legacy
 
@@ -67,7 +74,11 @@ def _insert_legacy_automatic_fixture(connection, content_id: int) -> int:
         rule_version="evaluation-v7",
         taxonomy_version="selling-points-v5.0",
     )
-    envelope_id, evidence_sha256, _ = build_evidence_envelope(connection, content_id)
+    envelope_id, evidence_sha256, _ = build_evidence_envelope(
+        connection,
+        content_id,
+        rule_version=str(release["rule_version"]),
+    )
     cursor = connection.execute(
         """
         INSERT INTO evaluation_versions(
@@ -350,7 +361,7 @@ class V8ApiTest(unittest.TestCase):
         self.client_context.__exit__(None, None, None)
 
     def test_openapi_version_matches_v8_contract_release(self) -> None:
-        self.assertEqual(self.app.version, "8.3")
+        self.assertEqual(self.app.version, "8.6")
 
     def test_health_reports_v8_database(self) -> None:
         response = self.client.get("/api/v8/health")
@@ -358,6 +369,29 @@ class V8ApiTest(unittest.TestCase):
         self.assertEqual(response.json()["report_version"], CURRENT_REPORT_VERSION)
         self.assertEqual(response.json()["database"], "dcar_insight.sqlite3")
         self.assertIn("data_freshness", response.json())
+        compatibility = response.json()["database_state"]["schema_compatibility"]
+        self.assertTrue(compatibility["compatible"])
+        # v14 落地时这里漏改成常量导致断言过期；改为跟随 SCHEMA_VERSION。
+        self.assertEqual(compatibility["user_version"], SCHEMA_VERSION)
+        self.assertEqual(
+            compatibility["supported_versions"],
+            sorted(RUNTIME_COMPATIBLE_SCHEMA_VERSIONS),
+        )
+        identity = response.json()["database_state"]["runtime_identity"]
+        self.assertEqual(identity["schema"], "dcar-runtime-identity-v1")
+        self.assertEqual(identity["report_version"], CURRENT_REPORT_VERSION)
+        self.assertEqual(identity["database_schema_version"], SCHEMA_VERSION)
+        self.assertEqual(
+            identity["database_schema_migration"], CURRENT_SCHEMA_MIGRATION_NAME
+        )
+        with connect(self.db, read_only=True) as connection:
+            release = connection.execute(
+                "SELECT * FROM evaluation_releases WHERE status='active'"
+            ).fetchone()
+        self.assertIsNotNone(release)
+        assert release is not None
+        self.assertEqual(identity["active_release_id"], release["id"])
+        self.assertEqual(identity["matcher_rule_sha256"], release["matcher_rule_sha256"])
 
     def test_daily_capture_freshness_excludes_backfill_slots(self) -> None:
         reference = datetime(2026, 8, 11, tzinfo=timezone.utc)
@@ -438,7 +472,7 @@ class V8ApiTest(unittest.TestCase):
                 catchup_status="running", catchup_results=[], catchup_error=None
             )
         )
-        expected = [{"job_id": "daily_capture", "status": "succeeded"}]
+        expected = [{"job_id": "daily_report", "status": "partial"}]
         with patch.object(api_module, "startup_catchup", return_value=expected):
             api_module._run_startup_catchup(
                 fake_app,
@@ -449,6 +483,60 @@ class V8ApiTest(unittest.TestCase):
         self.assertEqual(fake_app.state.catchup_results, expected)
         self.assertIsNone(fake_app.state.catchup_error)
 
+    def test_startup_catchup_worker_propagates_item_failure_and_deferral(self) -> None:
+        cases = (
+            (
+                [{"job_id": "daily_report", "status": "deferred"}],
+                "deferred",
+            ),
+            (
+                [
+                    {"job_id": "daily_report", "status": "deferred"},
+                    {"job_id": "weekly_report", "status": "failed"},
+                ],
+                "failed",
+            ),
+            ([{"job_id": "daily_report", "status": "unexpected"}], "failed"),
+        )
+        for results, expected_status in cases:
+            with self.subTest(expected_status=expected_status, results=results):
+                fake_app = SimpleNamespace(
+                    state=SimpleNamespace(
+                        catchup_status="running",
+                        catchup_results=[],
+                        catchup_error=None,
+                    )
+                )
+                with patch.object(
+                    api_module, "startup_catchup", return_value=results
+                ):
+                    api_module._run_startup_catchup(
+                        fake_app,
+                        db_path=self.db,
+                        reports_root=self.config.reports_root,
+                    )
+                self.assertEqual(fake_app.state.catchup_status, expected_status)
+                self.assertEqual(fake_app.state.catchup_results, results)
+
+    def test_startup_catchup_worker_records_top_level_exception(self) -> None:
+        fake_app = SimpleNamespace(
+            state=SimpleNamespace(
+                catchup_status="running", catchup_results=[], catchup_error=None
+            )
+        )
+        with patch.object(
+            api_module, "startup_catchup", side_effect=RuntimeError("catchup boom")
+        ), self.assertLogs(api_module.LOGGER, level="ERROR") as logs:
+            api_module._run_startup_catchup(
+                fake_app,
+                db_path=self.db,
+                reports_root=self.config.reports_root,
+            )
+        self.assertEqual(fake_app.state.catchup_status, "failed")
+        self.assertEqual(fake_app.state.catchup_results, [])
+        self.assertEqual(fake_app.state.catchup_error, "catchup boom")
+        self.assertIn("startup catch-up failed", "\n".join(logs.output))
+
     def test_scheduler_status_reports_disabled_startup_catchup(self) -> None:
         response = self.client.get("/api/v8/scheduler")
         self.assertEqual(response.status_code, 200)
@@ -458,6 +546,10 @@ class V8ApiTest(unittest.TestCase):
             response.json()["report_runtime"], {"ready": None, "error": None}
         )
         self.assertEqual(response.json()["startup_catchup"]["status"], "disabled")
+        self.assertEqual(response.json()["startup_catchup"]["mode"], "report_only")
+        self.assertEqual(
+            response.json()["scheduler_run_recovery"], {"interrupted": 0}
+        )
         self.assertIn("fetch_slot_recovery", response.json())
         self.assertIn("data_freshness", response.json())
 
@@ -629,7 +721,7 @@ class V8ApiTest(unittest.TestCase):
                     [
                         (
                             "test-current-release",
-                            api_module.RULE_VERSION,
+                            RULE_VERSION,
                             "selling-points-test",
                             LEGACY_MATCHER_RULE_SHA256,
                             "active",
@@ -717,7 +809,7 @@ class V8ApiTest(unittest.TestCase):
                         (
                             content_id,
                             "test-current-release",
-                            api_module.RULE_VERSION,
+                            RULE_VERSION,
                             "selling-points-test",
                             LEGACY_MATCHER_RULE_SHA256,
                             evidence_sha,
@@ -1099,98 +1191,8 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         self.client_context.__exit__(None, None, None)
         self.temp.cleanup()
 
-    def _activate_v8_report_release(self) -> None:
-        bundle = load_bundle()
-        with connect(self.db) as connection:
-            captured_at = now_utc()
-            for code in sorted(POINT_IDS):
-                rule = materialize_point_rule(bundle, code)
-                projection = project_materialized_rule(rule)
-                point = connection.execute(
-                    """
-                    SELECT id FROM selling_points
-                    WHERE taxonomy_id='taxonomy' AND code=?
-                    """,
-                    (code,),
-                ).fetchone()
-                if point is None:
-                    cursor = connection.execute(
-                        """
-                        INSERT INTO selling_points(
-                            taxonomy_id,code,tier,label,definition
-                        ) VALUES ('taxonomy',?,?,?,'test')
-                        """,
-                        (code, "other", f"测试卖点 {code}"),
-                    )
-                    point_id = int(cursor.lastrowid)
-                else:
-                    point_id = int(point["id"])
-                connection.execute(
-                    "DELETE FROM selling_point_scenes WHERE selling_point_id=?",
-                    (point_id,),
-                )
-                for scene in projection["scenes"]:
-                    connection.execute(
-                        """
-                        INSERT INTO selling_point_scenes(selling_point_id,scene)
-                        VALUES (?,?)
-                        """,
-                        (point_id, scene),
-                    )
-            connection.commit()
-        matcher = backfill_v5_1_matcher_rules(db_path=self.db)
-        release_id = "evaluation-v8__selling-points-v5.1"
-        with connect(self.db) as connection:
-            captured_at = now_utc()
-            connection.execute(
-                """
-                INSERT INTO evaluation_releases(
-                    id,rule_version,taxonomy_version,matcher_rule_sha256,status,
-                    created_at,updated_at
-                ) VALUES (?,'evaluation-v8','selling-points-v5.1',?,'backfilling',?,?)
-                """,
-                (
-                    release_id,
-                    matcher["matcher_rule_sha256"],
-                    captured_at,
-                    captured_at,
-                ),
-            )
-            connection.commit()
-        evaluate_release_content(
-            self.content_id, release_id=release_id, db_path=self.db
-        )
-        with connect(self.db) as connection:
-            captured_at = now_utc()
-            connection.execute(
-                """
-                UPDATE evaluation_releases
-                SET status='retired',retired_at=?,updated_at=?
-                WHERE status='active' AND id<>?
-                """,
-                (captured_at, captured_at, release_id),
-            )
-            connection.execute(
-                """
-                UPDATE taxonomy_versions SET status='retired'
-                WHERE status='published' AND version<>'selling-points-v5.1'
-                """
-            )
-            connection.execute(
-                """
-                UPDATE taxonomy_versions SET status='published',published_at=?
-                WHERE version='selling-points-v5.1'
-                """,
-                (captured_at,),
-            )
-            connection.execute(
-                """
-                UPDATE evaluation_releases
-                SET status='active',activated_at=?,updated_at=? WHERE id=?
-                """,
-                (captured_at, captured_at, release_id),
-            )
-            connection.commit()
+    def _activate_current_report_release(self) -> None:
+        activate_v9_report_fixture(self.db, [self.content_id])
 
     def test_review_api_starts_and_resolves_as_append_only_override(self) -> None:
         listed = self.client.get("/api/v8/reviews")
@@ -1716,15 +1718,18 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         started = self.client.post(f"/api/v8/reviews/{self.queue_id}/start")
         self.assertEqual(started.status_code, 200)
         stale_id = started.json()["base_evaluation_id"]
-        self._activate_v8_report_release()
         with connect(self.db) as connection:
             connection.execute(
                 "UPDATE content_items SET body='保养知识已更新',updated_at=? WHERE id=?",
                 (now_utc(), self.content_id),
             )
             connection.commit()
-        changed = evaluate_content(self.content_id, db_path=self.db)
-        self.assertNotEqual(changed.evaluation_id, stale_id)
+        with connect(self.db) as connection:
+            changed_id = _insert_legacy_automatic_fixture(
+                connection, self.content_id
+            )
+            connection.commit()
+        self.assertNotEqual(changed_id, stale_id)
         with connect(self.db) as connection:
             before = {
                 "reviews": int(
@@ -1959,7 +1964,7 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
                 "terminal_failed": 0,
             },
         )
-        self._activate_v8_report_release()
+        self._activate_current_report_release()
         existing_evidence = self.client.post(
             f"/api/v8/contents/{self.content_id}/media/retry",
             json={"allow_paid_refresh": False},
@@ -2009,18 +2014,20 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
             self.assertEqual(verified_file.content, b"local-image-evidence")
 
     def test_task_cancel_and_resume_routes_preserve_revision_history(self) -> None:
-        resolved = self.client.post(
-            f"/api/v8/reviews/{self.queue_id}/resolve",
-            json={
-                "base_evaluation_id": self.evaluation_id,
-                "decision": "insufficient_evidence",
-                "reason": "任务控制测试先清零首发闸门",
-                "reviewer": "测试复核员",
-                "evidence_type": "review_note",
-                "evidence_text": "确认当前测试内容没有足够媒体证据",
-            },
-        )
-        self.assertEqual(resolved.status_code, 200)
+        with connect(self.db) as connection:
+            manual_before = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM evaluation_versions
+                    WHERE evaluation_source='manual_review'
+                    """
+                ).fetchone()[0]
+            )
+            evidence_before = int(
+                connection.execute("SELECT COUNT(*) FROM manual_evidence").fetchone()[
+                    0
+                ]
+            )
         task = create_task(
             task_type="custom",
             period_start="2026-07-01",
@@ -2031,11 +2038,29 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         cancelled = self.client.post(f"/api/v8/tasks/{task['id']}/cancel")
         self.assertEqual(cancelled.status_code, 200)
         self.assertEqual(cancelled.json()["task_status"], "cancelled")
-        self._activate_v8_report_release()
+        self._activate_current_report_release()
         resumed = self.client.post(f"/api/v8/tasks/{task['id']}/resume")
         self.assertEqual(resumed.status_code, 200)
-        self.assertIn(resumed.json()["task_status"], {"succeeded", "partial"})
-        self.assertEqual(len(resumed.json()["revisions"]), 1)
+        self.assertEqual(resumed.json()["task_status"], "queued")
+        generated = self.client.get(f"/api/v8/tasks/{task['id']}").json()
+        self.assertIn(generated["task_status"], {"succeeded", "partial"})
+        self.assertEqual(len(generated["revisions"]), 1)
+        with connect(self.db) as connection:
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM evaluation_versions
+                    WHERE evaluation_source='manual_review'
+                    """
+                ).fetchone()[0],
+                manual_before,
+            )
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM manual_evidence").fetchone()[
+                    0
+                ],
+                evidence_before,
+            )
 
     def test_selling_point_api_edits_only_an_unreleased_matcher_draft(self) -> None:
         bundle = load_bundle()
@@ -2179,31 +2204,68 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
     def test_custom_task_generates_revision_and_downloads_run_scoped_files(
         self,
     ) -> None:
-        reviewed = self.client.post(
-            f"/api/v8/reviews/{self.queue_id}/resolve",
-            json={
-                "base_evaluation_id": self.evaluation_id,
-                "decision": "insufficient_evidence",
-                "reason": "报告测试先清零人工复核闸门",
-                "reviewer": "测试复核员",
-                "evidence_type": "review_note",
-                "evidence_text": "测试内容没有本地媒体，人工确认当前证据不足",
-            },
-        )
-        self.assertEqual(reviewed.status_code, 200)
-        self._activate_v8_report_release()
+        with connect(self.db) as connection:
+            manual_before = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM evaluation_versions
+                    WHERE evaluation_source='manual_review'
+                    """
+                ).fetchone()[0]
+            )
+            evidence_before = int(
+                connection.execute("SELECT COUNT(*) FROM manual_evidence").fetchone()[
+                    0
+                ]
+            )
+        self._activate_current_report_release()
         created = self.client.post(
             "/api/v8/tasks",
             json={"period_start": "2026-07-01", "period_end": "2026-07-01"},
         )
         self.assertEqual(created.status_code, 200)
-        value = created.json()
+        queued = created.json()
+        # Generation runs outside the request, so creation answers immediately and
+        # the workbench polls the task read model for progress.
+        self.assertEqual(queued["task_status"], "queued")
+        self.assertEqual(queued["progress"], 0)
+        self.assertEqual(queued["revisions"], [])
+        task_id = queued["id"]
+        value = self.client.get(f"/api/v8/tasks/{task_id}").json()
         self.assertEqual(value["task_status"], "partial")
+        self.assertEqual(value["progress"], 100)
         self.assertEqual(len(value["revisions"]), 1)
-        task_id = value["id"]
         report = self.client.get(f"/api/v8/tasks/{task_id}/revisions/1/report")
         self.assertEqual(report.status_code, 200)
         self.assertEqual(report.json()["metadata"]["task_id"], task_id)
+        self.assertEqual(
+            report.json()["metadata"]["collection_cutoff_at"],
+            value["created_at"],
+        )
+        self.assertEqual(
+            report.json()["data_quality_details"]["metrics_freshness"]["status"],
+            "below_threshold",
+        )
+        self.assertEqual(
+            report.json()["data_quality_details"]["discovery_coverage"]["status"],
+            "not_applicable",
+        )
+        with connect(self.db) as connection:
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM evaluation_versions
+                    WHERE evaluation_source='manual_review'
+                    """
+                ).fetchone()[0],
+                manual_before,
+            )
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM manual_evidence").fetchone()[
+                    0
+                ],
+                evidence_before,
+            )
         download = self.client.get(
             f"/api/v8/tasks/{task_id}/revisions/1/files/report-markdown"
         )
@@ -2214,6 +2276,29 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         )
         self.assertEqual(image.status_code, 200)
         self.assertIn(image.headers["content-type"], {"image/svg+xml", "image/png"})
+
+    def test_custom_task_rejects_an_unclosed_period_without_persisting_task(
+        self,
+    ) -> None:
+        self._activate_current_report_release()
+        with connect(self.db) as connection:
+            before = connection.execute("SELECT COUNT(*) FROM report_tasks").fetchone()[
+                0
+            ]
+        rejected = self.client.post(
+            "/api/v8/tasks",
+            json={"period_start": "2099-01-01", "period_end": "2099-01-01"},
+        )
+        self.assertEqual(rejected.status_code, 409)
+        self.assertEqual(
+            rejected.json()["detail"],
+            "manual report period must be closed before creation",
+        )
+        with connect(self.db) as connection:
+            after = connection.execute("SELECT COUNT(*) FROM report_tasks").fetchone()[
+                0
+            ]
+        self.assertEqual(after, before)
 
     def test_account_crud_import_and_export_keep_full_phone_with_post_search(
         self,

@@ -412,12 +412,23 @@ class V8RangeBackfillTest(unittest.TestCase):
                 "SELECT * FROM content_metric_snapshots WHERE content_id=?",
                 (content["id"],),
             ).fetchone()
+            repaired_observations = connection.execute(
+                """
+                SELECT observation_origin,captured_at,view_count,status
+                FROM content_metric_observations WHERE content_id=? ORDER BY id
+                """,
+                (content["id"],),
+            ).fetchall()
         self.assertEqual(repaired_slot["status"], "retryable_failed")
         self.assertEqual(repaired_slot["attempt_count"], 1)
         self.assertIsNone(repaired_snapshot["view_count"])
         self.assertEqual(repaired_snapshot["comment_count"], 3)
         self.assertEqual(repaired_snapshot["like_count"], 20)
         self.assertEqual(repaired_snapshot["status"], "missing")
+        self.assertEqual(
+            [tuple(row) for row in repaired_observations],
+            [("system_correction", "2026-08-03T00:00:00Z", None, "missing")],
+        )
 
         calls: list[str] = []
 
@@ -458,11 +469,25 @@ class V8RangeBackfillTest(unittest.TestCase):
                 "SELECT * FROM content_metric_snapshots WHERE content_id=?",
                 (content["id"],),
             ).fetchone()
+            final_observations = connection.execute(
+                """
+                SELECT observation_origin,view_count,status
+                FROM content_metric_observations WHERE content_id=? ORDER BY id
+                """,
+                (content["id"],),
+            ).fetchall()
         self.assertEqual(final_slot["status"], "succeeded")
         self.assertEqual(final_slot["attempt_count"], 2)
         self.assertEqual(final_slot["adapter_version"], "tikhub-statistics-v8.0")
         self.assertEqual(final_snapshot["view_count"], 4321)
         self.assertEqual(final_snapshot["status"], "available")
+        self.assertEqual(
+            [tuple(row) for row in final_observations],
+            [
+                ("system_correction", None, "missing"),
+                ("provider_capture", 4321, "available"),
+            ],
+        )
 
 
 if __name__ == "__main__":

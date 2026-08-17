@@ -1,0 +1,339 @@
+{
+  "mapping_version": "dcd-series-audit-2026-08-16",
+  "recent_policy": "include_recent=true 的官方车系；online 收全部正式在售且年款不晚于当前年，offline 仅收 2024 年至当前年款；不含 presale_car、urban",
+  "history_policy": "include_history=true 仅记录可用映射，不由近期抓取器自动导入",
+  "entries": {
+    "byd__qin-plus": {
+      "default_powertrain": "phev",
+      "powertrain_resolution": "infer_from_official_series_or_trim_spec",
+      "official_series": [
+        {"series_id": 4802, "official_name": "秦PLUS DM", "powertrain": "phev", "include_recent": true, "include_history": true},
+        {"series_id": 4899, "official_name": "秦PLUS EV", "powertrain": "ev", "include_recent": true, "include_history": true}
+      ]
+    },
+    "byd__song-plus": {
+      "default_powertrain": "phev",
+      "powertrain_resolution": "infer_from_official_series_or_trim_spec",
+      "official_series": [
+        {"series_id": 4865, "official_name": "宋PLUS DM", "powertrain": "phev", "include_recent": true, "include_history": true},
+        {"series_id": 4540, "official_name": "宋PLUS EV", "powertrain": "ev", "include_recent": true, "include_history": true},
+        {"series_id": 4539, "official_name": "宋PLUS", "powertrain": "ice", "include_recent": false, "include_history": true}
+      ]
+    },
+    "byd__seagull": {
+      "default_powertrain": "ev",
+      "powertrain_resolution": "fixed",
+      "official_series": [
+        {"series_id": 5952, "official_name": "海鸥", "powertrain": "ev", "include_recent": true, "include_history": true}
+      ]
+    },
+    "byd__dolphin": {
+      "default_powertrain": "ev",
+      "powertrain_resolution": "fixed",
+      "official_series": [
+        {"series_id": 5008, "official_name": "海豚", "powertrain": "ev", "include_recent": true, "include_history": true}
+      ]
+    },
+    "byd__han": {
+      "default_powertrain": "phev",
+      "powertrain_resolution": "infer_from_official_series_or_trim_spec",
+      "official_series": [
+        {"series_id": 4228, "official_name": "汉DM", "powertrain": "phev", "include_recent": true, "include_history": true},
+        {"series_id": 4300, "official_name": "汉EV", "powertrain": "ev", "include_recent": true, "include_history": true}
+      ]
+    },
+    "byd__tang": {
+      "default_powertrain": "phev",
+      "powertrain_resolution": "infer_from_official_series_or_trim_spec",
+      "official_series": [
+        {"series_id": 311, "official_name": "唐DM", "powertrain": "phev", "include_recent": true, "include_history": true},
+        {"series_id": 3077, "official_name": "唐EV", "powertrain": "ev", "include_recent": true, "include_history": true},
+        {"series_id": 2869, "official_name": "唐", "powertrain": "phev", "include_recent": false, "include_history": true}
+      ]
+    },
+    "tesla__model-3": {
+      "default_powertrain": "ev",
+      "powertrain_resolution": "fixed",
+      "official_series": [
+        {"series_id": 3762, "official_name": "Model 3", "powertrain": "ev", "include_recent": true, "include_history": true}
+      ]
+    },
+    "tesla__model-y": {
+      "default_powertrain": "ev",
+      "powertrain_resolution": "fixed",
+      "official_series": [
+        {"series_id": 4363, "official_name": "Model Y", "powertrain": "ev", "include_recent": true, "include_history": true},
+        {"series_id": 25651, "official_name": "Model Y L", "powertrain": "ev", "include_recent": true, "include_history": true}
+      ]
+    },
+    "lixiang__l6": {
+      "default_powertrain": "erev",
+      "powertrain_resolution": "fixed",
+      "official_series": [
+        {"series_id": 5845, "official_name": "理想L6", "powertrain": "erev", "include_recent": true, "include_history": true}
+      ]
+    },
+    "lixiang__l7": {
+      "default_powertrain": "erev",
+      "powertrain_resolution": "fixed",
+      "official_series": [
+        {"series_id": 6173, "official_name": "理想L7", "powertrain": "erev", "include_recent": true, "include_history": true}
+      ]
+    },
+    "lixiang__l9": {
+      "default_powertrain": "erev",
+      "powertrain_resolution": "fixed",
+      "official_series": [
+        {"series_id": 5227, "official_name": "理想L9", "powertrain": "erev", "include_recent": true, "include_history": true}
+      ]
+    },
+    "aito__m7": {
+      "default_powertrain": "erev",
+      "powertrain_resolution": "infer_from_official_series_or_trim_spec",
+      "official_series": [
+        {"series_id": 5820, "official_name": "问界M7", "powertrain": "mixed", "include_recent": true, "include_history": true}
+      ]
+    },
+    "aito__m9": {
+      "default_powertrain": "erev",
+      "powertrain_resolution": "infer_from_official_series_or_trim_spec",
+      "official_series": [
+        {"series_id": 6325, "official_name": "问界M9", "powertrain": "mixed", "include_recent": true, "include_history": true}
+      ]
+    },
+    "xiaomi__su7": {
+      "default_powertrain": "ev",
+      "powertrain_resolution": "fixed",
+      "official_series": [
+        {"series_id": 6187, "official_name": "小米SU7", "powertrain": "ev", "include_recent": true, "include_history": true},
+        {"series_id": 24986, "official_name": "小米SU7 Ultra", "powertrain": "ev", "include_recent": true, "include_history": true}
+      ]
+    },
+    "tank__300": {
+      "default_powertrain": "ice",
+      "powertrain_resolution": "infer_from_official_series_or_trim_spec",
+      "official_series": [
+        {"series_id": 4615, "official_name": "坦克300", "powertrain": "ice", "include_recent": true, "include_history": true},
+        {"series_id": 8959, "official_name": "坦克300 Hi4-T", "powertrain": "phev", "include_recent": true, "include_history": true}
+      ]
+    },
+    "haval__h6": {
+      "default_powertrain": "ice",
+      "powertrain_resolution": "infer_from_official_series_or_trim_spec",
+      "official_series": [
+        {"series_id": 649, "official_name": "哈弗H6", "powertrain": "ice", "include_recent": true, "include_history": true},
+        {"series_id": 5503, "official_name": "哈弗H6 PHEV", "powertrain": "phev", "include_recent": false, "include_history": true}
+      ]
+    },
+    "haval__dagou": {
+      "default_powertrain": "ice",
+      "powertrain_resolution": "fixed",
+      "official_series": [
+        {"series_id": 4563, "official_name": "哈弗大狗", "powertrain": "ice", "include_recent": true, "include_history": true}
+      ]
+    },
+    "wuling__hongguang-miniev": {
+      "default_powertrain": "ev",
+      "powertrain_resolution": "fixed",
+      "official_series": [
+        {"series_id": 4499, "official_name": "五菱宏光MINIEV", "powertrain": "ev", "include_recent": true, "include_history": true}
+      ]
+    },
+    "geely__xingyue-l": {
+      "default_powertrain": "ice",
+      "powertrain_resolution": "infer_from_official_series_or_trim_spec",
+      "official_series": [
+        {"series_id": 4857, "official_name": "星越L", "powertrain": "mixed", "include_recent": true, "include_history": true}
+      ]
+    },
+    "zeekr__001": {
+      "default_powertrain": "ev",
+      "powertrain_resolution": "fixed",
+      "official_series": [
+        {"series_id": 5015, "official_name": "ZEEKR 001", "powertrain": "ev", "include_recent": true, "include_history": true}
+      ]
+    },
+    "changan__cs75-plus": {
+      "default_powertrain": "ice",
+      "powertrain_resolution": "fixed",
+      "official_series": [
+        {"series_id": 3196, "official_name": "长安CS75 PLUS", "powertrain": "ice", "include_recent": true, "include_history": true}
+      ]
+    },
+    "nio__es6": {
+      "default_powertrain": "ev",
+      "powertrain_resolution": "fixed",
+      "official_series": [
+        {"series_id": 2843, "official_name": "蔚来ES6", "powertrain": "ev", "include_recent": true, "include_history": true}
+      ]
+    },
+    "xpeng__mona-m03": {
+      "default_powertrain": "ev",
+      "powertrain_resolution": "fixed",
+      "official_series": [
+        {"series_id": 10170, "official_name": "小鹏MONA M03", "powertrain": "ev", "include_recent": true, "include_history": true}
+      ]
+    },
+    "xpeng__g6": {
+      "default_powertrain": "ev",
+      "powertrain_resolution": "infer_from_official_series_or_trim_spec",
+      "official_series": [
+        {"series_id": 8895, "official_name": "小鹏G6", "powertrain": "mixed", "include_recent": true, "include_history": true}
+      ]
+    },
+    "benz__c-class": {
+      "default_powertrain": "ice",
+      "powertrain_resolution": "fixed",
+      "official_series": [
+        {"series_id": 212, "official_name": "奔驰C级", "powertrain": "ice", "include_recent": true, "include_history": true}
+      ]
+    },
+    "benz__glc": {
+      "default_powertrain": "ice",
+      "powertrain_resolution": "fixed",
+      "official_series": [
+        {"series_id": 216, "official_name": "奔驰GLC", "powertrain": "ice", "include_recent": true, "include_history": true}
+      ]
+    },
+    "bmw__3-series": {
+      "default_powertrain": "ice",
+      "powertrain_resolution": "fixed",
+      "official_series": [
+        {"series_id": 145, "official_name": "宝马3系", "powertrain": "ice", "include_recent": true, "include_history": true},
+        {"series_id": 116, "official_name": "宝马3系(进口)", "powertrain": "ice", "include_recent": false, "include_history": true}
+      ]
+    },
+    "bmw__5-series": {
+      "default_powertrain": "ice",
+      "powertrain_resolution": "fixed",
+      "official_series": [
+        {"series_id": 146, "official_name": "宝马5系", "powertrain": "ice", "include_recent": true, "include_history": true},
+        {"series_id": 120, "official_name": "宝马5系(进口)", "powertrain": "ice", "include_recent": true, "include_history": true}
+      ]
+    },
+    "bmw__x3": {
+      "default_powertrain": "ice",
+      "powertrain_resolution": "fixed",
+      "official_series": [
+        {"series_id": 2812, "official_name": "宝马X3", "powertrain": "ice", "include_recent": true, "include_history": true},
+        {"series_id": 126, "official_name": "宝马X3(进口)", "powertrain": "ice", "include_recent": true, "include_history": true}
+      ]
+    },
+    "audi__a4l": {
+      "default_powertrain": "ice",
+      "powertrain_resolution": "fixed",
+      "official_series": [
+        {"series_id": 96, "official_name": "奥迪A4L", "powertrain": "ice", "include_recent": true, "include_history": true}
+      ]
+    },
+    "audi__a6l": {
+      "default_powertrain": "ice",
+      "powertrain_resolution": "fixed",
+      "official_series": [
+        {"series_id": 99, "official_name": "奥迪A6L", "powertrain": "ice", "include_recent": true, "include_history": true}
+      ]
+    },
+    "audi__q5l": {
+      "default_powertrain": "ice",
+      "powertrain_resolution": "fixed",
+      "official_series": [
+        {"series_id": 2916, "official_name": "奥迪Q5L", "powertrain": "ice", "include_recent": true, "include_history": true}
+      ]
+    },
+    "vw__lavida": {
+      "default_powertrain": "ice",
+      "powertrain_resolution": "fixed",
+      "official_series": [
+        {"series_id": 393, "official_name": "朗逸", "powertrain": "ice", "include_recent": true, "include_history": true}
+      ]
+    },
+    "vw__sagitar": {
+      "default_powertrain": "ice",
+      "powertrain_resolution": "fixed",
+      "official_series": [
+        {"series_id": 414, "official_name": "速腾", "powertrain": "ice", "include_recent": true, "include_history": true}
+      ]
+    },
+    "vw__tiguan-l": {
+      "default_powertrain": "ice",
+      "powertrain_resolution": "infer_from_official_series_or_trim_spec",
+      "official_series": [
+        {"series_id": 404, "official_name": "途观L", "powertrain": "ice", "include_recent": true, "include_history": true},
+        {"series_id": 3001, "official_name": "途观L PHEV", "powertrain": "phev", "include_recent": true, "include_history": true}
+      ]
+    },
+    "toyota__corolla": {
+      "default_powertrain": "hev",
+      "powertrain_resolution": "infer_from_official_series_or_trim_spec",
+      "official_series": [
+        {"series_id": 542, "official_name": "卡罗拉", "powertrain": "mixed", "include_recent": true, "include_history": true},
+        {"series_id": 2881, "official_name": "卡罗拉双擎E+", "powertrain": "phev", "include_recent": false, "include_history": true}
+      ]
+    },
+    "toyota__camry": {
+      "default_powertrain": "hev",
+      "powertrain_resolution": "infer_from_official_series_or_trim_spec",
+      "official_series": [
+        {"series_id": 535, "official_name": "凯美瑞", "powertrain": "mixed", "include_recent": true, "include_history": true}
+      ]
+    },
+    "toyota__highlander": {
+      "default_powertrain": "hev",
+      "powertrain_resolution": "infer_from_official_series_or_trim_spec",
+      "official_series": [
+        {"series_id": 536, "official_name": "汉兰达", "powertrain": "mixed", "include_recent": true, "include_history": true},
+        {"series_id": 520, "official_name": "汉兰达(进口)", "powertrain": "ice", "include_recent": false, "include_history": true}
+      ]
+    },
+    "toyota__prado": {
+      "default_powertrain": "ice",
+      "powertrain_resolution": "infer_from_official_series_or_trim_spec",
+      "official_series": [
+        {"series_id": 547, "official_name": "普拉多", "powertrain": "mixed", "include_recent": true, "include_history": true}
+      ]
+    },
+    "toyota__land-cruiser": {
+      "default_powertrain": "ice",
+      "powertrain_resolution": "fixed",
+      "official_series": [
+        {"series_id": 548, "official_name": "兰德酷路泽", "powertrain": "ice", "include_recent": false, "include_history": true},
+        {"series_id": 522, "official_name": "兰德酷路泽(进口)", "powertrain": "ice", "include_recent": false, "include_history": true}
+      ]
+    },
+    "honda__civic": {
+      "default_powertrain": "ice",
+      "powertrain_resolution": "infer_from_official_series_or_trim_spec",
+      "official_series": [
+        {"series_id": 276, "official_name": "思域", "powertrain": "mixed", "include_recent": true, "include_history": true}
+      ]
+    },
+    "honda__accord": {
+      "default_powertrain": "ice",
+      "powertrain_resolution": "infer_from_official_series_or_trim_spec",
+      "official_series": [
+        {"series_id": 289, "official_name": "雅阁", "powertrain": "mixed", "include_recent": true, "include_history": true}
+      ]
+    },
+    "honda__crv": {
+      "default_powertrain": "ice",
+      "powertrain_resolution": "infer_from_official_series_or_trim_spec",
+      "official_series": [
+        {"series_id": 280, "official_name": "本田CR-V", "powertrain": "mixed", "include_recent": true, "include_history": true},
+        {"series_id": 4730, "official_name": "本田CR-V PHEV", "powertrain": "phev", "include_recent": false, "include_history": true}
+      ]
+    },
+    "nissan__sylphy": {
+      "default_powertrain": "ice",
+      "powertrain_resolution": "infer_from_official_series_or_trim_spec",
+      "official_series": [
+        {"series_id": 1145, "official_name": "轩逸", "powertrain": "mixed", "include_recent": true, "include_history": true}
+      ]
+    }
+  },
+  "unresolved": [
+    {
+      "series_slug": "toyota__land-cruiser",
+      "reason": "官方车系 548 与进口车系 522 均无 2024 至当前年款；本地 LC300/陆巡语义不能用旧款自动代替，保留车系兜底待人工确认"
+    }
+  ]
+}

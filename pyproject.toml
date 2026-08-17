@@ -26,5 +26,5 @@ dev = [
 package = false
 
 [tool.dcar]
-report-version = "dcar-content-operations-report-v8.5"
+report-version = "dcar-content-operations-report-v8.6"
 web-mode = "local-cache-only"

@@ -10,6 +10,7 @@ const navItems: Array<{ id: Section; label: string; href: string }> = [
   { id: "contents", label: "内容", href: "/contents" },
   { id: "accounts", label: "账号", href: "/accounts" },
   { id: "selling-points", label: "卖点", href: "/selling-points" },
+  { id: "spu-audience", label: "SPU人群", href: "/spu-audience" },
   { id: "tasks", label: "任务", href: "/tasks" },
 ];
 
@@ -19,6 +20,7 @@ const navIconShapes: Record<Section, ReactNode> = {
   accounts: <><circle cx="10" cy="7" r="3" /><path d="M4.5 17c.6-3.1 2.6-4.8 5.5-4.8s4.9 1.7 5.5 4.8" /></>,
   contents: <><path d="M5 2.75h6l4 4V16a1.5 1.5 0 0 1-1.5 1.5h-7A1.5 1.5 0 0 1 5 16V2.75Z" /><path d="M11 2.75V7h4M7.5 10.5h5M7.5 14h4" /></>,
   "selling-points": <><path d="M3.5 9.25V5.5a2 2 0 0 1 2-2h3.75l7.1 7.1a1.75 1.75 0 0 1 0 2.48l-3.27 3.27a1.75 1.75 0 0 1-2.48 0L3.5 9.25Z" /><circle cx="7" cy="7" r="1" /></>,
+  "spu-audience": <><circle cx="7" cy="6.5" r="2.4" /><circle cx="13.5" cy="8" r="1.9" /><path d="M3.2 16.5c.5-2.7 2-4.1 3.8-4.1s3.3 1.4 3.8 4.1" /><path d="M12.4 15.2c.4-1.9 1.5-3 2.9-3 .9 0 1.7.5 2.2 1.4" /></>,
 };
 
 function NavIcon({ section }: { section: Section }) {
@@ -26,14 +28,19 @@ function NavIcon({ section }: { section: Section }) {
 }
 
 const pageCopy: Record<Section, { eyebrow: string; title: string; description?: string }> = {
-  overview: { eyebrow: "OPERATIONS OVERVIEW", title: "数据概览", description: "多渠道内容运营核心指标总览与场景分析" },
-  tasks: { eyebrow: "REPORT TASKS", title: "数据报告任务" },
-  accounts: { eyebrow: "OPERATED ACCOUNTS", title: "运营账号" },
-  contents: { eyebrow: "CONTENT LIBRARY", title: "内容数据" },
+  overview: { eyebrow: "全渠道运营", title: "数据概览", description: "多渠道内容运营核心指标总览与场景分析" },
+  tasks: { eyebrow: "报告版本留档", title: "数据报告任务" },
+  accounts: { eyebrow: "账号档案", title: "运营账号" },
+  contents: { eyebrow: "内容库", title: "内容数据" },
   "selling-points": {
-    eyebrow: "SELLING POINT STANDARD",
+    eyebrow: "评估标准基线",
     title: "卖点标准",
     description: "围绕 E、X、M 三个业务场景，提供清晰的标签定义与分级规则，为内容评估与运营复核提供统一规范。",
+  },
+  "spu-audience": {
+    eyebrow: "车型 × 人群 × 场景",
+    title: "SPU人群",
+    description: "维护车型、人群与场景的识别规则，并按统计窗口查看三者的数据表现。",
   },
 };
 

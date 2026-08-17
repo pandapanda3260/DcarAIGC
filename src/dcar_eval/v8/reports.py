@@ -8,6 +8,7 @@ import html
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import uuid
@@ -23,6 +24,7 @@ from .contracts import (
     CURRENT_REPORT_EVIDENCE_VERSION,
     CURRENT_REPORT_VERSION,
     CURRENT_REPORT_RULE_VERSION,
+    LEGACY_CONTRACT_PATHS,
     REPORT_RULE_VERSIONS,
     expected_terminal_task_status,
     load_contract,
@@ -39,13 +41,15 @@ from .evaluation_selectors import (
 )
 from .duplicates import FINGERPRINT_VERSION, THRESHOLDS, duplicate_metric_decision
 from .insights import CHANNELS, SCENES, build_channel_conclusions
+from .media_state import media_terminal_states
 from .storage import (
-    CURRENT_SCHEMA_MIGRATION_NAME,
     DEFAULT_DB,
     PROJECT_ROOT,
     SCHEMA_VERSION,
+    SchemaMigrationError,
     connect,
     now_utc,
+    require_schema_compatibility,
     transaction,
 )
 
@@ -54,6 +58,8 @@ REPORTS_ROOT = PROJECT_ROOT / "reports" / "runs" / "v8"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 TASK_TYPES = {"daily", "weekly", "custom"}
 RUNNABLE_STATUSES = {"queued", "partial", "failed", "interrupted"}
+IMPLICIT_RUN_STATUSES = {"queued", "failed", "interrupted"}
+_REPORT_ID_BATCH_SIZE = 500
 
 _QUALITY_GATE_LABELS = {
     "discovery_coverage": "发现覆盖",
@@ -76,6 +82,27 @@ class TaskCancelled(ReportTaskError):
     pass
 
 
+def _report_id_batches(
+    connection: sqlite3.Connection,
+    ids: Sequence[int],
+    *,
+    reserved_parameters: int = 0,
+) -> Iterable[list[int]]:
+    """Yield bounded ID batches below the live SQLite variable limit."""
+
+    if reserved_parameters < 0:
+        raise ValueError("reserved_parameters must be non-negative")
+    variable_limit = connection.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER)
+    available_parameters = variable_limit - reserved_parameters
+    if available_parameters < 1:
+        raise ReportTaskError(
+            "SQLite variable limit is too low for a report query"
+        )
+    batch_size = min(_REPORT_ID_BATCH_SIZE, available_parameters)
+    for offset in range(0, len(ids), batch_size):
+        yield [int(value) for value in ids[offset : offset + batch_size]]
+
+
 def _task_completion_message(report: Mapping[str, Any]) -> str:
     if report.get("task", {}).get("task_status") != "partial":
         return "报告已生成"
@@ -91,6 +118,11 @@ def _task_completion_message(report: Mapping[str, Any]) -> str:
     contract = load_contract(report_version=str(report.get("report_version") or ""))
     failures = quality_gate_failures(
         data_quality,
+        data_quality_details=(
+            report.get("data_quality_details")
+            if isinstance(report.get("data_quality_details"), Mapping)
+            else None
+        ),
         contract=contract,
         enforce_boolean_quality_gates=bool(publications),
     )
@@ -112,107 +144,15 @@ def _task_completion_message(report: Mapping[str, Any]) -> str:
     return "报告已生成；未达发布门槛：" + "、".join(details)
 
 
-class _GrayReviewGateError(ReportTaskError):
-    def __init__(self, pending_count: int) -> None:
-        self.pending_count = pending_count
-        super().__init__(
-            f"正式报告已阻断：仍有 {pending_count} 条灰区内容或人工结论冲突"
-            "未完成人工复核"
-        )
-
-
-def _first_report_pending_gray_reviews(
-    connection: Any, release: Mapping[str, Any]
-) -> int:
-    formal_release_exists = (
-        connection.execute(
-            """
-            SELECT 1 FROM report_revisions
-            WHERE release_id=? AND contract_version=?
-              AND rule_version=? AND taxonomy_version=?
-              AND invalidated_at IS NULL
-            LIMIT 1
-            """,
-            (
-                release["id"],
-                CURRENT_REPORT_VERSION,
-                release["rule_version"],
-                release["taxonomy_version"],
-            ),
-        ).fetchone()
-        is not None
-    )
-    if formal_release_exists:
-        return 0
-    return int(
-        connection.execute(
-            """
-            WITH latest_active_evaluations AS (
-                SELECT content_id,pending_review,evidence_level,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY content_id
-                           ORDER BY evaluated_at DESC,id DESC
-                       ) selector_rank
-                FROM evaluation_versions
-                WHERE release_id=? AND invalidated_at IS NULL
-            ), blocking_contents AS (
-                SELECT content_id FROM latest_active_evaluations
-                WHERE selector_rank=1 AND pending_review=1
-                  AND evidence_level IN ('V2','V3')
-                UNION
-                SELECT q.content_id FROM review_queue q
-                JOIN evaluation_versions e ON e.id=q.evaluation_id
-                WHERE q.reason_code IN (
-                    'evaluation_gray_zone','manual_conclusion_conflict'
-                )
-                  AND q.status IN ('pending','manual_required','in_review')
-                  AND e.release_id=? AND e.invalidated_at IS NULL
-            )
-            SELECT COUNT(*) FROM blocking_contents
-            """,
-            (release["id"], release["id"]),
-        ).fetchone()[0]
-    )
-
-
-def _mark_review_gate_blocked(
-    connection: Any, task_id: str, error: _GrayReviewGateError
-) -> None:
-    blocked_at = now_utc()
-    connection.execute(
-        """
-        UPDATE report_tasks SET task_status='failed', progress=0, message=?,
-            completed_at=?, updated_at=? WHERE id=?
-        """,
-        (str(error), blocked_at, blocked_at, task_id),
-    )
-    connection.execute(
-        """
-        INSERT INTO task_events(task_id, event_type, message, payload_json, created_at)
-        VALUES (?, 'review_gate_blocked', ?, ?, ?)
-        """,
-        (
-            task_id,
-            str(error),
-            json.dumps({"pending_gray_reviews": error.pending_count}),
-            blocked_at,
-        ),
-    )
-
-
 def assert_report_runtime_ready(connection) -> Dict[str, Any]:
     """Return the pinned current release or fail before any report-side write."""
 
-    user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    migration = connection.execute(
-        "SELECT name FROM schema_migrations WHERE version=?", (SCHEMA_VERSION,)
-    ).fetchall()
-    if (
-        user_version != SCHEMA_VERSION
-        or len(migration) != 1
-        or str(migration[0]["name"]) != CURRENT_SCHEMA_MIGRATION_NAME
-    ):
-        raise ReportTaskError(f"complete schema v{SCHEMA_VERSION} is required")
+    try:
+        require_schema_compatibility(
+            connection, supported_versions=frozenset({SCHEMA_VERSION})
+        )
+    except SchemaMigrationError as error:
+        raise ReportTaskError(str(error)) from error
     try:
         release = selected_active_release(connection)
     except EvaluationSelectorError as error:
@@ -325,7 +265,7 @@ def resume_task(task_id: str, *, db_path: Path = DEFAULT_DB) -> Dict[str, Any]:
         connection.execute(
             """
             UPDATE report_tasks SET task_status='queued', progress=0,
-                message='任务已恢复，等待生成新 revision', started_at=NULL,
+                message='任务已恢复，等待重新生成报告', started_at=NULL,
                 completed_at=NULL, updated_at=? WHERE id=?
             """,
             (captured_at, task_id),
@@ -357,7 +297,7 @@ def retry_task(task_id: str, *, db_path: Path = DEFAULT_DB) -> Dict[str, Any]:
         connection.execute(
             """
             UPDATE report_tasks SET task_status='queued', progress=0,
-                message='已请求生成新 revision', started_at=NULL, completed_at=NULL,
+                message='已请求重新生成报告', started_at=NULL, completed_at=NULL,
                 updated_at=? WHERE id=?
             """,
             (captured_at, task_id),
@@ -365,7 +305,7 @@ def retry_task(task_id: str, *, db_path: Path = DEFAULT_DB) -> Dict[str, Any]:
         connection.execute(
             """
             INSERT INTO task_events(task_id,event_type,message,payload_json,created_at)
-            VALUES (?, 'retry_requested', '已请求生成新 revision', '{}', ?)
+            VALUES (?, 'retry_requested', '已请求重新生成报告', '{}', ?)
             """,
             (task_id, captured_at),
         )
@@ -454,8 +394,16 @@ def create_task(
         raise ReportTaskError("weekly task must cover Monday through Sunday")
     if creation_source == "manual" and task_type != "custom":
         raise ReportTaskError("manual report creation must use custom task type")
-    task_id = _task_id(task_type, period_start, period_end, creation_source)
+    if creation_source == "automatic" and task_type == "custom":
+        raise ReportTaskError("automatic report creation supports daily or weekly only")
     created_at = now_utc()
+    if creation_source == "manual":
+        _, period_end_utc = period_bounds(period_start, period_end)
+        created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        closed_at = datetime.fromisoformat(period_end_utc.replace("Z", "+00:00"))
+        if created < closed_at:
+            raise ReportTaskError("manual report period must be closed before creation")
+    task_id = _task_id(task_type, period_start, period_end, creation_source)
     display_name = (
         name.strip()
         if name and name.strip()
@@ -555,7 +503,24 @@ def _task_revision_read_model(connection, task_id: str) -> Dict[str, Any]:
                 value
                 for value in revision_values
                 if value["invalidated_at"] is None
+                and value["release_id"] == active["id"]
+                and value["contract_version"] != CURRENT_REPORT_VERSION
+                and value["contract_version"] in LEGACY_CONTRACT_PATHS
+                and value["rule_version"] == active["rule_version"]
+                and value["taxonomy_version"] == active["taxonomy_version"]
+                and REPORT_RULE_VERSIONS.get(value["contract_version"])
+                == value["rule_version"]
+            ),
+            None,
+        )
+    if current is None and stale is None:
+        stale = next(
+            (
+                value
+                for value in revision_values
+                if value["invalidated_at"] is None
                 and value["release_status"] == "retired"
+                and value["contract_version"] in LEGACY_CONTRACT_PATHS
                 and REPORT_RULE_VERSIONS.get(value["contract_version"])
                 == value["rule_version"]
             ),
@@ -666,24 +631,111 @@ def _snapshot_task_contents(connection, task: Mapping[str, Any]) -> None:
         )
 
 
-def _latest_metric_rows(connection, ids: Sequence[int]) -> Dict[int, Dict[str, Any]]:
+def _collection_cutoff_at(
+    task: Mapping[str, Any], *, generated_at: str
+) -> str:
+    """Return the evidence cutoff independently from revision generation time."""
+
+    task_type = str(task["task_type"])
+    creation_source = str(task["creation_source"])
+    if creation_source == "automatic" and task_type in {"daily", "weekly"}:
+        cutoff_day = _date(str(task["period_end"])) + timedelta(days=1)
+        cutoff_time = time(8, 0) if task_type == "daily" else time(8, 30)
+        cutoff = datetime.combine(cutoff_day, cutoff_time, SHANGHAI)
+    else:
+        created_at = task.get("created_at")
+        if not isinstance(created_at, str) or not created_at:
+            raise ReportTaskError("manual report task is missing its fixed created_at")
+        try:
+            cutoff = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ReportTaskError(
+                f"invalid report task created_at timestamp: {created_at}"
+            ) from error
+        if cutoff.tzinfo is None:
+            raise ReportTaskError("report task created_at timestamp must include timezone")
+    return (
+        cutoff.astimezone(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _latest_metric_observations_at(
+    connection, ids: Sequence[int], *, cutoff_at: str
+) -> Dict[int, Dict[str, Any]]:
     if not ids:
         return {}
-    placeholders = ",".join("?" for _ in ids)
-    rows = connection.execute(
-        f"""
-        SELECT * FROM content_metric_snapshots
-        WHERE content_id IN ({placeholders})
-        ORDER BY captured_at DESC, id DESC
-        """,
-        ids,
-    ).fetchall()
     output: Dict[int, Dict[str, Any]] = {}
-    for row in rows:
-        content_id = int(row["content_id"])
-        if content_id not in output:
-            output[content_id] = dict(row)
+    for batch in _report_id_batches(
+        connection, ids, reserved_parameters=1
+    ):
+        placeholders = ",".join("?" for _ in batch)
+        rows = connection.execute(
+            f"""
+            SELECT * FROM content_metric_observations
+            WHERE content_id IN ({placeholders})
+              AND julianday(captured_at)<=julianday(?)
+            ORDER BY content_id,julianday(captured_at) DESC,id DESC
+            """,
+            [*batch, cutoff_at],
+        ).fetchall()
+        for row in rows:
+            content_id = int(row["content_id"])
+            if content_id not in output:
+                output[content_id] = dict(row)
     return output
+
+
+def _metric_freshness_detail(
+    connection,
+    ids: Sequence[int],
+    *,
+    cutoff_at: str,
+    minimum_percentage: float,
+    latest_observations: Optional[Mapping[int, Mapping[str, Any]]] = None,
+) -> Dict[str, Any]:
+    latest = (
+        dict(latest_observations)
+        if latest_observations is not None
+        else _latest_metric_observations_at(connection, ids, cutoff_at=cutoff_at)
+    )
+    eligible_count = len(ids)
+    cutoff = datetime.fromisoformat(cutoff_at.replace("Z", "+00:00"))
+    freshness_start = cutoff - timedelta(hours=36)
+    fresh_count = sum(
+        1
+        for observation in latest.values()
+        if observation["status"] == "available"
+        and freshness_start
+        <= datetime.fromisoformat(
+            str(observation["captured_at"]).replace("Z", "+00:00")
+        )
+        <= cutoff
+    )
+    percentage = _percentage(fresh_count, eligible_count)
+    if eligible_count == 0:
+        status = "not_applicable"
+        reason = "报告窗口没有发布内容"
+    elif percentage is not None and percentage >= minimum_percentage:
+        status = "available"
+        reason = ""
+    else:
+        status = "below_threshold"
+        reason = (
+            f"固定采集截止点前 36 小时内的新鲜指标覆盖率为 "
+            f"{float(percentage or 0):.2f}%，低于 {minimum_percentage:g}% 发布门槛"
+        )
+    return {
+        "status": status,
+        "fresh_count": fresh_count,
+        "as_of_snapshot_count": len(latest),
+        "eligible_count": eligible_count,
+        "percentage": percentage,
+        "window_hours": 36,
+        "eligible_basis": "all_window_contents",
+        "reason": reason,
+    }
 
 
 def _percentage(numerator: int, denominator: int) -> Optional[float]:
@@ -698,46 +750,244 @@ def _dimension(items: Iterable[str], total: int) -> List[Dict[str, Any]]:
     ]
 
 
-def _metric_eligible(published_at: Optional[str], generated_at: datetime) -> bool:
-    if not published_at:
-        return False
+_DISCOVERY_TERMINAL_REASONS = frozenset(
+    {"window_start_reached", "provider_exhausted"}
+)
+_DISCOVERY_SUCCESS_PAGE_STATUSES = frozenset({"succeeded", "already_succeeded"})
+_DISCOVERY_SUCCESS_RULE = (
+    "identity.status=succeeded; stopped_reason in "
+    "{window_start_reached,provider_exhausted}; pages are contiguous and non-empty; "
+    "every page status in {succeeded,already_succeeded}, has no missing published_at "
+    "or derived failure; provider_exhausted requires final has_more=false"
+)
+
+
+def _daily_capture_occurrence_for(report_day: date) -> str:
+    occurrence = datetime.combine(report_day + timedelta(days=1), time(2, 0), SHANGHAI)
+    return (
+        occurrence.astimezone(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _parse_daily_capture_receipt(details_json: str) -> Dict[str, Any]:
     try:
-        published = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
-    except ValueError:
-        return False
-    return published <= generated_at <= published + timedelta(days=30)
+        details = json.loads(details_json)
+    except (TypeError, json.JSONDecodeError):
+        details = {}
+    if not isinstance(details, Mapping):
+        details = {}
+    monitored_value = details.get("monitored_accounts")
+    monitored_accounts = (
+        int(monitored_value)
+        if isinstance(monitored_value, int)
+        and not isinstance(monitored_value, bool)
+        and monitored_value >= 0
+        else 0
+    )
+    discovery = details.get("discovery")
+    rows = discovery if isinstance(discovery, list) else []
+    by_identity: Dict[tuple[int, str], List[Mapping[str, Any]]] = {}
+    for item in rows:
+        if not isinstance(item, Mapping):
+            continue
+        account_id = item.get("account_id")
+        platform = item.get("platform")
+        if (
+            isinstance(account_id, bool)
+            or not isinstance(account_id, int)
+            or platform not in {"douyin", "xiaohongshu"}
+        ):
+            continue
+        by_identity.setdefault((account_id, str(platform)), []).append(item)
+
+    successful: set[tuple[int, str]] = set()
+    for identity, items in by_identity.items():
+        if len(items) != 1:
+            continue
+        item = items[0]
+        pages = item.get("pages")
+        page_numbers = (
+            [page.get("page") for page in pages if isinstance(page, Mapping)]
+            if isinstance(pages, list)
+            else []
+        )
+        pages_valid = (
+            isinstance(pages, list)
+            and bool(pages)
+            and page_numbers == list(range(1, len(pages) + 1))
+            and all(
+                isinstance(page, Mapping)
+                and page.get("status") in _DISCOVERY_SUCCESS_PAGE_STATUSES
+                and int(page.get("missing_published_at_count") or 0) == 0
+                and not (
+                    isinstance(page.get("derived_stages"), Mapping)
+                    and page["derived_stages"].get("failures")
+                )
+                for page in pages
+            )
+        )
+        terminal_valid = item.get("stopped_reason") in _DISCOVERY_TERMINAL_REASONS
+        if (
+            terminal_valid
+            and item.get("stopped_reason") == "provider_exhausted"
+            and isinstance(pages, list)
+            and pages
+        ):
+            terminal_valid = (
+                isinstance(pages[-1], Mapping)
+                and pages[-1].get("has_more") is False
+            )
+        if (
+            item.get("status") == "succeeded"
+            and terminal_valid
+            and pages_valid
+        ):
+            successful.add(identity)
+    roster_count = len(by_identity)
+    roster_matches_monitored = roster_count == monitored_accounts
+    return {
+        "covered": len(successful) if roster_matches_monitored else 0,
+        "expected": max(monitored_accounts, roster_count),
+        "roster_count": roster_count,
+        "roster_matches_monitored": roster_matches_monitored,
+    }
 
 
-def _discovery_coverage(connection) -> float:
-    counts = connection.execute(
-        """
-        SELECT COUNT(*) identity_count,
-               COALESCE(SUM(
-                   CASE WHEN EXISTS (
-                       SELECT 1 FROM fetch_slots fs
-                       WHERE fs.account_id=api.account_id
-                         AND fs.stage='discovery'
-                         AND fs.provider='TikHub'
-                         AND fs.status='succeeded'
-                         AND (
-                             (api.platform='douyin'
-                              AND fs.adapter_version='tikhub-user-posts-v8.1')
-                             OR
-                             (api.platform='xiaohongshu'
-                              AND fs.adapter_version=
-                                  'tikhub-xhs-app-v2-user-posts-v8.1')
-                         )
-                   ) THEN 1 ELSE 0 END
-               ), 0) covered_identity_count
-        FROM account_platform_identities api
-        JOIN accounts a ON a.id=api.account_id
-        WHERE a.enabled=1 AND api.platform IN ('douyin','xiaohongshu')
-        """
-    ).fetchone()
-    identity_count = int(counts["identity_count"])
-    if identity_count == 0:
-        return 100.0
-    return round(int(counts["covered_identity_count"]) * 100 / identity_count, 2)
+def _daily_capture_receipts(
+    connection, *, generated_at: str
+) -> Dict[str, Dict[str, Any]]:
+    return {
+        str(row["scheduled_for"]): _parse_daily_capture_receipt(
+            str(row["details_json"] or "{}")
+        )
+        for row in connection.execute(
+            """
+            SELECT scheduled_for,details_json FROM scheduler_runs
+            WHERE job_id='daily_capture' AND completed_at IS NOT NULL
+              AND julianday(completed_at)<=julianday(?)
+            ORDER BY scheduled_for
+            """,
+            (generated_at,),
+        ).fetchall()
+    }
+
+
+def _nearest_discovery_roster_count(
+    receipts: Mapping[str, Mapping[str, Any]], target_occurrence: str
+) -> int:
+    target = datetime.fromisoformat(target_occurrence.replace("Z", "+00:00"))
+    candidates: List[tuple[datetime, int]] = []
+    for scheduled_for, receipt in receipts.items():
+        if not bool(receipt.get("roster_matches_monitored")):
+            continue
+        expected = int(receipt.get("expected") or 0)
+        if expected <= 0:
+            continue
+        try:
+            occurrence = datetime.fromisoformat(scheduled_for.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if occurrence <= target:
+            candidates.append((occurrence, expected))
+    if candidates:
+        return max(candidates)[1]
+    future_candidates: List[tuple[datetime, int]] = []
+    for scheduled_for, receipt in receipts.items():
+        if not bool(receipt.get("roster_matches_monitored")):
+            continue
+        expected = int(receipt.get("expected") or 0)
+        if expected <= 0:
+            continue
+        try:
+            occurrence = datetime.fromisoformat(scheduled_for.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if occurrence > target:
+            future_candidates.append((occurrence, expected))
+    return min(future_candidates)[1] if future_candidates else 0
+
+
+def _discovery_coverage_detail(
+    connection,
+    task: Mapping[str, Any],
+    *,
+    generated_at: str,
+    minimum_percentage: float,
+) -> Dict[str, Any]:
+    receipts = _daily_capture_receipts(connection, generated_at=generated_at)
+    start = _date(str(task["period_start"]))
+    end = _date(str(task["period_end"]))
+    covered_count = 0
+    expected_count = 0
+    observed = 0
+    validation_failures = 0
+    missing_dates: List[str] = []
+    active_identity_count = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) FROM account_platform_identities api
+            JOIN accounts a ON a.id=api.account_id
+            WHERE a.enabled=1 AND api.platform IN ('douyin','xiaohongshu')
+            """
+        ).fetchone()[0]
+    )
+    current = start
+    while current <= end:
+        occurrence = _daily_capture_occurrence_for(current)
+        receipt = receipts.get(occurrence)
+        if receipt is None or int(receipt.get("expected") or 0) <= 0:
+            inherited_roster = _nearest_discovery_roster_count(receipts, occurrence)
+            expected_count += inherited_roster or active_identity_count
+            missing_dates.append(current.isoformat())
+        elif not bool(receipt["roster_matches_monitored"]):
+            expected_count += int(receipt["expected"])
+            validation_failures += 1
+            missing_dates.append(current.isoformat())
+        else:
+            observed += 1
+            expected_count += int(receipt["expected"])
+            covered_count += min(
+                int(receipt["covered"]), int(receipt["expected"])
+            )
+        current += timedelta(days=1)
+
+    if expected_count > 0:
+        percentage = round(covered_count * 100 / expected_count, 2)
+        status = "available" if percentage >= minimum_percentage else "below_threshold"
+    else:
+        if active_identity_count == 0:
+            percentage = None
+            status = "not_applicable"
+        else:
+            percentage = 0.0
+            status = "below_threshold"
+    if status == "available":
+        reason = ""
+    elif status == "not_applicable":
+        reason = "没有需要执行发现采集的平台账号"
+    elif expected_count <= 0:
+        reason = "没有可验证的历史发现采集 roster，按 0% 处理"
+    else:
+        percentage_value = float(percentage) if percentage is not None else 0.0
+        reason = (
+            f"报告窗口发现覆盖率为 {percentage_value:.2f}%（{covered_count}/"
+            f"{expected_count}），低于 {minimum_percentage:g}% 发布门槛"
+        )
+    return {
+        "status": status,
+        "covered_identity_occurrence_count": covered_count,
+        "eligible_identity_occurrence_count": expected_count,
+        "percentage": percentage,
+        "eligible_basis": "scheduled_daily_capture_identity_occurrences",
+        "expected_occurrence_count": (end - start).days + 1,
+        "observed_occurrence_count": observed,
+        "missing_occurrence_dates": missing_dates,
+        "roster_validation_failures": validation_failures,
+        "success_rule": _DISCOVERY_SUCCESS_RULE,
+        "reason": reason,
+    }
 
 
 def _report_audience_rates(
@@ -745,7 +995,7 @@ def _report_audience_rates(
     conclusion_rows: List[Dict[str, Any]],
     *,
     window_end_utc: str,
-    generated_at: str,
+    report_cutoff_at: str,
 ) -> Dict[str, Dict[str, Any]]:
     """Per-slice automotive_user_rate for one report window.
 
@@ -766,7 +1016,7 @@ def _report_audience_rates(
         classifier_state=active_classifier_state(connection),
         evidence_window_start=evidence_window_start,
         evidence_window_end=window_end_utc,
-        report_cutoff_at=generated_at,
+        report_cutoff_at=report_cutoff_at,
         warm_up=True,
         channels=CHANNELS,
         scenes=SCENES,
@@ -801,10 +1051,43 @@ def _build_report_data(
     ).fetchall()
     contents = [dict(row) for row in content_rows]
     ids = [int(row["id"]) for row in content_rows]
-    eligible_evaluations = formal_eligible_release_evaluations(
-        connection, str(release["id"]), ids
+    collection_cutoff_at = _collection_cutoff_at(task, generated_at=generated_at)
+    snapshots = _latest_metric_observations_at(
+        connection, ids, cutoff_at=collection_cutoff_at
     )
-    snapshots = _latest_metric_rows(connection, ids)
+    contract = load_contract(report_version=CURRENT_REPORT_VERSION)
+    coverage_thresholds = contract["required_coverage_thresholds"]
+    metric_display_thresholds = contract["metric_display_coverage_thresholds"]
+    evaluation_minimum = float(coverage_thresholds["evaluation_coverage"])
+    fingerprint_minimum = float(
+        coverage_thresholds["duplicate_fingerprint_coverage"]
+    )
+    view_minimum = float(metric_display_thresholds["view_count"])
+    comment_minimum = float(metric_display_thresholds["comment_count"])
+    freshness_contract = contract["required_quality_details"]["metrics_freshness"]
+    discovery_contract = contract["required_quality_details"]["discovery_coverage"]
+    discovery_detail = _discovery_coverage_detail(
+        connection,
+        task,
+        generated_at=generated_at,
+        minimum_percentage=float(discovery_contract["minimum_percentage"]),
+    )
+    freshness_detail = _metric_freshness_detail(
+        connection,
+        ids,
+        cutoff_at=collection_cutoff_at,
+        minimum_percentage=float(freshness_contract["minimum_percentage"]),
+        latest_observations=snapshots,
+    )
+    eligible_evaluations: Dict[int, Dict[str, Any]] = {}
+    for batch in _report_id_batches(
+        connection, ids, reserved_parameters=1
+    ):
+        eligible_evaluations.update(
+            formal_eligible_release_evaluations(
+                connection, str(release["id"]), batch
+            )
+        )
     included_evaluations = {
         content_id: value
         for content_id, value in eligible_evaluations.items()
@@ -836,25 +1119,31 @@ def _build_report_data(
     fingerprint_ready = 0
     duplicate_calibration_ready = False
     if ids:
-        placeholders = ",".join("?" for _ in ids)
-        detail_ready = int(
-            connection.execute(
-                f"""
-                SELECT COUNT(DISTINCT content_id) FROM fetch_slots
-                WHERE content_id IN ({placeholders}) AND stage='detail' AND status='succeeded'
-                """,
-                ids,
-            ).fetchone()[0]
-        )
-        fingerprint_ready = int(
-            connection.execute(
-                f"""
-                SELECT COUNT(DISTINCT content_id) FROM duplicate_fingerprints
-                WHERE content_id IN ({placeholders}) AND fingerprint_version=?
-                """,
-                [*ids, FINGERPRINT_VERSION],
-            ).fetchone()[0]
-        )
+        for batch in _report_id_batches(connection, ids):
+            placeholders = ",".join("?" for _ in batch)
+            detail_ready += int(
+                connection.execute(
+                    f"""
+                    SELECT COUNT(DISTINCT content_id) FROM fetch_slots
+                    WHERE content_id IN ({placeholders})
+                      AND stage='detail' AND status='succeeded'
+                    """,
+                    batch,
+                ).fetchone()[0]
+            )
+        for batch in _report_id_batches(
+            connection, ids, reserved_parameters=1
+        ):
+            placeholders = ",".join("?" for _ in batch)
+            fingerprint_ready += int(
+                connection.execute(
+                    f"""
+                    SELECT COUNT(DISTINCT content_id) FROM duplicate_fingerprints
+                    WHERE content_id IN ({placeholders}) AND fingerprint_version=?
+                    """,
+                    [*batch, FINGERPRINT_VERSION],
+                ).fetchone()[0]
+            )
         duplicate_calibration_ready = (
             connection.execute(
                 """
@@ -874,64 +1163,50 @@ def _build_report_data(
             ).fetchone()
             is not None
         )
-    generated_dt = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
-    metric_eligible_ids = {
-        int(row["id"])
-        for row in content_rows
-        if _metric_eligible(row["published_at"], generated_dt)
-    }
-    fresh_metric_ids = {
-        content_id
-        for content_id, value in snapshots.items()
-        if content_id in metric_eligible_ids
-        and value["status"] == "available"
-        and datetime.fromisoformat(str(value["captured_at"]).replace("Z", "+00:00"))
-        >= generated_dt - timedelta(hours=36)
-    }
-    metrics_freshness = (
-        _percentage(len(fresh_metric_ids), len(metric_eligible_ids))
-        if metric_eligible_ids
-        else 100.0
-    )
-    routed_media_ids: set[int] = set()
     recent_comment_ids: set[int] = set()
     if ids:
-        placeholders = ",".join("?" for _ in ids)
-        routed_media_ids = {
-            int(row["content_id"])
-            for row in connection.execute(
-                f"""
-                SELECT DISTINCT content_id FROM review_queue
-                WHERE content_id IN ({placeholders})
-                  AND status IN ('manual_required','resolved','terminal_failed')
-                """,
-                ids,
-            ).fetchall()
-        }
         comment_cutoff = (
             (
-                datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
+                datetime.fromisoformat(collection_cutoff_at.replace("Z", "+00:00"))
                 - timedelta(days=8)
             )
             .isoformat()
             .replace("+00:00", "Z")
         )
-        recent_comment_ids = {
-            int(row["content_id"])
-            for row in connection.execute(
-                f"""
-                SELECT DISTINCT content_id FROM comment_evidence_versions
-                WHERE content_id IN ({placeholders}) AND status='available'
-                  AND captured_at>=? AND captured_at<=?
-                """,
-                [*ids, comment_cutoff, generated_at],
-            ).fetchall()
-        }
+        for batch in _report_id_batches(
+            connection, ids, reserved_parameters=2
+        ):
+            placeholders = ",".join("?" for _ in batch)
+            recent_comment_ids.update(
+                int(row["content_id"])
+                for row in connection.execute(
+                    f"""
+                    SELECT DISTINCT content_id FROM comment_evidence_versions
+                    WHERE content_id IN ({placeholders}) AND status='available'
+                      AND captured_at>=? AND captured_at<=?
+                    """,
+                    [*batch, comment_cutoff, collection_cutoff_at],
+                ).fetchall()
+            )
+    media_content_ids = [
+        int(content["id"])
+        for content in contents
+        if content["content_type"] in {"video", "image"}
+    ]
+    media_states = media_terminal_states(
+        connection,
+        str(release["id"]),
+        media_content_ids,
+    )
     media_terminal_ids = {
-        content_id for content_id in eligible_evaluations
-    } | routed_media_ids
+        content_id
+        for content_id, state in media_states.items()
+        if state in {"complete", "terminal_insufficient", "terminal_failed"}
+    }
     media_terminal_coverage = (
-        _percentage(len(media_terminal_ids), total) if total else 100.0
+        _percentage(len(media_terminal_ids), len(media_content_ids))
+        if media_content_ids
+        else 100.0
     )
     weekly_comment_coverage = (
         _percentage(len(recent_comment_ids), total)
@@ -943,15 +1218,16 @@ def _build_report_data(
             total,
             fingerprint_ready,
             duplicate_calibration_ready,
+            threshold=fingerprint_minimum,
         )
     )
     evaluation_coverage = (
         round(eval_ready * 100 / total, 2) if total else 100.0
     )
     data_quality: Dict[str, Any] = {
-        "discovery_coverage": _discovery_coverage(connection),
+        "discovery_coverage": discovery_detail["percentage"],
         "detail_coverage": _percentage(detail_ready, total) if total else 100.0,
-        "metrics_freshness": metrics_freshness,
+        "metrics_freshness": freshness_detail["percentage"],
         "evaluation_coverage": evaluation_coverage,
         "core_artifact_coverage": 100.0,
         "media_terminal_coverage": media_terminal_coverage,
@@ -963,9 +1239,12 @@ def _build_report_data(
     }
     task_status = expected_terminal_task_status(
         data_quality,
+        data_quality_details={
+            "discovery_coverage": discovery_detail,
+            "metrics_freshness": freshness_detail,
+        },
         enforce_boolean_quality_gates=bool(total),
     )
-    metric_coverage = _percentage(len(snapshots), total)
     view_values = [
         int(value["view_count"])
         for value in snapshots.values()
@@ -976,6 +1255,7 @@ def _build_report_data(
         for value in snapshots.values()
         if value["comment_count"] is not None
     ]
+    view_metric_coverage = _percentage(len(view_values), total)
     all_historical = bool(snapshots) and all(
         str(value["source"]).startswith("migrated_") for value in snapshots.values()
     )
@@ -987,7 +1267,7 @@ def _build_report_data(
         else "stale"
         if all_historical
         else "available"
-        if (metric_coverage or 0) >= 90
+        if (view_metric_coverage or 0) >= view_minimum
         else "below_threshold"
     )
     comment_status = (
@@ -996,34 +1276,36 @@ def _build_report_data(
         else "missing"
         if not comment_values
         else "available"
-        if len(comment_values) * 100 / total >= 90
+        if len(comment_values) * 100 / total >= comment_minimum
         else "below_threshold"
     )
     eval_status = (
         "not_applicable"
         if total == 0
         else "available"
-        if evaluation_coverage >= 95
+        if evaluation_coverage >= evaluation_minimum
         else "below_threshold"
     )
     evaluation_reason = (
         "正式评估覆盖率为 "
-        f"{evaluation_coverage:.2f}%，低于 95% 发布阈值"
+        f"{evaluation_coverage:.2f}%，低于 {evaluation_minimum:g}% 发布阈值"
         if eval_status == "below_threshold"
         else ""
     )
     view_reason = (
         "存量曝光为一次性历史快照，不能解释为当前实时值"
         if all_historical
-        else f"曝光量快照覆盖率为 {metric_coverage:.2f}%，低于 90% 发布阈值"
-        if view_status == "below_threshold" and metric_coverage is not None
+        else f"曝光量快照覆盖率为 {view_metric_coverage:.2f}%，低于 "
+        f"{view_minimum:g}% 发布阈值"
+        if view_status == "below_threshold" and view_metric_coverage is not None
         else ""
     )
     comment_metric_coverage = _percentage(len(comment_values), total)
     comment_reason = (
         "存量 valid_unique_commenters 不是评论量，未转换为评论数"
         if comment_status == "missing"
-        else f"评论量快照覆盖率为 {comment_metric_coverage:.2f}%，低于 90% 发布阈值"
+        else f"评论量快照覆盖率为 {comment_metric_coverage:.2f}%，低于 "
+        f"{comment_minimum:g}% 发布阈值"
         if comment_status == "below_threshold" and comment_metric_coverage is not None
         else ""
     )
@@ -1058,12 +1340,14 @@ def _build_report_data(
     review_rows = connection.execute(
         """
         SELECT rq.status, COUNT(*) count FROM review_queue rq
+        JOIN evaluation_versions ev ON ev.id=rq.evaluation_id
         WHERE rq.content_id IN (
             SELECT content_id FROM task_contents
             WHERE task_id=? AND inclusion_status='included'
-        ) GROUP BY rq.status ORDER BY rq.status
+        ) AND ev.release_id=? AND ev.invalidated_at IS NULL
+        GROUP BY rq.status ORDER BY rq.status
         """,
-        (task["id"],),
+        (task["id"], release["id"]),
     ).fetchall()
     capture_rows = connection.execute(
         """
@@ -1131,7 +1415,7 @@ def _build_report_data(
             connection,
             conclusion_rows,
             window_end_utc=end_utc,
-            generated_at=generated_at,
+            report_cutoff_at=collection_cutoff_at,
         ),
     )
     details: List[Dict[str, Any]] = []
@@ -1183,6 +1467,7 @@ def _build_report_data(
             "task_id": task["id"],
             "revision": revision,
             "generated_at": generated_at,
+            "collection_cutoff_at": collection_cutoff_at,
         },
         "scope": {
             "period_start": f"{task['period_start']}T00:00:00+08:00",
@@ -1196,6 +1481,10 @@ def _build_report_data(
             "name": task["name"],
         },
         "data_quality": data_quality,
+        "data_quality_details": {
+            "discovery_coverage": discovery_detail,
+            "metrics_freshness": freshness_detail,
+        },
         "summary_metrics": {
             "publication_count": quantity_metric(
                 total, unit="content", status="available"
@@ -1207,7 +1496,7 @@ def _build_report_data(
                 sum(view_values) if view_values else None,
                 unit="view",
                 status=view_status,
-                coverage_percentage=metric_coverage,
+                coverage_percentage=view_metric_coverage,
                 reason=view_reason,
             ),
             "comment_count": quantity_metric(
@@ -1304,7 +1593,7 @@ _UNPUBLISHED_STATUS_LABELS = {
 #: 不再使用泛化样本提示）。关键词与 audience_rate/insights 的
 #: reason 文案保持一致，改动需同步 web 端 unavailableShortLabel。
 _UNPUBLISHED_REASON_LABELS = (
-    ("感知指纹定标未通过", "重复指纹待校验"),
+    ("感知指纹尚未完成定标", "重复指纹待校验"),
     ("感知指纹覆盖率", "重复指纹待补齐"),
     ("用户身份覆盖率", "身份数据待补齐"),
     ("用户分类覆盖率", "用户分类未完成"),
@@ -1407,8 +1696,45 @@ def _markdown(report: Mapping[str, Any]) -> str:
             ]
         )
     lines.extend(["## 数据质量", ""])
+    quality_details = report.get("data_quality_details")
+    freshness_detail = (
+        quality_details.get("metrics_freshness")
+        if isinstance(quality_details, Mapping)
+        else None
+    )
+    discovery_detail = (
+        quality_details.get("discovery_coverage")
+        if isinstance(quality_details, Mapping)
+        else None
+    )
     for key, value in report["data_quality"].items():
-        lines.append(f"- {key}: {value}%")
+        if key == "discovery_coverage" and isinstance(discovery_detail, Mapping):
+            if discovery_detail.get("status") == "not_applicable":
+                lines.append(f"- {key}: 无适用内容")
+            else:
+                lines.append(
+                    f"- {key}: "
+                    f"{discovery_detail.get('covered_identity_occurrence_count', 0)}/"
+                    f"{discovery_detail.get('eligible_identity_occurrence_count', 0)}"
+                    f" · occurrence "
+                    f"{discovery_detail.get('observed_occurrence_count', 0)}/"
+                    f"{discovery_detail.get('expected_occurrence_count', 0)}"
+                    f" · {value}%"
+                )
+        elif key == "metrics_freshness" and isinstance(freshness_detail, Mapping):
+            if freshness_detail.get("status") == "not_applicable":
+                lines.append(f"- {key}: 无适用内容")
+            else:
+                lines.append(
+                    f"- {key}: {freshness_detail.get('fresh_count', 0)}/"
+                    f"{freshness_detail.get('eligible_count', 0)} · {value}%"
+                )
+        elif isinstance(value, bool):
+            lines.append(f"- {key}: {'通过' if value else '未通过'}")
+        elif value is None:
+            lines.append(f"- {key}: 无适用内容")
+        else:
+            lines.append(f"- {key}: {value}%")
     lines.extend(
         ["", "三项业务预估在 v8 首版恒为 `not_calculable`，不会生成推测值。", ""]
     )
@@ -1674,13 +2000,36 @@ def _record_task_failure(
         )
 
 
+def advance_task_progress(
+    task_id: str,
+    *,
+    progress: int,
+    message: str,
+    db_path: Path = DEFAULT_DB,
+) -> None:
+    """Publish a coarse run stage so a polling client can render live progress.
+
+    Only a running task is touched: a cancel request or a terminal status must
+    never be overwritten by a stage update that raced with it.
+    """
+
+    updated_at = now_utc()
+    with connect(db_path) as connection, transaction(connection):
+        connection.execute(
+            """
+            UPDATE report_tasks SET progress=?, message=?, updated_at=?
+            WHERE id=? AND task_status='running'
+            """,
+            (max(0, min(100, int(progress))), message, updated_at, task_id),
+        )
+
+
 def run_task(
     task_id: str,
     *,
     db_path: Path = DEFAULT_DB,
     reports_root: Path = REPORTS_ROOT,
 ) -> Dict[str, Any]:
-    blocked_message: Optional[str] = None
     release_value: Dict[str, Any]
     with connect(db_path) as connection, transaction(connection):
         task = connection.execute(
@@ -1693,15 +2042,6 @@ def run_task(
                 f"task {task_id} is not runnable from {task['task_status']}"
             )
         release_value = assert_report_runtime_ready(connection)
-        pending_gray_reviews = _first_report_pending_gray_reviews(
-            connection, release_value
-        )
-        if pending_gray_reviews:
-            blocked_error = _GrayReviewGateError(pending_gray_reviews)
-            blocked_message = str(blocked_error)
-            _mark_review_gate_blocked(connection, task_id, blocked_error)
-    if blocked_message is not None:
-        raise ReportTaskError(blocked_message)
     temporary: Optional[Path] = None
     target: Optional[Path] = None
     target_created_by_run = False
@@ -1729,7 +2069,7 @@ def run_task(
             connection.execute(
                 """
                 UPDATE report_tasks SET task_status='running', progress=10,
-                    message='正在生成不可变报告', started_at=?, completed_at=NULL, updated_at=?
+                    message='正在快照报告窗口内容', started_at=?, completed_at=NULL, updated_at=?
                 WHERE id=?
                 """,
                 (started_at, started_at, task_id),
@@ -1773,6 +2113,12 @@ def run_task(
             if kind != "summary-png"
         ]
         generated_at = now_utc()
+        advance_task_progress(
+            task_id,
+            progress=35,
+            message="正在汇总窗口指标与结论",
+            db_path=db_path,
+        )
         with connect(db_path) as connection:
             report = _build_report_data(
                 connection,
@@ -1782,6 +2128,12 @@ def run_task(
                 generated_at=generated_at,
                 files=planned_files,
             )
+        advance_task_progress(
+            task_id,
+            progress=65,
+            message="正在写出报告文件",
+            db_path=db_path,
+        )
         temp_paths = {kind: temporary / path.name for kind, path in final_paths.items()}
         temp_paths["report-markdown"].write_text(_markdown(report), encoding="utf-8")
         temp_paths["content-csv"].parent.mkdir(parents=True, exist_ok=True)
@@ -1799,6 +2151,12 @@ def run_task(
                     "status": "available",
                 }
             )
+        advance_task_progress(
+            task_id,
+            progress=85,
+            message="正在校验并归档 revision",
+            db_path=db_path,
+        )
         validate_report(report)
         if str(report["rule_version"]) != str(release_value["rule_version"]) or str(
             report["taxonomy_version"]
@@ -1825,11 +2183,6 @@ def run_task(
         terminal_status = str(report["task"]["task_status"])
         with connect(db_path) as connection, transaction(connection):
             _require_pinned_report_release(connection, release_value)
-            final_pending_gray_reviews = _first_report_pending_gray_reviews(
-                connection, release_value
-            )
-            if final_pending_gray_reviews:
-                raise _GrayReviewGateError(final_pending_gray_reviews)
             current_status = connection.execute(
                 "SELECT task_status FROM report_tasks WHERE id=?", (task_id,)
             ).fetchone()
@@ -1896,7 +2249,7 @@ def run_task(
                 """,
                 (
                     task_id,
-                    f"revision {revision} 已生成",
+                    f"第 {revision} 版报告已生成",
                     json.dumps({"revision": revision, "status": terminal_status}),
                     completed_at,
                 ),
@@ -1932,11 +2285,7 @@ def run_task(
             if not revision_registered:
                 shutil.rmtree(target)
         if owns_run:
-            if isinstance(exc, _GrayReviewGateError):
-                with connect(db_path) as connection, transaction(connection):
-                    _mark_review_gate_blocked(connection, task_id, exc)
-            else:
-                _record_task_failure(task_id, exc, db_path=db_path)
+            _record_task_failure(task_id, exc, db_path=db_path)
         raise
 
 
@@ -1960,6 +2309,6 @@ def create_and_run_task(
         name=name,
         db_path=db_path,
     )
-    if task["task_status"] in RUNNABLE_STATUSES:
+    if task["task_status"] in IMPLICIT_RUN_STATUSES:
         run_task(str(task["id"]), db_path=db_path, reports_root=reports_root)
     return get_task(str(task["id"]), db_path=db_path)

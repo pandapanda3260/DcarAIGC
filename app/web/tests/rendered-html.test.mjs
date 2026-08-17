@@ -52,6 +52,15 @@ test("metric presentation uses causes and never publishes a gated number", () =>
     assert.doesNotMatch(`${metricValue(metric)} ${metricStatus(metric)}`, /覆盖不足/);
   }
 
+  const uncalibrated = ratioMetric(
+    "not_calculable",
+    "重复内容感知指纹尚未完成定标，重复率暂不可计算",
+    null,
+  );
+  assert.equal(metricPublishesValue(uncalibrated), false);
+  assert.equal(metricUnavailableLabel(uncalibrated), "重复识别待补齐");
+  assert.equal(metricValue(uncalibrated), "重复识别待补齐");
+
   const available = ratioMetric("available", "", 62.05);
   assert.equal(metricPublishesValue(available), true);
   assert.equal(metricValue(available), "62.05%");
@@ -86,6 +95,7 @@ test("server-renders every real v8 product route", async () => {
     ["/overview", "数据概览"], ["/tasks", "数据报告任务"],
     ["/tasks/D8-TEST", "数据报告任务"], ["/accounts", "运营账号"],
     ["/contents", "内容数据"], ["/selling-points", "卖点标准"],
+    ["/spu-audience", "SPU人群"],
   ];
   for (const [path, title] of expectations) {
     const response = await render(path);
@@ -99,6 +109,7 @@ test("server-renders every real v8 product route", async () => {
     assert.match(html, /href="\/accounts"/);
     assert.match(html, /href="\/contents"/);
     assert.match(html, /href="\/selling-points"/);
+    assert.match(html, /href="\/spu-audience"/);
     assert.doesNotMatch(html, /codex-preview|Your site is taking shape|Starter Project/i);
   }
 });
@@ -162,8 +173,8 @@ test("sidebar navigation uses semantic graphical icons instead of character mark
   assert.match(shell, /aria-hidden="true"/);
   assert.match(shell, /focusable="false"/);
   assert.match(shell, /data-nav-icon=\{section\}/);
-  for (const section of ["overview", "tasks", "accounts", "contents", "selling-points"]) {
-    const key = section === "selling-points" ? `"${section}"` : section;
+  for (const section of ["overview", "tasks", "accounts", "contents", "selling-points", "spu-audience"]) {
+    const key = section.includes("-") ? `"${section}"` : section;
     assert.match(shell, new RegExp(`${key}:\\s*<>`));
   }
   assert.match(styles, /\.sidebar nav a \.nav-icon\s*\{[^}]*width:\s*20px;[^}]*height:\s*20px;/);
@@ -182,6 +193,8 @@ test("overview keeps time windows outside the fixed channel conclusion structure
   assert.match(source, /yesterday:\s*"昨天"/);
   assert.match(source, /this_week:\s*"本周"/);
   assert.match(source, /last_week:\s*"上周"/);
+  assert.match(source, /useState<WindowKey>\("last_week"\)/);
+  assert.match(source, /const activeWindow = overview\?\.windows\[windowKey\]/);
   assert.match(source, /channelOrder[^=]*=\s*\["douyin",\s*"xiaohongshu"\]/);
   assert.match(source, /sceneOrder[^=]*=\s*\["used_car",\s*"new_car",\s*"media"\]/);
   const labels = [
@@ -214,6 +227,7 @@ test("overview keeps time windows outside the fixed channel conclusion structure
   assert.match(source, /activeWindow\.channels\[key\]/);
   assert.match(source, /className="channel-switch" role="group" aria-label="统计窗口"/);
   assert.match(source, /type="button" aria-pressed=\{windowKey === key\}/);
+  assert.match(source, /onClick=\{\(\) => setWindowKey\(key\)\}/);
   assert.match(source, /<AppShell active="overview" actions=\{windowSwitch\}>/);
   assert.match(source, /brand-douyin-tiktok\.svg/);
   assert.match(source, /brand-xiaohongshu\.svg/);
@@ -309,7 +323,7 @@ test("selling point standards use E/X/M scenes, scene-local hits, and matcher-on
   assert.match(styles, /selling-points-hero-bg\.png/);
   assert.match(styles, /\.selling-point-summary-grid\s*\{[^}]*grid-template-columns:\s*repeat\(3,/);
   assert.doesNotMatch(styles, /data-family="C"|data-family="OTHER"/);
-  assert.match(styles, /\.selling-point-table\s*\{[^}]*min-width:\s*1080px;/);
+  assert.match(styles, /\.selling-point-table\s*\{[^}]*min-width:\s*1262px;/);
   assert.match(styles, /@media \(max-width:\s*480px\)/);
   const response = await render("/selling-points");
   const html = await response.text();
@@ -318,10 +332,251 @@ test("selling point standards use E/X/M scenes, scene-local hits, and matcher-on
   assert.ok(heroArtwork.byteLength > 1000, "selling point header artwork should be a real raster asset");
 });
 
+test("spu audience page keeps rule assets, association and 3D stats together", async () => {
+  const [page, wrapper, contents, shell, types, formatSource, styles, apiSource, storageSource, spuModule] = await Promise.all([
+    readFile(new URL("../app/spu-audience/SpuAudiencePage.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/spu-audience/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/contents/ContentsPage.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/components/AppShell.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/lib/types.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/lib/format.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+    readFile(new URL("../../../src/dcar_eval/v8/api.py", import.meta.url), "utf8"),
+    readFile(new URL("../../../src/dcar_eval/v8/storage.py", import.meta.url), "utf8"),
+    readFile(new URL("../../../src/dcar_eval/v8/spu_audience.py", import.meta.url), "utf8"),
+  ]);
+  // 导航与页面骨架
+  assert.match(shell, /id: "spu-audience", label: "SPU人群", href: "\/spu-audience"/);
+  assert.match(wrapper, /<SpuAudiencePage \/>/);
+  assert.match(page, /<AppShell active="spu-audience" actions=\{shellActions\}>/);
+  assert.match(page, /刷新数据/);
+  assert.match(page, /const shellActions = \([\s\S]*刷新数据[\s\S]*className="secondary spu-shell-action"[\s\S]*新增车型[\s\S]*\);\s*\n\s*return \(/);
+  assert.doesNotMatch(page, /className="secondary spu-block-action"/);
+  assert.match(styles, /\.spu-shell-action\s*\{[^}]*display:\s*inline-flex;[^}]*align-items:\s*center;[^}]*gap:\s*6px;/);
+  assert.doesNotMatch(page, /运行关联/);
+  // 页面信息架构（2026-08-16 Mark 定稿）：删掉刷新记录面板，规则链在上、规则校准在下
+  // 版式对齐卖点页后（Mark 要求"没必要的文字删一删"），两个纯文字的分节包装标题
+  //（"车型 → 人群 → 场景 规则链""规则预期 vs 内容实际"）连同长说明段一并删除，
+  // 顺序改由各区块自己的 <h2> 断言；覆盖率总览上提到页首。
+  {
+    const sectionOrder = ["<h2 id=\"spu-summary-title\">识别覆盖</h2>", "<h2>车系与款型库</h2>", "<h2>目标人群</h2>", "<h2>用车场景</h2>", "<h2>人群 × 场景映射</h2>", "<h2>覆盖缺口</h2>", "<h2>规则外溢</h2>"];
+    let previous = -1;
+    for (const sectionLabel of sectionOrder) {
+      const position = page.indexOf(sectionLabel);
+      assert.ok(position > previous, `${sectionLabel} 应按 规则链在上、规则校准在下 的顺序出现`);
+      previous = position;
+    }
+  }
+  assert.doesNotMatch(page, /最近一次数据刷新|spu-run-panel/);
+  // 统计窗口：卖点页同款控件；只有 昨天/本周/上周，默认上周
+  assert.match(page, /className="selling-point-window-control spu-window-control"/);
+  assert.match(page, /统计窗口/);
+  assert.match(page, /useState<string>\("last_week"\)/);
+  assert.doesNotMatch(page, /label: "全部" \}/);
+  assert.match(page, /stats\?window=last_week/);
+  // 车型库并入卖点页式渠道统计列；三维明细表与独立榜单删除
+  assert.match(page, /<th>命中统计<\/th><th>抖音条数占比<\/th><th>抖音曝光占比<\/th><th>小红书条数占比<\/th><th>小红书曝光占比<\/th><th>操作<\/th>/);
+  assert.match(page, /<th>品牌<\/th><th>车系<\/th><th>款型<\/th><th>目标人群<\/th>/);
+  assert.doesNotMatch(page, /<th>识别别名<\/th>/);
+  assert.match(page, /识别别名（顿号或逗号分隔）/);
+  assert.match(page, /selling-point-hit-value/);
+  assert.match(page, /selling-point-share-value/);
+  assert.match(page, /条发布/);
+  assert.match(page, /次有效曝光/);
+  // 车型库使用独立紧凑列宽，不能再被全局 1480px 宽表兜底覆盖
+  assert.match(styles, /table:not\(\.selling-point-table\):not\(\.spu-catalog-table\):has\(th:nth-child\(7\)\)\s*\{[^}]*min-width:\s*1480px;/);
+  assert.doesNotMatch(styles, /table:not\(\.selling-point-table\):has\(th:nth-child\(7\)\)\s*\{[^}]*min-width:\s*1480px;/);
+  assert.match(styles, /\.spu-catalog-table\s*\{[^}]*width:\s*100%;[^}]*min-width:\s*1152px;/);
+  assert.match(styles, /\.spu-catalog-table thead th,\s*\.spu-catalog-table tbody td\s*\{[^}]*padding-inline:\s*8px;/);
+  assert.match(styles, /\.spu-catalog-table th:nth-child\(2\)\s*\{[^}]*width:\s*116px;/);
+  assert.match(styles, /\.spu-catalog-table th:nth-child\(11\)\s*\{[^}]*width:\s*58px;/);
+  assert.match(styles, /\.spu-catalog-table :is\(th, td\):nth-child\(n\+6\):nth-child\(-n\+10\)\s*\{[^}]*text-align:\s*center;/);
+  assert.match(styles, /\.spu-catalog-table \.selling-point-hit-value\s*\{[^}]*justify-items:\s*center;/);
+  assert.match(styles, /\.spu-catalog-table \.selling-point-share-value,[\s\S]*\.spu-catalog-table \.selling-point-hit-empty\s*\{[^}]*text-align:\s*center;/);
+  assert.doesNotMatch(page, /车型 × 人群 × 场景 数据表现|spu-detail-table|车型榜|人群榜|场景榜|spu-rollup/);
+  assert.match(page, /<th>内容显式信号<\/th><th>发布条数<\/th><th>曝光量<\/th>/);
+  assert.match(page, /<th>负向词<\/th><th>发布条数<\/th><th>曝光量<\/th>/);
+  // 人群与场景是两个全宽纵向区块，不在宽屏下压成左右两列
+  assert.match(styles, /\.spu-dim-grid\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\);/);
+  // 自动保鲜：打开页面增量补算、保存规则后自动全量重算；资产与统计请求互不拖累
+  assert.match(page, /associate\?mode=incremental/);
+  assert.match(page, /stale_content_count/);
+  assert.match(page, /规则资产读取失败/);
+  assert.match(page, /统计读取失败/);
+  // 车型库翻页：复用全站 Pagination 组件、放在表格上方（账号页同款），前端切片+末页夹紧
+  assert.match(page, /import \{ Pagination \} from "\.\.\/components\/Pagination"/);
+  assert.match(page, /import \{ filterVehicleSeriesGroups, sortVehicleCatalogRows \} from "\.\/vehicleCatalogSort"/);
+  assert.match(page, /<Pagination page=\{catalogSafePage\} pageSize=\{catalogPageSize\} total=\{filteredSeriesTotal\} busy=\{saving\} ariaLabel="车型库分页" unitLabel="个车系" placement="top"/);
+  assert.match(page, /const catalogRows = useMemo\(\(\) => sortVehicleCatalogRows\(assets\?\.spu \?\? \[\]\), \[assets\]\)/);
+  assert.match(page, /热门品牌优先/);
+  assert.match(page, /Math\.min\(catalogPage, catalogLastPage\)/);
+  // 大车系库先按品牌/车系搜索再分页；改查询回到第1页，空结果给出明确反馈
+  assert.match(page, /filterVehicleSeriesGroups\(seriesGroups, catalogQuery\)/);
+  assert.match(page, /total=\{filteredSeriesTotal\}/);
+  assert.match(page, /aria-label="搜索品牌或车系"/);
+  assert.match(page, /setCatalogQuery\(event\.target\.value\); setCatalogPage\(1\)/);
+  assert.match(page, /未找到匹配“\$\{catalogQuery\.trim\(\)\}”的品牌或车系/);
+  assert.match(styles, /\.spu-catalog-search:focus-within\s*\{[^}]*border-color:\s*var\(--teal\);/);
+  assert.doesNotMatch(page, /function pageWindow/);
+  // 车型库带"经人群推导"的核心场景列，回应"车型库看不到场景"的反馈
+  assert.match(page, /<th>核心场景（经人群推导）<\/th>/);
+  assert.match(page, /coreScenesByAudience/);
+  // 刷新摘要是一句可读的话，并兼容新旧运行记录口径
+  assert.match(page, /run\.summary\?\.eligible \?\? Math\.max\(0, run\.contents_total - run\.insufficient_evidence\)/);
+  // 页面读写走 v8 API，统计为 GET（只读副本可用），关联为 POST（副本被写保护拦截）
+  assert.match(page, /\/api\/v8\/spu-audience\/assets/);
+  assert.match(page, /\/api\/v8\/spu-audience\/stats\?\$\{search\.toString\(\)\}/);
+  assert.match(page, /"\/api\/v8\/spu-audience\/associate", \{ method: "POST" \}/);
+  assert.match(page, /\/api\/v8\/spu-audience\/spu/);
+  // 规则校准区 + 口径脚注（脚注挂在车型库面板底部）
+  assert.match(page, /覆盖缺口/);
+  assert.match(page, /规则外溢/);
+  assert.match(page, /className="spu-footnotes"/);
+  // 车系聚合视图：品牌/车系拆列，车系名提升为主信息；款型点开才出现，残量行改叫「仅识别到车系」
+  assert.match(page, /catalogPageGroups\.map/);
+  assert.match(page, /expandedSeries\.has\(group\.slug\)/);
+  assert.match(page, /seriesAggregate\(group\)/);
+  assert.match(page, /className="spu-series-name">\{seriesNode\.series\}<\/strong>/);
+  assert.match(page, /<td colSpan=\{11\}>/);
+  assert.match(page, /仅识别到车系/);
+  assert.doesNotMatch(page, /车系合计（含仅识别到车系的内容）/);
+  assert.match(page, /formatVehicleMeta\(seriesNode\)/);
+  assert.match(page, /powertrainLabels\[row\.powertrain\] \?\? row\.powertrain/);
+  assert.match(page, /className="spu-audience-primary"/);
+  assert.match(styles, /\.spu-audience-primary\s*\{[^}]*background:\s*#e8efff;[^}]*color:\s*#245fcf;[^}]*font-weight:\s*750;/);
+  assert.doesNotMatch(page, /车系兜底（未细化）/);
+  // 款型展开入口是弱化后的次级按钮，同时保留展开态、键盘焦点和车系级读屏说明
+  assert.match(page, /className="spu-series-toggle"[\s\S]*aria-expanded=\{expanded\}[\s\S]*aria-label=\{`\$\{expanded \? "收起" : "展开"\}\$\{seriesNode\.series\}的 \$\{group\.trims\.length\} 个款型`\}/);
+  assert.match(styles, /\.spu-series-toggle\s*\{[^}]*color:\s*#74838a;[^}]*font-size:\s*9px;[^}]*font-weight:\s*600;/);
+  assert.match(styles, /\.spu-series-toggle:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--teal\);[^}]*outline-offset:\s*2px;/);
+  // 主表隐藏完整别名，编辑链路仍可回填普通/歧义别名并随保存请求提交
+  assert.match(page, /歧义别名（需语境确认才计入）/);
+  assert.match(page, /row\.aliases\.filter\(\(item\) => !item\.ambiguous\)/);
+  assert.match(page, /row\.aliases\.filter\(\(item\) => item\.ambiguous\)/);
+  assert.match(page, /audience_secondary: form\.audienceSecondary \|\| null,\s*aliases,/);
+  // 内容列表新增 SPU/人群/场景 三列与筛选，且顺序在卖点列之前；证据等级从卖点列拆出为独立列
+  assert.match(contents, /<th>内容方向<\/th><th>车型<\/th><th>人群<\/th><th>场景<\/th><th>卖点<\/th><th>证据等级<\/th><th>垂直度<\/th>/);
+  // 界面不暴露独立的英文 "SPU" 文本节点（会被浏览器翻译插件误译成"空间物理单元"）
+  assert.doesNotMatch(contents, /<th>SPU<\/th>/);
+  assert.doesNotMatch(page, /<th>SPU<\/th>/);
+  // 车型单元格两行制：第一行 品牌+型号（去重），第二行 款型/命中词/另提及车系
+  assert.match(contents, /function spuDisplayName/);
+  assert.match(contents, /spu\.series\.startsWith\(spu\.brand\) \? spu\.series : `\$\{spu\.brand\} \$\{spu\.series\}`/);
+  assert.match(contents, /命中「\$\{alias\}」/);
+  assert.match(contents, /另提及 \$\{item\.spu_secondary_count\} 车系/);
+  assert.match(contents, /spu-tag-subline/);
+  assert.match(types, /matched_aliases: string\[\];/);
+  assert.match(types, /spu_secondary_count: number;/);
+  assert.match(contents, /EVIDENCE_LEVEL_HINTS/);
+  assert.match(contents, /className="evidence-level-tag" title=\{EVIDENCE_LEVEL_HINTS\[item\.evidence_level\]\}/);
+  // 证据等级展示用「V码-中文短标签」（2026-08-15 Mark 定稿），未知等级回退裸 V 码
+  assert.match(contents, /V3: "V3-信息完整",\s*V2: "V2-媒体存在",\s*V1: "V1-只有文字",\s*V0: "V0-不可用",/);
+  assert.match(contents, /\{EVIDENCE_LEVEL_LABELS\[item\.evidence_level\] \?\? item\.evidence_level\}/);
+  // 卖点列多行完整显示：不再用单行省略号，V 值也不再挤在卖点下方的 cell-subline 里
+  assert.match(styles, /\.content-table \.selling-point-name \{ display: block; white-space: normal; overflow-wrap: anywhere; \}/);
+  assert.doesNotMatch(styles, /\.content-table \.selling-point-name \{[^}]*text-overflow/);
+  assert.doesNotMatch(contents, /<span className="cell-subline">\{item\.evidence_level/);
+  assert.match(contents, /spu_series: filters\.spuSeries \|\| null, audience: filters\.audience \|\| null, scene: filters\.scene \|\| null/);
+  assert.match(contents, /灰区待复核/);
+  assert.match(contents, /未细化/);
+  assert.match(contents, /content-scene-cell/);
+  assert.match(contents, /\/api\/v8\/spu-audience\/assets/);
+  assert.match(types, /spu: ContentTagSpu \| null;/);
+  assert.match(types, /audience: ContentTagAudience \| null;/);
+  assert.match(types, /scenes: ContentTagScene\[\];/);
+  assert.match(formatSource, /content_explicit: "内容显式", rule_prior: "规则推断"/);
+  // 列宽口径：证据等级列拆出后内容表总宽 2126
+  assert.match(styles, /\.content-table \{ min-width: 2126px !important; \}/);
+  assert.match(styles, /\.main-area\[data-section="spu-audience"\]/);
+  // 后端：v15 关联域（v14 + LLM 辅助）+ 端点 + 内容检索标签
+  assert.match(storageSource, /SCHEMA_VERSION = 15/);
+  assert.match(storageSource, /spu-audience-scene-domain/);
+  assert.match(storageSource, /spu-llm-assist/);
+  assert.match(storageSource, /CREATE TABLE IF NOT EXISTS spu_catalog/);
+  assert.match(storageSource, /CREATE TABLE IF NOT EXISTS content_spu_links/);
+  assert.match(storageSource, /CREATE TABLE IF NOT EXISTS llm_judgements/);
+  assert.match(storageSource, /def _migrate_v13_to_v14/);
+  assert.match(storageSource, /def _migrate_v14_to_v15/);
+  assert.match(apiSource, /\/api\/v8\/spu-audience\/assets/);
+  assert.match(apiSource, /\/api\/v8\/spu-audience\/stats/);
+  assert.match(apiSource, /\/api\/v8\/spu-audience\/associate/);
+  assert.match(apiSource, /spu_content_labels\(connection/);
+  assert.match(apiSource, /spu_series: Optional\[str\]/);
+  // 关联模块：规则链版本、款型细化、场景基础分修正、人群显式信号门槛
+  assert.match(spuModule, /ASSOCIATION_RULE_VERSION = "spu-association-v2"/);
+  // 执行通道（系统能力）：V2/V3 SQL 预过滤 + 批量预取 + 分批提交 + 后台任务 + CLI
+  assert.match(spuModule, /def _eligible_v23_contents/);
+  assert.match(spuModule, /evidence_level IN \('V2','V3'\)/);
+  assert.match(spuModule, /def _artifact_paths_by_content/);
+  assert.match(spuModule, /def start_association_run/);
+  assert.match(spuModule, /def recover_orphan_association_runs/);
+  assert.match(spuModule, /def dry_run_summary/);
+  assert.match(spuModule, /SQL_ID_CHUNK = 800/);
+  assert.match(apiSource, /start_association_run\(db_path=config\.db_path\)/);
+  assert.match(apiSource, /_run_spu_association_job, config\.db_path, run_id, since, scope_window/);
+  assert.match(apiSource, /recover_orphan_association_runs\(/);
+  assert.match(page, /数据刷新已在后台启动/);
+  assert.match(page, /window\.setInterval/);
+  assert.match(page, /证据完整（V2\/V3）/);
+  // 车型库渠道占比的数据源：build_stats 返回分平台桶与发布门槛
+  assert.match(spuModule, /"channels": channels,/);
+  assert.match(spuModule, /"post_share": post_share,/);
+  assert.match(spuModule, /"view_share": view_share,/);
+  assert.match(spuModule, /views_published/);
+  // 增量模式与单条补算是系统能力：页面打开/保存规则/内容更新数据都会自动触发
+  assert.match(spuModule, /def resolve_incremental_since/);
+  assert.match(spuModule, /def associate_single_content/);
+  // LLM 双轨（B 链，无人工复核版）：规则链后补空，降级不阻塞，摘要句披露补充数
+  assert.match(spuModule, /llm_hook/);
+  assert.match(spuModule, /def default_llm_hook/);
+  assert.match(apiSource, /llm_hook=default_spu_llm_hook\(\)/);
+  assert.match(page, /大模型补充/);
+  assert.match(page, /runLlmFilledCount/);
+  assert.match(formatSource, /llm: "大模型补充"/);
+  // 「刷新数据」弹窗四选一：先选范围再确认，范围按发布时间、与统计窗口同口径（_window_bounds 同源）
+  for (const label of ["昨天", "本周", "上周", "全部内容"]) assert.match(page, new RegExp(`label: "${label}"`));
+  assert.match(page, /选择刷新范围/);
+  assert.match(page, /推荐/);
+  assert.match(page, /耗时较长/);
+  assert.match(page, /spu-refresh-modal/);
+  assert.match(page, /spu-refresh-option/);
+  assert.match(page, /selectedRefreshScope/);
+  assert.match(page, /refreshRequestRef\.current/);
+  assert.match(page, /onChange=\{\(\) => setSelectedRefreshScope\(item\.key\)\}/);
+  assert.match(page, /refreshData\(selectedRefreshScope\)/);
+  assert.doesNotMatch(page, /refreshData\(item\.key\)/);
+  assert.match(page, /aria-labelledby="spu-refresh-title"/);
+  assert.match(page, /event\.key === "Escape"/);
+  assert.match(page, /开始刷新/);
+  assert.match(page, /associate\?mode=\$\{scope\}/);
+  assert.match(page, /setRefreshPicker\(true\)/);
+  assert.match(styles, /\.spu-refresh-options/);
+  assert.match(styles, /\.review-modal\.spu-refresh-modal/);
+  assert.match(styles, /grid-template-columns: repeat\(2, minmax\(0, 1fr\)\)/);
+  assert.match(styles, /\.spu-refresh-option\[data-selected="true"\]/);
+  assert.match(styles, /@media \(max-width: 600px\)/);
+  assert.match(spuModule, /scope_window/);
+  assert.match(spuModule, /window=scope_window/);
+  assert.match(apiSource, /"full", "incremental", "yesterday", "this_week", "last_week"/);
+  assert.match(apiSource, /mode: str = "full"/);
+  assert.match(apiSource, /resolve_incremental_since\(connection\)/);
+  assert.match(apiSource, /associate_single_content\(content_id, db_path=db_path\)/);
+  const cli = await readFile(new URL("../../../scripts/run_spu_association.py", import.meta.url), "utf8");
+  assert.match(cli, /--apply/);
+  assert.match(cli, /只处理 V2\/V3/);
+  assert.match(cli, /dry_run_summary/);
+  assert.match(cli, /"--window", choices=\("yesterday", "this_week", "last_week"\)/);
+  assert.match(spuModule, /SCENE_BASE_SCORE = 36/);
+  assert.match(spuModule, /EXPLICIT_SIGNAL_MIN_HITS = 2/);
+  assert.match(spuModule, /def resolve_trim/);
+  assert.match(spuModule, /车系兜底节点/);
+});
+
 test("routes preserve operations and expose evidence-backed review controls", async () => {
-  const [shell, accounts, contents, evidence, tasks, taskDetail, sellingPoints, apiSource, formatSource, layout, packageJson] = await Promise.all([
+  const [shell, accounts, pagination, contents, evidence, tasks, taskDetail, sellingPoints, apiSource, formatSource, layout, packageJson] = await Promise.all([
     readFile(new URL("../app/components/AppShell.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/accounts/AccountsPage.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/components/Pagination.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/contents/ContentsPage.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/contents/EvidenceModal.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/tasks/TasksPage.tsx", import.meta.url), "utf8"),
@@ -332,7 +587,7 @@ test("routes preserve operations and expose evidence-backed review controls", as
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
   ]);
-  for (const href of ["/overview", "/tasks", "/accounts", "/contents", "/selling-points"]) assert.match(shell, new RegExp(`href: "${href}"`));
+  for (const href of ["/overview", "/tasks", "/accounts", "/contents", "/selling-points", "/spu-audience"]) assert.match(shell, new RegExp(`href: "${href}"`));
   assert.match(accounts, /pending_platform_identities/);
   assert.match(accounts, /className="pending-identity-table"/);
   assert.match(accounts, /<caption className="visually-hidden">待归属平台身份列表<\/caption>/);
@@ -340,6 +595,16 @@ test("routes preserve operations and expose evidence-backed review controls", as
   assert.doesNotMatch(accounts, /pending-identity-grid/);
   assert.match(accounts, /一个手机号对应一行账号主数据/);
   assert.match(accounts, /className="account-master-table"/);
+  assert.match(accounts, /account-master-panel">\s*\n\s*<Pagination /);
+  assert.match(accounts, /<Pagination page=\{page\} pageSize=\{pageSize\} total=\{total\} busy=\{fetching \|\| saving\} ariaLabel="账号分页" unitLabel="个账号" placement="top"/);
+  assert.match(accounts, /page_size: size/);
+  assert.match(accounts, /reload\(\{ page: 1 \}\)/);
+  assert.match(pagination, /aria-label=\{ariaLabel\}/);
+  assert.match(pagination, /首页.*上一页/s);
+  assert.match(pagination, /下一页.*末页/s);
+  assert.match(pagination, /pagination-\$\{placement\}/);
+  assert.match(contents, /<Pagination page=\{page\} pageSize=\{pageSize\} total=\{total\}/);
+  assert.doesNotMatch(contents, /function pageWindow/);
   assert.match(accounts, /以手机号为锚点的账号主数据列表/);
   assert.match(accounts, /className="account-base-group" colSpan=\{4\} scope="colgroup">账号基础信息/);
   assert.match(accounts, /platformKeys\.map\(\(key\) => <th className="account-platform-group"/);
@@ -404,6 +669,40 @@ test("routes preserve operations and expose evidence-backed review controls", as
   await assert.rejects(access(new URL("../app/_sites-preview", import.meta.url)));
 });
 
+test("task list shows background generation progress on cards instead of jumping away", async () => {
+  const [tasks, taskDetail, styles, apiSource, reportsSource] = await Promise.all([
+    readFile(new URL("../app/tasks/TasksPage.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/tasks/[id]/TaskDetailPage.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+    readFile(new URL("../../../src/dcar_eval/v8/api.py", import.meta.url), "utf8"),
+    readFile(new URL("../../../src/dcar_eval/v8/reports.py", import.meta.url), "utf8"),
+  ]);
+  // 点“生成报告”后留在列表：任务以卡片形式出现，右侧是查看详情，卡片自己显示进度
+  assert.doesNotMatch(tasks, /useRouter|router\.push/);
+  assert.match(tasks, /className="task-card-list"/);
+  assert.match(tasks, /查看详情/);
+  assert.match(tasks, /role="progressbar"/);
+  assert.match(tasks, /GENERATING_STATUSES = new Set\(\["queued", "running", "cancel_requested"\]\)/);
+  assert.match(tasks, /setInterval\(/);
+  assert.doesNotMatch(tasks, /<table>|<thead>/);
+  assert.match(taskDetail, /task-progress-panel/);
+  assert.match(taskDetail, /setInterval\(/);
+  assert.match(styles, /\.task-card \{/);
+  assert.match(styles, /\.task-card \.progress-track i \{ background: var\(--teal\); transition: width \.4s ease; \}/);
+  assert.doesNotMatch(styles, /\.main-area\[data-section="tasks"\] \.table-panel/);
+  // 生成跑在请求之外，创建接口只返回排队中的任务
+  assert.match(apiSource, /background\.add_task\(/);
+  assert.match(apiSource, /_run_task_in_background/);
+  assert.doesNotMatch(apiSource, /create_and_run_task/);
+  assert.match(reportsSource, /def advance_task_progress\(/);
+  for (const stage of [35, 65, 85]) assert.match(reportsSource, new RegExp(`progress=${stage},`));
+  // 任务消息与事件全程中文：后端新事件直接写中文，前端对历史存量做展示层翻译
+  assert.match(reportsSource, /第 \{revision\} 版报告已生成/);
+  assert.doesNotMatch(reportsSource, /已请求生成新 revision|等待生成新 revision|revision \{revision\} 已生成/);
+  assert.match(tasks, /humanizeTaskMessage/);
+  assert.match(taskDetail, /humanizeTaskMessage/);
+});
+
 test("task detail renders channel conclusions in the platforms tab without fabricating rates", async () => {
   const [taskDetail, types, formatSource] = await Promise.all([
     readFile(new URL("../app/tasks/[id]/TaskDetailPage.tsx", import.meta.url), "utf8"),
@@ -442,6 +741,53 @@ test("task detail renders channel conclusions in the platforms tab without fabri
   assert.match(taskDetail, /平台发布分布/);
   assert.match(taskDetail, /platform_dimensions/);
   assert.doesNotMatch(taskDetail, /audience_verticality|互动用户垂直度/);
+});
+
+test("task detail renders v8.5 and v8.6 quality details without leaking raw values", async () => {
+  const source = await readFile(
+    new URL("../app/tasks/[id]/TaskDetailPage.tsx", import.meta.url),
+    "utf8",
+  );
+  const types = await readFile(new URL("../app/lib/types.ts", import.meta.url), "utf8");
+  const discoveryFormatter = source.slice(
+    source.indexOf("function discoveryCoverageRow"),
+    source.indexOf("function metricsFreshnessRow"),
+  );
+
+  assert.match(types, /data_quality_details\?:[\s\S]*metrics_freshness\?: MetricsFreshnessDetail \| null/);
+  assert.match(types, /discovery_coverage\?: DiscoveryCoverageDetail \| null/);
+  assert.match(types, /collection_cutoff_at\?: string \| null/);
+  assert.match(source, /report\.data_quality_details\?\.discovery_coverage/);
+  assert.match(source, /report\.data_quality\.discovery_coverage/);
+  assert.match(source, /`计划内的账号采集执行 \$\{eligible\} 次，实际覆盖 \$\{covered\} 次`/);
+  assert.match(source, /detail\.status === "not_applicable" \? "无适用内容"/);
+  assert.match(source, /typeof detail\.reason === "string" && detail\.reason\.trim\(\)/);
+  assert.match(source, /report\.data_quality_details\?\.metrics_freshness/);
+  assert.match(source, /report\.data_quality\.metrics_freshness/);
+  assert.match(source, /`\$\{freshCount\}\/\$\{eligibleCount\} 条内容在截止前有新数据`/);
+  assert.match(source, /"无适用内容"/);
+  assert.match(source, /`采集截止 \$\{formatDateTime\(cutoff\)\}`/);
+  assert.match(source, /value \? "已通过" : "未通过"/);
+  assert.doesNotMatch(source, /<dd>\{value\}<\/dd>/);
+  assert.doesNotMatch(source, /String\(value\)|`\$\{value\}%`/);
+  assert.doesNotMatch(discoveryFormatter, /\b90\b/);
+
+  // 质量检查在界面上只出现中文名与白话说明，接口字段名不落进 DOM（防止 revision 式英文再回来）
+  assert.match(source, /qualityCheckCopy/);
+  for (const name of ["发现覆盖", "详情覆盖", "指标新鲜度", "正式评估覆盖", "核心产物覆盖", "媒体处理终态覆盖", "重复指纹覆盖", "重复识别定标", "周评论证据覆盖"]) {
+    assert.match(source, new RegExp(name));
+  }
+  assert.doesNotMatch(source, /<dt>\{key\}<\/dt>|<dt>discovery_coverage<\/dt>|definition-list/);
+  // 周评论检查只对周报有实际意义，其他任务不显示这行恒为 100% 的占位
+  assert.match(source, /key !== "weekly_comment_coverage" \|\| detail\?\.task_type === "weekly"/);
+  // 文件与日志：产物名称、大小、事件类型全部转中文，raw 值只留在 title/接口里
+  assert.match(source, /fileKindLabels/);
+  assert.match(source, /渠道结论表 CSV/);
+  assert.match(source, /formatBytes\(file\.byte_size\)/);
+  assert.doesNotMatch(source, /\{file\.file_kind\} · /);
+  assert.match(source, /taskEventLabels/);
+  assert.match(source, /请求重新生成/);
+  assert.doesNotMatch(source, /<strong>\{event\.event_type\}<\/strong>/);
 });
 
 test("private account searches stay in POST bodies and obsolete static assets remain absent", async () => {

@@ -20,7 +20,7 @@ from urllib.parse import unquote
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler  # type: ignore[import-untyped]
-from fastapi import APIRouter, FastAPI, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
@@ -31,10 +31,19 @@ from .capture import (
     SlotUnavailable,
     recover_stale_fetch_slots,
 )
-from .contracts import CURRENT_REPORT_VERSION, quantity_metric, ratio_metric
+from .contracts import (
+    CURRENT_REPORT_VERSION,
+    load_contract,
+    quantity_metric,
+    ratio_metric,
+)
 from .duplicates import FINGERPRINT_VERSION, THRESHOLDS, duplicate_metric_decision
-from .evaluation import RULE_VERSION as RULE_VERSION
-from .evaluation import EvaluationError, reopen_review, resolve_review
+from .evaluation import (
+    EvaluationError,
+    assert_manual_review_writable,
+    reopen_review,
+    resolve_review,
+)
 from .evaluation_selectors import (
     DISPLAY_EFFECTIVE_EVALUATIONS_CTE,
     EvaluationSelectorError,
@@ -47,6 +56,22 @@ from .evaluation_selectors import (
     review_anchor_evaluation,
 )
 from .audience_rate import active_classifier_state, build_channel_audience_rates
+from .spu_audience import (
+    STAT_PLATFORMS,
+    STAT_WINDOWS,
+    SpuAudienceError,
+    associate_single_content,
+    build_stats as build_spu_audience_stats,
+    content_labels as spu_content_labels,
+    default_llm_hook as default_spu_llm_hook,
+    domain_ready as spu_domain_ready,
+    list_assets as list_spu_audience_assets,
+    recover_orphan_association_runs,
+    resolve_incremental_since,
+    run_association as run_spu_association,
+    start_association_run,
+    upsert_spu,
+)
 from .insights import CHANNELS, SCENES, build_channel_conclusions
 from .media import (
     MediaProcessingError,
@@ -71,10 +96,12 @@ from .providers import (
     update_content_data,
 )
 from .reports import (
+    IMPLICIT_RUN_STATUSES,
     REPORTS_ROOT,
     ReportTaskError,
+    TaskCancelled,
     assert_report_runtime_ready,
-    create_and_run_task,
+    create_task,
     get_task,
     list_tasks,
     request_task_cancel,
@@ -82,13 +109,20 @@ from .reports import (
     resume_task,
     run_task,
 )
-from .scheduler import install_jobs, startup_catchup
+from .scheduler import (
+    install_jobs,
+    recover_interrupted_scheduler_runs,
+    startup_catchup,
+)
 from .storage import (
     DEFAULT_DB,
     PROJECT_ROOT,
+    SCHEMA_VERSION,
     connect,
     initialize_database,
     now_utc,
+    require_schema_compatibility,
+    schema_compatibility_state,
     transaction,
 )
 from .taxonomy import (
@@ -120,6 +154,7 @@ LEGACY_EXPORTS = {
 DOUYIN_URL_RE = re.compile(r"https?://(?:www\.)?douyin\.com/", re.I)
 XHS_URL_RE = re.compile(r"https?://(?:www\.)?xiaohongshu\.com/", re.I)
 UID_RE = re.compile(r"^\d{6,24}$")
+RUNTIME_IDENTITY_SCHEMA = "dcar-runtime-identity-v1"
 
 
 def _enabled(name: str) -> bool:
@@ -202,6 +237,9 @@ class ContentSearchRequest(BaseModel):
     content_direction: Optional[str] = Field(default=None, max_length=32)
     review_status: Optional[str] = Field(default=None, max_length=32)
     selling_point: Optional[str] = Field(default=None, max_length=8)
+    spu_series: Optional[str] = Field(default=None, max_length=120)
+    audience: Optional[str] = Field(default=None, max_length=16)
+    scene: Optional[str] = Field(default=None, max_length=16)
     page: int = Field(default=1, ge=1)
     page_size: int = Field(default=50, ge=1, le=100)
 
@@ -233,6 +271,31 @@ class SellingPointMutationRequest(BaseModel):
     label: str = Field(min_length=1, max_length=300)
     definition: str = Field(default="", max_length=2000)
     matcher_rule: Dict[str, Any]
+
+
+class SpuAliasPayload(BaseModel):
+    alias: str = Field(min_length=1, max_length=60)
+    alias_type: str = Field(default="official", max_length=16)
+    ambiguous: bool = False
+
+
+class SpuUpsertRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    spu_id: Optional[str] = Field(default=None, max_length=160)
+    brand: str = Field(min_length=1, max_length=60)
+    series: str = Field(min_length=1, max_length=80)
+    trim_label: Optional[str] = Field(default=None, max_length=120)
+    model_year: Optional[int] = Field(default=None, ge=1990, le=2100)
+    powertrain: str = Field(default="", max_length=16)
+    body_style: str = Field(default="", max_length=16)
+    price_low: Optional[float] = Field(default=None, ge=0)
+    price_high: Optional[float] = Field(default=None, ge=0)
+    enabled: bool = True
+    audience_primary: Optional[str] = Field(default=None, max_length=8)
+    audience_secondary: Optional[str] = Field(default=None, max_length=8)
+    basis: str = Field(default="页面配置", max_length=300)
+    aliases: List[SpuAliasPayload] = Field(default_factory=list)
 
 
 class TaskCreateRequest(BaseModel):
@@ -466,6 +529,15 @@ def _window_summary(
     *,
     report_cutoff_at: Optional[str] = None,
 ) -> Dict[str, Any]:
+    contract = load_contract(report_version=CURRENT_REPORT_VERSION)
+    coverage_thresholds = contract["required_coverage_thresholds"]
+    metric_display_thresholds = contract["metric_display_coverage_thresholds"]
+    evaluation_minimum = float(coverage_thresholds["evaluation_coverage"])
+    fingerprint_minimum = float(
+        coverage_thresholds["duplicate_fingerprint_coverage"]
+    )
+    view_minimum = float(metric_display_thresholds["view_count"])
+    comment_minimum = float(metric_display_thresholds["comment_count"])
     start_utc, end_utc = _utc_text(start), _utc_text(end)
     content_rows = connection.execute(
         """
@@ -623,16 +695,17 @@ def _window_summary(
     comment_coverage = round(len(comment_values) * 100 / total, 2) if total else None
     views = sum(view_values)
     comments = sum(comment_values)
+    evaluation_coverage = round(eligible * 100 / total, 2) if total else None
     ratio_status = (
         "not_applicable"
         if total == 0
         else "available"
-        if eligible * 100 / total >= 95
+        if (evaluation_coverage or 0) >= evaluation_minimum
         else "below_threshold"
     )
-    evaluation_coverage = round(eligible * 100 / total, 2) if total else None
     evaluation_reason = (
-        f"正式评估覆盖率为 {evaluation_coverage:.2f}%，低于 95% 发布阈值"
+        f"正式评估覆盖率为 {evaluation_coverage:.2f}%，低于 "
+        f"{evaluation_minimum:g}% 发布阈值"
         if ratio_status == "below_threshold" and evaluation_coverage is not None
         else ""
     )
@@ -640,6 +713,7 @@ def _window_summary(
         total,
         fingerprint_count,
         duplicate_calibrated,
+        threshold=fingerprint_minimum,
     )
     return {
         "period_start": start.isoformat(),
@@ -663,12 +737,13 @@ def _window_summary(
                 else "missing"
                 if not view_values
                 else "available"
-                if (view_coverage or 0) >= 90
+                if (view_coverage or 0) >= view_minimum
                 else "below_threshold",
                 coverage_percentage=view_coverage,
                 reason=(
-                    f"曝光量快照覆盖率为 {view_coverage:.2f}%，低于 90% 发布阈值"
-                    if view_values and (view_coverage or 0) < 90
+                    f"曝光量快照覆盖率为 {view_coverage:.2f}%，低于 "
+                    f"{view_minimum:g}% 发布阈值"
+                    if view_values and (view_coverage or 0) < view_minimum
                     else ""
                 ),
             ),
@@ -680,12 +755,13 @@ def _window_summary(
                 else "missing"
                 if not comment_values
                 else "available"
-                if (comment_coverage or 0) >= 90
+                if (comment_coverage or 0) >= comment_minimum
                 else "below_threshold",
                 coverage_percentage=comment_coverage,
                 reason=(
-                    f"评论量快照覆盖率为 {comment_coverage:.2f}%，低于 90% 发布阈值"
-                    if comment_values and (comment_coverage or 0) < 90
+                    f"评论量快照覆盖率为 {comment_coverage:.2f}%，低于 "
+                    f"{comment_minimum:g}% 发布阈值"
+                    if comment_values and (comment_coverage or 0) < comment_minimum
                     else ""
                 ),
             ),
@@ -848,6 +924,36 @@ def _data_freshness(
 def _database_state(connection: sqlite3.Connection) -> Dict[str, Any]:
     """Return cheap snapshot identity fields used by deployment smoke checks."""
 
+    compatibility = schema_compatibility_state(connection)
+    user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    release_rows = connection.execute(
+        """
+        SELECT er.id,er.rule_version,er.taxonomy_version,
+               er.matcher_rule_sha256,er.status release_status,
+               tv.status taxonomy_status
+        FROM evaluation_releases er
+        JOIN taxonomy_versions tv ON tv.version=er.taxonomy_version
+        WHERE er.status='active'
+        ORDER BY er.id
+        """
+    ).fetchall()
+    if len(release_rows) != 1:
+        raise RuntimeError(
+            "database identity requires exactly one active evaluation release"
+        )
+    release = release_rows[0]
+    runtime_identity = {
+        "schema": RUNTIME_IDENTITY_SCHEMA,
+        "report_version": CURRENT_REPORT_VERSION,
+        "database_schema_version": user_version,
+        "database_schema_migration": compatibility["actual_migration_name"],
+        "active_release_id": str(release["id"]),
+        "active_release_status": str(release["release_status"]),
+        "rule_version": str(release["rule_version"]),
+        "taxonomy_version": str(release["taxonomy_version"]),
+        "taxonomy_status": str(release["taxonomy_status"]),
+        "matcher_rule_sha256": str(release["matcher_rule_sha256"]),
+    }
     return {
         "content_count": int(
             connection.execute("SELECT COUNT(*) FROM content_items").fetchone()[0]
@@ -855,7 +961,9 @@ def _database_state(connection: sqlite3.Connection) -> Dict[str, Any]:
         "latest_published_at": connection.execute(
             "SELECT MAX(published_at) FROM content_items"
         ).fetchone()[0],
-        "user_version": int(connection.execute("PRAGMA user_version").fetchone()[0]),
+        "user_version": user_version,
+        "schema_compatibility": compatibility,
+        "runtime_identity": runtime_identity,
     }
 
 
@@ -1093,6 +1201,43 @@ def _content_search(
         where.append("rq.terminal_count > 0")
     elif payload.review_status == "resolved":
         where.append("rq.pending_count = 0 AND rq.terminal_count = 0")
+    # SPU/人群/场景 标签筛选：只在 v14 关联域可用时生效（只读副本可能仍是 v13）
+    spu_filters: List[str] = []
+    spu_parameters: List[Any] = []
+    if payload.spu_series == SELLING_POINT_NONE:
+        spu_filters.append(
+            "NOT EXISTS (SELECT 1 FROM content_spu_links sl WHERE sl.content_id=c.id"
+            " AND sl.invalidated_at IS NULL AND sl.is_primary=1)"
+        )
+    elif payload.spu_series:
+        spu_filters.append(
+            "EXISTS (SELECT 1 FROM content_spu_links sl JOIN spu_catalog sc2 ON sc2.spu_id=sl.spu_id"
+            " WHERE sl.content_id=c.id AND sl.invalidated_at IS NULL AND sl.is_primary=1"
+            " AND sc2.series_slug=?)"
+        )
+        spu_parameters.append(payload.spu_series)
+    if payload.audience == SELLING_POINT_NONE:
+        spu_filters.append(
+            "NOT EXISTS (SELECT 1 FROM content_audience_links al WHERE al.content_id=c.id"
+            " AND al.invalidated_at IS NULL)"
+        )
+    elif payload.audience:
+        spu_filters.append(
+            "EXISTS (SELECT 1 FROM content_audience_links al WHERE al.content_id=c.id"
+            " AND al.invalidated_at IS NULL AND al.audience_code=?)"
+        )
+        spu_parameters.append(payload.audience)
+    if payload.scene == SELLING_POINT_NONE:
+        spu_filters.append(
+            "NOT EXISTS (SELECT 1 FROM content_scene_links cl WHERE cl.content_id=c.id"
+            " AND cl.invalidated_at IS NULL)"
+        )
+    elif payload.scene:
+        spu_filters.append(
+            "EXISTS (SELECT 1 FROM content_scene_links cl WHERE cl.content_id=c.id"
+            " AND cl.invalidated_at IS NULL AND cl.scene_code=?)"
+        )
+        spu_parameters.append(payload.scene)
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
     from_sql = """
         FROM content_items c
@@ -1125,6 +1270,11 @@ def _content_search(
     """
     offset = (payload.page - 1) * payload.page_size
     with connect(db_path, read_only=read_only) as connection:
+        labels_ready = spu_domain_ready(connection)
+        if labels_ready and spu_filters:
+            where.extend(spu_filters)
+            parameters.extend(spu_parameters)
+            where_sql = f"WHERE {' AND '.join(where)}"
         total = int(
             connection.execute(
                 f"WITH {DISPLAY_EFFECTIVE_EVALUATIONS_CTE} "
@@ -1158,8 +1308,27 @@ def _content_search(
             """,
             [*parameters, payload.page_size, offset],
         ).fetchall()
+        items = [dict(row) for row in rows]
+        tag_labels = (
+            spu_content_labels(connection, [int(item["id"]) for item in items])
+            if labels_ready
+            else {}
+        )
+    for item in items:
+        entry = tag_labels.get(int(item["id"])) or {
+            "spu": None,
+            "spu_secondary_count": 0,
+            "spu_gray_count": 0,
+            "audience": None,
+            "scenes": [],
+        }
+        item["spu"] = entry["spu"]
+        item["spu_secondary_count"] = entry["spu_secondary_count"]
+        item["spu_gray_count"] = entry["spu_gray_count"]
+        item["audience"] = entry["audience"]
+        item["scenes"] = entry["scenes"]
     return {
-        "items": [dict(row) for row in rows],
+        "items": items,
         "total": total,
         "page": payload.page,
         "page_size": payload.page_size,
@@ -1682,9 +1851,9 @@ def _run_startup_catchup(
     db_path: Path,
     reports_root: Path,
 ) -> None:
-    """Run potentially slow supplier catch-up without blocking API startup."""
+    """Run report-only catch-up without blocking API startup."""
     try:
-        app.state.catchup_results = startup_catchup(
+        results = startup_catchup(
             db_path=db_path, reports_root=reports_root
         )
     except Exception as exc:
@@ -1692,7 +1861,20 @@ def _run_startup_catchup(
         app.state.catchup_error = str(exc)
         app.state.catchup_status = "failed"
     else:
-        app.state.catchup_status = "succeeded"
+        app.state.catchup_results = results
+        statuses = {str(item.get("status") or "") for item in results}
+        if "failed" in statuses:
+            app.state.catchup_status = "failed"
+        elif statuses.intersection({"deferred", "skipped_duplicate"}):
+            app.state.catchup_status = "deferred"
+        elif statuses <= {
+            "succeeded",
+            "partial",
+            "skipped",
+        }:
+            app.state.catchup_status = "succeeded"
+        else:
+            app.state.catchup_status = "failed"
 
 
 @contextmanager
@@ -1748,11 +1930,10 @@ async def _lifespan_runtime(app: FastAPI):
             raise RuntimeError(
                 f"read-only replica database is missing: {config.db_path}"
             )
-        with sqlite3.connect(
-            f"{config.db_path.resolve().as_uri()}?mode=ro&immutable=1",
-            uri=True,
-        ) as connection:
-            connection.execute("PRAGMA query_only = ON")
+        with connect(config.db_path, read_only=True) as connection:
+            require_schema_compatibility(
+                connection, supported_versions=frozenset({SCHEMA_VERSION})
+            )
             connection.execute("SELECT 1 FROM content_items LIMIT 1").fetchone()
         app.state.database_sha256 = _file_sha256(config.db_path)
         app.state.recovered_fetch_slots = {
@@ -1770,9 +1951,13 @@ async def _lifespan_runtime(app: FastAPI):
             "skipped": "read_only",
         }
         app.state.recovered_tasks = 0
+        app.state.recovered_scheduler_runs = 0
     else:
         with connect(config.db_path) as connection:
             initialize_database(connection)
+        app.state.recovered_scheduler_runs = recover_interrupted_scheduler_runs(
+            db_path=config.db_path
+        )
         app.state.recovered_fetch_slots = recover_stale_fetch_slots(
             db_path=config.db_path
         )
@@ -1781,6 +1966,9 @@ async def _lifespan_runtime(app: FastAPI):
             processor_version_by_type=processor_versions(),
         )
         app.state.recovered_tasks = _recover_interrupted_tasks(db_path=config.db_path)
+        app.state.recovered_association_runs = recover_orphan_association_runs(
+            db_path=config.db_path
+        )
         app.state.database_sha256 = None
     app.state.scheduler_requested = config.scheduler_enabled
     app.state.scheduler_enabled = False
@@ -1890,7 +2078,7 @@ async def read_only_replica_guard(request: Request, call_next):
 
 
 def create_app(config: Optional[ApiConfig] = None) -> FastAPI:
-    application = FastAPI(title="DCar Insight API", version="8.3", lifespan=lifespan)
+    application = FastAPI(title="DCar Insight API", version="8.6", lifespan=lifespan)
     application.state.config = config or ApiConfig.from_env()
     application.add_middleware(
         CORSMiddleware,
@@ -1941,7 +2129,21 @@ def get_v8_scheduler_status(request: Request) -> Dict[str, Any]:
     with connect(config.db_path, read_only=config.read_only) as connection:
         rows = connection.execute(
             """
-            SELECT sr.* FROM scheduler_runs sr
+            SELECT sr.*,
+                   (
+                       SELECT COUNT(*) FROM scheduler_run_attempts sra
+                       WHERE sra.scheduler_run_id=sr.id
+                   ) attempt_count,
+                   (
+                       SELECT MAX(attempt_number) FROM scheduler_run_attempts sra
+                       WHERE sra.scheduler_run_id=sr.id
+                   ) latest_attempt_number,
+                   (
+                       SELECT invocation_source FROM scheduler_run_attempts sra
+                       WHERE sra.scheduler_run_id=sr.id
+                       ORDER BY attempt_number DESC LIMIT 1
+                   ) latest_invocation_source
+            FROM scheduler_runs sr
             JOIN (
                 SELECT job_id, MAX(scheduled_for) scheduled_for
                 FROM scheduler_runs GROUP BY job_id
@@ -1963,6 +2165,7 @@ def get_v8_scheduler_status(request: Request) -> Dict[str, Any]:
             "error": getattr(request.app.state, "report_runtime_error", None),
         },
         "startup_catchup": {
+            "mode": "report_only",
             "requested": bool(
                 getattr(request.app.state, "startup_catchup_requested", False)
             ),
@@ -1975,6 +2178,11 @@ def get_v8_scheduler_status(request: Request) -> Dict[str, Any]:
         },
         "data_freshness": data_freshness,
         "jobs": [dict(row) for row in rows],
+        "scheduler_run_recovery": {
+            "interrupted": int(
+                getattr(request.app.state, "recovered_scheduler_runs", 0)
+            )
+        },
         "media_slot_recovery": getattr(
             request.app.state,
             "recovered_media_slots",
@@ -1995,21 +2203,57 @@ def get_v8_scheduler_status(request: Request) -> Dict[str, Any]:
     }
 
 
+# Report generation is minutes long, so it never runs inside the request that
+# asks for it: the endpoint returns a queued task and the workbench polls the
+# task read model for progress. One lock keeps the single SQLite writer serial.
+_TASK_RUN_LOCK = threading.Lock()
+
+
+def _run_task_in_background(
+    task_id: str, *, db_path: Path, reports_root: Path
+) -> None:
+    with _TASK_RUN_LOCK:
+        try:
+            run_task(task_id, db_path=db_path, reports_root=reports_root)
+        except TaskCancelled:
+            LOGGER.info("report task cancelled while generating: %s", task_id)
+        except Exception:
+            # run_task already records the failure on the task; keep the worker alive.
+            LOGGER.exception("background report generation failed: %s", task_id)
+
+
+def _queue_task_run(
+    background: BackgroundTasks, task_id: str, config: ApiConfig
+) -> None:
+    background.add_task(
+        _run_task_in_background,
+        task_id,
+        db_path=config.db_path,
+        reports_root=config.reports_root,
+    )
+
+
 @router.post("/api/v8/tasks")
-def create_v8_task(request: Request, payload: TaskCreateRequest) -> Dict[str, Any]:
+def create_v8_task(
+    request: Request, payload: TaskCreateRequest, background: BackgroundTasks
+) -> Dict[str, Any]:
     config = _request_config(request)
     try:
-        return create_and_run_task(
+        with connect(config.db_path) as connection:
+            assert_report_runtime_ready(connection)
+        task = create_task(
             task_type="custom",
             period_start=payload.period_start,
             period_end=payload.period_end,
             creation_source="manual",
             name=payload.name,
             db_path=config.db_path,
-            reports_root=config.reports_root,
         )
     except ReportTaskError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if str(task["task_status"]) in IMPLICIT_RUN_STATUSES:
+        _queue_task_run(background, str(task["id"]), config)
+    return task
 
 
 @router.get("/api/v8/tasks/{task_id}")
@@ -2021,14 +2265,16 @@ def get_v8_task(request: Request, task_id: str) -> Dict[str, Any]:
 
 
 @router.post("/api/v8/tasks/{task_id}/retry")
-def retry_v8_task(request: Request, task_id: str) -> Dict[str, Any]:
+def retry_v8_task(
+    request: Request, task_id: str, background: BackgroundTasks
+) -> Dict[str, Any]:
     config = _request_config(request)
     try:
-        retry_task(task_id, db_path=config.db_path)
-        run_task(task_id, db_path=config.db_path, reports_root=config.reports_root)
-        return get_task(task_id, db_path=config.db_path)
+        task = retry_task(task_id, db_path=config.db_path)
     except ReportTaskError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    _queue_task_run(background, task_id, config)
+    return task
 
 
 @router.post("/api/v8/tasks/{task_id}/cancel")
@@ -2040,14 +2286,16 @@ def cancel_v8_task(request: Request, task_id: str) -> Dict[str, Any]:
 
 
 @router.post("/api/v8/tasks/{task_id}/resume")
-def resume_v8_task(request: Request, task_id: str) -> Dict[str, Any]:
+def resume_v8_task(
+    request: Request, task_id: str, background: BackgroundTasks
+) -> Dict[str, Any]:
     config = _request_config(request)
     try:
-        resume_task(task_id, db_path=config.db_path)
-        run_task(task_id, db_path=config.db_path, reports_root=config.reports_root)
-        return get_task(task_id, db_path=config.db_path)
+        task = resume_task(task_id, db_path=config.db_path)
     except ReportTaskError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    _queue_task_run(background, task_id, config)
+    return task
 
 
 @router.get("/api/v8/tasks/{task_id}/revisions/{revision}/report")
@@ -2234,10 +2482,17 @@ def import_v8_contents(request: Request, payload: BulkImportRequest) -> Dict[str
 
 @router.post("/api/v8/contents/{content_id}/update-data")
 def update_v8_content_data(request: Request, content_id: int) -> Dict[str, Any]:
+    db_path = _request_config(request).db_path
     try:
-        return update_content_data(content_id, db_path=_request_config(request).db_path)
+        result = update_content_data(content_id, db_path=db_path)
     except ProviderConfigurationError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    try:
+        # 数据更新后即时补算 车型/人群/场景 标签，让内容列表立刻反映最新证据
+        associate_single_content(content_id, db_path=db_path)
+    except (SpuAudienceError, sqlite3.Error):
+        LOGGER.exception("内容 %s 更新后补算三标签失败（不影响数据更新结果）", content_id)
+    return result
 
 
 @router.get("/api/v8/contents/{content_id}/evidence")
@@ -2437,6 +2692,10 @@ def start_v8_review(request: Request, queue_id: int) -> Dict[str, Any]:
         _connect_for_request(request) as connection,
         transaction(connection),
     ):
+        try:
+            assert_manual_review_writable(connection)
+        except EvaluationError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         row = connection.execute(
             "SELECT status,content_id,evaluation_id FROM review_queue WHERE id=?",
             (queue_id,),
@@ -2593,6 +2852,111 @@ def publish_v8_selling_points(request: Request) -> Dict[str, Any]:
         return publish_draft(db_path=_request_config(request).db_path)
     except TaxonomyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/api/v8/spu-audience/assets")
+def get_v8_spu_audience_assets(request: Request) -> Dict[str, Any]:
+    config = _request_config(request)
+    try:
+        return list_spu_audience_assets(
+            db_path=config.db_path, read_only=config.read_only
+        )
+    except SpuAudienceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/api/v8/spu-audience/stats")
+def get_v8_spu_audience_stats(
+    request: Request, window: str = "all", platform: str = ""
+) -> Dict[str, Any]:
+    config = _request_config(request)
+    if window not in STAT_WINDOWS:
+        raise HTTPException(status_code=422, detail=f"不支持的统计窗口：{window}")
+    if platform and platform not in STAT_PLATFORMS:
+        raise HTTPException(status_code=422, detail=f"不支持的统计平台：{platform}")
+    try:
+        return build_spu_audience_stats(
+            db_path=config.db_path,
+            window=window,
+            platform=platform,
+            read_only=config.read_only,
+        )
+    except SpuAudienceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/api/v8/spu-audience/associate")
+def run_v8_spu_association(
+    request: Request, background: BackgroundTasks, mode: str = "full"
+) -> Dict[str, Any]:
+    """启动后台刷新任务并立即返回；进度经 assets 接口的 last_run 轮询。
+
+    mode=full 全量重算；mode=incremental 只补算上次成功刷新之后新增/重评估
+    的 V2/V3 内容（页面打开时自动触发的就是增量），首次运行没有成功记录
+    时增量自动升级为全量；mode=yesterday/this_week/last_week 只重算发布
+    时间落在对应统计窗口内的 V2/V3 内容（页面「刷新数据」弹窗四选一）。
+    """
+
+    if mode not in {"full", "incremental", "yesterday", "this_week", "last_week"}:
+        raise HTTPException(status_code=422, detail=f"不支持的刷新方式：{mode}")
+    config = _request_config(request)
+    since: Optional[str] = None
+    scope_window: Optional[str] = None
+    if mode == "incremental":
+        with connect(config.db_path, read_only=config.read_only) as connection:
+            since = resolve_incremental_since(connection)
+    elif mode != "full":
+        scope_window = mode
+    try:
+        run_id = start_association_run(db_path=config.db_path)
+    except SpuAudienceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    background.add_task(
+        _run_spu_association_job, config.db_path, run_id, since, scope_window
+    )
+    if since:
+        resolved_mode = "incremental"
+    elif scope_window:
+        resolved_mode = f"window:{scope_window}"
+    else:
+        resolved_mode = "full"
+    return {
+        "run_id": run_id,
+        "status": "running",
+        "mode": resolved_mode,
+    }
+
+
+def _run_spu_association_job(
+    db_path: Path,
+    run_id: int,
+    since: Optional[str] = None,
+    scope_window: Optional[str] = None,
+) -> None:
+    """后台执行刷新；失败结论由 run_association 写回运行记录，这里补日志。
+
+    规则链后自动挂 LLM 补空（B 链）：key 缺失时 hook 为 None，纯规则运行；
+    LLM 阶段异常由 run_association 记入 summary_json.llm，不影响刷新状态。
+    """
+
+    try:
+        run_spu_association(
+            db_path=db_path, run_id=run_id, since=since,
+            scope_window=scope_window,
+            llm_hook=default_spu_llm_hook(),
+        )
+    except Exception:  # noqa: BLE001 —— 运行记录已标记 failed，仅记录堆栈
+        LOGGER.exception("SPU 数据刷新后台任务失败 run_id=%s", run_id)
+
+
+@router.post("/api/v8/spu-audience/spu")
+def upsert_v8_spu(request: Request, payload: SpuUpsertRequest) -> Dict[str, Any]:
+    try:
+        return upsert_spu(
+            payload.model_dump(), db_path=_request_config(request).db_path
+        )
+    except SpuAudienceError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.get("/api/v7/history/reports")

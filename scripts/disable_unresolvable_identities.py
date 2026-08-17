@@ -23,12 +23,19 @@ import argparse
 import json
 import shutil
 import sqlite3
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Sequence
 from zoneinfo import ZoneInfo
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PACKAGE_ROOT = PROJECT_ROOT / "src" / "dcar_eval"
+if str(PACKAGE_ROOT) not in sys.path:
+    sys.path.insert(0, str(PACKAGE_ROOT))
+
+from v8.storage import connect as storage_connect  # type: ignore[import-untyped]  # noqa: E402
+
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 _CANDIDATE_SQL = """
@@ -47,6 +54,10 @@ WHERE a.enabled=1
         WHERE x.account_id=a.id) = 1
   AND (SELECT COUNT(*) FROM content_items c WHERE c.account_id=a.id) = 0
 """
+
+
+def _connect(db_path: Path, *, read_only: bool) -> sqlite3.Connection:
+    return storage_connect(db_path, read_only=read_only)
 
 
 def _now_utc_text() -> str:
@@ -84,8 +95,7 @@ def run(db_path: Path, *, apply: bool, backup_dir: Path, error_marker: str) -> D
         "error_marker": error_marker,
     }
     if not apply:
-        connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        connection.row_factory = sqlite3.Row
+        connection = _connect(db_path, read_only=True)
         try:
             summary["candidates"] = _candidates(connection, error_marker)
             summary["ok"] = True
@@ -95,8 +105,7 @@ def run(db_path: Path, *, apply: bool, backup_dir: Path, error_marker: str) -> D
             connection.close()
 
     summary["backup"] = str(_backup(db_path, backup_dir))
-    connection = sqlite3.connect(db_path)
-    connection.row_factory = sqlite3.Row
+    connection = _connect(db_path, read_only=False)
     try:
         connection.execute("BEGIN IMMEDIATE")
         candidates = _candidates(connection, error_marker)

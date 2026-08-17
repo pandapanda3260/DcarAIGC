@@ -112,7 +112,11 @@ class ReleaseManagementTest(unittest.TestCase):
                 (LEGACY_V7_RELEASE_ID,),
             ).fetchone()
             assert legacy_release is not None
-            envelope_id, evidence_sha256, _ = build_evidence_envelope(connection, 1)
+            envelope_id, evidence_sha256, _ = build_evidence_envelope(
+                connection,
+                1,
+                rule_version=str(legacy_release["rule_version"]),
+            )
             connection.execute(
                 """
                 INSERT INTO evaluation_versions(

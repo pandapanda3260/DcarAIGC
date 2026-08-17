@@ -413,7 +413,7 @@ export default function SellingPointsPage() {
         <div className="modal-backdrop" role="presentation">
           <section className="review-modal selling-point-rule-modal" role="dialog" aria-modal="true" aria-label="编辑卖点">
             <div className="panel-head">
-              <div><span className="eyebrow">SELLING POINT DRAFT</span><h3>{editingCode ? `编辑 ${editingCode}` : "新增卖点"}</h3></div>
+              <div><span className="eyebrow">卖点草稿</span><h3>{editingCode ? `编辑 ${editingCode}` : "新增卖点"}</h3></div>
               <button className="modal-close" onClick={() => setForm(null)} aria-label="关闭">×</button>
             </div>
             <div className="review-fields">

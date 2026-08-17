@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import math
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,8 @@ from .capture import BudgetBlocked, ProviderResult
 from .duplicates import fingerprint_content
 from .evaluation import evaluate_content
 from .media import process_content_media
+from .media_state import MediaTerminalDetail, media_terminal_state_details
+from .metric_observations import persist_metric_observation
 from .providers import (
     TIKHUB_PRICE,
     TIKHUB_XHS_PRICE,
@@ -60,6 +63,79 @@ BLOCKING_CODES = {
 
 class RangeBackfillError(RuntimeError):
     pass
+
+
+def _active_evaluation_release_id(connection: sqlite3.Connection) -> str:
+    rows = connection.execute(
+        "SELECT id FROM evaluation_releases WHERE status='active' ORDER BY id"
+    ).fetchall()
+    if len(rows) != 1:
+        raise RangeBackfillError(
+            "本地证据回溯要求且仅允许一个 active evaluation release"
+        )
+    return str(rows[0]["id"])
+
+
+def _pinned_media_terminal_detail(
+    *,
+    db_path: Path,
+    release_id: str,
+    content_id: int,
+) -> MediaTerminalDetail:
+    with connect(db_path) as connection:
+        connection.execute("BEGIN")
+        current_release_id = _active_evaluation_release_id(connection)
+        if current_release_id != release_id:
+            raise RangeBackfillError(
+                "active evaluation release 在本地证据处理期间发生切换："
+                f"{release_id} -> {current_release_id}"
+            )
+        detail = media_terminal_state_details(
+            connection,
+            release_id,
+            [content_id],
+        ).get(content_id)
+        if detail is None:
+            raise RangeBackfillError(f"媒体终态 selector 未返回内容：{content_id}")
+        connection.commit()
+    return detail
+
+
+def _release_history_backfill_tag(
+    *,
+    db_path: Path,
+    release_id: str,
+    content_id: int,
+) -> bool:
+    with connect(db_path) as connection, transaction(connection):
+        current_release_id = _active_evaluation_release_id(connection)
+        if current_release_id != release_id:
+            raise RangeBackfillError(
+                "active evaluation release 在清除 history-backfill 标记前发生切换："
+                f"{release_id} -> {current_release_id}"
+            )
+        detail = media_terminal_state_details(
+            connection,
+            release_id,
+            [content_id],
+        ).get(content_id)
+        if detail is None or detail.state not in {
+            "complete",
+            "terminal_insufficient",
+        }:
+            reason = detail.reason if detail is not None else "selector_missing"
+            raise RangeBackfillError(
+                "媒体终态在清除 history-backfill 标记前发生漂移："
+                f"{reason}"
+            )
+        cleared = connection.execute(
+            """
+            UPDATE content_items SET source_group='', updated_at=?
+            WHERE id=? AND source_group=?
+            """,
+            (now_utc(), content_id, HISTORY_BACKFILL_SOURCE_GROUP),
+        )
+        return cleared.rowcount > 0
 
 
 def _utc(value: datetime) -> datetime:
@@ -871,7 +947,11 @@ def repair_discovery_placeholder_metrics(
     sql = f"""
         SELECT fs.id slot_id, fs.content_id, fs.attempt_count,
                c.platform, c.link_id, c.published_at,
-               ms.id snapshot_id, ms.metadata_json
+               ms.id snapshot_id, ms.captured_at snapshot_captured_at,
+               ms.window_key snapshot_window_key, ms.view_count,
+               ms.comment_count, ms.like_count, ms.share_count,
+               ms.collect_count, ms.source snapshot_source,
+               ms.raw_response_id, ms.metadata_json
         FROM fetch_slots fs
         JOIN content_items c ON c.id=fs.content_id
         JOIN content_metric_snapshots ms
@@ -924,19 +1004,28 @@ def repair_discovery_placeholder_metrics(
                     "repaired_at": repaired_at,
                 }
             )
-            connection.execute(
-                """
-                UPDATE content_metric_snapshots
-                SET view_count=NULL, status='missing', metadata_json=?
-                WHERE id=?
-                """,
-                (
-                    json.dumps(
-                        metadata, ensure_ascii=False, sort_keys=True,
-                        separators=(",", ":"),
-                    ),
-                    row["snapshot_id"],
+            persist_metric_observation(
+                connection,
+                content_id=int(row["content_id"]),
+                captured_at=str(row["snapshot_captured_at"]),
+                window_key=str(row["snapshot_window_key"]),
+                view_count=None,
+                comment_count=row["comment_count"],
+                like_count=row["like_count"],
+                share_count=row["share_count"],
+                collect_count=row["collect_count"],
+                status="missing",
+                source=str(row["snapshot_source"]),
+                raw_response_id=row["raw_response_id"],
+                metadata_json=json.dumps(
+                    metadata,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
                 ),
+                observation_origin="system_correction",
+                snapshot_mode="replace",
+                recorded_at=repaired_at,
             )
             connection.execute(
                 """
@@ -1160,8 +1249,9 @@ def run_local_evidence_backfill(
     """媒体+评估+感知重复的本地证据推进；history-archive 内容按口径永不进入。
 
     ``tagged_only=True`` 时只处理 ``history-backfill`` 标记的内容（最新优先），
-    单条完整走完媒体/评估/重复后当场清除标记，使其回归常规增量链路；
-    媒体可重试失败（如媒体源过期）保留标记，等待重试或付费刷新后再清。
+    单条由共享媒体终态 selector 判定：complete 完成重复指纹并清标，
+    terminal_insufficient 不伪造重复指纹但稳定清标；pending 与
+    terminal_failed 均保留标记，等待重试或未来显式刷新策略。
     """
 
     selected_platforms = sorted(set(platforms or ("douyin", "xiaohongshu")))
@@ -1178,6 +1268,7 @@ def run_local_evidence_backfill(
         HISTORY_BACKFILL_SOURCE_GROUP if tagged_only else HISTORY_ARCHIVE_SOURCE_GROUP
     )
     with connect(db_path) as connection:
+        pinned_release_id = _active_evaluation_release_id(connection)
         rows = connection.execute(
             f"""
             SELECT c.id, c.source_group FROM content_items c
@@ -1195,36 +1286,150 @@ def run_local_evidence_backfill(
         content_id = int(row["id"])
         was_tagged = str(row["source_group"] or "") == HISTORY_BACKFILL_SOURCE_GROUP
         try:
-            media = process_content_media(content_id, db_path=db_path)
-            if str(media.get("status") or "") != "evidence_ready":
+            pre_detail = _pinned_media_terminal_detail(
+                db_path=db_path,
+                release_id=pinned_release_id,
+                content_id=content_id,
+            )
+            if pre_detail.state == "terminal_failed":
+                results.append(
+                    {
+                        "content_id": content_id,
+                        "status": "terminal_failed",
+                        "media_terminal_state": pre_detail.state,
+                        "media_terminal_reason": pre_detail.reason,
+                        "error": f"媒体处理已终止：{pre_detail.reason}",
+                        "backfill_tag_cleared": False,
+                    }
+                )
+                continue
+            if pre_detail.state in {"complete", "terminal_insufficient"}:
+                duplicate_fingerprint = (
+                    fingerprint_content(content_id, db_path=db_path)
+                    if pre_detail.state == "complete"
+                    else None
+                )
+                tag_released = False
+                if was_tagged:
+                    tag_released = _release_history_backfill_tag(
+                        db_path=db_path,
+                        release_id=pinned_release_id,
+                        content_id=content_id,
+                    )
+                    tags_cleared += int(tag_released)
+                results.append(
+                    {
+                        "content_id": content_id,
+                        "status": pre_detail.state,
+                        "media_terminal_state": pre_detail.state,
+                        "media_terminal_reason": pre_detail.reason,
+                        "duplicate_fingerprint": duplicate_fingerprint,
+                        "backfill_tag_cleared": tag_released,
+                        "resumed_from_terminal_state": True,
+                    }
+                )
+                continue
+            try:
+                media = process_content_media(content_id, db_path=db_path)
+            except Exception as media_error:
+                detail = _pinned_media_terminal_detail(
+                    db_path=db_path,
+                    release_id=pinned_release_id,
+                    content_id=content_id,
+                )
+                if detail.state == "terminal_failed":
+                    results.append(
+                        {
+                            "content_id": content_id,
+                            "status": "terminal_failed",
+                            "media_terminal_state": detail.state,
+                            "media_terminal_reason": detail.reason,
+                            "error": f"{type(media_error).__name__}: {media_error}"[
+                                :500
+                            ],
+                            "backfill_tag_cleared": False,
+                        }
+                    )
+                    continue
+                raise
+            media_status = str(media.get("status") or "")
+            if media_status != "evidence_ready":
+                detail = _pinned_media_terminal_detail(
+                    db_path=db_path,
+                    release_id=pinned_release_id,
+                    content_id=content_id,
+                )
+                if detail.state == "terminal_failed":
+                    results.append(
+                        {
+                            "content_id": content_id,
+                            "status": "terminal_failed",
+                            "media": media,
+                            "media_terminal_state": detail.state,
+                            "media_terminal_reason": detail.reason,
+                            "error": f"媒体处理已终止：{detail.reason}",
+                            "backfill_tag_cleared": False,
+                        }
+                    )
+                    continue
                 raise RangeBackfillError(
                     "媒体证据尚未就绪："
-                    f"{media.get('status') or 'unknown'}"
+                    f"{media_status or 'unknown'}（{detail.reason}）"
                 )
-            evaluation = evaluate_content(content_id, db_path=db_path)
-            if str(evaluation.evidence_level) not in {"V2", "V3"}:
+            evaluation = evaluate_content(
+                content_id,
+                db_path=db_path,
+                expected_active_release_id=pinned_release_id,
+            )
+            detail = _pinned_media_terminal_detail(
+                db_path=db_path,
+                release_id=pinned_release_id,
+                content_id=content_id,
+            )
+            if detail.state == "pending":
                 raise RangeBackfillError(
-                    "评估证据等级不足："
-                    f"{evaluation.evidence_level}（清标仅接受 V2/V3）"
+                    "媒体证据 DAG 尚未终结："
+                    f"{detail.reason}（evaluation={evaluation.evaluation_id}）"
                 )
-            duplicate_fingerprint = fingerprint_content(content_id, db_path=db_path)
+            if detail.state == "terminal_failed":
+                results.append(
+                    {
+                        "content_id": content_id,
+                        "status": "terminal_failed",
+                        "media": media,
+                        "evaluation_id": evaluation.evaluation_id,
+                        "evaluation_created": evaluation.created,
+                        "evaluation_evidence_level": evaluation.evidence_level,
+                        "media_terminal_state": detail.state,
+                        "media_terminal_reason": detail.reason,
+                        "error": f"媒体处理已终止：{detail.reason}",
+                        "backfill_tag_cleared": False,
+                    }
+                )
+                continue
+            duplicate_fingerprint = (
+                fingerprint_content(content_id, db_path=db_path)
+                if detail.state == "complete"
+                else None
+            )
             tag_released = False
             if was_tagged:
-                with connect(db_path) as connection, transaction(connection):
-                    cleared = connection.execute(
-                        """
-                        UPDATE content_items SET source_group='', updated_at=?
-                        WHERE id=? AND source_group=?
-                        """,
-                        (now_utc(), content_id, HISTORY_BACKFILL_SOURCE_GROUP),
-                    )
-                    tag_released = cleared.rowcount > 0
+                tag_released = _release_history_backfill_tag(
+                    db_path=db_path,
+                    release_id=pinned_release_id,
+                    content_id=content_id,
+                )
                 tags_cleared += int(tag_released)
             results.append(
                 {
-                    "content_id": content_id, "status": str(media.get("status")),
-                    "media": media, "evaluation_id": evaluation.evaluation_id,
+                    "content_id": content_id,
+                    "status": detail.state,
+                    "media": media,
+                    "evaluation_id": evaluation.evaluation_id,
                     "evaluation_created": evaluation.created,
+                    "evaluation_evidence_level": evaluation.evidence_level,
+                    "media_terminal_state": detail.state,
+                    "media_terminal_reason": detail.reason,
                     "duplicate_fingerprint": duplicate_fingerprint,
                     "backfill_tag_cleared": tag_released,
                 }
@@ -1237,7 +1442,10 @@ def run_local_evidence_backfill(
                     "backfill_tag_cleared": False,
                 }
             )
-    failed = sum(item["status"] == "retryable_failed" for item in results)
+    failed = sum(
+        item["status"] in {"retryable_failed", "terminal_failed"}
+        for item in results
+    )
     if compact:
         compact_results: Any = {
             "status_counts": {},
@@ -1247,19 +1455,21 @@ def run_local_evidence_backfill(
                     "error": item.get("error"),
                 }
                 for item in results
-                if item["status"] == "retryable_failed"
+                if item["status"] in {"retryable_failed", "terminal_failed"}
             ][:COMPACT_FAILURE_LIMIT],
         }
         for item in results:
             compact_results["status_counts"][item["status"]] = (
                 compact_results["status_counts"].get(item["status"], 0) + 1
             )
+    terminal_status = "partial" if failed else "succeeded"
     output = {
         "task_id": task_id,
-        "status": "partial" if failed else "succeeded",
+        "status": terminal_status,
         "candidates": len(rows),
         "processed": len(results),
         "failed": failed,
+        "evaluation_release_id": pinned_release_id,
         "tagged_only": tagged_only,
         "tags_cleared": tags_cleared,
         "usage": _task_usage(task_id, db_path=db_path),
@@ -1267,7 +1477,7 @@ def run_local_evidence_backfill(
     }
     state_path = _write_state(
         task_id=task_id, start=start, end=end, max_amount=max_amount,
-        phase="local_evidence", status=output["status"], details=output,
+        phase="local_evidence", status=terminal_status, details=output,
         state_root=state_root,
     )
     output["state_path"] = str(state_path)

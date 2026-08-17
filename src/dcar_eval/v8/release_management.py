@@ -31,9 +31,11 @@ from .evaluation import (
 )
 from .matcher_dsl import V5_2_POINT_SPEC, taxonomy_matcher_sha256
 from .storage import (
-    CURRENT_SCHEMA_MIGRATION_NAME,
     SCHEMA_VERSION,
+    SchemaMigrationError,
+    configure_connection_safety,
     now_utc,
+    require_schema_compatibility,
     transaction,
 )
 from .taxonomy import TaxonomyError, serialize_point_row
@@ -604,7 +606,7 @@ def _existing_connection(
             f"{path.resolve().as_uri()}?mode={mode}", uri=True, timeout=30
         )
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys=ON")
+        configure_connection_safety(connection)
         connection.execute("PRAGMA busy_timeout=30000")
         if read_only:
             connection.execute("PRAGMA query_only=ON")
@@ -620,17 +622,14 @@ def _existing_connection(
 
 
 def _require_v9(connection: sqlite3.Connection) -> None:
-    user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    rows = connection.execute(
-        "SELECT version,name FROM schema_migrations WHERE version=?",
-        (SCHEMA_VERSION,),
-    ).fetchall()
-    if (
-        user_version != SCHEMA_VERSION
-        or len(rows) != 1
-        or str(rows[0]["name"]) != CURRENT_SCHEMA_MIGRATION_NAME
-    ):
-        raise ReleaseManagementError(f"complete schema v{SCHEMA_VERSION} is required")
+    try:
+        require_schema_compatibility(
+            connection, supported_versions=frozenset({SCHEMA_VERSION})
+        )
+    except SchemaMigrationError as error:
+        raise ReleaseManagementError(
+            f"complete schema v{SCHEMA_VERSION} is required"
+        ) from error
     required_columns = {
         "release_id",
         "parent_evaluation_id",
@@ -825,7 +824,7 @@ def _freeze_v1_and_current_evidence_state(
     connection: sqlite3.Connection, content_id: int
 ) -> tuple[dict[str, Any], str, dict[str, Any], str]:
     _, current_components, current_sha256 = _current_evidence_state(
-        connection, content_id
+        connection, content_id, rule_version=V8_RULE_VERSION
     )
     freeze_components = dict(current_components)
     return (

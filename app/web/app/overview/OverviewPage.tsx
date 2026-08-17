@@ -114,7 +114,7 @@ function ChannelConclusion({ channel, index }: { channel: OverviewChannel; index
   return <section className="panel channel-conclusion" data-channel={channel.platform}>
     <div className="channel-conclusion-head">
       <span className="channel-number" aria-hidden="true">{channelNumber}</span>
-      <div className="channel-heading-copy"><span className="eyebrow">CHANNEL {channelNumber}</span><div className="channel-title-row"><h3>{channel.label}渠道</h3><span className={`channel-platform-mark ${channel.platform}`} title={brand.label}><Image src={brand.src} alt="" width={17} height={17} unoptimized /></span></div><p>窗口发布 {channel.publication_count} 条 · 证据覆盖 {channel.evidence_coverage_percentage ?? "—"}% · 有效曝光内容 {channel.valid_exposure_items} 条 · 可归类曝光覆盖 {channel.exposure_coverage_percentage ?? "—"}%</p></div>
+      <div className="channel-heading-copy"><span className="eyebrow">渠道 {channelNumber}</span><div className="channel-title-row"><h3>{channel.label}渠道</h3><span className={`channel-platform-mark ${channel.platform}`} title={brand.label}><Image src={brand.src} alt="" width={17} height={17} unoptimized /></span></div><p>窗口发布 {channel.publication_count} 条 · 证据覆盖 {channel.evidence_coverage_percentage ?? "—"}% · 有效曝光内容 {channel.valid_exposure_items} 条 · 可归类曝光覆盖 {channel.exposure_coverage_percentage ?? "—"}%</p></div>
     </div>
     <div className="conclusion-subhead"><b>1</b><div><h4>汇总</h4><p>条数指标以该渠道窗口全部发布为分母；曝光分母仅含 view_count&gt;0 的有效曝光，未取得有效曝光不入分母。</p></div></div>
     <div className="conclusion-summary-grid">
@@ -129,7 +129,7 @@ function ChannelConclusion({ channel, index }: { channel: OverviewChannel; index
 
 export default function OverviewPage() {
   const [overview, setOverview] = useState<Overview | null>(null);
-  const [windowKey, setWindowKey] = useState<WindowKey>("yesterday");
+  const [windowKey, setWindowKey] = useState<WindowKey>("last_week");
   const [error, setError] = useState("");
 
   useEffect(() => {

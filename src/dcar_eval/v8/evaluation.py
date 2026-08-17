@@ -35,6 +35,7 @@ from .taxonomy import TaxonomyError, serialize_point_row
 
 RULE_VERSION = "evaluation-v7"
 V8_RULE_VERSION = "evaluation-v8"
+V9_RULE_VERSION = "evaluation-v9"
 EVIDENCE_VERSION = "evidence-v1"
 TEXT_EVIDENCE_VERSION = "text-evidence-v2"
 INCLUDE_MIN = 75
@@ -77,6 +78,20 @@ class _EvaluationRuntime:
 
 
 _ACTIVE_REVIEW_STATUSES = {"pending", "manual_required", "in_review"}
+_MATERIALIZED_RULE_VERSIONS = {V8_RULE_VERSION, V9_RULE_VERSION}
+_V9_TAXONOMY_VERSION = "selling-points-v5.2"
+
+
+def assert_manual_review_writable(connection: sqlite3.Connection) -> None:
+    """Fail closed before any review write when evaluation-v9 is active."""
+
+    releases = connection.execute(
+        "SELECT id,rule_version FROM evaluation_releases WHERE status='active' ORDER BY id"
+    ).fetchall()
+    if len(releases) > 1:
+        raise EvaluationError("multiple active evaluation releases exist")
+    if releases and str(releases[0]["rule_version"]) == V9_RULE_VERSION:
+        raise EvaluationError("manual review writes are disabled for evaluation-v9")
 
 
 def _is_current_active_automatic_evaluation(
@@ -373,6 +388,26 @@ def _gray_review_queue_sync_plan(connection: sqlite3.Connection) -> Dict[str, An
     if len(releases) != 1:
         raise EvaluationError("exactly one active release is required")
     release = releases[0]
+    if str(release["rule_version"]) == V9_RULE_VERSION:
+        payload: Dict[str, Any] = {
+            "schema_version": "gray-review-queue-sync-v2",
+            "release_id": str(release["id"]),
+            "rule_version": str(release["rule_version"]),
+            "targets": [],
+        }
+        return {
+            **payload,
+            "plan_sha256": sha256_json(payload),
+            "gray_evaluation_count": 0,
+            "synchronized_count": 0,
+            "target_count": 0,
+            "action_counts": {
+                "create": 0,
+                "reopen": 0,
+                "reanchor": 0,
+                "resolve": 0,
+            },
+        }
     rows = connection.execute(
         """
         WITH ranked AS (
@@ -555,7 +590,10 @@ def _artifact(
 
 
 def _artifact_components(
-    connection: sqlite3.Connection, content_id: int
+    connection: sqlite3.Connection,
+    content_id: int,
+    *,
+    rule_version: str,
 ) -> Dict[str, Any]:
     detail = connection.execute(
         """
@@ -584,13 +622,17 @@ def _artifact_components(
         """,
         (content_id,),
     ).fetchone()
-    manual_rows = connection.execute(
-        """
-        SELECT evidence_type, text_value, local_path, sha256
-        FROM manual_evidence WHERE content_id=? ORDER BY id
-        """,
-        (content_id,),
-    ).fetchall()
+    manual_rows = (
+        []
+        if rule_version == V9_RULE_VERSION
+        else connection.execute(
+            """
+            SELECT evidence_type, text_value, local_path, sha256
+            FROM manual_evidence WHERE content_id=? ORDER BY id
+            """,
+            (content_id,),
+        ).fetchall()
+    )
     manual_payload = [dict(row) for row in manual_rows]
     return {
         "detail_raw_sha256": str(detail["sha256"]) if detail is not None else None,
@@ -613,7 +655,10 @@ def _artifact_components(
 
 
 def _current_evidence_state(
-    connection: sqlite3.Connection, content_id: int
+    connection: sqlite3.Connection,
+    content_id: int,
+    *,
+    rule_version: str,
 ) -> tuple[Dict[str, Any], Dict[str, Any], str]:
     """Build the exact hash inputs shared by candidate detection and evaluation."""
 
@@ -622,7 +667,9 @@ def _current_evidence_state(
     ).fetchone()
     if content is None:
         raise EvaluationError(f"content {content_id} does not exist")
-    artifacts = _artifact_components(connection, content_id)
+    artifacts = _artifact_components(
+        connection, content_id, rule_version=rule_version
+    )
     text_sha = sha256_json(
         {
             "version": TEXT_EVIDENCE_VERSION,
@@ -646,10 +693,13 @@ def _current_evidence_state(
 
 
 def build_evidence_envelope(
-    connection: sqlite3.Connection, content_id: int
+    connection: sqlite3.Connection,
+    content_id: int,
+    *,
+    rule_version: str,
 ) -> tuple[int, str, Dict[str, Any]]:
     artifacts, components, evidence_sha = _current_evidence_state(
-        connection, content_id
+        connection, content_id, rule_version=rule_version
     )
     connection.execute(
         """
@@ -783,13 +833,15 @@ def _resolve_evaluation_release(
 
     status = str(release["status"])
     rule_version = str(release["rule_version"])
+    if source == "manual_review" and rule_version == V9_RULE_VERSION:
+        raise EvaluationError("manual review writes are disabled for evaluation-v9")
     if release_id is not None and (
         source != "automatic"
         or status != "backfilling"
-        or rule_version != V8_RULE_VERSION
+        or rule_version not in _MATERIALIZED_RULE_VERSIONS
     ):
         raise EvaluationError(
-            "explicit release evaluation requires an evaluation-v8 "
+            "explicit release evaluation requires an evaluation-v8 or evaluation-v9 "
             "release in backfilling status"
         )
     if source == "manual_review" and status != "active":
@@ -798,12 +850,14 @@ def _resolve_evaluation_release(
         raise EvaluationError(
             f"automatic evaluation cannot write release in status {status}"
         )
-    if rule_version not in {RULE_VERSION, V8_RULE_VERSION}:
+    if rule_version not in {RULE_VERSION, V8_RULE_VERSION, V9_RULE_VERSION}:
         raise EvaluationError(
             f"unsupported evaluation rule version: {release['rule_version']}"
         )
-    if status == "backfilling" and rule_version != V8_RULE_VERSION:
-        raise EvaluationError("only evaluation-v8 releases may be backfilled")
+    if status == "backfilling" and rule_version not in _MATERIALIZED_RULE_VERSIONS:
+        raise EvaluationError(
+            "only evaluation-v8 or evaluation-v9 releases may be backfilled"
+        )
     return release
 
 
@@ -817,8 +871,15 @@ def _load_release_runtime(
     if len(taxonomy_rows) != 1:
         raise EvaluationError("evaluation release taxonomy does not exist uniquely")
     taxonomy_row = taxonomy_rows[0]
+    rule_version = str(release["rule_version"])
     expected_taxonomy_status = (
-        "published" if str(release["status"]) == "active" else "draft"
+        "published"
+        if str(release["status"]) == "active"
+        or (
+            rule_version == V9_RULE_VERSION
+            and str(release["status"]) in {"backfilling", "ready"}
+        )
+        else "draft"
     )
     if str(taxonomy_row["status"]) != expected_taxonomy_status:
         raise EvaluationError(
@@ -831,13 +892,19 @@ def _load_release_runtime(
     taxonomy: Dict[str, Dict[str, Any]] = {}
     allowed_scenes: Dict[str, set[str]] = {}
     matcher: MaterializedMatcher | None = None
-    rule_version = str(release["rule_version"])
-    if rule_version == V8_RULE_VERSION:
+    if rule_version in _MATERIALIZED_RULE_VERSIONS:
         taxonomy_version = str(taxonomy_row["version"])
+        if (
+            rule_version == V9_RULE_VERSION
+            and taxonomy_version != _V9_TAXONOMY_VERSION
+        ):
+            raise EvaluationError(
+                "evaluation-v9 requires published selling-points-v5.2 taxonomy"
+            )
         point_spec = V8_TAXONOMY_POINT_SPECS.get(taxonomy_version)
         if point_spec is None:
             raise EvaluationError(
-                f"evaluation-v8 has no approved point contract for {taxonomy_version}"
+                f"{rule_version} has no approved point contract for {taxonomy_version}"
             )
         point_ids = set(point_spec)
         codes = {str(row["code"]) for row in point_rows}
@@ -847,7 +914,7 @@ def _load_release_runtime(
             or any(int(row["enabled"]) != 1 for row in point_rows)
         ):
             raise EvaluationError(
-                "evaluation-v8 taxonomy must contain exactly "
+                f"{rule_version} taxonomy must contain exactly "
                 f"{len(point_ids)} enabled approved points for {taxonomy_version}"
             )
         materialized_rules: Dict[str, Mapping[str, Any]] = {}
@@ -1125,11 +1192,23 @@ def _evaluate_content(
     manual_override: Optional[Mapping[str, Any]] = None,
     review_id: Optional[int] = None,
     parent_evaluation_id: Optional[int] = None,
+    expected_active_release_id: str | None = None,
     _release_id: str | None = None,
     _connection: Optional[sqlite3.Connection] = None,
 ) -> EvaluationResult:
     if source not in {"automatic", "manual_review"}:
         raise EvaluationError(f"unsupported evaluation source: {source}")
+    if expected_active_release_id is not None:
+        if source != "automatic":
+            raise EvaluationError(
+                "expected_active_release_id is only valid for automatic evaluation"
+            )
+        if not expected_active_release_id.strip():
+            raise EvaluationError("expected_active_release_id must not be empty")
+        if _release_id is not None:
+            raise EvaluationError(
+                "expected_active_release_id cannot be combined with explicit release"
+            )
     override = dict(manual_override or {})
     unknown_override_fields = set(override) - {
         "decision",
@@ -1172,6 +1251,14 @@ def _evaluate_content(
         release = _resolve_evaluation_release(
             connection, source=source, release_id=_release_id
         )
+        if (
+            expected_active_release_id is not None
+            and str(release["id"]) != expected_active_release_id
+        ):
+            raise EvaluationError(
+                "active evaluation release changed before evaluation write: "
+                f"expected {expected_active_release_id}, got {release['id']}"
+            )
         runtime = _load_release_runtime(connection, release)
         if source == "automatic" and runtime.matcher is None:
             raise EvaluationError(
@@ -1180,6 +1267,7 @@ def _evaluate_content(
             )
         taxonomy = runtime.taxonomy
         taxonomy_version = runtime.taxonomy_version
+        rule_version = str(release["rule_version"])
         parent: sqlite3.Row | None = None
         if source == "manual_review":
             review = connection.execute(
@@ -1202,7 +1290,9 @@ def _evaluate_content(
                 or str(parent["release_id"]) != str(release["id"])
             ):
                 raise EvaluationError("manual review lineage does not match content")
-        artifacts, _, evidence_sha = _current_evidence_state(connection, content_id)
+        artifacts, _, evidence_sha = _current_evidence_state(
+            connection, content_id, rule_version=rule_version
+        )
         if source == "automatic":
             existing = connection.execute(
                 """
@@ -1230,7 +1320,7 @@ def _evaluate_content(
             existing_envelope_id = existing["evidence_envelope_id"]
             if existing_envelope_id is None:
                 raise EvaluationError("existing evaluation has no evidence envelope")
-            if source == "automatic":
+            if source == "automatic" and rule_version != V9_RULE_VERSION:
                 _synchronize_gray_review_queue(
                     connection,
                     content_id=int(existing["content_id"]),
@@ -1256,7 +1346,7 @@ def _evaluate_content(
                 created=False,
             )
         envelope_id, persisted_evidence_sha, artifacts = build_evidence_envelope(
-            connection, content_id
+            connection, content_id, rule_version=rule_version
         )
         if persisted_evidence_sha != evidence_sha:
             raise EvaluationError("evidence changed during evaluation transaction")
@@ -1343,10 +1433,15 @@ def _evaluate_content(
         included = bool(
             primary and selling_score is not None and selling_score >= included_min
         )
-        pending_review = bool(
-            evidence_level in {"V0", "V1"}
-            or (
-                selling_score is not None and review_min <= selling_score < included_min
+        pending_review = (
+            False
+            if source == "automatic" and rule_version == V9_RULE_VERSION
+            else bool(
+                evidence_level in {"V0", "V1"}
+                or (
+                    selling_score is not None
+                    and review_min <= selling_score < included_min
+                )
             )
         )
         direction = (
@@ -1664,7 +1759,7 @@ def _evaluate_content(
                     canonical_json(match),
                 ),
             )
-        if source == "automatic":
+        if source == "automatic" and rule_version != V9_RULE_VERSION:
             _synchronize_gray_review_queue(
                 connection,
                 content_id=content_id,
@@ -1704,6 +1799,7 @@ def evaluate_content(
     manual_override: Optional[Mapping[str, Any]] = None,
     review_id: Optional[int] = None,
     parent_evaluation_id: Optional[int] = None,
+    expected_active_release_id: str | None = None,
 ) -> EvaluationResult:
     return _evaluate_content(
         content_id,
@@ -1712,6 +1808,7 @@ def evaluate_content(
         manual_override=manual_override,
         review_id=review_id,
         parent_evaluation_id=parent_evaluation_id,
+        expected_active_release_id=expected_active_release_id,
     )
 
 
@@ -1746,8 +1843,11 @@ def incremental_candidates(*, db_path: Path = DEFAULT_DB) -> List[int]:
             BACKFILL_SOURCE_GROUPS,
         ).fetchall()
         release = connection.execute(
-            "SELECT id FROM evaluation_releases WHERE status='active'"
+            "SELECT id,rule_version FROM evaluation_releases WHERE status='active'"
         ).fetchone()
+        active_rule_version = (
+            str(release["rule_version"]) if release is not None else RULE_VERSION
+        )
         current_rows = (
             []
             if release is None
@@ -1792,7 +1892,9 @@ def incremental_candidates(*, db_path: Path = DEFAULT_DB) -> List[int]:
         blocked: List[int] = []
         for row in content_rows:
             content_id = int(row["id"])
-            _, _, evidence_sha256 = _current_evidence_state(connection, content_id)
+            _, _, evidence_sha256 = _current_evidence_state(
+                connection, content_id, rule_version=active_rule_version
+            )
             evidence_key = (content_id, evidence_sha256)
             if evidence_key in current_evidence:
                 continue
@@ -1852,6 +1954,7 @@ def reopen_review(
     if not reason.strip() or not reopened_by.strip():
         raise EvaluationError("reopen reason and operator are required")
     with connect(db_path) as connection, transaction(connection):
+        assert_manual_review_writable(connection)
         queue = connection.execute(
             "SELECT * FROM review_queue WHERE id=?", (queue_id,)
         ).fetchone()
@@ -1948,6 +2051,7 @@ def resolve_review(
         }:
             raise EvaluationError("invalid content direction")
     with connect(db_path) as connection, transaction(connection):
+        assert_manual_review_writable(connection)
         queue = connection.execute(
             "SELECT * FROM review_queue WHERE id=?", (queue_id,)
         ).fetchone()

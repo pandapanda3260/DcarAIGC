@@ -587,7 +587,7 @@ def _source_groups_snapshot(
         raise FullLocalAnalysisError("history archive/backfill标签集合漂移")
     counts: dict[str, int] = {value: 0 for value in sorted(ALLOWED_SOURCE_GROUPS)}
     for _, source_group in rows:
-        counts[source_group] += 1
+        counts[str(source_group)] += 1
     return {
         "policy": "preserve_exact",
         "counts": counts,
@@ -3617,6 +3617,7 @@ def _validate_item_chain(
             "after",
         }
         before = intent.get("before")
+        target_rows = before.get("target_rows") if isinstance(before, Mapping) else None
         if isinstance(before, Mapping):
             _validate_exact_sequence_mapping(
                 before.get("sequences"), label=f"item intent {ordinal} before"
@@ -3656,11 +3657,11 @@ def _validate_item_chain(
                 "outputs",
                 "item_counts",
             }
-            or not isinstance(before.get("target_rows"), Mapping)
+            or not isinstance(target_rows, Mapping)
             or before.get("target_rows_sha256")
-            != _json_sha(before.get("target_rows"))
+            != _json_sha(target_rows)
             or before.get("target_sequences")
-            != _target_sequence_projection(before.get("target_rows"))
+            != _target_sequence_projection(target_rows)
             or receipt.get("intent_sha256") != local._sha256_file(intent_path)
             or type(receipt.get("content_id")) is not int
             or receipt.get("content_id") != expected_id
@@ -3910,7 +3911,11 @@ def _validate_review_pending_evaluation(
     evaluation = rows[0]
     try:
         artifacts, components, evidence_sha256 = (
-            evaluation_module._current_evidence_state(connection, content_id)
+            evaluation_module._current_evidence_state(
+                connection,
+                content_id,
+                rule_version=str(release["rule_version"]),
+            )
         )
     except Exception as exc:
         raise FullLocalAnalysisError(
@@ -4583,6 +4588,13 @@ def _validate_insufficient_media_processing(
         "media" if media_kind == "video" else "media_manifest"
     ]
     frames_artifact = artifacts.get("frames_manifest")
+    ocr_source_artifact = (
+        frames_artifact if media_kind == "video" else media_artifact
+    )
+    if ocr_source_artifact is None:
+        raise FullLocalAnalysisError(
+            f"content {content_id} insufficient OCR source artifact缺失"
+        )
     expected_slots: dict[str, tuple[str, str, int]] = {
         "download": (
             (
@@ -4598,13 +4610,7 @@ def _validate_insufficient_media_processing(
             int(media_artifact["id"]),
         ),
         "ocr": (
-            str(
-                (
-                    frames_artifact
-                    if media_kind == "video"
-                    else media_artifact
-                )["sha256"]
-            ),
+            str(ocr_source_artifact["sha256"]),
             str(versions["ocr"]),
             int(artifacts["ocr"]["id"]),
         ),
@@ -4772,7 +4778,11 @@ def _validate_insufficient_evaluation(
         type(release["id"]) is not str
         or not release["id"]
         or type(release["rule_version"]) is not str
-        or release["rule_version"] != evaluation_module.V8_RULE_VERSION
+        or release["rule_version"]
+        not in {
+            evaluation_module.V8_RULE_VERSION,
+            evaluation_module.V9_RULE_VERSION,
+        }
         or type(release["taxonomy_version"]) is not str
         or type(release["matcher_rule_sha256"]) is not str
         or re.fullmatch(r"[0-9a-f]{64}", release["matcher_rule_sha256"])
@@ -4813,7 +4823,11 @@ def _validate_insufficient_evaluation(
     evaluation = rows[0]
     try:
         artifacts, components, evidence_sha256 = (
-            evaluation_module._current_evidence_state(connection, content_id)
+            evaluation_module._current_evidence_state(
+                connection,
+                content_id,
+                rule_version=str(release["rule_version"]),
+            )
         )
     except Exception as exc:
         raise FullLocalAnalysisError(
@@ -4888,6 +4902,9 @@ def _validate_insufficient_evaluation(
     acquisition_score = evaluation_module._acquisition_score(
         None, audience_score, None, action_score
     )
+    expected_pending_review = (
+        release["rule_version"] == evaluation_module.V8_RULE_VERSION
+    )
     expected_payload = {
         "evaluation_status": "insufficient_evidence",
         "evidence_level": expected_level,
@@ -4895,7 +4912,7 @@ def _validate_insufficient_evaluation(
         "primary_selling_point_id": "",
         "selling_point_score": None,
         "selling_point_included": False,
-        "pending_review": True,
+        "pending_review": expected_pending_review,
         "content_direction": expected_direction,
         "content_automotive_score": None,
         "audience_automotive_score": audience_score,
@@ -4959,7 +4976,7 @@ def _validate_insufficient_evaluation(
         or evaluation["evidence_level"] != expected_level
         or evaluation["evidence_sha256"] != evidence_sha256
         or type(evaluation["pending_review"]) is not int
-        or evaluation["pending_review"] != 1
+        or evaluation["pending_review"] != int(expected_pending_review)
         or type(evaluation["selling_point_included"]) is not int
         or evaluation["selling_point_included"] != 0
         or evaluation["primary_selling_point_code"] is not None
@@ -4971,13 +4988,21 @@ def _validate_insufficient_evaluation(
         or payload != expected_payload
         or evaluation["payload_json"]
         != evaluation_module.canonical_json(expected_payload)
-        or payload["pending_review"] is not True
+        or payload["pending_review"] is not expected_pending_review
         or payload["selling_point_included"] is not False
         or envelope["schema_version"] != evaluation_module.EVIDENCE_VERSION
         or envelope["content_id"] != content_id
         or envelope["evidence_sha256"] != evidence_sha256
         or components_body != components
         or any(envelope[column] != components[column] for column in component_columns)
+        or (
+            release["rule_version"] == evaluation_module.V9_RULE_VERSION
+            and (
+                artifacts["manual_rows"]
+                or components["manual_evidence_sha256"] is not None
+                or envelope["manual_evidence_sha256"] is not None
+            )
+        )
         or content["evaluation_content_direction"] != expected_direction
         or evaluation_matches != 0
         or queue_count != 0
@@ -5158,7 +5183,7 @@ def _validate_item_success_strong(
     mini = _item_baseline_contract(intent, source)
     with closing(local._immutable_connection(paths.database)) as connection:
         release = connection.execute(
-            "SELECT id FROM evaluation_releases WHERE status='active'"
+            "SELECT id,rule_version FROM evaluation_releases WHERE status='active'"
         ).fetchone()
         if release is None:
             raise FullLocalAnalysisError("item success缺少active release")
@@ -5195,6 +5220,7 @@ def _validate_item_success_strong(
             connection,
             content_id=content_id,
             release_id=str(release["id"]),
+            rule_version=str(release["rule_version"]),
         )
         local._validate_target_baseline_and_sequences(
             connection,
@@ -6023,6 +6049,17 @@ def _after_deferred_attempt_anchor_commit(_content_id: int) -> None:
     """Test seam after anchor commit and before database finalization."""
 
 
+def _writable_connection(path: Path) -> sqlite3.Connection:
+    connection = sqlite3.connect(path, timeout=30)
+    connection.row_factory = sqlite3.Row
+    try:
+        local.storage_module.configure_connection_safety(connection)
+    except Exception:
+        connection.close()
+        raise
+    return connection
+
+
 def _stamp_live_deferred_attempt_anchor(
     paths: BatchPaths,
     *,
@@ -6068,10 +6105,8 @@ def _stamp_live_deferred_attempt_anchor(
     )
     _remove_owned_empty_deferred_media_directories(directories)
     _before_deferred_attempt_anchor_commit(int(intent["content_id"]))
-    connection = sqlite3.connect(paths.database, timeout=30)
-    connection.row_factory = sqlite3.Row
+    connection = _writable_connection(paths.database)
     try:
-        connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=30000")
         connection.execute("BEGIN IMMEDIATE")
         current_rows = local._target_rows(
@@ -7257,6 +7292,8 @@ def _run_item(
             ledger=ledger,
         )
     else:
+        if failure is None:
+            raise FullLocalAnalysisError("deferred item缺少failure证据")
         validated = _validate_item_deferred_exact(
             paths, intent=intent, source=source, ledger=ledger
         )
@@ -7956,6 +7993,10 @@ def _validate_batch_chain(
             contract=contract,
             expected_sequences=item_receipts[-1]["after"]["sequences"],
         )
+        if not isinstance(after, Mapping):
+            raise FullLocalAnalysisError(
+                f"batch receipt {index} after闭包形状无效"
+            )
         completed_count = int(completed_ordinals[-1])
         expected_outputs = (
             runtime.expected_output_closures_by_count.get(completed_count)
@@ -8022,6 +8063,10 @@ def _validate_batch_chain(
                 runtime.expected_output_closures_by_count[
                     completed_count
                 ] = expected_outputs
+        if expected_outputs is None:
+            raise FullLocalAnalysisError(
+                f"batch receipt {index} output prefix无法重派生"
+            )
         if local._canonical_bytes(after["outputs"]) != local._canonical_bytes(
             expected_outputs
         ):
@@ -9024,6 +9069,8 @@ def _validate_runtime_deferred_history(
             expected_previous_head=previous_head,
             expected_previous_count=previous_count,
         )
+        if not isinstance(evidence, Mapping):
+            raise FullLocalAnalysisError("runtime deferred evidence形状无效")
         if local._canonical_bytes(evidence["batch_delta"]) != local._canonical_bytes(
             expected_delta
         ):
@@ -9199,6 +9246,8 @@ def _validate_review_pending_history(
             expected_previous_head=previous_head,
             expected_previous_count=previous_count,
         )
+        if not isinstance(evidence, Mapping):
+            raise FullLocalAnalysisError("review_pending evidence形状无效")
         if local._canonical_bytes(evidence["batch_delta"]) != (
             local._canonical_bytes(expected_delta)
         ):
@@ -9390,6 +9439,10 @@ def _validate_insufficient_evidence_history(
             expected_previous_head=previous_head,
             expected_previous_count=previous_count,
         )
+        if not isinstance(evidence, Mapping):
+            raise FullLocalAnalysisError(
+                "insufficient_evidence evidence形状无效"
+            )
         if local._canonical_bytes(evidence["batch_delta"]) != (
             local._canonical_bytes(expected_delta)
         ):
@@ -9707,9 +9760,22 @@ def _validate_completion_value(
         insufficient_evidence, sequence=sequence
     )
     _validate_checkpoint_closure_shape(database=database, outputs=outputs)
+    if not isinstance(eligible, Mapping):
+        raise FullLocalAnalysisError("immutable completion eligible形状无效")
+    if not isinstance(runtime_deferred, Mapping):
+        raise FullLocalAnalysisError(
+            "immutable completion runtime_deferred形状无效"
+        )
+    if not isinstance(review_pending, Mapping):
+        raise FullLocalAnalysisError(
+            "immutable completion review_pending形状无效"
+        )
+    if not isinstance(insufficient_evidence, Mapping):
+        raise FullLocalAnalysisError(
+            "immutable completion insufficient_evidence形状无效"
+        )
     eligible_types_valid = (
-        isinstance(eligible, Mapping)
-        and set(eligible)
+        set(eligible)
         == {
             "total",
             "attempted",

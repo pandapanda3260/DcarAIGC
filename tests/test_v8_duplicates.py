@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from PIL import Image, ImageDraw
 
+from v8.contracts import load_contract
 from v8.duplicates import (
     CALIBRATION_PATH,
     FINGERPRINT_VERSION,
@@ -41,15 +42,21 @@ class V8DuplicateDetectionTest(unittest.TestCase):
         self.temp.cleanup()
 
     def test_duplicate_metric_decision_table(self) -> None:
+        threshold = float(
+            load_contract()["required_coverage_thresholds"][
+                "duplicate_fingerprint_coverage"
+            ]
+        )
+        self.assertEqual(threshold, 90.0)
         cases = (
             (
                 "empty scope",
-                (0, 0, False, 95),
+                (0, 0, False, threshold),
                 ("not_applicable", None, "统计范围内没有内容"),
             ),
             (
                 "uncalibrated even with complete fingerprints",
-                (100, 100, False, 95),
+                (100, 100, False, threshold),
                 (
                     "not_calculable",
                     100.0,
@@ -58,17 +65,17 @@ class V8DuplicateDetectionTest(unittest.TestCase):
             ),
             (
                 "calibrated below threshold",
-                (100, 94, True, 95),
+                (100, 89, True, threshold),
                 (
                     "below_threshold",
-                    94.0,
-                    "感知指纹覆盖率为 94.00%，低于 95% 发布阈值",
+                    89.0,
+                    "感知指纹覆盖率为 89.00%，低于 90% 发布阈值",
                 ),
             ),
             (
                 "calibrated at threshold",
-                (100, 95, True, 95),
-                ("available", 95.0, ""),
+                (100, 90, True, threshold),
+                ("available", 90.0, ""),
             ),
             (
                 "custom threshold",
@@ -83,7 +90,12 @@ class V8DuplicateDetectionTest(unittest.TestCase):
 
         for name, arguments, expected in cases:
             with self.subTest(name=name):
-                self.assertEqual(duplicate_metric_decision(*arguments), expected)
+                self.assertEqual(
+                    duplicate_metric_decision(
+                        *arguments[:3], threshold=arguments[3]
+                    ),
+                    expected,
+                )
 
     def _content(self, link_id: str, *, published_at: str | None = None) -> int:
         captured_at = now_utc()

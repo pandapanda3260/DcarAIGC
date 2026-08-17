@@ -230,6 +230,84 @@ class V8EvaluationTest(unittest.TestCase):
         self.assertEqual(evaluation["taxonomy_version"], "selling-points-v5.1")
         self.assertEqual(matches[0]["selling_point_code"], "C1")
 
+    def test_expected_active_release_fails_before_any_write_after_switch(self) -> None:
+        expected_release_id = "evaluation-v8__selling-points-v5.1"
+        switched_release_id = "evaluation-v8__selling-points-v5.2"
+        switched_at = "2026-08-03T00:00:00Z"
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                UPDATE evaluation_releases
+                SET status='retired',retired_at=?,updated_at=?
+                WHERE id=?
+                """,
+                (switched_at, switched_at, expected_release_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO taxonomy_versions(
+                    id,version,status,definition,created_at,published_at
+                ) VALUES ('taxonomy-v5.2','selling-points-v5.2','published',
+                          'release-switch-test',?,?)
+                """,
+                (switched_at, switched_at),
+            )
+            connection.execute(
+                """
+                INSERT INTO evaluation_releases(
+                    id,rule_version,taxonomy_version,matcher_rule_sha256,status,
+                    created_at,updated_at,activated_at
+                ) VALUES (?,'evaluation-v8','selling-points-v5.2',?,'active',?,?,?)
+                """,
+                (switched_release_id, "b" * 64, switched_at, switched_at, switched_at),
+            )
+            before = {
+                table: int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                for table in (
+                    "evidence_envelopes",
+                    "evaluation_versions",
+                    "evaluation_matches",
+                    "review_queue",
+                )
+            }
+            connection.commit()
+
+        with self.assertRaisesRegex(
+            EvaluationError,
+            "active evaluation release changed before evaluation write",
+        ):
+            evaluate_content(
+                1,
+                db_path=self.db,
+                expected_active_release_id=expected_release_id,
+            )
+
+        with connect(self.db) as connection:
+            after = {
+                table: int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                for table in before
+            }
+            switched_evaluations = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM evaluation_versions WHERE release_id=?",
+                    (switched_release_id,),
+                ).fetchone()[0]
+            )
+        self.assertEqual(after, before)
+        self.assertEqual(switched_evaluations, 0)
+
+    def test_expected_active_release_is_rejected_for_manual_evaluation(self) -> None:
+        with self.assertRaisesRegex(
+            EvaluationError,
+            "only valid for automatic evaluation",
+        ):
+            evaluate_content(
+                1,
+                db_path=self.db,
+                source="manual_review",
+                expected_active_release_id="evaluation-v8__selling-points-v5.1",
+            )
+
     def test_automatic_gray_evaluation_materializes_one_idempotent_queue(self) -> None:
         gray_match = {
             "id": "C1",

@@ -29,9 +29,34 @@ CREATE TABLE selling_points(
     boundary_rules_json TEXT NOT NULL DEFAULT '[]', enabled INTEGER NOT NULL DEFAULT 1,
     UNIQUE(taxonomy_id,code)
 );
-CREATE TABLE content_items(id INTEGER PRIMARY KEY AUTOINCREMENT);
+CREATE TABLE content_items(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    link_id TEXT NOT NULL DEFAULT 'LEGACY'
+);
+CREATE TABLE content_identities(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
+    platform_identity_key TEXT NOT NULL,
+    is_primary INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE fetch_slots(id INTEGER PRIMARY KEY AUTOINCREMENT);
 CREATE TABLE provider_raw_responses(id INTEGER PRIMARY KEY AUTOINCREMENT);
+CREATE TABLE content_metric_snapshots(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
+    captured_at TEXT NOT NULL,
+    window_key TEXT NOT NULL,
+    view_count INTEGER,
+    comment_count INTEGER,
+    like_count INTEGER,
+    share_count INTEGER,
+    collect_count INTEGER,
+    status TEXT NOT NULL,
+    source TEXT NOT NULL,
+    raw_response_id INTEGER REFERENCES provider_raw_responses(id),
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    UNIQUE(content_id,window_key,source)
+);
 CREATE TABLE comment_evidence_versions(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
@@ -134,6 +159,16 @@ CREATE TABLE report_files(
     created_at TEXT NOT NULL,
     FOREIGN KEY(task_id,revision) REFERENCES report_revisions(task_id,revision) ON DELETE CASCADE,
     UNIQUE(task_id,revision,file_kind)
+);
+CREATE TABLE scheduler_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    scheduled_for TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('running','succeeded','failed','skipped')),
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    UNIQUE(job_id, scheduled_for)
 );
 """
 

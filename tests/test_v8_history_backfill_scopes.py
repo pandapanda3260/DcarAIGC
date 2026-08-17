@@ -13,6 +13,7 @@ import v8.capture as capture_module
 from v8.capture import ProviderResult
 from v8.evaluation import evaluate_content, incremental_candidates
 from v8.matcher_dsl import POINT_IDS, POINT_SCENES
+from v8.media_state import MediaTerminalDetail
 from v8.operations import upsert_account, upsert_content
 from v8.range_backfill import (
     RangeBackfillError,
@@ -217,7 +218,7 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
         )
 
     def test_media_cutoff_ignores_history_scoped_ingest(self) -> None:
-        fresh = self._insert_content("777777777", "2026-08-01T10:00:00Z")
+        _fresh = self._insert_content("777777777", "2026-08-01T10:00:00Z")
         archived = self._insert_content("888888888", "2020-05-01T01:00:00Z")
         backfilled = self._insert_content("999999999", "2026-07-01T01:00:00Z")
         with connect(self.db) as connection:
@@ -237,6 +238,7 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
             datetime(2026, 8, 2, 7, 30, tzinfo=SHANGHAI), db_path=self.db
         )
         self.assertEqual(result["candidates"], 1)
+        self.assertEqual(result["state_counts"]["pending"], 1)
         with connect(self.db) as connection:
             queue = connection.execute(
                 """
@@ -244,7 +246,7 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
                 WHERE reason_code='media_processing_incomplete'
                 """
             ).fetchall()
-        self.assertEqual([int(row["content_id"]) for row in queue], [fresh])
+        self.assertEqual(queue, [])
 
     def test_discovery_backfill_tags_scopes_with_workers_and_compact(self) -> None:
         preexisting_unevaluated = self._insert_content(
@@ -365,7 +367,14 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
         ) as evaluate, patch(
             "v8.range_backfill.fingerprint_content",
             return_value={"source_sha256": "fingerprint"},
-        ) as fingerprint:
+        ) as fingerprint, patch(
+            "v8.range_backfill.media_terminal_state_details",
+            side_effect=[
+                {pending: MediaTerminalDetail("pending", "evaluation_pending")},
+                {pending: MediaTerminalDetail("complete", "complete")},
+                {pending: MediaTerminalDetail("complete", "complete")},
+            ],
+        ) as terminal_states:
             result = run_local_evidence_backfill(
                 start=self.start, end=self.end, task_id="local-evidence-test",
                 max_amount=1.0, db_path=self.db, limit=10, state_root=self.state,
@@ -377,6 +386,8 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
         self.assertEqual(self._source_group(archived), HISTORY_ARCHIVE_SOURCE_GROUP)
         self.assertEqual(evaluate.call_count, 1)
         self.assertEqual(fingerprint.call_count, 1)
+        self.assertEqual(terminal_states.call_count, 3)
+        self.assertEqual(result["results"][0]["status"], "complete")
         with patch(
             "v8.range_backfill.process_content_media",
             return_value={"status": "evidence_ready"},
@@ -391,7 +402,7 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
             )
         self.assertEqual(again["candidates"], 0)
 
-    def test_local_evidence_keeps_tag_when_evidence_is_below_v2(self) -> None:
+    def test_local_evidence_terminal_insufficient_clears_tag_idempotently(self) -> None:
         pending = self._insert_content("212121213", "2026-08-01T01:00:00Z")
         with connect(self.db) as connection:
             connection.execute(
@@ -408,7 +419,24 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
             return_value=SimpleNamespace(
                 evaluation_id=102, created=True, evidence_level="V1"
             ),
-        ), patch("v8.range_backfill.fingerprint_content") as fingerprint:
+        ), patch(
+            "v8.range_backfill.media_terminal_state_details",
+            side_effect=[
+                {pending: MediaTerminalDetail("pending", "evaluation_pending")},
+                {
+                    pending: MediaTerminalDetail(
+                        "terminal_insufficient", "terminal_insufficient"
+                    )
+                },
+                {
+                    pending: MediaTerminalDetail(
+                        "terminal_insufficient", "terminal_insufficient"
+                    )
+                },
+            ],
+        ) as terminal_states, patch(
+            "v8.range_backfill.fingerprint_content"
+        ) as fingerprint:
             result = run_local_evidence_backfill(
                 start=self.start,
                 end=self.end,
@@ -420,12 +448,112 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
                 tagged_only=True,
             )
 
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["failed"], 0)
+        self.assertEqual(result["tags_cleared"], 1)
+        self.assertEqual(self._source_group(pending), "")
+        self.assertEqual(result["results"][0]["status"], "terminal_insufficient")
+        self.assertEqual(result["results"][0]["evaluation_evidence_level"], "V1")
+        self.assertEqual(terminal_states.call_count, 3)
+        fingerprint.assert_not_called()
+        again = run_local_evidence_backfill(
+            start=self.start,
+            end=self.end,
+            task_id="local-evidence-v1",
+            max_amount=1.0,
+            db_path=self.db,
+            limit=10,
+            state_root=self.state,
+            tagged_only=True,
+        )
+        self.assertEqual(again["candidates"], 0)
+        self.assertEqual(again["tags_cleared"], 0)
+
+    def test_stable_terminal_insufficient_resumes_without_reprocessing(self) -> None:
+        pending = self._insert_content("212121215", "2026-08-01T01:00:00Z")
+        with connect(self.db) as connection:
+            connection.execute(
+                "UPDATE content_items SET source_group=? WHERE id=?",
+                (HISTORY_BACKFILL_SOURCE_GROUP, pending),
+            )
+            connection.commit()
+        stable = {
+            pending: MediaTerminalDetail(
+                "terminal_insufficient", "terminal_insufficient"
+            )
+        }
+        with patch(
+            "v8.range_backfill.media_terminal_state_details",
+            side_effect=[stable, stable],
+        ) as terminal_states, patch(
+            "v8.range_backfill.process_content_media"
+        ) as process, patch(
+            "v8.range_backfill.evaluate_content"
+        ) as evaluate, patch(
+            "v8.range_backfill.fingerprint_content"
+        ) as fingerprint:
+            result = run_local_evidence_backfill(
+                start=self.start,
+                end=self.end,
+                task_id="local-evidence-resume-terminal-insufficient",
+                max_amount=1.0,
+                db_path=self.db,
+                limit=10,
+                state_root=self.state,
+                tagged_only=True,
+            )
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["tags_cleared"], 1)
+        self.assertEqual(self._source_group(pending), "")
+        self.assertTrue(result["results"][0]["resumed_from_terminal_state"])
+        self.assertEqual(terminal_states.call_count, 2)
+        process.assert_not_called()
+        evaluate.assert_not_called()
+        fingerprint.assert_not_called()
+
+    def test_terminal_state_drift_before_tag_release_fails_closed(self) -> None:
+        pending = self._insert_content("212121216", "2026-08-01T01:00:00Z")
+        with connect(self.db) as connection:
+            connection.execute(
+                "UPDATE content_items SET source_group=? WHERE id=?",
+                (HISTORY_BACKFILL_SOURCE_GROUP, pending),
+            )
+            connection.commit()
+        with patch(
+            "v8.range_backfill.media_terminal_state_details",
+            side_effect=[
+                {
+                    pending: MediaTerminalDetail(
+                        "terminal_insufficient", "terminal_insufficient"
+                    )
+                },
+                {pending: MediaTerminalDetail("pending", "source_missing")},
+            ],
+        ), patch("v8.range_backfill.process_content_media") as process, patch(
+            "v8.range_backfill.evaluate_content"
+        ) as evaluate, patch(
+            "v8.range_backfill.fingerprint_content"
+        ) as fingerprint:
+            result = run_local_evidence_backfill(
+                start=self.start,
+                end=self.end,
+                task_id="local-evidence-terminal-drift",
+                max_amount=1.0,
+                db_path=self.db,
+                limit=10,
+                state_root=self.state,
+                tagged_only=True,
+            )
+
         self.assertEqual(result["status"], "partial")
         self.assertEqual(result["failed"], 1)
         self.assertEqual(result["tags_cleared"], 0)
         self.assertEqual(self._source_group(pending), HISTORY_BACKFILL_SOURCE_GROUP)
+        self.assertIn("发生漂移", result["results"][0]["error"])
+        process.assert_not_called()
+        evaluate.assert_not_called()
         fingerprint.assert_not_called()
-        self.assertIn("V1", result["results"][0]["error"])
 
     def test_local_evidence_keeps_tag_when_media_source_is_missing(self) -> None:
         pending = self._insert_content("212121212", "2026-08-01T01:00:00Z")
@@ -457,6 +585,112 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
                 (pending,),
             ).fetchone()[0]
         self.assertEqual(int(evaluated), 0)
+
+    def test_local_evidence_terminal_failed_keeps_tag_for_explicit_refresh(self) -> None:
+        pending = self._insert_content("212121214", "2026-08-01T01:00:00Z")
+        with connect(self.db) as connection:
+            connection.execute(
+                "UPDATE content_items SET source_group=? WHERE id=?",
+                (HISTORY_BACKFILL_SOURCE_GROUP, pending),
+            )
+            connection.commit()
+
+        with patch(
+            "v8.range_backfill.process_content_media",
+            return_value={"status": "evidence_ready"},
+        ) as process, patch(
+            "v8.range_backfill.evaluate_content",
+            return_value=SimpleNamespace(
+                evaluation_id=103, created=True, evidence_level="V1"
+            ),
+        ) as evaluate, patch(
+            "v8.range_backfill.media_terminal_state_details",
+            return_value={
+                pending: MediaTerminalDetail(
+                    "terminal_failed", "frames_terminal_failed"
+                )
+            },
+        ) as terminal_states, patch(
+            "v8.range_backfill.fingerprint_content"
+        ) as fingerprint:
+            result = run_local_evidence_backfill(
+                start=self.start,
+                end=self.end,
+                task_id="local-evidence-terminal-failed",
+                max_amount=1.0,
+                db_path=self.db,
+                limit=10,
+                state_root=self.state,
+                tagged_only=True,
+            )
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["failed"], 1)
+        self.assertEqual(result["tags_cleared"], 0)
+        self.assertEqual(self._source_group(pending), HISTORY_BACKFILL_SOURCE_GROUP)
+        self.assertEqual(result["results"][0]["status"], "terminal_failed")
+        self.assertEqual(
+            result["results"][0]["media_terminal_reason"],
+            "frames_terminal_failed",
+        )
+        self.assertEqual(terminal_states.call_count, 1)
+        process.assert_not_called()
+        evaluate.assert_not_called()
+        fingerprint.assert_not_called()
+
+    def test_local_evidence_release_switch_after_evaluation_keeps_tag(self) -> None:
+        pending = self._insert_content("212121217", "2026-08-01T01:00:00Z")
+        with connect(self.db) as connection:
+            connection.execute(
+                "UPDATE content_items SET source_group=? WHERE id=?",
+                (HISTORY_BACKFILL_SOURCE_GROUP, pending),
+            )
+            connection.commit()
+
+        def switch_release(*_args, **_kwargs):
+            with connect(self.db) as connection:
+                connection.execute(
+                    """
+                    UPDATE evaluation_releases
+                    SET status='retired',retired_at=?,updated_at=?
+                    WHERE status='active'
+                    """,
+                    (now_utc(), now_utc()),
+                )
+                connection.commit()
+            return SimpleNamespace(
+                evaluation_id=104,
+                created=True,
+                evidence_level="V2",
+            )
+
+        with patch(
+            "v8.range_backfill.media_terminal_state_details",
+            return_value={pending: MediaTerminalDetail("pending", "evaluation_pending")},
+        ) as terminal_states, patch(
+            "v8.range_backfill.process_content_media",
+            return_value={"status": "evidence_ready"},
+        ), patch(
+            "v8.range_backfill.evaluate_content", side_effect=switch_release
+        ), patch("v8.range_backfill.fingerprint_content") as fingerprint:
+            result = run_local_evidence_backfill(
+                start=self.start,
+                end=self.end,
+                task_id="local-evidence-release-switch",
+                max_amount=1.0,
+                db_path=self.db,
+                limit=10,
+                state_root=self.state,
+                tagged_only=True,
+            )
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["failed"], 1)
+        self.assertEqual(result["tags_cleared"], 0)
+        self.assertEqual(self._source_group(pending), HISTORY_BACKFILL_SOURCE_GROUP)
+        self.assertIn("active evaluation release", result["results"][0]["error"])
+        self.assertEqual(terminal_states.call_count, 1)
+        fingerprint.assert_not_called()
 
     def test_discovery_page_limit_and_missing_cursor_are_partial(self) -> None:
         def page_limit_call(operation, identity):
