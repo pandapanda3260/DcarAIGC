@@ -1,8 +1,19 @@
 # CODEX 交接说明：每日抓取恢复 + v16 安全上线
 
 > 更新时间：2026-08-18
-> 项目根：`/Users/mark/Documents/DcarAIGC`
-> 性质：当前工作树扫描后的集成交接，不是已上线回执
+> 当前项目根：`/Users/mark/Projects/DcarAIGC`
+> 性质：代码集成 + 离线 v16 切换交接；D 日激活与自然 02:00 验收尚未到时
+
+## 2026-08-18 执行回执摘要
+
+- 本地分支 `codex/daily-capture-recovery-v6`，checkpoint commit 为 `9fad164c314098c9941c72471db00b5f6763df6e`，未 push。
+- 唯一可写项目根已同卷原子移到 `/Users/mark/Projects/DcarAIGC`；旧 `~/Documents/DcarAIGC` 路径不再存在，`.venv` 已按 `uv.lock` 重建。
+- 正式库已通过 receipt-driven 原子安装切到 schema v16 / `remove-manual-review`，SHA-256 为 `9f6df4f1b2603b6cf17393d8ce23cd88e3b7b2f2f840b659bd9124e0da823fec`；`quick_check` / `integrity_check` / FK 均通过。
+- 原 v15 DB/WAL/SHM 保留在 `app/data/backups/v15-before-v16-20260818-1900/`；项目外已验证 v15 备份、backup receipt、r2 migration receipt 和 install receipt 位于 `~/Library/Application Support/DcarAIGC/migrations/v15-v16-20260818-9fad164/`。
+- 首份 candidate 因人工核对使 SHM mtime 变化而被 installer 正确拒绝；它作为失败审计保留。第二份 candidate 在回执生成后立即原子安装成功。
+- `provider_usage` 仍为 20,712 行 / USD 28.492，历史 `daily_capture` 仍只有 6 个槽；移根、备份、迁移和渲染全程零供应商增量。
+- D=`2026-08-21` 的 writer plist 已渲染到 `~/Library/LaunchAgents/cn.tj.dcar.writer-worker.plist`，仍 `Disabled=true`、未加载；publisher 仍 disabled/unloaded 且未重装。operator freeze 仍保留，不得提前解除。
+- 剩余时间门只有：D 日 00:09 最后复核与解冻、00:10 enable + bootstrap、自然 02:00 质量验收，以及后续白名单日期的有界内容恢复。
 
 ## 0. 先读结论
 
