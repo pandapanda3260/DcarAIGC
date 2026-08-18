@@ -4,8 +4,9 @@
 
 ## 当前正式基线
 
-- 数据库：`app/data/dcar_insight.sqlite3`（SQLite schema v13）
-- 报告合同：`config/report_contract_v8_6.json`
+- 代码 schema：SQLite v16 / `remove-manual-review`
+- 正式数据库：`app/data/dcar_insight.sqlite3`；若仍为 v15 / `spu-llm-assist`，只能按运行手册的离线 candidate 流程升级，API 运行时不会自动迁移正式库
+- 报告合同：`config/report_contract_v8_7.json`
 - 评估发布：`evaluation-v9__selling-points-v5.2`，taxonomy 为 `selling-points-v5.2`
 - Web：概览、任务列表、任务详情、账号、内容、卖点六类真实路由
 - 历史：v7 报告及 5 个 revision 只读保留，不再作为 v8 当前状态
@@ -39,6 +40,8 @@ npm --prefix app/web ci
 scripts/start_web_mvp.sh
 ```
 
-首次启动会在终端创建本地登录账号。打开 `http://127.0.0.1:4173` 后先登录；浏览器 API 也走同一个认证入口。内部端口为 Web 4174、API 8765，不应直接作为日常入口。调度器和启动补跑都默认关闭，避免一次普通启动意外产生供应商费用。确认成本后，可用 `DCAR_SCHEDULER_ENABLED=1 scripts/start_web_mvp.sh` 开启后续日调度；启动补跑仍需另外显式设置 `DCAR_STARTUP_CATCHUP_ENABLED=1`。
+首次启动会在终端创建本地登录账号。打开 `http://127.0.0.1:4173` 后先登录；浏览器 API 也走同一个认证入口。内部端口为 Web 4174、API 8765，不应直接作为日常入口。
+
+8765 固定是无调度 UI/API：`scripts/start_web_mvp.sh` 对非零 `DCAR_SCHEDULER_ENABLED`、非零 `DCAR_STARTUP_CATCHUP_ENABLED` 或非空 `DCAR_DAILY_CAPTURE_RECONCILE_FROM` 直接拒绝启动。每日调度只能由 macOS 指定 writer 在 `127.0.0.1:8766` 运行，不得用 8765 临时打开第二个 scheduler。operator freeze lock 存在时，正式 API 也会失败式停止。
 
 完整验证和备份流程见 `docs/v8/运行与备份手册.md`。

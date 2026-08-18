@@ -912,7 +912,6 @@ class LocalAnalysisCanaryControllerTest(unittest.TestCase):
         content_id: int,
         *,
         db_path: Path,
-        pending_review: int = 0,
     ):
         self.calls["evaluation"] += 1
         captured_at = now_utc()
@@ -932,16 +931,11 @@ class LocalAnalysisCanaryControllerTest(unittest.TestCase):
             ).fetchone()
             asr = evaluation._read_json(artifacts["asr_path"])
             ocr = evaluation._read_json(artifacts["ocr_path"])
-            manual_rows = artifacts["manual_rows"]
-            manual_text = "\n".join(
-                str(row.get("text_value") or "") for row in manual_rows
-            )
             body_text = "\n".join(
                 value
                 for value in (
                     str(content["title"] or ""),
                     str(content["body"] or ""),
-                    manual_text,
                 )
                 if value
             )
@@ -951,7 +945,6 @@ class LocalAnalysisCanaryControllerTest(unittest.TestCase):
                 media_path=artifacts["media_path"],
                 asr=asr,
                 ocr=ocr,
-                manual_rows=manual_rows,
             )
             payload = {
                 "evaluation_status": "evaluated",
@@ -960,7 +953,6 @@ class LocalAnalysisCanaryControllerTest(unittest.TestCase):
                 "primary_selling_point_id": "",
                 "selling_point_score": None,
                 "selling_point_included": False,
-                "pending_review": bool(pending_review),
                 "content_direction": "media",
                 "content_automotive_score": None,
                 "audience_automotive_score": None,
@@ -1019,10 +1011,10 @@ class LocalAnalysisCanaryControllerTest(unittest.TestCase):
                         content_id,evidence_envelope_id,release_id,rule_version,
                         taxonomy_version,matcher_rule_sha256,evidence_sha256,
                         evaluation_source,evaluation_status,evidence_level,
-                        content_direction,selling_point_included,pending_review,
+                        content_direction,selling_point_included,
                         payload_json,evaluated_at
                     ) VALUES (?,?,?,?,?,?,?,'automatic',
-                              'evaluated',?,'media',0,?,?,?)
+                              'evaluated',?,'media',0,?,?)
                     """,
                     (
                         content_id,
@@ -1033,7 +1025,6 @@ class LocalAnalysisCanaryControllerTest(unittest.TestCase):
                         release["matcher_rule_sha256"],
                         evidence_sha,
                         evidence_level,
-                        pending_review,
                         json.dumps(
                             payload,
                             ensure_ascii=False,
@@ -4311,16 +4302,6 @@ os._exit(0)
         with self.assertRaisesRegex(canary.LocalAnalysisCanaryError, "保护表"):
             self._run(media_side_effect=budget)
 
-    def test_pending_review_cannot_be_signed_as_report_ready(self) -> None:
-        with self.assertRaisesRegex(
-            canary.LocalAnalysisCanaryError, "formal eligible"
-        ):
-            self._run(
-                evaluation_side_effect=lambda content_id, db_path: self._fake_evaluation(
-                    content_id, db_path=db_path, pending_review=1
-                )
-            )
-
     def test_evidence_level_and_summary_are_recomputed_from_current_artifacts(self) -> None:
         def forge_level(content_id: int, *, db_path: Path):
             result = self._fake_fingerprint(content_id, db_path=db_path)
@@ -4757,6 +4738,34 @@ os._exit(0)
                     run_root=self.analysis_root / "other-run",
                 )
         self.assertEqual(self.calls, calls)
+
+    def test_existing_formal_database_alias_is_rejected_by_file_identity(self) -> None:
+        formal = self.root / "formal.sqlite3"
+        alias = self.root / "apfs-firmlink-spelling.sqlite3"
+        formal.write_bytes(b"formal-sentinel")
+        alias.hardlink_to(formal)
+        paths = canary._paths(
+            source_db_path=self.source_db,
+            source_completion_path=self.source_completion,
+            db_path=alias,
+            media_root=self.media_root,
+            run_root=self.run_root,
+        )
+
+        def allow_identity_alias(path: Path, *, label: str):
+            del label
+            return path.lstat()
+
+        with (
+            patch.object(canary.storage_module, "DEFAULT_DB", formal),
+            patch.object(
+                canary,
+                "_private_file",
+                side_effect=allow_identity_alias,
+            ),
+            self.assertRaisesRegex(canary.LocalAnalysisCanaryError, "正式数据库"),
+        ):
+            canary._validate_paths(paths, work_database_must_exist=True)
 
     def test_cli_defaults_to_plan_and_requires_explicit_apply(self) -> None:
         help_text = canary._parser().format_help()

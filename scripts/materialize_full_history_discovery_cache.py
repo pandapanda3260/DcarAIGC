@@ -27,7 +27,7 @@ from unittest.mock import patch
 
 from v8 import providers
 from v8.media import is_supported_media_url
-from v8.storage import PROJECT_ROOT
+from v8.storage import PROJECT_ROOT, is_formal_database_path
 
 
 FORMAL_DB = PROJECT_ROOT / "app/data/dcar_insight.sqlite3"
@@ -636,14 +636,8 @@ def _derived_only_provider_calls(derived_raw_root: Path) -> Iterator[None]:
 def _assert_disposable_database(db_path: Path) -> None:
     resolved = db_path.resolve()
     _require_private_regular_file(resolved, label="数据库副本")
-    formal = FORMAL_DB.resolve()
-    if resolved == formal:
+    if is_formal_database_path(resolved, formal_database=FORMAL_DB):
         raise CacheReplayError("缓存重放 apply 禁止直接写正式数据库")
-    try:
-        if formal.exists() and os.path.samefile(resolved, formal):
-            raise CacheReplayError("数据库副本是正式数据库的硬链接")
-    except FileNotFoundError:
-        pass
 
 
 def _assert_isolated_output_roots(
@@ -847,14 +841,8 @@ def _validate_output_path(path: Path | None, *, db_path: Path) -> None:
     database = db_path.resolve()
     if resolved == database or resolved.parent != database.parent:
         raise CacheReplayError("输出 JSON 必须与隔离数据库副本位于同一目录")
-    formal = FORMAL_DB.resolve()
-    if resolved == formal:
+    if is_formal_database_path(lexical, formal_database=FORMAL_DB):
         raise CacheReplayError("输出 JSON 禁止覆盖正式数据库")
-    try:
-        if lexical.exists() and formal.exists() and os.path.samefile(lexical, formal):
-            raise CacheReplayError("输出 JSON 禁止覆盖正式数据库硬链接")
-    except FileNotFoundError:
-        pass
 
 
 def main(argv: Sequence[str] | None = None) -> int:

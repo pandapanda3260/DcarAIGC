@@ -422,14 +422,13 @@ class JudgementCacheTest(unittest.TestCase):
 
 
 class SchemaAndConfigTest(unittest.TestCase):
-    def test_fresh_schema_is_v15_with_llm_tables(self):
+    def test_fresh_schema_is_current_with_llm_tables(self):
         connection = _fresh_connection()
         try:
-            self.assertEqual(SCHEMA_VERSION, 15)
             version = int(
                 connection.execute("PRAGMA user_version").fetchone()[0]
             )
-            self.assertEqual(version, 15)
+            self.assertEqual(version, SCHEMA_VERSION)
             tables = {
                 str(row[0]) for row in connection.execute(
                     "SELECT name FROM sqlite_master WHERE type='table'"

@@ -271,6 +271,19 @@ test("selling point statistics default to last week", async () => {
   assert.match(source, /useState<WindowKey>\("last_week"\)/);
 });
 
+test("data freshness types accept every scheduler run status returned by the API", async () => {
+  const types = await readFile(new URL("../app/lib/types.ts", import.meta.url), "utf8");
+  const freshnessStart = types.indexOf("export type DataFreshness");
+  const freshness = types.slice(
+    freshnessStart,
+    types.indexOf("export type Overview =", freshnessStart),
+  );
+  assert.match(
+    freshness,
+    /status: "running" \| "succeeded" \| "failed" \| "partial" \| "interrupted" \| "skipped";/,
+  );
+});
+
 test("selling point standards use E/X/M scenes, scene-local hits, and matcher-only editing", async () => {
   const [source, types, shell, styles, heroArtwork] = await Promise.all([
     readFile(new URL("../app/selling-points/SellingPointsPage.tsx", import.meta.url), "utf8"),
@@ -425,8 +438,6 @@ test("spu audience page keeps rule assets, association and 3D stats together", a
   // 车型库带"经人群推导"的核心场景列，回应"车型库看不到场景"的反馈
   assert.match(page, /<th>核心场景（经人群推导）<\/th>/);
   assert.match(page, /coreScenesByAudience/);
-  // 刷新摘要是一句可读的话，并兼容新旧运行记录口径
-  assert.match(page, /run\.summary\?\.eligible \?\? Math\.max\(0, run\.contents_total - run\.insufficient_evidence\)/);
   // 页面读写走 v8 API，统计为 GET（只读副本可用），关联为 POST（副本被写保护拦截）
   assert.match(page, /\/api\/v8\/spu-audience\/assets/);
   assert.match(page, /\/api\/v8\/spu-audience\/stats\?\$\{search\.toString\(\)\}/);
@@ -481,7 +492,10 @@ test("spu audience page keeps rule assets, association and 3D stats together", a
   assert.doesNotMatch(styles, /\.content-table \.selling-point-name \{[^}]*text-overflow/);
   assert.doesNotMatch(contents, /<span className="cell-subline">\{item\.evidence_level/);
   assert.match(contents, /spu_series: filters\.spuSeries \|\| null, audience: filters\.audience \|\| null, scene: filters\.scene \|\| null/);
-  assert.match(contents, /灰区待复核/);
+  assert.match(contents, /灰区/);
+  // v16 起系统无人工复核：内容页不再有复核状态筛选、待复核/再次复核入口
+  assert.doesNotMatch(contents, /复核/);
+  assert.doesNotMatch(contents, /review_status|review_queue_id|pending_review_count/);
   assert.match(contents, /未细化/);
   assert.match(contents, /content-scene-cell/);
   assert.match(contents, /\/api\/v8\/spu-audience\/assets/);
@@ -493,7 +507,8 @@ test("spu audience page keeps rule assets, association and 3D stats together", a
   assert.match(styles, /\.content-table \{ min-width: 2126px !important; \}/);
   assert.match(styles, /\.main-area\[data-section="spu-audience"\]/);
   // 后端：v15 关联域（v14 + LLM 辅助）+ 端点 + 内容检索标签
-  assert.match(storageSource, /SCHEMA_VERSION = 15/);
+  assert.match(storageSource, /SCHEMA_VERSION = 16/);
+  assert.match(storageSource, /CURRENT_SCHEMA_MIGRATION_NAME = "remove-manual-review"/);
   assert.match(storageSource, /spu-audience-scene-domain/);
   assert.match(storageSource, /spu-llm-assist/);
   assert.match(storageSource, /CREATE TABLE IF NOT EXISTS spu_catalog/);
@@ -519,7 +534,7 @@ test("spu audience page keeps rule assets, association and 3D stats together", a
   assert.match(apiSource, /start_association_run\(db_path=config\.db_path\)/);
   assert.match(apiSource, /_run_spu_association_job, config\.db_path, run_id, since, scope_window/);
   assert.match(apiSource, /recover_orphan_association_runs\(/);
-  assert.match(page, /数据刷新已在后台启动/);
+  assert.doesNotMatch(page, /数据刷新已在后台启动|数据刷新完成|runParticipatedCount|runLlmFilledCount|const \[message, setMessage\]/);
   assert.match(page, /window\.setInterval/);
   assert.match(page, /证据完整（V2\/V3）/);
   // 车型库渠道占比的数据源：build_stats 返回分平台桶与发布门槛
@@ -530,12 +545,10 @@ test("spu audience page keeps rule assets, association and 3D stats together", a
   // 增量模式与单条补算是系统能力：页面打开/保存规则/内容更新数据都会自动触发
   assert.match(spuModule, /def resolve_incremental_since/);
   assert.match(spuModule, /def associate_single_content/);
-  // LLM 双轨（B 链，无人工复核版）：规则链后补空，降级不阻塞，摘要句披露补充数
+  // LLM 双轨（B 链，无人工复核版）：规则链后补空，降级不阻塞
   assert.match(spuModule, /llm_hook/);
   assert.match(spuModule, /def default_llm_hook/);
   assert.match(apiSource, /llm_hook=default_spu_llm_hook\(\)/);
-  assert.match(page, /大模型补充/);
-  assert.match(page, /runLlmFilledCount/);
   assert.match(formatSource, /llm: "大模型补充"/);
   // 「刷新数据」弹窗四选一：先选范围再确认，范围按发布时间、与统计窗口同口径（_window_bounds 同源）
   for (const label of ["昨天", "本周", "上周", "全部内容"]) assert.match(page, new RegExp(`label: "${label}"`));
@@ -555,7 +568,7 @@ test("spu audience page keeps rule assets, association and 3D stats together", a
   assert.match(page, /associate\?mode=\$\{scope\}/);
   assert.match(page, /setRefreshPicker\(true\)/);
   assert.match(styles, /\.spu-refresh-options/);
-  assert.match(styles, /\.review-modal\.spu-refresh-modal/);
+  assert.match(styles, /\.modal-panel\.spu-refresh-modal/);
   assert.match(styles, /grid-template-columns: repeat\(2, minmax\(0, 1fr\)\)/);
   assert.match(styles, /\.spu-refresh-option\[data-selected="true"\]/);
   assert.match(styles, /@media \(max-width: 600px\)/);
@@ -576,7 +589,7 @@ test("spu audience page keeps rule assets, association and 3D stats together", a
   assert.match(spuModule, /车系兜底节点/);
 });
 
-test("routes preserve operations and expose evidence-backed review controls", async () => {
+test("routes preserve operations and expose read-only evidence workbench", async () => {
   const [shell, accounts, pagination, contents, evidence, tasks, taskDetail, sellingPoints, apiSource, formatSource, layout, packageJson] = await Promise.all([
     readFile(new URL("../app/components/AppShell.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/accounts/AccountsPage.tsx", import.meta.url), "utf8"),
@@ -627,7 +640,6 @@ test("routes preserve operations and expose evidence-backed review controls", as
   assert.match(contents, /\/api\/v8\/contents\/import/);
   assert.match(contents, /\/update-data/);
   assert.match(contents, /查看证据/);
-  assert.match(contents, /再次复核/);
   assert.match(contents, /旧规则评估/);
   assert.match(taskDetail, /display_effective_revision/);
   assert.match(taskDetail, /历史规则报告，已过时/);
@@ -637,7 +649,6 @@ test("routes preserve operations and expose evidence-backed review controls", as
   assert.match(tasks, /current_valid_revision/);
   assert.match(tasks, /stale_display_revision/);
   assert.match(tasks, /historical_revision_count/);
-  assert.match(evidence, /base_evaluation_id/);
   assert.match(evidence, /display_evaluation_id/);
   assert.match(evidence, /旧规则，已过时/);
   assert.match(evidence, /当前 release 尚无评估/);
@@ -649,10 +660,10 @@ test("routes preserve operations and expose evidence-backed review controls", as
   assert.match(evidence, /allow_paid_refresh/);
   assert.match(evidence, /\/evidence/);
   assert.match(evidence, /\/media\/retry/);
-  assert.match(evidence, /\/api\/v8\/reviews\/\$\{item\.review_queue_id\}\/reopen/);
-  assert.match(evidence, /不会改写当前结论，也不会生成新评估/);
-  assert.match(evidence, /提交人工复核表单，才会追加新的评估版本/);
-  assert.match(evidence, /再次复核发起失败/);
+  // v16 起证据弹窗是纯只读面板：无复核表单、无 reviews 接口调用
+  assert.doesNotMatch(evidence, /复核/);
+  assert.doesNotMatch(evidence, /\/api\/v8\/reviews/);
+  assert.match(evidence, /证据或规则变化后系统会自动重新评估并追加新版本/);
   assert.match(tasks, /新建自定义报告/);
   assert.match(taskDetail, /\/cancel/);
   assert.match(taskDetail, /\/resume/);

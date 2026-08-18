@@ -4,7 +4,9 @@ import hashlib
 import json
 import stat
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -111,6 +113,42 @@ class V8CaptureTest(unittest.TestCase):
                 (captured_at, captured_at),
             )
             connection.commit()
+
+    def _insert_task_budget(
+        self,
+        *,
+        task_id: str,
+        operation: str,
+        max_amount: float,
+        provider: str = "Rnote",
+        unit_price: float = 0.008,
+    ) -> str:
+        digest = hashlib.sha256(task_id.encode("utf-8")).hexdigest()[:16]
+        budget_id = f"task-{digest}-{provider.lower()}-{operation}-v1"
+        captured_at = now_utc()
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                INSERT INTO provider_budget_batches(
+                    id,purpose,provider,operation,currency,verified_unit_price,
+                    max_billable_requests,max_amount,pilot_size,daily_quota,
+                    price_verified_at,status,created_at,updated_at
+                ) VALUES (?,?,?,?,'USD',?,100,?,0,100,?,'approved',?,?)
+                """,
+                (
+                    budget_id,
+                    f"test_task_{digest}_{operation}",
+                    provider,
+                    operation,
+                    unit_price,
+                    max_amount,
+                    captured_at,
+                    captured_at,
+                    captured_at,
+                ),
+            )
+            connection.commit()
+        return budget_id
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -375,27 +413,31 @@ class V8CaptureTest(unittest.TestCase):
             ["2026-08-02T15:59:59Z", "2026-08-02T16:00:00Z"],
         )
 
-    def test_task_amount_ceiling_is_fail_closed_before_provider_call(self) -> None:
-        with connect(self.db) as connection:
-            connection.execute(
-                """
-                UPDATE provider_budget_batches
-                SET status='approved', max_billable_requests=10, max_amount=0.08,
-                    daily_quota=10
-                WHERE id='pilot'
-                """
-            )
-            connection.commit()
+    def test_task_amount_ceiling_spans_operations_before_provider_call(self) -> None:
+        task_id = "backfill-2026-07-20"
+        max_amount = 0.012
+        first_operation = "xiaohongshu_video_detail"
+        second_operation = "xiaohongshu_note_statistics"
+        first_budget = self._insert_task_budget(
+            task_id=task_id,
+            operation=first_operation,
+            max_amount=max_amount,
+        )
+        second_budget = self._insert_task_budget(
+            task_id=task_id,
+            operation=second_operation,
+            max_amount=max_amount,
+        )
         execute_content_fetch(
             content_id=1,
             stage="media_source_refresh",
             window_key="range-page-1",
             provider="Rnote",
             adapter_version="rnote-video-v8.0",
-            operation="xiaohongshu_video_detail",
-            budget_id="pilot",
-            task_id="backfill-2026-07-20",
-            task_max_amount=0.012,
+            operation=first_operation,
+            budget_id=first_budget,
+            task_id=task_id,
+            task_max_amount=max_amount,
             db_path=self.db,
             raw_root=self.raw,
             call=lambda: ProviderResult({"page": 1}, {"page": 1}, 200, True),
@@ -414,10 +456,10 @@ class V8CaptureTest(unittest.TestCase):
                 window_key="range-page-2",
                 provider="Rnote",
                 adapter_version="rnote-video-v8.0",
-                operation="xiaohongshu_video_detail",
-                budget_id="pilot",
-                task_id="backfill-2026-07-20",
-                task_max_amount=0.012,
+                operation=second_operation,
+                budget_id=second_budget,
+                task_id=task_id,
+                task_max_amount=max_amount,
                 db_path=self.db,
                 raw_root=self.raw,
                 call=unexpected_call,
@@ -429,34 +471,244 @@ class V8CaptureTest(unittest.TestCase):
                 "SELECT status,last_error_code FROM fetch_slots WHERE window_key='range-page-2'"
             ).fetchone()
         self.assertEqual(len(usage), 1)
-        self.assertEqual(usage[0]["task_id"], "backfill-2026-07-20")
+        self.assertEqual(usage[0]["task_id"], task_id)
         self.assertEqual(usage[0]["amount"], 0.008)
         self.assertEqual(
             (blocked_slot["status"], blocked_slot["last_error_code"]),
             ("retryable_failed", "budget_blocked"),
         )
 
-    def test_account_fetch_records_task_and_replays_raw_without_cost(self) -> None:
+    def test_unbilled_call_releases_task_capacity_for_another_operation(self) -> None:
+        task_id = "backfill-unbilled-release"
+        max_amount = 0.008
+        first_operation = "xiaohongshu_video_detail"
+        second_operation = "xiaohongshu_note_statistics"
+        first_budget = self._insert_task_budget(
+            task_id=task_id,
+            operation=first_operation,
+            max_amount=max_amount,
+        )
+        second_budget = self._insert_task_budget(
+            task_id=task_id,
+            operation=second_operation,
+            max_amount=max_amount,
+        )
+        first = execute_content_fetch(
+            content_id=1,
+            stage="detail",
+            window_key="unbilled-first",
+            provider="Rnote",
+            adapter_version="rnote-video-v8.0",
+            operation=first_operation,
+            budget_id=first_budget,
+            task_id=task_id,
+            task_max_amount=max_amount,
+            db_path=self.db,
+            raw_root=self.raw,
+            call=lambda: ProviderResult({"ok": True}, {"ok": True}, 200, False),
+        )
+        second = execute_content_fetch(
+            content_id=1,
+            stage="metrics",
+            window_key="unbilled-second",
+            provider="Rnote",
+            adapter_version="rnote-statistics-v8.0",
+            operation=second_operation,
+            budget_id=second_budget,
+            task_id=task_id,
+            task_max_amount=max_amount,
+            db_path=self.db,
+            raw_root=self.raw,
+            call=lambda: ProviderResult({"ok": True}, {"ok": True}, 200, True),
+        )
+        self.assertFalse(first.billed)
+        self.assertEqual(first.amount, 0.0)
+        self.assertTrue(second.billed)
+        self.assertEqual(second.amount, 0.008)
         with connect(self.db) as connection:
-            connection.execute(
-                """
-                UPDATE provider_budget_batches
-                SET status='approved', max_billable_requests=10, max_amount=0.08,
-                    daily_quota=10
-                WHERE id='pilot'
-                """
+            usage = connection.execute(
+                "SELECT amount,billed_requests FROM provider_usage "
+                "WHERE task_id=? ORDER BY id",
+                (task_id,),
+            ).fetchall()
+            budgets = {
+                row["id"]: (row["consumed_requests"], row["consumed_amount"])
+                for row in connection.execute(
+                    "SELECT id,consumed_requests,consumed_amount "
+                    "FROM provider_budget_batches WHERE id IN (?,?)",
+                    (first_budget, second_budget),
+                )
+            }
+        self.assertEqual([tuple(row) for row in usage], [(0.0, 0), (0.008, 1)])
+        self.assertEqual(budgets[first_budget], (0, 0.0))
+        self.assertEqual(budgets[second_budget], (1, 0.008))
+
+    def test_concurrent_reservations_cannot_exceed_task_ceiling(self) -> None:
+        task_id = "backfill-concurrent-ceiling"
+        max_amount = 0.008
+        first_operation = "xiaohongshu_video_detail"
+        second_operation = "xiaohongshu_note_statistics"
+        first_budget = self._insert_task_budget(
+            task_id=task_id,
+            operation=first_operation,
+            max_amount=max_amount,
+        )
+        second_budget = self._insert_task_budget(
+            task_id=task_id,
+            operation=second_operation,
+            max_amount=max_amount,
+        )
+        first_callback_entered = threading.Event()
+        release_first_callback = threading.Event()
+        second_callback_called = False
+
+        def first_call() -> ProviderResult:
+            first_callback_entered.set()
+            if not release_first_callback.wait(timeout=5):
+                raise AssertionError("test did not release the first provider callback")
+            return ProviderResult({"ok": True}, {"ok": True}, 200, True)
+
+        def second_call() -> ProviderResult:
+            nonlocal second_callback_called
+            second_callback_called = True
+            return ProviderResult({"ok": True}, {"ok": True}, 200, True)
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            first_future = pool.submit(
+                execute_content_fetch,
+                content_id=1,
+                stage="detail",
+                window_key="concurrent-first",
+                provider="Rnote",
+                adapter_version="rnote-video-v8.0",
+                operation=first_operation,
+                budget_id=first_budget,
+                task_id=task_id,
+                task_max_amount=max_amount,
+                db_path=self.db,
+                raw_root=self.raw,
+                call=first_call,
             )
-            connection.commit()
+            self.assertTrue(first_callback_entered.wait(timeout=5))
+            try:
+                with self.assertRaisesRegex(BudgetBlocked, "task amount ceiling"):
+                    execute_content_fetch(
+                        content_id=1,
+                        stage="metrics",
+                        window_key="concurrent-second",
+                        provider="Rnote",
+                        adapter_version="rnote-statistics-v8.0",
+                        operation=second_operation,
+                        budget_id=second_budget,
+                        task_id=task_id,
+                        task_max_amount=max_amount,
+                        db_path=self.db,
+                        raw_root=self.raw,
+                        call=second_call,
+                    )
+            finally:
+                release_first_callback.set()
+            first_outcome = first_future.result(timeout=5)
+
+        self.assertTrue(first_outcome.billed)
+        self.assertFalse(second_callback_called)
+        with connect(self.db) as connection:
+            usage = connection.execute(
+                "SELECT operation,amount FROM provider_usage WHERE task_id=?",
+                (task_id,),
+            ).fetchall()
+        self.assertEqual(
+            [tuple(row) for row in usage], [(first_operation, max_amount)]
+        )
+
+    def test_task_budget_contract_rejects_omissions_wrong_task_and_larger_cap(self) -> None:
+        task_id = "backfill-contract"
+        operation = "xiaohongshu_video_detail"
+        max_amount = 0.008
+        budget_id = self._insert_task_budget(
+            task_id=task_id,
+            operation=operation,
+            max_amount=max_amount,
+        )
+        provider_called = False
+
+        def unexpected_call() -> ProviderResult:
+            nonlocal provider_called
+            provider_called = True
+            return ProviderResult({}, {}, 200, True)
+
+        common = {
+            "content_id": 1,
+            "stage": "detail",
+            "provider": "Rnote",
+            "adapter_version": "rnote-video-v8.0",
+            "operation": operation,
+            "db_path": self.db,
+            "raw_root": self.raw,
+            "call": unexpected_call,
+        }
+        with self.assertRaisesRegex(ValueError, "provided together"):
+            execute_content_fetch(
+                **common,
+                window_key="missing-cap",
+                budget_id=budget_id,
+                task_id=task_id,
+            )
+        with self.assertRaisesRegex(BudgetBlocked, "does not match"):
+            execute_content_fetch(
+                **common,
+                window_key="wrong-task",
+                budget_id=budget_id,
+                task_id="another-task",
+                task_max_amount=max_amount,
+            )
+        with self.assertRaisesRegex(BudgetBlocked, "requires task_id"):
+            execute_content_fetch(
+                **common,
+                window_key="missing-task",
+                budget_id=budget_id,
+            )
+        with self.assertRaisesRegex(BudgetBlocked, "runtime ceiling"):
+            execute_content_fetch(
+                **common,
+                window_key="larger-cap",
+                budget_id=budget_id,
+                task_id=task_id,
+                task_max_amount=0.016,
+            )
+        self.assertFalse(provider_called)
+        with connect(self.db) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM provider_usage").fetchone()[0],
+                0,
+            )
+            slots = connection.execute(
+                "SELECT window_key,status,last_error_code FROM fetch_slots"
+            ).fetchall()
+        self.assertEqual(
+            [tuple(row) for row in slots],
+            [("larger-cap", "retryable_failed", "budget_blocked")],
+        )
+
+    def test_account_fetch_records_task_and_replays_raw_without_cost(self) -> None:
+        task_id = "backfill-account-test"
+        max_amount = 0.008
+        operation = "xiaohongshu_video_detail"
+        budget_id = self._insert_task_budget(
+            task_id=task_id,
+            operation=operation,
+            max_amount=max_amount,
+        )
         outcome = execute_account_fetch(
             account_id=1,
             stage="discovery",
             window_key="backfill:first-page",
             provider="Rnote",
             adapter_version="rnote-user-posts-v8.0",
-            operation="xiaohongshu_video_detail",
-            budget_id="pilot",
-            task_id="backfill-account-test",
-            task_max_amount=0.008,
+            operation=operation,
+            budget_id=budget_id,
+            task_id=task_id,
+            task_max_amount=max_amount,
             db_path=self.db,
             raw_root=self.raw,
             call=lambda: ProviderResult(
@@ -477,7 +729,7 @@ class V8CaptureTest(unittest.TestCase):
         self.assertEqual(replayed.value["data"]["items"][0]["id"], "note-1")
         with connect(self.db) as connection:
             usage = connection.execute("SELECT * FROM provider_usage").fetchone()
-        self.assertEqual(usage["task_id"], "backfill-account-test")
+        self.assertEqual(usage["task_id"], task_id)
         self.assertEqual(usage["amount"], 0.008)
 
     def test_budget_is_fail_closed_and_quality_gate_is_quantified(self) -> None:

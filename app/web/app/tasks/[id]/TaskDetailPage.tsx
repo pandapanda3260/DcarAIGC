@@ -216,6 +216,7 @@ export default function TaskDetailPage({ taskId }: { taskId: string }) {
     <Feedback error={error} message={message} onClose={() => { setError(""); setMessage(""); }} />
     {!detail ? <Loading label="正在读取任务详情" /> : <section className="page-stack wide-stack">
       <div className="detail-toolbar"><div><span className="eyebrow">{detail.id}</span><h2>{detail.name}</h2><p>{formatDate(detail.period_start)} — {formatDate(detail.period_end)} · {label(detail.task_status)} · {humanizeTaskMessage(detail.message) || "无附加说明"}</p></div><div>
+        {detail.display_effective_revision && <a className="primary button-link report-download-button" href={`${API_BASE}/api/v8/tasks/${encodeURIComponent(detail.id)}/revisions/${detail.display_effective_revision.revision}/download`} download title={`下载当前展示的第 ${detail.display_effective_revision.revision} 版报告图片和 Excel 明细`}>下载报告</a>}
         {retryable && <button className="secondary" disabled={saving} onClick={() => void action("retry")}>重新生成报告</button>}
         {cancellable && <button className="secondary danger-button" disabled={saving || detail.task_status === "cancel_requested"} onClick={() => void action("cancel")}>{detail.task_status === "cancel_requested" ? "取消中" : "取消任务"}</button>}
         {detail.task_status === "cancelled" && <button className="primary" disabled={saving} onClick={() => void action("resume")}>恢复任务</button>}

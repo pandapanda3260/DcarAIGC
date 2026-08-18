@@ -397,28 +397,8 @@ def _seed_v9_constraint_fixture(connection: sqlite3.Connection) -> dict[str, int
         ),
     )
     automatic_id = int(automatic.lastrowid)
-    queue = connection.execute(
-        """
-        INSERT INTO review_queue(
-            content_id,evaluation_id,reason_code,status,created_at,updated_at
-        ) VALUES (1,?,'evaluation_gray_zone','pending',?,?)
-        """,
-        (automatic_id, captured_at, captured_at),
-    )
-    review = connection.execute(
-        """
-        INSERT INTO evaluation_reviews(
-            queue_id,content_id,previous_evaluation_id,decision,reason,reviewer,created_at
-        ) VALUES (?,1,?,'override','fixture','reviewer',?)
-        """,
-        (queue.lastrowid, automatic_id, captured_at),
-    )
     connection.commit()
-    return {
-        "automatic_id": automatic_id,
-        "queue_id": int(queue.lastrowid),
-        "review_id": int(review.lastrowid),
-    }
+    return {"automatic_id": automatic_id}
 
 
 def _insert_v9_evaluation(
@@ -430,21 +410,19 @@ def _insert_v9_evaluation(
     evidence_sha256: str,
     source: str,
     parent_evaluation_id: int | None = None,
-    review_id: int | None = None,
 ) -> int:
     cursor = connection.execute(
         """
         INSERT INTO evaluation_versions(
-            content_id,release_id,parent_evaluation_id,review_id,rule_version,
+            content_id,release_id,parent_evaluation_id,rule_version,
             taxonomy_version,matcher_rule_sha256,evidence_sha256,evaluation_source,
             evaluation_status,evidence_level,payload_json,evaluated_at
-        ) VALUES (?,?,?,?,?,'selling-points-v5.0',?,?,?,'evaluated','V3','{}',?)
+        ) VALUES (?,?,?,?,'selling-points-v5.0',?,?,?,'evaluated','V3','{}',?)
         """,
         (
             content_id,
             release_id,
             parent_evaluation_id,
-            review_id,
             rule_version,
             storage.LEGACY_MATCHER_RULE_SHA256,
             evidence_sha256,
@@ -503,10 +481,8 @@ class V9SchemaMigrationTest(unittest.TestCase):
                 unique_indexes["uq_evaluation_automatic_idempotency"],
                 ["content_id", "release_id", "evidence_sha256"],
             )
-            self.assertEqual(
-                unique_indexes["uq_evaluation_manual_idempotency"],
-                ["release_id", "review_id"],
-            )
+            # v16 起复核域删除：人工幂等索引（键含 review_id）不复存在
+            self.assertNotIn("uq_evaluation_manual_idempotency", unique_indexes)
             self.assertEqual(
                 unique_indexes["uq_evaluation_migrated_parent_idempotency"],
                 ["release_id", "parent_evaluation_id"],
@@ -572,6 +548,9 @@ class V9SchemaMigrationTest(unittest.TestCase):
                 evidence_sha256="a" * 64,
                 source="automatic",
             )
+            # v16 移除了 uq_evaluation_manual_idempotency（键含 review_id）。
+            # 人工结论版本保留，但不再有复核维度的幂等约束；这里改为确认
+            # 自动评估的幂等键仍然生效、人工版本可自由并存。
             manual_v7 = _insert_v9_evaluation(
                 connection,
                 content_id=1,
@@ -580,21 +559,7 @@ class V9SchemaMigrationTest(unittest.TestCase):
                 evidence_sha256="m" * 64,
                 source="manual_review",
                 parent_evaluation_id=fixture["automatic_id"],
-                review_id=fixture["review_id"],
             )
-            connection.commit()
-            with self.assertRaises(sqlite3.IntegrityError):
-                _insert_v9_evaluation(
-                    connection,
-                    content_id=1,
-                    release_id=storage.LEGACY_V7_RELEASE_ID,
-                    rule_version="evaluation-v7",
-                    evidence_sha256="n" * 64,
-                    source="manual_review",
-                    parent_evaluation_id=fixture["automatic_id"],
-                    review_id=fixture["review_id"],
-                )
-            connection.rollback()
             manual_v6 = _insert_v9_evaluation(
                 connection,
                 content_id=1,
@@ -603,33 +568,10 @@ class V9SchemaMigrationTest(unittest.TestCase):
                 evidence_sha256="m" * 64,
                 source="manual_review",
                 parent_evaluation_id=fixture["automatic_id"],
-                review_id=fixture["review_id"],
-            )
-            second_review = connection.execute(
-                """
-                INSERT INTO evaluation_reviews(
-                    queue_id,content_id,previous_evaluation_id,decision,reason,reviewer,created_at
-                ) VALUES (?,1,?,'override','second','reviewer',?)
-                """,
-                (
-                    fixture["queue_id"],
-                    fixture["automatic_id"],
-                    "2026-08-04T00:00:00Z",
-                ),
-            )
-            manual_same_evidence = _insert_v9_evaluation(
-                connection,
-                content_id=1,
-                release_id=storage.LEGACY_V7_RELEASE_ID,
-                rule_version="evaluation-v7",
-                evidence_sha256="m" * 64,
-                source="manual_review",
-                parent_evaluation_id=fixture["automatic_id"],
-                review_id=int(second_review.lastrowid),
             )
             connection.commit()
             self.assertEqual(
-                {manual_v7, manual_v6, manual_same_evidence},
+                {manual_v7, manual_v6},
                 {
                     int(row[0])
                     for row in connection.execute(
@@ -734,7 +676,6 @@ class V9SchemaMigrationTest(unittest.TestCase):
                 evidence_sha256="m" * 64,
                 source="manual_review",
                 parent_evaluation_id=fixture["automatic_id"],
-                review_id=fixture["review_id"],
             )
             connection.commit()
             for sql, parameters in (
@@ -743,7 +684,6 @@ class V9SchemaMigrationTest(unittest.TestCase):
                     (storage.LEGACY_V7_RELEASE_ID,),
                 ),
                 ("DELETE FROM evaluation_versions WHERE id=?", (parent,)),
-                ("DELETE FROM evaluation_reviews WHERE id=?", (fixture["review_id"],)),
             ):
                 with self.assertRaises(sqlite3.IntegrityError):
                     connection.execute(sql, parameters)
@@ -766,9 +706,19 @@ class V9SchemaMigrationTest(unittest.TestCase):
     def test_v8_graph_migrates_with_lineage_and_projection_intact(self) -> None:
         with storage.connect(self.db) as connection:
             _seed_v8_fixture(connection)
-            old_columns = {
-                table: storage._table_columns(connection, table)
+            surviving = tuple(
+                table
                 for table in storage._REBUILT_V9_TABLES
+                if table not in storage._LEGACY_REVIEW_TABLES
+            )
+            removed_columns = {"review_id", "pending_review"}
+            old_columns = {
+                table: [
+                    column
+                    for column in storage._table_columns(connection, table)
+                    if column not in removed_columns
+                ]
+                for table in surviving
             }
             old_hashes = {
                 table: storage._table_projection_sha256(connection, table, columns)
@@ -797,14 +747,34 @@ class V9SchemaMigrationTest(unittest.TestCase):
                 },
                 {1: None, 2: 1, 3: None, 4: None, 5: 4, 6: None, 7: 6},
             )
+            # v16 删除复核域后人工结论保留为自然沉底版本，只是不再回链复核记录
             self.assertEqual(
                 [
-                    tuple(row)
+                    int(row[0])
                     for row in connection.execute(
-                        "SELECT id,review_id FROM evaluation_versions WHERE evaluation_source='manual_review' ORDER BY id"
+                        """
+                        SELECT id FROM evaluation_versions
+                        WHERE evaluation_source='manual_review' ORDER BY id
+                        """
                     )
                 ],
-                [(4, 1), (5, 1)],
+                [4, 5],
+            )
+            surviving_tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            self.assertEqual(
+                surviving_tables
+                & {
+                    "review_queue",
+                    "evaluation_reviews",
+                    "review_reopen_events",
+                    "manual_evidence",
+                },
+                set(),
             )
             self.assertEqual(
                 {

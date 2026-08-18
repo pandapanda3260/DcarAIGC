@@ -105,7 +105,7 @@ class V8MigrationTest(unittest.TestCase):
         }
         self.assertEqual(weeks, {"2026-W29": 56, "2026-W31": 720})
 
-    def test_evaluations_reviews_and_artifacts_are_complete(self) -> None:
+    def test_evaluations_and_artifacts_are_complete(self) -> None:
         total = BASELINE["content"]["total"]
         self.assertEqual(self.scalar("SELECT COUNT(*) FROM evidence_envelopes"), total)
         self.assertEqual(self.scalar("SELECT COUNT(*) FROM evaluation_versions"), total)
@@ -114,22 +114,6 @@ class V8MigrationTest(unittest.TestCase):
                 "SELECT COUNT(*) FROM evaluation_versions WHERE evaluation_source='migrated_from_v5'"
             ),
             total,
-        )
-        self.assertEqual(self.scalar("SELECT COUNT(*) FROM review_queue"), 186)
-        routes = {
-            str(row["reason_code"]): int(row["n"])
-            for row in self.connection.execute(
-                "SELECT reason_code, COUNT(*) n FROM review_queue GROUP BY reason_code"
-            )
-        }
-        self.assertEqual(
-            routes,
-            {
-                "legacy_content_unavailable": 12,
-                "media_evidence_missing": 164,
-                "stale_local_evidence": 1,
-                "evaluation_gray_zone": 9,
-            },
         )
         self.assertEqual(
             self.scalar(
@@ -194,7 +178,6 @@ class V8MigrationTest(unittest.TestCase):
                 "content_metric_observations",
                 "fetch_slots",
                 "evaluation_versions",
-                "review_queue",
             )
         }
         summary = migrate(target_db=self.database)

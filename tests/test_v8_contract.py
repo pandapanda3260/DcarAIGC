@@ -205,7 +205,6 @@ def valid_report() -> dict:
         "content_direction_dimensions": [],
         "selling_point_dimensions": [],
         "duplicates": [],
-        "review_summary": [],
         "capture_summary": [],
         "provider_costs": [],
         "content_details": [],
@@ -214,11 +213,11 @@ def valid_report() -> dict:
 
 
 class V8ContractTest(unittest.TestCase):
-    def test_project_metadata_matches_the_current_v8_6_contract(self) -> None:
+    def test_project_metadata_matches_the_current_contract(self) -> None:
         project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
         deployed_version = project["tool"]["dcar"]["report-version"]
         self.assertEqual(deployed_version, CURRENT_REPORT_VERSION)
-        self.assertEqual(CONTRACT_PATH.name, "report_contract_v8_6.json")
+        self.assertEqual(CONTRACT_PATH.name, "report_contract_v8_7.json")
         live_contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
         self.assertEqual(live_contract["report_version"], CURRENT_REPORT_VERSION)
         self.assertEqual(live_contract["rule_version"], CURRENT_REPORT_RULE_VERSION)
@@ -284,8 +283,16 @@ class V8ContractTest(unittest.TestCase):
     def test_valid_operational_report_passes(self) -> None:
         validate_report(valid_report())
 
+    @staticmethod
+    def _historical_report() -> dict:
+        """<=v8.6 契约仍把 review_summary 列为必备键（v8.7 起才移除）。"""
+
+        report = valid_report()
+        report["review_summary"] = []
+        return report
+
     def test_frozen_v8_2_report_remains_valid_but_versions_cannot_cross(self) -> None:
-        historical = valid_report()
+        historical = self._historical_report()
         historical["report_version"] = "dcar-content-operations-report-v8.2"
         historical["rule_version"] = "evaluation-v6"
         historical["evidence_version"] = "evidence-v1"
@@ -303,7 +310,7 @@ class V8ContractTest(unittest.TestCase):
                 validate_report(current)
 
     def test_frozen_v8_3_report_stays_on_evaluation_v7(self) -> None:
-        historical = valid_report()
+        historical = self._historical_report()
         historical["report_version"] = "dcar-content-operations-report-v8.3"
         historical["rule_version"] = "evaluation-v7"
         historical["evidence_version"] = "evidence-v1"
@@ -316,7 +323,7 @@ class V8ContractTest(unittest.TestCase):
 
     def test_frozen_v8_4_report_stays_on_evaluation_v8(self) -> None:
         version = "dcar-content-operations-report-v8.4"
-        historical = valid_report()
+        historical = self._historical_report()
         historical["report_version"] = version
         historical["rule_version"] = "evaluation-v8"
         historical["data_quality"]["discovery_coverage"] = 100.0

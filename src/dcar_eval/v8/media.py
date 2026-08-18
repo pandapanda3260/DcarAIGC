@@ -5926,13 +5926,6 @@ def ingest_existing_video_evidence(
             connection, content_id=content_id, artifact_type="ocr", path=corrected,
             processor_version="legacy-ocr-normalized-v8.0",
         )
-        connection.execute(
-            """
-            UPDATE review_queue SET status='resolved', resolved_at=?, updated_at=?
-            WHERE content_id=? AND reason_code='stale_local_evidence'
-            """,
-            (now_utc(), now_utc(), content_id),
-        )
     return {"media": media, "asr": asr, "ocr": ocr}
 
 

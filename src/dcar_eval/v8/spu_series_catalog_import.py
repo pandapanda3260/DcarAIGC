@@ -32,7 +32,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
-from .storage import DEFAULT_DB, SCHEMA_VERSION, connect, now_utc
+from .storage import (
+    DEFAULT_DB,
+    SCHEMA_VERSION,
+    connect,
+    is_formal_database_path,
+    now_utc,
+)
 
 
 SOURCE_ARTIFACT_SCHEMA = "dcar-dongchedi-series-catalog-v1"
@@ -377,6 +383,7 @@ def _parse_row(raw: Any, *, index: int) -> SeriesSpec:
         raw.get("dcd_series_id"), label=f"{label}.dcd_series_id"
     )
     represented_raw = raw.get("represented_official_series_ids")
+    represented_ids: Tuple[str, ...]
     if represented_raw is None:
         represented_ids = (dcd_series_id,)
     elif isinstance(represented_raw, list) and represented_raw:
@@ -656,7 +663,7 @@ def load_frozen_series_catalog(input_path: Path) -> FrozenSeriesCatalog:
 def _deny_formal_database_in_tests(db_path: Path) -> None:
     if (
         os.environ.get("DCAR_TEST_DENY_FORMAL_DB") == "1"
-        and db_path.resolve() == DEFAULT_DB.resolve()
+        and is_formal_database_path(db_path, formal_database=DEFAULT_DB)
     ):
         raise SpuSeriesCatalogImportError(
             "test process attempted to open the formal DCar database"
@@ -1012,8 +1019,10 @@ def _build_plan_from_connection(
                     unchanged_aliases += 1
 
     statuses: Dict[str, int] = {}
-    for row in catalog.rows:
-        statuses[row.business_status] = statuses.get(row.business_status, 0) + 1
+    for series_spec in catalog.rows:
+        statuses[series_spec.business_status] = (
+            statuses.get(series_spec.business_status, 0) + 1
+        )
 
     inserts = _sort_operations(catalog_inserts)
     updates = _sort_operations(catalog_updates)
@@ -1420,7 +1429,9 @@ def execute_import(
             "dry-run plan hash does not match current database/input state: "
             f"expected {expected}, current {initial_plan.plan_sha256}"
         )
-    if skip_backup and resolved_db == DEFAULT_DB.resolve():
+    if skip_backup and is_formal_database_path(
+        resolved_db, formal_database=DEFAULT_DB
+    ):
         raise SpuSeriesCatalogImportError(
             "--skip-backup is forbidden for the formal DEFAULT_DB"
         )

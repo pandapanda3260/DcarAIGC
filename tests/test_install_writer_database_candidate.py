@@ -1,224 +1,289 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import importlib.util
 import io
 import json
 import os
-import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
-from v8.release_management_v9 import (
-    REPORT_VERSION,
-    SOURCE_RELEASE_ID,
-    SOURCE_RULE_VERSION,
-    TAXONOMY_VERSION,
-)
-from v8.storage import connect, initialize_database, now_utc
+import v8.storage as storage
+from tests.schema_fixture import initialize_historical_schema
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "scripts" / "install_writer_database_candidate.py"
-SPEC = importlib.util.spec_from_file_location(
-    "install_writer_database_candidate", SCRIPT
+
+
+def _load_script(name: str, path: Path) -> Any:
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+installer = _load_script(
+    "install_writer_database_candidate",
+    ROOT / "scripts" / "install_writer_database_candidate.py",
 )
-assert SPEC is not None and SPEC.loader is not None
-installer = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = installer
-SPEC.loader.exec_module(installer)
+migrator = _load_script(
+    "migrate_v8_schema_for_installer_tests",
+    ROOT / "scripts" / "migrate_v8_schema.py",
+)
 
 
 def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class WriterDatabaseCandidateInstallerTest(unittest.TestCase):
-    def _build_source_database(
-        self,
-        path: Path,
-    ) -> None:
-        captured_at = now_utc()
-        connection = connect(path)
+    def _build_v15_database(self, path: Path) -> None:
+        stamp = "2026-08-18T00:00:00Z"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        connection = storage.connect(path)
         try:
-            initialize_database(connection)
+            initialize_historical_schema(connection, target_version=12)
+            storage._migrate_v12_to_v13(connection)
+            storage._migrate_v13_to_v14(connection)
+            storage._migrate_v14_to_v15(connection)
             connection.execute(
                 """
                 INSERT INTO taxonomy_versions(
-                    id,version,status,definition,source_path,source_sha256,
-                    created_at,published_at
-                ) VALUES ('candidate-taxonomy',?,'published','fixture',NULL,NULL,?,?)
+                    id,version,status,definition,created_at,published_at
+                ) VALUES ('tax-v15','selling-points-v15','published','fixture',?,?)
                 """,
-                (TAXONOMY_VERSION, captured_at, captured_at),
+                (stamp, stamp),
             )
             connection.execute(
                 """
                 INSERT INTO evaluation_releases(
                     id,rule_version,taxonomy_version,matcher_rule_sha256,status,
                     created_at,updated_at,activated_at
-                ) VALUES (?,?,? ,?,'active',?,?,?)
-                """,
-                (
-                    SOURCE_RELEASE_ID,
-                    SOURCE_RULE_VERSION,
-                    TAXONOMY_VERSION,
-                    "a" * 64,
-                    captured_at,
-                    captured_at,
-                    captured_at,
-                ),
-            )
-            connection.execute(
-                """
-                INSERT INTO content_items(
-                    link_id,platform,platform_content_id,canonical_url,title,body,
-                    content_type,published_at,source_group,source_label,source_path,
-                    imported_at,created_at,updated_at
                 ) VALUES (
-                    'ABC123','douyin','fixture-content','https://example.test/fixture',
-                    'fixture','fixture','video','2026-08-04T00:00:00Z','','fixture',
-                    'fixture.json',?,?,?
+                    'release-v15','evaluation-v15','selling-points-v15',?,
+                    'active',?,?,?
                 )
                 """,
-                (captured_at, captured_at, captured_at),
+                ("a" * 64, stamp, stamp, stamp),
             )
             content_id = int(
-                connection.execute("SELECT last_insert_rowid()").fetchone()[0]
+                connection.execute(
+                    """
+                    INSERT INTO content_items(
+                        link_id,platform,platform_content_id,canonical_url,title,body,
+                        content_type,published_at,source_group,source_label,source_path,
+                        imported_at,created_at,updated_at
+                    ) VALUES (
+                        'I00001','douyin','installer-fixture',
+                        'https://example.test/installer','迁移前标题','迁移前正文',
+                        'video','2026-08-17T00:00:00Z','','fixture','fixture.json',?,?,?
+                    )
+                    """,
+                    (stamp, stamp, stamp),
+                ).lastrowid
+            )
+            envelope_id = int(
+                connection.execute(
+                    """
+                    INSERT INTO evidence_envelopes(
+                        content_id,schema_version,text_sha256,evidence_sha256,
+                        components_json,created_at
+                    ) VALUES (?,'evidence-envelope-v3',?,?,'{}',?)
+                    """,
+                    (content_id, "b" * 64, "c" * 64, stamp),
+                ).lastrowid
+            )
+            automatic_id = int(
+                connection.execute(
+                    """
+                    INSERT INTO evaluation_versions(
+                        content_id,evidence_envelope_id,release_id,parent_evaluation_id,
+                        review_id,rule_version,taxonomy_version,matcher_rule_sha256,
+                        evidence_sha256,evaluation_source,evaluation_status,evidence_level,
+                        primary_selling_point_code,selling_point_score,
+                        selling_point_included,content_direction,content_automotive_score,
+                        audience_automotive_score,acquisition_potential_score,
+                        pending_review,payload_json,evaluated_at
+                    ) VALUES (
+                        ?,?,'release-v15',NULL,NULL,'evaluation-v15',
+                        'selling-points-v15',?,?,'automatic','evaluated','V3',
+                        NULL,81,1,'media',88,79,66,0,'{"source":"automatic"}',?
+                    )
+                    """,
+                    (content_id, envelope_id, "a" * 64, "c" * 64, stamp),
+                ).lastrowid
+            )
+            queue_id = int(
+                connection.execute(
+                    """
+                    INSERT INTO review_queue(
+                        content_id,evaluation_id,reason_code,priority,status,
+                        created_at,updated_at,resolved_at
+                    ) VALUES (?,?,'fixture-review',50,'resolved',?,?,?)
+                    """,
+                    (content_id, automatic_id, stamp, stamp, stamp),
+                ).lastrowid
+            )
+            review_id = int(
+                connection.execute(
+                    """
+                    INSERT INTO evaluation_reviews(
+                        queue_id,content_id,previous_evaluation_id,resulting_evaluation_id,
+                        decision,reason,reviewer,created_at
+                    ) VALUES (?,?,?,NULL,'override','fixture','tester',?)
+                    """,
+                    (queue_id, content_id, automatic_id, stamp),
+                ).lastrowid
+            )
+            manual_id = int(
+                connection.execute(
+                    """
+                    INSERT INTO evaluation_versions(
+                        content_id,evidence_envelope_id,release_id,parent_evaluation_id,
+                        review_id,rule_version,taxonomy_version,matcher_rule_sha256,
+                        evidence_sha256,evaluation_source,evaluation_status,evidence_level,
+                        primary_selling_point_code,selling_point_score,
+                        selling_point_included,content_direction,content_automotive_score,
+                        audience_automotive_score,acquisition_potential_score,
+                        pending_review,payload_json,evaluated_at
+                    ) VALUES (
+                        ?,?,'release-v15',?,?,'evaluation-v15',
+                        'selling-points-v15',?,?,'manual_review','evaluated','V3',
+                        NULL,93,1,'media',95,84,73,0,'{"source":"manual"}',?
+                    )
+                    """,
+                    (
+                        content_id,
+                        envelope_id,
+                        automatic_id,
+                        review_id,
+                        "a" * 64,
+                        "d" * 64,
+                        stamp,
+                    ),
+                ).lastrowid
+            )
+            connection.execute(
+                "UPDATE evaluation_reviews SET resulting_evaluation_id=? WHERE id=?",
+                (manual_id, review_id),
             )
             connection.execute(
                 """
-                INSERT INTO content_metric_snapshots(
-                    content_id,captured_at,window_key,view_count,comment_count,
-                    like_count,share_count,collect_count,status,source,metadata_json
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                INSERT INTO manual_evidence(
+                    review_id,content_id,evidence_type,text_value,sha256,created_at
+                ) VALUES (?,?,'review_note','fixture',?,?)
                 """,
-                (
-                    content_id,
-                    "2026-08-05T00:00:00Z",
-                    "fixture-window",
-                    10,
-                    2,
-                    3,
-                    4,
-                    5,
-                    "available",
-                    "fixture",
-                    '{"fixture":true}',
-                ),
-            )
-            connection.execute(
-                """
-                INSERT INTO scheduler_runs(
-                    job_id,scheduled_for,status,started_at,completed_at,details_json
-                ) VALUES (?,?,?,?,?,?)
-                """,
-                (
-                    "daily_capture",
-                    "2026-08-05T18:00:00Z",
-                    "succeeded",
-                    "2026-08-05T18:00:00Z",
-                    "2026-08-05T18:01:00Z",
-                    '{"fixture":true}',
-                ),
+                (review_id, content_id, "e" * 64, stamp),
             )
             connection.commit()
-            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         finally:
             connection.close()
-
-        # Fresh databases use the current schema. Rebuild the two changed
-        # surfaces into their exact v11 form so the test exercises the real
-        # v11 -> v12 -> v13 migration rather than two independently built v13s.
-        raw = sqlite3.connect(path)
-        try:
-            raw.execute("PRAGMA foreign_keys=OFF")
-            raw.executescript(
-                """
-                DROP TRIGGER trg_scheduler_run_attempts_terminal_update;
-                DROP TRIGGER trg_scheduler_run_attempts_no_delete;
-                DROP INDEX uq_scheduler_run_attempts_active;
-                DROP TABLE scheduler_run_attempts;
-                ALTER TABLE scheduler_runs RENAME TO scheduler_runs_v13_fixture;
-                CREATE TABLE scheduler_runs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    job_id TEXT NOT NULL,
-                    scheduled_for TEXT NOT NULL,
-                    status TEXT NOT NULL CHECK(status IN ('running','succeeded','failed','skipped')),
-                    started_at TEXT NOT NULL,
-                    completed_at TEXT,
-                    details_json TEXT NOT NULL DEFAULT '{}',
-                    UNIQUE(job_id, scheduled_for)
-                );
-                INSERT INTO scheduler_runs(
-                    id,job_id,scheduled_for,status,started_at,completed_at,details_json
-                )
-                SELECT id,job_id,scheduled_for,status,started_at,completed_at,details_json
-                FROM scheduler_runs_v13_fixture;
-                DROP TABLE scheduler_runs_v13_fixture;
-                DROP TRIGGER trg_metric_observations_immutable_payload;
-                DROP TRIGGER trg_metric_observations_no_delete;
-                DROP INDEX idx_metric_observations_content_capture;
-                DROP TABLE content_metric_observations;
-                DROP INDEX idx_content_identities_content_primary;
-                DELETE FROM schema_migrations WHERE version >= 12;
-                PRAGMA user_version=11;
-                """
+        with sqlite3.connect(path, isolation_level=None) as connection:
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            self.assertEqual(
+                str(connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0]),
+                "delete",
             )
-            raw.commit()
-        finally:
-            raw.close()
-
-    def _build_candidate_from_source(self, source: Path, candidate: Path) -> None:
-        shutil.copy2(source, candidate)
-        connection = connect(candidate)
-        try:
-            initialize_database(connection)
-            connection.commit()
-            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            connection.execute("PRAGMA journal_mode=DELETE")
-        finally:
-            connection.close()
+        for suffix in migrator.SQLITE_TRANSIENT_SUFFIXES:
+            sidecar = Path(f"{path}{suffix}")
+            if sidecar.exists():
+                self.assertEqual(sidecar.stat().st_size, 0)
+                sidecar.unlink()
 
     def _layout(self, root: Path, *, sidecars: bool = False) -> dict[str, Path]:
-        data = root / "app" / "data"
-        backups = data / "backups"
-        candidate_root = root / "candidate"
-        receipt_root = root / "receipts"
-        runtime = root / "runtime"
-        for directory in (backups, candidate_root, receipt_root, runtime):
+        project = root / "project"
+        external = root / "external"
+        formal = project / "app" / "data" / "dcar_insight.sqlite3"
+        backups = formal.parent / "backups"
+        freeze = project / "runtime" / "operator-freeze.lock"
+        candidate = external / "candidates" / "candidate-v16.sqlite3"
+        verified_backup = external / "backups" / "source-v15.sqlite3"
+        backup_receipt = external / "receipts" / "backup.json"
+        migration_receipt = external / "receipts" / "migration.json"
+        migration_lock = external / "locks" / "migration.lock"
+        install_receipt = external / "receipts" / "install.json"
+        for directory in (
+            backups,
+            freeze.parent,
+            candidate.parent,
+            verified_backup.parent,
+            backup_receipt.parent,
+            migration_lock.parent,
+        ):
             directory.mkdir(parents=True, exist_ok=True)
-        formal = data / "dcar_insight.sqlite3"
-        candidate = candidate_root / "candidate.sqlite3"
-        lock = runtime / "operator-freeze.lock"
-        lock.write_text("frozen\n", encoding="utf-8")
-        self._build_source_database(formal)
-        self._build_candidate_from_source(formal, candidate)
+        migration_lock.parent.chmod(0o700)
+        freeze.write_text("frozen\n", encoding="utf-8")
+        freeze.chmod(0o600)
+        self._build_v15_database(formal)
         if sidecars:
             Path(f"{formal}-wal").write_bytes(b"")
-            Path(f"{formal}-shm").write_bytes(b"preserved old shm")
+            Path(f"{formal}-shm").write_bytes(b"preserved source shm")
+
+        with patch.multiple(
+            migrator,
+            PROJECT_ROOT=project,
+            FORMAL_DATABASE=formal,
+            CANONICAL_OPERATOR_FREEZE_LOCK=freeze,
+        ):
+            migrator.prepare_verified_backup(
+                source_database=formal,
+                backup=verified_backup,
+                expected_source_sha256=_sha256(formal),
+                from_version=15,
+                freeze_lock=freeze,
+                migration_lock=migration_lock,
+                receipt=backup_receipt,
+                holder_checker=lambda _: [],
+            )
+            migrator.build_migration_candidate(
+                source_database=formal,
+                candidate=candidate,
+                expected_source_sha256=_sha256(formal),
+                from_version=15,
+                to_version=16,
+                freeze_lock=freeze,
+                migration_lock=migration_lock,
+                backup_receipt=backup_receipt,
+                receipt=migration_receipt,
+                holder_checker=lambda _: [],
+            )
         return {
+            "project": project,
             "formal": formal,
             "candidate": candidate,
             "backups": backups,
             "backup": backups / "install-001",
-            "receipt": receipt_root / "install-001.json",
-            "lock": lock,
+            "lock": freeze,
+            "verified_backup": verified_backup,
+            "backup_receipt": backup_receipt,
+            "migration_receipt": migration_receipt,
+            "migration_lock": migration_lock,
+            "receipt": install_receipt,
         }
 
-    def _install_arguments(self, layout: dict[str, Path]) -> dict[str, Any]:
+    def _arguments(self, layout: dict[str, Path]) -> dict[str, Any]:
         return {
             "formal_database": layout["formal"],
             "candidate": layout["candidate"],
-            "expected_source_sha256": _sha256(layout["formal"]),
-            "expected_candidate_sha256": _sha256(layout["candidate"]),
+            "migration_receipt": layout["migration_receipt"],
+            "expected_migration_receipt_sha256": _sha256(
+                layout["migration_receipt"]
+            ),
             "backup_directory": layout["backup"],
             "receipt": layout["receipt"],
             "freeze_lock": layout["lock"],
@@ -230,19 +295,31 @@ class WriterDatabaseCandidateInstallerTest(unittest.TestCase):
             patch.object(installer, "FORMAL_BACKUP_ROOT", layout["backups"]),
             patch.multiple(
                 installer,
+                PROJECT_ROOT=layout["project"],
                 CANONICAL_OPERATOR_FREEZE_LOCK=layout["lock"],
-                EXPECTED_SOURCE_CONTENT_COUNT=1,
-                EXPECTED_SOURCE_METRIC_SNAPSHOT_COUNT=1,
-                EXPECTED_SOURCE_SCHEDULER_RUN_COUNT=1,
             ),
         )
 
-    def test_success_atomically_preserves_database_and_sidecars(self) -> None:
+    def _rewrite_migration_receipt(
+        self,
+        layout: dict[str, Path],
+        mutate: Any,
+    ) -> None:
+        value = json.loads(
+            layout["migration_receipt"].read_text(encoding="utf-8")
+        )
+        mutate(value)
+        layout["migration_receipt"].write_text(
+            json.dumps(value, ensure_ascii=False, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    def test_success_atomically_preserves_v15_database_and_sidecars(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             layout = self._layout(Path(temporary), sidecars=True)
-            arguments = self._install_arguments(layout)
-            source_sha = str(arguments["expected_source_sha256"])
-            candidate_sha = str(arguments["expected_candidate_sha256"])
+            arguments = self._arguments(layout)
+            source_sha = _sha256(layout["formal"])
+            candidate_sha = _sha256(layout["candidate"])
             wal_sha = _sha256(Path(f"{layout['formal']}-wal"))
             shm_sha = _sha256(Path(f"{layout['formal']}-shm"))
             first, second, third = self._constant_patches(layout)
@@ -250,15 +327,15 @@ class WriterDatabaseCandidateInstallerTest(unittest.TestCase):
                 first,
                 second,
                 third,
-                patch.object(installer, "_database_writer_handles", return_value=[]),
+                patch.object(installer, "_database_handles", return_value=[]),
             ):
                 result = installer.install_candidate(**arguments)
 
             self.assertEqual(result["status"], "installed")
             self.assertEqual(_sha256(layout["formal"]), candidate_sha)
             self.assertFalse(layout["candidate"].exists())
-            backup_database = layout["backup"] / layout["formal"].name
-            self.assertEqual(_sha256(backup_database), source_sha)
+            preserved = layout["backup"] / layout["formal"].name
+            self.assertEqual(_sha256(preserved), source_sha)
             self.assertEqual(
                 _sha256(layout["backup"] / f"{layout['formal'].name}-wal"),
                 wal_sha,
@@ -274,23 +351,80 @@ class WriterDatabaseCandidateInstallerTest(unittest.TestCase):
             self.assertEqual(receipt, result)
             self.assertEqual(receipt["before"]["database"]["sha256"], source_sha)
             self.assertEqual(receipt["installed"]["file"]["sha256"], candidate_sha)
-            self.assertEqual(receipt["backup"]["database"]["sha256"], source_sha)
-            self.assertEqual(receipt["candidate"]["validation"]["schema_version"], 13)
+            self.assertEqual(receipt["candidate"]["validation"]["schema_version"], 16)
             self.assertEqual(
-                receipt["candidate"]["validation"]["v8_6_report_revision_count"],
-                0,
+                receipt["candidate"]["source_lineage"]["added_tables"],
+                [],
             )
+            self.assertEqual(
+                receipt["candidate"]["source_lineage"][
+                    "appended_migration_versions"
+                ],
+                [16],
+            )
+            self.assertEqual(receipt["database_handles"], [])
 
-    def test_every_durable_checkpoint_rolls_back_database_and_sidecars(self) -> None:
+    def test_final_lock_binding_failure_rolls_back_before_context_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            layout = self._layout(Path(temporary), sidecars=True)
+            arguments = self._arguments(layout)
+            source_sha = _sha256(layout["formal"])
+            candidate_sha = _sha256(layout["candidate"])
+            wal_sha = _sha256(Path(f"{layout['formal']}-wal"))
+            shm_sha = _sha256(Path(f"{layout['formal']}-shm"))
+            original_lock_context = installer._exclusive_existing_migration_lock
+
+            @contextmanager
+            def replace_before_commit(path: Path) -> Any:
+                with original_lock_context(path) as lease:
+                    class CommitLease:
+                        identity = lease.identity
+
+                        def verify_for_commit(self) -> None:
+                            displaced = path.with_suffix(".commit-displaced")
+                            path.replace(displaced)
+                            path.write_bytes(installer.MIGRATION_LOCK_PAYLOAD)
+                            path.chmod(0o600)
+                            lease.verify_for_commit()
+
+                    yield CommitLease()
+
+            first, second, third = self._constant_patches(layout)
+            with (
+                first,
+                second,
+                third,
+                patch.object(installer, "_database_handles", return_value=[]),
+                patch.object(
+                    installer,
+                    "_exclusive_existing_migration_lock",
+                    replace_before_commit,
+                ),
+                self.assertRaisesRegex(installer.CandidateInstallError, "rolled back"),
+            ):
+                installer.install_candidate(**arguments)
+
+            self.assertEqual(_sha256(layout["formal"]), source_sha)
+            self.assertEqual(_sha256(layout["candidate"]), candidate_sha)
+            self.assertEqual(_sha256(Path(f"{layout['formal']}-wal")), wal_sha)
+            self.assertEqual(_sha256(Path(f"{layout['formal']}-shm")), shm_sha)
+            self.assertFalse(layout["receipt"].exists())
+            marker = json.loads(
+                (layout["backup"] / "FAILED.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(marker["status"], "rolled_back")
+
+    def test_every_durable_checkpoint_rolls_back_all_original_paths(self) -> None:
         for checkpoint in installer.INSTALL_CHECKPOINTS:
             with (
                 self.subTest(checkpoint=checkpoint),
                 tempfile.TemporaryDirectory() as temporary,
             ):
                 layout = self._layout(Path(temporary), sidecars=True)
-                arguments = self._install_arguments(layout)
-                source_sha = str(arguments["expected_source_sha256"])
-                candidate_sha = str(arguments["expected_candidate_sha256"])
+                arguments = self._arguments(layout)
+                source_sha = _sha256(layout["formal"])
+                candidate_sha = _sha256(layout["candidate"])
+                migration_receipt_sha = _sha256(layout["migration_receipt"])
                 wal_path = Path(f"{layout['formal']}-wal")
                 shm_path = Path(f"{layout['formal']}-shm")
                 wal_sha = _sha256(wal_path)
@@ -305,17 +439,23 @@ class WriterDatabaseCandidateInstallerTest(unittest.TestCase):
                     first,
                     second,
                     third,
-                    patch.object(
-                        installer, "_database_writer_handles", return_value=[]
-                    ),
+                    patch.object(installer, "_database_handles", return_value=[]),
                     self.assertRaisesRegex(
-                        installer.CandidateInstallError, "rolled back"
+                        installer.CandidateInstallError,
+                        "rolled back",
                     ),
                 ):
-                    installer.install_candidate(**arguments, fault_injector=fail_at)
+                    installer.install_candidate(
+                        **arguments,
+                        fault_injector=fail_at,
+                    )
 
                 self.assertEqual(_sha256(layout["formal"]), source_sha)
                 self.assertEqual(_sha256(layout["candidate"]), candidate_sha)
+                self.assertEqual(
+                    _sha256(layout["migration_receipt"]),
+                    migration_receipt_sha,
+                )
                 self.assertEqual(_sha256(wal_path), wal_sha)
                 self.assertEqual(_sha256(shm_path), shm_sha)
                 self.assertFalse(layout["receipt"].exists())
@@ -324,111 +464,60 @@ class WriterDatabaseCandidateInstallerTest(unittest.TestCase):
                         (layout["backup"] / "FAILED.json").read_text(encoding="utf-8")
                     )
                     self.assertEqual(marker["status"], "rolled_back")
-                    self.assertEqual(
-                        marker["candidate_trace_path"], str(layout["candidate"])
-                    )
 
-    def test_rollback_quarantines_new_candidate_sidecars_before_restoring_source(
-        self,
-    ) -> None:
-        for original_sidecars in (False, True):
-            with (
-                self.subTest(original_sidecars=original_sidecars),
-                tempfile.TemporaryDirectory() as temporary,
-            ):
-                layout = self._layout(Path(temporary), sidecars=original_sidecars)
-                arguments = self._install_arguments(layout)
-                source_sha = str(arguments["expected_source_sha256"])
-                candidate_sha = str(arguments["expected_candidate_sha256"])
-                original_wal_sha = (
-                    _sha256(Path(f"{layout['formal']}-wal"))
-                    if original_sidecars
-                    else None
-                )
-                original_shm_sha = (
-                    _sha256(Path(f"{layout['formal']}-shm"))
-                    if original_sidecars
-                    else None
-                )
-
-                def create_candidate_sidecars(name: str) -> None:
-                    if name == "after_installed_file_synced":
-                        Path(f"{layout['formal']}-wal").write_bytes(
-                            b"new candidate wal"
-                        )
-                        Path(f"{layout['formal']}-shm").write_bytes(
-                            b"new candidate shm"
-                        )
-                        raise RuntimeError("injected candidate sidecars")
-
-                first, second, third = self._constant_patches(layout)
-                with (
-                    first,
-                    second,
-                    third,
-                    patch.object(
-                        installer, "_database_writer_handles", return_value=[]
-                    ),
-                    self.assertRaisesRegex(
-                        installer.CandidateInstallError, "rolled back"
-                    ),
-                ):
-                    installer.install_candidate(
-                        **arguments, fault_injector=create_candidate_sidecars
-                    )
-
-                self.assertEqual(_sha256(layout["formal"]), source_sha)
-                self.assertEqual(_sha256(layout["candidate"]), candidate_sha)
-                for suffix, expected_payload in (
-                    ("-wal", b"new candidate wal"),
-                    ("-shm", b"new candidate shm"),
-                ):
-                    quarantined = (
-                        layout["backup"]
-                        / f"FAILED-installed-{layout['formal'].name}{suffix}"
-                    )
-                    self.assertEqual(quarantined.read_bytes(), expected_payload)
-                if original_sidecars:
-                    self.assertEqual(
-                        _sha256(Path(f"{layout['formal']}-wal")),
-                        original_wal_sha,
-                    )
-                    self.assertEqual(
-                        _sha256(Path(f"{layout['formal']}-shm")),
-                        original_shm_sha,
-                    )
-                else:
-                    self.assertFalse(Path(f"{layout['formal']}-wal").exists())
-                    self.assertFalse(Path(f"{layout['formal']}-shm").exists())
-                marker = json.loads(
-                    (layout["backup"] / "FAILED.json").read_text(encoding="utf-8")
-                )
-                self.assertEqual(marker["status"], "rolled_back")
-                self.assertEqual(len(marker["quarantined_paths"]), 2)
-
-    def test_active_writer_during_rollback_fails_closed_without_mixing_files(
-        self,
-    ) -> None:
+    def test_rollback_quarantines_candidate_sidecars_before_source_restore(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             layout = self._layout(Path(temporary), sidecars=True)
-            arguments = self._install_arguments(layout)
-            source_sha = str(arguments["expected_source_sha256"])
-            candidate_sha = str(arguments["expected_candidate_sha256"])
+            arguments = self._arguments(layout)
+            source_sha = _sha256(layout["formal"])
+            candidate_sha = _sha256(layout["candidate"])
+            original_wal_sha = _sha256(Path(f"{layout['formal']}-wal"))
+            original_shm_sha = _sha256(Path(f"{layout['formal']}-shm"))
+
+            def create_sidecars(name: str) -> None:
+                if name == "after_installed_file_synced":
+                    Path(f"{layout['formal']}-wal").write_bytes(b"candidate wal")
+                    Path(f"{layout['formal']}-shm").write_bytes(b"candidate shm")
+                    raise RuntimeError("injected candidate sidecars")
+
+            first, second, third = self._constant_patches(layout)
+            with (
+                first,
+                second,
+                third,
+                patch.object(installer, "_database_handles", return_value=[]),
+                self.assertRaisesRegex(installer.CandidateInstallError, "rolled back"),
+            ):
+                installer.install_candidate(
+                    **arguments,
+                    fault_injector=create_sidecars,
+                )
+            self.assertEqual(_sha256(layout["formal"]), source_sha)
+            self.assertEqual(_sha256(layout["candidate"]), candidate_sha)
+            self.assertEqual(_sha256(Path(f"{layout['formal']}-wal")), original_wal_sha)
+            self.assertEqual(_sha256(Path(f"{layout['formal']}-shm")), original_shm_sha)
+            self.assertEqual(
+                (
+                    layout["backup"]
+                    / f"FAILED-installed-{layout['formal'].name}-wal"
+                ).read_bytes(),
+                b"candidate wal",
+            )
+
+    def test_handle_racing_rollback_fails_closed_without_mixing_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            layout = self._layout(Path(temporary), sidecars=True)
+            arguments = self._arguments(layout)
+            source_sha = _sha256(layout["formal"])
+            candidate_sha = _sha256(layout["candidate"])
             calls = 0
 
-            def writer_handles(_databases: Any) -> list[dict[str, Any]]:
+            def handles(_databases: Any) -> list[dict[str, Any]]:
                 nonlocal calls
                 calls += 1
                 if calls < 4:
                     return []
-                return [
-                    {
-                        "command": "python",
-                        "pid": 999,
-                        "descriptor": "4uW",
-                        "path": str(layout["formal"]),
-                    }
-                ]
+                return [{"command": "python", "pid": 999, "descriptor": "4u"}]
 
             def fail_after_install(name: str) -> None:
                 if name == "after_installed_file_synced":
@@ -440,40 +529,33 @@ class WriterDatabaseCandidateInstallerTest(unittest.TestCase):
                 first,
                 second,
                 third,
-                patch.object(
-                    installer,
-                    "_database_writer_handles",
-                    side_effect=writer_handles,
-                ),
+                patch.object(installer, "_database_handles", side_effect=handles),
                 self.assertRaisesRegex(
-                    installer.CandidateInstallError, "rollback was incomplete"
+                    installer.CandidateInstallError,
+                    "rollback was incomplete",
                 ),
             ):
                 installer.install_candidate(
-                    **arguments, fault_injector=fail_after_install
+                    **arguments,
+                    fault_injector=fail_after_install,
                 )
-
             self.assertEqual(_sha256(layout["formal"]), candidate_sha)
             self.assertFalse(layout["candidate"].exists())
             self.assertEqual(
-                _sha256(layout["backup"] / layout["formal"].name), source_sha
-            )
-            self.assertEqual(
-                Path(f"{layout['formal']}-wal").read_bytes(), b"writer wal"
+                _sha256(layout["backup"] / layout["formal"].name),
+                source_sha,
             )
             marker = json.loads(
                 (layout["backup"] / "FAILED.json").read_text(encoding="utf-8")
             )
             self.assertEqual(marker["status"], "rollback_incomplete")
 
-    def test_racing_formal_path_is_preserved_without_clobbering_and_source_returns(
-        self,
-    ) -> None:
+    def test_racing_formal_path_is_quarantined_and_source_returns(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             layout = self._layout(Path(temporary))
-            arguments = self._install_arguments(layout)
-            source_sha = str(arguments["expected_source_sha256"])
-            candidate_sha = str(arguments["expected_candidate_sha256"])
+            arguments = self._arguments(layout)
+            source_sha = _sha256(layout["formal"])
+            candidate_sha = _sha256(layout["candidate"])
 
             def recreate_formal(name: str) -> None:
                 if name == "after_source_shm_moved":
@@ -484,677 +566,424 @@ class WriterDatabaseCandidateInstallerTest(unittest.TestCase):
                 first,
                 second,
                 third,
-                patch.object(installer, "_database_writer_handles", return_value=[]),
+                patch.object(installer, "_database_handles", return_value=[]),
                 self.assertRaisesRegex(installer.CandidateInstallError, "rolled back"),
             ):
-                installer.install_candidate(**arguments, fault_injector=recreate_formal)
-
+                installer.install_candidate(
+                    **arguments,
+                    fault_injector=recreate_formal,
+                )
             self.assertEqual(_sha256(layout["formal"]), source_sha)
             self.assertEqual(_sha256(layout["candidate"]), candidate_sha)
             self.assertEqual(
                 (
-                    layout["backup"] / f"FAILED-racing-{layout['formal'].name}"
+                    layout["backup"]
+                    / f"FAILED-racing-{layout['formal'].name}"
                 ).read_bytes(),
                 b"racing database",
             )
 
-    def test_receipt_fsync_failure_removes_installer_owned_receipt_and_rolls_back(
-        self,
-    ) -> None:
+    def test_receipt_fsync_failure_rolls_back_and_removes_partial_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             layout = self._layout(Path(temporary), sidecars=True)
-            arguments = self._install_arguments(layout)
-            source_sha = str(arguments["expected_source_sha256"])
-            candidate_sha = str(arguments["expected_candidate_sha256"])
-            original_fsync = installer._fsync_directory
+            arguments = self._arguments(layout)
+            source_sha = _sha256(layout["formal"])
+            candidate_sha = _sha256(layout["candidate"])
+            original = installer._fsync_directory
             failed = False
 
-            def fail_receipt_parent_once(path: Path) -> None:
+            def fail_once(path: Path) -> None:
                 nonlocal failed
                 if path == layout["receipt"].parent and not failed:
                     failed = True
-                    raise OSError("injected receipt parent fsync failure")
-                original_fsync(path)
+                    raise OSError("injected receipt fsync failure")
+                original(path)
 
             first, second, third = self._constant_patches(layout)
             with (
                 first,
                 second,
                 third,
-                patch.object(installer, "_database_writer_handles", return_value=[]),
-                patch.object(
-                    installer,
-                    "_fsync_directory",
-                    side_effect=fail_receipt_parent_once,
-                ),
+                patch.object(installer, "_database_handles", return_value=[]),
+                patch.object(installer, "_fsync_directory", side_effect=fail_once),
                 self.assertRaisesRegex(installer.CandidateInstallError, "rolled back"),
             ):
                 installer.install_candidate(**arguments)
-
             self.assertTrue(failed)
             self.assertFalse(layout["receipt"].exists())
             self.assertEqual(_sha256(layout["formal"]), source_sha)
             self.assertEqual(_sha256(layout["candidate"]), candidate_sha)
 
-    def test_refuses_writer_handle_before_creating_backup(self) -> None:
+    def test_refuses_read_or_write_database_handle_before_cutover(self) -> None:
+        for descriptor in ("4r", "5u", "6w"):
+            with (
+                self.subTest(descriptor=descriptor),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                layout = self._layout(Path(temporary))
+                arguments = self._arguments(layout)
+                first, second, third = self._constant_patches(layout)
+                with (
+                    first,
+                    second,
+                    third,
+                    patch.object(
+                        installer,
+                        "_database_handles",
+                        return_value=[
+                            {
+                                "command": "python",
+                                "pid": 123,
+                                "descriptor": descriptor,
+                            }
+                        ],
+                    ),
+                    self.assertRaisesRegex(
+                        installer.CandidateInstallError,
+                        "database handles",
+                    ),
+                ):
+                    installer.install_candidate(**arguments)
+                self.assertFalse(layout["backup"].exists())
+
+    def test_migration_receipt_contract_is_strict_and_hash_anchored(self) -> None:
+        cases = (
+            ("schema", lambda value: value.__setitem__("schema_version", "wrong")),
+            ("from", lambda value: value.__setitem__("from_version", 14)),
+            (
+                "source-path",
+                lambda value: value["formal_source"].__setitem__(
+                    "path", "/tmp/wrong.sqlite3"
+                ),
+            ),
+            (
+                "candidate-path",
+                lambda value: value["candidate"].__setitem__(
+                    "path", "/tmp/wrong.sqlite3"
+                ),
+            ),
+            (
+                "lineage",
+                lambda value: value["lineage"].__setitem__(
+                    "added_tables", ["unexpected"]
+                ),
+            ),
+            (
+                "backup",
+                lambda value: value["verified_backup"]["database"].__setitem__(
+                    "sha256", "f" * 64
+                ),
+            ),
+            ("extra", lambda value: value.__setitem__("unsupported", True)),
+        )
+        for name, mutate in cases:
+            with (
+                self.subTest(case=name),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                layout = self._layout(Path(temporary))
+                self._rewrite_migration_receipt(layout, mutate)
+                arguments = self._arguments(layout)
+                first, second, third = self._constant_patches(layout)
+                with (
+                    first,
+                    second,
+                    third,
+                    patch.object(installer, "_database_handles", return_value=[]),
+                    self.assertRaises(installer.CandidateInstallError),
+                ):
+                    installer.install_candidate(**arguments)
+                self.assertFalse(layout["backup"].exists())
+
         with tempfile.TemporaryDirectory() as temporary:
             layout = self._layout(Path(temporary))
-            arguments = self._install_arguments(layout)
+            arguments = self._arguments(layout)
+            arguments["expected_migration_receipt_sha256"] = "f" * 64
             first, second, third = self._constant_patches(layout)
             with (
                 first,
                 second,
                 third,
-                patch.object(
-                    installer,
-                    "_database_writer_handles",
-                    return_value=[
-                        {
-                            "command": "python",
-                            "pid": 123,
-                            "descriptor": "4u",
-                            "path": str(layout["formal"]),
-                        }
-                    ],
-                ),
-                self.assertRaisesRegex(
-                    installer.CandidateInstallError, "writer handles"
-                ),
+                self.assertRaisesRegex(installer.CandidateInstallError, "SHA-256"),
             ):
                 installer.install_candidate(**arguments)
-            self.assertFalse(layout["backup"].exists())
-            self.assertTrue(layout["formal"].exists())
-            self.assertTrue(layout["candidate"].exists())
 
-    def test_refuses_source_and_candidate_sha_mismatches(self) -> None:
-        for field in ("expected_source_sha256", "expected_candidate_sha256"):
-            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
-                layout = self._layout(Path(temporary))
-                arguments = self._install_arguments(layout)
-                arguments[field] = "f" * 64
-                first, second, third = self._constant_patches(layout)
-                with (
-                    first,
-                    second,
-                    third,
-                    patch.object(
-                        installer, "_database_writer_handles", return_value=[]
-                    ),
-                    self.assertRaisesRegex(installer.CandidateInstallError, "SHA-256"),
-                ):
-                    installer.install_candidate(**arguments)
-                self.assertFalse(layout["backup"].exists())
-
-    def test_refuses_candidate_with_missing_or_mutated_preexisting_business_data(
+    def test_recomputes_lineage_after_candidate_tampering_even_if_receipt_is_rehashed(
         self,
     ) -> None:
-        mutations = (
-            (
-                "mutated-content",
-                "UPDATE content_items SET title='silently changed'",
-                "content_items",
-            ),
-            (
-                "missing-snapshot",
-                "DELETE FROM content_metric_snapshots",
-                "content_metric_snapshots",
-            ),
-        )
-        for name, statement, expected_table in mutations:
-            with (
-                self.subTest(case=name),
-                tempfile.TemporaryDirectory() as temporary,
-            ):
-                layout = self._layout(Path(temporary))
-                raw = sqlite3.connect(layout["candidate"])
-                try:
-                    raw.execute(statement)
-                    raw.commit()
-                finally:
-                    raw.close()
-                arguments = self._install_arguments(layout)
-                first, second, third = self._constant_patches(layout)
-                with (
-                    first,
-                    second,
-                    third,
-                    patch.object(
-                        installer, "_database_writer_handles", return_value=[]
-                    ),
-                    self.assertRaisesRegex(
-                        installer.CandidateInstallError, expected_table
-                    ),
-                ):
-                    installer.install_candidate(**arguments)
-                self.assertFalse(layout["backup"].exists())
-
-    def test_refuses_candidate_that_mutates_existing_migration_or_sequence(
-        self,
-    ) -> None:
-        mutations = (
-            (
-                "migration",
-                "UPDATE schema_migrations SET applied_at='changed' WHERE version=11",
-                "pre-existing schema migration",
-            ),
-            (
-                "sequence",
-                "UPDATE sqlite_sequence SET seq=seq+10 WHERE name='content_items'",
-                "AUTOINCREMENT sequences",
-            ),
-        )
-        for name, statement, message in mutations:
-            with (
-                self.subTest(case=name),
-                tempfile.TemporaryDirectory() as temporary,
-            ):
-                layout = self._layout(Path(temporary))
-                raw = sqlite3.connect(layout["candidate"])
-                try:
-                    raw.execute(statement)
-                    raw.commit()
-                finally:
-                    raw.close()
-                arguments = self._install_arguments(layout)
-                first, second, third = self._constant_patches(layout)
-                with (
-                    first,
-                    second,
-                    third,
-                    patch.object(
-                        installer, "_database_writer_handles", return_value=[]
-                    ),
-                    self.assertRaisesRegex(installer.CandidateInstallError, message),
-                ):
-                    installer.install_candidate(**arguments)
-                self.assertFalse(layout["backup"].exists())
-
-    def test_refuses_field_tampering_in_metric_and_scheduler_migration_rows(
-        self,
-    ) -> None:
-        cases = (
-            (
-                "metric-observation",
-                "trg_metric_observations_immutable_payload",
-                "UPDATE content_metric_observations "
-                "SET subject_key='wrong-subject',observation_sha256='f' || "
-                "substr(observation_sha256,2)",
-                "metric observation projection",
-            ),
-            (
-                "scheduler-attempt",
-                "trg_scheduler_run_attempts_terminal_update",
-                "UPDATE scheduler_run_attempts SET details_json='{\"wrong\":true}'",
-                "scheduler attempt baseline",
-            ),
-        )
-        for name, trigger, statement, message in cases:
-            with (
-                self.subTest(case=name),
-                tempfile.TemporaryDirectory() as temporary,
-            ):
-                layout = self._layout(Path(temporary))
-                raw = sqlite3.connect(layout["candidate"])
-                try:
-                    trigger_sql = str(
-                        raw.execute(
-                            "SELECT sql FROM sqlite_master "
-                            "WHERE type='trigger' AND name=?",
-                            (trigger,),
-                        ).fetchone()[0]
-                    )
-                    raw.execute(f'DROP TRIGGER "{trigger}"')
-                    raw.execute(statement)
-                    raw.execute(trigger_sql)
-                    raw.commit()
-                finally:
-                    raw.close()
-                arguments = self._install_arguments(layout)
-                first, second, third = self._constant_patches(layout)
-                with (
-                    first,
-                    second,
-                    third,
-                    patch.object(
-                        installer, "_database_writer_handles", return_value=[]
-                    ),
-                    self.assertRaisesRegex(installer.CandidateInstallError, message),
-                ):
-                    installer.install_candidate(**arguments)
-                self.assertFalse(layout["backup"].exists())
-
-    def test_refuses_exact_source_count_drift_even_if_candidate_matches(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             layout = self._layout(Path(temporary))
-            for database, statement in (
-                (layout["formal"], "DELETE FROM content_metric_snapshots"),
-                (layout["candidate"], "DELETE FROM content_metric_snapshots"),
-            ):
-                raw = sqlite3.connect(database)
-                try:
-                    raw.execute(statement)
-                    raw.commit()
-                finally:
-                    raw.close()
-            raw = sqlite3.connect(layout["candidate"])
-            try:
-                trigger = "trg_metric_observations_no_delete"
-                trigger_sql = str(
-                    raw.execute(
-                        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
-                        (trigger,),
-                    ).fetchone()[0]
+            with sqlite3.connect(layout["candidate"]) as connection:
+                connection.execute(
+                    "UPDATE content_items SET title='tampered candidate'"
                 )
-                raw.execute(f'DROP TRIGGER "{trigger}"')
-                raw.execute("DELETE FROM content_metric_observations")
-                raw.execute(trigger_sql)
-                raw.commit()
-            finally:
-                raw.close()
-            arguments = self._install_arguments(layout)
+
+            def update_file(value: dict[str, Any]) -> None:
+                value["candidate"]["file"] = installer._fingerprint(
+                    layout["candidate"]
+                )
+
+            self._rewrite_migration_receipt(layout, update_file)
+            arguments = self._arguments(layout)
             first, second, third = self._constant_patches(layout)
             with (
                 first,
                 second,
                 third,
-                patch.object(installer, "_database_writer_handles", return_value=[]),
+                patch.object(installer, "_database_handles", return_value=[]),
                 self.assertRaisesRegex(
-                    installer.CandidateInstallError, "metric snapshot count changed"
+                    installer.CandidateInstallError,
+                    "retained table projection",
                 ),
             ):
                 installer.install_candidate(**arguments)
             self.assertFalse(layout["backup"].exists())
 
-    def test_refuses_candidate_identity_and_cutover_state_errors(self) -> None:
-        cases = (
-            (
-                "wrong-active",
-                "evaluation-v7__selling-points-v5.2",
-                "evaluation-v7",
-                False,
-                "active evaluation-v8",
-            ),
-            (
-                "existing-v8.6",
-                SOURCE_RELEASE_ID,
-                SOURCE_RULE_VERSION,
-                True,
-                "zero v8.6",
-            ),
-        )
-        for name, release_id, rule_version, with_revision, message in cases:
-            with self.subTest(case=name), tempfile.TemporaryDirectory() as temporary:
-                layout = self._layout(Path(temporary))
-                raw = sqlite3.connect(layout["candidate"])
-                try:
-                    if release_id != SOURCE_RELEASE_ID:
-                        raw.execute(
-                            """
-                            UPDATE evaluation_releases
-                            SET id=?,rule_version=? WHERE id=?
-                            """,
-                            (release_id, rule_version, SOURCE_RELEASE_ID),
-                        )
-                    if with_revision:
-                        captured_at = now_utc()
-                        raw.execute(
-                            """
-                            INSERT INTO report_tasks(
-                                id,task_type,name,period_start,period_end,
-                                creation_source,task_status,progress,created_at,updated_at
-                            ) VALUES (
-                                'precutover-report','daily','precutover','2026-08-04',
-                                '2026-08-04','manual','partial',100,?,?
-                            )
-                            """,
-                            (captured_at, captured_at),
-                        )
-                        raw.execute(
-                            """
-                            INSERT INTO report_revisions(
-                                task_id,revision,release_id,contract_version,
-                                rule_version,taxonomy_version,report_json_path,
-                                report_sha256,created_at
-                            ) VALUES ('precutover-report',1,?,?,?,?,?,?,?)
-                            """,
-                            (
-                                release_id,
-                                REPORT_VERSION,
-                                rule_version,
-                                TAXONOMY_VERSION,
-                                "report.json",
-                                "b" * 64,
-                                captured_at,
-                            ),
-                        )
-                    raw.commit()
-                finally:
-                    raw.close()
-                arguments = self._install_arguments(layout)
-                first, second, third = self._constant_patches(layout)
-                with (
-                    first,
-                    second,
-                    third,
-                    patch.object(
-                        installer, "_database_writer_handles", return_value=[]
-                    ),
-                    self.assertRaisesRegex(installer.CandidateInstallError, message),
-                ):
-                    installer.install_candidate(**arguments)
-                self.assertFalse(layout["backup"].exists())
-
-    def test_refuses_inexact_candidate_schema(self) -> None:
+    def test_rejects_extra_candidate_trigger_even_if_receipt_is_rehashed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             layout = self._layout(Path(temporary))
-            raw = sqlite3.connect(layout["candidate"])
-            raw.execute("PRAGMA user_version=12")
-            raw.commit()
-            raw.close()
-            arguments = self._install_arguments(layout)
+            with sqlite3.connect(layout["candidate"]) as connection:
+                connection.execute(
+                    """
+                    CREATE TRIGGER injected_accounts_delete
+                    AFTER INSERT ON accounts
+                    BEGIN
+                        DELETE FROM accounts WHERE id=NEW.id;
+                    END
+                    """
+                )
+
+            def update_file(value: dict[str, Any]) -> None:
+                value["candidate"]["file"] = installer._fingerprint(
+                    layout["candidate"]
+                )
+
+            self._rewrite_migration_receipt(layout, update_file)
+            arguments = self._arguments(layout)
             first, second, third = self._constant_patches(layout)
             with (
                 first,
                 second,
                 third,
-                patch.object(installer, "_database_writer_handles", return_value=[]),
-                self.assertRaisesRegex(installer.CandidateInstallError, "schema"),
+                patch.object(installer, "_database_handles", return_value=[]),
+                self.assertRaisesRegex(
+                    installer.CandidateInstallError,
+                    "schema object lineage",
+                ),
             ):
                 installer.install_candidate(**arguments)
+            self.assertFalse(layout["backup"].exists())
 
-    def test_refuses_every_candidate_sidecar_and_nonempty_formal_wal(self) -> None:
-        for suffix in installer.SQLITE_TRANSIENT_SUFFIXES:
+    def test_refuses_changed_backup_held_migration_lock_and_candidate_sidecar(
+        self,
+    ) -> None:
+        scenarios = ("backup", "migration-lock", "candidate-sidecar")
+        for scenario in scenarios:
             with (
-                self.subTest(candidate_suffix=suffix),
+                self.subTest(scenario=scenario),
                 tempfile.TemporaryDirectory() as temporary,
             ):
                 layout = self._layout(Path(temporary))
-                Path(f"{layout['candidate']}{suffix}").write_bytes(b"sidecar")
-                arguments = self._install_arguments(layout)
+                lock_descriptor: int | None = None
+                if scenario == "backup":
+                    with layout["verified_backup"].open("ab") as handle:
+                        handle.write(b"changed")
+                elif scenario == "migration-lock":
+                    lock_descriptor = os.open(layout["migration_lock"], os.O_RDWR)
+                    fcntl.flock(lock_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                else:
+                    Path(f"{layout['candidate']}-wal").write_bytes(b"")
+                arguments = self._arguments(layout)
                 first, second, third = self._constant_patches(layout)
-                with (
-                    first,
-                    second,
-                    third,
-                    self.assertRaisesRegex(
-                        installer.CandidateInstallError, "self-contained"
-                    ),
-                ):
-                    installer.install_candidate(**arguments)
-                self.assertFalse(layout["backup"].exists())
-
-        with tempfile.TemporaryDirectory() as temporary:
-            layout = self._layout(Path(temporary))
-            Path(f"{layout['formal']}-wal").write_bytes(b"uncheckpointed")
-            arguments = self._install_arguments(layout)
-            first, second, third = self._constant_patches(layout)
-            with (
-                first,
-                second,
-                third,
-                patch.object(installer, "_database_writer_handles", return_value=[]),
-                self.assertRaisesRegex(
-                    installer.CandidateInstallError, "formal source WAL"
-                ),
-            ):
-                installer.install_candidate(**arguments)
-            self.assertFalse(layout["backup"].exists())
-
-    def test_refuses_symlinks_hardlinks_and_same_inode(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            layout = self._layout(Path(temporary))
-            real_candidate = layout["candidate"]
-            symlink = real_candidate.with_name("candidate-link.sqlite3")
-            symlink.symlink_to(real_candidate)
-            arguments = self._install_arguments(layout)
-            arguments["candidate"] = symlink
-            arguments["expected_candidate_sha256"] = _sha256(real_candidate)
-            first, second, third = self._constant_patches(layout)
-            with (
-                first,
-                second,
-                third,
-                self.assertRaisesRegex(installer.CandidateInstallError, "non-symlink"),
-            ):
-                installer.install_candidate(**arguments)
-
-        with tempfile.TemporaryDirectory() as temporary:
-            layout = self._layout(Path(temporary))
-            extra_link = layout["candidate"].with_name("candidate-hardlink.sqlite3")
-            os.link(layout["candidate"], extra_link)
-            arguments = self._install_arguments(layout)
-            first, second, third = self._constant_patches(layout)
-            with (
-                first,
-                second,
-                third,
-                self.assertRaisesRegex(installer.CandidateInstallError, "hard-linked"),
-            ):
-                installer.install_candidate(**arguments)
-
-        with tempfile.TemporaryDirectory() as temporary:
-            layout = self._layout(Path(temporary))
-            layout["candidate"].unlink()
-            os.link(layout["formal"], layout["candidate"])
-            arguments = self._install_arguments(layout)
-            first, second, third = self._constant_patches(layout)
-            with (
-                first,
-                second,
-                third,
-                self.assertRaisesRegex(
-                    installer.CandidateInstallError, "hard-linked|different inodes"
-                ),
-            ):
-                installer.install_candidate(**arguments)
-
-    def test_refuses_cross_device_candidate_before_any_move(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            layout = self._layout(Path(temporary))
-            arguments = self._install_arguments(layout)
-            original = installer._stat_identity
-
-            def cross_device(path: Path) -> Any:
-                identity = original(path)
-                if path == layout["candidate"]:
-                    return replace(identity, device=identity.device + 1)
-                return identity
-
-            first, second, third = self._constant_patches(layout)
-            with (
-                first,
-                second,
-                third,
-                patch.object(installer, "_stat_identity", side_effect=cross_device),
-                self.assertRaisesRegex(
-                    installer.CandidateInstallError, "same filesystem"
-                ),
-            ):
-                installer.install_candidate(**arguments)
-            self.assertFalse(layout["backup"].exists())
-
-    def test_refuses_path_escape_existing_outputs_and_noncanonical_lock(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            layout = self._layout(Path(temporary))
-            cases = (
-                (
-                    "backup_directory",
-                    layout["backups"].parent / "escaped",
-                    "direct child",
-                ),
-                ("receipt", layout["backups"] / "receipt.json", "outside"),
-                (
-                    "backup_directory",
-                    layout["backups"] / "nested" / "install",
-                    "direct child",
-                ),
-            )
-            for field, value, message in cases:
-                with self.subTest(field=field):
-                    arguments = self._install_arguments(layout)
-                    arguments[field] = value
-                    first, second, third = self._constant_patches(layout)
+                try:
                     with (
                         first,
                         second,
                         third,
-                        self.assertRaisesRegex(
-                            installer.CandidateInstallError, message
-                        ),
+                        patch.object(installer, "_database_handles", return_value=[]),
+                        self.assertRaises(installer.CandidateInstallError),
                     ):
                         installer.install_candidate(**arguments)
+                finally:
+                    if lock_descriptor is not None:
+                        fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+                        os.close(lock_descriptor)
+                self.assertFalse(layout["backup"].exists())
 
-            alternate = layout["lock"].with_name("alternate.lock")
-            alternate.write_text("frozen\n", encoding="utf-8")
-            arguments = self._install_arguments(layout)
-            arguments["freeze_lock"] = alternate
-            first, second, third = self._constant_patches(layout)
+    def test_refuses_symlink_hardlink_cross_device_and_noncanonical_freeze(self) -> None:
+        for scenario in ("symlink", "hardlink", "cross-device", "freeze-mode"):
             with (
-                first,
-                second,
-                third,
-                self.assertRaisesRegex(installer.CandidateInstallError, "canonical"),
+                self.subTest(scenario=scenario),
+                tempfile.TemporaryDirectory() as temporary,
             ):
-                installer.install_candidate(**arguments)
+                layout = self._layout(Path(temporary))
+                arguments = self._arguments(layout)
+                identity_patch: Any = patch.object(
+                    installer,
+                    "_stat_identity",
+                    wraps=installer._stat_identity,
+                )
+                if scenario == "symlink":
+                    real = layout["candidate"].with_name("real.sqlite3")
+                    layout["candidate"].replace(real)
+                    layout["candidate"].symlink_to(real)
+                elif scenario == "hardlink":
+                    os.link(
+                        layout["candidate"],
+                        layout["candidate"].with_name("second-link.sqlite3"),
+                    )
+                elif scenario == "cross-device":
+                    original = installer._stat_identity
 
-    def test_receipt_is_exclusive_and_preexisting_path_blocks_install(self) -> None:
+                    def different_device(path: Path) -> Any:
+                        value = original(path)
+                        if path == layout["candidate"]:
+                            return replace(value, device=value.device + 1)
+                        return value
+
+                    identity_patch = patch.object(
+                        installer,
+                        "_stat_identity",
+                        side_effect=different_device,
+                    )
+                else:
+                    layout["lock"].chmod(0o644)
+                first, second, third = self._constant_patches(layout)
+                with (
+                    first,
+                    second,
+                    third,
+                    identity_patch,
+                    self.assertRaises(installer.CandidateInstallError),
+                ):
+                    installer.install_candidate(**arguments)
+                self.assertFalse(layout["backup"].exists())
+
+    def test_install_receipt_is_o_excl_and_racer_is_not_overwritten(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             layout = self._layout(Path(temporary))
-            layout["receipt"].write_text("do not overwrite\n", encoding="utf-8")
-            arguments = self._install_arguments(layout)
+            arguments = self._arguments(layout)
+            source_sha = _sha256(layout["formal"])
+            candidate_sha = _sha256(layout["candidate"])
+            original = installer._write_json_exclusive
+
+            def race(path: Path, value: Any, **kwargs: Any) -> None:
+                if path == layout["receipt"]:
+                    path.write_text("operator-owned", encoding="utf-8")
+                original(path, value, **kwargs)
+
             first, second, third = self._constant_patches(layout)
             with (
                 first,
                 second,
                 third,
-                self.assertRaisesRegex(
-                    installer.CandidateInstallError, "must not already exist"
-                ),
+                patch.object(installer, "_database_handles", return_value=[]),
+                patch.object(installer, "_write_json_exclusive", side_effect=race),
+                self.assertRaisesRegex(installer.CandidateInstallError, "rolled back"),
             ):
                 installer.install_candidate(**arguments)
             self.assertEqual(
-                layout["receipt"].read_text(encoding="utf-8"), "do not overwrite\n"
+                layout["receipt"].read_text(encoding="utf-8"),
+                "operator-owned",
             )
-            self.assertFalse(layout["backup"].exists())
-
-    def test_receipt_o_excl_race_rolls_back_without_overwriting_racer(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            layout = self._layout(Path(temporary), sidecars=True)
-            arguments = self._install_arguments(layout)
-            source_sha = str(arguments["expected_source_sha256"])
-            candidate_sha = str(arguments["expected_candidate_sha256"])
-
-            def create_racing_receipt(name: str) -> None:
-                if name == "after_post_install_verification":
-                    layout["receipt"].write_text("racing operator\n", encoding="utf-8")
-
-            first, second, third = self._constant_patches(layout)
-            with (
-                first,
-                second,
-                third,
-                patch.object(installer, "_database_writer_handles", return_value=[]),
-                self.assertRaisesRegex(installer.CandidateInstallError, "rolled back"),
-            ):
-                installer.install_candidate(
-                    **arguments, fault_injector=create_racing_receipt
-                )
             self.assertEqual(_sha256(layout["formal"]), source_sha)
             self.assertEqual(_sha256(layout["candidate"]), candidate_sha)
-            self.assertEqual(
-                layout["receipt"].read_text(encoding="utf-8"),
-                "racing operator\n",
-            )
 
-    def test_lsof_parser_allows_readers_and_reports_writers(self) -> None:
+    def test_lsof_parser_reports_readers_and_writers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            database = Path(temporary) / "database.sqlite3"
-            database.write_bytes(b"database")
+            database = Path(temporary) / "db.sqlite3"
+            database.write_bytes(b"fixture")
             output = "\n".join(
                 (
                     "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME",
-                    f"python 101 mark 3rR REG 1,2 8 1 {database}",
-                    f"python 202 mark 4uW REG 1,2 8 1 {database}",
-                    f"python 303 mark 5wR REG 1,2 8 1 {database}",
+                    f"python 10 mark 4r REG 1,1 1 1 {database}",
+                    f"python 11 mark 5u REG 1,1 1 1 {database}",
+                    f"python 12 mark txt REG 1,1 1 1 {database}",
                 )
             )
-            completed = subprocess.CompletedProcess(
-                args=["lsof"], returncode=0, stdout=output, stderr=""
-            )
-            with patch.object(installer.subprocess, "run", return_value=completed):
-                writers = installer._database_writer_handles((database,))
-            self.assertEqual(
-                [(item["pid"], item["descriptor"]) for item in writers],
-                [(202, "4uW"), (303, "5wR")],
-            )
-
-            failed = subprocess.CompletedProcess(
-                args=["lsof"], returncode=2, stdout="", stderr="permission denied"
-            )
-            with (
-                patch.object(installer.subprocess, "run", return_value=failed),
-                self.assertRaisesRegex(
-                    installer.CandidateInstallError, "permission denied"
+            with patch.object(
+                installer.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout=output,
+                    stderr="",
                 ),
             ):
-                installer._database_writer_handles((database,))
+                handles = installer._database_handles((database,))
+            self.assertEqual(
+                [item["descriptor"] for item in handles],
+                ["4r", "5u"],
+            )
 
-    def test_cli_requires_all_explicit_inputs_and_forwards_exact_values(self) -> None:
-        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            installer.build_parser().parse_args([])
-
+    def test_cli_requires_and_forwards_migration_receipt_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            layout = self._layout(Path(temporary))
-            arguments = self._install_arguments(layout)
-            argv = [
+            root = Path(temporary)
+            arguments = [
                 "--formal-db",
-                str(layout["formal"]),
+                str(root / "formal.sqlite3"),
                 "--candidate",
-                str(layout["candidate"]),
-                "--expected-source-sha256",
-                str(arguments["expected_source_sha256"]),
-                "--expected-candidate-sha256",
-                str(arguments["expected_candidate_sha256"]),
+                str(root / "candidate.sqlite3"),
+                "--migration-receipt",
+                str(root / "migration.json"),
+                "--expected-migration-receipt-sha256",
+                "a" * 64,
                 "--backup-dir",
-                str(layout["backup"]),
+                str(root / "backup"),
                 "--receipt",
-                str(layout["receipt"]),
+                str(root / "install.json"),
                 "--freeze-lock",
-                str(layout["lock"]),
+                str(root / "freeze.lock"),
             ]
+            expected = {"status": "installed"}
             stdout = io.StringIO()
-            stderr = io.StringIO()
             with (
                 patch.object(
                     installer,
                     "install_candidate",
-                    return_value={"status": "installed"},
-                ) as invoked,
+                    return_value=expected,
+                ) as call,
                 redirect_stdout(stdout),
-                redirect_stderr(stderr),
             ):
-                code = installer.main(argv)
-            self.assertEqual((code, stderr.getvalue()), (0, ""))
-            self.assertEqual(json.loads(stdout.getvalue()), {"status": "installed"})
-            invoked.assert_called_once_with(**arguments)
+                self.assertEqual(installer.main(arguments), 0)
+            self.assertEqual(json.loads(stdout.getvalue()), expected)
+            call.assert_called_once_with(
+                formal_database=root / "formal.sqlite3",
+                candidate=root / "candidate.sqlite3",
+                migration_receipt=root / "migration.json",
+                expected_migration_receipt_sha256="a" * 64,
+                backup_directory=root / "backup",
+                receipt=root / "install.json",
+                freeze_lock=root / "freeze.lock",
+            )
+            with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
+                installer.main(arguments[:-2])
 
-    def test_exact_formal_target_is_not_configurable_by_cli(self) -> None:
+    def test_test_guard_refuses_actual_default_before_database_open(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            layout = self._layout(Path(temporary))
-            alternate = layout["formal"].with_name("alternate.sqlite3")
-            self._build_source_database(alternate)
-            arguments = self._install_arguments(layout)
-            arguments["formal_database"] = alternate
-            first, second, third = self._constant_patches(layout)
+            fake_formal = Path(temporary) / "never-open.sqlite3"
             with (
-                first,
-                second,
-                third,
+                patch.dict(os.environ, {"DCAR_TEST_DENY_FORMAL_DB": "1"}),
+                patch.multiple(
+                    installer,
+                    DEFAULT_DB=fake_formal,
+                    FORMAL_DATABASE=fake_formal,
+                ),
                 self.assertRaisesRegex(
-                    installer.CandidateInstallError, "formal target must be exactly"
+                    installer.CandidateInstallError,
+                    "test process attempted to open the formal",
                 ),
             ):
-                installer.install_candidate(**arguments)
+                installer.install_candidate(
+                    formal_database=fake_formal,
+                    candidate=Path(temporary) / "candidate.sqlite3",
+                    migration_receipt=Path(temporary) / "migration.json",
+                    expected_migration_receipt_sha256="a" * 64,
+                    backup_directory=Path(temporary) / "backup",
+                    receipt=Path(temporary) / "install.json",
+                    freeze_lock=Path(temporary) / "freeze.lock",
+                )
 
 
 if __name__ == "__main__":

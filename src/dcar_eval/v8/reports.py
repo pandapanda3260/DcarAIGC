@@ -1337,18 +1337,6 @@ def _build_report_data(
     duplicate_by_content = {
         int(row["duplicate_content_id"]): dict(row) for row in duplicate_rows
     }
-    review_rows = connection.execute(
-        """
-        SELECT rq.status, COUNT(*) count FROM review_queue rq
-        JOIN evaluation_versions ev ON ev.id=rq.evaluation_id
-        WHERE rq.content_id IN (
-            SELECT content_id FROM task_contents
-            WHERE task_id=? AND inclusion_status='included'
-        ) AND ev.release_id=? AND ev.invalidated_at IS NULL
-        GROUP BY rq.status ORDER BY rq.status
-        """,
-        (task["id"], release["id"]),
-    ).fetchall()
     capture_rows = connection.execute(
         """
         SELECT fs.stage, fs.status, COUNT(*) count FROM fetch_slots fs
@@ -1565,7 +1553,6 @@ def _build_report_data(
             for code, count in sorted(point_counts.items())
         ],
         "duplicates": [dict(row) for row in duplicate_rows],
-        "review_summary": [dict(row) for row in review_rows],
         "capture_summary": [dict(row) for row in capture_rows],
         "provider_costs": [dict(row) for row in cost_rows],
         "content_details": details,
@@ -1915,28 +1902,58 @@ def _write_channel_csv(path: Path, channels: Mapping[str, Any]) -> None:
         writer.writerows(rows)
 
 
-def _render_png(svg_path: Path, png_path: Path) -> bool:
-    renderer = shutil.which("qlmanage")
-    if renderer is None:
-        return False
+def _valid_summary_png(path: Path) -> bool:
+    """Reject square Quick Look thumbnails that crop the 1200x675 report SVG."""
+
     try:
-        result = subprocess.run(
-            [renderer, "-t", "-s", "1600", "-o", str(svg_path.parent), str(svg_path)],
-            capture_output=True,
-            timeout=30,
-            check=False,
+        payload = path.read_bytes()
+    except OSError:
+        return False
+    header = payload[:24]
+    return (
+        len(header) == 24
+        and header[:8] == b"\x89PNG\r\n\x1a\n"
+        and int.from_bytes(header[16:20], "big") == 1200
+        and int.from_bytes(header[20:24], "big") == 675
+        and len(payload) > 1024
+    )
+
+
+def render_summary_png(svg_path: Path, png_path: Path) -> bool:
+    """Render the report SVG without changing its aspect ratio.
+
+    macOS ``qlmanage -t`` produces a square thumbnail and crops this report.
+    Prefer real SVG renderers; if none is installed the caller keeps the SVG as
+    the lossless image artifact instead of publishing a malformed PNG.
+    """
+
+    commands = []
+    if renderer := shutil.which("sips"):
+        commands.append(
+            [renderer, "-s", "format", "png", str(svg_path), "--out", str(png_path)]
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    generated = svg_path.with_name(svg_path.name + ".png")
-    if (
-        result.returncode != 0
-        or not generated.is_file()
-        or generated.stat().st_size <= 1024
-    ):
-        return False
-    generated.replace(png_path)
-    return True
+    if renderer := shutil.which("rsvg-convert"):
+        commands.append([renderer, "-o", str(png_path), str(svg_path)])
+    if renderer := shutil.which("magick"):
+        commands.append([renderer, str(svg_path), str(png_path)])
+    if renderer := shutil.which("convert"):
+        commands.append([renderer, str(svg_path), str(png_path)])
+
+    for command in commands:
+        png_path.unlink(missing_ok=True)
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode == 0 and _valid_summary_png(png_path):
+            return True
+    png_path.unlink(missing_ok=True)
+    return False
 
 
 def _sha256(path: Path) -> str:
@@ -2140,7 +2157,7 @@ def run_task(
         _write_csv(temp_paths["content-csv"], report["content_details"])
         _write_channel_csv(temp_paths["channel-csv"], report["channels"])
         temp_paths["summary-svg"].write_text(_svg(report), encoding="utf-8")
-        png_available = _render_png(
+        png_available = render_summary_png(
             temp_paths["summary-svg"], temp_paths["summary-png"]
         )
         if png_available:

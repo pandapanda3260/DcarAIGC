@@ -33,14 +33,6 @@ class V8MediaTest(unittest.TestCase):
                 """,
                 (captured_at, captured_at, captured_at),
             )
-            connection.execute(
-                """
-                INSERT INTO review_queue(
-                    content_id, reason_code, status, created_at, updated_at
-                ) VALUES (1, 'stale_local_evidence', 'pending', ?, ?)
-                """,
-                (captured_at, captured_at),
-            )
             connection.commit()
         self.video = self.root / "video.mp4"
         subprocess.run(
@@ -5215,9 +5207,6 @@ class V8MediaTest(unittest.TestCase):
         )
         self.assertEqual(normalized["combined_text"], "汽车常见异响\n刹车片 平衡杆")
         self.assertEqual(set(artifacts), {"media", "asr", "ocr"})
-        with connect(self.db) as connection:
-            status = connection.execute("SELECT status FROM review_queue").fetchone()[0]
-        self.assertEqual(status, "resolved")
 
 
 if __name__ == "__main__":

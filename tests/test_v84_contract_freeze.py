@@ -299,8 +299,24 @@ class V84ContractFreezeTest(unittest.TestCase):
         self.assertEqual(
             v86["boolean_quality_fields"], ["duplicate_calibration_ready"]
         )
-        self.assertEqual(CURRENT_REPORT_VERSION, v86["report_version"])
-        self.assertEqual(CONTRACT_PATH, V8_6_CONTRACT_PATH)
+        # v8.7 起 review_summary 不再是必备键；v8.6 转为冻结历史契约
+        self.assertEqual(
+            LEGACY_CONTRACT_PATHS["dcar-content-operations-report-v8.6"],
+            V8_6_CONTRACT_PATH,
+        )
+        self.assertIn("review_summary", v86["required_top_level_keys"])
+        v87 = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(CONTRACT_PATH.name, "report_contract_v8_7.json")
+        self.assertEqual(CURRENT_REPORT_VERSION, v87["report_version"])
+        self.assertNotIn("review_summary", v87["required_top_level_keys"])
+        self.assertEqual(
+            [key for key in v87["required_top_level_keys"]],
+            [
+                key
+                for key in v86["required_top_level_keys"]
+                if key != "review_summary"
+            ],
+        )
         self.assertEqual(
             LEGACY_CONTRACT_PATHS["dcar-content-operations-report-v8.4"],
             V8_4_CONTRACT_PATH,

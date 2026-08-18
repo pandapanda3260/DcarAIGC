@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import fcntl
 import hashlib
 import json
@@ -9,14 +10,15 @@ import logging
 import os
 import re
 import sqlite3
+import tempfile
 import threading
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-from urllib.parse import unquote
+from typing import Any, Dict, List, Mapping, Optional
+from urllib.parse import quote, unquote
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler  # type: ignore[import-untyped]
@@ -38,12 +40,6 @@ from .contracts import (
     ratio_metric,
 )
 from .duplicates import FINGERPRINT_VERSION, THRESHOLDS, duplicate_metric_decision
-from .evaluation import (
-    EvaluationError,
-    assert_manual_review_writable,
-    reopen_review,
-    resolve_review,
-)
 from .evaluation_selectors import (
     DISPLAY_EFFECTIVE_EVALUATIONS_CTE,
     EvaluationSelectorError,
@@ -53,7 +49,6 @@ from .evaluation_selectors import (
     effective_direction,
     effective_direction_sql,
     formal_eligible_release_evaluations,
-    review_anchor_evaluation,
 )
 from .audience_rate import active_classifier_state, build_channel_audience_rates
 from .spu_audience import (
@@ -95,6 +90,11 @@ from .providers import (
     retry_content_media,
     update_content_data,
 )
+from .report_export import (
+    build_report_detail_workbook,
+    build_report_download_bundle,
+    report_bundle_filename,
+)
 from .reports import (
     IMPLICIT_RUN_STATUSES,
     REPORTS_ROOT,
@@ -105,6 +105,7 @@ from .reports import (
     get_task,
     list_tasks,
     request_task_cancel,
+    render_summary_png,
     retry_task,
     resume_task,
     run_task,
@@ -120,10 +121,10 @@ from .storage import (
     SCHEMA_VERSION,
     connect,
     initialize_database,
+    is_formal_database_path,
     now_utc,
     require_schema_compatibility,
     schema_compatibility_state,
-    transaction,
 )
 from .taxonomy import (
     TaxonomyError,
@@ -155,10 +156,23 @@ DOUYIN_URL_RE = re.compile(r"https?://(?:www\.)?douyin\.com/", re.I)
 XHS_URL_RE = re.compile(r"https?://(?:www\.)?xiaohongshu\.com/", re.I)
 UID_RE = re.compile(r"^\d{6,24}$")
 RUNTIME_IDENTITY_SCHEMA = "dcar-runtime-identity-v1"
+DAILY_CAPTURE_RECONCILE_INTERVAL_SECONDS = 3600
 
 
 def _enabled(name: str) -> bool:
     return os.environ.get(name, "0").strip() == "1"
+
+
+def _optional_strict_iso_date(name: str) -> date | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw) is None:
+        raise RuntimeError(f"{name} must use strict YYYY-MM-DD format")
+    try:
+        return date.fromisoformat(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a valid YYYY-MM-DD date") from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,12 +185,22 @@ class ApiConfig:
     scheduler_enabled: bool = False
     startup_catchup_enabled: bool = False
     read_only: bool = False
+    daily_capture_reconcile_from: date | None = None
 
     @classmethod
     def from_env(cls) -> "ApiConfig":
         freeze_value = os.environ.get("DCAR_OPERATOR_FREEZE_LOCK") or os.environ.get(
             "DCAR_FREEZE_LOCK"
         )
+        scheduler_enabled = _enabled("DCAR_SCHEDULER_ENABLED")
+        reconcile_from = _optional_strict_iso_date(
+            "DCAR_DAILY_CAPTURE_RECONCILE_FROM"
+        )
+        if scheduler_enabled and reconcile_from is None:
+            raise RuntimeError(
+                "DCAR_DAILY_CAPTURE_RECONCILE_FROM is required when "
+                "DCAR_SCHEDULER_ENABLED=1"
+            )
         return cls(
             db_path=Path(os.environ.get("DCAR_V8_DB", str(DEFAULT_DB))),
             reports_root=Path(
@@ -191,14 +215,21 @@ class ApiConfig:
             writer_lock=Path(
                 os.environ.get("DCAR_WRITER_LOCK", str(DEFAULT_WRITER_LOCK))
             ),
-            scheduler_enabled=_enabled("DCAR_SCHEDULER_ENABLED"),
+            scheduler_enabled=scheduler_enabled,
             startup_catchup_enabled=_enabled("DCAR_STARTUP_CATCHUP_ENABLED"),
             read_only=_enabled("DCAR_READ_ONLY"),
+            daily_capture_reconcile_from=reconcile_from,
         )
 
     @property
     def effective_startup_catchup_enabled(self) -> bool:
         return self.scheduler_enabled and self.startup_catchup_enabled
+
+    @property
+    def effective_daily_capture_reconcile_from(self) -> date | None:
+        if self.read_only or not self.scheduler_enabled:
+            return None
+        return self.daily_capture_reconcile_from
 
 
 def _request_config(request: Request) -> ApiConfig:
@@ -235,32 +266,12 @@ class ContentSearchRequest(BaseModel):
     platform: Optional[str] = Field(default=None, max_length=32)
     account_type: Optional[str] = Field(default=None, max_length=32)
     content_direction: Optional[str] = Field(default=None, max_length=32)
-    review_status: Optional[str] = Field(default=None, max_length=32)
     selling_point: Optional[str] = Field(default=None, max_length=8)
     spu_series: Optional[str] = Field(default=None, max_length=120)
     audience: Optional[str] = Field(default=None, max_length=16)
     scene: Optional[str] = Field(default=None, max_length=16)
     page: int = Field(default=1, ge=1)
     page_size: int = Field(default=50, ge=1, le=100)
-
-
-class ReviewResolveRequest(BaseModel):
-    base_evaluation_id: int = Field(ge=1)
-    decision: str = Field(max_length=40)
-    reason: str = Field(min_length=1, max_length=2000)
-    reviewer: str = Field(min_length=1, max_length=100)
-    evidence_type: str = Field(min_length=1, max_length=60)
-    evidence_text: str = Field(min_length=1, max_length=10000)
-    primary_selling_point_code: Optional[str] = Field(default=None, max_length=8)
-    selling_point_score: Optional[int] = Field(default=None, ge=0, le=100)
-    selling_point_included: Optional[bool] = None
-    content_automotive_score: Optional[int] = Field(default=None, ge=0, le=100)
-    content_direction: Optional[str] = Field(default=None, max_length=32)
-
-
-class ReviewReopenRequest(BaseModel):
-    reason: str = Field(min_length=1, max_length=2000)
-    reopened_by: str = Field(min_length=1, max_length=100)
 
 
 class SellingPointMutationRequest(BaseModel):
@@ -1000,16 +1011,6 @@ def v8_overview(db_path: Path, *, read_only: bool = False) -> Dict[str, Any]:
                     "SELECT COUNT(*) FROM content_items WHERE published_at IS NULL"
                 ).fetchone()[0]
             ),
-            "pending_reviews": int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM review_queue WHERE status IN ('pending','manual_required')"
-                ).fetchone()[0]
-            ),
-            "terminal_reviews": int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM review_queue WHERE status='terminal_failed'"
-                ).fetchone()[0]
-            ),
             "duplicate_fingerprint_coverage": round(
                 int(
                     connection.execute(
@@ -1195,12 +1196,6 @@ def _content_search(
     elif payload.selling_point:
         where.append("ev.primary_selling_point_code=?")
         parameters.append(payload.selling_point)
-    if payload.review_status == "pending":
-        where.append("rq.pending_count > 0")
-    elif payload.review_status == "terminal_failed":
-        where.append("rq.terminal_count > 0")
-    elif payload.review_status == "resolved":
-        where.append("rq.pending_count = 0 AND rq.terminal_count = 0")
     # SPU/人群/场景 标签筛选：只在 v14 关联域可用时生效（只读副本可能仍是 v13）
     spu_filters: List[str] = []
     spu_parameters: List[Any] = []
@@ -1243,20 +1238,6 @@ def _content_search(
         FROM content_items c
         LEFT JOIN accounts a ON a.id=c.account_id
         LEFT JOIN display_effective_evaluations ev ON ev.content_id=c.id
-        LEFT JOIN (
-            SELECT content_id,
-                   SUM(CASE WHEN status IN ('pending','manual_required','in_review') THEN 1 ELSE 0 END) pending_count,
-                   SUM(CASE WHEN status='terminal_failed' THEN 1 ELSE 0 END) terminal_count
-            FROM review_queue GROUP BY content_id
-        ) rq ON rq.content_id=c.id
-        LEFT JOIN review_queue current_rq ON current_rq.id=(
-            SELECT rq2.id FROM review_queue rq2
-            WHERE rq2.content_id=c.id
-            ORDER BY CASE rq2.status
-                WHEN 'in_review' THEN 0 WHEN 'pending' THEN 1
-                WHEN 'manual_required' THEN 2 WHEN 'terminal_failed' THEN 3 ELSE 4 END,
-                rq2.priority DESC, rq2.id DESC LIMIT 1
-        )
         LEFT JOIN content_metric_snapshots ms ON ms.id=(
             SELECT ms2.id FROM content_metric_snapshots ms2
             WHERE ms2.content_id=c.id ORDER BY ms2.captured_at DESC, ms2.id DESC LIMIT 1
@@ -1291,17 +1272,14 @@ def _content_search(
                    COALESCE(a.account_type, c.legacy_account_type, 'unknown') account_type,
                    {direction_sql} content_direction,
                    ev.primary_selling_point_code, ev.evidence_level,
-                   ev.content_automotive_score, ev.pending_review,
+                   ev.content_automotive_score,
                    ev.id display_evaluation_id,
                    ev.release_id evaluation_release_id,
                    COALESCE(ev.evaluation_freshness, 'missing') evaluation_freshness,
                    CASE WHEN ev.evaluation_freshness='stale' THEN 1 ELSE 0 END evaluation_is_stale,
                    ms.view_count, ms.comment_count, ms.like_count, ms.share_count,
                    ms.collect_count, ms.captured_at metrics_captured_at,
-                   original.link_id duplicate_original_link_id,
-                   current_rq.id review_queue_id, current_rq.status review_status,
-                   COALESCE(rq.pending_count, 0) pending_review_count,
-                   COALESCE(rq.terminal_count, 0) terminal_review_count
+                   original.link_id duplicate_original_link_id
             {from_sql} {where_sql}
             ORDER BY c.published_at IS NULL, c.published_at DESC, c.id DESC
             LIMIT ? OFFSET ?
@@ -1660,7 +1638,6 @@ def _content_evidence(
         if content is None:
             raise HTTPException(status_code=404, detail="内容不存在")
         evaluation = display_effective_evaluation(connection, content_id)
-        review_anchor = review_anchor_evaluation(connection, content_id)
         artifact_rows = connection.execute(
             """
             SELECT * FROM evidence_artifacts
@@ -1726,15 +1703,6 @@ def _content_evidence(
             """,
             (content_id,),
         ).fetchall()
-        review = connection.execute(
-            """
-            SELECT id,reason_code,status,priority,assigned_to,updated_at
-            FROM review_queue WHERE content_id=?
-            ORDER BY CASE status WHEN 'in_review' THEN 0 WHEN 'pending' THEN 1
-                WHEN 'manual_required' THEN 2 ELSE 3 END, id DESC LIMIT 1
-            """,
-            (content_id,),
-        ).fetchone()
     media_items: List[Dict[str, Any]] = []
     media_availability = {
         "status": "missing",
@@ -1788,9 +1756,6 @@ def _content_evidence(
                 "raw_account_name",
             )
         },
-        "base_evaluation_id": int(review_anchor["id"])
-        if review_anchor is not None
-        else None,
         "display_evaluation_id": int(evaluation["id"])
         if evaluation is not None
         else None,
@@ -1827,7 +1792,6 @@ def _content_evidence(
             "top_items": [dict(row) for row in comment_rows],
         },
         "processing_slots": [dict(row) for row in processing],
-        "review": dict(review) if review is not None else None,
     }
 
 
@@ -1906,19 +1870,17 @@ def _writer_process_lock(path: Path, *, enabled: bool):
             os.close(descriptor)
 
 
+def _uses_formal_database(path: Path) -> bool:
+    """Return whether one runtime points at the checked-out formal database."""
+
+    return is_formal_database_path(path, formal_database=DEFAULT_DB)
+
+
 @asynccontextmanager
 async def _lifespan_runtime(app: FastAPI):
     config = getattr(app.state, "config", None)
     if not isinstance(config, ApiConfig):
         raise RuntimeError("FastAPI application is missing ApiConfig")
-    if (
-        config.db_path.resolve() == DEFAULT_DB.resolve()
-        and config.operator_freeze_lock.exists()
-    ):
-        raise RuntimeError(
-            "production startup blocked by operator freeze lock: "
-            f"{config.operator_freeze_lock}"
-        )
     if config.read_only and (
         config.scheduler_enabled or config.startup_catchup_enabled
     ):
@@ -1953,8 +1915,30 @@ async def _lifespan_runtime(app: FastAPI):
         app.state.recovered_tasks = 0
         app.state.recovered_scheduler_runs = 0
     else:
-        with connect(config.db_path) as connection:
-            initialize_database(connection)
+        if _uses_formal_database(config.db_path):
+            if not config.db_path.is_file():
+                raise RuntimeError(
+                    f"formal SQLite database is missing: {config.db_path}"
+                )
+            # The formal database is migrated only by the explicit offline
+            # migration command.  Runtime startup must fail closed without
+            # opening a writable SQLite connection (which would create WAL/
+            # SHM sidecars before a schema mismatch can be reported).
+            with connect(config.db_path, read_only=True) as connection:
+                try:
+                    require_schema_compatibility(
+                        connection,
+                        supported_versions=frozenset({SCHEMA_VERSION}),
+                    )
+                except RuntimeError as exc:
+                    raise RuntimeError(
+                        "formal database schema is incompatible; "
+                        "offline schema migration is required: "
+                        f"{exc}"
+                    ) from exc
+        else:
+            with connect(config.db_path) as connection:
+                initialize_database(connection)
         app.state.recovered_scheduler_runs = recover_interrupted_scheduler_runs(
             db_path=config.db_path
         )
@@ -1974,6 +1958,12 @@ async def _lifespan_runtime(app: FastAPI):
     app.state.scheduler_enabled = False
     app.state.startup_catchup_requested = config.startup_catchup_enabled
     app.state.startup_catchup_enabled = False
+    app.state.daily_capture_reconcile_enabled = False
+    app.state.daily_capture_reconcile_effective_from = (
+        config.daily_capture_reconcile_from.isoformat()
+        if config.daily_capture_reconcile_from is not None
+        else None
+    )
     app.state.report_runtime_ready = None
     app.state.report_runtime_error = None
     scheduler: Optional[BackgroundScheduler] = None
@@ -1990,14 +1980,23 @@ async def _lifespan_runtime(app: FastAPI):
         else:
             app.state.report_runtime_ready = True
     if config.scheduler_enabled:
+        reconcile_effective_date = config.effective_daily_capture_reconcile_from
+        if reconcile_effective_date is None:
+            raise RuntimeError(
+                "daily capture reconcile requires an effective date when "
+                "scheduler is enabled"
+            )
         scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
         install_jobs(
             scheduler,
             db_path=config.db_path,
             reports_root=config.reports_root,
+            capture_call_override=None,
+            reconcile_effective_date=reconcile_effective_date,
         )
         scheduler.start()
         app.state.scheduler_enabled = True
+        app.state.daily_capture_reconcile_enabled = True
     if config.effective_startup_catchup_enabled:
         app.state.startup_catchup_enabled = True
         app.state.catchup_status = "running"
@@ -2032,6 +2031,19 @@ async def lifespan(app: FastAPI):
     config = getattr(app.state, "config", None)
     if not isinstance(config, ApiConfig):
         raise RuntimeError("FastAPI application is missing ApiConfig")
+    if config.scheduler_enabled and config.daily_capture_reconcile_from is None:
+        raise RuntimeError(
+            "daily capture reconcile requires an effective date when "
+            "scheduler is enabled"
+        )
+    if _uses_formal_database(config.db_path) and config.operator_freeze_lock.exists():
+        # Check the operator freeze before the scheduler lock context: entering
+        # that context creates/truncates the lock file even when DB startup is
+        # subsequently rejected.
+        raise RuntimeError(
+            "production startup blocked by operator freeze lock: "
+            f"{config.operator_freeze_lock}"
+        )
     app.state.writer_lock_path = str(config.writer_lock)
     app.state.writer_lock_held = False
     with _writer_process_lock(config.writer_lock, enabled=config.scheduler_enabled):
@@ -2175,6 +2187,22 @@ def get_v8_scheduler_status(request: Request) -> Dict[str, Any]:
             "status": getattr(request.app.state, "catchup_status", "unknown"),
             "error": getattr(request.app.state, "catchup_error", None),
             "results": getattr(request.app.state, "catchup_results", []),
+        },
+        "daily_capture_reconcile": {
+            "mode": "current_day_only",
+            "enabled": bool(
+                getattr(
+                    request.app.state,
+                    "daily_capture_reconcile_enabled",
+                    False,
+                )
+            ),
+            "effective_from": getattr(
+                request.app.state,
+                "daily_capture_reconcile_effective_from",
+                None,
+            ),
+            "interval_seconds": DAILY_CAPTURE_RECONCILE_INTERVAL_SECONDS,
         },
         "data_freshness": data_freshness,
         "jobs": [dict(row) for row in rows],
@@ -2348,6 +2376,115 @@ def download_v8_task_file(
         path,
         media_type=media_types.get(str(row["file_kind"]), "application/octet-stream"),
         filename=path.name,
+    )
+
+
+def _verified_report_file(row: Mapping[str, Any]) -> tuple[Path, bytes]:
+    path = _safe_project_path(str(row["local_path"]))
+    if not path.is_file():
+        raise HTTPException(status_code=410, detail="报告文件已登记但本地缺失")
+    try:
+        payload = path.read_bytes()
+    except OSError as exc:
+        raise HTTPException(status_code=410, detail="报告文件读取失败") from exc
+    expected_size = int(row["byte_size"])
+    expected_sha256 = str(row["sha256"])
+    if len(payload) != expected_size or hashlib.sha256(payload).hexdigest() != expected_sha256:
+        raise HTTPException(status_code=409, detail="报告文件完整性校验失败")
+    return path, payload
+
+
+@router.get("/api/v8/tasks/{task_id}/revisions/{revision}/download")
+def download_v8_task_report(
+    request: Request, task_id: str, revision: int
+) -> Response:
+    """Download one immutable revision as an image + native XLSX ZIP bundle."""
+
+    with _connect_for_request(request) as connection:
+        task = connection.execute(
+            """
+            SELECT t.id,t.name,t.period_start,t.period_end,t.task_status,t.created_at,
+                   rr.created_at revision_created_at
+            FROM report_revisions rr
+            JOIN report_tasks t ON t.id=rr.task_id
+            WHERE rr.task_id=? AND rr.revision=?
+            """,
+            (task_id, revision),
+        ).fetchone()
+        files = connection.execute(
+            """
+            SELECT file_kind,local_path,sha256,byte_size
+            FROM report_files
+            WHERE task_id=? AND revision=? AND status='available'
+              AND file_kind IN ('summary-svg','summary-png','content-csv','channel-csv')
+            """,
+            (task_id, revision),
+        ).fetchall()
+    if task is None:
+        raise HTTPException(status_code=404, detail="报告 revision 不存在")
+
+    by_kind = {str(row["file_kind"]): row for row in files}
+    content_row = by_kind.get("content-csv")
+    if content_row is None:
+        raise HTTPException(status_code=404, detail="报告内容明细不存在")
+    _, content_csv = _verified_report_file(content_row)
+
+    channel_csv = None
+    if channel_row := by_kind.get("channel-csv"):
+        _, channel_csv = _verified_report_file(channel_row)
+
+    image_extension: str
+    image_bytes: bytes
+    if svg_row := by_kind.get("summary-svg"):
+        svg_path, svg_bytes = _verified_report_file(svg_row)
+        with tempfile.TemporaryDirectory(prefix="dcar-report-download-") as directory:
+            rendered = Path(directory) / "core_summary.png"
+            if render_summary_png(svg_path, rendered):
+                image_extension = "png"
+                image_bytes = rendered.read_bytes()
+            else:
+                image_extension = "svg"
+                image_bytes = svg_bytes
+    elif png_row := by_kind.get("summary-png"):
+        _, image_bytes = _verified_report_file(png_row)
+        image_extension = "png"
+    else:
+        raise HTTPException(status_code=404, detail="报告图片不存在")
+
+    task_value = dict(task)
+    try:
+        workbook = build_report_detail_workbook(
+            task=task_value,
+            revision=revision,
+            content_csv=content_csv,
+            channel_csv=channel_csv,
+        )
+        bundle = build_report_download_bundle(
+            image_extension=image_extension,
+            image_bytes=image_bytes,
+            workbook_bytes=workbook,
+        )
+    except (UnicodeDecodeError, csv.Error, ValueError) as exc:
+        LOGGER.exception(
+            "report bundle generation failed: task=%s revision=%s", task_id, revision
+        )
+        raise HTTPException(status_code=500, detail="报告下载包生成失败") from exc
+
+    filename = report_bundle_filename(
+        task_name=str(task["name"]),
+        task_id=task_id,
+    )
+    encoded_filename = quote(filename, safe="")
+    return Response(
+        content=bundle,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="report.zip"; filename*=UTF-8\'\'{encoded_filename}'
+            ),
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 
@@ -2637,154 +2774,6 @@ def get_v8_selling_points(request: Request) -> Dict[str, Any]:
         )
     except TaxonomyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-
-@router.get("/api/v8/reviews")
-def get_v8_reviews(
-    request: Request, status: Optional[str] = None, limit: int = 100
-) -> Dict[str, Any]:
-    if limit < 1 or limit > 500:
-        raise HTTPException(status_code=422, detail="limit 必须在 1 到 500 之间")
-    where = "WHERE rq.status=?" if status else ""
-    parameters: List[Any] = [status] if status else []
-    with _connect_for_request(request) as connection:
-        active_release(connection)
-        rows = connection.execute(
-            f"""
-            WITH {DISPLAY_EFFECTIVE_EVALUATIONS_CTE}
-            SELECT rq.*, c.link_id, c.platform, c.canonical_url, c.title,
-                   c.raw_account_name, ev.evidence_level, ev.primary_selling_point_code,
-                   ev.selling_point_score, ev.content_automotive_score, ev.payload_json,
-                   ev.id display_evaluation_id,
-                   COALESCE(ev.evaluation_freshness, 'missing') evaluation_freshness,
-                   CASE WHEN ev.evaluation_freshness='stale' THEN 1 ELSE 0 END evaluation_is_stale
-            FROM review_queue rq
-            JOIN content_items c ON c.id=rq.content_id
-            LEFT JOIN display_effective_evaluations ev ON ev.content_id=c.id
-            {where}
-            ORDER BY CASE rq.status
-                WHEN 'in_review' THEN 0 WHEN 'pending' THEN 1
-                WHEN 'manual_required' THEN 2 ELSE 3 END,
-                rq.priority DESC, rq.id
-            LIMIT ?
-            """,
-            [*parameters, limit],
-        ).fetchall()
-        totals = connection.execute(
-            "SELECT status, COUNT(*) count FROM review_queue GROUP BY status"
-        ).fetchall()
-    items: List[Dict[str, Any]] = []
-    for row in rows:
-        value = dict(row)
-        value["evaluation"] = json.loads(str(value.pop("payload_json") or "{}"))
-        items.append(value)
-    return {
-        "items": items,
-        "total": sum(int(row["count"]) for row in totals),
-        "returned": len(items),
-        "status_counts": {str(row["status"]): int(row["count"]) for row in totals},
-    }
-
-
-@router.post("/api/v8/reviews/{queue_id}/start")
-def start_v8_review(request: Request, queue_id: int) -> Dict[str, Any]:
-    with (
-        _connect_for_request(request) as connection,
-        transaction(connection),
-    ):
-        try:
-            assert_manual_review_writable(connection)
-        except EvaluationError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        row = connection.execute(
-            "SELECT status,content_id,evaluation_id FROM review_queue WHERE id=?",
-            (queue_id,),
-        ).fetchone()
-        if row is None:
-            raise HTTPException(status_code=404, detail="复核任务不存在")
-        if row["status"] not in {"pending", "manual_required"}:
-            raise HTTPException(
-                status_code=409, detail=f"当前状态 {row['status']} 不能开始复核"
-            )
-        evaluation = review_anchor_evaluation(connection, int(row["content_id"]))
-        if evaluation is None:
-            raise HTTPException(status_code=409, detail="复核内容没有可用评估")
-        updated = connection.execute(
-            """
-            UPDATE review_queue
-            SET status='in_review', evaluation_id=?, updated_at=?
-            WHERE id=? AND status IN ('pending','manual_required')
-            """,
-            (evaluation["id"], now_utc(), queue_id),
-        )
-        if updated.rowcount != 1:
-            raise HTTPException(status_code=409, detail="复核任务状态已更新，请刷新")
-    return {
-        "id": queue_id,
-        "status": "in_review",
-        "base_evaluation_id": int(evaluation["id"]),
-    }
-
-
-@router.post("/api/v8/reviews/{queue_id}/reopen")
-def reopen_v8_review(
-    request: Request, queue_id: int, payload: ReviewReopenRequest
-) -> Dict[str, Any]:
-    try:
-        result = reopen_review(
-            queue_id,
-            reason=payload.reason,
-            reopened_by=payload.reopened_by,
-            db_path=_request_config(request).db_path,
-        )
-    except EvaluationError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return {
-        "id": result.queue_id,
-        "status": "in_review",
-        "reopen_event_id": result.event_id,
-        "base_evaluation_id": result.base_evaluation_id,
-    }
-
-
-@router.post("/api/v8/reviews/{queue_id}/resolve")
-def resolve_v8_review(
-    request: Request, queue_id: int, payload: ReviewResolveRequest
-) -> Dict[str, Any]:
-    override_fields = {
-        "primary_selling_point_code",
-        "selling_point_score",
-        "selling_point_included",
-        "content_automotive_score",
-        "content_direction",
-    }
-    overrides = {
-        key: getattr(payload, key)
-        for key in override_fields.intersection(payload.model_fields_set)
-    }
-    try:
-        result = resolve_review(
-            queue_id,
-            decision=payload.decision,
-            reason=payload.reason,
-            reviewer=payload.reviewer,
-            evidence_type=payload.evidence_type,
-            evidence_text=payload.evidence_text,
-            base_evaluation_id=payload.base_evaluation_id,
-            overrides=overrides,
-            db_path=_request_config(request).db_path,
-        )
-    except EvaluationError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return {
-        "queue_id": queue_id,
-        "status": "terminal_failed"
-        if payload.decision == "terminal_unavailable"
-        else "resolved",
-        "evaluation_id": result.evaluation_id,
-        "evidence_level": result.evidence_level,
-        "evidence_sha256": result.evidence_sha256,
-    }
 
 
 @router.post("/api/v8/selling-points/draft")

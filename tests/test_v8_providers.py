@@ -1525,11 +1525,6 @@ class V8ProviderUpdateTest(unittest.TestCase):
             evaluate_content(int(first["id"]), db_path=self.db).evaluation_id,
             evaluate_content(int(second["id"]), db_path=self.db).evaluation_id,
         }
-        with connect(self.db) as connection:
-            review_count_before = connection.execute(
-                "SELECT COUNT(*) FROM review_queue"
-            ).fetchone()[0]
-
         calls = 0
 
         def discovery_call(operation, identity):
@@ -1592,9 +1587,6 @@ class V8ProviderUpdateTest(unittest.TestCase):
             relations = connection.execute(
                 "SELECT * FROM duplicate_relations WHERE method='identity_conflict'"
             ).fetchall()
-            review_count_after = connection.execute(
-                "SELECT COUNT(*) FROM review_queue"
-            ).fetchone()[0]
             evaluation_rows = connection.execute(
                 "SELECT id,content_id FROM evaluation_versions WHERE id IN (?,?)",
                 tuple(sorted(evaluations)),
@@ -1613,7 +1605,6 @@ class V8ProviderUpdateTest(unittest.TestCase):
         self.assertEqual(tuple(usage_before_retry), (1, 0.01))
         self.assertEqual(len(relations), 1)
         self.assertEqual(relations[0]["status"], "pending_review")
-        self.assertEqual(review_count_after, review_count_before)
         self.assertEqual({row["id"] for row in evaluation_rows}, evaluations)
         self.assertEqual(content_ids, {first["id"], second["id"]})
 
@@ -1695,10 +1686,6 @@ class V8ProviderUpdateTest(unittest.TestCase):
                 """,
                 (first["id"], second["id"]),
             ).fetchall()
-            review_count_before = connection.execute(
-                "SELECT COUNT(*) FROM review_queue"
-            ).fetchone()[0]
-
         provider_calls = 0
 
         def discovery_call(operation, identity):
@@ -1816,9 +1803,6 @@ class V8ProviderUpdateTest(unittest.TestCase):
                 WHERE method='identity_conflict' AND status='pending_review'
                 """
             ).fetchall()
-            review_count_after = connection.execute(
-                "SELECT COUNT(*) FROM review_queue"
-            ).fetchone()[0]
             evaluation_rows = connection.execute(
                 "SELECT id,content_id FROM evaluation_versions WHERE id IN (?,?)",
                 tuple(sorted(evaluations)),
@@ -1837,7 +1821,6 @@ class V8ProviderUpdateTest(unittest.TestCase):
         self.assertEqual(raw_after_replay["source"], "live")
         self.assertEqual(tuple(usage_after_replay), tuple(usage_before_replay))
         self.assertEqual(len(relations), 1)
-        self.assertEqual(review_count_after, review_count_before)
         self.assertEqual({row["id"] for row in evaluation_rows}, evaluations)
         self.assertEqual(
             [tuple(row) for row in contents_after],

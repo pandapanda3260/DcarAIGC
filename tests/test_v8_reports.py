@@ -152,9 +152,9 @@ class V8ReportTaskTest(unittest.TestCase):
                     taxonomy_version,matcher_rule_sha256,evidence_sha256,
                     evaluation_source,evaluation_status,evidence_level,
                     selling_point_score,selling_point_included,content_direction,
-                    pending_review,payload_json,evaluated_at
+                    payload_json,evaluated_at
                 ) VALUES (1,?,?,?,?,?,?,'automatic','insufficient_evidence','V1',
-                          0,0,'unknown',0,?,?)
+                          0,0,'unknown',?,?)
                 """,
                 (
                     envelope_id,
@@ -171,7 +171,6 @@ class V8ReportTaskTest(unittest.TestCase):
                             "primary_selling_point_id": "",
                             "selling_point_score": 0,
                             "selling_point_included": False,
-                            "pending_review": False,
                             "content_direction": "unknown",
                             "content_automotive_score": None,
                             "audience_automotive_score": None,
@@ -467,7 +466,6 @@ class V8ReportTaskTest(unittest.TestCase):
                     connection,
                     content_id=content_id,
                     evidence_level="V3",
-                    pending_review=0,
                     included=1,
                     direction="media",
                     code="M1",
@@ -713,7 +711,6 @@ class V8ReportTaskTest(unittest.TestCase):
         *,
         content_id: int,
         evidence_level: str,
-        pending_review: int,
         included: int,
         direction: str,
         code: str,
@@ -732,8 +729,8 @@ class V8ReportTaskTest(unittest.TestCase):
                 matcher_rule_sha256,evidence_sha256,evaluation_source,
                 evaluation_status,evidence_level,primary_selling_point_code,
                 selling_point_score,selling_point_included,content_direction,
-                content_automotive_score,pending_review,payload_json,evaluated_at
-            ) VALUES (?,?,?,?,?,?,'automatic','evaluated',?,?,90,?,?,80,0+?,'{}',?)
+                content_automotive_score,payload_json,evaluated_at
+            ) VALUES (?,?,?,?,?,?,'automatic','evaluated',?,?,90,?,?,80,'{}',?)
             """,
             (
                 content_id,
@@ -746,7 +743,6 @@ class V8ReportTaskTest(unittest.TestCase):
                 code,
                 included,
                 direction,
-                pending_review,
                 evaluated_at or now_utc(),
             ),
         )
@@ -1100,7 +1096,7 @@ class V8ReportTaskTest(unittest.TestCase):
             ["current", "historical", "historical"],
         )
 
-    def test_formal_report_uses_only_v2_v3_non_pending_evaluations(self) -> None:
+    def test_formal_report_uses_only_v2_v3_evaluations(self) -> None:
         first_release = create_task(
             task_type="custom",
             period_start="2026-07-01",
@@ -1112,8 +1108,8 @@ class V8ReportTaskTest(unittest.TestCase):
             first_release["id"], db_path=self.db, reports_root=self.reports_root
         )
         with connect(self.db) as connection:
-            pending = self._insert_report_content(
-                connection, suffix="pending", manual_direction="media"
+            weak_evidence = self._insert_report_content(
+                connection, suffix="v0", manual_direction="media"
             )
             low_evidence = self._insert_report_content(
                 connection, suffix="v1", manual_direction="used_car"
@@ -1122,9 +1118,8 @@ class V8ReportTaskTest(unittest.TestCase):
             included = self._insert_report_content(connection, suffix="included")
             self._insert_report_evaluation(
                 connection,
-                content_id=pending,
-                evidence_level="V3",
-                pending_review=1,
+                content_id=weak_evidence,
+                evidence_level="V0",
                 included=1,
                 direction="new_car",
                 code="X1",
@@ -1133,7 +1128,6 @@ class V8ReportTaskTest(unittest.TestCase):
                 connection,
                 content_id=low_evidence,
                 evidence_level="V1",
-                pending_review=0,
                 included=1,
                 direction="new_car",
                 code="X1",
@@ -1142,7 +1136,6 @@ class V8ReportTaskTest(unittest.TestCase):
                 connection,
                 content_id=eligible_only,
                 evidence_level="V3",
-                pending_review=0,
                 included=0,
                 direction="media",
                 code="M1",
@@ -1151,7 +1144,6 @@ class V8ReportTaskTest(unittest.TestCase):
                 connection,
                 content_id=included,
                 evidence_level="V3",
-                pending_review=0,
                 included=1,
                 direction="new_car",
                 code="X2",
@@ -1166,7 +1158,6 @@ class V8ReportTaskTest(unittest.TestCase):
                 connection,
                 content_id=included,
                 evidence_level="V3",
-                pending_review=0,
                 included=1,
                 direction="used_car",
                 code="C1",
@@ -1212,7 +1203,7 @@ class V8ReportTaskTest(unittest.TestCase):
         self.assertEqual(direction_counts, {"media": 2, "new_car": 1, "used_car": 1})
         details = {row["content_id"]: row for row in report["content_details"]}
         for content_id, expected_direction in (
-            (pending, "media"),
+            (weak_evidence, "media"),
             (low_evidence, "used_car"),
         ):
             self.assertFalse(details[content_id]["evaluation_current"])
@@ -1227,73 +1218,7 @@ class V8ReportTaskTest(unittest.TestCase):
         self.assertEqual(details[included]["primary_selling_point_code"], "X2")
         self.assertEqual(details[included]["content_direction"], "new_car")
 
-    def test_media_terminal_coverage_is_independent_of_review_queue_rows(
-        self,
-    ) -> None:
-        def generate() -> dict[str, object]:
-            task = create_task(
-                task_type="custom",
-                period_start="2026-07-01",
-                period_end="2026-07-01",
-                creation_source="manual",
-                db_path=self.db,
-            )
-            return run_task(
-                task["id"], db_path=self.db, reports_root=self.reports_root
-            )
-
-        with patch(
-            "v8.reports.media_terminal_states", return_value={1: "pending"}
-        ):
-            self.assertEqual(
-                generate()["data_quality"]["media_terminal_coverage"], 0.0
-            )
-            with connect(self.db) as connection:
-                evaluation_id = connection.execute(
-                    """
-                    SELECT id FROM evaluation_versions
-                    WHERE content_id=1 AND release_id=?
-                    ORDER BY evaluated_at DESC,id DESC LIMIT 1
-                    """,
-                    (self.release_id,),
-                ).fetchone()[0]
-                connection.execute(
-                    """
-                    INSERT INTO review_queue(
-                        content_id,evaluation_id,reason_code,status,created_at,updated_at
-                    ) VALUES (1,?,'media_processing_incomplete','pending',?,?)
-                    """,
-                    (evaluation_id, now_utc(), now_utc()),
-                )
-                connection.commit()
-
-            for reason_code, status in (
-                ("media_processing_incomplete", "pending"),
-                ("media_evidence_missing", "manual_required"),
-                ("legacy_content_unavailable", "resolved"),
-                ("media_processing_incomplete", "terminal_failed"),
-            ):
-                with connect(self.db) as connection:
-                    connection.execute(
-                        """
-                        UPDATE review_queue SET reason_code=?,status=?,updated_at=?
-                        WHERE content_id=1
-                        """,
-                        (reason_code, status, now_utc()),
-                    )
-                    connection.commit()
-                self.assertEqual(
-                    generate()["data_quality"]["media_terminal_coverage"], 0.0
-                )
-
-            with connect(self.db) as connection:
-                connection.execute("DELETE FROM review_queue WHERE content_id=1")
-                connection.commit()
-            self.assertEqual(
-                generate()["data_quality"]["media_terminal_coverage"], 0.0
-            )
-
-    def test_pending_v3_can_be_media_complete_but_not_formal_evaluation_eligible(
+    def test_weak_evidence_can_be_media_complete_but_not_formal_eligible(
         self,
     ) -> None:
         with patch(
@@ -1312,13 +1237,12 @@ class V8ReportTaskTest(unittest.TestCase):
             run_task(first["id"], db_path=self.db, reports_root=self.reports_root)
             with connect(self.db) as connection:
                 content_id = self._insert_report_content(
-                    connection, suffix="pending-media"
+                    connection, suffix="weak-media"
                 )
                 self._insert_report_evaluation(
                     connection,
                     content_id=content_id,
-                    evidence_level="V3",
-                    pending_review=1,
+                    evidence_level="V1",
                     included=1,
                     direction="media",
                     code="M1",
@@ -1509,7 +1433,7 @@ class V8ReportTaskTest(unittest.TestCase):
         task_root = self.reports_root / task["id"]
         self.assertEqual(list(task_root.iterdir()) if task_root.exists() else [], [])
 
-    def test_gray_created_during_render_does_not_destroy_completed_revision(
+    def test_weak_evidence_created_during_render_does_not_destroy_revision(
         self,
     ) -> None:
         task = create_task(
@@ -1521,13 +1445,13 @@ class V8ReportTaskTest(unittest.TestCase):
         )
         original_validate = reports_module.validate_report
 
-        def validate_then_create_gray(report):
+        def validate_then_weaken_evidence(report):
             original_validate(report)
             with connect(self.db) as connection:
                 connection.execute(
                     """
                     UPDATE evaluation_versions
-                    SET pending_review=1,evidence_level='V3'
+                    SET evidence_level='V1'
                     WHERE content_id=1 AND release_id=?
                     """,
                     (self.release_id,),
@@ -1537,7 +1461,7 @@ class V8ReportTaskTest(unittest.TestCase):
         with patch.object(
             reports_module,
             "validate_report",
-            side_effect=validate_then_create_gray,
+            side_effect=validate_then_weaken_evidence,
         ):
             report = run_task(
                 task["id"], db_path=self.db, reports_root=self.reports_root
@@ -2019,213 +1943,6 @@ class V8ReportTaskTest(unittest.TestCase):
             ["cancelled", "resumed"],
         )
 
-    def test_pending_gray_review_is_disclosed_in_first_report_without_blocking(
-        self,
-    ) -> None:
-        with connect(self.db) as connection:
-            evaluation_id = self._insert_report_evaluation(
-                connection,
-                content_id=1,
-                evidence_level="V3",
-                pending_review=0,
-                included=1,
-                direction="media",
-                code="M1",
-            )
-            connection.execute(
-                """
-                INSERT INTO review_queue(
-                    content_id, evaluation_id, reason_code, status, created_at, updated_at
-                ) VALUES (1, ?, 'evaluation_gray_zone', 'pending', ?, ?)
-                """,
-                (evaluation_id, now_utc(), now_utc()),
-            )
-            connection.commit()
-        task = create_task(
-            task_type="custom",
-            period_start="2026-07-01",
-            period_end="2026-07-01",
-            creation_source="manual",
-            db_path=self.db,
-        )
-        report = run_task(
-            task["id"], db_path=self.db, reports_root=self.reports_root
-        )
-        state = get_task(task["id"], db_path=self.db)
-        self.assertEqual(report["task"]["task_status"], "partial")
-        self.assertEqual(report["data_quality"]["evaluation_coverage"], 100.0)
-        self.assertEqual(report["review_summary"], [{"status": "pending", "count": 1}])
-        self.assertEqual(len(state["revisions"]), 1)
-        self.assertEqual(state["events"][-1]["event_type"], "completed")
-
-    def test_pending_manual_conclusion_conflict_is_disclosed_without_v9_authority(
-        self,
-    ) -> None:
-        with connect(self.db) as connection:
-            evaluation_id = self._insert_report_evaluation(
-                connection,
-                content_id=1,
-                evidence_level="V3",
-                pending_review=0,
-                included=1,
-                direction="media",
-                code="M1",
-            )
-            connection.execute(
-                """
-                INSERT INTO review_queue(
-                    content_id,evaluation_id,reason_code,priority,status,created_at,updated_at
-                ) VALUES (1,?,'manual_conclusion_conflict',90,'manual_required',?,?)
-                """,
-                (evaluation_id, now_utc(), now_utc()),
-            )
-            connection.commit()
-        task = create_task(
-            task_type="custom",
-            period_start="2026-07-01",
-            period_end="2026-07-01",
-            creation_source="manual",
-            db_path=self.db,
-        )
-        report = run_task(
-            task["id"], db_path=self.db, reports_root=self.reports_root
-        )
-        state = get_task(task["id"], db_path=self.db)
-        self.assertEqual(report["task"]["task_status"], "partial")
-        self.assertEqual(report["data_quality"]["evaluation_coverage"], 100.0)
-        self.assertEqual(
-            report["review_summary"], [{"status": "manual_required", "count": 1}]
-        )
-        self.assertEqual(len(state["revisions"]), 1)
-        self.assertEqual(state["events"][-1]["event_type"], "completed")
-
-    def test_manual_conclusion_conflict_does_not_change_v9_selector_after_first_report(
-        self,
-    ) -> None:
-        with connect(self.db) as connection:
-            evaluation_id = self._insert_report_evaluation(
-                connection,
-                content_id=1,
-                evidence_level="V3",
-                pending_review=0,
-                included=1,
-                direction="media",
-                code="M1",
-            )
-            connection.commit()
-        first = create_task(
-            task_type="custom",
-            period_start="2026-07-01",
-            period_end="2026-07-01",
-            creation_source="manual",
-            db_path=self.db,
-        )
-        first_report = run_task(
-            first["id"], db_path=self.db, reports_root=self.reports_root
-        )
-        self.assertEqual(first_report["data_quality"]["evaluation_coverage"], 100.0)
-
-        with connect(self.db) as connection:
-            connection.execute(
-                """
-                INSERT INTO review_queue(
-                    content_id,evaluation_id,reason_code,priority,status,created_at,updated_at
-                ) VALUES (1,?,'manual_conclusion_conflict',90,'manual_required',?,?)
-                """,
-                (evaluation_id, now_utc(), now_utc()),
-            )
-            connection.commit()
-        second = create_task(
-            task_type="custom",
-            period_start="2026-07-01",
-            period_end="2026-07-01",
-            creation_source="manual",
-            db_path=self.db,
-        )
-        second_report = run_task(
-            second["id"], db_path=self.db, reports_root=self.reports_root
-        )
-        self.assertEqual(second_report["task"]["task_status"], "partial")
-        self.assertEqual(second_report["data_quality"]["evaluation_coverage"], 100.0)
-        self.assertEqual(
-            second_report["review_summary"],
-            [{"status": "manual_required", "count": 1}],
-        )
-        verticality = second_report["summary_metrics"]["verticality_rate"]
-        self.assertEqual(verticality["denominator"], 1)
-        self.assertEqual(verticality["eligible_count"], 1)
-        self.assertEqual(verticality["numerator"], 1)
-
-    def test_pending_gray_evaluation_is_excluded_from_first_report_without_queue(
-        self,
-    ) -> None:
-        with connect(self.db) as connection:
-            connection.execute(
-                """
-                UPDATE evaluation_versions
-                SET pending_review=1,evidence_level='V3'
-                WHERE content_id=1 AND release_id=?
-                """,
-                (self.release_id,),
-            )
-            connection.commit()
-        task = create_task(
-            task_type="custom",
-            period_start="2026-07-01",
-            period_end="2026-07-01",
-            creation_source="manual",
-            db_path=self.db,
-        )
-        report = run_task(
-            task["id"], db_path=self.db, reports_root=self.reports_root
-        )
-        state = get_task(task["id"], db_path=self.db)
-        self.assertEqual(report["task"]["task_status"], "partial")
-        self.assertEqual(report["data_quality"]["evaluation_coverage"], 0.0)
-        self.assertEqual(report["review_summary"], [])
-        self.assertEqual(len(state["revisions"]), 1)
-        self.assertEqual(state["events"][-1]["event_type"], "completed")
-
-    def test_pending_gray_review_is_reported_but_does_not_block_after_first_release(
-        self,
-    ) -> None:
-        first = create_task(
-            task_type="custom",
-            period_start="2026-07-01",
-            period_end="2026-07-01",
-            creation_source="manual",
-            db_path=self.db,
-        )
-        run_task(first["id"], db_path=self.db, reports_root=self.reports_root)
-        with connect(self.db) as connection:
-            evaluation_id = connection.execute(
-                """
-                SELECT id FROM evaluation_versions
-                WHERE content_id=1 AND release_id=? ORDER BY id DESC
-                """,
-                (self.release_id,),
-            ).fetchone()[0]
-            connection.execute(
-                """
-                INSERT INTO review_queue(
-                    content_id, evaluation_id, reason_code, status, created_at, updated_at
-                ) VALUES (1, ?, 'evaluation_gray_zone', 'pending', ?, ?)
-                """,
-                (evaluation_id, now_utc(), now_utc()),
-            )
-            connection.commit()
-        later = create_task(
-            task_type="custom",
-            period_start="2026-07-01",
-            period_end="2026-07-02",
-            creation_source="manual",
-            db_path=self.db,
-        )
-        report = run_task(later["id"], db_path=self.db, reports_root=self.reports_root)
-        self.assertEqual(report["metadata"]["revision"], 1)
-        self.assertEqual(report["task"]["task_status"], "partial")
-        self.assertEqual(report["review_summary"][0]["status"], "pending")
-
     def test_unsafe_automatic_current_contract_report_blocks_without_new_task(
         self,
     ) -> None:
@@ -2318,133 +2035,6 @@ class V8ReportTaskTest(unittest.TestCase):
             release = assert_report_runtime_ready(connection)
         self.assertEqual(release["id"], self.release_id)
 
-    def test_retired_release_gray_queue_does_not_block_current_first_report(
-        self,
-    ) -> None:
-        with connect(self.db) as connection:
-            legacy_evaluation = connection.execute(
-                """
-                SELECT id FROM evaluation_versions
-                WHERE content_id=1 AND release_id=? AND invalidated_at IS NULL
-                ORDER BY id DESC LIMIT 1
-                """,
-                (LEGACY_V7_RELEASE_ID,),
-            ).fetchone()
-            assert legacy_evaluation is not None
-            connection.execute(
-                """
-                INSERT INTO review_queue(
-                    content_id,evaluation_id,reason_code,status,created_at,updated_at
-                ) VALUES (1,?,'evaluation_gray_zone','pending',?,?)
-                """,
-                (legacy_evaluation["id"], now_utc(), now_utc()),
-            )
-            connection.commit()
-        task = create_task(
-            task_type="custom",
-            period_start="2026-07-01",
-            period_end="2026-07-01",
-            creation_source="manual",
-            db_path=self.db,
-        )
-        report = run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
-        self.assertEqual(report["metadata"]["revision"], 1)
-        self.assertEqual(report["review_summary"], [])
-
-    def test_review_summary_excludes_invalidated_active_release_evaluation(
-        self,
-    ) -> None:
-        with connect(self.db) as connection:
-            content_id = self._insert_report_content(
-                connection, suffix="invalidated-review"
-            )
-            evaluation_id = self._insert_report_evaluation(
-                connection,
-                content_id=content_id,
-                evidence_level="V3",
-                pending_review=0,
-                included=1,
-                direction="media",
-                code="M1",
-            )
-            connection.execute(
-                """
-                UPDATE evaluation_versions
-                SET invalidated_at=?,invalidation_reason='test invalidation'
-                WHERE id=?
-                """,
-                (now_utc(), evaluation_id),
-            )
-            connection.execute(
-                """
-                INSERT INTO review_queue(
-                    content_id,evaluation_id,reason_code,status,created_at,updated_at
-                ) VALUES (?,?,'evaluation_gray_zone','pending',?,?)
-                """,
-                (content_id, evaluation_id, now_utc(), now_utc()),
-            )
-            connection.commit()
-        task = create_task(
-            task_type="custom",
-            period_start="2026-07-03",
-            period_end="2026-07-03",
-            creation_source="manual",
-            db_path=self.db,
-        )
-        report = run_task(
-            task["id"], db_path=self.db, reports_root=self.reports_root
-        )
-        self.assertEqual(report["task"]["task_status"], "partial")
-        self.assertEqual(report["review_summary"], [])
-
-    def test_retired_release_report_does_not_hide_current_pending_evaluation(
-        self,
-    ) -> None:
-        self._insert_unsafe_legacy_report(creation_source="manual")
-        with connect(self.db) as connection:
-            current_evaluation = connection.execute(
-                """
-                SELECT id FROM evaluation_versions
-                WHERE content_id=1 AND release_id=? AND invalidated_at IS NULL
-                ORDER BY id DESC LIMIT 1
-                """,
-                (self.release_id,),
-            ).fetchone()
-            assert current_evaluation is not None
-            connection.execute(
-                """
-                INSERT INTO review_queue(
-                    content_id,evaluation_id,reason_code,status,created_at,updated_at
-                ) VALUES (1,?,'evaluation_gray_zone','pending',?,?)
-                """,
-                (current_evaluation["id"], now_utc(), now_utc()),
-            )
-            connection.execute(
-                """
-                UPDATE evaluation_versions
-                SET pending_review=1,evidence_level='V3'
-                WHERE id=?
-                """,
-                (current_evaluation["id"],),
-            )
-            connection.commit()
-        task = create_task(
-            task_type="custom",
-            period_start="2026-07-01",
-            period_end="2026-07-01",
-            creation_source="manual",
-            db_path=self.db,
-        )
-        report = run_task(
-            task["id"], db_path=self.db, reports_root=self.reports_root
-        )
-        self.assertEqual(report["task"]["task_status"], "partial")
-        self.assertEqual(report["data_quality"]["evaluation_coverage"], 0.0)
-        self.assertEqual(report["review_summary"], [{"status": "pending", "count": 1}])
-        self.assertEqual(
-            len(get_task(task["id"], db_path=self.db)["revisions"]), 1
-        )
-
     def test_current_schema_initialization_does_not_rewrite_reports(self) -> None:
         task = create_task(
             task_type="custom",
@@ -2455,19 +2045,8 @@ class V8ReportTaskTest(unittest.TestCase):
         )
         run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
         with connect(self.db) as connection:
-            evaluation_id = connection.execute(
-                "SELECT id FROM evaluation_versions WHERE content_id=1 ORDER BY id DESC"
-            ).fetchone()[0]
             connection.execute(
                 "UPDATE report_revisions SET contract_version='dcar-content-operations-report-v8.0'"
-            )
-            connection.execute(
-                """
-                INSERT INTO review_queue(
-                    content_id, evaluation_id, reason_code, status, created_at, updated_at
-                ) VALUES (1, ?, 'evaluation_gray_zone', 'pending', ?, ?)
-                """,
-                (evaluation_id, now_utc(), now_utc()),
             )
             connection.commit()
             revision_before = dict(

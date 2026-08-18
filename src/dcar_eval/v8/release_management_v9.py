@@ -27,8 +27,10 @@ from .storage import (
     SCHEMA_VERSION,
     SchemaMigrationError,
     configure_connection_safety,
+    is_formal_database_path,
     now_utc,
     require_schema_compatibility,
+    same_database_path,
     transaction,
 )
 
@@ -88,11 +90,7 @@ PROTECTED_TABLES = (
     "evidence_artifacts",
     "comment_evidence_versions",
     "comment_user_scores",
-    "manual_evidence",
     "provider_usage",
-    "evaluation_reviews",
-    "review_reopen_events",
-    "review_queue",
     "report_revisions",
 )
 
@@ -152,12 +150,15 @@ def assert_cli_cutover_guard(
     database = db_path.resolve()
     formal_database = DEFAULT_DB.resolve()
     formal_data_root = formal_database.parent
-    if database != formal_database:
+    if not is_formal_database_path(database, formal_database=DEFAULT_DB):
         if not isolated_clone:
             raise ReleaseV9Error(
                 "non-formal databases require the explicit --isolated-clone flag"
             )
-        if formal_data_root == database.parent or formal_data_root in database.parents:
+        if any(
+            same_database_path(ancestor, formal_data_root)
+            for ancestor in database.parents
+        ):
             raise ReleaseV9Error(
                 "--isolated-clone cannot target the formal app/data directory"
             )
@@ -425,7 +426,7 @@ def _source_projection(row: sqlite3.Row) -> dict[str, Any]:
         raise ReleaseV9Error(f"evaluation {row['id']} payload must be an object")
     return {
         key: _json_safe(row[key])
-        for key in (*EVALUATION_COMPARE_COLUMNS, "pending_review", "payload_json")
+        for key in (*EVALUATION_COMPARE_COLUMNS, "payload_json")
     } | {"payload": payload}
 
 
@@ -460,7 +461,6 @@ def _inventory(connection: sqlite3.Connection) -> list[dict[str, Any]]:
             or str(row["taxonomy_version"]) != TAXONOMY_VERSION
             or str(row["evaluation_source"]) != "automatic"
             or row["parent_evaluation_id"] is not None
-            or row["review_id"] is not None
         ):
             raise ReleaseV9Error(
                 f"source evaluation {row['id']} is not a valid automatic row"
@@ -587,20 +587,13 @@ def _activation_stable_state(
     state = {
         key: value
         for key, value in protected.items()
-        if key not in {"content_items", "review_queue", "source_release"}
+        if key not in {"content_items", "source_release"}
     }
     state["content_items"] = _rows_digest(
         connection,
         "content_items",
         selected_columns=_columns_without(
             connection, "content_items", {"evaluation_content_direction"}
-        ),
-    )
-    state["review_queue"] = _rows_digest(
-        connection,
-        "review_queue",
-        selected_columns=_columns_without(
-            connection, "review_queue", {"status", "updated_at", "resolved_at"}
         ),
     )
     return state
@@ -653,11 +646,9 @@ def _fast_guard(connection: sqlite3.Connection) -> dict[str, Any]:
                 "SELECT COUNT(*),COALESCE(MAX(id),0) FROM provider_usage"
             ).fetchone()
         ),
-        "manual_evidence": list(
-            connection.execute(
-                "SELECT COUNT(*),COALESCE(MAX(id),0) FROM manual_evidence"
-            ).fetchone()
-        ),
+        # v16 起 manual_evidence 表已删除；guard 键保留、恒为空表口径，
+        # 与历史清单比较时由 _require_fast_guard 的整体不匹配自然失败。
+        "manual_evidence": [0, 0],
         "v8_6_report_revision_count": _report_revision_count(connection),
         "taxonomy": list(
             connection.execute(
@@ -692,19 +683,9 @@ def _require_activation_stable(
 
 
 def _legacy_queue_snapshot(connection: sqlite3.Connection) -> list[dict[str, Any]]:
-    placeholders = ",".join("?" for _ in QUEUE_REASONS)
-    statuses = ",".join("?" for _ in ACTIVE_QUEUE_STATUSES)
-    return [
-        dict(row)
-        for row in connection.execute(
-            f"""
-            SELECT * FROM review_queue
-            WHERE reason_code IN ({placeholders}) AND status IN ({statuses})
-            ORDER BY id
-            """,
-            (*QUEUE_REASONS, *ACTIVE_QUEUE_STATUSES),
-        )
-    ]
+    # v16 起 review_queue 已删除：新生成的清单不再有活跃队列快照。
+    del connection
+    return []
 
 
 def _manifest_legacy_queue_snapshot(
@@ -1202,9 +1183,7 @@ def _target_semantic_core(
         if (
             str(row["evaluation_source"]) != "automatic"
             or row["parent_evaluation_id"] is not None
-            or row["review_id"] is not None
             or row["invalidated_at"] is not None
-            or bool(row["pending_review"])
             or str(row["rule_version"]) != TARGET_RULE_VERSION
             or str(row["taxonomy_version"]) != TAXONOMY_VERSION
             or str(row["matcher_rule_sha256"]) != str(target["matcher_rule_sha256"])
@@ -1260,28 +1239,7 @@ def _target_semantic_core(
                 "manual_evidence_excluded": bool(item["manual_evidence_excluded"]),
             }
         )
-    target_queue_count = int(
-        connection.execute(
-            """
-            SELECT COUNT(*) FROM review_queue q
-            JOIN evaluation_versions e ON e.id=q.evaluation_id
-            WHERE e.release_id=?
-            """,
-            (TARGET_RELEASE_ID,),
-        ).fetchone()[0]
-    )
-    target_review_count = int(
-        connection.execute(
-            """
-            SELECT COUNT(*) FROM evaluation_reviews r
-            JOIN evaluation_versions e ON e.id=r.resulting_evaluation_id
-            WHERE e.release_id=?
-            """,
-            (TARGET_RELEASE_ID,),
-        ).fetchone()[0]
-    )
-    if target_queue_count or target_review_count:
-        raise ReleaseV9Error("target release created manual queue or review rows")
+    # v16 起复核域已删除，目标 release 不可能再产生人工队列/复核行。
     _require_integrity(connection)
     return {
         "inventory_sha256": manifest["inventory_sha256"],
@@ -1291,11 +1249,11 @@ def _target_semantic_core(
         "taxonomy_version": TAXONOMY_VERSION,
         "matcher_rule_sha256": str(target["matcher_rule_sha256"]),
         "content_count": len(inventory),
+        # v16 起复核域已删除：三个计数恒为 0，manual_evidence 不再是受保护表
         "pending_review_count": 0,
         "manual_queue_count": 0,
         "manual_review_count": 0,
         "provider_usage": manifest["protected_state"]["provider_usage"],
-        "manual_evidence": manifest["protected_state"]["manual_evidence"],
         "semantic_sha256": _sha256_bytes(
             _canonical_json(semantic_rows).encode("utf-8")
         ),
@@ -1398,31 +1356,15 @@ def _load_receipt(path: Path, expected_sha256: str, manifest_sha256: str) -> dic
 def _restore_legacy_queues(
     connection: sqlite3.Connection, manifest: Mapping[str, Any]
 ) -> None:
+    """v16 起复核域已删除：带活跃队列快照的历史清单无法再回滚恢复。"""
+
+    del connection
     rows = _manifest_legacy_queue_snapshot(manifest)
-    for item in rows:
-        cursor = connection.execute(
-            """
-            UPDATE review_queue
-            SET evaluation_id=?,priority=?,status=?,assigned_to=?,created_at=?,
-                updated_at=?,resolved_at=?
-            WHERE id=? AND content_id=? AND reason_code=? AND status='resolved'
-            """,
-            (
-                item["evaluation_id"],
-                item["priority"],
-                item["status"],
-                item["assigned_to"],
-                item["created_at"],
-                item["updated_at"],
-                item["resolved_at"],
-                item["id"],
-                item["content_id"],
-                item["reason_code"],
-            ),
+    if rows:
+        raise ReleaseV9Error(
+            "schema v16 removed the manual review domain; a manifest with "
+            "active legacy review queues can no longer be restored"
         )
-        if cursor.rowcount != 1:
-            raise ReleaseV9Error(f"legacy review queue {item['id']} cannot be restored")
-    _require_legacy_queue_snapshot(connection, manifest)
 
 
 def _refresh_direction_cache(connection: sqlite3.Connection, release_id: str) -> int:
@@ -1484,29 +1426,9 @@ def activate(
             parameters=(captured_at,),
         )
         _checkpoint("activation_target_active")
-        placeholders = ",".join("?" for _ in QUEUE_REASONS)
-        statuses = ",".join("?" for _ in ACTIVE_QUEUE_STATUSES)
-        queue_cursor = connection.execute(
-            f"""
-            UPDATE review_queue
-            SET status='resolved',resolved_at=?,updated_at=?
-            WHERE reason_code IN ({placeholders}) AND status IN ({statuses})
-            """,
-            (captured_at, captured_at, *QUEUE_REASONS, *ACTIVE_QUEUE_STATUSES),
-        )
-        if queue_cursor.rowcount != len(legacy_queues):
+        # v16 起复核域已删除；能走到这里意味着清单快照为空，无队列可关。
+        if legacy_queues:
             raise ReleaseV9Error("legacy queue close count differs from manifest")
-        remaining_legacy_queues = int(
-            connection.execute(
-                f"""
-                SELECT COUNT(*) FROM review_queue
-                WHERE reason_code IN ({placeholders}) AND status IN ({statuses})
-                """,
-                (*QUEUE_REASONS, *ACTIVE_QUEUE_STATUSES),
-            ).fetchone()[0]
-        )
-        if remaining_legacy_queues:
-            raise ReleaseV9Error("legacy queues remained active after v9 activation")
         _checkpoint("activation_legacy_queues_closed")
         content_count = _refresh_direction_cache(connection, TARGET_RELEASE_ID)
         _checkpoint("activation_direction_cache_refreshed")

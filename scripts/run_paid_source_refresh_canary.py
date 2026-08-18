@@ -403,7 +403,7 @@ def _task_identity(
     budget_digest = hashlib.sha256(task_id.encode("utf-8")).hexdigest()[:16]
     return {
         "task_id": task_id,
-        "budget_id": f"task-{budget_digest}-tikhub-{OPERATION}-v2",
+        "budget_id": f"task-{budget_digest}-tikhub-{OPERATION}-v1",
         "window_key": f"paid-source-refresh-v2-{digest[:16]}",
     }
 

@@ -5,13 +5,16 @@ import hashlib
 import json
 import logging
 import os
+import sqlite3
 import tempfile
 import unittest
+import zipfile
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+from urllib.parse import quote
 
 from fastapi.testclient import TestClient
 
@@ -86,9 +89,9 @@ def _insert_legacy_automatic_fixture(connection, content_id: int) -> int:
             taxonomy_version,matcher_rule_sha256,evidence_sha256,
             evaluation_source,evaluation_status,evidence_level,
             selling_point_score,selling_point_included,content_direction,
-            pending_review,payload_json,evaluated_at
+            payload_json,evaluated_at
         ) VALUES (?,?,?,?,?,?,?,'automatic','insufficient_evidence','V1',
-                  0,0,'unknown',0,?,?)
+                  0,0,'unknown',?,?)
         """,
         (
             content_id,
@@ -106,7 +109,6 @@ def _insert_legacy_automatic_fixture(connection, content_id: int) -> int:
                     "primary_selling_point_id": "",
                     "selling_point_score": 0,
                     "selling_point_included": False,
-                    "pending_review": False,
                     "content_direction": "unknown",
                     "content_automotive_score": None,
                     "audience_automotive_score": None,
@@ -318,6 +320,297 @@ class ApiFactoryIsolationTest(unittest.TestCase):
             self.assertEqual(app_a.state.config.db_path, config_a.db_path)
             self.assertEqual(app_b.state.config.db_path, config_b.db_path)
             self.assertIsNot(app_a.state, app_b.state)
+
+
+class ApiStartupSafetyTest(unittest.TestCase):
+    def setUp(self) -> None:
+        (PROJECT_ROOT / "tmp").mkdir(exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(dir=PROJECT_ROOT / "tmp")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def _patch_runtime_recovery(self):
+        return (
+            patch.object(
+                api_module,
+                "recover_interrupted_scheduler_runs",
+                return_value=0,
+            ),
+            patch.object(
+                api_module,
+                "recover_stale_fetch_slots",
+                return_value={"stale_candidates": 0, "recovered": 0},
+            ),
+            patch.object(
+                api_module,
+                "recover_stale_media_processing_slots",
+                return_value={
+                    "stale_candidates": 0,
+                    "recovered": 0,
+                    "retryable_failed": 0,
+                    "terminal_failed": 0,
+                    "cas_conflicts": 0,
+                    "exhausted_normalized": 0,
+                },
+            ),
+            patch.object(api_module, "_recover_interrupted_tasks", return_value=0),
+            patch.object(
+                api_module,
+                "recover_orphan_association_runs",
+                return_value=0,
+            ),
+        )
+
+    def test_formal_database_detection_uses_existing_file_identity(self) -> None:
+        formal = self.root / "formal.sqlite3"
+        alias = self.root / "apfs-firmlink-spelling.sqlite3"
+        formal.write_bytes(b"formal-sentinel")
+        alias.hardlink_to(formal)
+        self.assertNotEqual(alias.resolve(), formal.resolve())
+        with patch.object(api_module, "DEFAULT_DB", formal):
+            self.assertTrue(api_module._uses_formal_database(alias))
+
+    def test_temporary_writable_database_is_still_initialized(self) -> None:
+        config = _test_config(self.root, db_name="new.sqlite3")
+        self.assertFalse(config.db_path.exists())
+        recovery_patches = self._patch_runtime_recovery()
+        with (
+            patch.object(
+                api_module,
+                "initialize_database",
+                wraps=initialize_database,
+            ) as initialize,
+            recovery_patches[0],
+            recovery_patches[1],
+            recovery_patches[2],
+            recovery_patches[3],
+            recovery_patches[4],
+        ):
+            with TestClient(api_module.create_app(config)):
+                pass
+        initialize.assert_called_once()
+        # A newly initialized writable database may still have committed schema
+        # pages in its WAL.  Use a normal SQLite reader here; immutable replica
+        # mode intentionally ignores WAL files.
+        with sqlite3.connect(config.db_path) as connection:
+            self.assertEqual(
+                int(connection.execute("PRAGMA user_version").fetchone()[0]),
+                SCHEMA_VERSION,
+            )
+
+    def test_formal_compatible_database_is_validated_without_initialization(
+        self,
+    ) -> None:
+        config = _test_config(self.root, db_name="formal-v16.sqlite3")
+        _seed_read_model_database(config.db_path)
+        recovery_patches = self._patch_runtime_recovery()
+        with (
+            patch.object(api_module, "DEFAULT_DB", config.db_path),
+            patch.object(api_module, "initialize_database") as initialize,
+            recovery_patches[0],
+            recovery_patches[1],
+            recovery_patches[2],
+            recovery_patches[3],
+            recovery_patches[4],
+        ):
+            with TestClient(api_module.create_app(config)):
+                pass
+        initialize.assert_not_called()
+
+    def test_formal_schema_mismatch_fails_without_db_or_sidecar_writes(self) -> None:
+        config = _test_config(self.root, db_name="formal-v15.sqlite3")
+        with sqlite3.connect(config.db_path) as connection:
+            connection.execute(
+                "CREATE TABLE schema_migrations("
+                "version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO schema_migrations(version,name,applied_at) "
+                "VALUES (15,'spu-llm-assist','2026-08-18T00:00:00Z')"
+            )
+            connection.execute("PRAGMA user_version=15")
+        sidecars = [
+            config.db_path.with_name(config.db_path.name + suffix)
+            for suffix in ("-wal", "-shm")
+        ]
+        before = hashlib.sha256(config.db_path.read_bytes()).hexdigest()
+        recovery_patches = self._patch_runtime_recovery()
+        with (
+            patch.object(api_module, "DEFAULT_DB", config.db_path),
+            patch.object(api_module, "initialize_database") as initialize,
+            recovery_patches[0] as scheduler_recovery,
+            recovery_patches[1] as fetch_recovery,
+            recovery_patches[2] as media_recovery,
+            recovery_patches[3] as task_recovery,
+            recovery_patches[4] as association_recovery,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"offline schema migration is required:.*supported=\[16\]",
+            ):
+                with TestClient(api_module.create_app(config)):
+                    pass
+        initialize.assert_not_called()
+        scheduler_recovery.assert_not_called()
+        fetch_recovery.assert_not_called()
+        media_recovery.assert_not_called()
+        task_recovery.assert_not_called()
+        association_recovery.assert_not_called()
+        self.assertEqual(hashlib.sha256(config.db_path.read_bytes()).hexdigest(), before)
+        self.assertFalse(any(sidecar.exists() for sidecar in sidecars))
+
+    def test_formal_freeze_blocks_before_writer_lock_creation(self) -> None:
+        freeze_lock = self.root / "operator-freeze.lock"
+        freeze_lock.write_text("{}", encoding="utf-8")
+        writer_lock = self.root / "writer-worker.lock"
+        config = api_module.ApiConfig(
+            db_path=api_module.DEFAULT_DB,
+            reports_root=self.root / "reports",
+            legacy_db_path=self.root / "legacy.sqlite3",
+            operator_freeze_lock=freeze_lock,
+            writer_lock=writer_lock,
+            scheduler_enabled=True,
+            startup_catchup_enabled=False,
+            daily_capture_reconcile_from=date(2026, 8, 21),
+        )
+        with (
+            patch.dict(os.environ, {"DCAR_TEST_DENY_FORMAL_DB": "1"}),
+            patch.object(
+                api_module,
+                "_writer_process_lock",
+                wraps=api_module._writer_process_lock,
+            ) as writer_lock_context,
+            patch.object(api_module, "initialize_database") as initialize,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "production startup blocked by operator freeze lock",
+            ):
+                with TestClient(api_module.create_app(config)):
+                    pass
+        writer_lock_context.assert_not_called()
+        initialize.assert_not_called()
+        self.assertFalse(writer_lock.exists())
+
+    def test_reconcile_environment_date_is_strict_and_required_for_scheduler(
+        self,
+    ) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "DCAR_SCHEDULER_ENABLED": "1",
+                "DCAR_DAILY_CAPTURE_RECONCILE_FROM": "2026-08-21",
+            },
+            clear=True,
+        ):
+            config = api_module.ApiConfig.from_env()
+        self.assertEqual(config.daily_capture_reconcile_from, date(2026, 8, 21))
+        self.assertEqual(
+            config.effective_daily_capture_reconcile_from,
+            date(2026, 8, 21),
+        )
+
+        with patch.dict(
+            os.environ,
+            {"DCAR_SCHEDULER_ENABLED": "1"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "DCAR_DAILY_CAPTURE_RECONCILE_FROM is required",
+            ):
+                api_module.ApiConfig.from_env()
+
+        invalid_values = (
+            "",
+            "2026-8-21",
+            "20260821",
+            "2026-02-30",
+            " 2026-08-21",
+            "2026-08-21 ",
+        )
+        for value in invalid_values:
+            with self.subTest(value=value), patch.dict(
+                os.environ,
+                {"DCAR_DAILY_CAPTURE_RECONCILE_FROM": value},
+                clear=True,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "strict|valid"):
+                    api_module.ApiConfig.from_env()
+
+    def test_reconcile_date_is_ineffective_without_writable_scheduler(self) -> None:
+        reconcile_from = date(2026, 8, 21)
+        scheduler_disabled = replace(
+            _test_config(self.root / "disabled"),
+            daily_capture_reconcile_from=reconcile_from,
+        )
+        read_only = replace(
+            _test_config(self.root / "read-only"),
+            scheduler_enabled=True,
+            read_only=True,
+            daily_capture_reconcile_from=reconcile_from,
+        )
+        self.assertIsNone(
+            scheduler_disabled.effective_daily_capture_reconcile_from
+        )
+        self.assertIsNone(read_only.effective_daily_capture_reconcile_from)
+
+    def test_scheduler_missing_reconcile_date_fails_before_writer_lock(self) -> None:
+        writer_lock = self.root / "missing-date-writer.lock"
+        config = replace(
+            _test_config(self.root / "missing-date"),
+            writer_lock=writer_lock,
+            scheduler_enabled=True,
+        )
+        with patch.object(api_module, "initialize_database") as initialize:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "daily capture reconcile requires an effective date",
+            ):
+                with TestClient(api_module.create_app(config)):
+                    pass
+        initialize.assert_not_called()
+        self.assertFalse(writer_lock.exists())
+
+    def test_scheduler_installs_reconcile_and_reports_status(self) -> None:
+        config = replace(
+            _test_config(self.root / "enabled"),
+            scheduler_enabled=True,
+            daily_capture_reconcile_from=date(2026, 8, 21),
+        )
+        _seed_read_model_database(config.db_path)
+        scheduler = MagicMock()
+        recovery_patches = self._patch_runtime_recovery()
+        with (
+            patch.object(api_module, "BackgroundScheduler", return_value=scheduler),
+            patch.object(api_module, "install_jobs") as install_jobs,
+            patch.object(api_module, "assert_report_runtime_ready"),
+            recovery_patches[0],
+            recovery_patches[1],
+            recovery_patches[2],
+            recovery_patches[3],
+            recovery_patches[4],
+        ):
+            with TestClient(api_module.create_app(config)) as client:
+                response = client.get("/api/v8/scheduler")
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(
+                    response.json()["daily_capture_reconcile"],
+                    {
+                        "mode": "current_day_only",
+                        "enabled": True,
+                        "effective_from": "2026-08-21",
+                        "interval_seconds": 3600,
+                    },
+                )
+        install_jobs.assert_called_once_with(
+            scheduler,
+            db_path=config.db_path,
+            reports_root=config.reports_root,
+            capture_call_override=None,
+            reconcile_effective_date=date(2026, 8, 21),
+        )
+        scheduler.start.assert_called_once_with()
 
 
 class V8ApiTest(unittest.TestCase):
@@ -549,6 +842,15 @@ class V8ApiTest(unittest.TestCase):
         self.assertEqual(response.json()["startup_catchup"]["mode"], "report_only")
         self.assertEqual(
             response.json()["scheduler_run_recovery"], {"interrupted": 0}
+        )
+        self.assertEqual(
+            response.json()["daily_capture_reconcile"],
+            {
+                "mode": "current_day_only",
+                "enabled": False,
+                "effective_from": None,
+                "interval_seconds": 3600,
+            },
         )
         self.assertIn("fetch_slot_recovery", response.json())
         self.assertIn("data_freshness", response.json())
@@ -803,8 +1105,8 @@ class V8ApiTest(unittest.TestCase):
                             primary_selling_point_code,selling_point_score,
                             selling_point_included,content_direction,
                             content_automotive_score,audience_automotive_score,
-                            acquisition_potential_score,pending_review,payload_json,evaluated_at
-                        ) VALUES (?,?,?,?,?,?,'automatic','evaluated','V3',?,90,?,?,?,?,?,0,'{}',?)
+                            acquisition_potential_score,payload_json,evaluated_at
+                        ) VALUES (?,?,?,?,?,?,'automatic','evaluated','V3',?,90,?,?,?,?,?,'{}',?)
                         """,
                         (
                             content_id,
@@ -828,10 +1130,10 @@ class V8ApiTest(unittest.TestCase):
                         content_id,release_id,rule_version,taxonomy_version,
                         matcher_rule_sha256,evidence_sha256,
                         evaluation_source,evaluation_status,evidence_level,
-                        selling_point_included,content_direction,pending_review,
+                        selling_point_included,content_direction,
                         payload_json,evaluated_at
                     ) VALUES (?,?,'evaluation-v6','selling-points-test',?,?,'automatic',
-                              'evaluated','V3',0,'new_car',0,'{}','2026-08-02T13:00:00Z')
+                              'evaluated','V3',0,'new_car','{}','2026-08-02T13:00:00Z')
                     """,
                     (
                         ids["content-a"],
@@ -937,10 +1239,6 @@ class V8ApiTest(unittest.TestCase):
         contents = self.client.post(
             "/api/v8/contents/search", json={"page": 1, "page_size": 20}
         )
-        pending = self.client.post(
-            "/api/v8/contents/search",
-            json={"review_status": "pending", "page_size": 1},
-        )
         selling_points = self.client.get("/api/v8/selling-points")
 
         self.assertEqual(tasks.status_code, 200)
@@ -979,12 +1277,10 @@ class V8ApiTest(unittest.TestCase):
         self.assertEqual(contents.status_code, 200)
         self.assertEqual(contents.json()["total"], expected_content_count)
         self.assertEqual(len(contents.json()["items"]), min(expected_content_count, 20))
-        self.assertEqual(pending.status_code, 200)
         overview = self.client.get("/api/v8/overview")
         self.assertEqual(overview.status_code, 200)
-        self.assertEqual(
-            pending.json()["total"], overview.json()["data_quality"]["pending_reviews"]
-        )
+        # v16 起概览数据质量不再有复核计数
+        self.assertNotIn("pending_reviews", overview.json()["data_quality"])
         self.assertEqual(selling_points.status_code, 200)
         self.assertEqual(
             selling_points.json()["taxonomy"]["version"], "selling-points-v5.0"
@@ -1172,17 +1468,6 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
                 connection, self.content_id
             )
             connection.commit()
-        with connect(self.db) as connection:
-            queue = connection.execute(
-                """
-                INSERT INTO review_queue(
-                    content_id, evaluation_id, reason_code, status, created_at, updated_at
-                ) VALUES (?, ?, 'evaluation_gray_zone', 'pending', ?, ?)
-                """,
-                (self.content_id, self.evaluation_id, now_utc(), now_utc()),
-            )
-            connection.commit()
-            self.queue_id = int(queue.lastrowid)
         self.app = api_module.create_app(self.config)
         self.client_context = TestClient(self.app)
         self.client = self.client_context.__enter__()
@@ -1194,48 +1479,7 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
     def _activate_current_report_release(self) -> None:
         activate_v9_report_fixture(self.db, [self.content_id])
 
-    def test_review_api_starts_and_resolves_as_append_only_override(self) -> None:
-        listed = self.client.get("/api/v8/reviews")
-        self.assertEqual(listed.status_code, 200)
-        self.assertEqual(listed.json()["total"], 1)
-        self.assertEqual(listed.json()["status_counts"], {"pending": 1})
-
-        started = self.client.post(f"/api/v8/reviews/{self.queue_id}/start")
-        self.assertEqual(started.status_code, 200)
-        self.assertEqual(started.json()["status"], "in_review")
-        resolved = self.client.post(
-            f"/api/v8/reviews/{self.queue_id}/resolve",
-            json={
-                "base_evaluation_id": started.json()["base_evaluation_id"],
-                "decision": "override",
-                "reason": "画面明确展示汽车保养流程",
-                "reviewer": "测试复核员",
-                "evidence_type": "visual_summary",
-                "evidence_text": "连续画面展示机油更换和车辆保养操作",
-                "primary_selling_point_code": "C1",
-                "selling_point_score": 92,
-                "selling_point_included": True,
-                "content_automotive_score": 95,
-                "content_direction": "media",
-            },
-        )
-        self.assertEqual(resolved.status_code, 200)
-        self.assertEqual(resolved.json()["status"], "resolved")
-        with connect(self.db) as connection:
-            versions = connection.execute(
-                "SELECT evaluation_source FROM evaluation_versions ORDER BY id"
-            ).fetchall()
-            evidence_count = connection.execute(
-                "SELECT COUNT(*) FROM manual_evidence"
-            ).fetchone()[0]
-            status = connection.execute(
-                "SELECT status FROM review_queue WHERE id=?", (self.queue_id,)
-            ).fetchone()[0]
-        self.assertEqual([row[0] for row in versions], ["automatic", "manual_review"])
-        self.assertEqual(evidence_count, 1)
-        self.assertEqual(status, "resolved")
-
-    def test_backfilling_evaluation_is_hidden_from_display_but_remains_review_cas_anchor(
+    def test_backfilling_evaluation_is_hidden_from_display_surfaces(
         self,
     ) -> None:
         with connect(self.db) as connection:
@@ -1265,9 +1509,9 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
                     matcher_rule_sha256,evidence_sha256,evaluation_source,
                     evaluation_status,evidence_level,primary_selling_point_code,
                     selling_point_score,selling_point_included,content_direction,
-                    pending_review,payload_json,evaluated_at
+                    payload_json,evaluated_at
                 ) VALUES (?,'release-v8','evaluation-v8','selling-points-v5.1',?,?,
-                          'automatic','evaluated','V3','X8',99,1,'new_car',0,?,?)
+                          'automatic','evaluated','V3','X8',99,1,'new_car',?,?)
                 """,
                 (
                     self.content_id,
@@ -1299,294 +1543,17 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         self.assertEqual(evidence.status_code, 200)
         evidence_value = evidence.json()
         self.assertEqual(evidence_value["display_evaluation_id"], self.evaluation_id)
-        self.assertEqual(evidence_value["base_evaluation_id"], backfill_id)
+        # v16 起证据接口是纯只读的，不再暴露复核 CAS 锚点
+        self.assertNotIn("base_evaluation_id", evidence_value)
+        self.assertNotIn("review", evidence_value)
         self.assertNotEqual(
             evidence_value["evaluation"]["primary_selling_point_id"], "X8"
         )
         self.assertEqual(evidence_value["evaluation_freshness"], "current")
 
-        reviews = self.client.get("/api/v8/reviews")
-        self.assertEqual(reviews.status_code, 200)
-        review = reviews.json()["items"][0]
-        self.assertEqual(review["display_evaluation_id"], self.evaluation_id)
-        self.assertNotEqual(review["evaluation"]["primary_selling_point_id"], "X8")
-        self.assertEqual(review["evaluation_freshness"], "current")
-
-        started = self.client.post(f"/api/v8/reviews/{self.queue_id}/start")
-        self.assertEqual(started.status_code, 200)
-        self.assertEqual(started.json()["base_evaluation_id"], backfill_id)
-        rejected = self.client.post(
-            f"/api/v8/reviews/{self.queue_id}/resolve",
-            json={
-                "base_evaluation_id": backfill_id,
-                "decision": "confirm",
-                "reason": "回填期间不得跨 release 复核",
-                "reviewer": "测试复核员",
-                "evidence_type": "review_note",
-                "evidence_text": "这条提交必须整体回滚",
-            },
-        )
-        self.assertEqual(rejected.status_code, 409)
-        self.assertIn("lineage", rejected.json()["detail"])
-        with connect(self.db) as connection:
-            self.assertEqual(
-                connection.execute(
-                    "SELECT COUNT(*) FROM evaluation_reviews"
-                ).fetchone()[0],
-                0,
-            )
-            self.assertEqual(
-                connection.execute("SELECT COUNT(*) FROM manual_evidence").fetchone()[
-                    0
-                ],
-                0,
-            )
-
-    def test_review_api_reopens_with_audit_event_and_appends_new_version(self) -> None:
-        started = self.client.post(f"/api/v8/reviews/{self.queue_id}/start")
-        self.assertEqual(started.status_code, 200)
-        first = self.client.post(
-            f"/api/v8/reviews/{self.queue_id}/resolve",
-            json={
-                "base_evaluation_id": started.json()["base_evaluation_id"],
-                "decision": "override",
-                "reason": "第一次代理复核",
-                "reviewer": "Codex代理",
-                "evidence_type": "visual_summary",
-                "evidence_text": "第一次人工证据摘要",
-                "primary_selling_point_code": "C1",
-                "selling_point_score": 82,
-                "selling_point_included": True,
-                "content_automotive_score": 86,
-                "content_direction": "media",
-            },
-        )
-        self.assertEqual(first.status_code, 200)
-        first_evaluation_id = int(first.json()["evaluation_id"])
-        with connect(self.db) as connection:
-            first_review_id = int(
-                connection.execute(
-                    "SELECT id FROM evaluation_reviews WHERE queue_id=?",
-                    (self.queue_id,),
-                ).fetchone()[0]
-            )
-
-        reopened = self.client.post(
-            f"/api/v8/reviews/{self.queue_id}/reopen",
-            json={
-                "reason": "业务负责人要求重新核验代理判定",
-                "reopened_by": "运营复核员",
-            },
-        )
-        self.assertEqual(reopened.status_code, 200)
-        self.assertEqual(reopened.json()["status"], "in_review")
-        self.assertEqual(reopened.json()["base_evaluation_id"], first_evaluation_id)
-
-        duplicate_reopen = self.client.post(
-            f"/api/v8/reviews/{self.queue_id}/reopen",
-            json={"reason": "重复重开", "reopened_by": "运营复核员"},
-        )
-        self.assertEqual(duplicate_reopen.status_code, 409)
-
-        second = self.client.post(
-            f"/api/v8/reviews/{self.queue_id}/resolve",
-            json={
-                "base_evaluation_id": reopened.json()["base_evaluation_id"],
-                "decision": "override",
-                "reason": "业务负责人完成二次核验",
-                "reviewer": "运营复核员",
-                "evidence_type": "visual_summary",
-                "evidence_text": "业务人员重新查看画面后形成的新证据摘要",
-                "primary_selling_point_code": "C1",
-                "selling_point_score": 94,
-                "selling_point_included": True,
-                "content_automotive_score": 96,
-                "content_direction": "media",
-            },
-        )
-        self.assertEqual(second.status_code, 200)
-        self.assertNotEqual(second.json()["evaluation_id"], first_evaluation_id)
-
-        with connect(self.db) as connection:
-            reopen_event = connection.execute(
-                "SELECT * FROM review_reopen_events WHERE queue_id=?",
-                (self.queue_id,),
-            ).fetchone()
-            sources = connection.execute(
-                "SELECT evaluation_source FROM evaluation_versions ORDER BY id"
-            ).fetchall()
-            review_count = int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM evaluation_reviews WHERE queue_id=?",
-                    (self.queue_id,),
-                ).fetchone()[0]
-            )
-            evidence_count = int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM manual_evidence WHERE content_id=?",
-                    (self.content_id,),
-                ).fetchone()[0]
-            )
-            queue_status = str(
-                connection.execute(
-                    "SELECT status FROM review_queue WHERE id=?", (self.queue_id,)
-                ).fetchone()[0]
-            )
-        self.assertEqual(reopen_event["previous_review_id"], first_review_id)
-        self.assertEqual(reopen_event["base_evaluation_id"], first_evaluation_id)
-        self.assertEqual(reopen_event["reopened_by"], "运营复核员")
-        self.assertEqual(reopen_event["reason"], "业务负责人要求重新核验代理判定")
-        self.assertEqual(
-            [row[0] for row in sources],
-            ["automatic", "manual_review", "manual_review"],
-        )
-        self.assertEqual(review_count, 2)
-        self.assertEqual(evidence_count, 2)
-        self.assertEqual(queue_status, "resolved")
-
-    def test_review_api_distinguishes_omitted_override_from_explicit_null(
-        self,
-    ) -> None:
-        with connect(self.db) as connection:
-            parent = dict(
-                connection.execute(
-                    "SELECT * FROM evaluation_versions WHERE id=?",
-                    (self.evaluation_id,),
-                ).fetchone()
-            )
-        started = self.client.post(f"/api/v8/reviews/{self.queue_id}/start")
-        self.assertEqual(started.status_code, 200)
-        partial = self.client.post(
-            f"/api/v8/reviews/{self.queue_id}/resolve",
-            json={
-                "base_evaluation_id": started.json()["base_evaluation_id"],
-                "decision": "override",
-                "reason": "只修正内容垂直度",
-                "reviewer": "测试复核员",
-                "evidence_type": "review_note",
-                "evidence_text": "人工核验后内容垂直度应为十二分",
-                "content_automotive_score": 12,
-            },
-        )
-        self.assertEqual(partial.status_code, 200)
-        partial_id = int(partial.json()["evaluation_id"])
-        with connect(self.db) as connection:
-            partial_row = connection.execute(
-                "SELECT * FROM evaluation_versions WHERE id=?", (partial_id,)
-            ).fetchone()
-        self.assertEqual(
-            partial_row["primary_selling_point_code"],
-            parent["primary_selling_point_code"],
-        )
-        self.assertEqual(
-            partial_row["selling_point_score"], parent["selling_point_score"]
-        )
-        self.assertEqual(
-            partial_row["selling_point_included"], parent["selling_point_included"]
-        )
-        self.assertEqual(partial_row["content_automotive_score"], 12)
-
-        reopened = self.client.post(
-            f"/api/v8/reviews/{self.queue_id}/reopen",
-            json={"reason": "明确清空主卖点", "reopened_by": "测试复核员"},
-        )
-        self.assertEqual(reopened.status_code, 200)
-        cleared = self.client.post(
-            f"/api/v8/reviews/{self.queue_id}/resolve",
-            json={
-                "base_evaluation_id": reopened.json()["base_evaluation_id"],
-                "decision": "override",
-                "reason": "明确清空主卖点",
-                "reviewer": "测试复核员",
-                "evidence_type": "review_note",
-                "evidence_text": "人工证据确认不应保留任何卖点",
-                "primary_selling_point_code": None,
-            },
-        )
-        self.assertEqual(cleared.status_code, 200)
-        with connect(self.db) as connection:
-            cleared_row = connection.execute(
-                "SELECT * FROM evaluation_versions WHERE id=?",
-                (cleared.json()["evaluation_id"],),
-            ).fetchone()
-            match_count = int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM evaluation_matches WHERE evaluation_id=?",
-                    (cleared.json()["evaluation_id"],),
-                ).fetchone()[0]
-            )
-        self.assertIsNone(cleared_row["primary_selling_point_code"])
-        self.assertEqual(cleared_row["selling_point_score"], 0)
-        self.assertEqual(cleared_row["selling_point_included"], 0)
-        self.assertEqual(match_count, 0)
-
-    def test_review_api_rejects_selling_point_scene_conflict(self) -> None:
-        started = self.client.post(f"/api/v8/reviews/{self.queue_id}/start")
-        self.assertEqual(started.status_code, 200)
-        seeded = self.client.post(
-            f"/api/v8/reviews/{self.queue_id}/resolve",
-            json={
-                "base_evaluation_id": started.json()["base_evaluation_id"],
-                "decision": "override",
-                "reason": "先建立媒体场景主卖点",
-                "reviewer": "测试复核员",
-                "evidence_type": "visual_summary",
-                "evidence_text": "画面明确展示汽车保养知识",
-                "primary_selling_point_code": "C1",
-                "selling_point_score": 90,
-                "selling_point_included": True,
-                "content_automotive_score": 90,
-                "content_direction": "media",
-            },
-        )
-        self.assertEqual(seeded.status_code, 200)
-        reopened = self.client.post(
-            f"/api/v8/reviews/{self.queue_id}/reopen",
-            json={"reason": "检查继承场景约束", "reopened_by": "测试复核员"},
-        )
-        self.assertEqual(reopened.status_code, 200)
-        with connect(self.db) as connection:
-            before_reviews = int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM evaluation_reviews"
-                ).fetchone()[0]
-            )
-            before_evidence = int(
-                connection.execute("SELECT COUNT(*) FROM manual_evidence").fetchone()[0]
-            )
-        rejected = self.client.post(
-            f"/api/v8/reviews/{self.queue_id}/resolve",
-            json={
-                "base_evaluation_id": reopened.json()["base_evaluation_id"],
-                "decision": "override",
-                "reason": "尝试提交冲突场景",
-                "reviewer": "测试复核员",
-                "evidence_type": "visual_summary",
-                "evidence_text": "画面证据摘要",
-                "content_direction": "new_car",
-            },
-        )
-        self.assertEqual(rejected.status_code, 409)
-        self.assertIn("does not allow content direction", rejected.json()["detail"])
-        with connect(self.db) as connection:
-            self.assertEqual(
-                connection.execute(
-                    "SELECT COUNT(*) FROM evaluation_reviews"
-                ).fetchone()[0],
-                before_reviews,
-            )
-            self.assertEqual(
-                connection.execute("SELECT COUNT(*) FROM manual_evidence").fetchone()[
-                    0
-                ],
-                before_evidence,
-            )
-            self.assertEqual(
-                connection.execute(
-                    "SELECT status FROM review_queue WHERE id=?", (self.queue_id,)
-                ).fetchone()[0],
-                "in_review",
-            )
+        # v16 起复核接口整体下线
+        self.assertEqual(self.client.get("/api/v8/reviews").status_code, 404)
+        self.assertGreater(backfill_id, 0)
 
     def test_selling_point_hits_are_split_into_the_latest_business_scene(self) -> None:
         with connect(self.db) as connection:
@@ -1713,83 +1680,6 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         self.assertEqual(point_value["scene_hits"]["new_car"]["primary_hits"], 1)
         self.assertEqual(point_value["scene_hits"]["used_car"]["primary_hits"], 1)
         self.assertEqual(point_value["scene_hits"]["media"]["primary_hits"], 0)
-
-    def test_review_api_rejects_stale_evaluation_cursor(self) -> None:
-        started = self.client.post(f"/api/v8/reviews/{self.queue_id}/start")
-        self.assertEqual(started.status_code, 200)
-        stale_id = started.json()["base_evaluation_id"]
-        with connect(self.db) as connection:
-            connection.execute(
-                "UPDATE content_items SET body='保养知识已更新',updated_at=? WHERE id=?",
-                (now_utc(), self.content_id),
-            )
-            connection.commit()
-        with connect(self.db) as connection:
-            changed_id = _insert_legacy_automatic_fixture(
-                connection, self.content_id
-            )
-            connection.commit()
-        self.assertNotEqual(changed_id, stale_id)
-        with connect(self.db) as connection:
-            before = {
-                "reviews": int(
-                    connection.execute(
-                        "SELECT COUNT(*) FROM evaluation_reviews"
-                    ).fetchone()[0]
-                ),
-                "manual_evidence": int(
-                    connection.execute(
-                        "SELECT COUNT(*) FROM manual_evidence"
-                    ).fetchone()[0]
-                ),
-                "evaluations": int(
-                    connection.execute(
-                        "SELECT COUNT(*) FROM evaluation_versions"
-                    ).fetchone()[0]
-                ),
-                "queue": dict(
-                    connection.execute(
-                        "SELECT * FROM review_queue WHERE id=?", (self.queue_id,)
-                    ).fetchone()
-                ),
-            }
-        rejected = self.client.post(
-            f"/api/v8/reviews/{self.queue_id}/resolve",
-            json={
-                "base_evaluation_id": stale_id,
-                "decision": "confirm",
-                "reason": "旧页面提交",
-                "reviewer": "测试复核员",
-                "evidence_type": "review_note",
-                "evidence_text": "这是基于旧评估打开的复核页面",
-            },
-        )
-        self.assertEqual(rejected.status_code, 409)
-        self.assertIn("请刷新证据", rejected.json()["detail"])
-        with connect(self.db) as connection:
-            after = {
-                "reviews": int(
-                    connection.execute(
-                        "SELECT COUNT(*) FROM evaluation_reviews"
-                    ).fetchone()[0]
-                ),
-                "manual_evidence": int(
-                    connection.execute(
-                        "SELECT COUNT(*) FROM manual_evidence"
-                    ).fetchone()[0]
-                ),
-                "evaluations": int(
-                    connection.execute(
-                        "SELECT COUNT(*) FROM evaluation_versions"
-                    ).fetchone()[0]
-                ),
-                "queue": dict(
-                    connection.execute(
-                        "SELECT * FROM review_queue WHERE id=?", (self.queue_id,)
-                    ).fetchone()
-                ),
-            }
-        self.assertEqual(after, before)
 
     def test_evidence_media_file_and_processing_search_are_readable(self) -> None:
         media_path = Path(self.temp.name) / "evidence.jpg"
@@ -1923,7 +1813,7 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         evidence = self.client.get(f"/api/v8/contents/{self.content_id}/evidence")
         self.assertEqual(evidence.status_code, 200)
         value = evidence.json()
-        self.assertEqual(value["base_evaluation_id"], self.evaluation_id)
+        self.assertEqual(value["display_evaluation_id"], self.evaluation_id)
         self.assertEqual(value["asr"]["text"], "完整的本地语音证据")
         self.assertEqual(value["ocr"]["text"], "关键帧文字证据\n车辆保养流程")
         self.assertEqual(value["comments"]["stored_count"], 1)
@@ -2023,11 +1913,6 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
                     """
                 ).fetchone()[0]
             )
-            evidence_before = int(
-                connection.execute("SELECT COUNT(*) FROM manual_evidence").fetchone()[
-                    0
-                ]
-            )
         task = create_task(
             task_type="custom",
             period_start="2026-07-01",
@@ -2054,12 +1939,6 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
                     """
                 ).fetchone()[0],
                 manual_before,
-            )
-            self.assertEqual(
-                connection.execute("SELECT COUNT(*) FROM manual_evidence").fetchone()[
-                    0
-                ],
-                evidence_before,
             )
 
     def test_selling_point_api_edits_only_an_unreleased_matcher_draft(self) -> None:
@@ -2213,11 +2092,6 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
                     """
                 ).fetchone()[0]
             )
-            evidence_before = int(
-                connection.execute("SELECT COUNT(*) FROM manual_evidence").fetchone()[
-                    0
-                ]
-            )
         self._activate_current_report_release()
         created = self.client.post(
             "/api/v8/tasks",
@@ -2260,12 +2134,6 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
                 ).fetchone()[0],
                 manual_before,
             )
-            self.assertEqual(
-                connection.execute("SELECT COUNT(*) FROM manual_evidence").fetchone()[
-                    0
-                ],
-                evidence_before,
-            )
         download = self.client.get(
             f"/api/v8/tasks/{task_id}/revisions/1/files/report-markdown"
         )
@@ -2276,6 +2144,92 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         )
         self.assertEqual(image.status_code, 200)
         self.assertIn(image.headers["content-type"], {"image/svg+xml", "image/png"})
+
+        with connect(self.db) as connection:
+            before_download = {
+                "task": tuple(
+                    connection.execute(
+                        "SELECT task_status,progress,message FROM report_tasks WHERE id=?",
+                        (task_id,),
+                    ).fetchone()
+                ),
+                "revision": tuple(
+                    connection.execute(
+                        "SELECT report_sha256,invalidated_at FROM report_revisions WHERE task_id=? AND revision=1",
+                        (task_id,),
+                    ).fetchone()
+                ),
+                "file_count": connection.execute(
+                    "SELECT COUNT(*) FROM report_files WHERE task_id=? AND revision=1",
+                    (task_id,),
+                ).fetchone()[0],
+            }
+        bundle = self.client.get(f"/api/v8/tasks/{task_id}/revisions/1/download")
+        self.assertEqual(bundle.status_code, 200)
+        self.assertEqual(bundle.headers["content-type"], "application/zip")
+        expected_bundle_name = f'{value["name"]}.zip'
+        self.assertEqual(
+            bundle.headers["content-disposition"],
+            f'attachment; filename="report.zip"; filename*=UTF-8\'\'{quote(expected_bundle_name, safe="")}',
+        )
+        self.assertEqual(bundle.headers["cache-control"], "private, no-store")
+        with zipfile.ZipFile(io.BytesIO(bundle.content)) as archive:
+            self.assertIsNone(archive.testzip())
+            names = archive.namelist()
+            self.assertEqual(len(names), 2)
+            self.assertIn("02_数据明细.xlsx", names)
+            image_names = [
+                name for name in names if name in {"01_图片报告.png", "01_图片报告.svg"}
+            ]
+            self.assertEqual(len(image_names), 1)
+            self.assertTrue(
+                all(
+                    not name.startswith("/") and ".." not in Path(name).parts
+                    for name in names
+                )
+            )
+            bundled_image = archive.read(image_names[0])
+            if image_names[0].endswith(".png"):
+                self.assertEqual(
+                    (
+                        int.from_bytes(bundled_image[16:20], "big"),
+                        int.from_bytes(bundled_image[20:24], "big"),
+                    ),
+                    (1200, 675),
+                )
+            else:
+                self.assertIn(b'<svg xmlns="http://www.w3.org/2000/svg"', bundled_image)
+            workbook = archive.read("02_数据明细.xlsx")
+        with zipfile.ZipFile(io.BytesIO(workbook)) as xlsx:
+            self.assertIsNone(xlsx.testzip())
+            workbook_xml = xlsx.read("xl/workbook.xml")
+            self.assertIn("报告说明".encode(), workbook_xml)
+            self.assertIn("内容明细".encode(), workbook_xml)
+            self.assertIn("渠道结论".encode(), workbook_xml)
+        with connect(self.db) as connection:
+            after_download = {
+                "task": tuple(
+                    connection.execute(
+                        "SELECT task_status,progress,message FROM report_tasks WHERE id=?",
+                        (task_id,),
+                    ).fetchone()
+                ),
+                "revision": tuple(
+                    connection.execute(
+                        "SELECT report_sha256,invalidated_at FROM report_revisions WHERE task_id=? AND revision=1",
+                        (task_id,),
+                    ).fetchone()
+                ),
+                "file_count": connection.execute(
+                    "SELECT COUNT(*) FROM report_files WHERE task_id=? AND revision=1",
+                    (task_id,),
+                ).fetchone()[0],
+            }
+        self.assertEqual(after_download, before_download)
+        missing_bundle = self.client.get(
+            f"/api/v8/tasks/{task_id}/revisions/999/download"
+        )
+        self.assertEqual(missing_bundle.status_code, 404)
 
     def test_custom_task_rejects_an_unclosed_period_without_persisting_task(
         self,
@@ -2517,25 +2471,28 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         self.assertIn("evaluation_freshness", export_text.splitlines()[0])
 
     def test_content_search_filters_by_selling_point(self) -> None:
-        started = self.client.post(f"/api/v8/reviews/{self.queue_id}/start")
-        self.assertEqual(started.status_code, 200)
-        resolved = self.client.post(
-            f"/api/v8/reviews/{self.queue_id}/resolve",
-            json={
-                "base_evaluation_id": started.json()["base_evaluation_id"],
-                "decision": "override",
-                "reason": "画面明确展示汽车保养流程",
-                "reviewer": "测试复核员",
-                "evidence_type": "visual_summary",
-                "evidence_text": "连续画面展示机油更换和车辆保养操作",
-                "primary_selling_point_code": "C1",
-                "selling_point_score": 92,
-                "selling_point_included": True,
-                "content_automotive_score": 95,
-                "content_direction": "media",
-            },
-        )
-        self.assertEqual(resolved.status_code, 200)
+        # v16 起没有人工改判入口：直接把当前评估设成 C1 命中来构造筛选样本
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                UPDATE evaluation_versions
+                SET primary_selling_point_code='C1',selling_point_score=92,
+                    selling_point_included=1,content_direction='media',
+                    evaluation_status='evaluated',evidence_level='V3',
+                    content_automotive_score=95
+                WHERE id=?
+                """,
+                (self.evaluation_id,),
+            )
+            connection.execute(
+                """
+                INSERT INTO evaluation_matches(
+                    evaluation_id,selling_point_code,scene,match_role,score,evidence_json
+                ) VALUES (?, 'C1', 'media', 'primary', 92, '{}')
+                """,
+                (self.evaluation_id,),
+            )
+            connection.commit()
         imported = self.client.post(
             "/api/v8/contents/import",
             json={

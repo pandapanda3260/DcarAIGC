@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Mapping, Optional
 from .storage import PROJECT_ROOT
 
 
-CONTRACT_PATH = PROJECT_ROOT / "config" / "report_contract_v8_6.json"
+CONTRACT_PATH = PROJECT_ROOT / "config" / "report_contract_v8_7.json"
 LEGACY_CONTRACT_PATHS = {
     "dcar-content-operations-report-v8.2": (
         PROJECT_ROOT / "config" / "report_contract_v8_2.json"
@@ -28,12 +28,18 @@ LEGACY_CONTRACT_PATHS = {
     "dcar-content-operations-report-v8.5": (
         PROJECT_ROOT / "config" / "report_contract_v8_5.json"
     ),
+    # v8.6 是最后一个含 review_summary 必备键的契约；v8.7 起系统无人工复核
+    # 域，报告不再携带该段。历史 v8.6 修订版仍按冻结契约校验。
+    "dcar-content-operations-report-v8.6": (
+        PROJECT_ROOT / "config" / "report_contract_v8_6.json"
+    ),
 }
-CURRENT_REPORT_VERSION = "dcar-content-operations-report-v8.6"
+CURRENT_REPORT_VERSION = "dcar-content-operations-report-v8.7"
 CURRENT_REPORT_RULE_VERSION = "evaluation-v9"
 CURRENT_REPORT_EVIDENCE_VERSION = "evidence-v2"
 REPORT_RULE_VERSIONS = {
     CURRENT_REPORT_VERSION: CURRENT_REPORT_RULE_VERSION,
+    "dcar-content-operations-report-v8.6": "evaluation-v9",
     "dcar-content-operations-report-v8.5": "evaluation-v8",
     "dcar-content-operations-report-v8.4": "evaluation-v8",
     "dcar-content-operations-report-v8.3": "evaluation-v7",
@@ -1158,7 +1164,6 @@ def validate_report(
         "content_direction_dimensions",
         "selling_point_dimensions",
         "duplicates",
-        "review_summary",
         "capture_summary",
         "provider_costs",
         "content_details",

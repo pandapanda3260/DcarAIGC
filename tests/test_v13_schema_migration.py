@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from tests.schema_fixture import initialize_historical_schema
 import v8.storage as storage
 
 
@@ -21,23 +22,7 @@ class V13SchemaMigrationTest(unittest.TestCase):
         self.temporary.cleanup()
 
     def _downgrade_current_to_v12(self, connection: sqlite3.Connection) -> None:
-        storage.initialize_database(connection)
-        connection.execute("DROP TABLE scheduler_run_attempts")
-        connection.execute(
-            "ALTER TABLE scheduler_runs RENAME TO scheduler_runs_v13_current"
-        )
-        connection.execute(storage._V12_SCHEDULER_RUNS_SQL)
-        columns = (
-            "id,job_id,scheduled_for,status,started_at,completed_at,details_json"
-        )
-        connection.execute(
-            f"INSERT INTO scheduler_runs({columns}) "
-            f"SELECT {columns} FROM scheduler_runs_v13_current"
-        )
-        connection.execute("DROP TABLE scheduler_runs_v13_current")
-        connection.execute("DELETE FROM schema_migrations WHERE version=13")
-        connection.execute("PRAGMA user_version=12")
-        connection.commit()
+        initialize_historical_schema(connection, target_version=12)
         self.assertEqual(storage.require_schema_compatibility(connection), 12)
 
     def _seed_v12_runs(
@@ -109,13 +94,12 @@ class V13SchemaMigrationTest(unittest.TestCase):
                 [
                     (9, "release-bound-evaluation-schema"),
                     (10, "audience-interaction-user-domain"),
-                    (11, "interaction-user-v1-fallback-keys"),
-                    (12, "append-only-metric-observations"),
-                    (13, "scheduler-run-attempt-history"),
+                    *sorted(storage.SCHEMA_MIGRATION_NAMES.items()),
                 ],
             )
             self.assertEqual(
-                int(connection.execute("PRAGMA user_version").fetchone()[0]), 13
+                int(connection.execute("PRAGMA user_version").fetchone()[0]),
+                storage.SCHEMA_VERSION,
             )
             storage._validate_v13_structure(connection)
             self.assertTrue(storage.schema_compatibility_state(connection)["compatible"])
@@ -475,7 +459,7 @@ class V13SchemaMigrationTest(unittest.TestCase):
                     storage.initialize_database(connection)
                     self.assertEqual(
                         int(connection.execute("PRAGMA user_version").fetchone()[0]),
-                        13,
+                        storage.SCHEMA_VERSION,
                     )
                     self.assertEqual(
                         int(
@@ -488,11 +472,7 @@ class V13SchemaMigrationTest(unittest.TestCase):
 
     def test_v11_ladder_runs_v12_then_v13(self) -> None:
         with storage.connect(self.database) as connection:
-            self._downgrade_current_to_v12(connection)
-            connection.execute("DROP TABLE content_metric_observations")
-            connection.execute("DROP INDEX idx_content_identities_content_primary")
-            connection.execute("DELETE FROM schema_migrations WHERE version=12")
-            connection.execute("PRAGMA user_version=11")
+            initialize_historical_schema(connection, target_version=11)
             connection.execute(
                 """
                 INSERT INTO scheduler_runs(
@@ -510,7 +490,8 @@ class V13SchemaMigrationTest(unittest.TestCase):
 
             storage.initialize_database(connection)
             self.assertEqual(
-                int(connection.execute("PRAGMA user_version").fetchone()[0]), 13
+                int(connection.execute("PRAGMA user_version").fetchone()[0]),
+                storage.SCHEMA_VERSION,
             )
             self.assertEqual(
                 [

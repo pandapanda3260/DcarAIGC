@@ -96,9 +96,9 @@ export default function TasksPage() {
       <div className="task-card-list">{tasks.map((task) => <TaskCard key={task.id} task={task} />)}</div>
       {tasks.length === 0 && <article className="panel"><div className="empty-state"><strong>还没有报告任务</strong><span>新建任务后会立即基于已落库数据生成。</span></div></article>}
     </section>}
-    {modal && <div className="modal-backdrop" role="presentation"><section className="review-modal range-modal" role="dialog" aria-modal="true" aria-label="新建报告任务">
+    {modal && <div className="modal-backdrop" role="presentation"><section className="modal-panel range-modal" role="dialog" aria-modal="true" aria-label="新建报告任务">
       <div className="panel-head"><div><span className="eyebrow">自定义报告</span><h3>新建自定义报告</h3><p>生成报告不会隐式触发付费抓取。</p></div><button className="modal-close" onClick={closeModal} disabled={saving} aria-label="关闭">×</button></div>
-      <div className="review-fields">
+      <div className="modal-fields">
         <div className="span-two drp-block">
           <span>报告区间（按发布日期，闭区间）</span>
           <DateRangePicker start={form.periodStart} end={form.periodEnd} disabled={saving} onChange={(periodStart, periodEnd) => setForm((current) => ({ ...current, periodStart, periodEnd }))} />

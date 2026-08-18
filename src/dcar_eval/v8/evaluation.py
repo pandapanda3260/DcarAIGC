@@ -1,4 +1,4 @@
-"""Database-native incremental v8 evaluation and append-only manual review."""
+"""Database-native incremental v8 evaluation (fully automatic, no manual review)."""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ from pathlib import Path
 from statistics import mean
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence
 
-from .evaluation_selectors import review_anchor_evaluation
 from .matcher_dsl import (
     V5_1_POINT_SPEC,
     V5_2_POINT_SPEC,
@@ -61,14 +60,6 @@ class EvaluationResult:
 
 
 @dataclass(frozen=True)
-class ReviewReopenResult:
-    event_id: int
-    queue_id: int
-    content_id: int
-    base_evaluation_id: int
-
-
-@dataclass(frozen=True)
 class _EvaluationRuntime:
     release: Mapping[str, Any]
     taxonomy_version: str
@@ -77,294 +68,8 @@ class _EvaluationRuntime:
     matcher: MaterializedMatcher | None
 
 
-_ACTIVE_REVIEW_STATUSES = {"pending", "manual_required", "in_review"}
 _MATERIALIZED_RULE_VERSIONS = {V8_RULE_VERSION, V9_RULE_VERSION}
 _V9_TAXONOMY_VERSION = "selling-points-v5.2"
-
-
-def assert_manual_review_writable(connection: sqlite3.Connection) -> None:
-    """Fail closed before any review write when evaluation-v9 is active."""
-
-    releases = connection.execute(
-        "SELECT id,rule_version FROM evaluation_releases WHERE status='active' ORDER BY id"
-    ).fetchall()
-    if len(releases) > 1:
-        raise EvaluationError("multiple active evaluation releases exist")
-    if releases and str(releases[0]["rule_version"]) == V9_RULE_VERSION:
-        raise EvaluationError("manual review writes are disabled for evaluation-v9")
-
-
-def _is_current_active_automatic_evaluation(
-    connection: sqlite3.Connection,
-    *,
-    content_id: int,
-    evaluation_id: int,
-    release_id: str,
-) -> bool:
-    release = connection.execute(
-        "SELECT status FROM evaluation_releases WHERE id=?", (release_id,)
-    ).fetchone()
-    if release is None:
-        raise EvaluationError(f"evaluation release does not exist: {release_id}")
-    if str(release["status"]) != "active":
-        return False
-    latest = connection.execute(
-        """
-        SELECT id,evaluation_source FROM evaluation_versions
-        WHERE content_id=? AND release_id=? AND invalidated_at IS NULL
-        ORDER BY evaluated_at DESC,id DESC LIMIT 1
-        """,
-        (content_id, release_id),
-    ).fetchone()
-    return bool(
-        latest is not None
-        and int(latest["id"]) == evaluation_id
-        and str(latest["evaluation_source"]) == "automatic"
-    )
-
-
-def _append_review_reopen_event(
-    connection: sqlite3.Connection,
-    *,
-    queue_id: int,
-    content_id: int,
-    previous_review_id: int | None,
-    evaluation_id: int,
-    reopened_by: str,
-    reason: str,
-    created_at: str,
-) -> None:
-    connection.execute(
-        """
-        INSERT INTO review_reopen_events(
-            queue_id,content_id,previous_review_id,base_evaluation_id,
-            reopened_by,reason,created_at
-        ) VALUES (?,?,?,?,?,?,?)
-        """,
-        (
-            queue_id,
-            content_id,
-            previous_review_id,
-            evaluation_id,
-            reopened_by,
-            reason,
-            created_at,
-        ),
-    )
-
-
-def _synchronize_review_queue_state(
-    connection: sqlite3.Connection,
-    *,
-    content_id: int,
-    evaluation_id: int,
-    reason_code: str,
-    should_be_active: bool,
-    active_status: str,
-    priority: int,
-    reopen_reason: str,
-    previous_review_id: int | None = None,
-    record_reopen_on_create: bool = False,
-) -> None:
-    queue = connection.execute(
-        "SELECT * FROM review_queue WHERE content_id=? AND reason_code=?",
-        (content_id, reason_code),
-    ).fetchone()
-    if not should_be_active:
-        if queue is None or str(queue["status"]) not in _ACTIVE_REVIEW_STATUSES:
-            return
-        captured_at = now_utc()
-        connection.execute(
-            """
-            UPDATE review_queue
-            SET evaluation_id=?,status='resolved',assigned_to='system:evaluation',
-                resolved_at=?,updated_at=?
-            WHERE id=? AND status IN ('pending','manual_required','in_review')
-            """,
-            (evaluation_id, captured_at, captured_at, queue["id"]),
-        )
-        return
-
-    captured_at = now_utc()
-    if queue is None:
-        cursor = connection.execute(
-            """
-            INSERT INTO review_queue(
-                content_id,evaluation_id,reason_code,priority,status,created_at,updated_at
-            ) VALUES (?,?,?,?,?,?,?)
-            """,
-            (
-                content_id,
-                evaluation_id,
-                reason_code,
-                priority,
-                active_status,
-                captured_at,
-                captured_at,
-            ),
-        )
-        if record_reopen_on_create:
-            if cursor.lastrowid is None:
-                raise RuntimeError("review queue insert returned no id")
-            _append_review_reopen_event(
-                connection,
-                queue_id=int(cursor.lastrowid),
-                content_id=content_id,
-                previous_review_id=previous_review_id,
-                evaluation_id=evaluation_id,
-                reopened_by="system:evaluation",
-                reason=reopen_reason,
-                created_at=captured_at,
-            )
-        return
-
-    status = str(queue["status"])
-    if (
-        queue["evaluation_id"] is not None
-        and int(queue["evaluation_id"]) == evaluation_id
-        and status in _ACTIVE_REVIEW_STATUSES
-        and int(queue["priority"]) == priority
-    ):
-        return
-    if status in {"resolved", "terminal_failed"}:
-        if previous_review_id is None:
-            previous_review = connection.execute(
-                """
-                SELECT id FROM evaluation_reviews
-                WHERE queue_id=? AND resulting_evaluation_id IS NOT NULL
-                ORDER BY id DESC LIMIT 1
-                """,
-                (queue["id"],),
-            ).fetchone()
-            previous_review_id = (
-                int(previous_review["id"]) if previous_review is not None else None
-            )
-        _append_review_reopen_event(
-            connection,
-            queue_id=int(queue["id"]),
-            content_id=content_id,
-            previous_review_id=previous_review_id,
-            evaluation_id=evaluation_id,
-            reopened_by="system:evaluation",
-            reason=reopen_reason,
-            created_at=captured_at,
-        )
-        connection.execute(
-            """
-            UPDATE review_queue
-            SET evaluation_id=?,priority=?,status=?,assigned_to=NULL,
-                resolved_at=NULL,updated_at=?
-            WHERE id=?
-            """,
-            (evaluation_id, priority, active_status, captured_at, queue["id"]),
-        )
-        return
-
-    connection.execute(
-        "UPDATE review_queue SET evaluation_id=?,priority=?,updated_at=? WHERE id=?",
-        (evaluation_id, priority, captured_at, queue["id"]),
-    )
-
-
-def _synchronize_gray_review_queue(
-    connection: sqlite3.Connection,
-    *,
-    content_id: int,
-    evaluation_id: int,
-    release_id: str,
-    evidence_level: str,
-    pending_review: bool,
-) -> None:
-    """Keep the active release queue aligned with its latest automatic result."""
-
-    if not _is_current_active_automatic_evaluation(
-        connection,
-        content_id=content_id,
-        evaluation_id=evaluation_id,
-        release_id=release_id,
-    ):
-        return
-    is_gray = pending_review and evidence_level in {"V2", "V3"}
-    _synchronize_review_queue_state(
-        connection,
-        content_id=content_id,
-        evaluation_id=evaluation_id,
-        reason_code="evaluation_gray_zone",
-        should_be_active=is_gray,
-        active_status="pending",
-        priority=50,
-        reopen_reason="current release automatic evaluation entered gray zone",
-    )
-
-
-def _synchronize_manual_conclusion_conflict_queue(
-    connection: sqlite3.Connection,
-    *,
-    content_id: int,
-    evaluation_id: int,
-    release_id: str,
-    evidence_level: str,
-    pending_review: bool,
-) -> None:
-    if not _is_current_active_automatic_evaluation(
-        connection,
-        content_id=content_id,
-        evaluation_id=evaluation_id,
-        release_id=release_id,
-    ):
-        return
-    automatic = connection.execute(
-        "SELECT * FROM evaluation_versions WHERE id=?", (evaluation_id,)
-    ).fetchone()
-    if automatic is None:
-        raise EvaluationError(f"evaluation does not exist: {evaluation_id}")
-    manual = connection.execute(
-        """
-        SELECT * FROM evaluation_versions
-        WHERE content_id=? AND evaluation_source='manual_review'
-          AND invalidated_at IS NULL AND id<?
-        ORDER BY evaluated_at DESC,id DESC LIMIT 1
-        """,
-        (content_id, evaluation_id),
-    ).fetchone()
-
-    def conclusion(row: sqlite3.Row) -> tuple[bool, str | None, str | None]:
-        included = bool(row["selling_point_included"])
-        if not included:
-            return False, None, None
-        primary_code = (
-            str(row["primary_selling_point_code"])
-            if row["primary_selling_point_code"] is not None
-            else None
-        )
-        return True, primary_code, str(row["content_direction"])
-
-    is_high_confidence = not pending_review and evidence_level in {"V2", "V3"}
-    is_conflict = bool(
-        is_high_confidence
-        and manual is not None
-        and conclusion(automatic) != conclusion(manual)
-    )
-    previous_review_id = (
-        int(manual["review_id"])
-        if is_conflict and manual is not None and manual["review_id"] is not None
-        else None
-    )
-    _synchronize_review_queue_state(
-        connection,
-        content_id=content_id,
-        evaluation_id=evaluation_id,
-        reason_code="manual_conclusion_conflict",
-        should_be_active=is_conflict,
-        active_status="manual_required",
-        priority=100,
-        reopen_reason=(
-            "current release automatic evaluation conflicts with the latest "
-            "human conclusion"
-        ),
-        previous_review_id=previous_review_id,
-        record_reopen_on_create=True,
-    )
 
 
 def canonical_json(value: Any) -> str:
@@ -379,178 +84,6 @@ def canonical_json(value: Any) -> str:
 
 def sha256_json(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
-
-
-def _gray_review_queue_sync_plan(connection: sqlite3.Connection) -> Dict[str, Any]:
-    releases = connection.execute(
-        "SELECT id,rule_version FROM evaluation_releases WHERE status='active'"
-    ).fetchall()
-    if len(releases) != 1:
-        raise EvaluationError("exactly one active release is required")
-    release = releases[0]
-    if str(release["rule_version"]) == V9_RULE_VERSION:
-        payload: Dict[str, Any] = {
-            "schema_version": "gray-review-queue-sync-v2",
-            "release_id": str(release["id"]),
-            "rule_version": str(release["rule_version"]),
-            "targets": [],
-        }
-        return {
-            **payload,
-            "plan_sha256": sha256_json(payload),
-            "gray_evaluation_count": 0,
-            "synchronized_count": 0,
-            "target_count": 0,
-            "action_counts": {
-                "create": 0,
-                "reopen": 0,
-                "reanchor": 0,
-                "resolve": 0,
-            },
-        }
-    rows = connection.execute(
-        """
-        WITH ranked AS (
-            SELECT id,content_id,evidence_level,pending_review,evaluation_source,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY content_id
-                       ORDER BY evaluated_at DESC,id DESC
-                   ) selector_rank
-            FROM evaluation_versions
-            WHERE release_id=? AND invalidated_at IS NULL
-        )
-        SELECT r.content_id,r.id evaluation_id,r.evidence_level,r.pending_review,
-               q.id queue_id,q.evaluation_id queue_evaluation_id,q.status queue_status
-        FROM ranked r
-        LEFT JOIN review_queue q
-          ON q.content_id=r.content_id AND q.reason_code='evaluation_gray_zone'
-        WHERE r.selector_rank=1 AND r.evaluation_source='automatic'
-          AND (
-              q.id IS NOT NULL
-              OR (r.pending_review=1 AND r.evidence_level IN ('V2','V3'))
-          )
-        ORDER BY r.content_id
-        """,
-        (release["id"],),
-    ).fetchall()
-    targets: List[Dict[str, Any]] = []
-    synchronized = 0
-    gray_evaluation_count = 0
-    active_statuses = {"pending", "manual_required", "in_review"}
-    for row in rows:
-        queue_id = row["queue_id"]
-        queue_evaluation_id = row["queue_evaluation_id"]
-        queue_status = (
-            str(row["queue_status"]) if row["queue_status"] is not None else None
-        )
-        is_gray = bool(row["pending_review"]) and str(row["evidence_level"]) in {
-            "V2",
-            "V3",
-        }
-        gray_evaluation_count += int(is_gray)
-        if not is_gray:
-            if queue_id is None or queue_status not in active_statuses:
-                continue
-            action = "resolve"
-        elif queue_id is None:
-            action = "create"
-        elif (
-            queue_evaluation_id is not None
-            and int(queue_evaluation_id) == int(row["evaluation_id"])
-            and queue_status in active_statuses
-        ):
-            synchronized += 1
-            continue
-        elif queue_status in {"resolved", "terminal_failed"}:
-            action = "reopen"
-        else:
-            action = "reanchor"
-        targets.append(
-            {
-                "content_id": int(row["content_id"]),
-                "evaluation_id": int(row["evaluation_id"]),
-                "evidence_level": str(row["evidence_level"]),
-                "pending_review": bool(row["pending_review"]),
-                "queue_id": int(queue_id) if queue_id is not None else None,
-                "queue_evaluation_id": int(queue_evaluation_id)
-                if queue_evaluation_id is not None
-                else None,
-                "queue_status": queue_status,
-                "action": action,
-            }
-        )
-    action_counts = {
-        action: sum(int(item["action"] == action) for item in targets)
-        for action in ("create", "reopen", "reanchor", "resolve")
-    }
-    payload = {
-        "schema_version": "gray-review-queue-sync-v2",
-        "release_id": str(release["id"]),
-        "rule_version": str(release["rule_version"]),
-        "targets": targets,
-    }
-    return {
-        **payload,
-        "plan_sha256": sha256_json(payload),
-        "gray_evaluation_count": gray_evaluation_count,
-        "synchronized_count": synchronized,
-        "target_count": len(targets),
-        "action_counts": action_counts,
-    }
-
-
-def plan_gray_review_queue_sync(*, db_path: Path = DEFAULT_DB) -> Dict[str, Any]:
-    """Build a deterministic, strictly read-only plan for current v8 gray rows."""
-
-    resolved = db_path.resolve()
-    if not resolved.is_file():
-        raise EvaluationError(f"database does not exist: {resolved}")
-    connection = sqlite3.connect(f"{resolved.as_uri()}?mode=ro", uri=True, timeout=10)
-    connection.row_factory = sqlite3.Row
-    try:
-        return _gray_review_queue_sync_plan(connection)
-    finally:
-        connection.close()
-
-
-def apply_gray_review_queue_sync(
-    *,
-    expected_plan_sha256: str,
-    db_path: Path = DEFAULT_DB,
-) -> Dict[str, Any]:
-    """Apply one currently confirmed queue plan atomically."""
-
-    resolved = db_path.resolve()
-    if not resolved.is_file():
-        raise EvaluationError(f"database does not exist: {resolved}")
-    with connect(resolved) as connection, transaction(connection):
-        plan = _gray_review_queue_sync_plan(connection)
-        if expected_plan_sha256 != str(plan["plan_sha256"]):
-            raise EvaluationError("gray review queue sync plan hash changed")
-        changes_before = connection.total_changes
-        for item in plan["targets"]:
-            _synchronize_gray_review_queue(
-                connection,
-                content_id=int(item["content_id"]),
-                evaluation_id=int(item["evaluation_id"]),
-                release_id=str(plan["release_id"]),
-                evidence_level=str(item["evidence_level"]),
-                pending_review=bool(item["pending_review"]),
-            )
-        applied_changes = connection.total_changes - changes_before
-        remaining = _gray_review_queue_sync_plan(connection)
-        if int(remaining["target_count"]) != 0:
-            raise EvaluationError("gray review queue sync did not converge")
-    return {
-        "release_id": plan["release_id"],
-        "plan_sha256": plan["plan_sha256"],
-        "target_count": plan["target_count"],
-        "action_counts": plan["action_counts"],
-        "applied_count": plan["target_count"],
-        "sqlite_changes": applied_changes,
-        "remaining_target_count": 0,
-        "reused": int(plan["target_count"]) == 0,
-    }
 
 
 def _resolved_path(local_path: str) -> Path:
@@ -622,18 +155,6 @@ def _artifact_components(
         """,
         (content_id,),
     ).fetchone()
-    manual_rows = (
-        []
-        if rule_version == V9_RULE_VERSION
-        else connection.execute(
-            """
-            SELECT evidence_type, text_value, local_path, sha256
-            FROM manual_evidence WHERE content_id=? ORDER BY id
-            """,
-            (content_id,),
-        ).fetchall()
-    )
-    manual_payload = [dict(row) for row in manual_rows]
     return {
         "detail_raw_sha256": str(detail["sha256"]) if detail is not None else None,
         "media_sha256": str(media["sha256"]) if media is not None else None,
@@ -642,15 +163,15 @@ def _artifact_components(
         "comments_version_sha256": str(comments["sha256"])
         if comments is not None
         else None,
-        "manual_evidence_sha256": sha256_json(manual_payload)
-        if manual_payload
-        else None,
+        # v16 起系统无人工复核域：人工证据不再存在。哈希公式保留该键并恒为
+        # None——evaluation-v9 本就排除人工证据，既有 evidence_sha256 因此
+        # 逐字不变，不会触发全库“证据变化”重评。
+        "manual_evidence_sha256": None,
         "media_path": _resolved_path(str(media["local_path"]))
         if media is not None
         else None,
         "asr_path": _resolved_path(str(asr["local_path"])) if asr is not None else None,
         "ocr_path": _resolved_path(str(ocr["local_path"])) if ocr is not None else None,
-        "manual_rows": manual_payload,
     }
 
 
@@ -757,13 +278,7 @@ def _evidence_level(
     media_path: Optional[Path],
     asr: Mapping[str, Any],
     ocr: Mapping[str, Any],
-    manual_rows: Sequence[Mapping[str, Any]],
 ) -> tuple[str, str]:
-    manual_visual = any(
-        row.get("evidence_type") in {"visual_summary", "media_observation"}
-        and _chinese_count(str(row.get("text_value") or "")) >= 8
-        for row in manual_rows
-    )
     media = _media_available(content_type, media_path)
     asr_text = str(asr.get("text") or "")
     ocr_text = str(ocr.get("combined_text") or "")
@@ -776,12 +291,10 @@ def _evidence_level(
     )
     if content_type == "video" and media and asr_ok and ocr_ok:
         return "V3", "完整视频、固定模型 ASR 和连续关键帧 OCR 共同覆盖"
-    if media and (asr_ok or ocr_ok or manual_visual):
-        return "V2", "媒体与 ASR、OCR 或人工画面证据可覆盖主叙事"
+    if media and (asr_ok or ocr_ok):
+        return "V2", "媒体与 ASR 或 OCR 可覆盖主叙事"
     if content_type != "video" and ocr_ok:
         return "V2", "图文 OCR 覆盖可用媒体证据"
-    if manual_visual:
-        return "V2", "人工画面证据覆盖主叙事"
     if text.strip():
         return "V1", "只有标题、正文或话题，完整媒体证据不足"
     return "V0", "内容主体和有效文字均不可用"
@@ -790,7 +303,6 @@ def _evidence_level(
 def _resolve_evaluation_release(
     connection: sqlite3.Connection,
     *,
-    source: str,
     release_id: str | None,
 ) -> sqlite3.Row:
     if release_id is None:
@@ -833,20 +345,15 @@ def _resolve_evaluation_release(
 
     status = str(release["status"])
     rule_version = str(release["rule_version"])
-    if source == "manual_review" and rule_version == V9_RULE_VERSION:
-        raise EvaluationError("manual review writes are disabled for evaluation-v9")
     if release_id is not None and (
-        source != "automatic"
-        or status != "backfilling"
+        status != "backfilling"
         or rule_version not in _MATERIALIZED_RULE_VERSIONS
     ):
         raise EvaluationError(
             "explicit release evaluation requires an evaluation-v8 or evaluation-v9 "
             "release in backfilling status"
         )
-    if source == "manual_review" and status != "active":
-        raise EvaluationError("manual review evaluations require the active release")
-    if source == "automatic" and status not in {"active", "backfilling"}:
+    if status not in {"active", "backfilling"}:
         raise EvaluationError(
             f"automatic evaluation cannot write release in status {status}"
         )
@@ -1109,148 +616,28 @@ def _evaluation_write_scope(
         yield owned_connection
 
 
-def _parent_evaluation_projection(
-    connection: sqlite3.Connection, parent: sqlite3.Row
-) -> Dict[str, Any]:
-    try:
-        parsed_payload = json.loads(str(parent["payload_json"]))
-    except json.JSONDecodeError as exc:
-        raise EvaluationError("parent evaluation payload is invalid") from exc
-    if not isinstance(parsed_payload, dict):
-        raise EvaluationError("parent evaluation payload is not an object")
-
-    matches: List[Dict[str, Any]] = []
-    match_rows = connection.execute(
-        """
-        SELECT selling_point_code,scene,match_role,score,evidence_json
-        FROM evaluation_matches WHERE evaluation_id=?
-        ORDER BY CASE match_role WHEN 'primary' THEN 0 ELSE 1 END,rowid
-        """,
-        (parent["id"],),
-    ).fetchall()
-    for row in match_rows:
-        try:
-            parsed_match = json.loads(str(row["evidence_json"]))
-        except json.JSONDecodeError as exc:
-            raise EvaluationError("parent evaluation match is invalid") from exc
-        if not isinstance(parsed_match, dict):
-            raise EvaluationError("parent evaluation match is not an object")
-        match = dict(parsed_match)
-        match.update(
-            {
-                "id": str(row["selling_point_code"]),
-                "scene": str(row["scene"]),
-                "score": int(row["score"] or 0),
-            }
-        )
-        matches.append(match)
-
-    primary_code = (
-        str(parent["primary_selling_point_code"])
-        if parent["primary_selling_point_code"] is not None
-        else None
-    )
-    if bool(primary_code) != bool(matches) or (
-        primary_code is not None and str(matches[0]["id"]) != primary_code
-    ):
-        raise EvaluationError(
-            "parent evaluation primary fields and matches are inconsistent"
-        )
-    return {
-        "payload": dict(parsed_payload),
-        "evaluation_status": str(parent["evaluation_status"]),
-        "evidence_level": str(parent["evidence_level"]),
-        "evidence_summary": str(parsed_payload.get("evidence_summary") or ""),
-        "primary_code": primary_code,
-        "selling_score": int(parent["selling_point_score"])
-        if parent["selling_point_score"] is not None
-        else None,
-        "included": bool(parent["selling_point_included"]),
-        "direction": str(parent["content_direction"]),
-        "content_score": int(parent["content_automotive_score"])
-        if parent["content_automotive_score"] is not None
-        else None,
-        "audience_score": int(parent["audience_automotive_score"])
-        if parent["audience_automotive_score"] is not None
-        else None,
-        "action_score": int(parsed_payload["action_intent_score"])
-        if parsed_payload.get("action_intent_score") is not None
-        else None,
-        "valid_commenters": int(parsed_payload.get("valid_unique_commenters") or 0),
-        "acquisition_score": int(parent["acquisition_potential_score"])
-        if parent["acquisition_potential_score"] is not None
-        else None,
-        "matches": matches,
-    }
-
-
 def _evaluate_content(
     content_id: int,
     *,
     db_path: Path = DEFAULT_DB,
-    source: str = "automatic",
-    manual_override: Optional[Mapping[str, Any]] = None,
-    review_id: Optional[int] = None,
-    parent_evaluation_id: Optional[int] = None,
     expected_active_release_id: str | None = None,
     _release_id: str | None = None,
     _connection: Optional[sqlite3.Connection] = None,
 ) -> EvaluationResult:
-    if source not in {"automatic", "manual_review"}:
-        raise EvaluationError(f"unsupported evaluation source: {source}")
     if expected_active_release_id is not None:
-        if source != "automatic":
-            raise EvaluationError(
-                "expected_active_release_id is only valid for automatic evaluation"
-            )
         if not expected_active_release_id.strip():
             raise EvaluationError("expected_active_release_id must not be empty")
         if _release_id is not None:
             raise EvaluationError(
                 "expected_active_release_id cannot be combined with explicit release"
             )
-    override = dict(manual_override or {})
-    unknown_override_fields = set(override) - {
-        "decision",
-        "primary_selling_point_code",
-        "selling_point_score",
-        "selling_point_included",
-        "content_automotive_score",
-        "content_direction",
-    }
-    if unknown_override_fields:
-        raise EvaluationError(
-            f"unknown manual override fields: {sorted(unknown_override_fields)}"
-        )
-    decision = str(override.get("decision") or "")
-    if source == "automatic" and manual_override is not None:
-        raise EvaluationError("automatic evaluation does not accept manual_override")
-    if source == "manual_review" and decision not in {
-        "confirm",
-        "override",
-        "insufficient_evidence",
-        "terminal_unavailable",
-    }:
-        raise EvaluationError("manual review evaluation requires a valid decision")
-    if source == "manual_review" and review_id is None:
-        raise EvaluationError("manual review evaluation requires review_id")
-    if source == "manual_review" and parent_evaluation_id is None:
-        raise EvaluationError("manual review evaluation requires parent_evaluation_id")
-    if source != "manual_review" and review_id is not None:
-        raise EvaluationError("review_id is only valid for manual review evaluations")
-    if source != "manual_review" and parent_evaluation_id is not None:
-        raise EvaluationError(
-            "parent_evaluation_id is only valid for manual review evaluations"
-        )
     with _evaluation_write_scope(db_path, _connection) as connection:
         content = connection.execute(
             "SELECT * FROM content_items WHERE id=?", (content_id,)
         ).fetchone()
         if content is None:
             raise EvaluationError(f"content {content_id} does not exist")
-        release = _resolve_evaluation_release(
-            connection, source=source, release_id=_release_id
-        )
+        release = _resolve_evaluation_release(connection, release_id=_release_id)
         if (
             expected_active_release_id is not None
             and str(release["id"]) != expected_active_release_id
@@ -1260,7 +647,7 @@ def _evaluate_content(
                 f"expected {expected_active_release_id}, got {release['id']}"
             )
         runtime = _load_release_runtime(connection, release)
-        if source == "automatic" and runtime.matcher is None:
+        if runtime.matcher is None:
             raise EvaluationError(
                 "automatic evaluation requires a materialized release matcher; "
                 "legacy matcher fallback is disabled"
@@ -1268,49 +655,17 @@ def _evaluate_content(
         taxonomy = runtime.taxonomy
         taxonomy_version = runtime.taxonomy_version
         rule_version = str(release["rule_version"])
-        parent: sqlite3.Row | None = None
-        if source == "manual_review":
-            review = connection.execute(
-                """
-                SELECT content_id,previous_evaluation_id
-                FROM evaluation_reviews WHERE id=?
-                """,
-                (review_id,),
-            ).fetchone()
-            parent = connection.execute(
-                "SELECT * FROM evaluation_versions WHERE id=?",
-                (parent_evaluation_id,),
-            ).fetchone()
-            if review is None or parent is None:
-                raise EvaluationError("manual review lineage does not exist")
-            if (
-                int(review["content_id"]) != content_id
-                or int(parent["content_id"]) != content_id
-                or review["previous_evaluation_id"] != parent_evaluation_id
-                or str(parent["release_id"]) != str(release["id"])
-            ):
-                raise EvaluationError("manual review lineage does not match content")
         artifacts, _, evidence_sha = _current_evidence_state(
             connection, content_id, rule_version=rule_version
         )
-        if source == "automatic":
-            existing = connection.execute(
-                """
-                SELECT * FROM evaluation_versions
-                WHERE content_id=? AND release_id=? AND evidence_sha256=?
-                  AND evaluation_source='automatic'
-                """,
-                (content_id, release["id"], evidence_sha),
-            ).fetchone()
-        else:
-            existing = connection.execute(
-                """
-                SELECT * FROM evaluation_versions
-                WHERE release_id=? AND review_id=?
-                  AND evaluation_source='manual_review'
-                """,
-                (release["id"], review_id),
-            ).fetchone()
+        existing = connection.execute(
+            """
+            SELECT * FROM evaluation_versions
+            WHERE content_id=? AND release_id=? AND evidence_sha256=?
+              AND evaluation_source='automatic'
+            """,
+            (content_id, release["id"], evidence_sha),
+        ).fetchone()
         if existing is not None:
             if existing["invalidated_at"] is not None:
                 raise EvaluationError(
@@ -1320,23 +675,6 @@ def _evaluate_content(
             existing_envelope_id = existing["evidence_envelope_id"]
             if existing_envelope_id is None:
                 raise EvaluationError("existing evaluation has no evidence envelope")
-            if source == "automatic" and rule_version != V9_RULE_VERSION:
-                _synchronize_gray_review_queue(
-                    connection,
-                    content_id=int(existing["content_id"]),
-                    evaluation_id=int(existing["id"]),
-                    release_id=str(release["id"]),
-                    evidence_level=str(existing["evidence_level"]),
-                    pending_review=bool(existing["pending_review"]),
-                )
-                _synchronize_manual_conclusion_conflict_queue(
-                    connection,
-                    content_id=int(existing["content_id"]),
-                    evaluation_id=int(existing["id"]),
-                    release_id=str(release["id"]),
-                    evidence_level=str(existing["evidence_level"]),
-                    pending_review=bool(existing["pending_review"]),
-                )
             return EvaluationResult(
                 evaluation_id=int(existing["id"]),
                 evidence_envelope_id=int(existing_envelope_id),
@@ -1353,49 +691,24 @@ def _evaluate_content(
 
         asr = _read_json(artifacts["asr_path"])
         ocr = _read_json(artifacts["ocr_path"])
-        manual_rows = artifacts["manual_rows"]
-        manual_text = "\n".join(str(row.get("text_value") or "") for row in manual_rows)
-        manual_visual_text = "\n".join(
-            str(row.get("text_value") or "")
-            for row in manual_rows
-            if row.get("evidence_type") in {"visual_summary", "media_observation"}
-        )
-        manual_desc_text = "\n".join(
-            str(row.get("text_value") or "")
-            for row in manual_rows
-            if row.get("evidence_type") not in {"visual_summary", "media_observation"}
-        )
         body_text = "\n".join(
             value
             for value in (
                 str(content["title"] or ""),
                 str(content["body"] or ""),
-                manual_text,
             )
             if value
         )
-        matcher_desc = "\n".join(
-            value
-            for value in (
-                str(content["title"] or ""),
-                str(content["body"] or ""),
-                manual_desc_text,
-            )
-            if value
-        )
+        matcher_desc = body_text
         evidence_level, evidence_summary = _evidence_level(
             content_type=str(content["content_type"]),
             text=body_text,
             media_path=artifacts["media_path"],
             asr=asr,
             ocr=ocr,
-            manual_rows=manual_rows,
         )
         matches: List[Dict[str, Any]]
-        if source == "manual_review":
-            matches = []
-            included_min, review_min = INCLUDE_MIN, REVIEW_MIN
-        elif evidence_level not in {"V2", "V3"}:
+        if evidence_level not in {"V2", "V3"}:
             matches = []
             included_min, review_min = INCLUDE_MIN, REVIEW_MIN
         else:
@@ -1410,9 +723,11 @@ def _evaluate_content(
                 asr,
                 ocr,
                 evidence_level,
-                {"summary": manual_visual_text},
+                {"summary": ""},
             )
             included_min = int(runtime.matcher.thresholds["included_min"])
+            # DSL 阈值键名 review_min 属于已发布规则合同（改名会变
+            # matcher_rule_sha256），保留原键名，仅表示 60 分弱匹配下限。
             review_min = int(runtime.matcher.thresholds["review_min"])
             max_secondary = int(runtime.matcher.thresholds["max_secondary"])
             matches = (
@@ -1433,17 +748,6 @@ def _evaluate_content(
         included = bool(
             primary and selling_score is not None and selling_score >= included_min
         )
-        pending_review = (
-            False
-            if source == "automatic" and rule_version == V9_RULE_VERSION
-            else bool(
-                evidence_level in {"V0", "V1"}
-                or (
-                    selling_score is not None
-                    and review_min <= selling_score < included_min
-                )
-            )
-        )
         direction = (
             str(primary["scene"])
             if primary is not None
@@ -1460,130 +764,6 @@ def _evaluate_content(
             else None
         )
 
-        parent_projection: Dict[str, Any] | None = None
-        if decision == "terminal_unavailable":
-            evidence_level, evidence_summary = "V0", "人工确认内容不可用"
-            primary_code, selling_score, included, content_score = (
-                None,
-                None,
-                False,
-                None,
-            )
-            pending_review = False
-            matches = []
-        elif decision == "insufficient_evidence":
-            evidence_level, evidence_summary = "V1", "人工确认现有证据不足"
-            primary_code, selling_score, included, content_score = (
-                None,
-                None,
-                False,
-                None,
-            )
-            pending_review = False
-            matches = []
-        elif decision == "override":
-            override_fields = {
-                "primary_selling_point_code",
-                "selling_point_score",
-                "selling_point_included",
-                "content_automotive_score",
-                "content_direction",
-            }
-            present_fields = override_fields.intersection(override)
-            if not present_fields:
-                raise EvaluationError("override requires at least one explicit field")
-            if parent is None:
-                raise EvaluationError("override requires a parent evaluation")
-            parent_projection = _parent_evaluation_projection(connection, parent)
-            evidence_level = str(parent_projection["evidence_level"])
-            evidence_summary = str(parent_projection["evidence_summary"])
-            primary_code = parent_projection["primary_code"]
-            selling_score = parent_projection["selling_score"]
-            included = bool(parent_projection["included"])
-            direction = str(parent_projection["direction"])
-            content_score = parent_projection["content_score"]
-            matches = [dict(match) for match in parent_projection["matches"]]
-
-            primary_field_present = "primary_selling_point_code" in override
-            requested_primary = (
-                override.get("primary_selling_point_code")
-                if primary_field_present
-                else primary_code
-            )
-            next_primary = str(requested_primary or "").strip() or None
-            if next_primary is not None and next_primary not in taxonomy:
-                raise EvaluationError(f"unknown selling point: {next_primary}")
-            primary_changed = next_primary != primary_code
-            primary_code = next_primary
-
-            if primary_field_present and primary_code is None:
-                if override.get("selling_point_score") not in {None, 0} or override.get(
-                    "selling_point_included"
-                ) not in {None, False}:
-                    raise EvaluationError(
-                        "clearing the primary selling point requires score 0 and included false"
-                    )
-                selling_score = 0
-                included = False
-                matches = []
-            else:
-                if "selling_point_score" in override:
-                    if override["selling_point_score"] is None:
-                        raise EvaluationError(
-                            "selling_point_score cannot be null while a primary point exists"
-                        )
-                    selling_score = int(override["selling_point_score"])
-                elif primary_code is not None and selling_score is None:
-                    selling_score = 90
-                if "selling_point_included" in override:
-                    if override["selling_point_included"] is None:
-                        raise EvaluationError("selling_point_included cannot be null")
-                    included = bool(override["selling_point_included"])
-
-            if "content_automotive_score" in override:
-                content_value = override["content_automotive_score"]
-                content_score = (
-                    int(content_value) if content_value is not None else None
-                )
-            if "content_direction" in override:
-                if override["content_direction"] is None:
-                    raise EvaluationError("content_direction cannot be null")
-                direction = str(override["content_direction"])
-
-            if primary_code is not None:
-                if primary_changed or not matches:
-                    matches = [
-                        {
-                            "id": primary_code,
-                            "score": selling_score,
-                            "scene": direction,
-                            "reason": "人工复核覆盖",
-                            "source": "manual",
-                        }
-                    ]
-                else:
-                    if "selling_point_score" in override:
-                        matches[0]["score"] = selling_score
-                        matches[0]["reason"] = "人工复核覆盖"
-                        matches[0]["source"] = "manual"
-                    if "content_direction" in override:
-                        matches[0]["scene"] = direction
-                        matches[0]["reason"] = "人工复核覆盖"
-                        matches[0]["source"] = "manual"
-            pending_review = False
-        elif decision == "confirm":
-            if parent is None:
-                raise EvaluationError("confirm requires a parent evaluation")
-            parent_projection = _parent_evaluation_projection(connection, parent)
-            evidence_level = str(parent_projection["evidence_level"])
-            evidence_summary = str(parent_projection["evidence_summary"])
-            primary_code = parent_projection["primary_code"]
-            selling_score = parent_projection["selling_score"]
-            included = bool(parent_projection["included"])
-            direction = str(parent_projection["direction"])
-            content_score = parent_projection["content_score"]
-            matches = [dict(match) for match in parent_projection["matches"]]
-            pending_review = False
         if direction not in {"new_car", "used_car", "media", "other", "unknown"}:
             raise EvaluationError(f"invalid content direction: {direction}")
         if content_score is not None and not 0 <= content_score <= 100:
@@ -1605,16 +785,6 @@ def _evaluate_content(
             )
         if matches and direction not in {"new_car", "used_car", "media"}:
             raise EvaluationError("matched selling points require an E/X/M scene")
-        if (
-            decision == "override"
-            and primary_code is not None
-            and direction not in runtime.allowed_scenes[primary_code]
-        ):
-            allowed_scene_text = ", ".join(sorted(runtime.allowed_scenes[primary_code]))
-            raise EvaluationError(
-                f"selling point {primary_code} does not allow content direction "
-                f"{direction}; allowed: {allowed_scene_text}"
-            )
         for match in matches:
             code = str(match.get("id") or "")
             scene = str(match.get("scene") or direction)
@@ -1629,100 +799,57 @@ def _evaluate_content(
                 )
             match["scene"] = scene
 
-        if parent_projection is not None:
-            audience_score = parent_projection["audience_score"]
-            action_score = parent_projection["action_score"]
-            valid_commenters = int(parent_projection["valid_commenters"])
-            if decision == "override":
-                task_fit = (
-                    selling_score
-                    if included
-                    else 0
-                    if content_score is not None
-                    else None
-                )
-                acquisition_score = _acquisition_score(
-                    content_score, audience_score, task_fit, action_score
-                )
-            else:
-                acquisition_score = parent_projection["acquisition_score"]
-            evaluation_status = str(parent_projection["evaluation_status"])
-            payload = dict(parent_projection["payload"])
-            payload.update(
-                {
-                    "evaluation_status": evaluation_status,
-                    "evidence_level": evidence_level,
-                    "evidence_summary": evidence_summary,
-                    "primary_selling_point_id": primary_code or "",
-                    "selling_point_score": selling_score,
-                    "selling_point_included": included,
-                    "pending_review": False,
-                    "content_direction": direction,
-                    "content_automotive_score": content_score,
-                    "audience_automotive_score": audience_score,
-                    "action_intent_score": action_score,
-                    "valid_unique_commenters": valid_commenters,
-                    "acquisition_potential": acquisition_score,
-                    "matches": matches[:3],
-                    "evaluation_source": source,
-                    "release_id": str(release["id"]),
-                }
-            )
-        else:
-            audience_score, action_score, valid_commenters = _comment_scores(
-                connection, content_id
-            )
-            task_fit = (
-                selling_score if included else 0 if content_score is not None else None
-            )
-            acquisition_score = _acquisition_score(
-                content_score, audience_score, task_fit, action_score
-            )
-            evaluation_status = (
-                "evaluated"
-                if evidence_level in {"V2", "V3"}
-                else "insufficient_evidence"
-            )
-            payload = {
-                "evaluation_status": evaluation_status,
-                "evidence_level": evidence_level,
-                "evidence_summary": evidence_summary,
-                "primary_selling_point_id": primary_code or "",
-                "selling_point_score": selling_score,
-                "selling_point_included": included,
-                "pending_review": pending_review,
-                "content_direction": direction,
-                "content_automotive_score": content_score,
-                "audience_automotive_score": audience_score,
-                "action_intent_score": action_score,
-                "valid_unique_commenters": valid_commenters,
-                "acquisition_potential": acquisition_score,
-                "matches": matches[:3],
-                "evaluation_source": source,
-                "release_id": str(release["id"]),
-            }
+        audience_score, action_score, valid_commenters = _comment_scores(
+            connection, content_id
+        )
+        task_fit = (
+            selling_score if included else 0 if content_score is not None else None
+        )
+        acquisition_score = _acquisition_score(
+            content_score, audience_score, task_fit, action_score
+        )
+        evaluation_status = (
+            "evaluated"
+            if evidence_level in {"V2", "V3"}
+            else "insufficient_evidence"
+        )
+        payload = {
+            "evaluation_status": evaluation_status,
+            "evidence_level": evidence_level,
+            "evidence_summary": evidence_summary,
+            "primary_selling_point_id": primary_code or "",
+            "selling_point_score": selling_score,
+            "selling_point_included": included,
+            "content_direction": direction,
+            "content_automotive_score": content_score,
+            "audience_automotive_score": audience_score,
+            "action_intent_score": action_score,
+            "valid_unique_commenters": valid_commenters,
+            "acquisition_potential": acquisition_score,
+            "matches": matches[:3],
+            "evaluation_source": "automatic",
+            "release_id": str(release["id"]),
+        }
         cursor = connection.execute(
             """
             INSERT INTO evaluation_versions(
-                content_id, evidence_envelope_id, release_id, parent_evaluation_id,
-                review_id, rule_version, taxonomy_version, matcher_rule_sha256,
+                content_id, evidence_envelope_id, release_id,
+                rule_version, taxonomy_version, matcher_rule_sha256,
                 evidence_sha256, evaluation_source, evaluation_status, evidence_level,
                 primary_selling_point_code, selling_point_score, selling_point_included,
                 content_direction, content_automotive_score, audience_automotive_score,
-                acquisition_potential_score, pending_review, payload_json, evaluated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                acquisition_potential_score, payload_json, evaluated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 content_id,
                 envelope_id,
                 release["id"],
-                parent_evaluation_id,
-                review_id,
                 release["rule_version"],
                 taxonomy_version,
                 release["matcher_rule_sha256"],
                 evidence_sha,
-                source,
+                "automatic",
                 payload["evaluation_status"],
                 evidence_level,
                 primary_code,
@@ -1732,7 +859,6 @@ def _evaluate_content(
                 content_score,
                 audience_score,
                 acquisition_score,
-                int(pending_review),
                 canonical_json(payload),
                 now_utc(),
             ),
@@ -1759,23 +885,6 @@ def _evaluate_content(
                     canonical_json(match),
                 ),
             )
-        if source == "automatic" and rule_version != V9_RULE_VERSION:
-            _synchronize_gray_review_queue(
-                connection,
-                content_id=content_id,
-                evaluation_id=evaluation_id,
-                release_id=str(release["id"]),
-                evidence_level=evidence_level,
-                pending_review=pending_review,
-            )
-            _synchronize_manual_conclusion_conflict_queue(
-                connection,
-                content_id=content_id,
-                evaluation_id=evaluation_id,
-                release_id=str(release["id"]),
-                evidence_level=evidence_level,
-                pending_review=pending_review,
-            )
         if str(release["status"]) == "active":
             connection.execute(
                 "UPDATE content_items SET evaluation_content_direction=? WHERE id=?",
@@ -1795,19 +904,11 @@ def evaluate_content(
     content_id: int,
     *,
     db_path: Path = DEFAULT_DB,
-    source: str = "automatic",
-    manual_override: Optional[Mapping[str, Any]] = None,
-    review_id: Optional[int] = None,
-    parent_evaluation_id: Optional[int] = None,
     expected_active_release_id: str | None = None,
 ) -> EvaluationResult:
     return _evaluate_content(
         content_id,
         db_path=db_path,
-        source=source,
-        manual_override=manual_override,
-        review_id=review_id,
-        parent_evaluation_id=parent_evaluation_id,
         expected_active_release_id=expected_active_release_id,
     )
 
@@ -1825,7 +926,6 @@ def evaluate_release_content(
     return _evaluate_content(
         content_id,
         db_path=db_path,
-        source="automatic",
         _release_id=release_id,
     )
 
@@ -1940,237 +1040,3 @@ def evaluate_incremental(
         "reused": reused,
         "results": results,
     }
-
-
-def reopen_review(
-    queue_id: int,
-    *,
-    reason: str,
-    reopened_by: str,
-    db_path: Path = DEFAULT_DB,
-) -> ReviewReopenResult:
-    """Reopen a resolved queue with an explicit append-only audit event."""
-
-    if not reason.strip() or not reopened_by.strip():
-        raise EvaluationError("reopen reason and operator are required")
-    with connect(db_path) as connection, transaction(connection):
-        assert_manual_review_writable(connection)
-        queue = connection.execute(
-            "SELECT * FROM review_queue WHERE id=?", (queue_id,)
-        ).fetchone()
-        if queue is None:
-            raise EvaluationError(f"review queue {queue_id} does not exist")
-        if queue["status"] != "resolved":
-            raise EvaluationError(
-                f"review queue {queue_id} must be resolved before reopening"
-            )
-        current = review_anchor_evaluation(connection, int(queue["content_id"]))
-        if current is None:
-            raise EvaluationError("review content has no current evaluation")
-        previous_review = connection.execute(
-            """
-            SELECT id FROM evaluation_reviews
-            WHERE queue_id=? AND resulting_evaluation_id IS NOT NULL
-            ORDER BY id DESC LIMIT 1
-            """,
-            (queue_id,),
-        ).fetchone()
-        created_at = now_utc()
-        cursor = connection.execute(
-            """
-            INSERT INTO review_reopen_events(
-                queue_id, content_id, previous_review_id, base_evaluation_id,
-                reopened_by, reason, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                queue_id,
-                queue["content_id"],
-                previous_review["id"] if previous_review is not None else None,
-                current["id"],
-                reopened_by.strip(),
-                reason.strip(),
-                created_at,
-            ),
-        )
-        if cursor.lastrowid is None:
-            raise RuntimeError("review reopen insert returned no id")
-        updated = connection.execute(
-            """
-            UPDATE review_queue
-            SET evaluation_id=?, status='in_review', assigned_to=?,
-                resolved_at=NULL, updated_at=?
-            WHERE id=? AND status='resolved'
-            """,
-            (current["id"], reopened_by.strip(), created_at, queue_id),
-        )
-        if updated.rowcount != 1:
-            raise EvaluationError("复核任务状态已更新，请刷新后重试")
-        return ReviewReopenResult(
-            event_id=int(cursor.lastrowid),
-            queue_id=queue_id,
-            content_id=int(queue["content_id"]),
-            base_evaluation_id=int(current["id"]),
-        )
-
-
-def resolve_review(
-    queue_id: int,
-    *,
-    decision: str,
-    reason: str,
-    reviewer: str,
-    evidence_type: str,
-    evidence_text: str,
-    base_evaluation_id: int,
-    overrides: Optional[Mapping[str, Any]] = None,
-    db_path: Path = DEFAULT_DB,
-) -> EvaluationResult:
-    allowed = {"confirm", "override", "insufficient_evidence", "terminal_unavailable"}
-    if decision not in allowed:
-        raise EvaluationError(f"invalid review decision: {decision}")
-    if not reason.strip() or not reviewer.strip() or not evidence_text.strip():
-        raise EvaluationError("reason, reviewer and manual evidence are required")
-    if base_evaluation_id is None or base_evaluation_id < 1:
-        raise EvaluationError("base_evaluation_id is required")
-    override_values = dict(overrides or {})
-    if decision == "override":
-        score = override_values.get("selling_point_score")
-        verticality = override_values.get("content_automotive_score")
-        direction = override_values.get("content_direction")
-        if score is not None and not 0 <= int(score) <= 100:
-            raise EvaluationError("selling point score must be 0..100")
-        if verticality is not None and not 0 <= int(verticality) <= 100:
-            raise EvaluationError("content automotive score must be 0..100")
-        if direction is not None and direction not in {
-            "new_car",
-            "used_car",
-            "media",
-            "other",
-            "unknown",
-        }:
-            raise EvaluationError("invalid content direction")
-    with connect(db_path) as connection, transaction(connection):
-        assert_manual_review_writable(connection)
-        queue = connection.execute(
-            "SELECT * FROM review_queue WHERE id=?", (queue_id,)
-        ).fetchone()
-        if queue is None:
-            raise EvaluationError(f"review queue {queue_id} does not exist")
-        queue_evaluation_id = (
-            int(queue["evaluation_id"]) if queue["evaluation_id"] is not None else None
-        )
-        if queue_evaluation_id != base_evaluation_id:
-            raise EvaluationError("评估证据已更新，请刷新证据后重新复核")
-        previous = review_anchor_evaluation(connection, int(queue["content_id"]))
-        current_evaluation_id = int(previous["id"]) if previous is not None else None
-        if current_evaluation_id != base_evaluation_id:
-            raise EvaluationError("评估证据已更新，请刷新证据后重新复核")
-        if queue["status"] in {"resolved", "terminal_failed"}:
-            raise EvaluationError(
-                f"review queue {queue_id} is already {queue['status']}"
-            )
-        if decision == "override":
-            primary_code = override_values.get("primary_selling_point_code")
-            direction = override_values.get("content_direction")
-            if primary_code and direction:
-                allowed_scenes = {
-                    str(row["scene"])
-                    for row in connection.execute(
-                        """
-                        SELECT sps.scene
-                        FROM taxonomy_versions tv
-                        JOIN selling_points sp ON sp.taxonomy_id=tv.id
-                        JOIN selling_point_scenes sps
-                          ON sps.selling_point_id=sp.id
-                        WHERE tv.id=(
-                            SELECT id FROM taxonomy_versions
-                            WHERE status='published'
-                            ORDER BY published_at DESC, created_at DESC LIMIT 1
-                        ) AND sp.code=?
-                        """,
-                        (primary_code,),
-                    ).fetchall()
-                }
-                if allowed_scenes and direction not in allowed_scenes:
-                    allowed_scene_text = ", ".join(sorted(allowed_scenes))
-                    raise EvaluationError(
-                        f"selling point {primary_code} does not allow content "
-                        f"direction {direction}; allowed: {allowed_scene_text}"
-                    )
-        review_cursor = connection.execute(
-            """
-            INSERT INTO evaluation_reviews(
-                queue_id, content_id, previous_evaluation_id, decision,
-                reason, reviewer, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                queue_id,
-                queue["content_id"],
-                previous["id"] if previous else None,
-                decision,
-                reason.strip(),
-                reviewer.strip(),
-                now_utc(),
-            ),
-        )
-        if review_cursor.lastrowid is None:
-            raise RuntimeError("review insert returned no id")
-        review_id = int(review_cursor.lastrowid)
-        evidence_sha = hashlib.sha256(evidence_text.strip().encode("utf-8")).hexdigest()
-        connection.execute(
-            """
-            INSERT INTO manual_evidence(
-                review_id, content_id, evidence_type, text_value, sha256, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                review_id,
-                queue["content_id"],
-                evidence_type,
-                evidence_text.strip(),
-                evidence_sha,
-                now_utc(),
-            ),
-        )
-        manual_override = {"decision": decision, **override_values}
-        result = _evaluate_content(
-            int(queue["content_id"]),
-            db_path=db_path,
-            source="manual_review",
-            manual_override=manual_override,
-            review_id=review_id,
-            parent_evaluation_id=current_evaluation_id,
-            _connection=connection,
-        )
-        next_status = (
-            "terminal_failed" if decision == "terminal_unavailable" else "resolved"
-        )
-        review_updated = connection.execute(
-            """
-            UPDATE evaluation_reviews SET resulting_evaluation_id=? WHERE id=?
-            """,
-            (result.evaluation_id, review_id),
-        )
-        if review_updated.rowcount != 1:
-            raise RuntimeError("review result update did not affect exactly one row")
-        completed_at = now_utc()
-        updated = connection.execute(
-            """
-            UPDATE review_queue SET evaluation_id=?, status=?, resolved_at=?, updated_at=?
-            WHERE id=? AND evaluation_id=?
-              AND status IN ('pending','in_review','manual_required')
-            """,
-            (
-                result.evaluation_id,
-                next_status,
-                completed_at,
-                completed_at,
-                queue_id,
-                base_evaluation_id,
-            ),
-        )
-        if updated.rowcount != 1:
-            raise EvaluationError("评估证据已更新，请刷新证据后重新复核")
-        return result

@@ -15,14 +15,15 @@ from typing import Iterator
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_DB = PROJECT_ROOT / "app" / "data" / "dcar_insight.sqlite3"
-SCHEMA_VERSION = 15
-CURRENT_SCHEMA_MIGRATION_NAME = "spu-llm-assist"
+SCHEMA_VERSION = 16
+CURRENT_SCHEMA_MIGRATION_NAME = "remove-manual-review"
 SCHEMA_MIGRATION_NAMES = {
     11: "interaction-user-v1-fallback-keys",
     12: "append-only-metric-observations",
     13: "scheduler-run-attempt-history",
     14: "spu-audience-scene-domain",
-    15: CURRENT_SCHEMA_MIGRATION_NAME,
+    15: "spu-llm-assist",
+    16: CURRENT_SCHEMA_MIGRATION_NAME,
 }
 RUNTIME_COMPATIBLE_SCHEMA_VERSIONS = frozenset(SCHEMA_MIGRATION_NAMES)
 LEGACY_TAXONOMY_VERSION = "selling-points-v5.0"
@@ -70,12 +71,52 @@ def configure_connection_safety(connection: sqlite3.Connection) -> None:
         raise RuntimeError("SQLite foreign keys could not be enabled")
 
 
+def same_database_path(left: Path, right: Path) -> bool:
+    """Compare database paths by file identity when both targets exist.
+
+    macOS exposes the same file through both ``/Users`` and
+    ``/System/Volumes/Data/Users``.  Those APFS firmlink spellings can retain
+    different ``Path.resolve()`` strings, so security decisions must use the
+    underlying device/inode identity.  For paths that do not exist yet, retain
+    the deterministic canonical-path comparison used by create-time guards.
+    """
+
+    left_path = Path(left).expanduser()
+    right_path = Path(right).expanduser()
+    try:
+        left_stat = left_path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        left_stat = None
+    try:
+        right_stat = right_path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        right_stat = None
+    if left_stat is not None and right_stat is not None:
+        return os.path.samestat(left_stat, right_stat)
+
+    # Permission and other I/O failures intentionally propagate instead of
+    # turning an unverified alias into a negative security decision.  Only a
+    # genuinely missing target may use the deterministic create-time fallback.
+    return left_path.resolve(strict=False) == right_path.resolve(strict=False)
+
+
+def is_formal_database_path(
+    path: Path, *, formal_database: Path | None = None
+) -> bool:
+    """Return whether ``path`` names the formal database, including aliases."""
+
+    return same_database_path(
+        path,
+        DEFAULT_DB if formal_database is None else formal_database,
+    )
+
+
 def connect(
     path: Path = DEFAULT_DB, *, read_only: bool | None = None
 ) -> sqlite3.Connection:
     if (
         os.environ.get("DCAR_TEST_DENY_FORMAL_DB") == "1"
-        and path.resolve() == DEFAULT_DB.resolve()
+        and is_formal_database_path(path)
     ):
         raise RuntimeError("test process attempted to open the formal DCar database")
     if read_only is None:
@@ -669,8 +710,6 @@ CREATE TABLE IF NOT EXISTS evaluation_versions (
     release_id TEXT NOT NULL,
     parent_evaluation_id INTEGER REFERENCES evaluation_versions(id)
         ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
-    review_id INTEGER REFERENCES evaluation_reviews(id)
-        ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
     rule_version TEXT NOT NULL,
     taxonomy_version TEXT NOT NULL,
     matcher_rule_sha256 TEXT NOT NULL CHECK(length(matcher_rule_sha256)=64),
@@ -690,7 +729,6 @@ CREATE TABLE IF NOT EXISTS evaluation_versions (
         CHECK(audience_automotive_score IS NULL OR audience_automotive_score BETWEEN 0 AND 100),
     acquisition_potential_score INTEGER
         CHECK(acquisition_potential_score IS NULL OR acquisition_potential_score BETWEEN 0 AND 100),
-    pending_review INTEGER NOT NULL DEFAULT 0 CHECK(pending_review IN (0,1)),
     payload_json TEXT NOT NULL,
     evaluated_at TEXT NOT NULL,
     invalidated_at TEXT,
@@ -699,10 +737,6 @@ CREATE TABLE IF NOT EXISTS evaluation_versions (
         REFERENCES evaluation_releases(
             id, rule_version, taxonomy_version, matcher_rule_sha256
         ) ON DELETE RESTRICT,
-    CHECK(
-        (evaluation_source='manual_review' AND review_id IS NOT NULL)
-        OR (evaluation_source<>'manual_review' AND review_id IS NULL)
-    ),
     CHECK(parent_evaluation_id IS NULL OR parent_evaluation_id<>id),
     CHECK(
         (invalidated_at IS NULL AND invalidation_reason IS NULL)
@@ -713,9 +747,6 @@ CREATE TABLE IF NOT EXISTS evaluation_versions (
 CREATE UNIQUE INDEX IF NOT EXISTS uq_evaluation_automatic_idempotency
 ON evaluation_versions(content_id, release_id, evidence_sha256)
 WHERE evaluation_source='automatic';
-CREATE UNIQUE INDEX IF NOT EXISTS uq_evaluation_manual_idempotency
-ON evaluation_versions(release_id, review_id)
-WHERE evaluation_source='manual_review' AND review_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_evaluation_migrated_parent_idempotency
 ON evaluation_versions(release_id, parent_evaluation_id)
 WHERE evaluation_source='migrated_from_v5' AND parent_evaluation_id IS NOT NULL;
@@ -727,8 +758,6 @@ WHERE invalidated_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_evaluation_parent
 ON evaluation_versions(parent_evaluation_id)
 WHERE parent_evaluation_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_evaluation_review
-ON evaluation_versions(review_id) WHERE review_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS evaluation_matches (
     evaluation_id INTEGER NOT NULL REFERENCES evaluation_versions(id) ON DELETE RESTRICT,
@@ -744,71 +773,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_evaluation_primary_match
 ON evaluation_matches(evaluation_id) WHERE match_role='primary';
 CREATE INDEX IF NOT EXISTS idx_evaluation_matches_scene_code
 ON evaluation_matches(scene, selling_point_code, evaluation_id);
-
-CREATE TABLE IF NOT EXISTS review_queue (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE RESTRICT,
-    evaluation_id INTEGER REFERENCES evaluation_versions(id) ON DELETE RESTRICT,
-    reason_code TEXT NOT NULL,
-    priority INTEGER NOT NULL DEFAULT 50,
-    status TEXT NOT NULL CHECK(status IN ('pending','in_review','resolved','manual_required','terminal_failed')),
-    assigned_to TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    resolved_at TEXT,
-    UNIQUE(content_id, reason_code)
-);
-
-CREATE INDEX IF NOT EXISTS idx_review_queue_status_priority
-ON review_queue(status, priority DESC, updated_at, id);
-CREATE INDEX IF NOT EXISTS idx_review_queue_evaluation
-ON review_queue(evaluation_id) WHERE evaluation_id IS NOT NULL;
-
-CREATE TABLE IF NOT EXISTS evaluation_reviews (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    queue_id INTEGER REFERENCES review_queue(id) ON DELETE RESTRICT,
-    content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE RESTRICT,
-    previous_evaluation_id INTEGER REFERENCES evaluation_versions(id) ON DELETE RESTRICT,
-    resulting_evaluation_id INTEGER REFERENCES evaluation_versions(id) ON DELETE RESTRICT,
-    decision TEXT NOT NULL,
-    reason TEXT NOT NULL,
-    reviewer TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_evaluation_reviews_queue
-ON evaluation_reviews(queue_id, created_at, id);
-CREATE UNIQUE INDEX IF NOT EXISTS uq_evaluation_review_result
-ON evaluation_reviews(resulting_evaluation_id)
-WHERE resulting_evaluation_id IS NOT NULL;
-
-CREATE TABLE IF NOT EXISTS review_reopen_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    queue_id INTEGER NOT NULL REFERENCES review_queue(id) ON DELETE RESTRICT,
-    content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE RESTRICT,
-    previous_review_id INTEGER REFERENCES evaluation_reviews(id) ON DELETE RESTRICT,
-    base_evaluation_id INTEGER REFERENCES evaluation_versions(id) ON DELETE RESTRICT,
-    reopened_by TEXT NOT NULL,
-    reason TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_review_reopen_queue
-ON review_reopen_events(queue_id, created_at, id);
-
-CREATE TABLE IF NOT EXISTS manual_evidence (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    review_id INTEGER NOT NULL REFERENCES evaluation_reviews(id) ON DELETE RESTRICT,
-    content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE RESTRICT,
-    evidence_type TEXT NOT NULL,
-    text_value TEXT,
-    local_path TEXT,
-    sha256 TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_manual_evidence_review
-ON manual_evidence(review_id, id);
 
 CREATE TABLE IF NOT EXISTS duplicate_relations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1246,7 +1210,7 @@ def schema_compatibility_state(
         and actual_name == expected_name
         and max_migration_version == user_version
     )
-    if compatible and user_version in {11, 12, 13, 14, 15}:
+    if compatible and user_version in {11, 12, 13, 14, 15, 16}:
         try:
             _validate_v9_structure(connection)
             _validate_v10_structure(connection)
@@ -1259,6 +1223,8 @@ def schema_compatibility_state(
                 _validate_v14_structure(connection)
             if user_version >= 15:
                 _validate_v15_structure(connection)
+            if user_version >= 16:
+                _validate_v16_structure(connection)
         except SchemaMigrationError:
             compatible = False
     return {
@@ -1305,6 +1271,143 @@ _REBUILT_V9_TABLES = (
     "report_revisions",
     "report_files",
 )
+
+#: v16 起人工复核域（review_queue/evaluation_reviews/review_reopen_events/
+#: manual_evidence）从 SCHEMA_SQL 模板中移除。v8→v9 迁移阶梯与 v15 及更早
+#: 版本的结构校验仍需要这些表当时的逐字定义，冻结在下面的常量里；
+#: v15→v16 迁移最终删除这四张表并重建 evaluation_versions。
+_LEGACY_REVIEW_TABLES = (
+    "review_queue",
+    "evaluation_reviews",
+    "review_reopen_events",
+    "manual_evidence",
+)
+
+_LEGACY_V15_TABLE_SQL: dict[str, str] = {
+    "evaluation_versions": """CREATE TABLE IF NOT EXISTS evaluation_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE RESTRICT,
+    evidence_envelope_id INTEGER REFERENCES evidence_envelopes(id) ON DELETE RESTRICT,
+    release_id TEXT NOT NULL,
+    parent_evaluation_id INTEGER REFERENCES evaluation_versions(id)
+        ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+    review_id INTEGER REFERENCES evaluation_reviews(id)
+        ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+    rule_version TEXT NOT NULL,
+    taxonomy_version TEXT NOT NULL,
+    matcher_rule_sha256 TEXT NOT NULL CHECK(length(matcher_rule_sha256)=64),
+    evidence_sha256 TEXT NOT NULL,
+    evaluation_source TEXT NOT NULL CHECK(evaluation_source IN ('automatic','manual_review','migrated_from_v5')),
+    evaluation_status TEXT NOT NULL
+        CHECK(evaluation_status IN ('evaluated','insufficient_evidence')),
+    evidence_level TEXT NOT NULL CHECK(evidence_level IN ('V0','V1','V2','V3')),
+    primary_selling_point_code TEXT,
+    selling_point_score INTEGER CHECK(selling_point_score IS NULL OR selling_point_score BETWEEN 0 AND 100),
+    selling_point_included INTEGER NOT NULL DEFAULT 0 CHECK(selling_point_included IN (0,1)),
+    content_direction TEXT NOT NULL DEFAULT 'unknown'
+        CHECK(content_direction IN ('new_car','used_car','media','other','unknown')),
+    content_automotive_score INTEGER
+        CHECK(content_automotive_score IS NULL OR content_automotive_score BETWEEN 0 AND 100),
+    audience_automotive_score INTEGER
+        CHECK(audience_automotive_score IS NULL OR audience_automotive_score BETWEEN 0 AND 100),
+    acquisition_potential_score INTEGER
+        CHECK(acquisition_potential_score IS NULL OR acquisition_potential_score BETWEEN 0 AND 100),
+    pending_review INTEGER NOT NULL DEFAULT 0 CHECK(pending_review IN (0,1)),
+    payload_json TEXT NOT NULL,
+    evaluated_at TEXT NOT NULL,
+    invalidated_at TEXT,
+    invalidation_reason TEXT,
+    FOREIGN KEY(release_id, rule_version, taxonomy_version, matcher_rule_sha256)
+        REFERENCES evaluation_releases(
+            id, rule_version, taxonomy_version, matcher_rule_sha256
+        ) ON DELETE RESTRICT,
+    CHECK(
+        (evaluation_source='manual_review' AND review_id IS NOT NULL)
+        OR (evaluation_source<>'manual_review' AND review_id IS NULL)
+    ),
+    CHECK(parent_evaluation_id IS NULL OR parent_evaluation_id<>id),
+    CHECK(
+        (invalidated_at IS NULL AND invalidation_reason IS NULL)
+        OR (invalidated_at IS NOT NULL AND invalidation_reason IS NOT NULL)
+    )
+)""",
+    "review_queue": """CREATE TABLE IF NOT EXISTS review_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE RESTRICT,
+    evaluation_id INTEGER REFERENCES evaluation_versions(id) ON DELETE RESTRICT,
+    reason_code TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 50,
+    status TEXT NOT NULL CHECK(status IN ('pending','in_review','resolved','manual_required','terminal_failed')),
+    assigned_to TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    resolved_at TEXT,
+    UNIQUE(content_id, reason_code)
+)""",
+    "evaluation_reviews": """CREATE TABLE IF NOT EXISTS evaluation_reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    queue_id INTEGER REFERENCES review_queue(id) ON DELETE RESTRICT,
+    content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE RESTRICT,
+    previous_evaluation_id INTEGER REFERENCES evaluation_versions(id) ON DELETE RESTRICT,
+    resulting_evaluation_id INTEGER REFERENCES evaluation_versions(id) ON DELETE RESTRICT,
+    decision TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    reviewer TEXT NOT NULL,
+    created_at TEXT NOT NULL
+)""",
+    "review_reopen_events": """CREATE TABLE IF NOT EXISTS review_reopen_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    queue_id INTEGER NOT NULL REFERENCES review_queue(id) ON DELETE RESTRICT,
+    content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE RESTRICT,
+    previous_review_id INTEGER REFERENCES evaluation_reviews(id) ON DELETE RESTRICT,
+    base_evaluation_id INTEGER REFERENCES evaluation_versions(id) ON DELETE RESTRICT,
+    reopened_by TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL
+)""",
+    "manual_evidence": """CREATE TABLE IF NOT EXISTS manual_evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    review_id INTEGER NOT NULL REFERENCES evaluation_reviews(id) ON DELETE RESTRICT,
+    content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE RESTRICT,
+    evidence_type TEXT NOT NULL,
+    text_value TEXT,
+    local_path TEXT,
+    sha256 TEXT NOT NULL,
+    created_at TEXT NOT NULL
+)""",
+}
+
+_LEGACY_V15_INDEX_SQL = (
+    """CREATE UNIQUE INDEX IF NOT EXISTS uq_evaluation_manual_idempotency
+ON evaluation_versions(release_id, review_id)
+WHERE evaluation_source='manual_review' AND review_id IS NOT NULL""",
+    """CREATE INDEX IF NOT EXISTS idx_evaluation_review
+ON evaluation_versions(review_id) WHERE review_id IS NOT NULL""",
+    """CREATE INDEX IF NOT EXISTS idx_review_queue_status_priority
+ON review_queue(status, priority DESC, updated_at, id)""",
+    """CREATE INDEX IF NOT EXISTS idx_review_queue_evaluation
+ON review_queue(evaluation_id) WHERE evaluation_id IS NOT NULL""",
+    """CREATE INDEX IF NOT EXISTS idx_evaluation_reviews_queue
+ON evaluation_reviews(queue_id, created_at, id)""",
+    """CREATE UNIQUE INDEX IF NOT EXISTS uq_evaluation_review_result
+ON evaluation_reviews(resulting_evaluation_id)
+WHERE resulting_evaluation_id IS NOT NULL""",
+    """CREATE INDEX IF NOT EXISTS idx_review_reopen_queue
+ON review_reopen_events(queue_id, created_at, id)""",
+    """CREATE INDEX IF NOT EXISTS idx_manual_evidence_review
+ON manual_evidence(review_id, id)""",
+)
+
+
+def _legacy_v15_table_statement(table: str, replacements: dict[str, str]) -> str:
+    try:
+        statement = _LEGACY_V15_TABLE_SQL[table]
+    except KeyError as exc:
+        raise SchemaMigrationError(f"missing legacy schema template for {table}") from exc
+    statement = statement.replace("CREATE TABLE IF NOT EXISTS", "CREATE TABLE", 1)
+    for source in sorted(replacements, key=len, reverse=True):
+        statement = re.sub(rf"\b{re.escape(source)}\b", replacements[source], statement)
+    return statement
 
 
 def _schema_statements() -> list[str]:
@@ -1650,7 +1753,10 @@ def _migrate_v8_to_v9(connection: sqlite3.Connection) -> None:
         _migration_checkpoint("releases_registered")
 
         for table in _REBUILT_V9_TABLES:
-            connection.execute(_schema_table_statement(table, replacements))
+            if table in _LEGACY_V15_TABLE_SQL:
+                connection.execute(_legacy_v15_table_statement(table, replacements))
+            else:
+                connection.execute(_schema_table_statement(table, replacements))
 
         evaluation_rows = connection.execute(
             "SELECT * FROM evaluation_versions ORDER BY id"
@@ -1771,6 +1877,8 @@ def _migrate_v8_to_v9(connection: sqlite3.Connection) -> None:
                 and target.group(1) in {*_REBUILT_V9_TABLES, "evaluation_releases"}
             ):
                 connection.execute(statement)
+        for statement in _LEGACY_V15_INDEX_SQL:
+            connection.execute(statement)
         _restore_sequences(connection, sequences)
         connection.execute(
             """
@@ -1873,6 +1981,13 @@ def _create_fresh_schema(connection: sqlite3.Connection) -> None:
             """,
             (captured_at,),
         )
+        connection.execute(
+            """
+            INSERT INTO schema_migrations(version,name,applied_at)
+            VALUES (16,'remove-manual-review',?)
+            """,
+            (captured_at,),
+        )
         connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         connection.commit()
     except Exception:
@@ -1881,16 +1996,29 @@ def _create_fresh_schema(connection: sqlite3.Connection) -> None:
 
 
 def _validate_v9_structure(connection: sqlite3.Connection) -> None:
+    """校验 v9 引入的评估版本结构。
+
+    v16 起人工复核域被移除：以 ``review_queue`` 表是否存在判定当前库处于
+    哪个制度。旧制度（≤v15）要求 review 列/索引齐全；新制度（≥v16）要求
+    它们已彻底消失。
+    """
+
     columns = set(_table_columns(connection, "evaluation_versions"))
+    legacy_review_domain = "review_queue" in _table_names(connection)
     required = {
         "release_id",
         "parent_evaluation_id",
-        "review_id",
         "matcher_rule_sha256",
     }
+    if legacy_review_domain:
+        required = required | {"review_id"}
     if required - columns:
         raise SchemaMigrationError(
             f"schema v9 is missing evaluation columns: {sorted(required - columns)}"
+        )
+    if not legacy_review_domain and ({"review_id", "pending_review"} & columns):
+        raise SchemaMigrationError(
+            "schema v16 evaluation_versions still carries review columns"
         )
     indexes = {
         str(row["name"])
@@ -1898,9 +2026,14 @@ def _validate_v9_structure(connection: sqlite3.Connection) -> None:
     }
     required_indexes = {
         "uq_evaluation_automatic_idempotency",
-        "uq_evaluation_manual_idempotency",
         "uq_evaluation_migrated_parent_idempotency",
     }
+    if legacy_review_domain:
+        required_indexes = required_indexes | {"uq_evaluation_manual_idempotency"}
+    elif "uq_evaluation_manual_idempotency" in indexes:
+        raise SchemaMigrationError(
+            "schema v16 still carries the manual review idempotency index"
+        )
     if required_indexes - indexes or "uq_evaluation_idempotency" in indexes:
         raise SchemaMigrationError("schema v9 evaluation indexes are inconsistent")
 
@@ -3276,6 +3409,240 @@ def _validate_v15(connection: sqlite3.Connection) -> None:
         raise SchemaMigrationError("schema v15 has foreign-key violations")
 
 
+_V16_EVALUATION_COPY_COLUMNS = (
+    "id",
+    "content_id",
+    "evidence_envelope_id",
+    "release_id",
+    "parent_evaluation_id",
+    "rule_version",
+    "taxonomy_version",
+    "matcher_rule_sha256",
+    "evidence_sha256",
+    "evaluation_source",
+    "evaluation_status",
+    "evidence_level",
+    "primary_selling_point_code",
+    "selling_point_score",
+    "selling_point_included",
+    "content_direction",
+    "content_automotive_score",
+    "audience_automotive_score",
+    "acquisition_potential_score",
+    "payload_json",
+    "evaluated_at",
+    "invalidated_at",
+    "invalidation_reason",
+)
+
+#: 删除顺序按外键依赖从子到父。
+_V16_DROPPED_TABLES = (
+    "manual_evidence",
+    "review_reopen_events",
+    "evaluation_reviews",
+    "review_queue",
+)
+
+_V16_REMOVED_INDEXES = (
+    "uq_evaluation_manual_idempotency",
+    "idx_evaluation_review",
+    "idx_review_queue_status_priority",
+    "idx_review_queue_evaluation",
+    "idx_evaluation_reviews_queue",
+    "uq_evaluation_review_result",
+    "idx_review_reopen_queue",
+    "idx_manual_evidence_review",
+)
+
+_V16_EVALUATION_INDEXES = (
+    (
+        "uq_evaluation_automatic_idempotency",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_evaluation_automatic_idempotency",
+    ),
+    (
+        "uq_evaluation_migrated_parent_idempotency",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_evaluation_migrated_parent_idempotency",
+    ),
+    (
+        "idx_evaluation_content_audit",
+        "CREATE INDEX IF NOT EXISTS idx_evaluation_content_audit",
+    ),
+    (
+        "idx_evaluation_release_current",
+        "CREATE INDEX IF NOT EXISTS idx_evaluation_release_current",
+    ),
+    (
+        "idx_evaluation_parent",
+        "CREATE INDEX IF NOT EXISTS idx_evaluation_parent",
+    ),
+)
+
+
+def _migrate_v15_to_v16(connection: sqlite3.Connection) -> None:
+    """消灭人工复核域（Mark 2026-08-17 口径定稿）。
+
+    - 删除 ``review_queue``/``evaluation_reviews``/``review_reopen_events``/
+      ``manual_evidence`` 四张表（历史 1270 条队列已全部 resolved、10 条复核
+      记录随之删除，Mark 知情确认审计断链）；
+    - 重建 ``evaluation_versions``：去掉 ``review_id``、``pending_review``
+      两列与 manual_review↔review_id 约束；``evaluation_source`` 仍允许
+      'manual_review'——既有 18 个人工结论版本原样保留为当前结论（自然沉底，
+      下次证据/规则变化重评时由自动评估接管）；
+    - 灰区语义不再落库：60–74 弱匹配与 V0/V1 可由 selling_point_score /
+      evidence_level 推导，无需 pending_review 派生列。
+
+    重建遵循 v15 教训：旧表改名→按 SCHEMA_SQL 模板原文建新表→逐列拷贝
+    （显式 id）→删旧表→按模板重建索引；期间开启 legacy_alter_table，
+    避免 RENAME 把 evaluation_matches 等存量表 DDL 里的外键目标改写掉。
+    """
+
+    if connection.in_transaction:
+        raise SchemaMigrationError("v16 migration requires no active transaction")
+    if int(connection.execute("PRAGMA foreign_keys").fetchone()[0]) != 1:
+        raise SchemaMigrationError("v16 migration requires PRAGMA foreign_keys=ON")
+    state = schema_compatibility_state(
+        connection, supported_versions=frozenset({15})
+    )
+    if not bool(state["compatible"]):
+        raise SchemaMigrationError("v16 migration requires complete schema v15")
+    residue = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table','index')"
+        )
+    } & {"evaluation_versions_v15_old"}
+    if residue:
+        raise SchemaMigrationError(
+            f"v16 migration found leftover objects: {sorted(residue)}"
+        )
+    copy_columns = list(_V16_EVALUATION_COPY_COLUMNS)
+    old_count = int(
+        connection.execute("SELECT COUNT(*) FROM evaluation_versions").fetchone()[0]
+    )
+    old_hash = _table_projection_sha256(
+        connection, "evaluation_versions", copy_columns
+    )
+    manual_count = int(
+        connection.execute(
+            "SELECT COUNT(*) FROM evaluation_versions WHERE evaluation_source='manual_review'"
+        ).fetchone()[0]
+    )
+    sequences = {
+        str(row["name"]): int(row["seq"])
+        for row in connection.execute("SELECT name,seq FROM sqlite_sequence")
+    }
+    captured_at = now_utc()
+    connection.execute("PRAGMA foreign_keys=OFF")
+    connection.execute("PRAGMA legacy_alter_table=ON")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            "ALTER TABLE evaluation_versions RENAME TO evaluation_versions_v15_old"
+        )
+        connection.execute(_schema_table_statement("evaluation_versions", {}))
+        names = ",".join(copy_columns)
+        connection.execute(
+            f"INSERT INTO evaluation_versions({names}) "
+            f"SELECT {names} FROM evaluation_versions_v15_old"
+        )
+        connection.execute("DROP TABLE evaluation_versions_v15_old")
+        for table in _V16_DROPPED_TABLES:
+            connection.execute(f'DROP TABLE "{table}"')
+        for name, prefix in _V16_EVALUATION_INDEXES:
+            connection.execute(
+                _schema_object_sql(object_type="index", name=name, prefix=prefix)
+            )
+        _restore_sequences(connection, sequences, tables=("evaluation_versions",))
+        connection.execute(
+            """
+            INSERT INTO schema_migrations(version,name,applied_at)
+            VALUES (16,'remove-manual-review',?)
+            """,
+            (captured_at,),
+        )
+        connection.execute("PRAGMA user_version=16")
+        new_count = int(
+            connection.execute("SELECT COUNT(*) FROM evaluation_versions").fetchone()[0]
+        )
+        new_hash = _table_projection_sha256(
+            connection, "evaluation_versions", copy_columns
+        )
+        if new_count != old_count or new_hash != old_hash:
+            raise SchemaMigrationError(
+                "v16 evaluation_versions rebuild lost or altered rows: "
+                f"count {old_count}->{new_count}"
+            )
+        new_manual = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM evaluation_versions WHERE evaluation_source='manual_review'"
+            ).fetchone()[0]
+        )
+        if new_manual != manual_count:
+            raise SchemaMigrationError(
+                "v16 manual_review evaluation rows changed during rebuild: "
+                f"{manual_count}->{new_manual}"
+            )
+        violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise SchemaMigrationError(
+                f"v16 foreign-key violations before commit: {len(violations)}"
+            )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        connection.execute("PRAGMA legacy_alter_table=OFF")
+        connection.execute("PRAGMA foreign_keys=ON")
+        raise
+    connection.execute("PRAGMA legacy_alter_table=OFF")
+    connection.execute("PRAGMA foreign_keys=ON")
+    integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
+    if integrity != "ok":
+        raise SchemaMigrationError(f"v16 integrity check failed: {integrity}")
+
+
+def _validate_v16_structure(connection: sqlite3.Connection) -> None:
+    expected = _schema_object_sql(
+        object_type="table",
+        name="evaluation_versions",
+        prefix="CREATE TABLE IF NOT EXISTS evaluation_versions ",
+    )
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='evaluation_versions'"
+    ).fetchone()
+    if row is None or row[0] is None:
+        raise SchemaMigrationError("schema v16 is missing evaluation_versions")
+    if _normalized_schema_sql(str(row[0])) != _normalized_schema_sql(expected):
+        raise SchemaMigrationError(
+            "schema v16 object definition drifted: evaluation_versions"
+        )
+    for name, prefix in _V16_EVALUATION_INDEXES:
+        expected = _schema_object_sql(object_type="index", name=name, prefix=prefix)
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+            (name,),
+        ).fetchone()
+        if row is None or row[0] is None:
+            raise SchemaMigrationError(f"schema v16 is missing {name}")
+        if _normalized_schema_sql(str(row[0])) != _normalized_schema_sql(expected):
+            raise SchemaMigrationError(f"schema v16 object definition drifted: {name}")
+    leftovers = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table','index')"
+        )
+    } & (set(_V16_DROPPED_TABLES) | set(_V16_REMOVED_INDEXES))
+    if leftovers:
+        raise SchemaMigrationError(
+            f"schema v16 still contains manual review objects: {sorted(leftovers)}"
+        )
+
+
+def _validate_v16(connection: sqlite3.Connection) -> None:
+    _validate_v16_structure(connection)
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        raise SchemaMigrationError("schema v16 has foreign-key violations")
+
+
 def initialize_database(connection: sqlite3.Connection) -> None:
     if int(connection.execute("PRAGMA recursive_triggers").fetchone()[0]) != 1:
         raise SchemaMigrationError(
@@ -3291,6 +3658,7 @@ def initialize_database(connection: sqlite3.Connection) -> None:
         _validate_v13(connection)
         _validate_v14(connection)
         _validate_v15(connection)
+        _validate_v16(connection)
         require_schema_compatibility(
             connection, supported_versions=frozenset({SCHEMA_VERSION})
         )
@@ -3326,6 +3694,9 @@ def initialize_database(connection: sqlite3.Connection) -> None:
     if version == 14:
         _migrate_v14_to_v15(connection)
         version = 15
+    if version == 15:
+        _migrate_v15_to_v16(connection)
+        version = 16
     if version != SCHEMA_VERSION:
         raise SchemaMigrationError(f"unsupported schema version: {version}")
     _validate_v9(connection)
@@ -3335,6 +3706,7 @@ def initialize_database(connection: sqlite3.Connection) -> None:
     _validate_v13(connection)
     _validate_v14(connection)
     _validate_v15(connection)
+    _validate_v16(connection)
     require_schema_compatibility(
         connection, supported_versions=frozenset({SCHEMA_VERSION})
     )

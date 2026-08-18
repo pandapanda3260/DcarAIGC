@@ -27,7 +27,6 @@ from workflow.cache_index import preflight  # noqa: E402
 from workflow.reporting import (  # noqa: E402
     build_report_revision,
     create_report_run,
-    submit_manual_review,
 )
 from workflow.storage import migrate  # noqa: E402
 from workflow.tasks import (  # noqa: E402
@@ -363,21 +362,6 @@ class Handler(BaseHTTPRequestHandler):
             if match:
                 promote_formal_baseline(DB_PATH, match.group(1))
                 self.send_json(get_run(match.group(1)))
-                return
-            match = re.fullmatch(r"/api/runs/([a-zA-Z0-9_-]+)/reviews", route)
-            if match:
-                patch = payload.get("patch")
-                if not isinstance(patch, dict):
-                    raise ValueError("patch 必须是 JSON 对象")
-                report = submit_manual_review(
-                    DB_PATH,
-                    match.group(1),
-                    int(payload.get("content_item_id")),
-                    patch,
-                    str(payload.get("reason") or ""),
-                    reviewer=str(payload.get("reviewer") or "local-user"),
-                )
-                self.send_json(report)
                 return
             self.send_json({"error": "接口不存在"}, 404)
         except (ValueError, json.JSONDecodeError) as exc:

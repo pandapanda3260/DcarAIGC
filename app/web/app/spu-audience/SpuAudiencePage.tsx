@@ -32,7 +32,6 @@ import {
 } from "./vehicleCatalogSort";
 import type {
   SpuAssetRow,
-  SpuAssociationRun,
   SpuAudienceAssets,
   SpuAudienceStats,
 } from "../lib/types";
@@ -94,20 +93,6 @@ function splitWords(value: string) {
   return value.split(/[,，、\s]+/).map((word) => word.trim()).filter(Boolean);
 }
 
-// 兼容新旧两种刷新记录口径：新记录 summary 里带 eligible；旧记录用
-// contents_total（全部已发布）减 insufficient_evidence（非V2/V3）反推。
-function runParticipatedCount(run: SpuAssociationRun) {
-  return run.summary?.eligible ?? Math.max(0, run.contents_total - run.insufficient_evidence);
-}
-
-// 大模型补充的落库总处数（车型/款型/场景/人群合计）；旧记录没有 llm 字段时为 0。
-function runLlmFilledCount(run: SpuAssociationRun) {
-  const llm = run.summary?.llm;
-  if (!llm) return 0;
-  return (llm.spu_filled ?? 0) + (llm.gray_upgraded ?? 0) + (llm.gray_overridden ?? 0)
-    + (llm.trim_refined ?? 0) + (llm.scene_filled ?? 0) + (llm.audience_filled ?? 0);
-}
-
 function formatShare(value: number | null | undefined) {
   return value == null ? "—" : `${value}%`;
 }
@@ -133,12 +118,6 @@ const refreshScopes = [
 ] as const;
 type RefreshScopeKey = (typeof refreshScopes)[number]["key"];
 
-// 运行记录 summary.mode → 完成提示里的范围文案
-const refreshModeLabels: Record<string, string> = {
-  "window:yesterday": "昨天", "window:this_week": "本周", "window:last_week": "上周",
-  full: "全部", incremental: "增量",
-};
-
 export default function SpuAudiencePage() {
   const [assets, setAssets] = useState<SpuAudienceAssets | null>(null);
   const [stats, setStats] = useState<SpuAudienceStats | null>(null);
@@ -155,14 +134,9 @@ export default function SpuAudiencePage() {
   const [expandedSeries, setExpandedSeries] = useState<ReadonlySet<string>>(new Set());
   const [form, setForm] = useState<SpuForm | null>(null);
   const [error, setError] = useState("");
-  const [message, setMessage] = useState("");
   const refreshTriggerRef = useRef<HTMLButtonElement>(null);
   const refreshDialogRef = useRef<HTMLElement>(null);
   const refreshRequestRef = useRef(false);
-
-  const feedback = useCallback((nextError: string, nextMessage = "") => {
-    setError(nextError); setMessage(nextMessage);
-  }, []);
 
   const loadAssets = useCallback(async () => {
     const result = await readJson<SpuAudienceAssets>("/api/v8/spu-audience/assets");
@@ -254,16 +228,9 @@ export default function SpuAudiencePage() {
             const search = new URLSearchParams({ window: statWindow });
             if (statPlatform) search.set("platform", statPlatform);
             setStats(await readJson<SpuAudienceStats>(`/api/v8/spu-audience/stats?${search.toString()}`));
-            const run = next.last_run;
-            if (status === "succeeded" && run) {
+            if (status === "succeeded") {
               setError("");
-              const llmFilled = runLlmFilledCount(run);
-              const llmNote = llmFilled > 0 ? `，大模型补充 ${llmFilled.toLocaleString("zh-CN")} 处` : "";
-              const modeLabel = refreshModeLabels[run.summary?.mode ?? ""] ?? "";
-              const modeNote = modeLabel ? `（范围：${modeLabel}）` : "";
-              setMessage(`数据刷新完成${modeNote}：证据完整（V2/V3）参与识别 ${runParticipatedCount(run).toLocaleString("zh-CN")} 条，识别出车型 ${run.spu_linked.toLocaleString("zh-CN")} 条${llmNote}`);
             } else {
-              setMessage("");
               setError("数据刷新失败，请查看刷新记录后重试");
             }
           }
@@ -279,16 +246,14 @@ export default function SpuAudiencePage() {
     if (refreshRequestRef.current || lastRunStatus === "running") return;
     refreshRequestRef.current = true;
     setRefreshPicker(false);
-    setRunning(true); feedback("");
+    setRunning(true); setError("");
     try {
       await readJson<{ run_id: number; status: string }>(
         `/api/v8/spu-audience/associate?mode=${scope}`, { method: "POST" },
       );
       await loadAssets();
-      const scopeLabel = refreshScopes.find((item) => item.key === scope)?.label ?? "数据刷新";
-      feedback("", `数据刷新已在后台启动（${scopeLabel}），只处理证据完整（V2/V3）的内容；完成后自动更新统计`);
     } catch (reason) {
-      feedback(reason instanceof Error ? reason.message : "数据刷新启动失败");
+      setError(reason instanceof Error ? reason.message : "数据刷新启动失败");
     } finally {
       refreshRequestRef.current = false;
       setRunning(false);
@@ -323,7 +288,7 @@ export default function SpuAudiencePage() {
 
   async function saveSpu() {
     if (!form) return;
-    setSaving(true); feedback("");
+    setSaving(true); setError("");
     try {
       const aliases = [
         ...splitWords(form.aliases).map((alias) => ({ alias, alias_type: "official", ambiguous: false })),
@@ -347,13 +312,11 @@ export default function SpuAudiencePage() {
       try {
         await readJson("/api/v8/spu-audience/associate", { method: "POST" });
         await loadAssets();
-        feedback("", "车型已保存，正在后台按新规则重算标签，完成后统计自动更新");
       } catch {
         await loadAssets();
-        feedback("", "车型已保存；当前已有刷新在运行，完成后可再点一次「刷新数据」让新规则生效");
       }
     } catch (reason) {
-      feedback(reason instanceof Error ? reason.message : "车型保存失败");
+      setError(reason instanceof Error ? reason.message : "车型保存失败");
     } finally {
       setSaving(false);
     }
@@ -477,7 +440,7 @@ export default function SpuAudiencePage() {
 
   return (
     <AppShell active="spu-audience" actions={shellActions}>
-      <Feedback error={error} message={message} onClose={() => feedback("")} />
+      <Feedback error={error} onClose={() => setError("")} />
       {loading ? <Loading label="正在读取SPU人群数据" /> : assets && !assets.ready ? (
         <section className="page-stack spu-audience-page"><article className="panel"><p>数据库尚未升级到最新结构，SPU人群功能在本环境暂不可用。</p></article></section>
       ) : (
@@ -819,7 +782,7 @@ export default function SpuAudiencePage() {
         >
           <section
             ref={refreshDialogRef}
-            className="review-modal spu-refresh-modal"
+            className="modal-panel spu-refresh-modal"
             role="dialog"
             aria-modal="true"
             aria-labelledby="spu-refresh-title"
@@ -889,9 +852,9 @@ export default function SpuAudiencePage() {
 
       {form && (
         <div className="modal-backdrop" role="presentation">
-          <section className="review-modal operation-modal" role="dialog" aria-modal="true" aria-label="编辑车型">
+          <section className="modal-panel operation-modal" role="dialog" aria-modal="true" aria-label="编辑车型">
             <div className="panel-head"><div><span className="eyebrow">车型主数据</span><h3>{form.spuId ? "编辑车型" : "新增车型"}</h3></div><button className="modal-close" onClick={() => setForm(null)} aria-label="关闭">×</button></div>
-            <div className="review-fields">
+            <div className="modal-fields">
               <label>品牌<input value={form.brand} disabled={Boolean(form.spuId)} onChange={(event) => setForm({ ...form, brand: event.target.value })} /></label>
               <label>车系<input value={form.series} disabled={Boolean(form.spuId)} onChange={(event) => setForm({ ...form, series: event.target.value })} /></label>
               <label className="span-two">款型名称（留空表示车系级记录：内容仅识别到车系时计入该行）<input value={form.trimLabel} placeholder="如：2026款 DM-i 55KM 领先型" onChange={(event) => setForm({ ...form, trimLabel: event.target.value })} /></label>

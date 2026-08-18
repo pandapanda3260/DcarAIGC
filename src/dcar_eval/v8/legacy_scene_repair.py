@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any
 
 from .evaluation import canonical_json
-from .evaluation_selectors import review_anchor_evaluation
 from .release_management_v5_1 import (
     FreezeManifest,
     ReleaseManagementError,
@@ -44,6 +43,25 @@ from .storage import (
     now_utc,
     transaction,
 )
+
+
+LEGACY_SCENE_REPAIR_RETIRED_MESSAGE = (
+    "legacy scene repair is retired: the 2026-08 repair already ran in "
+    "production, and schema v16 removed the manual review domain it seeded"
+)
+
+
+def review_anchor_evaluation(connection, content_id):
+    """Historical helper kept for archaeology (selector removed in v16)."""
+
+    return connection.execute(
+        """
+        SELECT * FROM evaluation_versions
+        WHERE content_id=? AND invalidated_at IS NULL
+        ORDER BY evaluated_at DESC, id DESC LIMIT 1
+        """,
+        (content_id,),
+    ).fetchone()
 
 
 REPAIR_CONTRACT = "legacy-illegal-point-scene-repair-v1"
@@ -1632,6 +1650,11 @@ def repair_legacy_illegal_scene_chains(
 ) -> dict[str, Any]:
     """Dry-run or atomically apply the frozen legacy illegal-scene plan."""
 
+    raise LegacySceneRepairError(LEGACY_SCENE_REPAIR_RETIRED_MESSAGE)
+
+    # Historical implementation retained below for audit archaeology. The
+    # unconditional guard above is the product boundary: schema v16 removed
+    # review_queue, so the frozen plan/verify chain can never run again.
     db_path = db_path.resolve()
     manifest_path = manifest_path.resolve()
     receipt_path = receipt_path.resolve()

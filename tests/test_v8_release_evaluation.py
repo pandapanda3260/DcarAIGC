@@ -14,7 +14,6 @@ from v8.evaluation import (
     evaluate_content,
     evaluate_release_content,
     incremental_candidates,
-    resolve_review,
 )
 from v8.storage import (
     PROJECT_ROOT,
@@ -203,44 +202,6 @@ class V8ReleaseEvaluationTest(unittest.TestCase):
                 ).fetchone()[0],
             }
 
-    def _insert_manual_visual_evidence(self) -> None:
-        evidence_text = (
-            "画面明确展示AI小懂解释故障报警灯和车辆异响，并给出安全处置建议。"
-        )
-        captured_at = "2026-08-04T00:30:00Z"
-        with connect(self.db) as connection:
-            queue = connection.execute(
-                """
-                INSERT INTO review_queue(
-                    content_id,reason_code,status,created_at,updated_at,resolved_at
-                ) VALUES (?,'manual_visual_fixture','resolved',?,?,?)
-                """,
-                (self.content_id, captured_at, captured_at, captured_at),
-            )
-            review = connection.execute(
-                """
-                INSERT INTO evaluation_reviews(
-                    queue_id,content_id,decision,reason,reviewer,created_at
-                ) VALUES (?,?,'override','测试人工画面证据','测试复核员',?)
-                """,
-                (queue.lastrowid, self.content_id, captured_at),
-            )
-            connection.execute(
-                """
-                INSERT INTO manual_evidence(
-                    review_id,content_id,evidence_type,text_value,sha256,created_at
-                ) VALUES (?,?,'visual_summary',?,?,?)
-                """,
-                (
-                    review.lastrowid,
-                    self.content_id,
-                    evidence_text,
-                    hashlib.sha256(evidence_text.encode("utf-8")).hexdigest(),
-                    captured_at,
-                ),
-            )
-            connection.commit()
-
     def _activate_release(self) -> None:
         activated_at = "2026-08-04T01:00:00Z"
         with connect(self.db) as connection:
@@ -326,7 +287,7 @@ class V8ReleaseEvaluationTest(unittest.TestCase):
         self.assertEqual(after["provider"], before["provider"])
         self.assertEqual(violations, [])
 
-    def test_backfilling_gray_result_does_not_write_review_queue(self) -> None:
+    def test_backfilling_gray_result_is_stored_without_any_queue_concept(self) -> None:
         gray_match = {
             "id": "C1",
             "score": 70,
@@ -343,14 +304,15 @@ class V8ReleaseEvaluationTest(unittest.TestCase):
             )
         with connect(self.db) as connection:
             evaluation = connection.execute(
-                "SELECT pending_review FROM evaluation_versions WHERE id=?",
+                """
+                SELECT selling_point_score,selling_point_included
+                FROM evaluation_versions WHERE id=?
+                """,
                 (result.evaluation_id,),
             ).fetchone()
-            queue_count = connection.execute(
-                "SELECT COUNT(*) FROM review_queue"
-            ).fetchone()[0]
-        self.assertEqual(evaluation["pending_review"], 1)
-        self.assertEqual(queue_count, 0)
+        # 60-74 弱匹配：分数照常落库，只是不计入覆盖；v16 起没有任何队列派生
+        self.assertEqual(evaluation["selling_point_score"], 70)
+        self.assertEqual(evaluation["selling_point_included"], 0)
 
     def test_hash_mismatch_and_non_writable_statuses_fail_before_business_writes(
         self,
@@ -502,29 +464,6 @@ class V8ReleaseEvaluationTest(unittest.TestCase):
         self.assertEqual(row["evaluation_content_direction"], "used_car")
         self.assertNotIn(second_content_id, incremental_candidates(db_path=self.db))
 
-    def test_backfill_routes_manual_visual_summary_to_visual_matcher_source(
-        self,
-    ) -> None:
-        self._insert_manual_visual_evidence()
-
-        evaluated = evaluate_release_content(
-            self.content_id, release_id=self.release_id, db_path=self.db
-        )
-        with connect(self.db) as connection:
-            rows = connection.execute(
-                """
-                SELECT selling_point_code,scene,evidence_json
-                FROM evaluation_matches WHERE evaluation_id=?
-                ORDER BY CASE match_role WHEN 'primary' THEN 0 ELSE 1 END,rowid
-                """,
-                (evaluated.evaluation_id,),
-            ).fetchall()
-        visual_match = next(row for row in rows if row["selling_point_code"] == "M5")
-        evidence = json.loads(str(visual_match["evidence_json"]))
-        self.assertEqual(visual_match["scene"], "media")
-        self.assertEqual(evidence["source"], "关键帧画面语义")
-        self.assertIn("AI小懂", evidence["evidence_snippet"])
-
     def test_automatic_legacy_release_fails_closed_without_matcher(self) -> None:
         before = self._business_counts()
         with patch(
@@ -553,9 +492,9 @@ class V8ReleaseEvaluationTest(unittest.TestCase):
                     taxonomy_version,matcher_rule_sha256,evidence_sha256,
                     evaluation_source,evaluation_status,evidence_level,
                     selling_point_score,selling_point_included,content_direction,
-                    pending_review,payload_json,evaluated_at
+                    payload_json,evaluated_at
                 ) VALUES (?,?,?,?,?,?,?,'automatic','evaluated','V3',
-                          0,0,'unknown',0,'{}',?)
+                          0,0,'unknown','{}',?)
                 """,
                 (
                     self.content_id,
@@ -589,86 +528,6 @@ class V8ReleaseEvaluationTest(unittest.TestCase):
         ):
             evaluate_content(self.content_id, db_path=self.db)
         self.assertEqual(self._business_counts(), before)
-
-    def test_confirm_copies_parent_conclusion_without_rematching_manual_evidence(
-        self,
-    ) -> None:
-        self._activate_release()
-        automatic = evaluate_content(self.content_id, db_path=self.db)
-        with connect(self.db) as connection:
-            parent = dict(
-                connection.execute(
-                    "SELECT * FROM evaluation_versions WHERE id=?",
-                    (automatic.evaluation_id,),
-                ).fetchone()
-            )
-            parent_matches = [
-                dict(row)
-                for row in connection.execute(
-                    """
-                    SELECT selling_point_code,scene,match_role,score,evidence_json
-                    FROM evaluation_matches WHERE evaluation_id=? ORDER BY rowid
-                    """,
-                    (automatic.evaluation_id,),
-                ).fetchall()
-            ]
-            queue = connection.execute(
-                """
-                INSERT INTO review_queue(
-                    content_id,evaluation_id,reason_code,status,created_at,updated_at
-                ) VALUES (?,?,'evaluation_gray_zone','pending',?,?)
-                """,
-                (self.content_id, automatic.evaluation_id, now_utc(), now_utc()),
-            )
-            connection.commit()
-        confirmed = resolve_review(
-            int(queue.lastrowid),
-            decision="confirm",
-            reason="确认原自动结论，不接受人工证据触发重新匹配",
-            reviewer="测试复核员",
-            evidence_type="visual_summary",
-            evidence_text=(
-                "画面明确展示AI小懂解释故障报警灯和车辆异响，并给出安全处置建议。"
-            ),
-            base_evaluation_id=automatic.evaluation_id,
-            db_path=self.db,
-        )
-        with connect(self.db) as connection:
-            child = dict(
-                connection.execute(
-                    "SELECT * FROM evaluation_versions WHERE id=?",
-                    (confirmed.evaluation_id,),
-                ).fetchone()
-            )
-            child_matches = [
-                dict(row)
-                for row in connection.execute(
-                    """
-                    SELECT selling_point_code,scene,match_role,score,evidence_json
-                    FROM evaluation_matches WHERE evaluation_id=? ORDER BY rowid
-                    """,
-                    (confirmed.evaluation_id,),
-                ).fetchall()
-            ]
-        for field in (
-            "evaluation_status",
-            "evidence_level",
-            "primary_selling_point_code",
-            "selling_point_score",
-            "selling_point_included",
-            "content_direction",
-            "content_automotive_score",
-            "audience_automotive_score",
-            "acquisition_potential_score",
-        ):
-            self.assertEqual(child[field], parent[field])
-        self.assertEqual(child_matches, parent_matches)
-        self.assertEqual(child["evaluation_source"], "manual_review")
-        self.assertEqual(child["parent_evaluation_id"], automatic.evaluation_id)
-        self.assertEqual(child["pending_review"], 0)
-        self.assertNotEqual(child["evidence_sha256"], parent["evidence_sha256"])
-        self.assertNotIn(self.content_id, incremental_candidates(db_path=self.db))
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from tests.schema_fixture import initialize_historical_schema
 import v8.storage as storage
 from v8.operations import merge_content_records
 
@@ -24,7 +25,7 @@ class V12SchemaMigrationTest(unittest.TestCase):
     def _seed_v11_metric_snapshots(
         self, connection: sqlite3.Connection
     ) -> tuple[list[str], str]:
-        storage.initialize_database(connection)
+        initialize_historical_schema(connection, target_version=11)
         connection.executemany(
             """
             INSERT INTO content_items(
@@ -145,25 +146,6 @@ class V12SchemaMigrationTest(unittest.TestCase):
                 ),
             ),
         )
-        connection.execute("DROP TABLE scheduler_run_attempts")
-        connection.execute(
-            "ALTER TABLE scheduler_runs RENAME TO scheduler_runs_v13_current"
-        )
-        connection.execute(storage._V12_SCHEDULER_RUNS_SQL)
-        scheduler_columns = (
-            "id,job_id,scheduled_for,status,started_at,completed_at,details_json"
-        )
-        connection.execute(
-            f"INSERT INTO scheduler_runs({scheduler_columns}) "
-            f"SELECT {scheduler_columns} FROM scheduler_runs_v13_current"
-        )
-        connection.execute("DROP TABLE scheduler_runs_v13_current")
-        connection.execute("DELETE FROM schema_migrations WHERE version=13")
-        connection.execute("PRAGMA user_version=12")
-        connection.execute("DROP TABLE content_metric_observations")
-        connection.execute("DROP INDEX idx_content_identities_content_primary")
-        connection.execute("DELETE FROM schema_migrations WHERE version=12")
-        connection.execute("PRAGMA user_version=11")
         connection.commit()
         columns = storage._table_columns(connection, "content_metric_snapshots")
         return columns, storage._table_projection_sha256(
@@ -185,13 +167,12 @@ class V12SchemaMigrationTest(unittest.TestCase):
                 [
                     (9, "release-bound-evaluation-schema"),
                     (10, "audience-interaction-user-domain"),
-                    (11, "interaction-user-v1-fallback-keys"),
-                    (12, "append-only-metric-observations"),
-                    (13, "scheduler-run-attempt-history"),
+                    *sorted(storage.SCHEMA_MIGRATION_NAMES.items()),
                 ],
             )
             self.assertEqual(
-                int(connection.execute("PRAGMA user_version").fetchone()[0]), 13
+                int(connection.execute("PRAGMA user_version").fetchone()[0]),
+                storage.SCHEMA_VERSION,
             )
             self.assertIn(
                 "content_metric_observations", storage._table_names(connection)
@@ -328,7 +309,8 @@ class V12SchemaMigrationTest(unittest.TestCase):
 
             storage.initialize_database(connection)
             self.assertEqual(
-                int(connection.execute("PRAGMA user_version").fetchone()[0]), 13
+                int(connection.execute("PRAGMA user_version").fetchone()[0]),
+                storage.SCHEMA_VERSION,
             )
             self.assertEqual(
                 int(
@@ -371,7 +353,7 @@ class V12SchemaMigrationTest(unittest.TestCase):
                         "SELECT MAX(version) FROM schema_migrations"
                     ).fetchone()[0]
                 ),
-                13,
+                storage.SCHEMA_VERSION,
             )
             self.assertEqual(
                 int(connection.execute("PRAGMA user_version").fetchone()[0]), 11

@@ -31,7 +31,7 @@ test("SPU refresh modal has scoped responsive styling and keyboard dialog behavi
   assert.match(page, /推荐/);
   assert.match(page, /耗时较长/);
 
-  assert.match(styles, /\.review-modal\.spu-refresh-modal/);
+  assert.match(styles, /\.modal-panel\.spu-refresh-modal/);
   assert.match(styles, /grid-template-columns: repeat\(2, minmax\(0, 1fr\)\)/);
   assert.match(styles, /\.spu-refresh-option\[data-selected="true"\]/);
   assert.match(styles, /@media \(max-width: 600px\)/);

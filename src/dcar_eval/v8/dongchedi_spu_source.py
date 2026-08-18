@@ -316,8 +316,11 @@ def _fetch_validated_response(
             data = payload.get("data")
             if not isinstance(data, Mapping):
                 raise DongchediSourceError("响应缺少 data object")
+            raw_series_id = data.get("series_id")
+            if raw_series_id is None:
+                raise DongchediSourceError("data.series_id 非法")
             try:
-                actual_series_id = int(data.get("series_id"))
+                actual_series_id = int(raw_series_id)
             except (TypeError, ValueError) as exc:
                 raise DongchediSourceError("data.series_id 非法") from exc
             if actual_series_id != series_id:
@@ -532,8 +535,10 @@ def _row_from_info(
         return None
     car_id = _positive_int(info.get("car_id", info.get("id")), "car_id")
     row_series_id = info.get("series_id")
-    if row_series_id not in (None, "") and int(row_series_id) != int(
-        source["series_id"]
+    if (
+        row_series_id is not None
+        and row_series_id != ""
+        and int(row_series_id) != int(source["series_id"])
     ):
         raise DongchediSourceError(
             f"car_id={car_id} 的 series_id={row_series_id} 与响应车系 {source['series_id']} 不一致"

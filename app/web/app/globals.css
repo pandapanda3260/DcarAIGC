@@ -196,7 +196,9 @@ textarea:focus, input:focus { border-color: var(--teal); box-shadow: 0 0 0 3px r
 .conclusion-grid b { color: #d9ff57; font-size: 10px; }
 
 .detail-toolbar { align-items: flex-end; margin-bottom: 0; }
-.detail-toolbar > div:last-child { display: flex; gap: 10px; align-items: center; }
+.detail-toolbar > div:first-child { min-width: 0; flex: 1; }
+.detail-toolbar > div:last-child { flex: 0 0 auto; display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 10px; align-items: center; }
+.detail-toolbar > div:last-child > * { white-space: nowrap; }
 .detail-toolbar input:not(.file-input) { width: 280px; height: 38px; padding: 0 12px; border: 1px solid var(--line); border-radius: 8px; outline: none; color: var(--ink); background: #fff; font-size: 10px; }
 .table-panel { padding: 0; overflow: hidden; }
 .table-scroll { overflow: auto; }
@@ -448,6 +450,15 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
 /* 卖点文案多行完整显示（2026-08-15 Mark 要求去掉单行省略号）；overflow-wrap 兜底超长连续字符 */
 .content-table .selling-point-name { display: block; white-space: normal; overflow-wrap: anywhere; }
 .content-table .evidence-level-tag { border-bottom: 1px dotted #b7c4c8; cursor: help; }
+/* 标题折叠：默认两行，末尾内联「展开」。首列是 sticky 且恒为 #fff（无 hover 变色），
+   所以按钮可以用白色渐变盖住第二行末尾的文字，做出"…展开"的收尾效果。 */
+.content-table .content-title { position: relative; display: block; }
+.content-table .content-title-text { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; margin: 0; color: inherit; }
+.content-table .content-title[data-expanded="true"] .content-title-text { display: inline; overflow: visible; }
+.content-table .content-title-toggle { position: absolute; right: 0; bottom: 0; padding: 0 0 0 22px; border: 0; color: var(--teal); font-size: 9px; font-weight: 750; line-height: inherit; cursor: pointer; background: linear-gradient(90deg, rgba(255, 255, 255, 0) 0, #fff 40%); }
+.content-table .content-title[data-expanded="true"] .content-title-toggle { position: static; margin-left: 5px; padding-left: 0; background: transparent; }
+.content-table .content-title-toggle:hover { text-decoration: underline; }
+.content-table .content-title-toggle:focus-visible { outline: 2px solid var(--teal); outline-offset: 2px; border-radius: 3px; }
 /* 单元格副行：原先只在 .content-table 下生效，SPU 表里第 2/4 列副行会挤成一行，故去掉作用域限定 */
 .cell-subline { display: block; margin-top: 4px; color: #8b989c; }
 .content-table { border-collapse: separate; border-spacing: 0; }
@@ -458,7 +469,6 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
 .status-badge { display: inline-block; padding: 4px 7px; border-radius: 5px; font-weight: 750; }
 .status-badge.done { background: var(--teal-soft); color: #23796e; }
 .status-badge.pending { background: var(--orange-soft); color: #a95f31; }
-.status-badge.terminal { background: var(--red-soft); color: #a74343; }
 
 /* 任务卡片列表：报告在后台生成，卡片承载状态、真实进度与“查看详情”入口 */
 .task-card-list { display: grid; gap: 12px; }
@@ -479,7 +489,6 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
 .task-progress em { flex: 0 0 auto; color: var(--teal); font-style: normal; }
 .task-card .progress-track { height: 6px; }
 .task-card .progress-track i { background: var(--teal); transition: width .4s ease; }
-.review-entry { padding: 4px 7px; border-radius: 5px; background: var(--orange-soft); color: #a95f31; }
 .selling-points-page { max-width: 1600px !important; margin-top: -33px; padding-top: 0; gap: 20px; position: relative; z-index: 2; font-family: var(--font-geist-sans), "PingFang SC", "Microsoft YaHei", sans-serif; }
 .selling-point-summary { overflow: hidden; border: 1px solid rgba(220, 227, 237, .9); border-radius: 12px; background: rgba(255, 255, 255, .97); box-shadow: 0 18px 42px rgba(43, 59, 92, .09); }
 .selling-point-summary-head { min-height: 45px; padding: 14px 24px 10px; display: flex; align-items: center; justify-content: space-between; gap: 24px; }
@@ -576,10 +585,10 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
 .text-button.danger { color: #a74343; }
 
 .modal-backdrop { position: fixed; inset: 0; z-index: 50; padding: 24px; display: grid; place-items: center; background: rgba(9, 26, 32, .62); backdrop-filter: blur(4px); }
-.review-modal { width: min(680px, 100%); max-height: calc(100vh - 48px); overflow: auto; padding: 26px; border-radius: 16px; background: #fff; box-shadow: 0 28px 80px rgba(4, 19, 24, .35); }
+.modal-panel { width: min(680px, 100%); max-height: calc(100vh - 48px); overflow: auto; padding: 26px; border-radius: 16px; background: #fff; box-shadow: 0 28px 80px rgba(4, 19, 24, .35); }
 /* SPU人群页：「刷新数据」范围弹窗（先选范围，再确认执行） */
 .modal-backdrop.spu-refresh-backdrop { padding: 16px; background: rgba(9, 26, 32, .54); backdrop-filter: blur(6px); }
-.review-modal.spu-refresh-modal { width: min(560px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); padding: 0; overflow: hidden; display: flex; flex-direction: column; border: 1px solid rgba(223, 230, 232, .96); border-radius: 18px; box-shadow: 0 30px 90px rgba(4, 19, 24, .3); }
+.modal-panel.spu-refresh-modal { width: min(560px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); padding: 0; overflow: hidden; display: flex; flex-direction: column; border: 1px solid rgba(223, 230, 232, .96); border-radius: 18px; box-shadow: 0 30px 90px rgba(4, 19, 24, .3); }
 .spu-refresh-header { flex: 0 0 auto; padding: 21px 23px 17px; display: flex; align-items: flex-start; gap: 12px; border-bottom: 1px solid #e7edef; background: linear-gradient(135deg, #fff 0%, #f4faf8 100%); }
 .spu-refresh-header-icon { width: 40px; height: 40px; flex: 0 0 40px; display: grid; place-items: center; border-radius: 11px; background: var(--teal-soft); color: var(--teal); }
 .spu-refresh-heading { min-width: 0; flex: 1; padding-top: 1px; }
@@ -614,7 +623,7 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
 .spu-refresh-close:focus-visible, .spu-refresh-actions button:focus-visible { outline: 2px solid var(--teal); outline-offset: 2px; }
 @media (max-width: 600px) {
   .modal-backdrop.spu-refresh-backdrop { padding: 0; place-items: end center; }
-  .review-modal.spu-refresh-modal { width: 100%; max-height: calc(100dvh - 12px); border-radius: 18px 18px 0 0; }
+  .modal-panel.spu-refresh-modal { width: 100%; max-height: calc(100dvh - 12px); border-radius: 18px 18px 0 0; }
   .spu-refresh-header { padding: 18px 18px 14px; }
   .spu-refresh-header-icon { width: 36px; height: 36px; flex-basis: 36px; }
   .spu-refresh-heading h2 { font-size: 18px; }
@@ -634,14 +643,11 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
 .platform-editor label:last-child { grid-column: 1 / -1; }
 .platform-editor input, .platform-editor select { height: 38px; padding: 0 10px; border: 1px solid #cad5d8; border-radius: 8px; background: #fff; color: var(--ink); }
 .modal-close { width: 34px; height: 34px; border: 0; border-radius: 50%; background: #eef2f3; color: #52656b; font-size: 19px; }
-.review-fields { margin-top: 22px; display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
-.review-fields label, .review-reason { display: grid; gap: 7px; color: #566970; font-size: 10px; font-weight: 750; }
-.review-fields input, .review-fields select { height: 40px; padding: 0 11px; border: 1px solid #cad5d8; border-radius: 8px; outline: none; background: #fff; color: var(--ink); }
-.review-fields textarea { min-height: 92px; font: 11px/1.6 var(--font-geist-sans), sans-serif; }
-.review-fields .span-two { grid-column: 1 / -1; }
-.review-reason { margin-top: 15px; }
-.review-reason textarea { min-height: 110px; }
-.override-fields { padding-top: 16px; border-top: 1px solid var(--line); }
+.modal-fields { margin-top: 22px; display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.modal-fields label { display: grid; gap: 7px; color: #566970; font-size: 10px; font-weight: 750; }
+.modal-fields input, .modal-fields select { height: 40px; padding: 0 11px; border: 1px solid #cad5d8; border-radius: 8px; outline: none; background: #fff; color: var(--ink); }
+.modal-fields textarea { min-height: 92px; font: 11px/1.6 var(--font-geist-sans), sans-serif; }
+.modal-fields .span-two { grid-column: 1 / -1; }
 .modal-actions { margin-top: 18px; display: flex; justify-content: flex-end; gap: 10px; }
 .compact-modal { width: min(560px, 100%); }
 .task-detail-backdrop { place-items: stretch center; }
@@ -665,7 +671,6 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
 .slot-list strong { color: var(--ink); font-size: 10px; }
 .slot-list span, .slot-list small { color: #7b898e; font-size: 9px; line-height: 1.5; }
 .slot-list small { color: var(--red); }
-.review-workbench { border-color: #bfe1d9; background: #f3faf8; }
 .pending-identity-panel { overflow: hidden; }
 .pending-identity-list { max-height: 430px; margin-top: 16px; overflow: auto; border: 1px solid #e2e8ea; border-radius: 10px; }
 .pending-identity-table { min-width: 660px !important; }
@@ -750,9 +755,9 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
   .cache-run-panel { grid-template-columns: 1fr; }
   .cache-run-panel .secondary { width: 100%; }
   .validation-numbers div { padding-inline: 12px; }
-  .review-fields { grid-template-columns: 1fr; }
+  .modal-fields { grid-template-columns: 1fr; }
   .platform-editor { grid-template-columns: 1fr; }
-  .review-fields .span-two { grid-column: auto; }
+  .modal-fields .span-two { grid-column: auto; }
   .insight-metrics, .quality-grid { grid-template-columns: 1fr; }
   .main-area[data-section="selling-points"] { padding: 0 15px 92px; }
   .topbar[data-section="selling-points"] { min-height: 254px; margin-inline: -15px; padding: 23px 18px 70px; display: grid; grid-template-columns: 1fr; align-content: start; gap: 18px; background-position: 58% center; }
@@ -857,7 +862,7 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
 
 /* ---- 新建报告：日期区间选择器 ---- */
 .range-modal { width: min(760px, 100%); }
-.review-fields .drp-block { display: grid; gap: 7px; color: #566970; font-size: 10px; font-weight: 750; }
+.modal-fields .drp-block { display: grid; gap: 7px; color: #566970; font-size: 10px; font-weight: 750; }
 .drp { position: relative; display: grid; gap: 8px; }
 .drp-field { display: flex; align-items: center; justify-content: space-between; gap: 10px; height: 40px; padding: 0 11px; border: 1px solid #cad5d8; border-radius: 8px; background: #fff; color: var(--ink); font-size: 12px; font-weight: 650; cursor: pointer; transition: border-color .15s ease, box-shadow .15s ease; }
 .drp-field:hover:not(:disabled) { border-color: #9fb1b6; }

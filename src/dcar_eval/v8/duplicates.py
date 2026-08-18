@@ -18,7 +18,14 @@ import imagehash  # type: ignore[import-untyped]
 from PIL import Image
 
 from .media import _resolved, _run_processing_slot, file_sha256
-from .storage import DEFAULT_DB, PROJECT_ROOT, connect, now_utc, transaction
+from .storage import (
+    DEFAULT_DB,
+    PROJECT_ROOT,
+    connect,
+    is_formal_database_path,
+    now_utc,
+    transaction,
+)
 
 
 FINGERPRINT_VERSION = (
@@ -37,6 +44,12 @@ THRESHOLDS: Dict[str, float] = {
 
 class DuplicateDetectionError(RuntimeError):
     pass
+
+
+def _fingerprint_root_for_database(db_path: Path) -> Path:
+    if is_formal_database_path(db_path, formal_database=DEFAULT_DB):
+        return FINGERPRINT_ROOT
+    return db_path.parent / "duplicate-fingerprints"
 
 
 def duplicate_metric_decision(
@@ -287,11 +300,7 @@ def fingerprint_content(content_id: int, *, db_path: Path = DEFAULT_DB) -> Dict[
     with connect(db_path) as connection:
         inputs, source_sha256 = _current_source_state(connection, content_id)
     content = inputs["content"]
-    output_root = (
-        FINGERPRINT_ROOT
-        if db_path.resolve() == DEFAULT_DB.resolve()
-        else db_path.parent / "duplicate-fingerprints"
-    )
+    output_root = _fingerprint_root_for_database(db_path)
     target = output_root / f"{content['link_id']}.json"
 
     def produce() -> Path:

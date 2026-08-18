@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 from pathlib import Path
 
+import v8.storage as storage_module
 from v8.storage import (
     DEFAULT_DB,
     LEGACY_MATCHER_RULE_SHA256,
@@ -16,6 +17,7 @@ from v8.storage import (
     ensure_legacy_evaluation_release,
     initialize_database,
     require_schema_compatibility,
+    same_database_path,
     schema_compatibility_state,
 )
 
@@ -25,6 +27,42 @@ class V8StorageTest(unittest.TestCase):
         with patch.dict("os.environ", {"DCAR_TEST_DENY_FORMAL_DB": "1"}):
             with self.assertRaisesRegex(RuntimeError, "formal DCar database"):
                 connect(DEFAULT_DB)
+
+    def test_test_guard_rejects_existing_formal_alias_by_file_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            formal = root / "formal.sqlite3"
+            alias = root / "apfs-firmlink-spelling.sqlite3"
+            formal.write_bytes(b"formal-sentinel")
+            alias.hardlink_to(formal)
+            self.assertNotEqual(alias.resolve(), formal.resolve())
+            self.assertTrue(same_database_path(alias, formal))
+            with (
+                patch.object(storage_module, "DEFAULT_DB", formal),
+                patch.dict("os.environ", {"DCAR_TEST_DENY_FORMAL_DB": "1"}),
+                self.assertRaisesRegex(RuntimeError, "formal DCar database"),
+            ):
+                connect(alias)
+
+    def test_database_path_comparison_canonicalizes_missing_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            formal = root / "formal.sqlite3"
+            equivalent = root / "missing-parent" / ".." / formal.name
+            self.assertFalse(formal.exists())
+            self.assertFalse(equivalent.exists())
+            self.assertTrue(same_database_path(equivalent, formal))
+
+    def test_database_path_comparison_fails_closed_on_identity_probe_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            formal = root / "formal.sqlite3"
+            alias = root / "alias.sqlite3"
+            formal.write_bytes(b"formal-sentinel")
+            alias.hardlink_to(formal)
+            with patch.object(Path, "stat", side_effect=PermissionError("denied")):
+                with self.assertRaisesRegex(PermissionError, "denied"):
+                    same_database_path(alias, formal)
 
     def test_connect_enables_recursive_triggers_for_writable_and_read_only(
         self,
@@ -122,6 +160,17 @@ class V8StorageTest(unittest.TestCase):
                         "SELECT name FROM sqlite_master WHERE type='table'"
                     )
                 }
+                # v16 起人工复核域已删除：四张表不得再出现
+                self.assertEqual(
+                    tables
+                    & {
+                        "review_queue",
+                        "evaluation_reviews",
+                        "review_reopen_events",
+                        "manual_evidence",
+                    },
+                    set(),
+                )
                 required = {
                     "accounts",
                     "account_platform_identities",
@@ -150,10 +199,6 @@ class V8StorageTest(unittest.TestCase):
                     "evaluation_releases",
                     "evaluation_versions",
                     "evaluation_matches",
-                    "review_queue",
-                    "evaluation_reviews",
-                    "review_reopen_events",
-                    "manual_evidence",
                     "duplicate_relations",
                     "duplicate_fingerprints",
                     "duplicate_calibration_runs",
@@ -208,10 +253,6 @@ class V8StorageTest(unittest.TestCase):
                     ["content_id", "release_id", "evidence_sha256"],
                 )
                 self.assertEqual(
-                    evaluation_indexes["uq_evaluation_manual_idempotency"],
-                    ["release_id", "review_id"],
-                )
-                self.assertEqual(
                     evaluation_indexes["uq_evaluation_migrated_parent_idempotency"],
                     ["release_id", "parent_evaluation_id"],
                 )
@@ -257,18 +298,20 @@ class V8StorageTest(unittest.TestCase):
             finally:
                 connection.close()
 
-    def test_runtime_schema_compatibility_accepts_complete_v11_v12_and_v13(
+    def test_runtime_schema_compatibility_accepts_complete_walk_down(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             connection = connect(Path(temporary) / "v8.sqlite3")
             try:
                 initialize_database(connection)
-                self.assertEqual(require_schema_compatibility(connection), 13)
+                self.assertEqual(require_schema_compatibility(connection), SCHEMA_VERSION)
                 self.assertTrue(schema_compatibility_state(connection)["compatible"])
 
                 connection.execute("DROP TABLE scheduler_run_attempts")
-                connection.execute("DELETE FROM schema_migrations WHERE version=13")
+                # 走回 v12 需要同时清掉 v13 之后的迁移清单行，否则
+                # max_migration_version 与 user_version 不一致（fail-closed）。
+                connection.execute("DELETE FROM schema_migrations WHERE version>=13")
                 connection.execute("PRAGMA user_version=12")
                 connection.commit()
                 self.assertEqual(require_schema_compatibility(connection), 12)
@@ -276,7 +319,7 @@ class V8StorageTest(unittest.TestCase):
 
                 connection.execute("DROP TABLE content_metric_observations")
                 connection.execute("DROP INDEX idx_content_identities_content_primary")
-                connection.execute("DELETE FROM schema_migrations WHERE version=12")
+                connection.execute("DELETE FROM schema_migrations WHERE version>=12")
                 connection.execute("PRAGMA user_version=11")
                 connection.commit()
                 self.assertEqual(require_schema_compatibility(connection), 11)

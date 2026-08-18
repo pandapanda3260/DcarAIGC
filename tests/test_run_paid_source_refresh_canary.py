@@ -466,6 +466,20 @@ class PaidSourceRefreshCanaryTest(unittest.TestCase):
         self.assertEqual(before, self._tree(self.fixture.step3_root))
         self.assertEqual(self.calls, {"price": 0, "balance": 0, "detail": 0})
 
+    def test_task_identity_uses_capture_canonical_budget_id(self) -> None:
+        identity = paid._task_identity(
+            source_db_sha256="a" * 64,
+            source_completion_sha256="b" * 64,
+            content_id=1,
+        )
+        task_digest = hashlib.sha256(
+            identity["task_id"].encode("utf-8")
+        ).hexdigest()[:16]
+        self.assertEqual(
+            identity["budget_id"],
+            f"task-{task_digest}-tikhub-{paid.OPERATION}-v1",
+        )
+
     def test_success_binds_durable_metadata_ledger_and_frozen_transport(self) -> None:
         result = self._run()
         self.assertEqual(result["status"], "succeeded")

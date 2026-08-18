@@ -4,7 +4,7 @@ import json
 import tempfile
 import threading
 import unittest
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -26,6 +26,8 @@ from v8.scheduler import (
     _claim_run,
     _finish_run,
     _select_due_capture_contents,
+    current_day_daily_capture_guard,
+    daily_capture_quality_gate,
     execute_job,
     install_jobs,
     latest_occurrence,
@@ -267,17 +269,299 @@ class V8SchedulerTest(unittest.TestCase):
             )
             connection.commit()
 
-    def test_six_fixed_jobs_are_registered_with_the_expected_times(self) -> None:
+    def test_six_fixed_jobs_and_hourly_reconcile_are_registered(self) -> None:
         scheduler = BackgroundScheduler(timezone=SHANGHAI)
-        install_jobs(scheduler, db_path=self.db, reports_root=self.reports)
+        before = datetime.now(SHANGHAI)
+        install_jobs(
+            scheduler,
+            db_path=self.db,
+            reports_root=self.reports,
+            capture_call_override=lambda _operation, _payload: ProviderResult(
+                {}, {}, 200, False
+            ),
+            reconcile_effective_date=date(2026, 8, 21),
+        )
+        after = datetime.now(SHANGHAI)
         jobs = {job.id: str(job.trigger) for job in scheduler.get_jobs()}
-        self.assertEqual(set(jobs), {job.job_id for job in JOBS})
+        self.assertEqual(
+            set(jobs), {job.job_id for job in JOBS} | {"daily_capture_reconcile"}
+        )
         self.assertIn("hour='2', minute='0'", jobs["daily_capture"])
         self.assertIn("hour='2', minute='20'", jobs["daily_media_download"])
         self.assertIn("hour='3', minute='0'", jobs["daily_media_processing"])
         self.assertIn("hour='7', minute='30'", jobs["daily_media_cutoff"])
         self.assertIn("hour='8', minute='0'", jobs["daily_report"])
         self.assertIn("day_of_week='mon'", jobs["weekly_report"])
+        reconcile = scheduler.get_job("daily_capture_reconcile")
+        self.assertEqual(str(reconcile.trigger), "interval[1:00:00]")
+        self.assertTrue(reconcile.coalesce)
+        self.assertEqual(reconcile.max_instances, 1)
+        self.assertIsNone(reconcile.misfire_grace_time)
+        self.assertGreaterEqual(reconcile.next_run_time, before)
+        self.assertLessEqual(reconcile.next_run_time, after)
+        self.assertNotIn("daily_capture_reconcile", {job.job_id for job in JOBS})
+
+    def test_install_jobs_requires_all_paid_path_dependencies(self) -> None:
+        scheduler = BackgroundScheduler(timezone=SHANGHAI)
+        with self.assertRaises(TypeError):
+            install_jobs(  # type: ignore[call-arg]
+                scheduler,
+                db_path=self.db,
+                reports_root=self.reports,
+            )
+
+    def test_current_day_guard_never_scans_yesterday_or_before_two(self) -> None:
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                INSERT INTO scheduler_runs(
+                    job_id,scheduled_for,status,started_at,completed_at,details_json
+                ) VALUES ('daily_capture','2026-08-18T18:00:00Z','failed',
+                          '2026-08-18T18:00:01Z','2026-08-18T18:01:00Z','{}')
+                """
+            )
+            connection.commit()
+        with patch("v8.scheduler.execute_job") as action:
+            result = current_day_daily_capture_guard(
+                now=datetime(2026, 8, 20, 1, 59, tzinfo=SHANGHAI),
+                effective_from=date(2026, 8, 20),
+                db_path=self.db,
+                reports_root=self.reports,
+                capture_call_override=None,
+            )
+        self.assertEqual(result["status"], "before_today_slot")
+        action.assert_not_called()
+        with connect(self.db) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM scheduler_runs WHERE job_id='daily_capture'"
+                ).fetchone()[0],
+                1,
+            )
+
+    def test_current_day_guard_calls_exact_today_slot_after_two(self) -> None:
+        expected = {"job_id": "daily_capture", "status": "succeeded"}
+        with patch("v8.scheduler.execute_job", return_value=expected) as action:
+            result = current_day_daily_capture_guard(
+                now=datetime(2026, 8, 20, 11, 5, tzinfo=SHANGHAI),
+                effective_from=date(2026, 8, 20),
+                db_path=self.db,
+                reports_root=self.reports,
+                capture_call_override=None,
+            )
+        self.assertEqual(result, expected)
+        args, kwargs = action.call_args
+        self.assertEqual(args[:2], ("daily_capture", datetime(2026, 8, 20, 2, 0, tzinfo=SHANGHAI)))
+        self.assertEqual(kwargs["db_path"], self.db)
+        self.assertEqual(kwargs["reports_root"], self.reports)
+        self.assertIsNone(kwargs["capture_call_override"])
+        self.assertFalse(kwargs["allow_retry"])
+        self.assertEqual(kwargs["invocation_source"], "scheduled")
+
+    def test_current_day_guard_is_zero_write_before_effective_date(self) -> None:
+        with patch("v8.scheduler.execute_job") as action:
+            result = current_day_daily_capture_guard(
+                now=datetime(2026, 8, 20, 12, 0, tzinfo=SHANGHAI),
+                effective_from=date(2026, 8, 21),
+                db_path=self.db,
+                reports_root=self.reports,
+                capture_call_override=None,
+            )
+        self.assertEqual(result["status"], "before_effective_date")
+        action.assert_not_called()
+        with connect(self.db) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM scheduler_runs WHERE job_id='daily_capture'"
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_current_day_guard_treats_every_existing_status_as_attempted(self) -> None:
+        statuses = (
+            "running",
+            "succeeded",
+            "partial",
+            "skipped",
+            "failed",
+            "interrupted",
+        )
+        with patch("v8.scheduler.execute_job") as action:
+            for offset, status in enumerate(statuses):
+                local_day = date(2026, 8, 20) + timedelta(days=offset)
+                scheduled_for = datetime.combine(
+                    local_day, datetime.min.time().replace(hour=2), SHANGHAI
+                )
+                started = scheduled_for.astimezone(ZoneInfo("UTC")).isoformat().replace(
+                    "+00:00", "Z"
+                )
+                with connect(self.db) as connection:
+                    connection.execute(
+                        """
+                        INSERT INTO scheduler_runs(
+                            job_id,scheduled_for,status,started_at,completed_at,details_json
+                        ) VALUES ('daily_capture',?,?,?,?, '{}')
+                        """,
+                        (
+                            started,
+                            status,
+                            started,
+                            None if status == "running" else started,
+                        ),
+                    )
+                    connection.commit()
+                result = current_day_daily_capture_guard(
+                    now=datetime.combine(
+                        local_day, datetime.min.time().replace(hour=12), SHANGHAI
+                    ),
+                    effective_from=date(2026, 8, 20),
+                    db_path=self.db,
+                    reports_root=self.reports,
+                    capture_call_override=None,
+                )
+                self.assertEqual(
+                    (result["status"], result["existing_status"]),
+                    ("already_attempted", status),
+                )
+        action.assert_not_called()
+
+    def test_current_day_guard_concurrency_claims_one_run_and_attempt(self) -> None:
+        start = threading.Barrier(3)
+        results: list[dict[str, object]] = []
+
+        def invoke() -> None:
+            start.wait()
+            results.append(
+                current_day_daily_capture_guard(
+                    now=datetime(2026, 8, 20, 2, 5, tzinfo=SHANGHAI),
+                    effective_from=date(2026, 8, 20),
+                    db_path=self.db,
+                    reports_root=self.reports,
+                    capture_call_override=lambda _operation, _payload: ProviderResult(
+                        {}, {}, 200, False
+                    ),
+                )
+            )
+
+        threads = [threading.Thread(target=invoke) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        start.wait()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(len(results), 2)
+        with connect(self.db) as connection:
+            run_count = connection.execute(
+                """
+                SELECT COUNT(*) FROM scheduler_runs
+                WHERE job_id='daily_capture' AND scheduled_for='2026-08-19T18:00:00Z'
+                """
+            ).fetchone()[0]
+            attempt_count = connection.execute(
+                """
+                SELECT COUNT(*) FROM scheduler_run_attempts sra
+                JOIN scheduler_runs sr ON sr.id=sra.scheduler_run_id
+                WHERE sr.job_id='daily_capture'
+                  AND sr.scheduled_for='2026-08-19T18:00:00Z'
+                """
+            ).fetchone()[0]
+        self.assertEqual((run_count, attempt_count), (1, 1))
+
+    def test_daily_capture_quality_gate_uses_selected_cohort_ratios(self) -> None:
+        baseline = {
+            "monitored_accounts": 183,
+            "monitored_contents": 3000,
+            "discovery": ([{"status": "succeeded"}] * 178)
+            + ([{"status": "failed"}] * 5),
+            "content_updates": ([{"status": "succeeded"}] * 2189)
+            + ([{"status": "partial"}] * 811),
+            "blocked_providers": [],
+            "budget_max_amount": 8.0,
+            "reported_provider_cost": 6.151,
+            "ledger_provider_cost": 6.151,
+        }
+        self.assertTrue(daily_capture_quality_gate(baseline)["passed"])
+        poor = {
+            **baseline,
+            "content_updates": ([{"status": "succeeded"}])
+            + ([{"status": "partial"}] * 2999),
+        }
+        self.assertFalse(daily_capture_quality_gate(poor)["passed"])
+        blocked = {**baseline, "blocked_providers": ["TikHub"]}
+        self.assertFalse(daily_capture_quality_gate(blocked)["passed"])
+        mismatched = {**baseline, "discovery": baseline["discovery"][:-1]}
+        self.assertFalse(daily_capture_quality_gate(mismatched)["passed"])
+
+    def test_daily_capture_quality_gate_rejects_cost_reconciliation_mismatch(
+        self,
+    ) -> None:
+        details = {
+            "monitored_accounts": 1,
+            "monitored_contents": 1,
+            "discovery": [{"status": "succeeded"}],
+            "content_updates": [{"status": "succeeded"}],
+            "blocked_providers": [],
+            "budget_max_amount": 8.0,
+            "reported_provider_cost": 1.0,
+            "ledger_provider_cost": 1.001,
+        }
+        result = daily_capture_quality_gate(details)
+        self.assertFalse(result["passed"])
+        self.assertFalse(result["checks"]["ledger_matches_details"])
+
+    def test_daily_capture_quality_gate_enforces_fixed_usd_eight_contract(
+        self,
+    ) -> None:
+        baseline = {
+            "monitored_accounts": 1,
+            "monitored_contents": 1,
+            "discovery": [{"status": "succeeded"}],
+            "content_updates": [{"status": "succeeded"}],
+            "blocked_providers": [],
+            "budget_max_amount": 8.0,
+            "reported_provider_cost": 1.0,
+            "ledger_provider_cost": 1.0,
+        }
+        enlarged_contract = {**baseline, "budget_max_amount": 9.0}
+        enlarged_result = daily_capture_quality_gate(enlarged_contract)
+        self.assertFalse(enlarged_result["passed"])
+        self.assertFalse(enlarged_result["checks"]["budget_contract"])
+
+        overspent = {
+            **baseline,
+            "reported_provider_cost": 8.001,
+            "ledger_provider_cost": 8.001,
+        }
+        overspent_result = daily_capture_quality_gate(overspent)
+        self.assertFalse(overspent_result["passed"])
+        self.assertFalse(overspent_result["checks"]["within_budget"])
+
+    def test_partial_daily_capture_is_terminal_even_for_operator_retry(self) -> None:
+        occurrence = datetime(2026, 8, 20, 2, 0, tzinfo=SHANGHAI)
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                INSERT INTO scheduler_runs(
+                    job_id,scheduled_for,status,started_at,completed_at,details_json
+                ) VALUES ('daily_capture','2026-08-19T18:00:00Z','partial',
+                          '2026-08-19T18:00:01Z','2026-08-19T18:01:00Z','{}')
+                """
+            )
+            connection.commit()
+        with patch("v8.scheduler._run_job_action") as action:
+            result = execute_job(
+                "daily_capture",
+                occurrence,
+                db_path=self.db,
+                reports_root=self.reports,
+                capture_call_override=lambda _operation, _payload: ProviderResult(
+                    {}, {}, 200, False
+                ),
+                allow_retry=True,
+                invocation_source="operator_retry",
+            )
+        self.assertEqual(result["status"], "skipped_duplicate")
+        action.assert_not_called()
 
     def test_scheduler_run_is_idempotent_and_daily_report_targets_yesterday(
         self,
@@ -1656,7 +1940,7 @@ class V8SchedulerTest(unittest.TestCase):
                     """
                 ).fetchone()[0]
             )
-        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["status"], "partial")
         self.assertEqual(calls["metrics"], 2)
         self.assertGreater(ledger_cost, 0)
         self.assertEqual(result["provider_cost"], ledger_cost)
@@ -2039,7 +2323,7 @@ class V8SchedulerTest(unittest.TestCase):
             ["succeeded"] * 4,
         )
 
-    def test_media_cutoff_keeps_scope_without_creating_manual_review(self) -> None:
+    def test_media_cutoff_keeps_scope_to_eligible_content(self) -> None:
         self._insert_media_cutoff_content(1)
         self._insert_media_cutoff_content(
             2, source_group="30-account-random-sample"
@@ -2064,11 +2348,6 @@ class V8SchedulerTest(unittest.TestCase):
         self.assertEqual(result["threshold"], 90.0)
         self.assertEqual(result["threshold_status"], "below_threshold")
         self.assertNotIn("manual_required", result)
-        with connect(self.db) as connection:
-            queue_count = connection.execute(
-                "SELECT COUNT(*) FROM review_queue"
-            ).fetchone()[0]
-        self.assertEqual(queue_count, 0)
 
     def test_media_cutoff_evaluates_only_pending_evaluations_and_uses_ninety(
         self,
@@ -2091,25 +2370,6 @@ class V8SchedulerTest(unittest.TestCase):
         final_states[content_ids[8]] = MediaTerminalDetail(
             "terminal_insufficient", "terminal_insufficient"
         )
-        queue_reasons = (
-            "media_processing_incomplete",
-            "media_evidence_missing",
-            "stale_local_evidence",
-            "legacy_content_unavailable",
-        )
-        captured_at = "2026-08-02T01:00:00Z"
-        with connect(self.db) as connection:
-            for content_id, reason in zip(content_ids, queue_reasons):
-                connection.execute(
-                    """
-                    INSERT INTO review_queue(
-                        content_id,reason_code,status,created_at,updated_at
-                    ) VALUES (?,?,'manual_required',?,?)
-                    """,
-                    (content_id, reason, captured_at, captured_at),
-                )
-            connection.commit()
-
         with (
             patch(
                 "v8.scheduler.media_terminal_state_details",
@@ -2152,15 +2412,8 @@ class V8SchedulerTest(unittest.TestCase):
         self.assertEqual(result["evaluation"]["candidates"], 1)
         self.assertEqual(result["evaluation"]["created"], 1)
         self.assertEqual(result["evaluation"]["reused"], 0)
-        self.assertEqual(result["resolved_media_queue_rows"], 4)
-        with connect(self.db) as connection:
-            queues = connection.execute(
-                "SELECT status,resolved_at FROM review_queue ORDER BY id"
-            ).fetchall()
-        self.assertEqual(
-            [(row["status"], row["resolved_at"] is not None) for row in queues],
-            [("resolved", True)] * 4,
-        )
+        # v16 起媒体截止不再触碰任何队列：结果里没有队列字段
+        self.assertNotIn("resolved_media_queue_rows", result)
 
     def test_media_cutoff_evaluates_completed_dag_on_the_next_day(self) -> None:
         content_id = self._insert_media_cutoff_content(20)
@@ -2261,22 +2514,11 @@ class V8SchedulerTest(unittest.TestCase):
             expected_active_release_id=V9_FIXTURE_RELEASE_ID,
         )
 
-    def test_media_cutoff_evaluation_failure_preserves_legacy_media_queue(
+    def test_media_cutoff_evaluation_failure_marks_the_run_failed(
         self,
     ) -> None:
         content_id = self._insert_media_cutoff_content(1)
         self._insert_media_source_artifact(content_id)
-        captured_at = "2026-08-02T01:00:00Z"
-        with connect(self.db) as connection:
-            connection.execute(
-                """
-                INSERT INTO review_queue(
-                    content_id,reason_code,status,created_at,updated_at
-                ) VALUES (?,'media_processing_incomplete','manual_required',?,?)
-                """,
-                (content_id, captured_at, captured_at),
-            )
-            connection.commit()
         states = {content_id: MediaTerminalDetail("pending", "evaluation_pending")}
         occurrence = datetime(2026, 8, 2, 7, 30, tzinfo=SHANGHAI)
         with (
@@ -2295,23 +2537,12 @@ class V8SchedulerTest(unittest.TestCase):
             )
 
         with connect(self.db) as connection:
-            queue = connection.execute(
-                """
-                SELECT status,resolved_at,updated_at FROM review_queue
-                WHERE content_id=? AND reason_code='media_processing_incomplete'
-                """,
-                (content_id,),
-            ).fetchone()
             run = connection.execute(
                 """
                 SELECT status FROM scheduler_runs
                 WHERE job_id='daily_media_cutoff' ORDER BY id DESC LIMIT 1
                 """
             ).fetchone()
-        self.assertEqual(
-            (queue["status"], queue["resolved_at"], queue["updated_at"]),
-            ("manual_required", None, captured_at),
-        )
         self.assertEqual(run["status"], "failed")
 
 

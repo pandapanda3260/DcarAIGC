@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import hashlib
 import json
+import sqlite3
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -502,9 +503,44 @@ class SpuCatalogImportTest(unittest.TestCase):
     def test_skip_backup_is_forbidden_when_target_is_default_database(self) -> None:
         self._write([self._row()])
         dry_run = self._dry_run()
-        with patch.object(importer, "DEFAULT_DB", self.database):
+        with patch.object(importer, "DEFAULT_DB", self.database), patch.dict(
+            importer.os.environ,
+            {"DCAR_TEST_DENY_FORMAL_DB": "0"},
+        ):
             with self.assertRaisesRegex(importer.SpuCatalogImportError, "forbidden"):
                 self._apply(dry_run, skip_backup=True)
+
+    def test_skip_backup_is_forbidden_for_existing_default_database_alias(self) -> None:
+        self._write([self._row()])
+        formal = self.root / "formal.sqlite3"
+        source = sqlite3.connect(self.database)
+        destination = sqlite3.connect(formal)
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+            source.close()
+        alias = self.root / "apfs-firmlink-spelling.sqlite3"
+        alias.hardlink_to(formal)
+        with (
+            patch.object(importer, "DEFAULT_DB", formal),
+            patch.dict(importer.os.environ, {"DCAR_TEST_DENY_FORMAL_DB": "0"}),
+        ):
+            dry_run = importer.execute_import(
+                self.input_path,
+                db_path=alias,
+                mapping_path=self.mapping_path,
+            )
+            with self.assertRaisesRegex(importer.SpuCatalogImportError, "forbidden"):
+                importer.execute_import(
+                    self.input_path,
+                    db_path=alias,
+                    apply=True,
+                    expected_plan_sha256=str(dry_run["plan_sha256"]),
+                    backup_dir=self.backups,
+                    skip_backup=True,
+                    mapping_path=self.mapping_path,
+                )
 
     def test_receipt_cannot_overwrite_input_database_or_sidecars(self) -> None:
         self._write([self._row()])

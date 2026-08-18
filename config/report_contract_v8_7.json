@@ -1,0 +1,199 @@
+{
+  "report_version": "dcar-content-operations-report-v8.7",
+  "rule_version": "evaluation-v9",
+  "taxonomy_version_pattern": "^selling-points-v[1-9][0-9]*\\.[0-9]+$",
+  "evidence_version": "evidence-v2",
+  "timezone": "Asia/Shanghai",
+  "metric_statuses": [
+    "available",
+    "below_threshold",
+    "sample_only",
+    "not_applicable",
+    "not_calculable",
+    "missing",
+    "stale"
+  ],
+  "task_statuses": [
+    "succeeded",
+    "partial"
+  ],
+  "quantity_units": [
+    "content",
+    "account",
+    "view",
+    "comment",
+    "person",
+    "lead",
+    "request",
+    "currency"
+  ],
+  "summary_metrics": {
+    "publication_count": {
+      "kind": "quantity",
+      "unit": "content"
+    },
+    "active_account_count": {
+      "kind": "quantity",
+      "unit": "account"
+    },
+    "view_count": {
+      "kind": "quantity",
+      "unit": "view"
+    },
+    "comment_count": {
+      "kind": "quantity",
+      "unit": "comment"
+    },
+    "verticality_rate": {
+      "kind": "ratio",
+      "unit": "percent"
+    },
+    "selling_point_coverage_rate": {
+      "kind": "ratio",
+      "unit": "percent"
+    },
+    "duplicate_rate": {
+      "kind": "ratio",
+      "unit": "percent"
+    },
+    "estimated_new_users": {
+      "kind": "quantity",
+      "unit": "person"
+    },
+    "estimated_reactivated_users": {
+      "kind": "quantity",
+      "unit": "person"
+    },
+    "estimated_leads": {
+      "kind": "quantity",
+      "unit": "lead"
+    }
+  },
+  "required_coverage_thresholds": {
+    "detail_coverage": 90.0,
+    "evaluation_coverage": 90.0,
+    "media_terminal_coverage": 90.0,
+    "duplicate_fingerprint_coverage": 90.0,
+    "weekly_comment_coverage": 90.0
+  },
+  "metric_display_coverage_thresholds": {
+    "view_count": 90.0,
+    "comment_count": 90.0
+  },
+  "required_quality_details": {
+    "discovery_coverage": {
+      "minimum_percentage": 90.0,
+      "allow_not_applicable_when_empty": true,
+      "eligible_basis": "scheduled_daily_capture_identity_occurrences"
+    },
+    "metrics_freshness": {
+      "minimum_percentage": 90.0,
+      "allow_not_applicable_when_empty": true,
+      "window_hours": 36,
+      "eligible_basis": "all_window_contents"
+    }
+  },
+  "required_boolean_quality_gates": {},
+  "boolean_quality_fields": [
+    "duplicate_calibration_ready"
+  ],
+  "metadata_required_keys": [
+    "task_id",
+    "revision",
+    "generated_at",
+    "collection_cutoff_at"
+  ],
+  "metadata_utc_timestamp_keys": [
+    "generated_at",
+    "collection_cutoff_at"
+  ],
+  "task_required_keys": [
+    "task_type",
+    "creation_source",
+    "task_status",
+    "name"
+  ],
+  "required_top_level_keys": [
+    "report_version",
+    "rule_version",
+    "taxonomy_version",
+    "evidence_version",
+    "metadata",
+    "scope",
+    "task",
+    "data_quality",
+    "data_quality_details",
+    "summary_metrics",
+    "platform_dimensions",
+    "account_type_dimensions",
+    "content_direction_dimensions",
+    "selling_point_dimensions",
+    "duplicates",
+    "capture_summary",
+    "provider_costs",
+    "content_details",
+    "files",
+    "channels"
+  ],
+  "channel_conclusion_metrics": {
+    "selling_point_count_share": {
+      "kind": "ratio",
+      "unit": "percent"
+    },
+    "core_selling_point_count_share": {
+      "kind": "ratio",
+      "unit": "percent"
+    },
+    "selling_point_exposure_share": {
+      "kind": "ratio",
+      "unit": "percent"
+    },
+    "core_selling_point_exposure_share": {
+      "kind": "ratio",
+      "unit": "percent"
+    },
+    "content_verticality": {
+      "kind": "score",
+      "unit": "point"
+    },
+    "automotive_user_rate": {
+      "kind": "ratio",
+      "unit": "percent"
+    },
+    "acquisition_potential": {
+      "kind": "score",
+      "unit": "point"
+    }
+  },
+  "channels": {
+    "platforms": [
+      "douyin",
+      "xiaohongshu"
+    ],
+    "scenes": [
+      "used_car",
+      "new_car",
+      "media"
+    ]
+  },
+  "audience_quality_required_keys": [
+    "captured_comment_count",
+    "declared_comment_count",
+    "comment_collection_coverage_percentage",
+    "identity_coverage_percentage",
+    "candidate_user_count",
+    "classified_user_count",
+    "classification_coverage_percentage",
+    "capped_content_count",
+    "audience_definition_version",
+    "classifier_version",
+    "user_key_version",
+    "evidence_window_start",
+    "evidence_window_end",
+    "report_cutoff_at",
+    "warm_up"
+  ],
+  "audience_definition_version": "audience-definition-v1",
+  "user_key_version": "platform-user-hmac-v2",
+  "comment_collection_version": "paged-comments-v2"
+}

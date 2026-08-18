@@ -15,6 +15,9 @@ from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler  # type: ignore[import-untyped]
 from apscheduler.triggers.cron import CronTrigger  # type: ignore[import-untyped]
+from apscheduler.triggers.interval import (  # type: ignore[import-untyped]
+    IntervalTrigger,
+)
 
 from .capture import ProviderResult, ensure_content_slot
 from .contracts import load_contract
@@ -55,6 +58,8 @@ DAILY_DISCOVERY_MAX_PAGES = 20
 DAILY_CAPTURE_WORKERS = 4
 DAILY_CAPTURE_MAX_ATTEMPTS = 2
 DAILY_CAPTURE_RETRY_DELAY_SECONDS = 1.0
+DAILY_CAPTURE_DISCOVERY_QUALITY_PERCENT = 90
+DAILY_CAPTURE_CONTENT_QUALITY_PERCENT = 60
 CAPTURE_CIRCUIT_BREAK_CODES = frozenset(
     {"provider_balance_blocked", "provider_auth_blocked", "budget_blocked"}
 )
@@ -119,6 +124,64 @@ def latest_occurrence(job: JobDefinition, now: datetime) -> datetime:
     if candidate > local:
         candidate -= timedelta(days=7 if job.day_of_week else 1)
     return candidate
+
+
+def current_day_daily_capture_guard(
+    *,
+    now: datetime,
+    effective_from: date,
+    db_path: Path,
+    reports_root: Path,
+    capture_call_override: Optional[
+        Callable[[str, Mapping[str, Any]], ProviderResult]
+    ],
+) -> Dict[str, Any]:
+    """Run only today's exact 02:00 capture occurrence, at most once.
+
+    This deliberately does not use :func:`latest_occurrence`: before 02:00 that
+    helper points at yesterday, which would turn a residency guard into an
+    unbounded historical backfill mechanism.
+    """
+
+    local_now = now.astimezone(SHANGHAI)
+    if local_now.date() < effective_from:
+        return {
+            "job_id": "daily_capture",
+            "status": "before_effective_date",
+            "effective_from": effective_from.isoformat(),
+        }
+    occurrence = datetime.combine(local_now.date(), time(2, 0), SHANGHAI)
+    if local_now < occurrence:
+        return {
+            "job_id": "daily_capture",
+            "status": "before_today_slot",
+            "scheduled_for": _scheduled_iso(occurrence),
+        }
+    occurrence_key = _scheduled_iso(occurrence)
+    with connect(db_path) as connection:
+        existing = connection.execute(
+            """
+            SELECT status FROM scheduler_runs
+            WHERE job_id='daily_capture' AND scheduled_for=?
+            """,
+            (occurrence_key,),
+        ).fetchone()
+    if existing is not None:
+        return {
+            "job_id": "daily_capture",
+            "status": "already_attempted",
+            "scheduled_for": occurrence_key,
+            "existing_status": str(existing["status"]),
+        }
+    return execute_job(
+        "daily_capture",
+        occurrence,
+        db_path=db_path,
+        reports_root=reports_root,
+        capture_call_override=capture_call_override,
+        allow_retry=False,
+        invocation_source="scheduled",
+    )
 
 
 def _claim_run(
@@ -752,6 +815,7 @@ def run_due_capture(
     metrics_refreshed: set[int] = set()
     metrics_attempted: set[int] = set()
     metrics_retry_ids: set[int] = set()
+    metrics_first_results: List[Dict[str, Any]] = []
     metrics_first_summary = {
         "attempted": len(metrics_targets),
         "succeeded": 0,
@@ -799,9 +863,7 @@ def run_due_capture(
         with ThreadPoolExecutor(
             max_workers=metrics_workers, thread_name_prefix="dcar-metrics-first"
         ) as pool:
-            metrics_first_results = list(
-                pool.map(refresh_metrics_only, metrics_targets)
-            )
+            metrics_first_results = list(pool.map(refresh_metrics_only, metrics_targets))
         for content, result in zip(metrics_targets, metrics_first_results):
             content_id = int(content["id"])
             if result.get("status") == "circuit_break_skipped":
@@ -957,11 +1019,24 @@ def run_due_capture(
         ) as pool:
             for index, retry_result in pool.map(retry_content_stages, retry_targets):
                 content_updates[index] = retry_result
+                if any(
+                    stage.get("stage") == "metrics"
+                    and stage.get("status") == "succeeded"
+                    for stage in retry_result.get("stages", [])
+                ):
+                    metrics_refreshed.add(int(contents[index]["id"]))
     if provider_blocked.is_set():
         blocked_providers.add("TikHub")
 
+    unresolved_metrics = {
+        int(content["id"]) for content in metrics_targets
+    } - metrics_refreshed
+    metrics_first_summary["final_succeeded"] = len(metrics_refreshed)
+    metrics_first_summary["final_unresolved"] = len(unresolved_metrics)
+
     reported_provider_cost = sum(
-        float(item.get("provider_cost") or 0) for item in discovery + content_updates
+        float(item.get("provider_cost") or 0)
+        for item in discovery + metrics_first_results + content_updates
     )
     with connect(db_path) as connection:
         ledger_provider_cost = float(
@@ -974,15 +1049,34 @@ def run_due_capture(
             ).fetchone()[0]
             or 0
         )
-    provider_cost = max(
-        round(reported_provider_cost, 6), round(ledger_provider_cost, 6)
+    reported_provider_cost = round(reported_provider_cost, 6)
+    ledger_provider_cost = round(ledger_provider_cost, 6)
+    provider_cost = max(reported_provider_cost, ledger_provider_cost)
+    incomplete_discovery = sum(
+        item.get("status") != "succeeded" for item in discovery
     )
-    failed = sum(
-        item.get("status") in {"failed", "partial"}
-        for item in discovery + content_updates
+    incomplete_contents = sum(
+        item.get("status") not in {"succeeded", "already_succeeded"}
+        for item in content_updates
     )
-    return {
-        "status": "failed" if failed else "succeeded",
+    successful_operations = (
+        len(discovery)
+        - incomplete_discovery
+        + len(content_updates)
+        - incomplete_contents
+        + len(metrics_refreshed)
+    )
+    failed_operations = (
+        incomplete_discovery + incomplete_contents + len(unresolved_metrics)
+    )
+    if blocked_providers or successful_operations == 0:
+        status = "failed"
+    elif failed_operations:
+        status = "partial"
+    else:
+        status = "succeeded"
+    details = {
+        "status": status,
         "task_id": task_id,
         "budget_max_amount": max_amount,
         "content_limit": content_limit,
@@ -993,8 +1087,74 @@ def run_due_capture(
         "discovery": discovery,
         "content_updates": content_updates,
         "blocked_providers": sorted(blocked_providers),
-        "failed_operations": failed,
+        "failed_operations": failed_operations,
+        "reported_provider_cost": reported_provider_cost,
+        "ledger_provider_cost": ledger_provider_cost,
         "provider_cost": provider_cost,
+    }
+    details["quality_gate"] = daily_capture_quality_gate(details)
+    return details
+
+
+def daily_capture_quality_gate(details: Mapping[str, Any]) -> Dict[str, Any]:
+    """Evaluate an occurrence for rollout acceptance without rewriting status."""
+
+    discovery = list(details.get("discovery") or [])
+    content_updates = list(details.get("content_updates") or [])
+    monitored_accounts = int(details.get("monitored_accounts") or 0)
+    monitored_contents = int(details.get("monitored_contents") or 0)
+    discovery_succeeded = sum(
+        item.get("status") == "succeeded" for item in discovery
+    )
+    content_succeeded = sum(
+        item.get("status") in {"succeeded", "already_succeeded"}
+        for item in content_updates
+    )
+    reported_cost = round(
+        float(details.get("reported_provider_cost", details.get("provider_cost", 0)) or 0),
+        6,
+    )
+    ledger_cost = round(
+        float(details.get("ledger_provider_cost", details.get("provider_cost", 0)) or 0),
+        6,
+    )
+    budget_max = float(
+        details.get("budget_max_amount", DAILY_CAPTURE_MAX_AMOUNT)
+    )
+    checks = {
+        "accounts_complete": len(discovery) == monitored_accounts,
+        "contents_complete": len(content_updates) == monitored_contents,
+        "discovery_rate": (
+            monitored_accounts > 0
+            and discovery_succeeded * 100
+            >= monitored_accounts * DAILY_CAPTURE_DISCOVERY_QUALITY_PERCENT
+        ),
+        "content_rate": (
+            monitored_contents == 0
+            or content_succeeded * 100
+            >= monitored_contents * DAILY_CAPTURE_CONTENT_QUALITY_PERCENT
+        ),
+        "providers_unblocked": not list(details.get("blocked_providers") or []),
+        "ledger_matches_details": abs(reported_cost - ledger_cost) <= 1e-6,
+        "budget_contract": (
+            0 < budget_max <= DAILY_CAPTURE_MAX_AMOUNT + 1e-9
+        ),
+        "within_budget": (
+            ledger_cost <= budget_max + 1e-9
+            and ledger_cost <= DAILY_CAPTURE_MAX_AMOUNT + 1e-9
+        ),
+    }
+    return {
+        "passed": all(checks.values()),
+        "checks": checks,
+        "discovery_succeeded": discovery_succeeded,
+        "monitored_accounts": monitored_accounts,
+        "content_succeeded": content_succeeded,
+        "monitored_contents": monitored_contents,
+        "discovery_threshold_percent": DAILY_CAPTURE_DISCOVERY_QUALITY_PERCENT,
+        "content_threshold_percent": DAILY_CAPTURE_CONTENT_QUALITY_PERCENT,
+        "declared_budget_max_amount": budget_max,
+        "authorized_budget_max_amount": DAILY_CAPTURE_MAX_AMOUNT,
     }
 
 
@@ -1003,7 +1163,7 @@ def run_media_cutoff(
     *,
     db_path: Path = DEFAULT_DB,
 ) -> Dict[str, Any]:
-    """Evaluate completed media DAGs, then retire legacy media review rows."""
+    """Evaluate completed media DAGs at the daily cutoff."""
 
     local_day = scheduled_for.astimezone(SHANGHAI).date()
     start = datetime.combine(local_day, time.min, SHANGHAI).astimezone(timezone.utc)
@@ -1086,7 +1246,6 @@ def run_media_cutoff(
             }
         )
 
-    resolved_queue_rows = 0
     with connect(db_path) as connection, transaction(connection):
         active_releases = connection.execute(
             "SELECT id FROM evaluation_releases WHERE status='active' ORDER BY id"
@@ -1101,23 +1260,6 @@ def run_media_cutoff(
         final_states = media_terminal_state_details(
             connection, release_id, final_state_content_ids
         )
-        if final_state_content_ids:
-            placeholders = ",".join("?" for _ in final_state_content_ids)
-            resolved_at = now_utc()
-            updated = connection.execute(
-                f"""
-                UPDATE review_queue
-                SET status='resolved',resolved_at=COALESCE(resolved_at,?),updated_at=?
-                WHERE content_id IN ({placeholders})
-                  AND reason_code IN (
-                    'media_processing_incomplete','media_evidence_missing',
-                    'stale_local_evidence','legacy_content_unavailable'
-                  )
-                  AND status<>'resolved'
-                """,
-                (resolved_at, resolved_at, *final_state_content_ids),
-            )
-            resolved_queue_rows = int(updated.rowcount)
 
     state_counts = Counter(
         final_states[content_id].state for content_id in coverage_content_ids
@@ -1156,7 +1298,6 @@ def run_media_cutoff(
             "reused": sum(int(not item["created"]) for item in evaluation_results),
             "results": evaluation_results,
         },
-        "resolved_media_queue_rows": resolved_queue_rows,
     }
 
 
@@ -1322,21 +1463,69 @@ def _live_job(
     *,
     db_path: Path,
     reports_root: Path,
+    capture_call_override: Optional[
+        Callable[[str, Mapping[str, Any]], ProviderResult]
+    ],
 ) -> None:
     definition = next(job for job in JOBS if job.job_id == job_id)
     occurrence = latest_occurrence(definition, datetime.now(SHANGHAI))
-    execute_job(job_id, occurrence, db_path=db_path, reports_root=reports_root)
+    execute_job(
+        job_id,
+        occurrence,
+        db_path=db_path,
+        reports_root=reports_root,
+        capture_call_override=capture_call_override,
+    )
+
+
+def _daily_capture_guard_job(
+    *,
+    effective_from: date,
+    db_path: Path,
+    reports_root: Path,
+    capture_call_override: Optional[
+        Callable[[str, Mapping[str, Any]], ProviderResult]
+    ],
+) -> None:
+    current_day_daily_capture_guard(
+        now=datetime.now(SHANGHAI),
+        effective_from=effective_from,
+        db_path=db_path,
+        reports_root=reports_root,
+        capture_call_override=capture_call_override,
+    )
 
 
 def install_jobs(
     scheduler: BackgroundScheduler,
     *,
-    db_path: Path = DEFAULT_DB,
-    reports_root: Path = REPORTS_ROOT,
+    db_path: Path,
+    reports_root: Path,
+    capture_call_override: Optional[
+        Callable[[str, Mapping[str, Any]], ProviderResult]
+    ],
+    reconcile_effective_date: date,
 ) -> None:
     for job in JOBS:
+        callback: Callable[..., None]
+        if job.job_id == "daily_capture":
+            callback = _daily_capture_guard_job
+            kwargs = {
+                "effective_from": reconcile_effective_date,
+                "db_path": db_path,
+                "reports_root": reports_root,
+                "capture_call_override": capture_call_override,
+            }
+        else:
+            callback = _live_job
+            kwargs = {
+                "job_id": job.job_id,
+                "db_path": db_path,
+                "reports_root": reports_root,
+                "capture_call_override": capture_call_override,
+            }
         scheduler.add_job(
-            _live_job,
+            callback,
             CronTrigger(
                 hour=job.hour,
                 minute=job.minute,
@@ -1345,15 +1534,27 @@ def install_jobs(
             ),
             id=job.job_id,
             replace_existing=True,
-            kwargs={
-                "job_id": job.job_id,
-                "db_path": db_path,
-                "reports_root": reports_root,
-            },
+            kwargs=kwargs,
             coalesce=True,
             max_instances=1,
             misfire_grace_time=3600,
         )
+    scheduler.add_job(
+        _daily_capture_guard_job,
+        IntervalTrigger(hours=1, timezone=SHANGHAI),
+        id="daily_capture_reconcile",
+        replace_existing=True,
+        kwargs={
+            "effective_from": reconcile_effective_date,
+            "db_path": db_path,
+            "reports_root": reports_root,
+            "capture_call_override": capture_call_override,
+        },
+        next_run_time=datetime.now(SHANGHAI),
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=None,
+    )
 
 
 def _report_occurrence(

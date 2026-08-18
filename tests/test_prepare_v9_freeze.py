@@ -6,6 +6,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -15,6 +16,7 @@ from v8.storage import connect, initialize_database
 
 
 ROOT = Path(__file__).resolve().parents[1]
+RECONCILE_FROM = date(2026, 8, 21)
 SPEC = importlib.util.spec_from_file_location(
     "prepare_v9_freeze", ROOT / "scripts" / "prepare_v9_freeze.py"
 )
@@ -225,6 +227,7 @@ class ApiConfigTest(unittest.TestCase):
                 "DCAR_WRITER_LOCK": str(root / "writer.lock"),
                 "DCAR_SCHEDULER_ENABLED": "1",
                 "DCAR_STARTUP_CATCHUP_ENABLED": "1",
+                "DCAR_DAILY_CAPTURE_RECONCILE_FROM": RECONCILE_FROM.isoformat(),
                 "DCAR_READ_ONLY": "1",
             }
             with patch.dict(os.environ, values, clear=True):
@@ -234,6 +237,7 @@ class ApiConfigTest(unittest.TestCase):
         self.assertEqual(config.legacy_db_path, root / "legacy.sqlite3")
         self.assertEqual(config.operator_freeze_lock, root / "freeze.lock")
         self.assertEqual(config.writer_lock, root / "writer.lock")
+        self.assertEqual(config.daily_capture_reconcile_from, RECONCILE_FROM)
         self.assertTrue(config.effective_startup_catchup_enabled)
         self.assertTrue(config.read_only)
 
@@ -244,6 +248,15 @@ class ApiConfigTest(unittest.TestCase):
             'startup_catchup_enabled="${DCAR_STARTUP_CATCHUP_ENABLED:-0}"',
             source,
         )
+        self.assertIn(
+            'daily_capture_reconcile_from="${DCAR_DAILY_CAPTURE_RECONCILE_FROM:-}"',
+            source,
+        )
+        self.assertIn('if [[ "$scheduler_enabled" != "0" ]]', source)
+        self.assertIn('if [[ "$startup_catchup_enabled" != "0" ]]', source)
+        self.assertIn('if [[ -n "$daily_capture_reconcile_from" ]]', source)
+        self.assertIn("DCAR_SCHEDULER_ENABLED=0", source)
+        self.assertIn("DCAR_STARTUP_CATCHUP_ENABLED=0", source)
         self.assertIn("DCar 自动调度：", source)
 
     def test_catchup_cannot_bypass_disabled_scheduler(self) -> None:
@@ -317,6 +330,9 @@ class ApiLifespanSwitchTest(unittest.IsolatedAsyncioTestCase):
                     writer_lock=root / "writer.lock",
                     scheduler_enabled=scheduler_enabled,
                     startup_catchup_enabled=catchup_enabled,
+                    daily_capture_reconcile_from=(
+                        RECONCILE_FROM if scheduler_enabled else None
+                    ),
                 )
                 self._seed_report_runtime(config.db_path)
                 application = api.create_app(config)
@@ -368,6 +384,7 @@ class ApiLifespanSwitchTest(unittest.IsolatedAsyncioTestCase):
                 "writer_lock": root / "writer.lock",
                 "scheduler_enabled": True,
                 "startup_catchup_enabled": False,
+                "daily_capture_reconcile_from": RECONCILE_FROM,
             }
             first = api.create_app(api.ApiConfig(**common))
             second = api.create_app(api.ApiConfig(**common))
@@ -410,6 +427,7 @@ class ApiLifespanSwitchTest(unittest.IsolatedAsyncioTestCase):
                 writer_lock=root / "writer.lock",
                 scheduler_enabled=True,
                 startup_catchup_enabled=True,
+                daily_capture_reconcile_from=RECONCILE_FROM,
             )
             application = api.create_app(config)
             scheduler = MagicMock()
@@ -510,6 +528,7 @@ class ApiLifespanSwitchTest(unittest.IsolatedAsyncioTestCase):
                 writer_lock=root / "writer.lock",
                 scheduler_enabled=True,
                 startup_catchup_enabled=True,
+                daily_capture_reconcile_from=RECONCILE_FROM,
             )
             application = api.create_app(config)
             scheduler = MagicMock()

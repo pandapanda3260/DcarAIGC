@@ -39,7 +39,7 @@ import re
 import sqlite3
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 from .storage import DEFAULT_DB, PROJECT_ROOT, connect, now_utc, transaction
@@ -591,7 +591,9 @@ def _artifact_paths_by_content(
     return mapping
 
 
-def _assemble_texts(content: sqlite3.Row, paths: Dict[str, str]) -> Dict[str, str]:
+def _assemble_texts(
+    content: sqlite3.Row | Mapping[str, Any], paths: Mapping[str, str]
+) -> Dict[str, str]:
     asr_payload = (
         _read_json_file(_resolved_path(paths["asr"])) if "asr" in paths else {}
     )
@@ -1405,7 +1407,7 @@ def run_association(
                     json.dumps(final_summary, ensure_ascii=False), run_id,
                 ),
             )
-        result = {"run_id": run_id, **counters}
+        result: Dict[str, Any] = {"run_id": run_id, **counters}
         if llm_summary is not None:
             result["llm"] = llm_summary
         return result

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Atomically install one pre-validated schema-v13 writer database candidate.
+"""Atomically install one pre-validated current-schema writer database candidate.
 
 This is a deliberately narrow cutover tool.  It only accepts the repository's
 canonical formal database and operator-freeze lock, consumes an explicitly
@@ -12,6 +12,7 @@ network, or invoke providers.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -20,7 +21,8 @@ import sqlite3
 import stat
 import subprocess
 import sys
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,20 +34,18 @@ PACKAGE_ROOT = PROJECT_ROOT / "src" / "dcar_eval"
 if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
-from v8.release_management_v9 import (  # noqa: E402
-    REPORT_VERSION,
-    SOURCE_RELEASE_ID,
-    SOURCE_RULE_VERSION,
-    TAXONOMY_VERSION,
-)
 from v8.storage import (  # noqa: E402
     CURRENT_SCHEMA_MIGRATION_NAME,
     DEFAULT_DB,
     SCHEMA_MIGRATION_NAMES,
     SCHEMA_VERSION,
+    _V16_DROPPED_TABLES,
+    _V16_EVALUATION_COPY_COLUMNS,
+    _V16_REMOVED_INDEXES,
     configure_connection_safety,
-    metric_observation_sha256,
+    is_formal_database_path,
     require_schema_compatibility,
+    same_database_path,
 )
 
 
@@ -53,16 +53,28 @@ FORMAL_DATABASE = DEFAULT_DB
 FORMAL_BACKUP_ROOT = FORMAL_DATABASE.parent / "backups"
 CANONICAL_OPERATOR_FREEZE_LOCK = PROJECT_ROOT / "runtime" / "operator-freeze.lock"
 RECEIPT_SCHEMA = "dcar-writer-database-candidate-install-v1"
+MIGRATION_RECEIPT_SCHEMA = "dcar-v16-offline-migration-v1"
+BACKUP_RECEIPT_SCHEMA = "dcar-v16-offline-backup-v1"
 HEX_SHA256 = re.compile(r"[0-9a-f]{64}", re.ASCII)
 SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm")
 SQLITE_TRANSIENT_SUFFIXES = (*SQLITE_SIDECAR_SUFFIXES, "-journal")
-EXPECTED_SOURCE_SCHEMA_VERSION = 11
-EXPECTED_SOURCE_CONTENT_COUNT = 61_800
-EXPECTED_SOURCE_METRIC_SNAPSHOT_COUNT = 65_145
-EXPECTED_SOURCE_SCHEDULER_RUN_COUNT = 33
-MIGRATION_ONLY_TABLES = frozenset(
-    {"content_metric_observations", "scheduler_run_attempts"}
-)
+EXPECTED_SOURCE_SCHEMA_VERSION = 15
+EXPECTED_SOURCE_MIGRATION = SCHEMA_MIGRATION_NAMES[EXPECTED_SOURCE_SCHEMA_VERSION]
+EXPECTED_CANDIDATE_SCHEMA_VERSION = 16
+EXPECTED_CANDIDATE_MIGRATION = CURRENT_SCHEMA_MIGRATION_NAME
+MIGRATION_ADDED_TABLES: frozenset[str] = frozenset()
+MIGRATION_REMOVED_TABLES = frozenset(_V16_DROPPED_TABLES)
+MIGRATION_REBUILT_TABLE_COLUMNS = {
+    "evaluation_versions": tuple(_V16_EVALUATION_COPY_COLUMNS),
+}
+MIGRATION_APPENDED_VERSIONS = frozenset({EXPECTED_CANDIDATE_SCHEMA_VERSION})
+MAX_MIGRATION_RECEIPT_BYTES = 8 * 1024 * 1024
+MAX_BACKUP_RECEIPT_BYTES = 64 * 1024
+MIGRATION_LOCK_PAYLOAD = b"dcar-v16-offline-migration-lock-v1\n"
+if SCHEMA_VERSION != EXPECTED_CANDIDATE_SCHEMA_VERSION:
+    raise RuntimeError(
+        "writer candidate installer must be reviewed for schema versions after v16"
+    )
 
 # Tests inject failures immediately after every durable state transition.  The
 # hook is not exposed by the CLI and therefore cannot weaken production checks.
@@ -92,6 +104,52 @@ class FileIdentity:
     mode: int
     size: int
     mtime_ns: int
+
+
+class _MigrationLockLease:
+    """Keep the lock held while moving its final binding check into commit."""
+
+    def __init__(
+        self,
+        *,
+        identity: FileIdentity,
+        verify_binding: Callable[[], None],
+    ) -> None:
+        self.identity = identity
+        self._verify_binding = verify_binding
+        self.commit_verified = False
+        self.binding_failed = False
+
+    def verify_for_commit(self) -> None:
+        if self.commit_verified:
+            return
+        try:
+            self._verify_binding()
+        except BaseException:
+            self.binding_failed = True
+            raise
+        self.commit_verified = True
+
+
+@dataclass(frozen=True)
+class MigrationReceiptContract:
+    value: dict[str, Any]
+    receipt_identity: FileIdentity
+    receipt_sha256: str
+    source_sha256: str
+    candidate_sha256: str
+    migration_lock_path: Path
+    migration_lock_identity: FileIdentity
+    migration_lock_sha256: str
+    backup_receipt_path: Path
+    backup_receipt_identity: FileIdentity
+    backup_receipt_sha256: str
+    backup_path: Path
+    backup_identity: FileIdentity
+    backup_sha256: str
+    source_validation: dict[str, Any]
+    candidate_validation: dict[str, Any]
+    lineage: dict[str, Any]
 
 
 def _utc_now() -> str:
@@ -168,6 +226,61 @@ def _require_directory(path: Path, *, label: str) -> Path:
     return path.resolve(strict=True)
 
 
+def _is_within(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def _has_ancestor_identity(path: Path, ancestor: Path) -> bool:
+    current = path if path.is_dir() else path.parent
+    while not _path_exists(current):
+        parent = current.parent
+        if parent == current:
+            return False
+        current = parent
+    while True:
+        try:
+            if os.path.samefile(current, ancestor):
+                return True
+        except OSError:
+            pass
+        parent = current.parent
+        if parent == current:
+            return False
+        current = parent
+
+
+def _require_project_external(path: Path, *, label: str) -> Path:
+    resolved = path.resolve(strict=path.exists())
+    project = PROJECT_ROOT.resolve(strict=True)
+    if _is_within(resolved, project) or _has_ancestor_identity(path, project):
+        raise CandidateInstallError(f"{label} must be outside the project root")
+    return resolved
+
+
+def _require_same_resolved_path(value: Any, actual: Path, *, label: str) -> None:
+    if not isinstance(value, str):
+        raise CandidateInstallError(f"{label} is not a path string")
+    declared = Path(value)
+    if not declared.is_absolute():
+        raise CandidateInstallError(f"{label} must be absolute")
+    try:
+        matches = same_database_path(declared, actual)
+    except OSError as error:
+        raise CandidateInstallError(f"{label} cannot be resolved") from error
+    if not matches:
+        raise CandidateInstallError(f"{label} differs")
+
+
+def _require_secure_lock_parent(path: Path) -> Path:
+    parent = _require_directory(path.parent, label="migration lock parent")
+    value = parent.stat()
+    if value.st_uid != os.geteuid() or stat.S_IMODE(value.st_mode) != 0o700:
+        raise CandidateInstallError(
+            "migration lock parent must be owned by the current user with mode 0700"
+        )
+    return parent
+
+
 def _same_identity(left: FileIdentity, right: FileIdentity) -> bool:
     return left.device == right.device and left.inode == right.inode
 
@@ -180,6 +293,47 @@ def _require_no_traversal(path: Path, *, label: str) -> None:
 def _fingerprint(path: Path) -> dict[str, Any]:
     identity = _stat_identity(path)
     return {**asdict(identity), "sha256": _sha256_file(path)}
+
+
+def _require_exact_keys(
+    value: Mapping[str, Any],
+    expected: frozenset[str],
+    *,
+    label: str,
+) -> None:
+    if set(value) != expected:
+        raise CandidateInstallError(f"{label} fields are not the exact contract")
+
+
+def _require_mapping(value: Any, *, label: str) -> Mapping[str, Any]:
+    if not isinstance(value, dict):
+        raise CandidateInstallError(f"{label} must be a JSON object")
+    return value
+
+
+def _require_fingerprint(
+    value: Any,
+    path: Path,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    mapping = _require_mapping(value, label=label)
+    fields = frozenset(
+        {"device", "inode", "link_count", "mode", "size", "mtime_ns", "sha256"}
+    )
+    _require_exact_keys(mapping, fields, label=label)
+    for key in fields - {"sha256"}:
+        item = mapping[key]
+        if not isinstance(item, int) or isinstance(item, bool):
+            raise CandidateInstallError(f"{label}.{key} must be an integer")
+    digest = mapping["sha256"]
+    if not isinstance(digest, str):
+        raise CandidateInstallError(f"{label}.sha256 must be a string")
+    _require_sha256(digest, label=f"{label}.sha256")
+    actual = _fingerprint(path)
+    if dict(mapping) != actual:
+        raise CandidateInstallError(f"{label} no longer matches {path}")
+    return actual
 
 
 def _connect_immutable_database(path: Path, *, label: str) -> sqlite3.Connection:
@@ -240,7 +394,8 @@ def _validate_candidate_database(path: Path) -> dict[str, Any]:
             )
         try:
             require_schema_compatibility(
-                connection, supported_versions=frozenset({SCHEMA_VERSION})
+                connection,
+                supported_versions=frozenset({EXPECTED_CANDIDATE_SCHEMA_VERSION}),
             )
         except Exception as error:
             raise CandidateInstallError(
@@ -249,63 +404,29 @@ def _validate_candidate_database(path: Path) -> dict[str, Any]:
         user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
         migration_rows = connection.execute(
             "SELECT version,name FROM schema_migrations WHERE version=?",
-            (SCHEMA_VERSION,),
+            (EXPECTED_CANDIDATE_SCHEMA_VERSION,),
         ).fetchall()
         maximum = connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
         ).fetchone()[0]
         if (
-            user_version != SCHEMA_VERSION
+            user_version != EXPECTED_CANDIDATE_SCHEMA_VERSION
             or len(migration_rows) != 1
-            or int(migration_rows[0]["version"]) != SCHEMA_VERSION
-            or str(migration_rows[0]["name"]) != CURRENT_SCHEMA_MIGRATION_NAME
-            or int(maximum) != SCHEMA_VERSION
+            or int(migration_rows[0]["version"])
+            != EXPECTED_CANDIDATE_SCHEMA_VERSION
+            or str(migration_rows[0]["name"]) != EXPECTED_CANDIDATE_MIGRATION
+            or int(maximum) != EXPECTED_CANDIDATE_SCHEMA_VERSION
         ):
             raise CandidateInstallError(
-                "candidate schema-v13 migration identity is not exact"
+                "candidate current-schema migration identity is not exact"
             )
 
-        active = connection.execute(
-            """
-            SELECT id,rule_version,taxonomy_version,status
-            FROM evaluation_releases WHERE status='active' ORDER BY id
-            """
-        ).fetchall()
-        expected_active = (
-            SOURCE_RELEASE_ID,
-            SOURCE_RULE_VERSION,
-            TAXONOMY_VERSION,
-            "active",
-        )
-        actual_active = [tuple(str(value) for value in row) for row in active]
-        if actual_active != [expected_active]:
-            raise CandidateInstallError(
-                "candidate must have exactly one active evaluation-v8 source release"
-            )
-        revision_count = int(
-            connection.execute(
-                "SELECT COUNT(*) FROM report_revisions WHERE contract_version=?",
-                (REPORT_VERSION,),
-            ).fetchone()[0]
-        )
-        if revision_count != 0:
-            raise CandidateInstallError(
-                "candidate must contain zero v8.6 report revisions before v9 cutover"
-            )
         return {
-            "quick_check": quick_rows,
-            "integrity_check": integrity_rows,
+            "quick_check": "ok",
+            "integrity_check": "ok",
             "foreign_key_violation_count": 0,
             "schema_version": user_version,
-            "schema_migration_name": str(migration_rows[0]["name"]),
-            "active_release": {
-                "id": str(active[0]["id"]),
-                "rule_version": str(active[0]["rule_version"]),
-                "taxonomy_version": str(active[0]["taxonomy_version"]),
-            },
-            "v8_6_report_revision_count": revision_count,
-            "wal_byte_size": 0,
-            "sidecars_absent": list(SQLITE_TRANSIENT_SUFFIXES),
+            "schema_migration": str(migration_rows[0]["name"]),
         }
     except sqlite3.Error as error:
         raise CandidateInstallError(
@@ -382,350 +503,240 @@ def _schema_migration_rows(
     ]
 
 
-def _validate_metric_observation_projection(
-    source: sqlite3.Connection,
-    candidate: sqlite3.Connection,
-) -> dict[str, Any]:
-    source_count = int(
-        source.execute("SELECT COUNT(*) FROM content_metric_snapshots").fetchone()[0]
-    )
-    if source_count != EXPECTED_SOURCE_METRIC_SNAPSHOT_COUNT:
-        raise CandidateInstallError(
-            "formal source metric snapshot count changed: "
-            f"expected={EXPECTED_SOURCE_METRIC_SNAPSHOT_COUNT},actual={source_count}"
+def _sequence_state(connection: sqlite3.Connection) -> dict[str, int]:
+    return {
+        str(row["name"]): int(row["seq"])
+        for row in connection.execute(
+            "SELECT name,seq FROM sqlite_sequence ORDER BY name"
         )
-    candidate_count = int(
-        candidate.execute(
-            "SELECT COUNT(*) FROM content_metric_observations"
+    }
+
+
+def _projection_manifest(connection: sqlite3.Connection) -> dict[str, Any]:
+    tables = _table_names(connection)
+    results: dict[str, dict[str, Any]] = {}
+    aggregate = hashlib.sha256()
+    for table in sorted(tables - {"schema_migrations"}):
+        columns = _table_columns(connection, table)
+        if table == "evaluation_versions":
+            columns = [
+                column
+                for column in _V16_EVALUATION_COPY_COLUMNS
+                if column in columns
+            ]
+        quoted = _quote_identifier(table)
+        count = int(connection.execute(f"SELECT COUNT(*) FROM {quoted}").fetchone()[0])
+        digest = _table_projection_sha256(connection, table, columns)
+        results[table] = {
+            "row_count": count,
+            "projection_sha256": digest,
+            "projection_columns": columns,
+        }
+        aggregate.update(table.encode("utf-8"))
+        aggregate.update(b"\0")
+        aggregate.update(str(count).encode("ascii"))
+        aggregate.update(b"\0")
+        aggregate.update(digest.encode("ascii"))
+        aggregate.update(b"\n")
+    manual_count = int(
+        connection.execute(
+            "SELECT COUNT(*) FROM evaluation_versions "
+            "WHERE evaluation_source='manual_review'"
         ).fetchone()[0]
     )
-    if candidate_count != source_count:
-        raise CandidateInstallError(
-            "candidate metric observation baseline count differs from source snapshots: "
-            f"snapshots={source_count},observations={candidate_count}"
-        )
+    return {
+        "tables": results,
+        "aggregate_sha256": aggregate.hexdigest(),
+        "evaluation_manual_review_count": manual_count,
+        "sqlite_sequence": _sequence_state(connection),
+        "schema_migrations": [
+            list(row) for row in _schema_migration_rows(connection)
+        ],
+    }
 
-    rows = candidate.execute(
-        """
-        SELECT
-            s.id snapshot_id,
-            s.content_id snapshot_content_id,
-            s.captured_at snapshot_captured_at,
-            s.window_key snapshot_window_key,
-            s.view_count snapshot_view_count,
-            s.comment_count snapshot_comment_count,
-            s.like_count snapshot_like_count,
-            s.share_count snapshot_share_count,
-            s.collect_count snapshot_collect_count,
-            s.status snapshot_status,
-            s.source snapshot_source,
-            s.raw_response_id snapshot_raw_response_id,
-            s.metadata_json snapshot_metadata_json,
-            COALESCE(
-                (
-                    SELECT ci.platform_identity_key
-                    FROM content_identities ci
-                    WHERE ci.content_id=s.content_id
-                    ORDER BY ci.is_primary DESC,ci.id
-                    LIMIT 1
-                ),
-                'link:' || c.link_id
-            ) expected_subject_key,
-            o.content_id observation_content_id,
-            o.subject_key observation_subject_key,
-            o.captured_at observation_captured_at,
-            o.window_key observation_window_key,
-            o.view_count observation_view_count,
-            o.comment_count observation_comment_count,
-            o.like_count observation_like_count,
-            o.share_count observation_share_count,
-            o.collect_count observation_collect_count,
-            o.status observation_status,
-            o.source observation_source,
-            o.raw_response_id observation_raw_response_id,
-            o.metadata_json observation_metadata_json,
-            o.observation_origin,
-            o.legacy_snapshot_id,
-            o.observation_sha256
-        FROM content_metric_snapshots s
-        JOIN content_items c ON c.id=s.content_id
-        LEFT JOIN content_metric_observations o ON o.legacy_snapshot_id=s.id
-        ORDER BY s.id
-        """
-    ).fetchall()
-    if len(rows) != source_count:
-        raise CandidateInstallError(
-            "candidate metric observation projection did not cover every source snapshot"
-        )
-    mismatches = 0
-    for row in rows:
-        expected_values = (
-            row["snapshot_content_id"],
-            row["expected_subject_key"],
-            row["snapshot_captured_at"],
-            row["snapshot_window_key"],
-            row["snapshot_view_count"],
-            row["snapshot_comment_count"],
-            row["snapshot_like_count"],
-            row["snapshot_share_count"],
-            row["snapshot_collect_count"],
-            row["snapshot_status"],
-            row["snapshot_source"],
-            row["snapshot_raw_response_id"],
-            row["snapshot_metadata_json"],
-            "legacy_snapshot_baseline",
-            row["snapshot_id"],
-        )
-        actual_values = (
-            row["observation_content_id"],
-            row["observation_subject_key"],
-            row["observation_captured_at"],
-            row["observation_window_key"],
-            row["observation_view_count"],
-            row["observation_comment_count"],
-            row["observation_like_count"],
-            row["observation_share_count"],
-            row["observation_collect_count"],
-            row["observation_status"],
-            row["observation_source"],
-            row["observation_raw_response_id"],
-            row["observation_metadata_json"],
-            row["observation_origin"],
-            row["legacy_snapshot_id"],
-        )
-        expected_digest = metric_observation_sha256(
-            observation_origin="legacy_snapshot_baseline",
-            legacy_snapshot_id=int(row["snapshot_id"]),
-            subject_key=str(row["expected_subject_key"]),
-            captured_at=str(row["snapshot_captured_at"]),
-            window_key=str(row["snapshot_window_key"]),
-            view_count=row["snapshot_view_count"],
-            comment_count=row["snapshot_comment_count"],
-            like_count=row["snapshot_like_count"],
-            share_count=row["snapshot_share_count"],
-            collect_count=row["snapshot_collect_count"],
-            status=str(row["snapshot_status"]),
-            source=str(row["snapshot_source"]),
-            raw_response_id=row["snapshot_raw_response_id"],
-            metadata_json=str(row["snapshot_metadata_json"]),
-        )
+
+def _validate_source_database(path: Path) -> dict[str, Any]:
+    connection = _connect_immutable_database(path, label="formal source database")
+    try:
+        quick = [str(row[0]) for row in connection.execute("PRAGMA quick_check")]
+        integrity = [
+            str(row[0]) for row in connection.execute("PRAGMA integrity_check")
+        ]
+        foreign_keys = list(connection.execute("PRAGMA foreign_key_check"))
+        if quick != ["ok"] or integrity != ["ok"]:
+            raise CandidateInstallError(
+                "formal source database integrity validation failed"
+            )
+        if foreign_keys:
+            raise CandidateInstallError(
+                "formal source database has foreign-key violations: "
+                f"{len(foreign_keys)}"
+            )
+        try:
+            version = require_schema_compatibility(
+                connection,
+                supported_versions=frozenset({EXPECTED_SOURCE_SCHEMA_VERSION}),
+            )
+        except Exception as error:
+            raise CandidateInstallError(
+                f"formal source schema compatibility failed: {error}"
+            ) from error
+        migrations = _schema_migration_rows(connection)
+        matches = [row for row in migrations if row[0] == EXPECTED_SOURCE_SCHEMA_VERSION]
         if (
-            expected_values != actual_values
-            or row["observation_sha256"] != expected_digest
+            version != EXPECTED_SOURCE_SCHEMA_VERSION
+            or len(matches) != 1
+            or matches[0][1] != EXPECTED_SOURCE_MIGRATION
+            or max((row[0] for row in migrations), default=0)
+            != EXPECTED_SOURCE_SCHEMA_VERSION
         ):
-            mismatches += 1
-    if mismatches:
+            raise CandidateInstallError("formal source schema identity is not exact v15")
+        return {
+            "quick_check": "ok",
+            "integrity_check": "ok",
+            "foreign_key_violation_count": 0,
+            "schema_version": version,
+            "schema_migration": EXPECTED_SOURCE_MIGRATION,
+        }
+    except sqlite3.Error as error:
         raise CandidateInstallError(
-            f"candidate metric observation projection has {mismatches} mismatches"
-        )
-    return {
-        "source_snapshot_count": source_count,
-        "candidate_observation_count": candidate_count,
-        "field_mismatch_count": 0,
-    }
-
-
-def _validate_scheduler_attempt_projection(
-    source: sqlite3.Connection,
-    candidate: sqlite3.Connection,
-) -> dict[str, Any]:
-    source_count = int(
-        source.execute("SELECT COUNT(*) FROM scheduler_runs").fetchone()[0]
-    )
-    if source_count != EXPECTED_SOURCE_SCHEDULER_RUN_COUNT:
-        raise CandidateInstallError(
-            "formal source scheduler run count changed: "
-            f"expected={EXPECTED_SOURCE_SCHEDULER_RUN_COUNT},actual={source_count}"
-        )
-    candidate_count = int(
-        candidate.execute("SELECT COUNT(*) FROM scheduler_run_attempts").fetchone()[0]
-    )
-    mismatch_count = int(
-        candidate.execute(
-            """
-            SELECT COUNT(*)
-            FROM scheduler_runs r
-            LEFT JOIN scheduler_run_attempts a ON a.scheduler_run_id=r.id
-            WHERE a.id IS NULL
-               OR a.attempt_number!=1
-               OR a.invocation_source!='legacy_migration'
-               OR a.status IS NOT r.status
-               OR a.started_at IS NOT r.started_at
-               OR a.completed_at IS NOT r.completed_at
-               OR a.details_json IS NOT r.details_json
-            """
-        ).fetchone()[0]
-    )
-    if candidate_count != source_count or mismatch_count:
-        raise CandidateInstallError(
-            "candidate scheduler attempt baseline differs from source runs: "
-            f"runs={source_count},attempts={candidate_count},mismatches={mismatch_count}"
-        )
-    return {
-        "source_run_count": source_count,
-        "candidate_attempt_count": candidate_count,
-        "field_mismatch_count": 0,
-    }
+            f"formal source database validation failed: {error}"
+        ) from error
+    finally:
+        connection.close()
 
 
 def _validate_source_candidate_lineage(
     source_path: Path,
     candidate_path: Path,
 ) -> dict[str, Any]:
-    """Prove that candidate is the lossless v11-to-v13 migration of source."""
+    """Prove the exact, lossless v15-to-v16 migration contract."""
 
     source = _connect_immutable_database(source_path, label="formal source database")
     candidate = _connect_candidate(candidate_path)
     try:
-        try:
-            source_version = require_schema_compatibility(
-                source,
-                supported_versions=frozenset({EXPECTED_SOURCE_SCHEMA_VERSION}),
-            )
-            candidate_version = require_schema_compatibility(
-                candidate, supported_versions=frozenset({SCHEMA_VERSION})
-            )
-        except Exception as error:
-            raise CandidateInstallError(
-                f"source/candidate schema lineage is incompatible: {error}"
-            ) from error
-        source_quick = [str(row[0]) for row in source.execute("PRAGMA quick_check")]
-        source_integrity = [
-            str(row[0]) for row in source.execute("PRAGMA integrity_check")
-        ]
-        source_foreign_keys = source.execute("PRAGMA foreign_key_check").fetchall()
-        if source_quick != ["ok"] or source_integrity != ["ok"]:
-            raise CandidateInstallError(
-                "formal source database integrity validation failed"
-            )
-        if source_foreign_keys:
-            raise CandidateInstallError(
-                "formal source database has foreign-key violations: "
-                f"{len(source_foreign_keys)}"
-            )
-
-        source_tables = _table_names(source)
-        candidate_tables = _table_names(candidate)
-        missing_tables = source_tables - candidate_tables
-        allowed_additions = (
-            MIGRATION_ONLY_TABLES
-            if EXPECTED_SOURCE_SCHEMA_VERSION == 11
-            else frozenset()
-        )
-        unexpected_tables = (candidate_tables - source_tables) - allowed_additions
-        absent_additions = allowed_additions - (candidate_tables - source_tables)
-        if missing_tables or unexpected_tables or absent_additions:
+        source_manifest = _projection_manifest(source)
+        candidate_manifest = _projection_manifest(candidate)
+        source_tables = set(source_manifest["tables"])
+        candidate_tables = set(candidate_manifest["tables"])
+        actual_removals = source_tables - candidate_tables
+        actual_additions = candidate_tables - source_tables
+        if (
+            actual_removals != MIGRATION_REMOVED_TABLES
+            or actual_additions != MIGRATION_ADDED_TABLES
+        ):
             raise CandidateInstallError(
                 "candidate table lineage differs from formal source: "
-                f"missing={sorted(missing_tables)},"
-                f"unexpected={sorted(unexpected_tables)},"
-                f"absent_migration_tables={sorted(absent_additions)}"
+                f"removed={sorted(actual_removals)},"
+                f"expected_removed={sorted(MIGRATION_REMOVED_TABLES)},"
+                f"added={sorted(actual_additions)},"
+                f"expected_added={sorted(MIGRATION_ADDED_TABLES)}"
             )
 
-        source_migrations = _schema_migration_rows(source)
-        candidate_migrations = _schema_migration_rows(candidate)
-        source_by_version = {row[0]: row for row in source_migrations}
-        candidate_by_version = {row[0]: row for row in candidate_migrations}
-        if any(candidate_by_version.get(row[0]) != row for row in source_migrations):
+        source_columns = _table_columns(source, "evaluation_versions")
+        candidate_columns = _table_columns(candidate, "evaluation_versions")
+        expected_rebuilt_columns = list(_V16_EVALUATION_COPY_COLUMNS)
+        if (
+            candidate_columns != expected_rebuilt_columns
+            or set(source_columns) - set(expected_rebuilt_columns)
+            != {"review_id", "pending_review"}
+            or set(expected_rebuilt_columns) - set(source_columns)
+        ):
+            raise CandidateInstallError(
+                "evaluation_versions is not the sole declared v16 rebuild"
+            )
+
+        retained: dict[str, Any] = {}
+        for table in sorted(candidate_tables):
+            before = source_manifest["tables"][table]
+            after = candidate_manifest["tables"][table]
+            if table != "evaluation_versions" and (
+                _table_columns(source, table) != _table_columns(candidate, table)
+            ):
+                raise CandidateInstallError(
+                    f"candidate changed columns for retained table {table}"
+                )
+            if before != after:
+                raise CandidateInstallError(
+                    f"candidate changed retained table projection: {table}"
+                )
+            retained[table] = before
+
+        if (
+            source_manifest["evaluation_manual_review_count"]
+            != candidate_manifest["evaluation_manual_review_count"]
+        ):
+            raise CandidateInstallError(
+                "candidate changed manual_review evaluation row count"
+            )
+        expected_sequences = {
+            name: value
+            for name, value in source_manifest["sqlite_sequence"].items()
+            if name not in MIGRATION_REMOVED_TABLES
+        }
+        if candidate_manifest["sqlite_sequence"] != expected_sequences:
+            raise CandidateInstallError(
+                "candidate changed retained AUTOINCREMENT sequences"
+            )
+
+        source_migrations = [
+            tuple(row) for row in source_manifest["schema_migrations"]
+        ]
+        candidate_migrations = [
+            tuple(row) for row in candidate_manifest["schema_migrations"]
+        ]
+        if candidate_migrations[:-1] != source_migrations:
             raise CandidateInstallError(
                 "candidate changed pre-existing schema migration records"
             )
-        expected_versions = set(source_by_version) | {12, 13}
-        if set(candidate_by_version) != expected_versions:
-            raise CandidateInstallError(
-                "candidate schema migrations must only append versions 12 and 13"
-            )
-        for version in (12, 13):
-            expected_name = SCHEMA_MIGRATION_NAMES[version]
-            row = candidate_by_version.get(version)
-            if row is None or row[1] != expected_name:
-                raise CandidateInstallError(
-                    f"candidate schema migration {version} identity is not exact"
-                )
-
-        table_results: dict[str, dict[str, Any]] = {}
-        aggregate = hashlib.sha256()
-        for table in sorted(source_tables - {"schema_migrations"}):
-            source_columns = _table_columns(source, table)
-            candidate_columns = _table_columns(candidate, table)
-            if candidate_columns != source_columns:
-                raise CandidateInstallError(
-                    f"candidate changed columns for pre-existing table {table}"
-                )
-            quoted_table = _quote_identifier(table)
-            source_count = int(
-                source.execute(f"SELECT COUNT(*) FROM {quoted_table}").fetchone()[0]
-            )
-            candidate_count = int(
-                candidate.execute(f"SELECT COUNT(*) FROM {quoted_table}").fetchone()[0]
-            )
-            source_digest = _table_projection_sha256(source, table, source_columns)
-            candidate_digest = _table_projection_sha256(
-                candidate, table, candidate_columns
-            )
-            if candidate_count != source_count or candidate_digest != source_digest:
-                raise CandidateInstallError(
-                    f"candidate changed pre-existing table {table}: "
-                    f"source_count={source_count},candidate_count={candidate_count},"
-                    f"source_digest={source_digest},candidate_digest={candidate_digest}"
-                )
-            table_results[table] = {
-                "row_count": source_count,
-                "projection_sha256": source_digest,
-            }
-            aggregate.update(table.encode("utf-8"))
-            aggregate.update(b"\0")
-            aggregate.update(str(source_count).encode("ascii"))
-            aggregate.update(b"\0")
-            aggregate.update(source_digest.encode("ascii"))
-            aggregate.update(b"\n")
-
-        content_count = table_results.get("content_items", {}).get("row_count")
-        if content_count != EXPECTED_SOURCE_CONTENT_COUNT:
-            raise CandidateInstallError(
-                "formal source content count changed: "
-                f"expected={EXPECTED_SOURCE_CONTENT_COUNT},actual={content_count}"
-            )
-
-        source_sequences = {
-            str(row["name"]): int(row["seq"])
-            for row in source.execute("SELECT name,seq FROM sqlite_sequence").fetchall()
+        appended_versions = {
+            int(row[0]) for row in candidate_migrations[len(source_migrations) :]
         }
-        candidate_sequences = {
-            str(row["name"]): int(row["seq"])
+        if (
+            len(candidate_migrations) != len(source_migrations) + 1
+            or appended_versions != MIGRATION_APPENDED_VERSIONS
+            or candidate_migrations[-1][1] != EXPECTED_CANDIDATE_MIGRATION
+        ):
+            raise CandidateInstallError(
+                "candidate must append exactly the v16 migration record"
+            )
+
+        object_names = {
+            str(row[0])
             for row in candidate.execute(
-                "SELECT name,seq FROM sqlite_sequence"
-            ).fetchall()
-        }
-        sequence_mismatches = {
-            name: {"source": value, "candidate": candidate_sequences.get(name)}
-            for name, value in source_sequences.items()
-            if candidate_sequences.get(name) != value
-        }
-        if sequence_mismatches:
-            raise CandidateInstallError(
-                "candidate changed pre-existing AUTOINCREMENT sequences: "
-                + json.dumps(sequence_mismatches, ensure_ascii=False, sort_keys=True)
+                "SELECT name FROM sqlite_master WHERE type IN ('table','index')"
             )
+        }
+        leftovers = object_names & (
+            MIGRATION_REMOVED_TABLES | frozenset(_V16_REMOVED_INDEXES)
+        )
+        if leftovers:
+            raise CandidateInstallError(
+                f"candidate retained removed review objects: {sorted(leftovers)}"
+            )
+        schema_objects = _validate_schema_object_lineage(source, candidate)
 
-        metric_projection = _validate_metric_observation_projection(source, candidate)
-        scheduler_projection = _validate_scheduler_attempt_projection(source, candidate)
         return {
-            "source_schema_version": source_version,
-            "candidate_schema_version": candidate_version,
-            "source_quick_check": source_quick,
-            "source_integrity_check": source_integrity,
-            "source_foreign_key_violation_count": 0,
-            "preexisting_table_count": len(table_results),
-            "preexisting_tables": table_results,
-            "aggregate_projection_sha256": aggregate.hexdigest(),
-            "schema_migrations": [
-                {"version": version, "name": name}
-                for version, name, _ in candidate_migrations
+            "source_table_count": len(source_tables),
+            "candidate_table_count": len(candidate_tables),
+            "retained_table_count": len(retained),
+            "retained_tables": retained,
+            "added_tables": [],
+            "source_projection_aggregate_sha256": source_manifest[
+                "aggregate_sha256"
             ],
-            "metric_observation_projection": metric_projection,
-            "scheduler_attempt_projection": scheduler_projection,
-            "preexisting_sequence_count": len(source_sequences),
+            "candidate_projection_aggregate_sha256": candidate_manifest[
+                "aggregate_sha256"
+            ],
+            "evaluation_versions": retained["evaluation_versions"],
+            "manual_review_row_count": candidate_manifest[
+                "evaluation_manual_review_count"
+            ],
+            "sqlite_sequence": candidate_manifest["sqlite_sequence"],
+            "appended_migration_versions": sorted(MIGRATION_APPENDED_VERSIONS),
+            "removed_tables": sorted(MIGRATION_REMOVED_TABLES),
+            "removed_indexes": sorted(_V16_REMOVED_INDEXES),
+            "schema_objects": schema_objects,
         }
     except sqlite3.Error as error:
         raise CandidateInstallError(
@@ -736,7 +747,637 @@ def _validate_source_candidate_lineage(
         source.close()
 
 
-def _database_writer_handles(databases: Sequence[Path]) -> list[dict[str, Any]]:
+def _schema_object_rows(
+    connection: sqlite3.Connection,
+) -> dict[tuple[str, str], tuple[str, str, str, str]]:
+    rows = {
+        (str(row[0]), str(row[1])): (
+            str(row[0]),
+            str(row[1]),
+            str(row[2]),
+            str(row[3] or ""),
+        )
+        for row in connection.execute(
+            "SELECT type,name,tbl_name,sql FROM sqlite_master "
+            "WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name"
+        )
+    }
+    return rows
+
+
+def _schema_object_manifest(connection: sqlite3.Connection) -> dict[str, Any]:
+    rows = [list(row) for row in _schema_object_rows(connection).values()]
+    payload = json.dumps(
+        rows,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        "object_count": len(rows),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+
+
+def _validate_schema_object_lineage(
+    source: sqlite3.Connection,
+    candidate: sqlite3.Connection,
+) -> dict[str, Any]:
+    source_objects = _schema_object_rows(source)
+    candidate_objects = _schema_object_rows(candidate)
+    source_keys = set(source_objects)
+    candidate_keys = set(candidate_objects)
+    expected_removed_names = set(MIGRATION_REMOVED_TABLES) | set(
+        _V16_REMOVED_INDEXES
+    )
+    expected_removed = {
+        key for key in source_keys if key[1] in expected_removed_names
+    }
+    actual_removed = source_keys - candidate_keys
+    actual_added = candidate_keys - source_keys
+    actual_changed = {
+        key
+        for key in source_keys & candidate_keys
+        if source_objects[key] != candidate_objects[key]
+    }
+    expected_changed = {("table", "evaluation_versions")}
+    if (
+        {key[1] for key in expected_removed} != expected_removed_names
+        or actual_removed != expected_removed
+        or actual_added
+        or actual_changed != expected_changed
+    ):
+        raise CandidateInstallError(
+            "candidate schema object lineage is not the exact v15-to-v16 delta: "
+            f"removed={sorted(actual_removed)},"
+            f"added={sorted(actual_added)},"
+            f"changed={sorted(actual_changed)}"
+        )
+    return {
+        "source": _schema_object_manifest(source),
+        "candidate": _schema_object_manifest(candidate),
+        "added_objects": [],
+        "removed_objects": [
+            f"{object_type}:{name}"
+            for object_type, name in sorted(actual_removed)
+        ],
+        "changed_objects": [
+            f"{object_type}:{name}"
+            for object_type, name in sorted(actual_changed)
+        ],
+    }
+
+
+def _validate_backup_lineage(
+    source_path: Path,
+    backup_path: Path,
+) -> dict[str, Any]:
+    source = _connect_immutable_database(source_path, label="formal source database")
+    backup = _connect_immutable_database(backup_path, label="verified backup database")
+    try:
+        source_manifest = _projection_manifest(source)
+        backup_manifest = _projection_manifest(backup)
+        if backup_manifest != source_manifest:
+            raise CandidateInstallError(
+                "verified backup data projection differs from formal source"
+            )
+        source_schema = _schema_object_manifest(source)
+        backup_schema = _schema_object_manifest(backup)
+        if backup_schema != source_schema:
+            raise CandidateInstallError(
+                "verified backup schema objects differ from formal source"
+            )
+        return {
+            "table_count": len(source_manifest["tables"]),
+            "projection_aggregate_sha256": source_manifest["aggregate_sha256"],
+            "schema_objects": source_schema,
+            "sqlite_sequence": source_manifest["sqlite_sequence"],
+            "schema_migrations": source_manifest["schema_migrations"],
+        }
+    finally:
+        backup.close()
+        source.close()
+
+
+def _read_json_object(path: Path, *, label: str, maximum_bytes: int) -> dict[str, Any]:
+    identity = _require_regular_single_link(path, label=label)
+    if identity.size > maximum_bytes:
+        raise CandidateInstallError(f"{label} is unexpectedly large")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise CandidateInstallError(f"{label} is not valid UTF-8 JSON") from error
+    if not isinstance(value, dict):
+        raise CandidateInstallError(f"{label} must be a JSON object")
+    return value
+
+
+def _validate_backup_receipt(
+    *,
+    receipt_path: Path,
+    expected_receipt_sha256: str,
+    source_database: Path,
+    source_sha256: str,
+    backup_path: Path,
+    backup_sha256: str,
+    migration_lock: Path,
+) -> dict[str, Any]:
+    if _sha256_file(receipt_path) != expected_receipt_sha256:
+        raise CandidateInstallError("backup receipt SHA-256 changed")
+    value = _read_json_object(
+        receipt_path,
+        label="backup receipt",
+        maximum_bytes=MAX_BACKUP_RECEIPT_BYTES,
+    )
+    fields = frozenset(
+        {
+            "schema_version",
+            "source_path",
+            "source_sha256",
+            "source_byte_size",
+            "source_schema_version",
+            "source_schema_migration",
+            "backup_path",
+            "backup_sha256",
+            "backup_byte_size",
+            "restore_verified",
+            "quick_check",
+            "integrity_check",
+            "foreign_key_violation_count",
+            "migration_lock",
+            "migration_lock_file",
+        }
+    )
+    _require_exact_keys(value, fields, label="backup receipt")
+    _require_same_resolved_path(
+        value["source_path"],
+        source_database,
+        label="backup receipt source path",
+    )
+    _require_same_resolved_path(
+        value["backup_path"],
+        backup_path,
+        label="backup receipt backup path",
+    )
+    _require_same_resolved_path(
+        value["migration_lock"],
+        migration_lock,
+        label="backup receipt migration lock path",
+    )
+    _require_fingerprint(
+        value["migration_lock_file"],
+        migration_lock,
+        label="backup receipt migration lock file",
+    )
+    expected = {
+        "schema_version": BACKUP_RECEIPT_SCHEMA,
+        "source_sha256": source_sha256,
+        "source_byte_size": source_database.stat().st_size,
+        "source_schema_version": EXPECTED_SOURCE_SCHEMA_VERSION,
+        "source_schema_migration": EXPECTED_SOURCE_MIGRATION,
+        "backup_sha256": backup_sha256,
+        "backup_byte_size": backup_path.stat().st_size,
+        "restore_verified": True,
+        "quick_check": "ok",
+        "integrity_check": "ok",
+        "foreign_key_violation_count": 0,
+    }
+    for key, expected_value in expected.items():
+        if value[key] != expected_value:
+            raise CandidateInstallError(
+                f"backup receipt {key} no longer matches its databases"
+            )
+    return value
+
+
+@contextmanager
+def _exclusive_existing_migration_lock(
+    path: Path,
+) -> Iterator[_MigrationLockLease]:
+    expected_identity = _require_regular_single_link(path, label="migration lock")
+    _require_project_external(path, label="migration lock")
+    if expected_identity.mode != 0o600:
+        raise CandidateInstallError("migration lock permissions must be 0600")
+    parent = _require_secure_lock_parent(path)
+    parent_descriptor = os.open(
+        parent,
+        os.O_RDONLY
+        | os.O_CLOEXEC
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    descriptor = -1
+    parent_locked = False
+    file_locked = False
+    try:
+        try:
+            fcntl.flock(parent_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise CandidateInstallError(
+                "offline migration lock is still held"
+            ) from error
+        parent_locked = True
+        parent_value = os.fstat(parent_descriptor)
+        current_parent = parent.stat()
+        if (parent_value.st_dev, parent_value.st_ino) != (
+            current_parent.st_dev,
+            current_parent.st_ino,
+        ):
+            raise CandidateInstallError("migration lock parent identity changed")
+        descriptor = os.open(
+            path.name,
+            os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_descriptor,
+        )
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise CandidateInstallError(
+                "offline migration lock is still held"
+            ) from error
+        file_locked = True
+        value = os.fstat(descriptor)
+        path_value = os.stat(
+            path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        identity = _identity_from_stat(value)
+        if (
+            not stat.S_ISREG(value.st_mode)
+            or value.st_nlink != 1
+            or value.st_uid != os.geteuid()
+            or not _same_identity(identity, expected_identity)
+            or (value.st_dev, value.st_ino) != (path_value.st_dev, path_value.st_ino)
+        ):
+            raise CandidateInstallError("migration lock identity contract differs")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        if os.read(descriptor, len(MIGRATION_LOCK_PAYLOAD) + 1) != MIGRATION_LOCK_PAYLOAD:
+            raise CandidateInstallError("migration lock content contract differs")
+        lease = _MigrationLockLease(
+            identity=identity,
+            verify_binding=lambda: _assert_existing_lock_binding(
+                path,
+                parent,
+                parent_descriptor,
+                descriptor,
+            ),
+        )
+        try:
+            yield lease
+        except BaseException as body_error:
+            if not lease.binding_failed:
+                try:
+                    _assert_existing_lock_binding(
+                        path,
+                        parent,
+                        parent_descriptor,
+                        descriptor,
+                    )
+                except BaseException as binding_error:
+                    raise CandidateInstallError(
+                        "migration lock binding failed during recovery: "
+                        f"{binding_error}"
+                    ) from body_error
+            raise
+        if not lease.commit_verified:
+            lease.verify_for_commit()
+    finally:
+        try:
+            if file_locked:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                if parent_locked:
+                    fcntl.flock(parent_descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(parent_descriptor)
+
+
+def _assert_existing_lock_binding(
+    path: Path,
+    parent: Path,
+    parent_descriptor: int,
+    descriptor: int,
+) -> None:
+    parent_fd_value = os.fstat(parent_descriptor)
+    parent_path_value = parent.stat()
+    if (parent_fd_value.st_dev, parent_fd_value.st_ino) != (
+        parent_path_value.st_dev,
+        parent_path_value.st_ino,
+    ):
+        raise CandidateInstallError("migration lock parent identity changed")
+    file_fd_value = os.fstat(descriptor)
+    file_path_value = os.stat(
+        path.name,
+        dir_fd=parent_descriptor,
+        follow_symlinks=False,
+    )
+    if (file_fd_value.st_dev, file_fd_value.st_ino) != (
+        file_path_value.st_dev,
+        file_path_value.st_ino,
+    ):
+        raise CandidateInstallError("migration lock path identity changed")
+
+
+def _migration_lock_from_receipt(
+    migration_receipt: Path,
+    *,
+    expected_sha256: str,
+) -> Path:
+    _require_regular_single_link(migration_receipt, label="migration receipt")
+    _require_project_external(migration_receipt, label="migration receipt")
+    if _sha256_file(migration_receipt) != expected_sha256:
+        raise CandidateInstallError("migration receipt SHA-256 does not match expectation")
+    value = _read_json_object(
+        migration_receipt,
+        label="migration receipt",
+        maximum_bytes=MAX_MIGRATION_RECEIPT_BYTES,
+    )
+    raw_path = value.get("migration_lock")
+    if not isinstance(raw_path, str):
+        raise CandidateInstallError("migration receipt migration_lock is invalid")
+    path = Path(raw_path)
+    if not path.is_absolute():
+        raise CandidateInstallError("migration receipt migration_lock is not absolute")
+    _require_regular_single_link(path, label="migration lock")
+    _require_project_external(path, label="migration lock")
+    _require_fingerprint(
+        value.get("migration_lock_file"),
+        path,
+        label="migration receipt migration lock file",
+    )
+    return path
+
+
+def _load_migration_receipt_contract(
+    *,
+    migration_receipt: Path,
+    expected_migration_receipt_sha256: str,
+    formal_database: Path,
+    candidate: Path,
+    freeze_lock: Path,
+    held_migration_lock: Path,
+    held_migration_lock_identity: FileIdentity,
+) -> MigrationReceiptContract:
+    receipt_identity = _require_regular_single_link(
+        migration_receipt,
+        label="migration receipt",
+    )
+    _require_project_external(migration_receipt, label="migration receipt")
+    receipt_sha256 = _sha256_file(migration_receipt)
+    if receipt_sha256 != expected_migration_receipt_sha256:
+        raise CandidateInstallError("migration receipt SHA-256 does not match expectation")
+    value = _read_json_object(
+        migration_receipt,
+        label="migration receipt",
+        maximum_bytes=MAX_MIGRATION_RECEIPT_BYTES,
+    )
+    fields = frozenset(
+        {
+            "schema_version",
+            "status",
+            "completed_at",
+            "from_version",
+            "from_migration",
+            "to_version",
+            "to_migration",
+            "formal_source",
+            "verified_backup",
+            "candidate",
+            "lineage",
+            "operator_freeze_lock",
+            "migration_lock",
+            "migration_lock_file",
+            "database_handles",
+            "receipt",
+        }
+    )
+    _require_exact_keys(value, fields, label="migration receipt")
+    expected_scalars = {
+        "schema_version": MIGRATION_RECEIPT_SCHEMA,
+        "status": "candidate_ready",
+        "from_version": EXPECTED_SOURCE_SCHEMA_VERSION,
+        "from_migration": EXPECTED_SOURCE_MIGRATION,
+        "to_version": EXPECTED_CANDIDATE_SCHEMA_VERSION,
+        "to_migration": EXPECTED_CANDIDATE_MIGRATION,
+        "database_handles": [],
+    }
+    for key, expected in expected_scalars.items():
+        if value[key] != expected:
+            raise CandidateInstallError(f"migration receipt {key} is not exact")
+    if not isinstance(value["completed_at"], str) or not value["completed_at"]:
+        raise CandidateInstallError("migration receipt completed_at is invalid")
+    for key, actual_path in (
+        ("operator_freeze_lock", freeze_lock),
+        ("receipt", migration_receipt),
+    ):
+        _require_same_resolved_path(
+            value[key],
+            actual_path,
+            label=f"migration receipt {key}",
+        )
+
+    _require_same_resolved_path(
+        value["migration_lock"],
+        held_migration_lock,
+        label="migration receipt migration_lock",
+    )
+    _require_fingerprint(
+        value["migration_lock_file"],
+        held_migration_lock,
+        label="migration receipt migration_lock_file",
+    )
+    if _stat_identity(held_migration_lock) != held_migration_lock_identity:
+        raise CandidateInstallError("held migration lock path changed")
+
+    source = _require_mapping(value["formal_source"], label="formal_source")
+    _require_exact_keys(
+        source,
+        frozenset({"path", "file", "sidecars", "validation"}),
+        label="formal_source",
+    )
+    _require_same_resolved_path(
+        source["path"],
+        formal_database,
+        label="migration receipt formal source path",
+    )
+    source_file = _require_fingerprint(
+        source["file"],
+        formal_database,
+        label="formal_source.file",
+    )
+    source_validation = _validate_source_database(formal_database)
+    if source["validation"] != source_validation:
+        raise CandidateInstallError("migration receipt formal validation differs")
+    sidecars = _require_mapping(source["sidecars"], label="formal_source.sidecars")
+    actual_sidecars: dict[str, dict[str, Any]] = {}
+    for suffix in SQLITE_TRANSIENT_SUFFIXES:
+        sidecar = Path(f"{formal_database}{suffix}")
+        if _path_exists(sidecar):
+            actual_sidecars[suffix] = _fingerprint(sidecar)
+    if dict(sidecars) != actual_sidecars:
+        raise CandidateInstallError("migration receipt formal sidecars differ")
+
+    candidate_value = _require_mapping(value["candidate"], label="candidate")
+    _require_exact_keys(
+        candidate_value,
+        frozenset({"path", "file", "validation"}),
+        label="candidate",
+    )
+    _require_same_resolved_path(
+        candidate_value["path"],
+        candidate,
+        label="migration receipt candidate path",
+    )
+    candidate_file = _require_fingerprint(
+        candidate_value["file"],
+        candidate,
+        label="candidate.file",
+    )
+    candidate_validation = _validate_candidate_database(candidate)
+    if candidate_value["validation"] != candidate_validation:
+        raise CandidateInstallError("migration receipt candidate validation differs")
+
+    lineage = _validate_source_candidate_lineage(formal_database, candidate)
+    if value["lineage"] != lineage:
+        raise CandidateInstallError("migration receipt lineage differs from databases")
+
+    verified_backup = _require_mapping(
+        value["verified_backup"],
+        label="verified_backup",
+    )
+    _require_exact_keys(
+        verified_backup,
+        frozenset(
+            {
+                "receipt_path",
+                "receipt_sha256",
+                "path",
+                "file",
+                "database",
+                "validation",
+                "lineage",
+            }
+        ),
+        label="verified_backup",
+    )
+    receipt_path_value = verified_backup["receipt_path"]
+    backup_path_value = verified_backup["path"]
+    if not isinstance(receipt_path_value, str) or not isinstance(
+        backup_path_value, str
+    ):
+        raise CandidateInstallError("migration receipt backup paths are invalid")
+    backup_receipt_path = Path(receipt_path_value)
+    backup_path = Path(backup_path_value)
+    for path, label in (
+        (backup_receipt_path, "backup receipt"),
+        (backup_path, "verified backup"),
+    ):
+        if not path.is_absolute():
+            raise CandidateInstallError(f"migration receipt {label} path is not canonical")
+        _require_project_external(path, label=label)
+    backup_receipt_identity = _require_regular_single_link(
+        backup_receipt_path,
+        label="backup receipt",
+    )
+    backup_identity = _require_regular_single_link(
+        backup_path,
+        label="verified backup",
+    )
+    _require_fingerprint(
+        verified_backup["file"],
+        backup_receipt_path,
+        label="verified_backup.file",
+    )
+    _require_fingerprint(
+        verified_backup["database"],
+        backup_path,
+        label="verified_backup.database",
+    )
+    backup_receipt_sha256 = _sha256_file(backup_receipt_path)
+    if verified_backup["receipt_sha256"] != backup_receipt_sha256:
+        raise CandidateInstallError("migration receipt backup receipt SHA differs")
+    backup_sha256 = _sha256_file(backup_path)
+    _validate_backup_receipt(
+        receipt_path=backup_receipt_path,
+        expected_receipt_sha256=backup_receipt_sha256,
+        source_database=formal_database,
+        source_sha256=str(source_file["sha256"]),
+        backup_path=backup_path,
+        backup_sha256=backup_sha256,
+        migration_lock=held_migration_lock,
+    )
+    backup_validation = _validate_source_database(backup_path)
+    if verified_backup["validation"] != backup_validation:
+        raise CandidateInstallError("migration receipt backup validation differs")
+    backup_lineage = _validate_backup_lineage(formal_database, backup_path)
+    if verified_backup["lineage"] != backup_lineage:
+        raise CandidateInstallError("migration receipt backup lineage differs")
+
+    return MigrationReceiptContract(
+        value=value,
+        receipt_identity=receipt_identity,
+        receipt_sha256=receipt_sha256,
+        source_sha256=str(source_file["sha256"]),
+        candidate_sha256=str(candidate_file["sha256"]),
+        migration_lock_path=held_migration_lock,
+        migration_lock_identity=held_migration_lock_identity,
+        migration_lock_sha256=_sha256_file(held_migration_lock),
+        backup_receipt_path=backup_receipt_path,
+        backup_receipt_identity=backup_receipt_identity,
+        backup_receipt_sha256=backup_receipt_sha256,
+        backup_path=backup_path,
+        backup_identity=backup_identity,
+        backup_sha256=backup_sha256,
+        source_validation=source_validation,
+        candidate_validation=candidate_validation,
+        lineage=lineage,
+    )
+
+
+def _assert_migration_contract_files_unchanged(
+    contract: MigrationReceiptContract,
+    *,
+    migration_receipt: Path,
+) -> None:
+    checks = (
+        (
+            contract.migration_lock_path,
+            contract.migration_lock_identity,
+            contract.migration_lock_sha256,
+            "migration lock",
+        ),
+        (
+            migration_receipt,
+            contract.receipt_identity,
+            contract.receipt_sha256,
+            "migration receipt",
+        ),
+        (
+            contract.backup_receipt_path,
+            contract.backup_receipt_identity,
+            contract.backup_receipt_sha256,
+            "backup receipt",
+        ),
+        (
+            contract.backup_path,
+            contract.backup_identity,
+            contract.backup_sha256,
+            "verified backup",
+        ),
+    )
+    for path, identity, digest, label in checks:
+        if (
+            not _path_exists(path)
+            or _stat_identity(path) != identity
+            or _sha256_file(path) != digest
+        ):
+            raise CandidateInstallError(f"{label} changed before installation")
+
+
+def _database_handles(databases: Sequence[Path]) -> list[dict[str, Any]]:
     targets: list[str] = []
     for database in databases:
         for path in (
@@ -763,19 +1404,23 @@ def _database_writer_handles(databases: Sequence[Path]) -> list[dict[str, Any]]:
             "cannot verify database writer handles with lsof: "
             f"{result.stderr.strip() or 'lsof failed'}"
         )
-    writers: list[dict[str, Any]] = []
+    handles: list[dict[str, Any]] = []
     for line in result.stdout.splitlines()[1:]:
         parts = line.split()
         if len(parts) < 9:
             continue
         descriptor = parts[3]
         descriptor_match = re.fullmatch(r"\d+([rwu]).*", descriptor)
-        if descriptor_match is not None and descriptor_match.group(1) in {"u", "w"}:
+        if descriptor_match is not None and descriptor_match.group(1) in {
+            "r",
+            "u",
+            "w",
+        }:
             try:
                 pid = int(parts[1])
             except ValueError:
                 pid = -1
-            writers.append(
+            handles.append(
                 {
                     "command": parts[0],
                     "pid": pid,
@@ -783,7 +1428,7 @@ def _database_writer_handles(databases: Sequence[Path]) -> list[dict[str, Any]]:
                     "path": parts[-1],
                 }
             )
-    return writers
+    return handles
 
 
 def _fsync_file(path: Path) -> None:
@@ -838,6 +1483,7 @@ def _preflight_paths(
     *,
     formal_database: Path,
     candidate: Path,
+    migration_receipt: Path,
     backup_directory: Path,
     receipt: Path,
     freeze_lock: Path,
@@ -851,19 +1497,24 @@ def _preflight_paths(
 ]:
     formal_database = formal_database.absolute()
     candidate = candidate.absolute()
+    migration_receipt = migration_receipt.absolute()
     backup_directory = backup_directory.absolute()
     receipt = receipt.absolute()
     freeze_lock = freeze_lock.absolute()
     for path, label in (
         (formal_database, "formal writer database"),
         (candidate, "candidate database"),
+        (migration_receipt, "migration receipt"),
         (backup_directory, "backup directory"),
         (receipt, "receipt"),
         (freeze_lock, "operator freeze lock"),
     ):
         _require_no_traversal(path, label=label)
 
-    if formal_database.resolve(strict=False) != FORMAL_DATABASE.resolve(strict=False):
+    if not is_formal_database_path(
+        formal_database,
+        formal_database=FORMAL_DATABASE,
+    ):
         raise CandidateInstallError(
             f"formal target must be exactly {FORMAL_DATABASE.resolve(strict=False)}"
         )
@@ -873,6 +1524,9 @@ def _preflight_paths(
     candidate_identity = _require_regular_single_link(
         candidate, label="candidate database"
     )
+    _require_project_external(candidate, label="candidate database")
+    _require_regular_single_link(migration_receipt, label="migration receipt")
+    _require_project_external(migration_receipt, label="migration receipt")
     if _same_identity(formal_identity, candidate_identity) or os.path.samefile(
         formal_database, candidate
     ):
@@ -893,6 +1547,8 @@ def _preflight_paths(
         raise CandidateInstallError(
             "formal installation requires the canonical operator freeze lock"
         )
+    if lock_identity.mode != 0o600:
+        raise CandidateInstallError("operator freeze lock permissions must be 0600")
 
     backup_root = _require_directory(
         FORMAL_BACKUP_ROOT.absolute(), label="formal backup root"
@@ -916,8 +1572,21 @@ def _preflight_paths(
         raise CandidateInstallError("receipt path must not already exist")
     if receipt_parent == formal_data_root or formal_data_root in receipt_parent.parents:
         raise CandidateInstallError("receipt must be outside the formal app/data tree")
-    if candidate == receipt or candidate == backup_directory:
-        raise CandidateInstallError("candidate path collides with an output path")
+    _require_project_external(receipt, label="install receipt")
+    if len(
+        {
+            path.resolve(strict=False)
+            for path in (
+                formal_database,
+                candidate,
+                migration_receipt,
+                backup_directory,
+                receipt,
+                freeze_lock,
+            )
+        }
+    ) != 6:
+        raise CandidateInstallError("installer paths must be distinct")
 
     for suffix in SQLITE_SIDECAR_SUFFIXES:
         sidecar = Path(f"{formal_database}{suffix}")
@@ -977,26 +1646,87 @@ def install_candidate(
     *,
     formal_database: Path,
     candidate: Path,
-    expected_source_sha256: str,
-    expected_candidate_sha256: str,
+    migration_receipt: Path,
+    expected_migration_receipt_sha256: str,
     backup_directory: Path,
     receipt: Path,
     freeze_lock: Path,
     fault_injector: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
+    """Hold the external migration lock for the complete atomic install."""
+
+    expected_digest = _require_sha256(
+        expected_migration_receipt_sha256,
+        label="expected migration receipt SHA-256",
+    )
+    formal_database = formal_database.absolute()
+    migration_receipt = migration_receipt.absolute()
+    if (
+        os.environ.get("DCAR_TEST_DENY_FORMAL_DB") == "1"
+        and is_formal_database_path(
+            formal_database,
+            formal_database=DEFAULT_DB,
+        )
+    ):
+        raise CandidateInstallError(
+            "test process attempted to open the formal DCar database"
+        )
+    migration_lock = _migration_lock_from_receipt(
+        migration_receipt,
+        expected_sha256=expected_digest,
+    )
+    with _exclusive_existing_migration_lock(migration_lock) as lock_lease:
+        return _install_candidate_locked(
+            formal_database=formal_database,
+            candidate=candidate,
+            migration_receipt=migration_receipt,
+            expected_migration_receipt_sha256=expected_digest,
+            backup_directory=backup_directory,
+            receipt=receipt,
+            freeze_lock=freeze_lock,
+            held_migration_lock=migration_lock,
+            held_migration_lock_identity=lock_lease.identity,
+            verify_migration_lock_for_commit=lock_lease.verify_for_commit,
+            fault_injector=fault_injector,
+        )
+
+
+def _install_candidate_locked(
+    *,
+    formal_database: Path,
+    candidate: Path,
+    migration_receipt: Path,
+    expected_migration_receipt_sha256: str,
+    backup_directory: Path,
+    receipt: Path,
+    freeze_lock: Path,
+    held_migration_lock: Path,
+    held_migration_lock_identity: FileIdentity,
+    verify_migration_lock_for_commit: Callable[[], None],
+    fault_injector: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
     """Install ``candidate`` or restore every original path before raising."""
 
-    expected_source_sha256 = _require_sha256(
-        expected_source_sha256, label="expected source SHA-256"
-    )
-    expected_candidate_sha256 = _require_sha256(
-        expected_candidate_sha256, label="expected candidate SHA-256"
+    expected_migration_receipt_sha256 = _require_sha256(
+        expected_migration_receipt_sha256,
+        label="expected migration receipt SHA-256",
     )
     formal_database = formal_database.absolute()
     candidate = candidate.absolute()
+    migration_receipt = migration_receipt.absolute()
     backup_directory = backup_directory.absolute()
     receipt = receipt.absolute()
     freeze_lock = freeze_lock.absolute()
+    if (
+        os.environ.get("DCAR_TEST_DENY_FORMAL_DB") == "1"
+        and is_formal_database_path(
+            formal_database,
+            formal_database=DEFAULT_DB,
+        )
+    ):
+        raise CandidateInstallError(
+            "test process attempted to open the formal DCar database"
+        )
 
     (
         formal_identity,
@@ -1008,22 +1738,34 @@ def install_candidate(
     ) = _preflight_paths(
         formal_database=formal_database,
         candidate=candidate,
+        migration_receipt=migration_receipt,
         backup_directory=backup_directory,
         receipt=receipt,
         freeze_lock=freeze_lock,
     )
+    contract = _load_migration_receipt_contract(
+        migration_receipt=migration_receipt,
+        expected_migration_receipt_sha256=expected_migration_receipt_sha256,
+        formal_database=formal_database,
+        candidate=candidate,
+        freeze_lock=freeze_lock,
+        held_migration_lock=held_migration_lock,
+        held_migration_lock_identity=held_migration_lock_identity,
+    )
+    expected_source_sha256 = contract.source_sha256
+    expected_candidate_sha256 = contract.candidate_sha256
     source_before = _fingerprint(formal_database)
     candidate_before = _fingerprint(candidate)
     if source_before["sha256"] != expected_source_sha256:
         raise CandidateInstallError("formal source SHA-256 does not match expectation")
     if candidate_before["sha256"] != expected_candidate_sha256:
         raise CandidateInstallError("candidate SHA-256 does not match expectation")
-    candidate_validation = _validate_candidate_database(candidate)
-    writers = _database_writer_handles((formal_database, candidate))
-    if writers:
+    candidate_validation = contract.candidate_validation
+    database_handles = _database_handles((formal_database, candidate))
+    if database_handles:
         raise CandidateInstallError(
-            "database writer handles are still open: "
-            + json.dumps(writers, ensure_ascii=False, sort_keys=True)
+            "database handles are still open: "
+            + json.dumps(database_handles, ensure_ascii=False, sort_keys=True)
         )
 
     source_sidecars: dict[str, dict[str, Any]] = {}
@@ -1037,7 +1779,7 @@ def install_candidate(
         raise CandidateInstallError(
             "formal source WAL must be absent or empty before cutover"
         )
-    lineage_validation = _validate_source_candidate_lineage(formal_database, candidate)
+    lineage_validation = contract.lineage
 
     # Close the validation connection before this final TOCTOU guard.
     if _stat_identity(formal_database) != formal_identity:
@@ -1072,11 +1814,15 @@ def install_candidate(
             raise CandidateInstallError(
                 f"candidate {suffix} sidecar appeared during preflight"
             )
-    writers = _database_writer_handles((formal_database, candidate))
-    if writers:
+    _assert_migration_contract_files_unchanged(
+        contract,
+        migration_receipt=migration_receipt,
+    )
+    database_handles = _database_handles((formal_database, candidate))
+    if database_handles:
         raise CandidateInstallError(
-            "database writer handles appeared during preflight: "
-            + json.dumps(writers, ensure_ascii=False, sort_keys=True)
+            "database handles appeared during preflight: "
+            + json.dumps(database_handles, ensure_ascii=False, sort_keys=True)
         )
     if (
         _require_regular_single_link(freeze_lock, label="operator freeze lock")
@@ -1137,11 +1883,15 @@ def install_candidate(
                 raise CandidateInstallError(
                     f"candidate {suffix} sidecar appeared before cutover"
                 )
-        writers = _database_writer_handles((formal_database, candidate))
-        if writers:
+        _assert_migration_contract_files_unchanged(
+            contract,
+            migration_receipt=migration_receipt,
+        )
+        database_handles = _database_handles((formal_database, candidate))
+        if database_handles:
             raise CandidateInstallError(
-                "database writer handles appeared immediately before cutover: "
-                + json.dumps(writers, ensure_ascii=False, sort_keys=True)
+                "database handles appeared immediately before cutover: "
+                + json.dumps(database_handles, ensure_ascii=False, sort_keys=True)
             )
 
         os.replace(formal_database, source_backup)
@@ -1230,11 +1980,11 @@ def install_candidate(
                     f"preserved source {suffix} sidecar SHA-256 mismatch"
                 )
             backup_sidecars[suffix] = fingerprint
-        writers = _database_writer_handles((formal_database, candidate))
-        if writers:
+        database_handles = _database_handles((formal_database, candidate))
+        if database_handles:
             raise CandidateInstallError(
-                "database writer handles appeared after candidate installation: "
-                + json.dumps(writers, ensure_ascii=False, sort_keys=True)
+                "database handles appeared after candidate installation: "
+                + json.dumps(database_handles, ensure_ascii=False, sort_keys=True)
             )
         _checkpoint("after_post_install_verification", fault_injector)
 
@@ -1247,6 +1997,10 @@ def install_candidate(
             )
         if not _same_identity(_stat_identity(receipt_parent), receipt_parent_identity):
             raise CandidateInstallError("receipt parent changed before receipt write")
+        _assert_migration_contract_files_unchanged(
+            contract,
+            migration_receipt=migration_receipt,
+        )
         for suffix in SQLITE_TRANSIENT_SUFFIXES:
             if _path_exists(Path(f"{formal_database}{suffix}")):
                 raise CandidateInstallError(
@@ -1262,12 +2016,23 @@ def install_candidate(
             "canonical_operator_freeze_lock": str(freeze_lock),
             "backup_directory": str(backup_directory),
             "expected": {
+                "migration_receipt_sha256": expected_migration_receipt_sha256,
                 "source_sha256": expected_source_sha256,
                 "candidate_sha256": expected_candidate_sha256,
+            },
+            "migration_receipt": {
+                "path": str(migration_receipt),
+                "file": _fingerprint(migration_receipt),
+                "schema_version": MIGRATION_RECEIPT_SCHEMA,
+                "from_version": EXPECTED_SOURCE_SCHEMA_VERSION,
+                "to_version": EXPECTED_CANDIDATE_SCHEMA_VERSION,
+                "verified_backup_path": str(contract.backup_path),
+                "verified_backup_sha256": contract.backup_sha256,
             },
             "before": {
                 "database": source_before,
                 "sidecars": source_sidecars,
+                "validation": contract.source_validation,
             },
             "candidate": {
                 "file": candidate_before,
@@ -1282,7 +2047,7 @@ def install_candidate(
                 "database": backup,
                 "sidecars": backup_sidecars,
             },
-            "writer_handles": writers,
+            "database_handles": database_handles,
             "rollback": "not_required",
             "receipt": str(receipt),
         }
@@ -1293,6 +2058,7 @@ def install_candidate(
 
         _write_json_exclusive(receipt, result, on_created=receipt_created)
         _checkpoint("after_receipt_written", fault_injector)
+        verify_migration_lock_for_commit()
         return result
     except BaseException as error:
         rollback_errors: list[str] = []
@@ -1312,15 +2078,15 @@ def install_candidate(
         rollback_paths_safe = True
         try:
             if candidate_installed or source_moved:
-                rollback_writers = _database_writer_handles(
+                rollback_handles = _database_handles(
                     (formal_database, candidate)
                 )
-                if rollback_writers:
+                if rollback_handles:
                     rollback_paths_safe = False
                     rollback_errors.append(
-                        "writer handles appeared during rollback: "
+                        "database handles appeared during rollback: "
                         + json.dumps(
-                            rollback_writers, ensure_ascii=False, sort_keys=True
+                            rollback_handles, ensure_ascii=False, sort_keys=True
                         )
                     )
         except Exception as rollback_error:
@@ -1508,8 +2274,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Required exact formal target: {FORMAL_DATABASE}",
     )
     parser.add_argument("--candidate", type=Path, required=True)
-    parser.add_argument("--expected-source-sha256", required=True)
-    parser.add_argument("--expected-candidate-sha256", required=True)
+    parser.add_argument("--migration-receipt", type=Path, required=True)
+    parser.add_argument("--expected-migration-receipt-sha256", required=True)
     parser.add_argument(
         "--backup-dir",
         type=Path,
@@ -1537,8 +2303,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = install_candidate(
             formal_database=arguments.formal_db,
             candidate=arguments.candidate,
-            expected_source_sha256=arguments.expected_source_sha256,
-            expected_candidate_sha256=arguments.expected_candidate_sha256,
+            migration_receipt=arguments.migration_receipt,
+            expected_migration_receipt_sha256=(
+                arguments.expected_migration_receipt_sha256
+            ),
             backup_directory=arguments.backup_dir,
             receipt=arguments.receipt,
             freeze_lock=arguments.freeze_lock,

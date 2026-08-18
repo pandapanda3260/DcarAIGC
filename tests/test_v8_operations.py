@@ -70,9 +70,9 @@ class V8OperationsTest(unittest.TestCase):
                     content_id,release_id,rule_version,taxonomy_version,
                     matcher_rule_sha256,evidence_sha256,evaluation_source,
                     evaluation_status,evidence_level,selling_point_included,
-                    content_direction,pending_review,payload_json,evaluated_at
+                    content_direction,payload_json,evaluated_at
                 ) VALUES (?,?,?,?,?,?,'migrated_from_v5','evaluated','V1',0,
-                          'unknown',0,'{}',?)
+                          'unknown','{}',?)
                 """,
                 (
                     content_id,
@@ -1245,14 +1245,6 @@ class V8OperationsTest(unittest.TestCase):
         )
         evaluation_id = self._insert_legacy_evaluation_history(protected["id"])
         with connect(self.db) as connection:
-            queue = connection.execute(
-                """
-                INSERT INTO review_queue(
-                    content_id,evaluation_id,reason_code,status,created_at,updated_at
-                ) VALUES (?,?,'evaluation_gray_zone','pending',?,?)
-                """,
-                (protected["id"], evaluation_id, now_utc(), now_utc()),
-            )
             connection.execute(
                 """
                 CREATE TRIGGER forbid_evaluation_delete
@@ -1260,15 +1252,7 @@ class V8OperationsTest(unittest.TestCase):
                 BEGIN SELECT RAISE(ABORT, 'evaluation delete forbidden'); END
                 """
             )
-            connection.execute(
-                """
-                CREATE TRIGGER forbid_queue_delete
-                BEFORE DELETE ON review_queue
-                BEGIN SELECT RAISE(ABORT, 'queue delete forbidden'); END
-                """
-            )
             connection.commit()
-            queue_id = int(queue.lastrowid)
         merged = upsert_content(
             {
                 "platform": "kuaishou",
@@ -1284,14 +1268,9 @@ class V8OperationsTest(unittest.TestCase):
                 "SELECT * FROM evaluation_versions WHERE id=?",
                 (evaluation_id,),
             ).fetchone()
-            queue_row = connection.execute(
-                "SELECT * FROM review_queue WHERE id=?", (queue_id,)
-            ).fetchone()
             violations = connection.execute("PRAGMA foreign_key_check").fetchall()
         self.assertEqual([row["id"] for row in contents], [protected["id"]])
         self.assertEqual(evaluation_row["content_id"], protected["id"])
-        self.assertEqual(queue_row["content_id"], protected["id"])
-        self.assertEqual(queue_row["evaluation_id"], evaluation_id)
         self.assertEqual(violations, [])
 
     def test_content_import_overwrites_by_platform_identity_and_duplicate_reminder_points_to_earliest(

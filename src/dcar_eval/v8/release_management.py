@@ -621,7 +621,22 @@ def _existing_connection(
             connection.close()
 
 
+RELEASE_LIFECYCLE_RETIRED_MESSAGE = (
+    "this release lifecycle is retired: evaluation-v8__selling-points-v5.2 already shipped, "
+    "evaluation-v9 is the active release, and schema v16 removed the manual "
+    "review domain (review_id / pending_review) this lifecycle attests over"
+)
+
+
 def _require_v9(connection: sqlite3.Connection) -> None:
+    # v16 起复核域已删除。该历史生命周期的冻结/校验链逐列比对 review_id 与
+    # pending_review，在 v16 上不可能成立——与其抛出含混的“schema 列不全”，
+    # 不如在唯一入口显式失败，说明它已退役。
+    if "review_id" not in {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(evaluation_versions)")
+    }:
+        raise ReleaseManagementError(RELEASE_LIFECYCLE_RETIRED_MESSAGE)
     try:
         require_schema_compatibility(
             connection, supported_versions=frozenset({SCHEMA_VERSION})
@@ -1561,7 +1576,6 @@ def backfill(
                     result = _evaluate_content(
                         item.content_id,
                         db_path=db_path,
-                        source="automatic",
                         _release_id=release_id,
                         _connection=connection,
                     )

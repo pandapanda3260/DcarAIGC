@@ -219,9 +219,14 @@ def campaign_task_id(campaign: str, phase: str, tranche: int = 1) -> str:
 
 
 def open_readonly_database(path: Path) -> sqlite3.Connection:
+    source_root = str(REPO / "src" / "dcar_eval")
+    if source_root not in sys.path:
+        sys.path.insert(0, source_root)
+    from v8.storage import is_formal_database_path
+
     if (
         os.environ.get("DCAR_TEST_DENY_FORMAL_DB") == "1"
-        and path.resolve() == FORMAL_DB.resolve()
+        and is_formal_database_path(path, formal_database=FORMAL_DB)
     ):
         raise RuntimeError("test process attempted to open the formal DCar database")
     return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
@@ -880,7 +885,8 @@ def remaining_backfill_tags() -> int:
 
 
 def phase_local_evidence(
-    state: Dict[str, Any], batches: int, *, campaign: str, end: str
+    state: Dict[str, Any], batches: int, *, campaign: str, end: str,
+    as_of: str,
 ) -> int:
     for batch in range(1, batches + 1):
         remaining = remaining_backfill_tags()
@@ -888,7 +894,7 @@ def phase_local_evidence(
             break
         log(f"本地证据批次 {batch}/{batches}：剩余 {remaining} 条待媒体+评估")
         result = run_command(
-            rb("local-evidence", end, "--task-id",
+            rb("local-evidence", end, "--as-of", as_of, "--task-id",
                campaign_task_id(campaign, "local-evidence"), "--max-amount", "1",
                "--limit", str(LOCAL_BATCH_LIMIT), "--tagged-only", "--compact"),
             parse_json=True, allow_exit_2=True,
@@ -1045,12 +1051,6 @@ def phase_postflight(state: Dict[str, Any], *, campaign: str) -> None:
                 (day_key, week_key, active_release_id, *batch),
             ).fetchall()
             rows.extend(dict(row) for row in batch_rows)
-        review_counts = {
-            str(row["status"]): int(row["n"])
-            for row in connection.execute(
-                "SELECT status,COUNT(*) n FROM review_queue GROUP BY status"
-            ).fetchall()
-        }
         usage = dict(
             connection.execute(
                 """
@@ -1099,7 +1099,6 @@ def phase_postflight(state: Dict[str, Any], *, campaign: str) -> None:
         "inserted_contents": len(inserted),
         "verified_rows": len(rows),
         "active_release_id": active_release_id,
-        "review_queue": review_counts,
         "provider_usage": usage,
         "failures": failures,
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -1224,7 +1223,7 @@ def main(argv: List[str] | None = None) -> int:
                "--task-id", campaign_task_id(campaign, "comments-xhs"),
                "--max-amount", "<报价×1.3>",
                "--workers", "4", "--compact", "--history-only"),
-            rb("local-evidence", end, "--task-id",
+            rb("local-evidence", end, "--as-of", snapshot, "--task-id",
                campaign_task_id(campaign, "local-evidence"), "--max-amount", "1",
                "--limit", str(LOCAL_BATCH_LIMIT), "--tagged-only", "--compact"),
             [*python_prefix(), "-m", "v8.duplicates", "fingerprint",
@@ -1375,7 +1374,11 @@ def main(argv: List[str] | None = None) -> int:
                           budgets["comments_xhs"], values.end, data_snapshot_at,
                           "--platform", "xiaohongshu", "--stage", "comments")
         remaining = phase_local_evidence(
-            state, values.local_batches, campaign=campaign, end=values.end
+            state,
+            values.local_batches,
+            campaign=campaign,
+            end=values.end,
+            as_of=str(data_snapshot_at),
         )
         log(f"阶段状态：{json.dumps(state['phases'], ensure_ascii=False)}")
         if remaining:

@@ -164,11 +164,9 @@ export default function OverviewPage() {
               </dl>
             </article>
             <article className="panel overview-support-card quality-card">
-              <div className="support-card-title"><ShieldCheckIcon size={19} weight="regular" aria-hidden="true" /><div><h3>数据质量状态</h3><p>缺日期内容不进入任何日期窗口，复核与终态记录单独保留。</p></div></div>
+              <div className="support-card-title"><ShieldCheckIcon size={19} weight="regular" aria-hidden="true" /><div><h3>数据质量状态</h3><p>缺日期内容不进入任何日期窗口，重复内容单独记录。</p></div></div>
               <div className="quality-grid">
                 <div><strong>{overview?.data_quality.missing_published_at ?? "—"}</strong><span>缺失发布日期</span></div>
-                <div><strong>{overview?.data_quality.pending_reviews ?? "—"}</strong><span>待复核 / 补证</span></div>
-                <div><strong>{overview?.data_quality.terminal_reviews ?? "—"}</strong><span>终态不可用</span></div>
                 <div><strong>{overview?.data_quality.duplicate_fingerprint_coverage ?? "—"}%</strong><span>重复指纹覆盖</span></div>
                 <div><strong>{overview?.data_quality.confirmed_duplicate_count ?? "—"}</strong><span>确认重复内容</span></div>
                 <div><strong>{overview?.data_quality.duplicate_calibration_ready ? "已通过" : "未通过"}</strong><span>150 对定标</span></div>

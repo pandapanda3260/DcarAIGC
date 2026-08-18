@@ -53,6 +53,13 @@ CONTENT_CHILD_REKEY_TABLES = (
     "evidence_envelopes",
     "media_processing_slots",
     "duplicate_fingerprints",
+    # SPU 关联域（schema v14/v15）：派生标签，随内容改键搬到存活方。
+    # 它们都带 invalidated_at + rule_version，重跑关联即可重建，
+    # 但合并时必须跟着走，否则旧 content_id 上的关联会成为孤儿。
+    "content_spu_links",
+    "content_audience_links",
+    "content_scene_links",
+    "llm_judgements",
 )
 CONTENT_CHILD_MERGE_POLICIES = {
     **{table: "rekey" for table in CONTENT_CHILD_REKEY_TABLES},
@@ -61,10 +68,6 @@ CONTENT_CHILD_MERGE_POLICIES = {
     "comment_user_scores": "special_rekey",
     "duplicate_relations": "special_relation",
     "evaluation_versions": "protected_history",
-    "review_queue": "protected_history",
-    "evaluation_reviews": "protected_history",
-    "review_reopen_events": "protected_history",
-    "manual_evidence": "protected_history",
     "task_contents": "protected_history",
 }
 DOUYIN_ID_RE = re.compile(r"(?:/video/|[?&]modal_id=)(\d{6,24})(?:[/?&#]|$)", re.I)
@@ -615,10 +618,6 @@ def _merge_unique_children(connection, table: str, survivor: int, loser: int) ->
 
 _PROTECTED_CONTENT_HISTORY_TABLES = (
     "evaluation_versions",
-    "review_queue",
-    "evaluation_reviews",
-    "review_reopen_events",
-    "manual_evidence",
     "task_contents",
 )
 
@@ -698,7 +697,7 @@ def _raise_identity_conflict(
         reason=reason,
     )
     raise IdentityConflictError(
-        "identity_conflict: 内容身份冲突，已进入重复内容人工复核"
+        "identity_conflict: 内容身份冲突，已记录重复内容关系，请在内容页重复提醒处处理"
     )
 
 
@@ -848,7 +847,7 @@ def merge_content_records(connection, first_id: int, second_id: int) -> int:
             reason=f"merge_constraint_conflict:{type(exc).__name__}",
         )
         raise IdentityConflictError(
-            "identity_conflict: 内容身份合并无法无损完成，已进入重复内容人工复核"
+            "identity_conflict: 内容身份合并无法无损完成，已记录重复内容关系，请在内容页重复提醒处处理"
         ) from exc
     except Exception:
         connection.execute("ROLLBACK TO merge_content_records")
@@ -1295,7 +1294,7 @@ def update_content(
                         reason="multiple_identity_candidates",
                     )
                 raise IdentityConflictError(
-                    "identity_conflict: 平台内容 ID 与链接命中不同内容，已进入重复内容人工复核"
+                    "identity_conflict: 平台内容 ID 与链接命中不同内容，已记录重复内容关系，请在内容页重复提醒处处理"
                 )
             for candidate_id in external_candidate_ids:
                 affected_text_ids.add(candidate_id)

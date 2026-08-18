@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import sqlite3
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -544,7 +545,7 @@ class SpuSeriesCatalogImportTest(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual((series_count, alias_count), (0, 0))
 
-    def test_schema_v15_plan_sha_backup_and_receipt_guards(self) -> None:
+    def test_schema_v16_plan_sha_backup_and_receipt_guards(self) -> None:
         self._write([self._row()])
         dry_run = self._dry_run()
         with self.assertRaisesRegex(
@@ -558,18 +559,21 @@ class SpuSeriesCatalogImportTest(unittest.TestCase):
             )
 
         with connect(self.database) as connection:
-            connection.execute("PRAGMA user_version=14")
+            connection.execute("PRAGMA user_version=15")
             connection.commit()
         with self.assertRaisesRegex(
-            importer.SpuSeriesCatalogImportError, "must be v15"
+            importer.SpuSeriesCatalogImportError, "must be v16"
         ):
             self._dry_run()
         with connect(self.database) as connection:
-            connection.execute("PRAGMA user_version=15")
+            connection.execute("PRAGMA user_version=16")
             connection.commit()
 
         dry_run = self._dry_run()
-        with patch.object(importer, "DEFAULT_DB", self.database):
+        with patch.object(importer, "DEFAULT_DB", self.database), patch.dict(
+            importer.os.environ,
+            {"DCAR_TEST_DENY_FORMAL_DB": "0"},
+        ):
             with self.assertRaisesRegex(
                 importer.SpuSeriesCatalogImportError, "forbidden"
             ):
@@ -591,6 +595,36 @@ class SpuSeriesCatalogImportTest(unittest.TestCase):
                         db_path=self.database,
                         receipt_path=destination,
                     )
+
+    def test_skip_backup_is_forbidden_for_existing_default_database_alias(self) -> None:
+        self._write([self._row()])
+        formal = self.root / "formal.sqlite3"
+        source = sqlite3.connect(self.database)
+        destination = sqlite3.connect(formal)
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+            source.close()
+        alias = self.root / "apfs-firmlink-spelling.sqlite3"
+        alias.hardlink_to(formal)
+        with (
+            patch.object(importer, "DEFAULT_DB", formal),
+            patch.dict(importer.os.environ, {"DCAR_TEST_DENY_FORMAL_DB": "0"}),
+        ):
+            dry_run = importer.execute_import(self.input_path, db_path=alias)
+            with self.assertRaisesRegex(
+                importer.SpuSeriesCatalogImportError,
+                "forbidden",
+            ):
+                importer.execute_import(
+                    self.input_path,
+                    db_path=alias,
+                    apply=True,
+                    expected_plan_sha256=str(dry_run["plan_sha256"]),
+                    backup_dir=self.backups,
+                    skip_backup=True,
+                )
 
     def test_cli_defaults_to_dry_run_and_emits_json_receipt(self) -> None:
         self._write([self._row()])

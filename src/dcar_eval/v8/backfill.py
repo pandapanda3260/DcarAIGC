@@ -310,19 +310,10 @@ class RnoteVideoAdapter:
 
 
 def backfill_candidates(*, db_path: Path = DEFAULT_DB) -> List[Dict[str, Any]]:
-    with connect(db_path) as connection:
-        rows = connection.execute(
-            """
-            SELECT c.id content_id, c.link_id, c.platform_content_id note_id,
-                   c.canonical_url, rq.reason_code, rq.status review_status
-            FROM review_queue rq
-            JOIN content_items c ON c.id=rq.content_id
-            WHERE rq.reason_code IN ('stale_local_evidence','media_evidence_missing')
-            ORDER BY CASE rq.reason_code WHEN 'stale_local_evidence' THEN 0 ELSE 1 END,
-                     c.id
-            """
-        ).fetchall()
-    return [dict(row) for row in rows]
+    """Retired: schema v16 removed the media backfill ledger (review_queue)."""
+
+    del db_path
+    return []
 
 
 def prepare_backfill_slots(*, db_path: Path = DEFAULT_DB) -> Dict[str, int]:
@@ -418,24 +409,6 @@ def _update_detail_fields(
         )
 
 
-def _mark_review(
-    content_id: int,
-    status: str,
-    *,
-    db_path: Path,
-) -> None:
-    with connect(db_path) as connection, transaction(connection):
-        resolved = now_utc() if status in {"resolved", "terminal_failed"} else None
-        connection.execute(
-            """
-            UPDATE review_queue
-            SET status=?, resolved_at=?, updated_at=?
-            WHERE content_id=? AND reason_code='media_evidence_missing'
-            """,
-            (status, resolved, now_utc(), content_id),
-        )
-
-
 def _read_source_manifest(link_id: str) -> Optional[Dict[str, Any]]:
     path = _source_manifest_path(link_id)
     if not path.is_file():
@@ -471,7 +444,6 @@ def process_paid_candidate(
             if exc.error_code in {"provider_balance_blocked", "provider_auth_blocked"}:
                 raise
             if not exc.retryable:
-                _mark_review(content_id, "terminal_failed", db_path=db_path)
                 return "terminal_failed"
             return "retryable_failed"
         normalized = dict(outcome.data)
@@ -485,14 +457,12 @@ def process_paid_candidate(
         _update_detail_fields(db_path=db_path, content_id=content_id, normalized=normalized)
     urls = [str(url) for url in normalized.get("video_urls", []) if isinstance(url, str)]
     if not urls:
-        _mark_review(content_id, "terminal_failed", db_path=db_path)
         return "terminal_failed"
     try:
         media = download_video_sources(content_id, urls, db_path=db_path)
         process_video_evidence(content_id, PROJECT_ROOT / media.local_path, db_path=db_path)
     except MediaProcessingError:
         return "retryable_failed"
-    _mark_review(content_id, "resolved", db_path=db_path)
     return "evidence_ready"
 
 
@@ -530,31 +500,12 @@ def pilot_status(*, db_path: Path = DEFAULT_DB) -> Dict[str, Any]:
                 ids,
             ).fetchone()[0]
         )
-        evidence_ready = int(
-            connection.execute(
-                f"""
-                SELECT COUNT(*) FROM review_queue
-                WHERE content_id IN ({placeholders}) AND reason_code='media_evidence_missing'
-                  AND status='resolved'
-                """,
-                ids,
-            ).fetchone()[0]
-        )
-        terminal = int(
-            connection.execute(
-                f"""
-                SELECT COUNT(*) FROM review_queue
-                WHERE content_id IN ({placeholders}) AND reason_code='media_evidence_missing'
-                  AND status='terminal_failed'
-                """,
-                ids,
-            ).fetchone()[0]
-        )
+    # v16 起媒体补证台账（review_queue）已删除，历史口径字段恒为 0。
     return {
         "attempted": attempted,
         "media_recovered": media_recovered,
-        "evidence_ready": evidence_ready,
-        "terminal_failed": terminal,
+        "evidence_ready": 0,
+        "terminal_failed": 0,
     }
 
 
@@ -646,7 +597,6 @@ def run_daily_backfill_batch(
     items = [
         item for item in backfill_candidates(db_path=db_path)
         if item["reason_code"] == "media_evidence_missing"
-        and item["review_status"] in {"pending", "manual_required"}
     ][: min(limit, int(budget["daily_quota"]))]
     if not items:
         return {"status": "succeeded", "attempted": 0, "results": {}}
@@ -670,101 +620,14 @@ def run_daily_backfill_batch(
         "status": "partial" if any(key.endswith("blocked") for key in results) else "succeeded",
         "attempted": attempted,
         "results": results,
-        "routes": route_summary(db_path=db_path),
     }
-
-
-def route_remaining_manual_after_failed_gate(*, db_path: Path = DEFAULT_DB) -> int:
-    with connect(db_path) as connection, transaction(connection):
-        budget = connection.execute(
-            "SELECT status FROM provider_budget_batches WHERE id=?", (BUDGET_ID,)
-        ).fetchone()
-        if budget is None or budget["status"] != "suspended":
-            raise BudgetBlocked("remaining items can only be routed after a failed suspended pilot")
-        cursor = connection.execute(
-            """
-            UPDATE review_queue SET status='manual_required', updated_at=?
-            WHERE reason_code='media_evidence_missing' AND status='pending'
-            """,
-            (now_utc(),),
-        )
-    return int(cursor.rowcount)
-
-
-def route_provider_blocked_manual(*, db_path: Path = DEFAULT_DB) -> int:
-    """Repair and route a batch when provider auth/balance prevents a valid pilot."""
-
-    with connect(db_path) as connection, transaction(connection):
-        blocked = int(
-            connection.execute(
-                """
-                SELECT COUNT(*) FROM fetch_attempts
-                WHERE error_code IN ('http_401','http_402','http_403',
-                                     'provider_balance_blocked','provider_auth_blocked')
-                """
-            ).fetchone()[0]
-        )
-        if blocked == 0:
-            raise BudgetBlocked("no provider auth or balance failure is recorded")
-        connection.execute(
-            """
-            UPDATE fetch_slots SET status='retryable_failed',
-                last_error_code=CASE last_error_code
-                    WHEN 'http_402' THEN 'provider_balance_blocked'
-                    WHEN 'http_401' THEN 'provider_auth_blocked'
-                    WHEN 'http_403' THEN 'provider_auth_blocked'
-                    ELSE last_error_code END,
-                updated_at=?
-            WHERE id IN (
-                SELECT slot_id FROM fetch_attempts
-                WHERE error_code IN ('http_401','http_402','http_403',
-                                     'provider_balance_blocked','provider_auth_blocked')
-            )
-            """,
-            (now_utc(),),
-        )
-        connection.execute(
-            """
-            UPDATE fetch_attempts SET error_code=CASE error_code
-                WHEN 'http_402' THEN 'provider_balance_blocked'
-                WHEN 'http_401' THEN 'provider_auth_blocked'
-                WHEN 'http_403' THEN 'provider_auth_blocked'
-                ELSE error_code END
-            WHERE error_code IN ('http_401','http_402','http_403')
-            """
-        )
-        cursor = connection.execute(
-            """
-            UPDATE review_queue SET status='manual_required', resolved_at=NULL, updated_at=?
-            WHERE reason_code='media_evidence_missing'
-              AND status IN ('pending','terminal_failed')
-            """,
-            (now_utc(),),
-        )
-        connection.execute(
-            "UPDATE provider_budget_batches SET status='suspended', updated_at=? WHERE id=?",
-            (now_utc(), BUDGET_ID),
-        )
-    return int(cursor.rowcount)
-
-
-def route_summary(*, db_path: Path = DEFAULT_DB) -> Dict[str, int]:
-    with connect(db_path) as connection:
-        rows = connection.execute(
-            """
-            SELECT status, COUNT(*) count FROM review_queue
-            WHERE reason_code IN ('stale_local_evidence','media_evidence_missing')
-            GROUP BY status
-            """
-        ).fetchall()
-    return {str(row["status"]): int(row["count"]) for row in rows}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "command",
-        choices=("prepare", "pilot", "status", "route-failed-pilot", "route-provider-blocked"),
+        choices=("prepare", "pilot", "status"),
     )
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
     parser.add_argument("--key-file", type=Path, default=KEY_FILE)
@@ -778,22 +641,11 @@ def main() -> int:
         result: Any = {
             "slots": prepare_backfill_slots(db_path=args.db),
             "local_evidence_ready": ingest_local_backfill(db_path=args.db),
-            "routes": route_summary(db_path=args.db),
         }
     elif args.command == "pilot":
         result = run_pilot(db_path=args.db, key_file=args.key_file)
-    elif args.command == "route-failed-pilot":
-        result = {
-            "routed": route_remaining_manual_after_failed_gate(db_path=args.db),
-            "routes": route_summary(db_path=args.db),
-        }
-    elif args.command == "route-provider-blocked":
-        result = {
-            "routed": route_provider_blocked_manual(db_path=args.db),
-            "routes": route_summary(db_path=args.db),
-        }
     else:
-        result = {"pilot": pilot_status(db_path=args.db), "routes": route_summary(db_path=args.db)}
+        result = {"pilot": pilot_status(db_path=args.db)}
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 

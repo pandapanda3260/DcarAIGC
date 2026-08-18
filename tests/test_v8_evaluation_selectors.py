@@ -17,7 +17,6 @@ from v8.evaluation_selectors import (
     formal_eligible_release_evaluations,
     formal_current_evaluations,
     release_current_evaluations,
-    review_anchor_evaluation,
 )
 from v8.storage import connect, initialize_database
 
@@ -170,9 +169,9 @@ class EvaluationSelectorsTest(unittest.TestCase):
             INSERT INTO evaluation_versions(
                 content_id,release_id,rule_version,taxonomy_version,matcher_rule_sha256,
                 evidence_sha256,evaluation_source,evaluation_status,evidence_level,
-                selling_point_included,content_direction,pending_review,payload_json,
+                selling_point_included,content_direction,payload_json,
                 evaluated_at
-            ) VALUES (?,?,?,?,?,?,'automatic','evaluated','V3',0,?,0,?,?)
+            ) VALUES (?,?,?,?,?,?,'automatic','evaluated','V3',0,?,?,?)
             """,
             (
                 content_id,
@@ -190,7 +189,7 @@ class EvaluationSelectorsTest(unittest.TestCase):
         assert cursor.lastrowid is not None
         return int(cursor.lastrowid)
 
-    def test_formal_display_review_and_audit_selectors_have_distinct_semantics(
+    def test_formal_display_and_audit_selectors_have_distinct_semantics(
         self,
     ) -> None:
         with connect(self.db) as connection:
@@ -200,8 +199,6 @@ class EvaluationSelectorsTest(unittest.TestCase):
             release_v8 = release_current_evaluations(
                 connection, "release-v8", [1, 2, 3]
             )
-            review = review_anchor_evaluation(connection, 1)
-            backfill_only_review = review_anchor_evaluation(connection, 3)
             history = audit_evaluations(connection, 2)
 
         self.assertEqual(set(formal), {1})
@@ -212,10 +209,6 @@ class EvaluationSelectorsTest(unittest.TestCase):
         self.assertEqual(display[2]["evaluation_freshness"], "stale")
         self.assertNotIn(3, display)
         self.assertEqual(set(release_v8), {1, 3})
-        assert review is not None
-        self.assertEqual(review["release_id"], "release-v8")
-        assert backfill_only_review is not None
-        self.assertEqual(backfill_only_review["release_id"], "release-v8")
         self.assertEqual(
             [row["release_id"] for row in history], ["release-v8", "release-v6"]
         )
@@ -276,16 +269,25 @@ class EvaluationSelectorsTest(unittest.TestCase):
         self.assertEqual(after_switch[2]["release_id"], "release-v8")
         self.assertNotIn(2, after_invalidation)
 
-    def test_formal_eligible_selector_excludes_gray_weak_and_manual_conflicts(
+    def test_formal_eligible_selector_excludes_weak_evidence_and_gray_scores(
         self,
     ) -> None:
+        """v16 起灰区由存量字段推导：自动 60-74 弱匹配不入正式，V0/V1 同样排除。
+
+        人工结论（manual_review）即使落在 60-74 区间也保持正式——历史上它是
+        人工定论，不是待复核灰区。
+        """
+
         with connect(self.db) as connection:
+            # content 1：自动评估落在 60-74 弱匹配灰区 → 不入正式
             connection.execute(
                 """
-                UPDATE evaluation_versions SET pending_review=1
+                UPDATE evaluation_versions
+                SET selling_point_score=64, evaluation_source='automatic'
                 WHERE content_id=1 AND release_id='release-v8'
                 """
             )
+            # content 2：V1 弱证据 → 不入正式
             weak_id = self._insert_evaluation(
                 connection,
                 2,
@@ -301,26 +303,14 @@ class EvaluationSelectorsTest(unittest.TestCase):
                 "UPDATE evaluation_versions SET evidence_level='V1' WHERE id=?",
                 (weak_id,),
             )
-            conflict_evaluation = connection.execute(
+            # content 3：人工结论且同样落在灰区分段 → 仍是正式
+            connection.execute(
                 """
-                SELECT id FROM evaluation_versions
+                UPDATE evaluation_versions
+                SET selling_point_score=64, evaluation_source='manual_review'
                 WHERE content_id=3 AND release_id='release-v8'
                   AND invalidated_at IS NULL
                 """
-            ).fetchone()
-            assert conflict_evaluation is not None
-            connection.execute(
-                """
-                INSERT INTO review_queue(
-                    content_id,evaluation_id,reason_code,priority,status,
-                    created_at,updated_at
-                ) VALUES (3,?,'manual_conclusion_conflict',90,'manual_required',?,?)
-                """,
-                (
-                    conflict_evaluation["id"],
-                    "2026-08-01T07:00:00Z",
-                    "2026-08-01T07:00:00Z",
-                ),
             )
             connection.commit()
 
@@ -331,7 +321,7 @@ class EvaluationSelectorsTest(unittest.TestCase):
                 connection, "release-v6", [2]
             )
 
-        self.assertEqual(eligible_v8, {})
+        self.assertEqual(set(eligible_v8), {3})
         self.assertEqual(set(eligible_v6), {2})
 
     def test_effective_direction_skips_unknown_and_sql_matches_python_order(

@@ -411,12 +411,12 @@ export default function SellingPointsPage() {
 
       {form && (
         <div className="modal-backdrop" role="presentation">
-          <section className="review-modal selling-point-rule-modal" role="dialog" aria-modal="true" aria-label="编辑卖点">
+          <section className="modal-panel selling-point-rule-modal" role="dialog" aria-modal="true" aria-label="编辑卖点">
             <div className="panel-head">
               <div><span className="eyebrow">卖点草稿</span><h3>{editingCode ? `编辑 ${editingCode}` : "新增卖点"}</h3></div>
               <button className="modal-close" onClick={() => setForm(null)} aria-label="关闭">×</button>
             </div>
-            <div className="review-fields">
+            <div className="modal-fields">
               <label>编码<input value={form.code} disabled={Boolean(editingCode)} onChange={(event) => setForm({ ...form, code: event.target.value.toUpperCase() })} /></label>
               <label>层级<select value={form.tier} onChange={(event) => setForm({ ...form, tier: event.target.value as PointForm["tier"] })}><option value="core">核心</option><option value="other">其他</option></select></label>
               <label className="span-two">名称<input value={form.label} onChange={(event) => setForm({ ...form, label: event.target.value })} /></label>

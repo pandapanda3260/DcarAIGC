@@ -239,14 +239,6 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
         )
         self.assertEqual(result["candidates"], 1)
         self.assertEqual(result["state_counts"]["pending"], 1)
-        with connect(self.db) as connection:
-            queue = connection.execute(
-                """
-                SELECT content_id FROM review_queue
-                WHERE reason_code='media_processing_incomplete'
-                """
-            ).fetchall()
-        self.assertEqual(queue, [])
 
     def test_discovery_backfill_tags_scopes_with_workers_and_compact(self) -> None:
         preexisting_unevaluated = self._insert_content(
@@ -291,6 +283,7 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
 
         result = run_discovery_backfill(
             start=self.start, end=self.end,
+            as_of=self.end,
             task_id="full-history-test", max_amount=1.0,
             db_path=self.db, platforms=["douyin"],
             call_override=discovery_call, state_root=self.state,
@@ -377,6 +370,7 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
         ) as terminal_states:
             result = run_local_evidence_backfill(
                 start=self.start, end=self.end, task_id="local-evidence-test",
+                as_of=self.end,
                 max_amount=1.0, db_path=self.db, limit=10, state_root=self.state,
                 tagged_only=True,
             )
@@ -397,6 +391,7 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
         ):
             again = run_local_evidence_backfill(
                 start=self.start, end=self.end, task_id="local-evidence-test",
+                as_of=self.end,
                 max_amount=1.0, db_path=self.db, limit=10, state_root=self.state,
                 tagged_only=True,
             )
@@ -440,6 +435,7 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
             result = run_local_evidence_backfill(
                 start=self.start,
                 end=self.end,
+                as_of=self.end,
                 task_id="local-evidence-v1",
                 max_amount=1.0,
                 db_path=self.db,
@@ -459,6 +455,7 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
         again = run_local_evidence_backfill(
             start=self.start,
             end=self.end,
+            as_of=self.end,
             task_id="local-evidence-v1",
             max_amount=1.0,
             db_path=self.db,
@@ -495,6 +492,7 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
             result = run_local_evidence_backfill(
                 start=self.start,
                 end=self.end,
+                as_of=self.end,
                 task_id="local-evidence-resume-terminal-insufficient",
                 max_amount=1.0,
                 db_path=self.db,
@@ -538,6 +536,7 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
             result = run_local_evidence_backfill(
                 start=self.start,
                 end=self.end,
+                as_of=self.end,
                 task_id="local-evidence-terminal-drift",
                 max_amount=1.0,
                 db_path=self.db,
@@ -567,6 +566,7 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
         result = run_local_evidence_backfill(
             start=self.start,
             end=self.end,
+            as_of=self.end,
             task_id="local-evidence-no-source",
             max_amount=1.0,
             db_path=self.db,
@@ -616,6 +616,7 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
             result = run_local_evidence_backfill(
                 start=self.start,
                 end=self.end,
+                as_of=self.end,
                 task_id="local-evidence-terminal-failed",
                 max_amount=1.0,
                 db_path=self.db,
@@ -676,6 +677,7 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
             result = run_local_evidence_backfill(
                 start=self.start,
                 end=self.end,
+                as_of=self.end,
                 task_id="local-evidence-release-switch",
                 max_amount=1.0,
                 db_path=self.db,
@@ -722,6 +724,7 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
         limited = run_discovery_backfill(
             start=self.start,
             end=self.end,
+            as_of=self.end,
             task_id="page-limit-test",
             max_amount=1.0,
             db_path=self.db,
@@ -745,6 +748,7 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
         missing = run_discovery_backfill(
             start=missing_start,
             end=missing_end,
+            as_of=missing_end,
             task_id="missing-cursor-test",
             max_amount=1.0,
             db_path=self.db,
@@ -768,6 +772,7 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
         repeated = run_discovery_backfill(
             start=datetime(2010, 1, 3, 0, 0, tzinfo=SHANGHAI),
             end=repeated_end,
+            as_of=repeated_end,
             task_id="repeated-cursor-test",
             max_amount=1.0,
             db_path=self.db,
@@ -813,6 +818,7 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
         result = run_discovery_backfill(
             start=self.start,
             end=self.end,
+            as_of=self.end,
             task_id="preserve-rich-content-test",
             max_amount=1.0,
             db_path=self.db,
@@ -866,6 +872,7 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
         result = run_discovery_backfill(
             start=datetime(2010, 1, 4, 0, 0, tzinfo=SHANGHAI),
             end=datetime(2026, 8, 4, 0, 0, tzinfo=SHANGHAI),
+            as_of=datetime(2026, 8, 4, 0, 0, tzinfo=SHANGHAI),
             task_id="missing-published-test",
             max_amount=1.0,
             db_path=self.db,
@@ -892,6 +899,7 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
             connection.commit()
         result = run_local_evidence_backfill(
             start=self.start, end=self.end, task_id="local-evidence-default",
+            as_of=self.end,
             max_amount=1.0, db_path=self.db, limit=10, state_root=self.state,
         )
         self.assertEqual(result["candidates"], 0)
@@ -922,6 +930,7 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
 
         result = run_content_backfill(
             start=self.start, end=self.end, task_id="content-workers-test",
+            as_of=self.end,
             max_amount=1.0, db_path=self.db, call_override=content_call,
             state_root=self.state, workers=2, compact=True,
         )
@@ -998,6 +1007,7 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
 
         result = run_content_backfill(
             start=self.start, end=self.end, task_id="history-only-test",
+            as_of=self.end,
             max_amount=1.0, db_path=self.db, call_override=content_call,
             state_root=self.state, stages=["metrics"], history_only=True,
         )

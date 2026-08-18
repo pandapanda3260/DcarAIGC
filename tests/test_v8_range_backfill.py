@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import contextlib
+import inspect
+import io
+import json
+import os
 import tempfile
 import unittest
 from datetime import datetime
@@ -8,9 +13,14 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 import v8.capture as capture_module
+import v8.range_backfill as range_module
 from v8.capture import CaptureError, ProviderResult
 from v8.operations import upsert_account, upsert_content
 from v8.range_backfill import (
+    RangeBackfillError,
+    _iso,
+    _parse_datetime,
+    main,
     pending_content_ids,
     repair_discovery_placeholder_metrics,
     run_content_backfill,
@@ -103,7 +113,7 @@ class V8RangeBackfillTest(unittest.TestCase):
         first = run_discovery_backfill(
             start=self.start, end=self.end, task_id=self.task_id,
             max_amount=0.10, db_path=self.db, platforms=["xiaohongshu"],
-            call_override=discovery_call, state_root=self.state,
+            call_override=discovery_call, state_root=self.state, as_of=self.end,
         )
         self.assertEqual(first["status"], "succeeded")
         self.assertEqual(first["pages_processed"], 2)
@@ -123,7 +133,7 @@ class V8RangeBackfillTest(unittest.TestCase):
         second = run_discovery_backfill(
             start=self.start, end=self.end, task_id=self.task_id,
             max_amount=0.10, db_path=self.db, platforms=["xiaohongshu"],
-            call_override=no_provider_call, state_root=self.state,
+            call_override=no_provider_call, state_root=self.state, as_of=self.end,
         )
         self.assertEqual(second["status"], "succeeded")
         self.assertEqual(second["inserted"], 0)
@@ -164,6 +174,7 @@ class V8RangeBackfillTest(unittest.TestCase):
             platforms=["xiaohongshu"],
             call_override=failed_call,
             state_root=self.state,
+            as_of=self.end,
         )
         self.assertEqual(result["status"], "partial")
         self.assertEqual(result["failed_pages"], 1)
@@ -224,7 +235,7 @@ class V8RangeBackfillTest(unittest.TestCase):
         first = run_content_backfill(
             start=self.start, end=self.end, task_id=self.task_id,
             max_amount=0.10, db_path=self.db, call_override=content_call,
-            state_root=self.state,
+            state_root=self.state, as_of=self.end,
         )
         self.assertEqual(first["status"], "succeeded")
         self.assertEqual(first["processed"], 2)
@@ -243,7 +254,7 @@ class V8RangeBackfillTest(unittest.TestCase):
         second = run_content_backfill(
             start=self.start, end=self.end, task_id=self.task_id,
             max_amount=0.10, db_path=self.db, call_override=content_call,
-            state_root=self.state,
+            state_root=self.state, as_of=self.end,
         )
         self.assertEqual(second["candidates"], 0)
         self.assertEqual(second["usage"]["amount"], 0.006)
@@ -488,6 +499,310 @@ class V8RangeBackfillTest(unittest.TestCase):
                 ("provider_capture", 4321, "available"),
             ],
         )
+
+    def test_iso_preserves_fractional_second_end_boundary(self) -> None:
+        fractional = datetime.fromisoformat("2026-08-17T23:59:59.999999+08:00")
+        exact = datetime.fromisoformat("2026-08-17T23:59:59+08:00")
+        self.assertEqual(_iso(fractional), "2026-08-17T15:59:59.999999Z")
+        self.assertEqual(_iso(exact), "2026-08-17T15:59:59Z")
+
+    def test_parse_datetime_rejects_timezone_less_values(self) -> None:
+        with self.assertRaisesRegex(RangeBackfillError, "必须包含时区"):
+            _parse_datetime("2026-08-17T23:59:59.999999")
+
+    def test_mutating_range_functions_require_explicit_as_of(self) -> None:
+        for function in (
+            range_module.run_discovery_backfill,
+            range_module.run_content_backfill,
+            range_module.run_local_evidence_backfill,
+        ):
+            signature = inspect.signature(function)
+            self.assertIs(
+                signature.parameters["as_of"].default,
+                inspect.Parameter.empty,
+                function.__name__,
+            )
+            with self.assertRaises(TypeError, msg=function.__name__):
+                signature.bind(
+                    start=self.start,
+                    end=self.end,
+                    task_id="explicit-as-of-contract",
+                    max_amount=0.10,
+                )
+
+    def test_cli_requires_explicit_start_and_as_of_before_dispatch(self) -> None:
+        with patch.object(range_module, "summarize_range_status") as summarize:
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as missing_start:
+                    main(
+                        [
+                            "status",
+                            "--end",
+                            self.end.isoformat(),
+                            "--as-of",
+                            self.end.isoformat(),
+                            "--db",
+                            str(self.db),
+                        ]
+                    )
+                with self.assertRaises(SystemExit) as missing_as_of:
+                    main(
+                        [
+                            "status",
+                            "--start",
+                            self.start.isoformat(),
+                            "--end",
+                            self.end.isoformat(),
+                            "--db",
+                            str(self.db),
+                        ]
+                    )
+        self.assertEqual(missing_start.exception.code, 2)
+        self.assertEqual(missing_as_of.exception.code, 2)
+        summarize.assert_not_called()
+
+    def test_campaign_contract_is_anchored_before_db_or_provider_work(self) -> None:
+        upsert_account(
+            {
+                "phone": "13800138012",
+                "platforms": [
+                    {
+                        "platform": "xiaohongshu",
+                        "uid": "67f6657f000000000e02c22c",
+                        "nickname": "合同测试号",
+                    }
+                ],
+            },
+            db_path=self.db,
+        )
+        task_id = "range-contract-test"
+        as_of = datetime.fromisoformat("2026-08-18T12:34:56.123456+08:00")
+        provider_calls = 0
+
+        def discovery_call(operation, identity):
+            nonlocal provider_calls
+            provider_calls += 1
+            return ProviderResult(
+                {"items": [], "next_cursor": None, "has_more": False},
+                {"items": []},
+                200,
+                True,
+            )
+
+        result = run_discovery_backfill(
+            start=self.start,
+            end=self.end,
+            as_of=as_of,
+            task_id=task_id,
+            max_amount=0.10,
+            max_pages_per_account=8,
+            db_path=self.db,
+            platforms=["xiaohongshu"],
+            call_override=discovery_call,
+            state_root=self.state,
+        )
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(provider_calls, 1)
+        state_path = self.state / f"{task_id}.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            state["contract"],
+            {
+                "task_id": task_id,
+                "start": _iso(self.start),
+                "end": _iso(self.end),
+                "as_of": _iso(as_of),
+                "max_amount": 0.10,
+                "max_pages": 8,
+                "platforms": ["xiaohongshu"],
+            },
+        )
+        self.assertEqual(state["phase_contracts"]["discover"]["phase"], "discover")
+
+        run_content_backfill(
+            start=self.start,
+            end=self.end,
+            as_of=as_of,
+            task_id=task_id,
+            max_amount=0.10,
+            contract_max_pages=8,
+            db_path=self.db,
+            platforms=["xiaohongshu"],
+            stages=["detail"],
+            call_override=lambda stage, content: (_ for _ in ()).throw(
+                AssertionError("empty discovery must not create content work")
+            ),
+            state_root=self.state,
+        )
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            set(state["phase_contracts"]), {"discover", "content"}
+        )
+
+        with connect(self.db) as connection:
+            before = tuple(
+                connection.execute(
+                    "SELECT COUNT(*),COALESCE(SUM(amount),0) FROM provider_usage"
+                ).fetchone()
+            )
+        mismatches = (
+            {"as_of": datetime.fromisoformat("2026-08-18T12:34:57+08:00")},
+            {"max_amount": 0.20},
+            {"max_pages_per_account": 9},
+            {"platforms": ["douyin"]},
+        )
+        for mismatch in mismatches:
+            arguments = {
+                "start": self.start,
+                "end": self.end,
+                "as_of": as_of,
+                "task_id": task_id,
+                "max_amount": 0.10,
+                "max_pages_per_account": 8,
+                "db_path": self.db,
+                "platforms": ["xiaohongshu"],
+                "call_override": discovery_call,
+                "state_root": self.state,
+            }
+            arguments.update(mismatch)
+            with (
+                patch.object(
+                    range_module,
+                    "_enabled_identities",
+                    side_effect=AssertionError("DB work happened before contract rejection"),
+                ),
+                self.assertRaisesRegex(RangeBackfillError, "完整合同"),
+            ):
+                run_discovery_backfill(**arguments)
+        self.assertEqual(provider_calls, 1)
+        with connect(self.db) as connection:
+            after = tuple(
+                connection.execute(
+                    "SELECT COUNT(*),COALESCE(SUM(amount),0) FROM provider_usage"
+                ).fetchone()
+            )
+        self.assertEqual(after, before)
+
+    def test_formal_mutation_requires_freeze_before_state_db_or_provider(self) -> None:
+        missing_freeze = self.root / "missing-freeze.lock"
+        provider_called = False
+
+        def unexpected_call(operation, identity):
+            nonlocal provider_called
+            provider_called = True
+            raise AssertionError("provider must not run without freeze")
+
+        state_root = self.root / "formal-state"
+        with (
+            patch.object(range_module, "DEFAULT_DB", self.db),
+            patch.dict(
+                os.environ,
+                {"DCAR_OPERATOR_FREEZE_LOCK": str(missing_freeze)},
+                clear=False,
+            ),
+            patch.object(
+                range_module,
+                "_enabled_identities",
+                side_effect=AssertionError("DB work must not run without freeze"),
+            ),
+            self.assertRaisesRegex(RangeBackfillError, "operator freeze lock"),
+        ):
+            run_discovery_backfill(
+                start=self.start,
+                end=self.end,
+                as_of=self.end,
+                task_id="formal-freeze-test",
+                max_amount=0.10,
+                db_path=self.db,
+                platforms=["xiaohongshu"],
+                call_override=unexpected_call,
+                state_root=state_root,
+            )
+        self.assertFalse(provider_called)
+        self.assertFalse(state_root.exists())
+        with connect(self.db) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM provider_usage").fetchone()[0],
+                0,
+            )
+
+    def test_formal_mutation_alias_cannot_bypass_freeze(self) -> None:
+        alias = self.root / "apfs-firmlink-spelling.sqlite3"
+        alias.hardlink_to(self.db)
+        missing_freeze = self.root / "missing-alias-freeze.lock"
+        with (
+            patch.object(range_module, "DEFAULT_DB", self.db),
+            patch.dict(
+                os.environ,
+                {"DCAR_OPERATOR_FREEZE_LOCK": str(missing_freeze)},
+                clear=False,
+            ),
+            self.assertRaisesRegex(RangeBackfillError, "operator freeze lock"),
+        ):
+            range_module._require_formal_mutation_freeze(db_path=alias)
+
+    def test_detail_only_backfill_does_not_create_metric_snapshots(self) -> None:
+        upsert_account(
+            {
+                "phone": "13800138013",
+                "platforms": [
+                    {"platform": "douyin", "uid": "99887773", "nickname": "详情号"}
+                ],
+            },
+            db_path=self.db,
+        )
+        upsert_content(
+            {
+                "platform": "douyin",
+                "platform_content_id": "555555555",
+                "canonical_url": "https://www.douyin.com/video/555555555",
+                "title": "待补详情",
+                "body": "汽车内容",
+                "published_at": "2026-08-02T01:00:00Z",
+                "content_type": "video",
+                "account_uid": "99887773",
+                "account_name": "详情号",
+            },
+            db_path=self.db,
+        )
+
+        def detail_call(stage, content):
+            self.assertEqual(stage, "detail")
+            return ProviderResult(
+                {
+                    "title": "实时详情",
+                    "body": "实时详情正文",
+                    "published_at": content["published_at"],
+                    "account_uid": "99887773",
+                    "account_name": "详情号",
+                    "content_type": "video",
+                    "media_urls": [],
+                },
+                {"stage": stage},
+                200,
+                True,
+            )
+
+        result = run_content_backfill(
+            start=self.start,
+            end=self.end,
+            as_of=datetime.fromisoformat("2026-08-18T15:00:00+08:00"),
+            task_id="detail-only-test",
+            max_amount=0.10,
+            db_path=self.db,
+            platforms=["douyin"],
+            stages=["detail"],
+            call_override=detail_call,
+            state_root=self.state,
+        )
+        self.assertEqual(result["status"], "succeeded")
+        with connect(self.db) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM content_metric_snapshots"
+                ).fetchone()[0],
+                0,
+            )
 
 
 if __name__ == "__main__":

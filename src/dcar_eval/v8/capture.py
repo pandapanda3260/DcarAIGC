@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import os
 import sqlite3
 from dataclasses import dataclass
@@ -179,16 +180,29 @@ def _validate_task_budget(
     budget_id: Optional[str],
     task_id: Optional[str],
     task_max_amount: Optional[float],
+    provider: str,
+    operation: str,
 ) -> None:
-    if task_id is not None and not task_id.strip():
+    if task_id is None and task_max_amount is None:
+        if budget_id is not None and budget_id.startswith("task-"):
+            raise BudgetBlocked("task budget requires task_id and task_max_amount")
+        return
+    if task_id is None or task_max_amount is None:
+        raise ValueError("task_id and task_max_amount must be provided together")
+    if not task_id.strip():
         raise ValueError("task_id must not be blank")
-    if task_max_amount is not None:
-        if task_id is None:
-            raise ValueError("task_max_amount requires task_id")
-        if task_max_amount <= 0:
-            raise ValueError("task_max_amount must be positive")
-    if task_id is not None and budget_id is None:
-        raise ValueError("task_id requires budget_id")
+    if not math.isfinite(float(task_max_amount)) or float(task_max_amount) <= 0:
+        raise ValueError("task_max_amount must be a finite positive number")
+    if budget_id is None:
+        raise ValueError("task budget requires budget_id")
+    task_digest = hashlib.sha256(task_id.encode("utf-8")).hexdigest()[:16]
+    expected_budget_id = (
+        f"task-{task_digest}-{provider.lower()}-{operation}-v1"
+    )
+    if budget_id != expected_budget_id:
+        raise BudgetBlocked(
+            "task budget id does not match task, provider, and operation"
+        )
 
 
 def load_succeeded_raw_response(
@@ -613,6 +627,13 @@ def _reserve_budget(
     task_id: Optional[str] = None,
     task_max_amount: Optional[float] = None,
 ) -> tuple[int, float, str]:
+    _validate_task_budget(
+        budget_id=budget_id,
+        task_id=task_id,
+        task_max_amount=task_max_amount,
+        provider=provider,
+        operation=operation,
+    )
     row = connection.execute(
         "SELECT * FROM provider_budget_batches WHERE id=?", (budget_id,)
     ).fetchone()
@@ -622,6 +643,11 @@ def _reserve_budget(
         raise BudgetBlocked(f"budget {budget_id} is {row['status']}")
     if row["provider"] != provider or row["operation"] != operation:
         raise BudgetBlocked("budget provider or operation mismatch")
+    if task_id is not None:
+        if task_max_amount is None:
+            raise ValueError("task_id and task_max_amount must be provided together")
+        if abs(float(row["max_amount"]) - float(task_max_amount)) > 1e-9:
+            raise BudgetBlocked("task budget max_amount does not match runtime ceiling")
     unit_price = float(row["verified_unit_price"])
     consumed_requests = int(row["consumed_requests"])
     consumed_amount = float(row["consumed_amount"])
@@ -803,8 +829,15 @@ def _execute_claimed_fetch(
     usage_id: Optional[int] = None
     unit_price = 0.0
     currency = ""
-    if budget_id is not None:
-        try:
+    try:
+        _validate_task_budget(
+            budget_id=budget_id,
+            task_id=task_id,
+            task_max_amount=task_max_amount,
+            provider=provider,
+            operation=operation,
+        )
+        if budget_id is not None:
             with connect(db_path) as connection, transaction(connection):
                 usage_id, unit_price, currency = _reserve_budget(
                     connection,
@@ -814,26 +847,26 @@ def _execute_claimed_fetch(
                     task_id=task_id,
                     task_max_amount=task_max_amount,
                 )
-        except Exception as exc:
-            with connect(db_path) as connection, transaction(connection):
-                finished_at = now_utc()
-                connection.execute(
-                    """
-                    UPDATE fetch_attempts
-                    SET response_finished_at=?, error_code='budget_blocked', error_message=?
-                    WHERE id=?
-                    """,
-                    (finished_at, str(exc)[:500], claim.attempt_id),
-                )
-                connection.execute(
-                    """
-                    UPDATE fetch_slots
-                    SET status='retryable_failed', last_error_code='budget_blocked',
-                        last_error_message=?, finished_at=?, updated_at=? WHERE id=?
-                    """,
-                    (str(exc)[:500], finished_at, finished_at, claim.slot_id),
-                )
-            raise
+    except Exception as exc:
+        with connect(db_path) as connection, transaction(connection):
+            finished_at = now_utc()
+            connection.execute(
+                """
+                UPDATE fetch_attempts
+                SET response_finished_at=?, error_code='budget_blocked', error_message=?
+                WHERE id=?
+                """,
+                (finished_at, str(exc)[:500], claim.attempt_id),
+            )
+            connection.execute(
+                """
+                UPDATE fetch_slots
+                SET status='retryable_failed', last_error_code='budget_blocked',
+                    last_error_message=?, finished_at=?, updated_at=? WHERE id=?
+                """,
+                (str(exc)[:500], finished_at, finished_at, claim.slot_id),
+            )
+        raise
 
     try:
         result = call()
@@ -981,6 +1014,8 @@ def execute_content_fetch(
         budget_id=budget_id,
         task_id=task_id,
         task_max_amount=task_max_amount,
+        provider=provider,
+        operation=operation,
     )
     claim = claim_content_slot(
         db_path=db_path,
@@ -1023,6 +1058,8 @@ def execute_account_fetch(
         budget_id=budget_id,
         task_id=task_id,
         task_max_amount=task_max_amount,
+        provider=provider,
+        operation=operation,
     )
     claim = claim_account_slot(
         db_path=db_path,

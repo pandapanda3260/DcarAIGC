@@ -81,14 +81,13 @@ class V10SchemaMigrationTest(unittest.TestCase):
             versions = connection.execute(
                 "SELECT version, name FROM schema_migrations ORDER BY version"
             ).fetchall()
+            # 清单跟随 storage 的迁移表，避免每加一版就手改一次写死列表
             self.assertEqual(
                 [(int(row[0]), str(row[1])) for row in versions],
                 [
                     (9, "release-bound-evaluation-schema"),
                     (10, "audience-interaction-user-domain"),
-                    (11, "interaction-user-v1-fallback-keys"),
-                    (12, "append-only-metric-observations"),
-                    (13, "scheduler-run-attempt-history"),
+                    *sorted(storage.SCHEMA_MIGRATION_NAMES.items()),
                 ],
             )
             self.assertEqual(
@@ -105,7 +104,7 @@ class V10SchemaMigrationTest(unittest.TestCase):
                         "SELECT COUNT(*) FROM schema_migrations"
                     ).fetchone()[0]
                 ),
-                5,
+                len(storage.SCHEMA_MIGRATION_NAMES) + 2,
             )
 
     def test_migrating_v9_database_preserves_rows_and_backfills_versions(self) -> None:

@@ -2,9 +2,7 @@
 
 The selectors are intentionally separate from evaluation writers.  Product
 surfaces prefer the active release and may fall back to an older valid result
-with an explicit stale marker.  Formal consumers never fall back.  Review CAS
-anchors remain the latest valid evaluation across releases so a hidden newer
-evaluation cannot be reviewed through an older cursor.
+with an explicit stale marker.  Formal consumers never fall back.
 """
 
 from __future__ import annotations
@@ -218,10 +216,12 @@ def formal_eligible_release_evaluations(
 ) -> dict[int, dict[str, Any]]:
     """Return report-safe evaluations for one pinned release.
 
-    Every rule excludes weak V0/V1 evidence and rows still marked pending.
-    Historical rules also exclude unresolved human conflicts.  Evaluation-v9
-    has no authoritative human-review queue, so its V2/V3 rows remain formal
-    regardless of legacy queue state.
+    Every rule excludes weak V0/V1 evidence.  Evaluation-v9 V2/V3 rows are
+    always formal.  For historical (pre-v9) releases the retired
+    ``pending_review`` gray-zone marker is derived from stored fields instead:
+    an automatic 60-74 weak match never entered formal metrics, while human
+    (``manual_review``) conclusions were final regardless of score.  Schema
+    v16 removed the manual-review domain, so no queue state is consulted.
     """
 
     release = connection.execute(
@@ -237,34 +237,18 @@ def formal_eligible_release_evaluations(
     base_eligible = {
         content_id: value
         for content_id, value in evaluations.items()
-        if int(value["pending_review"]) == 0
-        and value["evidence_level"] in {"V2", "V3"}
+        if value["evidence_level"] in {"V2", "V3"}
     }
     if str(release["rule_version"]) == "evaluation-v9":
         return base_eligible
-    ids = sorted(base_eligible)
-    if not ids:
-        return {}
-    placeholders = ",".join("?" for _ in ids)
-    unresolved_conflicts = {
-        int(row["content_id"])
-        for row in connection.execute(
-            f"""
-            SELECT DISTINCT q.content_id
-            FROM review_queue q
-            JOIN evaluation_versions ev ON ev.id=q.evaluation_id
-            WHERE q.content_id IN ({placeholders})
-              AND q.reason_code='manual_conclusion_conflict'
-              AND q.status IN ('pending','manual_required','in_review')
-              AND ev.release_id=? AND ev.invalidated_at IS NULL
-            """,
-            [*ids, release_id],
-        ).fetchall()
-    }
     return {
         content_id: value
         for content_id, value in base_eligible.items()
-        if content_id not in unresolved_conflicts
+        if not (
+            str(value["evaluation_source"]) != "manual_review"
+            and value["selling_point_score"] is not None
+            and 60 <= int(value["selling_point_score"]) < 75
+        )
     }
 
 
@@ -293,21 +277,6 @@ def display_effective_evaluation(
     connection: sqlite3.Connection, content_id: int
 ) -> dict[str, Any] | None:
     return display_effective_evaluations(connection, [content_id]).get(content_id)
-
-
-def review_anchor_evaluation(
-    connection: sqlite3.Connection, content_id: int
-) -> sqlite3.Row | None:
-    """Return the latest valid evaluation used only for review concurrency CAS."""
-
-    return connection.execute(
-        """
-        SELECT * FROM evaluation_versions
-        WHERE content_id=? AND invalidated_at IS NULL
-        ORDER BY evaluated_at DESC, id DESC LIMIT 1
-        """,
-        (content_id,),
-    ).fetchone()
 
 
 def audit_evaluations(

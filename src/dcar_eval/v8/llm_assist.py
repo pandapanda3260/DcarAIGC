@@ -383,8 +383,11 @@ def _quote_ok(
 
 
 def _confidence(entry: Dict[str, Any]) -> float:
+    raw_confidence = entry.get("confidence")
+    if raw_confidence is None:
+        return 0.0
     try:
-        value = float(entry.get("confidence"))
+        value = float(raw_confidence)
     except (TypeError, ValueError):
         return 0.0
     return value if 0.0 <= value <= 1.0 else 0.0

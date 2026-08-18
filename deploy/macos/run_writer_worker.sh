@@ -20,6 +20,16 @@ project_root="$(cd "$project_root" && pwd -P)"
 [[ -z "${TIKHUB_API_KEY:-}" ]] || \
   fail "direct TIKHUB_API_KEY values are forbidden; use an external key file"
 
+reconcile_from="${DCAR_DAILY_CAPTURE_RECONCILE_FROM:-}"
+unset DCAR_DAILY_CAPTURE_RECONCILE_FROM
+[[ "$reconcile_from" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || \
+  fail "DCAR_DAILY_CAPTURE_RECONCILE_FROM must be exactly YYYY-MM-DD"
+normalized_reconcile_from="$(
+  /bin/date -j -f '%Y-%m-%d' "$reconcile_from" '+%Y-%m-%d' 2>/dev/null
+)" || fail "DCAR_DAILY_CAPTURE_RECONCILE_FROM is not a valid calendar date"
+[[ "$normalized_reconcile_from" == "$reconcile_from" ]] || \
+  fail "DCAR_DAILY_CAPTURE_RECONCILE_FROM is not canonical"
+
 writer_env="${DCAR_WRITER_ENV_FILE:-}"
 [[ -n "$writer_env" ]] || fail "DCAR_WRITER_ENV_FILE is missing"
 [[ "$writer_env" = /* ]] || fail "DCAR_WRITER_ENV_FILE must be absolute"
@@ -92,6 +102,7 @@ export TIKHUB_API_KEY_FILE="$key_file_path"
 export DCAR_READ_ONLY=0
 export DCAR_SCHEDULER_ENABLED=1
 export DCAR_STARTUP_CATCHUP_ENABLED=1
+export DCAR_DAILY_CAPTURE_RECONCILE_FROM="$reconcile_from"
 
 echo "Dcar writer worker starting on 127.0.0.1:8766; scheduler=1 catchup=report_only"
 exec /usr/bin/caffeinate -s \

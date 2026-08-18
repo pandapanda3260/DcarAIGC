@@ -45,13 +45,15 @@
     <key>DCAR_OPERATOR_FREEZE_LOCK</key>
     <string>__PROJECT_ROOT_XML__/runtime/operator-freeze.lock</string>
     <key>DCAR_WRITER_LOCK</key>
-    <string>__PROJECT_ROOT_XML__/runtime/writer-worker.lock</string>
+    <string>__HOME_XML__/Library/Application Support/DcarAIGC/runtime/writer-worker.lock</string>
     <key>DCAR_READ_ONLY</key>
     <string>0</string>
     <key>DCAR_SCHEDULER_ENABLED</key>
     <string>1</string>
     <key>DCAR_STARTUP_CATCHUP_ENABLED</key>
     <string>1</string>
+    <key>DCAR_DAILY_CAPTURE_RECONCILE_FROM</key>
+    <string>__RECONCILE_FROM_XML__</string>
     <key>DCAR_WORKER_HOST</key>
     <string>127.0.0.1</string>
     <key>DCAR_WORKER_PORT</key>

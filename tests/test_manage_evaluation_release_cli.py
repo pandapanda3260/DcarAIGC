@@ -310,7 +310,7 @@ class ManageEvaluationReleaseCliTest(unittest.TestCase):
         self.assertFalse(missing.exists())
         status.assert_not_called()
 
-    def test_status_runs_against_an_explicit_existing_v9_database(self) -> None:
+    def test_status_rejects_retired_lifecycle_on_explicit_v16_database(self) -> None:
         database = self.root / "status.sqlite3"
         with storage.connect(database) as connection:
             storage.initialize_database(connection)
@@ -324,11 +324,14 @@ class ManageEvaluationReleaseCliTest(unittest.TestCase):
                 str(self.manifest),
             ]
         )
-        self.assertEqual((code, stderr), (0, ""))
-        result = json.loads(stdout)["result"]
-        self.assertIsNone(result["release"])
-        self.assertEqual(result["active_releases"], [])
-        self.assertEqual(result["published_taxonomies"], [])
+        self.assertEqual((code, stdout), (1, ""))
+        error = json.loads(stderr)
+        self.assertFalse(error["ok"])
+        self.assertEqual(error["command"], "status")
+        self.assertEqual(error["error_type"], "ReleaseManagementError")
+        self.assertEqual(
+            error["error"], cli.management.RELEASE_LIFECYCLE_RETIRED_MESSAGE
+        )
 
     def test_script_has_no_database_default_initialization_or_provider_import(
         self,

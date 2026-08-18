@@ -33,7 +33,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
-from .storage import DEFAULT_DB, PROJECT_ROOT, SCHEMA_VERSION, connect, now_utc
+from .storage import (
+    DEFAULT_DB,
+    PROJECT_ROOT,
+    SCHEMA_VERSION,
+    connect,
+    is_formal_database_path,
+    now_utc,
+)
 
 
 INPUT_SCHEMA_VERSION = "dcar-dongchedi-spu-trims-normalized-v1"
@@ -682,7 +689,7 @@ def load_frozen_catalog(
 def _deny_formal_database_in_tests(db_path: Path) -> None:
     if (
         os.environ.get("DCAR_TEST_DENY_FORMAL_DB") == "1"
-        and db_path.resolve() == DEFAULT_DB.resolve()
+        and is_formal_database_path(db_path, formal_database=DEFAULT_DB)
     ):
         raise SpuCatalogImportError(
             "test process attempted to open the formal DCar database"
@@ -1400,7 +1407,9 @@ def execute_import(
             "dry-run plan hash does not match current database/input state: "
             f"expected {expected}, current {initial_plan.plan_sha256}"
         )
-    if skip_backup and resolved_db == DEFAULT_DB.resolve():
+    if skip_backup and is_formal_database_path(
+        resolved_db, formal_database=DEFAULT_DB
+    ):
         raise SpuCatalogImportError(
             "--skip-backup is forbidden for the formal DEFAULT_DB"
         )

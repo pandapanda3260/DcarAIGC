@@ -10618,7 +10618,19 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+FULL_LOCAL_ANALYSIS_RETIRED_MESSAGE = (
+    "run_full_local_analysis_batches is retired: the 2026-08 full-history "
+    "local-analysis campaign is closed, and schema v16 removed the manual "
+    "review domain (review_queue / pending_review) its frozen audit chain "
+    "validates against"
+)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    raise SystemExit(FULL_LOCAL_ANALYSIS_RETIRED_MESSAGE)
+
+
+def _retired_main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     kwargs = {
         "source_db_path": arguments.source_db,

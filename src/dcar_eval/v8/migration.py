@@ -687,9 +687,9 @@ def migrate(
                         evaluation_source, evaluation_status, evidence_level,
                         primary_selling_point_code, selling_point_score, selling_point_included,
                         content_direction, content_automotive_score, audience_automotive_score,
-                        acquisition_potential_score, pending_review, payload_json, evaluated_at
+                        acquisition_potential_score, payload_json, evaluated_at
                     ) VALUES (?, ?, ?, 'evaluation-v6', 'selling-points-v5.0', ?, ?,
-                              'migrated_from_v5', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                              'migrated_from_v5', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         new_id,
@@ -706,7 +706,6 @@ def migrate(
                         row["content_automotive_score"],
                         row["audience_automotive_score"],
                         row["acquisition_potential"],
-                        int(row["pending_review"]),
                         canonical_json(payload),
                         normalize_timestamp(row["evaluated_at"]) or captured_at,
                     ),
@@ -751,51 +750,6 @@ def migrate(
                             ),
                         )
 
-                evidence_level = str(row["evidence_level"])
-                pending = int(row["pending_review"])
-                if pending:
-                    if evidence_level == "V0":
-                        queue_status, reason = (
-                            "terminal_failed",
-                            "legacy_content_unavailable",
-                        )
-                    elif evidence_level == "V1":
-                        local_video = (
-                            PROJECT_ROOT
-                            / "data"
-                            / "cache"
-                            / "rnote"
-                            / "media"
-                            / str(row["platform_content_id"])
-                            / "video.mp4"
-                        )
-                        reason = (
-                            "stale_local_evidence"
-                            if local_video.exists()
-                            and local_video.stat().st_size > 1024
-                            else "media_evidence_missing"
-                        )
-                        queue_status = "pending"
-                    else:
-                        queue_status, reason = "pending", "evaluation_gray_zone"
-                    destination.execute(
-                        """
-                        INSERT INTO review_queue(
-                            content_id, evaluation_id, reason_code, status,
-                            created_at, updated_at, resolved_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            new_id,
-                            evaluation_id,
-                            reason,
-                            queue_status,
-                            captured_at,
-                            captured_at,
-                            captured_at if queue_status == "terminal_failed" else None,
-                        ),
-                    )
-
             score_rows = source.execute(
                 "SELECT * FROM comment_user_scores ORDER BY content_item_id, anonymous_user_key"
             ).fetchall()
@@ -824,41 +778,7 @@ def migrate(
                     ),
                 )
 
-            review_rows = source.execute(
-                "SELECT * FROM manual_reviews ORDER BY id"
-            ).fetchall()
-            for review in review_rows:
-                new_id = old_to_new[int(review["content_item_id"])]
-                review_cursor = destination.execute(
-                    """
-                    INSERT INTO evaluation_reviews(
-                        content_id, previous_evaluation_id, decision, reason, reviewer, created_at
-                    ) VALUES (?, ?, 'migrated_patch', ?, ?, ?)
-                    """,
-                    (
-                        new_id,
-                        evaluation_by_old_id[int(review["content_item_id"])],
-                        review["reason"],
-                        review["reviewer"],
-                        normalize_timestamp(review["created_at"]) or captured_at,
-                    ),
-                )
-                patch_json = str(review["patch_json"])
-                destination.execute(
-                    """
-                    INSERT INTO manual_evidence(
-                        review_id, content_id, evidence_type, text_value, sha256, created_at
-                    ) VALUES (?, ?, 'legacy_review_patch', ?, ?, ?)
-                    """,
-                    (
-                        lastrowid(review_cursor),
-                        new_id,
-                        patch_json,
-                        sha256_bytes(patch_json.encode("utf-8")),
-                        normalize_timestamp(review["created_at"]) or captured_at,
-                    ),
-                )
-
+            # v16 起系统无人工复核域：旧库 manual_reviews 补丁记录不再导入。
             destination.execute(
                 """
                 INSERT INTO pending_platform_identities(
@@ -899,12 +819,6 @@ def migrate(
                 ),
                 "comment_user_scores": len(score_rows),
                 "comment_weeks": dict(sorted(weeks.items())),
-                "review_queue": int(
-                    destination.execute("SELECT COUNT(*) FROM review_queue").fetchone()[
-                        0
-                    ]
-                ),
-                "manual_review_history": len(review_rows),
                 "pending_platform_identities": int(
                     destination.execute(
                         "SELECT COUNT(*) FROM pending_platform_identities"

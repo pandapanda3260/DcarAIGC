@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from PIL import Image, ImageDraw
 
+import v8.duplicates as duplicates_module
 from v8.contracts import load_contract
 from v8.duplicates import (
     CALIBRATION_PATH,
@@ -40,6 +41,22 @@ class V8DuplicateDetectionTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def test_formal_database_alias_uses_canonical_fingerprint_root(self) -> None:
+        alias = self.root / "apfs-firmlink-spelling.sqlite3"
+        alias.hardlink_to(self.db)
+        with (
+            patch.object(duplicates_module, "DEFAULT_DB", self.db),
+            patch.object(
+                duplicates_module,
+                "FINGERPRINT_ROOT",
+                self.root / "canonical-fingerprints",
+            ),
+        ):
+            self.assertEqual(
+                duplicates_module._fingerprint_root_for_database(alias),
+                self.root / "canonical-fingerprints",
+            )
 
     def test_duplicate_metric_decision_table(self) -> None:
         threshold = float(

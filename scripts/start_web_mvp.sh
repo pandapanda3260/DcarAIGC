@@ -5,10 +5,25 @@ project_root="$(cd "$(dirname "$0")/.." && pwd)"
 freeze_lock="${DCAR_OPERATOR_FREEZE_LOCK:-${DCAR_FREEZE_LOCK:-$project_root/runtime/operator-freeze.lock}}"
 scheduler_enabled="${DCAR_SCHEDULER_ENABLED:-0}"
 startup_catchup_enabled="${DCAR_STARTUP_CATCHUP_ENABLED:-0}"
+daily_capture_reconcile_from="${DCAR_DAILY_CAPTURE_RECONCILE_FROM:-}"
 auth_root="${DCAR_AUTH_RUNTIME_ROOT:-$project_root/runtime/auth}"
 htpasswd_file="${DCAR_AUTH_HTPASSWD:-$auth_root/users.htpasswd}"
 session_db="${DCAR_AUTH_SESSION_DB:-$auth_root/sessions.sqlite3}"
 reuse_api="${DCAR_REUSE_EXISTING_READ_ONLY_API:-0}"
+
+if [[ "$scheduler_enabled" != "0" ]]; then
+  echo "DCar Insight 8765 启动失败：DCAR_SCHEDULER_ENABLED 必须为 0；调度仅允许在 8766 writer 运行" >&2
+  exit 78
+fi
+if [[ "$startup_catchup_enabled" != "0" ]]; then
+  echo "DCar Insight 8765 启动失败：DCAR_STARTUP_CATCHUP_ENABLED 必须为 0" >&2
+  exit 78
+fi
+if [[ -n "$daily_capture_reconcile_from" ]]; then
+  echo "DCar Insight 8765 启动失败：DCAR_DAILY_CAPTURE_RECONCILE_FROM 仅允许由 8766 writer 使用" >&2
+  exit 78
+fi
+unset DCAR_DAILY_CAPTURE_RECONCILE_FROM
 
 if [[ -e "$freeze_lock" ]]; then
   if [[ "$reuse_api" != "1" ]]; then
@@ -57,8 +72,8 @@ if health.get("mode") != "read_only_replica" or health.get("read_only") is not T
 PY
   echo "复用现有只读 API：127.0.0.1:8765"
 else
-  DCAR_SCHEDULER_ENABLED="$scheduler_enabled" \
-  DCAR_STARTUP_CATCHUP_ENABLED="$startup_catchup_enabled" \
+  DCAR_SCHEDULER_ENABLED=0 \
+  DCAR_STARTUP_CATCHUP_ENABLED=0 \
   python3 -m uv run --frozen uvicorn v8.api:app \
     --app-dir "$project_root/src/dcar_eval" \
     --host 127.0.0.1 \

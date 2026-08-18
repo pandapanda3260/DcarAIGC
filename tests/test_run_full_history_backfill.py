@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from contextlib import ExitStack, redirect_stdout
@@ -16,6 +17,20 @@ from v8.storage import connect, initialize_database
 
 
 class FullHistoryWrapperTest(unittest.TestCase):
+    def test_readonly_guard_rejects_existing_formal_alias_by_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            formal = root / "formal.sqlite3"
+            alias = root / "apfs-firmlink-spelling.sqlite3"
+            formal.write_bytes(b"formal-sentinel")
+            alias.hardlink_to(formal)
+            with (
+                patch.object(runner, "FORMAL_DB", formal),
+                patch.dict(os.environ, {"DCAR_TEST_DENY_FORMAL_DB": "1"}),
+                self.assertRaisesRegex(RuntimeError, "formal DCar database"),
+            ):
+                runner.open_readonly_database(alias)
+
     @staticmethod
     def _discovery_result(status: str, reason: str | None) -> dict:
         return {
@@ -357,6 +372,13 @@ class FullHistoryWrapperTest(unittest.TestCase):
         self.assertTrue(paid)
         self.assertTrue(all("--history-only" in command for command in paid))
         self.assertTrue(all("--as-of" in command for command in paid))
+        local_evidence = [
+            command
+            for command in commands
+            if "range_backfill local-evidence" in command
+        ]
+        self.assertEqual(len(local_evidence), 1)
+        self.assertIn("--as-of <实际数据采集截面>", local_evidence[0])
 
     def test_execute_orders_evidence_before_classifier_and_always_releases_lock(self) -> None:
         events: list[str] = []

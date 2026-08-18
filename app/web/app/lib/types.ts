@@ -87,7 +87,7 @@ export type DataFreshness = {
   last_successful_capture_at: string | null;
   latest_capture_run: {
     scheduled_for: string;
-    status: "running" | "succeeded" | "failed" | "skipped";
+    status: "running" | "succeeded" | "failed" | "partial" | "interrupted" | "skipped";
     completed_at: string | null;
   } | null;
 };
@@ -101,8 +101,6 @@ export type Overview = {
   data_freshness: DataFreshness;
   data_quality: {
     missing_published_at: number;
-    pending_reviews: number;
-    terminal_reviews: number;
     duplicate_fingerprint_coverage: number;
     duplicate_calibration_ready: boolean;
     confirmed_duplicate_count: number;
@@ -176,7 +174,6 @@ export type ReportView = {
   account_type_dimensions: Array<Record<string, string | number | null>>;
   content_direction_dimensions: Array<Record<string, string | number | null>>;
   content_details: Array<Record<string, string | number | boolean | null>>;
-  review_summary: Array<Record<string, string | number>>;
   capture_summary: Array<Record<string, string | number>>;
   provider_costs: Array<Record<string, string | number>>;
 };
@@ -248,10 +245,6 @@ export type ContentItem = {
   evaluation_release_id: string | null;
   evaluation_freshness: "current" | "stale" | "missing";
   evaluation_is_stale: boolean;
-  review_queue_id: number | null;
-  review_status: string | null;
-  pending_review_count: number;
-  terminal_review_count: number;
   view_count: number | null;
   comment_count: number | null;
   metrics_captured_at: string | null;
@@ -265,7 +258,6 @@ export type ContentItem = {
 
 export type EvidenceBundle = {
   content: Pick<ContentItem, "id" | "link_id" | "platform" | "canonical_url" | "title" | "body" | "content_type" | "published_at" | "raw_account_uid" | "raw_account_name">;
-  base_evaluation_id: number | null;
   display_evaluation_id: number | null;
   evaluation_freshness: "current" | "stale" | "missing";
   evaluation_is_stale: boolean;
@@ -290,7 +282,6 @@ export type EvidenceBundle = {
     error_message: string | null;
     updated_at: string;
   }>;
-  review: { id: number; reason_code: string; status: string } | null;
 };
 
 export type SellingPointChannelWindowHits = {

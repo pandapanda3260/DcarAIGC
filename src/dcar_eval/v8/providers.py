@@ -2310,7 +2310,7 @@ def discover_account_content(
     except SlotUnavailable as unavailable:
         if unavailable.error_code == IdentityConflictError.error_code:
             raise IdentityConflictError(
-                "identity_conflict: 内容身份冲突，等待重复内容人工复核",
+                "identity_conflict: 内容身份冲突，已记录重复内容关系待处理",
                 provider_cost=round(costs, 6),
             ) from unavailable
         stored_raw = load_succeeded_raw_response(

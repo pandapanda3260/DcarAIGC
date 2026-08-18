@@ -7,26 +7,19 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from fastapi.testclient import TestClient
-
-import v8.api as api_module
 from v8.evaluation import (
     EvaluationError,
     V8_RULE_VERSION,
     V9_RULE_VERSION,
     _current_evidence_state,
     _load_release_runtime,
-    apply_gray_review_queue_sync,
     evaluate_content,
     evaluate_release_content,
     incremental_candidates,
-    plan_gray_review_queue_sync,
-    reopen_review,
-    resolve_review,
 )
 from v8.evaluation_selectors import formal_eligible_release_evaluations
 from v8.matcher_dsl import MaterializedMatcher, POINT_IDS, POINT_SCENES
-from v8.storage import PROJECT_ROOT, connect, initialize_database, now_utc
+from v8.storage import PROJECT_ROOT, connect, initialize_database
 from v8.taxonomy_rule_backfill import backfill_v5_1_matcher_rules
 from v8.taxonomy_v5_2_builder import build_v5_2_taxonomy_draft
 
@@ -244,33 +237,6 @@ class V9EvaluationTest(unittest.TestCase):
             )
             connection.commit()
 
-    def _insert_manual_evidence(self, content_id: int, text: str) -> None:
-        with connect(self.db) as connection:
-            review = connection.execute(
-                """
-                INSERT INTO evaluation_reviews(
-                    content_id,decision,reason,reviewer,created_at
-                ) VALUES (?,'confirm','legacy synthetic evidence','legacy-reviewer',?)
-                """,
-                (content_id, now_utc()),
-            )
-            assert review.lastrowid is not None
-            connection.execute(
-                """
-                INSERT INTO manual_evidence(
-                    review_id,content_id,evidence_type,text_value,sha256,created_at
-                ) VALUES (?,?,'visual_summary',?,?,?)
-                """,
-                (
-                    int(review.lastrowid),
-                    content_id,
-                    text,
-                    hashlib.sha256(text.encode("utf-8")).hexdigest(),
-                    now_utc(),
-                ),
-            )
-            connection.commit()
-
     @staticmethod
     def _gray_match() -> list[dict[str, object]]:
         return [
@@ -311,7 +277,7 @@ class V9EvaluationTest(unittest.TestCase):
             with self.assertRaisesRegex(EvaluationError, "requires a draft taxonomy"):
                 _load_release_runtime(connection, v8_backfill)
 
-    def test_v9_gray_is_formal_but_never_pending_or_queue_driven(self) -> None:
+    def test_v9_gray_stays_formal_without_any_queue_concept(self) -> None:
         with patch.object(
             MaterializedMatcher, "match_points", return_value=self._gray_match()
         ):
@@ -319,27 +285,7 @@ class V9EvaluationTest(unittest.TestCase):
                 1, release_id=V9_RELEASE_ID, db_path=self.db
             )
         self._activate_v9()
-        with connect(self.db) as connection:
-            for reason_code in (
-                "evaluation_gray_zone",
-                "manual_conclusion_conflict",
-            ):
-                connection.execute(
-                    """
-                    INSERT INTO review_queue(
-                        content_id,evaluation_id,reason_code,status,created_at,updated_at,
-                        resolved_at
-                    ) VALUES (1,?,?, 'resolved',?,?,?)
-                    """,
-                    (
-                        backfilled.evaluation_id,
-                        reason_code,
-                        now_utc(),
-                        now_utc(),
-                        now_utc(),
-                    ),
-                )
-            connection.commit()
+        self.assertIsNotNone(backfilled.evaluation_id)
 
         reused = evaluate_content(1, db_path=self.db)
         self.assertFalse(reused.created)
@@ -354,52 +300,23 @@ class V9EvaluationTest(unittest.TestCase):
         with connect(self.db) as connection:
             rows = connection.execute(
                 """
-                SELECT content_id,pending_review,selling_point_included,evidence_level
+                SELECT content_id,selling_point_included,evidence_level
                 FROM evaluation_versions WHERE release_id=? ORDER BY content_id
                 """,
                 (V9_RELEASE_ID,),
             ).fetchall()
-            queue_rows = connection.execute(
-                """
-                SELECT content_id,reason_code,status FROM review_queue ORDER BY id
-                """
-            ).fetchall()
-            connection.execute(
-                """
-                INSERT INTO review_queue(
-                    content_id,evaluation_id,reason_code,status,created_at,updated_at
-                ) VALUES (2,?,'manual_conclusion_conflict','manual_required',?,?)
-                """,
-                (created.evaluation_id, now_utc(), now_utc()),
-            )
-            connection.commit()
             formal = formal_eligible_release_evaluations(
                 connection, V9_RELEASE_ID, [1, 2]
             )
 
         self.assertEqual(
             [tuple(row) for row in rows],
-            [(1, 0, 0, "V3"), (2, 0, 0, "V3")],
+            [(1, 0, "V3"), (2, 0, "V3")],
         )
-        self.assertEqual(
-            [(row["reason_code"], row["status"]) for row in queue_rows],
-            [
-                ("evaluation_gray_zone", "resolved"),
-                ("manual_conclusion_conflict", "resolved"),
-            ],
-        )
+        # v9 灰区照常正式：60-74 排除规则只适用于 v9 之前的历史 release
         self.assertEqual(set(formal), {1, 2})
-        plan = plan_gray_review_queue_sync(db_path=self.db)
-        self.assertEqual(plan["target_count"], 0)
-        applied = apply_gray_review_queue_sync(
-            expected_plan_sha256=str(plan["plan_sha256"]), db_path=self.db
-        )
-        self.assertEqual(applied["sqlite_changes"], 0)
 
-    def test_v9_insufficient_and_manual_evidence_are_automatic_terminal_states(self) -> None:
-        self._insert_manual_evidence(
-            5, "人工画面声称连续展示车辆维修过程但不得进入v9自动证据"
-        )
+    def test_v9_insufficient_evidence_is_an_automatic_terminal_state(self) -> None:
         self._activate_v9()
         with connect(self.db) as connection:
             v8_state = _current_evidence_state(
@@ -408,13 +325,12 @@ class V9EvaluationTest(unittest.TestCase):
             v9_state = _current_evidence_state(
                 connection, 5, rule_version=V9_RULE_VERSION
             )
-        self.assertIsNotNone(v8_state[1]["manual_evidence_sha256"])
+        # v16 起人工证据域已删除：两个规则版本的该分量都恒为 None
+        self.assertIsNone(v8_state[1]["manual_evidence_sha256"])
         self.assertIsNone(v9_state[1]["manual_evidence_sha256"])
-        self.assertEqual(v9_state[0]["manual_rows"], [])
 
         results = [evaluate_content(content_id, db_path=self.db) for content_id in (3, 4, 5)]
         self.assertEqual([result.evidence_level for result in results], ["V1", "V0", "V1"])
-        self._insert_manual_evidence(5, "第二条合成人工证据也不得改变v9自动评估")
         reused = evaluate_content(5, db_path=self.db)
         self.assertFalse(reused.created)
         self.assertEqual(reused.evaluation_id, results[-1].evaluation_id)
@@ -422,7 +338,7 @@ class V9EvaluationTest(unittest.TestCase):
         with connect(self.db) as connection:
             rows = connection.execute(
                 """
-                SELECT content_id,evaluation_status,pending_review,selling_point_included
+                SELECT content_id,evaluation_status,selling_point_included
                 FROM evaluation_versions WHERE release_id=? ORDER BY content_id
                 """,
                 (V9_RELEASE_ID,),
@@ -434,153 +350,17 @@ class V9EvaluationTest(unittest.TestCase):
                 """,
                 (results[-1].evidence_envelope_id,),
             ).fetchone()
-            queue_count = int(
-                connection.execute("SELECT COUNT(*) FROM review_queue").fetchone()[0]
-            )
         self.assertEqual(
             [tuple(row) for row in rows],
             [
-                (3, "insufficient_evidence", 0, 0),
-                (4, "insufficient_evidence", 0, 0),
-                (5, "insufficient_evidence", 0, 0),
+                (3, "insufficient_evidence", 0),
+                (4, "insufficient_evidence", 0),
+                (5, "insufficient_evidence", 0),
             ],
         )
         assert envelope is not None
         self.assertIsNone(envelope["manual_evidence_sha256"])
         self.assertIsNone(json.loads(envelope["components_json"])["manual_evidence_sha256"])
-        self.assertEqual(queue_count, 0)
-
-    def test_v9_review_entry_points_return_409_and_write_nothing(self) -> None:
-        self._activate_v9()
-        with patch.object(
-            MaterializedMatcher,
-            "match_points",
-            return_value=[
-                {
-                    "id": "E1",
-                    "score": 80,
-                    "scene": "used_car",
-                    "reason": "v9 included fixture",
-                    "source": "matcher",
-                }
-            ],
-        ):
-            evaluation = evaluate_content(1, db_path=self.db)
-        with connect(self.db) as connection:
-            pending = connection.execute(
-                """
-                INSERT INTO review_queue(
-                    content_id,evaluation_id,reason_code,status,created_at,updated_at
-                ) VALUES (1,?,'legacy-manual-fixture','pending',?,?)
-                """,
-                (evaluation.evaluation_id, now_utc(), now_utc()),
-            )
-            resolved = connection.execute(
-                """
-                INSERT INTO review_queue(
-                    content_id,evaluation_id,reason_code,status,created_at,updated_at,
-                    resolved_at
-                ) VALUES (1,?,'legacy-resolved-fixture','resolved',?,?,?)
-                """,
-                (
-                    evaluation.evaluation_id,
-                    now_utc(),
-                    now_utc(),
-                    now_utc(),
-                ),
-            )
-            assert pending.lastrowid is not None and resolved.lastrowid is not None
-            pending_id = int(pending.lastrowid)
-            resolved_id = int(resolved.lastrowid)
-            connection.commit()
-
-        before = self._review_write_snapshot()
-        with self.assertRaisesRegex(EvaluationError, "disabled for evaluation-v9"):
-            reopen_review(
-                resolved_id,
-                reason="不得重开",
-                reopened_by="v9-test",
-                db_path=self.db,
-            )
-        with self.assertRaisesRegex(EvaluationError, "disabled for evaluation-v9"):
-            resolve_review(
-                pending_id,
-                decision="confirm",
-                reason="不得裁决",
-                reviewer="v9-test",
-                evidence_type="review_note",
-                evidence_text="不得创建人工证据",
-                base_evaluation_id=evaluation.evaluation_id,
-                db_path=self.db,
-            )
-        with self.assertRaisesRegex(EvaluationError, "disabled for evaluation-v9"):
-            evaluate_content(
-                1,
-                db_path=self.db,
-                source="manual_review",
-                manual_override={"decision": "confirm"},
-                review_id=999,
-                parent_evaluation_id=evaluation.evaluation_id,
-            )
-        self.assertEqual(self._review_write_snapshot(), before)
-
-        config = api_module.ApiConfig(
-            db_path=self.db,
-            reports_root=self.root / "reports",
-            legacy_db_path=self.root / "legacy.sqlite3",
-            operator_freeze_lock=self.root / "freeze.lock",
-            writer_lock=self.root / "writer.lock",
-        )
-        with TestClient(api_module.create_app(config)) as client:
-            responses = (
-                client.post(f"/api/v8/reviews/{pending_id}/start"),
-                client.post(
-                    f"/api/v8/reviews/{resolved_id}/reopen",
-                    json={"reason": "不得重开", "reopened_by": "v9-test"},
-                ),
-                client.post(
-                    f"/api/v8/reviews/{pending_id}/resolve",
-                    json={
-                        "base_evaluation_id": evaluation.evaluation_id,
-                        "decision": "confirm",
-                        "reason": "不得裁决",
-                        "reviewer": "v9-test",
-                        "evidence_type": "review_note",
-                        "evidence_text": "不得创建人工证据",
-                    },
-                ),
-            )
-        self.assertEqual([response.status_code for response in responses], [409, 409, 409])
-        self.assertTrue(
-            all("disabled for evaluation-v9" in response.json()["detail"] for response in responses)
-        )
-        self.assertEqual(self._review_write_snapshot(), before)
-
-    def _review_write_snapshot(self) -> dict[str, object]:
-        with connect(self.db) as connection:
-            return {
-                "queues": [
-                    tuple(row)
-                    for row in connection.execute(
-                        """
-                        SELECT id,evaluation_id,status,assigned_to,resolved_at,updated_at
-                        FROM review_queue ORDER BY id
-                        """
-                    ).fetchall()
-                ],
-                "reviews": int(
-                    connection.execute("SELECT COUNT(*) FROM evaluation_reviews").fetchone()[0]
-                ),
-                "manual_evidence": int(
-                    connection.execute("SELECT COUNT(*) FROM manual_evidence").fetchone()[0]
-                ),
-                "reopen_events": int(
-                    connection.execute("SELECT COUNT(*) FROM review_reopen_events").fetchone()[0]
-                ),
-                "evaluations": int(
-                    connection.execute("SELECT COUNT(*) FROM evaluation_versions").fetchone()[0]
-                ),
-            }
 
 
 if __name__ == "__main__":

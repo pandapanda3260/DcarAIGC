@@ -74,8 +74,6 @@ MANAGED_TARGET_TABLES = frozenset(
         "media_processing_slots",
         "evaluation_versions",
         "evaluation_matches",
-        "review_queue",
-        "review_reopen_events",
         "duplicate_fingerprints",
     }
 )
@@ -690,9 +688,11 @@ def _validate_paths(paths: CanaryPaths, *, work_database_must_exist: bool) -> No
             raise LocalAnalysisCanaryError("首次canary要求全新不存在的work database")
         _private_file(paths.database, label="待恢复数据库copy")
     if formal.exists():
-        if work_database_exists and os.path.samefile(paths.database, formal):
+        if work_database_exists and storage_module.is_formal_database_path(
+            paths.database
+        ):
             raise LocalAnalysisCanaryError("数据库clone与正式数据库指向同一文件")
-        if os.path.samefile(paths.source_database, formal):
+        if storage_module.is_formal_database_path(paths.source_database):
             raise LocalAnalysisCanaryError("Step3源数据库与正式数据库指向同一文件")
     if work_database_exists and os.path.samefile(
         paths.database, paths.source_database
@@ -3922,7 +3922,6 @@ def _validate_current_evaluation(
         "primary_selling_point_id",
         "selling_point_score",
         "selling_point_included",
-        "pending_review",
         "content_direction",
         "content_automotive_score",
         "audience_automotive_score",
@@ -3981,16 +3980,11 @@ def _validate_current_evaluation(
     )
     asr = evaluation_module._read_json(artifacts["asr_path"])
     ocr = evaluation_module._read_json(artifacts["ocr_path"])
-    manual_rows = artifacts["manual_rows"]
-    manual_text = "\n".join(
-        str(row.get("text_value") or "") for row in manual_rows
-    )
     body_text = "\n".join(
         value
         for value in (
             str(content["title"] or ""),
             str(content["body"] or ""),
-            manual_text,
         )
         if value
     )
@@ -4001,7 +3995,6 @@ def _validate_current_evaluation(
             media_path=artifacts["media_path"],
             asr=asr,
             ocr=ocr,
-            manual_rows=manual_rows,
         )
     )
     component_columns = (
@@ -4018,7 +4011,6 @@ def _validate_current_evaluation(
         or str(evaluation["rule_version"]) != rule_version
         or str(evaluation["evaluation_source"]) != "automatic"
         or str(evaluation["evaluation_status"]) != "evaluated"
-        or int(evaluation["pending_review"]) != 0
         or str(evaluation["evidence_level"]) not in {"V2", "V3"}
         or str(evaluation["evidence_level"]) != expected_evidence_level
         or payload["evidence_summary"] != expected_evidence_summary
@@ -4034,7 +4026,6 @@ def _validate_current_evaluation(
         or payload["selling_point_score"] != expected_primary_score
         or int(bool(payload["selling_point_included"]))
         != int(evaluation["selling_point_included"])
-        or int(bool(payload["pending_review"])) != int(evaluation["pending_review"])
         or str(payload["content_direction"] or "")
         != str(evaluation["content_direction"] or "")
         or payload["content_automotive_score"]
@@ -4200,8 +4191,6 @@ def _validate_target_baseline_and_sequences(
         or len(deltas["evaluation_versions"]) != len(content_ids)
         or len(deltas["evidence_envelopes"]) != len(content_ids)
         or len(deltas["duplicate_fingerprints"]) != len(content_ids)
-        or deltas["review_queue"]
-        or deltas["review_reopen_events"]
         or any(
             int(row["id"]) not in active_evaluation_ids
             for row in deltas["evaluation_versions"]

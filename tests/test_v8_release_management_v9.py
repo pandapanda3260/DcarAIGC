@@ -31,12 +31,10 @@ class EvaluationV9ReleaseLifecycleTest(unittest.TestCase):
             db_path=self.db, manifest_path=self.manifest
         )
         self.manifest_sha256 = str(prepared["manifest_sha256"])
-        self.assertEqual(prepared["manual_evidence_excluded_count"], 1)
         self.assertEqual(prepared["content_count"], 2)
         manifest = json.loads(self.manifest.read_text(encoding="utf-8"))
-        self.assertEqual(
-            manifest["legacy_active_review_queues"], self.queue_baseline
-        )
+        # v16 起复核域已删除：新清单里活跃队列快照恒为空
+        self.assertEqual(manifest["legacy_active_review_queues"], [])
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -106,125 +104,10 @@ class EvaluationV9ReleaseLifecycleTest(unittest.TestCase):
                         captured_at,
                     ),
                 )
-            review = connection.execute(
-                """
-                INSERT INTO evaluation_reviews(
-                    content_id,decision,reason,reviewer,created_at
-                ) VALUES (2,'override','legacy synthetic evidence fixture',
-                          'legacy-fixture',?)
-                """,
-                (captured_at,),
-            )
-            assert review.lastrowid is not None
-            connection.execute(
-                """
-                INSERT INTO manual_evidence(
-                    review_id,content_id,evidence_type,text_value,sha256,created_at
-                ) VALUES (?,2,'visual_summary',? ,?,?)
-                """,
-                (
-                    review.lastrowid,
-                    "画面人工结论声称存在高置信汽车卖点，仅用于验证v9排除。",
-                    "c" * 64,
-                    captured_at,
-                ),
-            )
             connection.commit()
-        first = evaluate_content(1, db_path=self.db)
+        evaluate_content(1, db_path=self.db)
         evaluate_content(2, db_path=self.db)
-        with connect(self.db) as connection:
-            connection.executemany(
-                """
-                INSERT INTO review_queue(
-                    content_id,evaluation_id,reason_code,priority,status,
-                    created_at,updated_at
-                ) VALUES (?,?,?,?,?,?,?)
-                """,
-                (
-                    (
-                        1,
-                        first.evaluation_id,
-                        "evaluation_gray_zone",
-                        50,
-                        "pending",
-                        captured_at,
-                        captured_at,
-                    ),
-                    (
-                        1,
-                        first.evaluation_id,
-                        "manual_conclusion_conflict",
-                        80,
-                        "manual_required",
-                        captured_at,
-                        captured_at,
-                    ),
-                    (
-                        1,
-                        None,
-                        "media_processing_incomplete",
-                        60,
-                        "manual_required",
-                        captured_at,
-                        captured_at,
-                    ),
-                    (
-                        1,
-                        first.evaluation_id,
-                        "media_evidence_missing",
-                        60,
-                        "manual_required",
-                        captured_at,
-                        captured_at,
-                    ),
-                    (
-                        1,
-                        first.evaluation_id,
-                        "stale_local_evidence",
-                        50,
-                        "in_review",
-                        captured_at,
-                        captured_at,
-                    ),
-                    (
-                        1,
-                        first.evaluation_id,
-                        "legacy_content_unavailable",
-                        50,
-                        "terminal_failed",
-                        captured_at,
-                        captured_at,
-                    ),
-                    (
-                        1,
-                        first.evaluation_id,
-                        "legacy_nonautomatic_point_scene_conflict_v1",
-                        80,
-                        "manual_required",
-                        captured_at,
-                        captured_at,
-                    ),
-                ),
-            )
-            connection.commit()
-            self.queue_baseline = [
-                dict(row)
-                for row in connection.execute(
-                    """
-                    SELECT * FROM review_queue
-                    WHERE reason_code IN (
-                        'evaluation_gray_zone',
-                        'manual_conclusion_conflict',
-                        'media_processing_incomplete',
-                        'media_evidence_missing',
-                        'stale_local_evidence',
-                        'legacy_content_unavailable',
-                        'legacy_nonautomatic_point_scene_conflict_v1'
-                    )
-                    ORDER BY id
-                    """
-                )
-            ]
+        self.queue_baseline = []
         checkpoint = sqlite3.connect(self.db)
         try:
             checkpoint.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -274,27 +157,13 @@ class EvaluationV9ReleaseLifecycleTest(unittest.TestCase):
         )
         self.assertEqual(activated["status"], "active")
         with connect(self.db) as connection:
-            queue_rows = [
-                dict(row)
-                for row in connection.execute(
-                    "SELECT * FROM review_queue ORDER BY id"
-                )
-            ]
-            self.assertEqual(
-                {str(row["reason_code"]): str(row["status"]) for row in queue_rows},
-                {reason: "resolved" for reason in releases.QUEUE_REASONS},
-            )
-            self.assertEqual(
-                [row["evaluation_id"] for row in queue_rows],
-                [row["evaluation_id"] for row in self.queue_baseline],
-            )
             target_rows = connection.execute(
-                "SELECT pending_review,evaluation_source FROM evaluation_versions WHERE release_id=?",
+                "SELECT evaluation_source FROM evaluation_versions WHERE release_id=?",
                 (releases.TARGET_RELEASE_ID,),
             ).fetchall()
             self.assertEqual(len(target_rows), 2)
             self.assertTrue(
-                all(not row["pending_review"] and row["evaluation_source"] == "automatic" for row in target_rows)
+                all(row["evaluation_source"] == "automatic" for row in target_rows)
             )
             taxonomy_after = [
                 dict(row)
@@ -312,16 +181,6 @@ class EvaluationV9ReleaseLifecycleTest(unittest.TestCase):
             reason="fault before report resume",
         )
         self.assertEqual(rolled_back["restored_release_id"], releases.SOURCE_RELEASE_ID)
-        with connect(self.db) as connection:
-            self.assertEqual(
-                [
-                    dict(row)
-                    for row in connection.execute(
-                        "SELECT * FROM review_queue ORDER BY id"
-                    )
-                ],
-                self.queue_baseline,
-            )
 
     def test_backfill_is_resumable_after_fault(self) -> None:
         releases.create(
@@ -395,15 +254,8 @@ class EvaluationV9ReleaseLifecycleTest(unittest.TestCase):
                     "SELECT id,status FROM evaluation_releases"
                 )
             }
-            queue_rows = [
-                dict(row)
-                for row in connection.execute(
-                    "SELECT * FROM review_queue ORDER BY id"
-                )
-            ]
         self.assertEqual(states[releases.SOURCE_RELEASE_ID], "active")
         self.assertEqual(states[releases.TARGET_RELEASE_ID], "ready")
-        self.assertEqual(queue_rows, self.queue_baseline)
 
     def test_abort_fails_nonactive_release_and_invalidates_partial_rows(self) -> None:
         self._create_and_backfill()
@@ -454,26 +306,6 @@ class EvaluationV9ReleaseLifecycleTest(unittest.TestCase):
         file_sha = hashlib.sha256(tampered.read_bytes()).hexdigest()
         with self.assertRaisesRegex(
             releases.ReleaseV9Error, "not the exact source automatic selector"
-        ):
-            releases.create(
-                db_path=self.db,
-                manifest_path=tampered,
-                manifest_sha256=file_sha,
-            )
-
-    def test_rehashed_manifest_queue_subset_is_rejected_against_database(self) -> None:
-        value = json.loads(self.manifest.read_text(encoding="utf-8"))
-        value["legacy_active_review_queues"] = value[
-            "legacy_active_review_queues"
-        ][:-1]
-        tampered = self.root / "queue-subset-manifest.json"
-        tampered.write_text(
-            json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        file_sha = hashlib.sha256(tampered.read_bytes()).hexdigest()
-        with self.assertRaisesRegex(
-            releases.ReleaseV9Error, "legacy queue snapshot changed"
         ):
             releases.create(
                 db_path=self.db,
@@ -712,6 +544,22 @@ class EvaluationV9ReleaseLifecycleTest(unittest.TestCase):
                     freeze_lock=lock,
                     isolated_clone=True,
                 )
+
+    def test_formal_cli_guard_rejects_existing_alias_as_formal(self) -> None:
+        alias = self.root / "apfs-firmlink-spelling.sqlite3"
+        alias.hardlink_to(self.db)
+        with (
+            patch.object(releases, "DEFAULT_DB", self.db),
+            self.assertRaisesRegex(
+                releases.ReleaseV9Error,
+                "formal database cannot be marked as an isolated clone",
+            ),
+        ):
+            releases.assert_cli_cutover_guard(
+                db_path=alias,
+                freeze_lock=self.root / "unused.lock",
+                isolated_clone=True,
+            )
 
     def test_writer_handle_parser_rejects_macos_lock_suffix(self) -> None:
         completed = type(

@@ -340,7 +340,6 @@ class V8MediaTerminalStateTest(unittest.TestCase):
         evaluation_status: str,
         evidence_level: str,
         suffix: str = "current",
-        pending_review: int = 0,
         evaluation_source: str = "automatic",
     ) -> None:
         evidence_sha256 = self._sha(f"{content_id}:envelope:{suffix}")
@@ -378,9 +377,9 @@ class V8MediaTerminalStateTest(unittest.TestCase):
                 content_id,evidence_envelope_id,release_id,rule_version,
                 taxonomy_version,matcher_rule_sha256,evidence_sha256,
                 evaluation_source,evaluation_status,evidence_level,
-                pending_review,payload_json,evaluated_at
+                payload_json,evaluated_at
             ) VALUES (?,?,?,'evaluation-test','selling-points-test',?,?,
-                      ?,?,?,?,?,?)
+                      ?,?,?,?,?)
             """,
             (
                 content_id,
@@ -391,7 +390,6 @@ class V8MediaTerminalStateTest(unittest.TestCase):
                 evaluation_source,
                 evaluation_status,
                 evidence_level,
-                pending_review,
                 "{}",
                 self._timestamp(4),
             ),
@@ -414,7 +412,6 @@ class V8MediaTerminalStateTest(unittest.TestCase):
                 ocr_sha256=ocr_sha256,
                 evaluation_status="evaluated",
                 evidence_level="V3",
-                pending_review=1,
             )
             connection.commit()
             states = media_terminal_states(

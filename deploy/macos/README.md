@@ -1,95 +1,75 @@
-# macOS designated writer and snapshot publisher
+# macOS 指定 writer 与 snapshot publisher
 
-This directory defines the single macOS writer for the DcarAIGC production
-topology. The worker owns scheduled provider calls, media processing,
-incremental evaluation, and report jobs. It runs a loopback-only API on
-`127.0.0.1:8766`; the normal local UI/API remains on `127.0.0.1:4173` and
-`127.0.0.1:8765`.
+该目录定义 DcarAIGC 正式拓扑中唯一允许运行调度的 macOS writer。writer 监听 `127.0.0.1:8766`，负责供应商抓取、媒体处理、增量评估和报告任务。日常 UI/API 继续使用 4173/8765，且 8765 固定不启用 scheduler。
 
-Nothing in this directory is installed or loaded automatically. Both plist
-templates are disabled by default. Each renderer never calls `launchctl`.
+仓库不会自动安装、加载或启用任何 LaunchAgent。renderer 只生成 disabled-by-default plist，永不调用 `launchctl`。
 
-## Safety contract
+## 安全合同
 
-- There must be exactly one scheduled writer. The Ubuntu read replica keeps
-  `DCAR_SCHEDULER_ENABLED=0` and `DCAR_STARTUP_CATCHUP_ENABLED=0`.
-- The writer uses `DCAR_SCHEDULER_ENABLED=1` and
-  `DCAR_STARTUP_CATCHUP_ENABLED=1`, but the only supported startup mode is
-  `report_only`. Startup catch-up may create or retry due `daily_report` and
-  `weekly_report` occurrences. It never runs `daily_capture`, media download,
-  media processing, or `daily_media_cutoff`, so it cannot spend provider money.
-- The current `daily_capture` provider ceiling is **USD 8 per scheduled day**.
-  Do not enable the LaunchAgent until the operator has explicitly authorized
-  that recurring ceiling and added the acknowledgement to `writer.env`.
-- The TikHub API key is never stored in the plist or `writer.env`. The latter
-  contains only `TIKHUB_API_KEY_FILE`, pointing to the existing external key
-  file, which itself contains `TIKHUB_API_KEY=...` and must have mode `0400` or
-  `0600`.
-- The Mac must stay powered, connected to the network, and awake through the
-  scheduled window. The wrapper uses `caffeinate -s`, which prevents idle
-  system sleep while the Mac is on AC power. Closing a laptop lid, losing AC
-  power, rebooting, or manually sleeping the Mac can still skip a run.
-- This is a per-user LaunchAgent, so the designated macOS account must be
-  logged into its GUI session after a reboot.
-- An operator freeze lock at `runtime/operator-freeze.lock` blocks startup.
-  Do not remove it without completing the corresponding recovery procedure.
+- 同一时刻只能有一个 scheduled writer。Ubuntu 副本和 8765 均必须保持 `DCAR_SCHEDULER_ENABLED=0` 和 `DCAR_STARTUP_CATCHUP_ENABLED=0`。
+- writer 使用 `DCAR_SCHEDULER_ENABLED=1` 和 `DCAR_STARTUP_CATCHUP_ENABLED=1`，但 startup catch-up 严格为 `report_only`：只可创建/重试 `daily_report` 和 `weekly_report`，不运行 capture、media 或 cutoff，不产生供应商费用。
+- 每日 capture 的 task 总额硬顶为 USD 8。只有运营者明确批准循环成本并在 `writer.env` 写入固定 acknowledgement 后才能启用。
+- TikHub API key 不得进入 plist 或 `writer.env`。`writer.env` 只允许 `TIKHUB_API_KEY_FILE`、`DCAR_DAILY_COST_AUTHORIZATION`、空行和注释；其他条目都会 exit 78。
+- `DCAR_DAILY_CAPTURE_RECONCILE_FROM` 只能由 plist 继承，必须是真实且规范的 `YYYY-MM-DD`。不得将它写进 `writer.env`。
+- scheduler 锁在 `$HOME/Library/Application Support/DcarAIGC/runtime/writer-worker.lock`，不在 checkout 里。`writer_lock.held=true` 只证明唯一 scheduler 进程锁已持有，不证明数据库没有其他非调度写进者。
+- `runtime/operator-freeze.lock` 存在时不得启动 writer。正式库只能在停服、freeze、已验证备份下走 v15→v16 离线 candidate 流程，运行时不自动迁移。
+- wrapper 使用 `caffeinate -s`，只能在接交流电时防止系统空闲睡眠。合盖、断电、人工睡眠或重启仍可以跳过 Cron。
+- 这是 per-user LaunchAgent，Mac 重启后指定账号必须登录 GUI session。
 
-## 1. Prepare the external writer configuration
+## 1. 准备项目外 writer 配置
 
-Do this only after the recurring USD 8 ceiling has been approved. Copy the
-example outside the repository, edit the absolute key-file path, and protect
-it. Set `DCAR_DAILY_COST_AUTHORIZATION` to
-`I_ACKNOWLEDGE_DAILY_PROVIDER_LIMIT_USD_8` only after that approval. The example
-leaves it blank so a copy alone cannot authorize spend. Do not paste the API
-key into this file.
+只在 USD 8 循环上限已批准后执行。复制示例到项目外，修改绝对 key-file 路径，并保护文件。`DCAR_DAILY_COST_AUTHORIZATION` 只能在审批后设为 `I_ACKNOWLEDGE_DAILY_PROVIDER_LIMIT_USD_8`。
 
 ```sh
 install -d -m 0700 "$HOME/Library/Application Support/DcarAIGC"
+install -d -m 0700 "$HOME/Library/Application Support/DcarAIGC/runtime"
 install -d -m 0700 "$HOME/Library/Logs/DcarAIGC"
 install -m 0600 deploy/macos/writer.env.example \
   "$HOME/Library/Application Support/DcarAIGC/writer.env"
 chmod 0600 /absolute/path/outside/the/repository/TikHub.env.local
 ```
 
-Review both files locally. The key file must remain outside the checkout. The
-worker preflight rejects symlinks, permissive file modes, direct
-`TIKHUB_API_KEY` environment values, missing cost acknowledgement, a missing
-formal database, and any attempt to use port 8765.
+key 文件必须是项目外的普通非 symlink 文件，mode 只能是 0400 或 0600，内含 `TIKHUB_API_KEY=...`。wrapper 会在导出任何付费环境前完成该校验和 reconcile 日期校验。
 
-## 2. Render without loading
+## 2. 只渲染，不加载
 
-Run the side-effect-free check first, then render a new disabled plist. The
-renderer refuses to overwrite an existing file and never runs `launchctl`.
+用 `D` 表示这次新调度生效的北京自然日。renderer 对已存在输出使用 `open("xb")` 拒绝覆盖；如果需要顺延 D 或更新 plist，先将旧文件移到备份路径，再重新渲染。
 
 ```sh
+D=2026-08-21
+
 python3 deploy/macos/render_launch_agent.py \
   --project-root "$PWD" \
+  --reconcile-from "$D" \
   --check
 
 python3 deploy/macos/render_launch_agent.py \
   --project-root "$PWD" \
+  --reconcile-from "$D" \
   --output "$HOME/Library/LaunchAgents/cn.tj.dcar.writer-worker.plist"
 
 plutil -lint "$HOME/Library/LaunchAgents/cn.tj.dcar.writer-worker.plist"
 plutil -p "$HOME/Library/LaunchAgents/cn.tj.dcar.writer-worker.plist"
 ```
 
-Before enabling, verify all of the following:
+渲染前后必须核对：
 
-1. the Mac is on AC power and configured not to sleep;
-2. `.venv/bin/python`, `mlx-whisper`, Homebrew `ffmpeg`/`ffprobe`, and
-   `/usr/bin/swiftc` are present; the LaunchAgent supplies their explicit PATH;
-3. `app/data/dcar_insight.sqlite3` is the intended formal writer database;
-4. no process is already listening on 8766;
-5. the Ubuntu scheduler and startup catch-up both report disabled;
-6. the recurring provider ceiling has explicit operator approval;
-7. there is no operator freeze lock.
+1. Mac 接交流电、网络正常，且计划窗口内不睡眠。
+2. `.venv/bin/python`、`mlx-whisper`、Homebrew `ffmpeg`/`ffprobe` 和 `/usr/bin/swiftc` 存在。
+3. `app/data/dcar_insight.sqlite3` 已是通过离线 candidate 切换和回执验证的 v16 正式库。
+4. 8766 无既有监听者，Ubuntu 调度/catch-up 为关，8765 无调度。
+5. 循环成本已批准，且 operator freeze lock 尚未提前解除。
+6. plist 中 `DCAR_DAILY_CAPTURE_RECONCILE_FROM=D`，writer lock 是项目外路径，不含 API key。
 
-## 3. Explicitly enable and wait for first start
+## 3. D 日启用时序
 
-These commands are intentionally not run by the renderer. Execute them only
-after the review above. `Disabled=true` in the template requires the explicit
-`launchctl enable` step.
+所有实施、测试、备份、迁移、plist 复核必须在 **D 日 01:00 前**完成。未按时完成时，D 自动顺延到下一自然日；先归档已渲染 plist，再用新日期重新渲染。禁止在 D 日 02:00 之后“临时修好就启动”。
+
+计划在 **D 日 00:09** 做最后一次 v16 identity、备份/安装回执、plist 和端口门禁复核，全部通过后才按回执解除 canonical operator freeze；任一项不通过则保留 freeze 并顺延 D。
+
+计划的首次 bootstrap 时刻是 **D 日 00:10**。plist 是 `RunAtLoad=true`，bootstrap 会立即启动 writer；小时 reconcile 也通过显式 `next_run_time=now` 立即检查。00:10 尚未到当天 02:00 业务槽，因此返回 `before_today_slot` 且不产生供应商费用。02:00 后 bootstrap 则会立即尝试当天真实付费抓取。
+
+只在 freeze 解除、正式 v16 身份和所有门禁验收后执行：
 
 ```sh
 label="cn.tj.dcar.writer-worker"
@@ -100,10 +80,7 @@ launchctl enable "$domain/$label"
 launchctl bootstrap "$domain" "$plist"
 ```
 
-`RunAtLoad=true` makes `bootstrap` start the worker. Do not immediately follow
-it with `kickstart -k`: that kills the just-started process and can leave the
-job waiting for the 300-second throttle interval. Instead, give the first
-process time to finish its preflight and bind the health port:
+`bootstrap` 后不要紧接 `kickstart -k`；这会杀掉刚启动的进程，并可能触发 300 秒 throttle。等待 health：
 
 ```sh
 for attempt in $(seq 1 60); do
@@ -114,7 +91,7 @@ for attempt in $(seq 1 60); do
 done
 ```
 
-Verify separation and runtime state without invoking a provider:
+在不调用供应商的情况下验证：
 
 ```sh
 lsof -nP -iTCP:8765 -sTCP:LISTEN
@@ -122,20 +99,20 @@ lsof -nP -iTCP:8766 -sTCP:LISTEN
 curl -fsS http://127.0.0.1:8766/api/v8/health
 curl -fsS http://127.0.0.1:8766/api/v8/scheduler | python3 -m json.tool
 launchctl print "gui/$(id -u)/cn.tj.dcar.writer-worker"
+tail -n 200 "$HOME/Library/Logs/DcarAIGC/writer-worker.stderr.log"
 ```
 
-The worker scheduler must report requested and enabled. Startup catch-up must
-report `mode=report_only`, requested/enabled, and eventually `status=succeeded`;
-every result must be a `daily_report` or `weekly_report`. A capture or media job
-in that result list is a deployment-blocking safety violation. Do not manually
-execute `daily_capture` as a smoke test; wait for the authorized scheduled
-window or use existing mocked tests.
+scheduler 必须报告 requested/enabled，`startup_catchup.mode=report_only`，其 results 只能是日报/周报；`daily_capture_reconcile` 必须是 `mode=current_day_only`、`effective_from=D`、`interval_seconds=3600`。稳定观察至少 650 秒，除了 PID/health 稳定，stderr 还必须没有 preflight exit 78、日期拒绝或 KeepAlive/ThrottleInterval 崩溃循环。
 
-### Deliberate restart of an already loaded worker
+禁止手工执行 `daily_capture` 作为烟测；等待已授权的自然 02:00 槽。该槽结束后，状态可以是 `succeeded` 或 `partial`，但还必须通过独立质量门：discovery ≥90%、当天选中 cohort ≥60%、数组计数一致、provider 无阻断、ledger 与 details 一致且不超 USD 8。3,000 是选中 cohort 上限，不是全库覆盖率。
 
-Use `kickstart -k` only when intentionally restarting an existing loaded job,
-not as part of first installation or as a retry while its first process is
-still starting:
+### 睡眠/唤醒语义
+
+02:00 Cron 负责低延迟，每小时 reconcile 负责当天正确性。Mac 在 02:00 睡眠、当天稍后唤醒时，只要 writer 仍运行，reconcile 会补当天 02:00 槽；它不会追回昨天或更早槽。白天补抓也不会紧接着追跑 02:20/03:00/07:30、日/周报或 publisher。
+
+## 故意重启、更新、停用和卸载
+
+只有已加载且明确要重启的 writer 才使用：
 
 ```sh
 label="cn.tj.dcar.writer-worker"
@@ -143,14 +120,7 @@ domain="gui/$(id -u)"
 launchctl kickstart -k "$domain/$label"
 ```
 
-For a plist update, use the bootout/render/review/bootstrap sequence below so
-launchd loads the new definition. After either kind of deliberate restart,
-wait for the health port in the same way as the first start.
-
-## Stop, disable, and uninstall
-
-Stopping or uninstalling the LaunchAgent does not delete the database, reports,
-cache, external key file, external `writer.env`, or logs.
+plist 更新必须走 bootout→归档旧 plist→用新日期渲染→复核→bootstrap。停用/卸载不会删除 DB、reports、cache、key 文件、`writer.env` 或日志：
 
 ```sh
 label="cn.tj.dcar.writer-worker"
@@ -163,197 +133,14 @@ mkdir -p "$HOME/.Trash/DcarAIGC-launchagents"
 mv "$plist" "$HOME/.Trash/DcarAIGC-launchagents/$label.plist"
 ```
 
-Keep the external configuration until the service is deliberately retired.
-For a plist update, boot out the old job, move the old plist aside, render and
-review a new one, then repeat the explicit enable/bootstrap sequence.
+## snapshot publisher：已停用、未加载
 
-## Daily read-replica publisher (default disabled)
+snapshot publisher 不属于本轮恢复范围。当前 LaunchAgent 已停用且未加载；不得 render/load/enable/bootstrap/kickstart，不得把它当作 writer 验收的一部分。
 
-The second LaunchAgent is scheduled for 09:00 Asia/Shanghai, after the 08:00
-daily report window. It does not run a scheduler or provider call. Before it can
-publish, it requires all of the following:
+源码仍保留，但 publisher 与 server installer 共用的发布身份已有三组明确漂移：
 
-1. the loopback writer on port 8766 is healthy and points at the formal DB;
-   its health identity must exactly match the DB and must be report v8.6,
-   schema 13 / `scheduler-run-attempt-history`, active evaluation-v9 on the
-   published selling-points-v5.2 taxonomy, including the DB-frozen matcher SHA;
-2. the writer scheduler is enabled and holds the single-writer lock, while
-   startup catch-up has succeeded in `report_only` mode and returned only
-   `daily_report`/`weekly_report` results;
-3. today's 02:00 `daily_capture` row has a terminal status and completion time;
-4. today's 07:30 `daily_media_cutoff` succeeded with a valid completion time;
-5. the DB/WAL storage and newest content pass the configured freshness gates;
-6. a consistent SQLite online-backup snapshot and every referenced artifact
-   pass the snapshot builder's checks;
-7. a dedicated SSH alias, strict known-host match, dedicated identity, remote
-   free-space gate, and all three rsync dry runs pass.
+1. `EXPECTED_DATABASE_SCHEMA_VERSION = 13`，而当前代码 schema 为 16。
+2. `EXPECTED_DATABASE_SCHEMA_MIGRATION = "scheduler-run-attempt-history"`，而当前为 `remove-manual-review`。
+3. `EXPECTED_REPORT_VERSION = "dcar-content-operations-report-v8.6"`，而 `pyproject.toml` 和当前报告合同为 v8.7。
 
-The 08:00 `daily_report` result is not a publication gate: a failed or unavailable
-report remains visible as that status in the snapshot and is not silently turned
-into success. Any existing manual review or release gate still applies.
-
-The publisher uploads into one unique, versioned staging tree:
-
-```text
-/var/lib/dcar-aigc/incoming/<snapshot-id>/
-  bundle/
-  artifacts/cache/
-  artifacts/reports/
-```
-
-It never rsyncs directly into the active cache or report roots and never uses
-`--delete`. The server verifier hashes the staged version first. With the API
-stopped, the installer backs up every differing active artifact before replacing
-it and restores those exact bytes together with the DB on failure or rollback.
-An identity mismatch in the installed API health response is an install failure
-and triggers that same automatic DB/artifact rollback.
-The installer is the only component allowed to promote a verified generation.
-For unchanged bytes, rsync may hard-link from the active root into staging via
-`--link-dest`; active files are only references and are never changed by rsync.
-
-### 1. Prepare the external publisher configuration
-
-Copy the non-secret example outside the repository and protect it. It contains
-only deployment coordinates and limits. Do not add a password, private key,
-provider key, or BasicAuth credential.
-
-```sh
-install -d -m 0700 "$HOME/Library/Application Support/DcarAIGC"
-install -d -m 0700 "$HOME/Library/Logs/DcarAIGC"
-install -m 0600 deploy/macos/publisher.env.example \
-  "$HOME/Library/Application Support/DcarAIGC/publisher.env"
-```
-
-Use a dedicated SSH alias. Seed `~/.ssh/known_hosts` through a trusted channel
-before the first run; do not use `accept-new` or disable host-key checking.
-
-```sshconfig
-Host dcar-prod
-  HostName <production-host>
-  User <snapshot-publisher-user>
-  IdentityFile ~/.ssh/id_ed25519_dcar_prod
-  IdentitiesOnly yes
-  BatchMode yes
-  PasswordAuthentication no
-  KbdInteractiveAuthentication no
-  StrictHostKeyChecking yes
-  UserKnownHostsFile ~/.ssh/known_hosts
-```
-
-Keep the identity external to this repository with mode `0600`. On the server,
-grant `NOPASSWD` only for the fixed Python interpreter plus
-`deploy/server/install_snapshot.py verify|install --bundle` below the fixed
-incoming root. Validate the sudoers rule with `visudo`; do not grant a shell or
-general passwordless sudo to the publisher account.
-
-The snapshot uses the explicit `thin-server-v1` policy. The capacity gate counts
-only the included small evidence/report set, the database bundle, and the
-default 5 GiB reserve. Large binary media is listed as optional reuse and is
-never transferred; the installer reuses it only when the active file has the
-same path, size, and SHA-256. The publisher also parses
-`rsync --dry-run --stats` for cache, reports, and bundle, checks free space
-again, and checks the reserve once more before remote verification. Any failed
-gate stops before the active generation changes.
-
-### 2. Run side-effect-free local checks
-
-The plist check only validates the disabled 09:00 job definition. The publisher
-`--check` additionally validates the external file and current writer state; it
-does not build a snapshot and does not invoke SSH or rsync.
-
-```sh
-python3 deploy/macos/render_snapshot_publisher.py \
-  --project-root "$PWD" \
-  --check
-
-.venv/bin/python deploy/macos/publish_snapshot.py \
-  --project-root "$PWD" \
-  --env-file "$HOME/Library/Application Support/DcarAIGC/publisher.env" \
-  --db "$PWD/app/data/dcar_insight.sqlite3" \
-  --legacy-db "$PWD/app/data/web_mvp.sqlite3" \
-  --check
-```
-
-The local writer must already be running for the second command. A successful
-result explicitly reports `no_snapshot_built=true` and
-`no_ssh_attempted=true`.
-
-### 3. Render, review, and explicitly enable
-
-Rendering still leaves the job disabled and unloaded. The commands below are
-operator steps; this repository does not execute them automatically.
-
-```sh
-python3 deploy/macos/render_snapshot_publisher.py \
-  --project-root "$PWD" \
-  --output "$HOME/Library/LaunchAgents/cn.tj.dcar.snapshot-publisher.plist"
-
-plutil -lint \
-  "$HOME/Library/LaunchAgents/cn.tj.dcar.snapshot-publisher.plist"
-plutil -p \
-  "$HOME/Library/LaunchAgents/cn.tj.dcar.snapshot-publisher.plist"
-```
-
-Only after the server installer, sudo rule, SSH alias, capacity, and rollback
-have been reviewed, enable and bootstrap the job. Do not `kickstart` it merely
-as a smoke test because that performs a real publication.
-
-```sh
-label="cn.tj.dcar.snapshot-publisher"
-domain="gui/$(id -u)"
-plist="$HOME/Library/LaunchAgents/$label.plist"
-
-launchctl enable "$domain/$label"
-launchctl bootstrap "$domain" "$plist"
-```
-
-The writer keeps `DCAR_STARTUP_CATCHUP_ENABLED=1` exclusively for report-only
-catch-up. The publisher and Ubuntu replica both keep scheduler and catch-up set
-to `0`; enabling the publisher does not broaden provider authorization. Paid
-capture and media processing remain scheduled or explicitly operator-invoked
-writer work and are never triggered by startup catch-up.
-
-### Failure handling and monitoring
-
-A failed local build leaves no partial named snapshot. A failed remote space,
-rsync, verify, or install step never changes the local formal DB and does not
-delete local snapshots or server history. A unique remote staging directory may
-remain for investigation. The server installer owns active-generation rollback;
-never manually copy staged files over an active root.
-
-There is deliberately no publisher-side `rm` or automatic remote cleanup in
-this change. `--link-dest` prevents unchanged artifacts from consuming another
-full 40.7 GB, but each successful staging tree still retains its database
-bundle and changed bytes. Before enabling unattended daily publication, monitor
-`/var/lib/dcar-aigc` capacity and use this retention policy: keep the active
-staging tree, the two previous successful trees, and failed trees until their
-incident is closed. Pruning must be a separate root-owned, receipt-aware server
-operation that refuses to remove the active snapshot or rollback history; do
-not add a wildcard `rm` cron job. Such a garbage collector is not installed or
-enabled by this deployment.
-
-```sh
-launchctl print "gui/$(id -u)/cn.tj.dcar.snapshot-publisher"
-tail -n 200 "$HOME/Library/Logs/DcarAIGC/snapshot-publisher.stdout.log"
-tail -n 200 "$HOME/Library/Logs/DcarAIGC/snapshot-publisher.stderr.log"
-```
-
-After success, inspect the local `publisher-receipt.json` under that day's
-snapshot and the server's active-snapshot receipt. The local receipt records
-both capture and media-cutoff states plus the three dry-run sizes. Confirm the
-online overview, yesterday, and this-week windows before treating the
-publication as complete.
-
-To disable and remove only this LaunchAgent (without deleting snapshots,
-configuration, logs, or server data):
-
-```sh
-label="cn.tj.dcar.snapshot-publisher"
-domain="gui/$(id -u)"
-plist="$HOME/Library/LaunchAgents/$label.plist"
-
-launchctl bootout "$domain" "$plist"
-launchctl disable "$domain/$label"
-mkdir -p "$HOME/.Trash/DcarAIGC-launchagents"
-mv "$plist" "$HOME/.Trash/DcarAIGC-launchagents/$label.plist"
-```
+这三项未在独立 publisher 升级中同步、测试和端到端验证前，publisher 不可用。本轮只保留已知失败的单测证据，不修改 publisher 逻辑，也不通过放宽身份门禁消红。

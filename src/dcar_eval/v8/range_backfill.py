@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -33,18 +34,19 @@ from .storage import (
     HISTORY_BACKFILL_SOURCE_GROUP,
     PROJECT_ROOT,
     connect,
+    is_formal_database_path,
     now_utc,
     transaction,
 )
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
-DEFAULT_START = datetime(2026, 7, 20, 0, 0, tzinfo=SHANGHAI)
 #: 全量历史模式的区间起点：早于双平台任何账号的可能建号时间，
 #: 使发现翻页只受 has_more/max_pages/预算约束，不受时间过滤截断。
 FULL_HISTORY_START = datetime(2010, 1, 1, 0, 0, tzinfo=SHANGHAI)
 DEFAULT_MAX_AMOUNT = 9.0
 STATE_ROOT = PROJECT_ROOT / "data" / "cache" / "v8" / "range_backfill"
+DEFAULT_OPERATOR_FREEZE_LOCK = PROJECT_ROOT / "runtime" / "operator-freeze.lock"
 #: 长跑阶段每处理多少条内容刷新一次状态文件（可观测且崩溃后有据可查）。
 PROGRESS_FLUSH_EVERY = 200
 #: 压缩模式下状态/输出里保留的失败明细上限。
@@ -145,7 +147,7 @@ def _utc(value: datetime) -> datetime:
 
 
 def _iso(value: datetime) -> str:
-    return _utc(value).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return _utc(value).isoformat(timespec="auto").replace("+00:00", "Z")
 
 
 def _parse_datetime(value: str) -> datetime:
@@ -154,7 +156,7 @@ def _parse_datetime(value: str) -> datetime:
         raise RangeBackfillError("时间不能为空")
     parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=SHANGHAI)
+        raise RangeBackfillError("区间时间必须包含时区")
     return parsed
 
 
@@ -162,6 +164,118 @@ def task_id_for(start: datetime, end: datetime) -> str:
     local_start = start.astimezone(SHANGHAI).strftime("%Y%m%dT%H%M%S")
     local_end = end.astimezone(SHANGHAI).strftime("%Y%m%dT%H%M%S")
     return f"two-week-backfill-{local_start}-{local_end}-bjt"
+
+
+def _selected_platforms(platforms: Optional[Sequence[str]]) -> List[str]:
+    selected = sorted(set(platforms or ("douyin", "xiaohongshu")))
+    invalid = set(selected) - {"douyin", "xiaohongshu"}
+    if invalid:
+        raise RangeBackfillError(f"不支持的平台：{','.join(sorted(invalid))}")
+    if not selected:
+        raise RangeBackfillError("至少选择一个平台")
+    return selected
+
+
+def _require_formal_mutation_freeze(*, db_path: Path) -> None:
+    if not is_formal_database_path(db_path, formal_database=DEFAULT_DB):
+        return
+    freeze_value = os.environ.get("DCAR_OPERATOR_FREEZE_LOCK") or os.environ.get(
+        "DCAR_FREEZE_LOCK"
+    )
+    freeze_lock = Path(freeze_value or DEFAULT_OPERATOR_FREEZE_LOCK).expanduser()
+    if not freeze_lock.is_file() or freeze_lock.is_symlink():
+        raise RangeBackfillError(
+            "正式数据库变更要求有效的 operator freeze lock："
+            f"{freeze_lock}"
+        )
+
+
+def _campaign_contract(
+    *,
+    task_id: str,
+    start: datetime,
+    end: datetime,
+    as_of: datetime,
+    max_amount: float,
+    max_pages: int,
+    platforms: Sequence[str],
+) -> Dict[str, Any]:
+    if not task_id.strip():
+        raise RangeBackfillError("task_id 不能为空")
+    if _utc(start) >= _utc(end):
+        raise RangeBackfillError("补抓开始时间必须早于结束时间")
+    _utc(as_of)
+    if not math.isfinite(max_amount) or max_amount <= 0:
+        raise RangeBackfillError("预算必须为有限正数")
+    if max_pages <= 0:
+        raise RangeBackfillError("每账号页数上限必须为正数")
+    return {
+        "task_id": task_id,
+        "start": _iso(start),
+        "end": _iso(end),
+        "as_of": _iso(as_of),
+        "max_amount": max_amount,
+        "max_pages": max_pages,
+        "platforms": list(platforms),
+    }
+
+
+def _prepare_campaign_contract(
+    *,
+    task_id: str,
+    start: datetime,
+    end: datetime,
+    as_of: datetime,
+    max_amount: float,
+    max_pages: int,
+    platforms: Sequence[str],
+    phase: str,
+    state_root: Path,
+) -> Path:
+    contract = _campaign_contract(
+        task_id=task_id,
+        start=start,
+        end=end,
+        as_of=as_of,
+        max_amount=max_amount,
+        max_pages=max_pages,
+        platforms=platforms,
+    )
+    state_root.mkdir(parents=True, exist_ok=True)
+    target = state_root / f"{task_id}.json"
+    existing: Dict[str, Any] = {}
+    if target.is_file():
+        loaded = json.loads(target.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            raise RangeBackfillError("已有补抓状态文件不是 JSON object")
+        existing = loaded
+        if existing.get("contract") != contract:
+            raise RangeBackfillError("已有补抓状态文件与本次完整合同不一致")
+    phase_contracts = dict(existing.get("phase_contracts") or {})
+    phase_contract = {**contract, "phase": phase}
+    recorded_phase_contract = phase_contracts.get(phase)
+    if recorded_phase_contract is not None and recorded_phase_contract != phase_contract:
+        raise RangeBackfillError("已有补抓阶段合同与本次调用不一致")
+    phase_contracts[phase] = phase_contract
+    captured_at = now_utc()
+    value = {
+        **existing,
+        "task_id": task_id,
+        "timezone": "Asia/Shanghai",
+        "contract": contract,
+        "phase_contracts": phase_contracts,
+        "phase": existing.get("phase") or phase,
+        "status": existing.get("status") or "prepared",
+        "created_at": existing.get("created_at") or captured_at,
+        "updated_at": captured_at,
+    }
+    temporary = target.with_name(f".{target.name}.tmp")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(target)
+    return target
 
 
 def _cursor_digest(cursor: Any) -> str:
@@ -205,25 +319,30 @@ def _write_state(
     task_id: str,
     start: datetime,
     end: datetime,
+    as_of: datetime,
     max_amount: float,
+    max_pages: int,
+    platforms: Sequence[str],
     phase: str,
     status: str,
     details: Mapping[str, Any],
     state_root: Path,
 ) -> Path:
-    state_root.mkdir(parents=True, exist_ok=True)
-    target = state_root / f"{task_id}.json"
-    existing: Dict[str, Any] = {}
-    if target.is_file():
-        loaded = json.loads(target.read_text(encoding="utf-8"))
-        if isinstance(loaded, dict):
-            existing = loaded
-        contract = (
-            existing.get("start"), existing.get("end"), existing.get("max_amount")
-        )
-        expected = (_iso(start), _iso(end), max_amount)
-        if contract != expected:
-            raise RangeBackfillError("已有补抓状态文件与本次区间或预算不一致")
+    target = _prepare_campaign_contract(
+        task_id=task_id,
+        start=start,
+        end=end,
+        as_of=as_of,
+        max_amount=max_amount,
+        max_pages=max_pages,
+        platforms=platforms,
+        phase=phase,
+        state_root=state_root,
+    )
+    loaded = json.loads(target.read_text(encoding="utf-8"))
+    if not isinstance(loaded, dict):
+        raise RangeBackfillError("已有补抓状态文件不是 JSON object")
+    existing: Dict[str, Any] = loaded
     captured_at = now_utc()
     value = {
         **existing,
@@ -231,7 +350,10 @@ def _write_state(
         "timezone": "Asia/Shanghai",
         "start": _iso(start),
         "end": _iso(end),
+        "as_of": _iso(as_of),
         "max_amount": max_amount,
+        "max_pages": max_pages,
+        "platforms": list(platforms),
         "phase": phase,
         "status": status,
         "details": dict(details),
@@ -381,14 +503,13 @@ def tag_history_scopes(
     幂等：重复执行不会改写已标记或已评估的行。
     """
 
+    if apply_changes:
+        _require_formal_mutation_freeze(db_path=db_path)
     start_utc, end_utc = _utc(start), _utc(end)
     archive_utc = _utc(archive_before)
     if start_utc >= end_utc:
         raise RangeBackfillError("标记区间开始时间必须早于结束时间")
-    selected_platforms = sorted(set(platforms or ("douyin", "xiaohongshu")))
-    invalid = set(selected_platforms) - {"douyin", "xiaohongshu"}
-    if invalid:
-        raise RangeBackfillError(f"不支持的平台：{','.join(sorted(invalid))}")
+    selected_platforms = _selected_platforms(platforms)
     platform_clause = ",".join("?" for _ in selected_platforms)
     segments = []
     if archive_utc > start_utc:
@@ -631,12 +752,12 @@ def run_discovery_backfill(
     archive_before: Optional[datetime] = None,
     workers: int = 1,
     compact: bool = False,
-    as_of: Optional[datetime] = None,
+    as_of: datetime,
     require_live_detail: bool = False,
     skip_existing_derived_stages: bool = False,
 ) -> Dict[str, Any]:
+    _require_formal_mutation_freeze(db_path=db_path)
     start_utc, end_utc = _utc(start), _utc(end)
-    effective_as_of = as_of or end
     if start_utc >= end_utc:
         raise RangeBackfillError("补抓开始时间必须早于结束时间")
     if max_amount <= 0 or max_pages_per_account <= 0:
@@ -645,8 +766,20 @@ def run_discovery_backfill(
         raise RangeBackfillError("workers 必须在 1 到 8 之间")
     if archive_before is not None:
         _utc(archive_before)
+    selected_platforms = _selected_platforms(platforms)
+    _prepare_campaign_contract(
+        task_id=task_id,
+        start=start,
+        end=end,
+        as_of=as_of,
+        max_amount=max_amount,
+        max_pages=max_pages_per_account,
+        platforms=selected_platforms,
+        phase="discover",
+        state_root=state_root,
+    )
     identities = _enabled_identities(
-        db_path=db_path, platforms=platforms, account_limit=account_limit
+        db_path=db_path, platforms=selected_platforms, account_limit=account_limit
     )
     blocking_stop = Event()
 
@@ -681,7 +814,7 @@ def run_discovery_backfill(
                 page = discover_account_content(
                     int(identity["account_id"]), str(identity["platform"]),
                     str(identity["uid"]),
-                    as_of=effective_as_of.astimezone(SHANGHAI).date(),
+                    as_of=as_of.astimezone(SHANGHAI).date(),
                     cursor=cursor, window_key=window_key,
                     published_start=start_utc, published_end=end_utc,
                     task_id=task_id, task_max_amount=max_amount,
@@ -781,7 +914,7 @@ def run_discovery_backfill(
         "status": status,
         "start": _iso(start),
         "end": _iso(end),
-        "as_of": _iso(effective_as_of),
+        "as_of": _iso(as_of),
         "require_live_detail": require_live_detail,
         "skip_existing_derived_stages": skip_existing_derived_stages,
         "accounts_considered": len(identities),
@@ -817,7 +950,7 @@ def run_discovery_backfill(
         )
         output["history_scopes"] = tag_history_scopes(
             start=start, end=end, archive_before=archive_before,
-            db_path=db_path, platforms=platforms, apply_changes=True,
+            db_path=db_path, platforms=selected_platforms, apply_changes=True,
             content_ids=inserted_content_ids,
         )
     output["content_manifest"] = _write_discovery_content_manifest(
@@ -829,8 +962,10 @@ def run_discovery_backfill(
         db_path=db_path,
     )
     state_path = _write_state(
-        task_id=task_id, start=start, end=end, max_amount=max_amount,
-        phase="discovery", status=status, details=output, state_root=state_root,
+        task_id=task_id, start=start, end=end, as_of=as_of,
+        max_amount=max_amount, max_pages=max_pages_per_account,
+        platforms=selected_platforms, phase="discover", status=status,
+        details=output, state_root=state_root,
     )
     output["state_path"] = str(state_path)
     return output
@@ -927,10 +1062,9 @@ def repair_discovery_placeholder_metrics(
 ) -> Dict[str, Any]:
     """Reopen only metrics slots closed by non-authoritative discovery zeros."""
 
-    selected_platforms = sorted(set(platforms or ("douyin", "xiaohongshu")))
-    invalid = set(selected_platforms) - {"douyin", "xiaohongshu"}
-    if invalid:
-        raise RangeBackfillError(f"不支持的平台：{','.join(sorted(invalid))}")
+    if apply_changes:
+        _require_formal_mutation_freeze(db_path=db_path)
+    selected_platforms = _selected_platforms(platforms)
     if limit is not None and limit <= 0:
         raise RangeBackfillError("limit 必须为正数")
     day_key = as_of.astimezone(SHANGHAI).date().isoformat()
@@ -1059,13 +1193,23 @@ def run_repaired_metrics_backfill(
     workers: int = 1,
     compact: bool = False,
     history_only: bool = False,
+    contract_max_pages: int = 20,
 ) -> Dict[str, Any]:
-    selected_platforms = sorted(set(platforms or ("douyin", "xiaohongshu")))
-    invalid = set(selected_platforms) - {"douyin", "xiaohongshu"}
-    if invalid:
-        raise RangeBackfillError(f"不支持的平台：{','.join(sorted(invalid))}")
+    _require_formal_mutation_freeze(db_path=db_path)
+    selected_platforms = _selected_platforms(platforms)
     if max_amount <= 0 or (limit is not None and limit <= 0):
         raise RangeBackfillError("预算与 limit 必须为正数")
+    _prepare_campaign_contract(
+        task_id=task_id,
+        start=start,
+        end=end,
+        as_of=as_of,
+        max_amount=max_amount,
+        max_pages=contract_max_pages,
+        platforms=selected_platforms,
+        phase="fetch-repaired-metrics",
+        state_root=state_root,
+    )
     day_key = as_of.astimezone(SHANGHAI).date().isoformat()
     parameters: List[Any] = [
         day_key, _iso(start), _iso(end), *selected_platforms,
@@ -1099,8 +1243,10 @@ def run_repaired_metrics_backfill(
 
     def flush_progress(partial_results: List[Dict[str, Any]]) -> None:
         _write_state(
-            task_id=task_id, start=start, end=end, max_amount=max_amount,
-            phase="metrics_repair", status="running",
+            task_id=task_id, start=start, end=end, as_of=as_of,
+            max_amount=max_amount, max_pages=contract_max_pages,
+            platforms=selected_platforms, phase="fetch-repaired-metrics",
+            status="running",
             details={
                 "candidates": len(content_ids),
                 "processed": len(partial_results),
@@ -1143,9 +1289,10 @@ def run_repaired_metrics_backfill(
         "results": _compact_content_results(results) if compact else results,
     }
     state_path = _write_state(
-        task_id=task_id, start=start, end=end, max_amount=max_amount,
-        phase="metrics_repair", status=status, details=output,
-        state_root=state_root,
+        task_id=task_id, start=start, end=end, as_of=as_of,
+        max_amount=max_amount, max_pages=contract_max_pages,
+        platforms=selected_platforms, phase="fetch-repaired-metrics",
+        status=status, details=output, state_root=state_root,
     )
     output["state_path"] = str(state_path)
     return output
@@ -1168,19 +1315,33 @@ def run_content_backfill(
     workers: int = 1,
     compact: bool = False,
     history_only: bool = False,
-    as_of: Optional[datetime] = None,
+    as_of: datetime,
+    contract_max_pages: int = 20,
 ) -> Dict[str, Any]:
-    effective_as_of = as_of or end
+    _require_formal_mutation_freeze(db_path=db_path)
+    selected_platforms = _selected_platforms(platforms)
     selected_stages = list(dict.fromkeys(stages or ("detail", "metrics", "comments")))
+    _prepare_campaign_contract(
+        task_id=task_id,
+        start=start,
+        end=end,
+        as_of=as_of,
+        max_amount=max_amount,
+        max_pages=contract_max_pages,
+        platforms=selected_platforms,
+        phase="content",
+        state_root=state_root,
+    )
     content_ids = pending_content_ids(
-        start=start, end=end, as_of=effective_as_of, db_path=db_path, limit=limit,
-        platforms=platforms, stages=selected_stages, history_only=history_only,
+        start=start, end=end, as_of=as_of, db_path=db_path, limit=limit,
+        platforms=selected_platforms, stages=selected_stages, history_only=history_only,
     )
 
     def flush_progress(partial_results: List[Dict[str, Any]]) -> None:
         _write_state(
-            task_id=task_id, start=start, end=end, max_amount=max_amount,
-            phase="content", status="running",
+            task_id=task_id, start=start, end=end, as_of=as_of,
+            max_amount=max_amount, max_pages=contract_max_pages,
+            platforms=selected_platforms, phase="content", status="running",
             details={
                 "candidates": len(content_ids),
                 "processed": len(partial_results),
@@ -1194,7 +1355,7 @@ def run_content_backfill(
         content_ids,
         processor=lambda content_id: update_content_data(
             content_id,
-            as_of=effective_as_of.astimezone(SHANGHAI).date(),
+            as_of=as_of.astimezone(SHANGHAI).date(),
             db_path=db_path,
             call_override=call_override, stages=selected_stages,
             process_media=False, task_id=task_id, task_max_amount=max_amount,
@@ -1210,7 +1371,7 @@ def run_content_backfill(
     output = {
         "task_id": task_id,
         "status": status,
-        "as_of": _iso(effective_as_of),
+        "as_of": _iso(as_of),
         "history_only": history_only,
         "candidates": len(content_ids),
         "processed": sum(
@@ -1226,8 +1387,10 @@ def run_content_backfill(
         "results": _compact_content_results(results) if compact else results,
     }
     state_path = _write_state(
-        task_id=task_id, start=start, end=end, max_amount=max_amount,
-        phase="content", status=status, details=output, state_root=state_root,
+        task_id=task_id, start=start, end=end, as_of=as_of,
+        max_amount=max_amount, max_pages=contract_max_pages,
+        platforms=selected_platforms, phase="content", status=status,
+        details=output, state_root=state_root,
     )
     output["state_path"] = str(state_path)
     return output
@@ -1245,6 +1408,8 @@ def run_local_evidence_backfill(
     platforms: Optional[Sequence[str]] = None,
     tagged_only: bool = False,
     compact: bool = False,
+    as_of: datetime,
+    contract_max_pages: int = 20,
 ) -> Dict[str, Any]:
     """媒体+评估+感知重复的本地证据推进；history-archive 内容按口径永不进入。
 
@@ -1254,10 +1419,21 @@ def run_local_evidence_backfill(
     terminal_failed 均保留标记，等待重试或未来显式刷新策略。
     """
 
-    selected_platforms = sorted(set(platforms or ("douyin", "xiaohongshu")))
-    invalid = set(selected_platforms) - {"douyin", "xiaohongshu"}
-    if invalid:
-        raise RangeBackfillError(f"不支持的平台：{','.join(sorted(invalid))}")
+    _require_formal_mutation_freeze(db_path=db_path)
+    selected_platforms = _selected_platforms(platforms)
+    if limit <= 0:
+        raise RangeBackfillError("limit 必须为正数")
+    _prepare_campaign_contract(
+        task_id=task_id,
+        start=start,
+        end=end,
+        as_of=as_of,
+        max_amount=max_amount,
+        max_pages=contract_max_pages,
+        platforms=selected_platforms,
+        phase="local-evidence",
+        state_root=state_root,
+    )
     platform_clause = ",".join("?" for _ in selected_platforms)
     scope_clause = (
         "c.source_group=?"
@@ -1476,9 +1652,10 @@ def run_local_evidence_backfill(
         "results": compact_results if compact else results,
     }
     state_path = _write_state(
-        task_id=task_id, start=start, end=end, max_amount=max_amount,
-        phase="local_evidence", status=terminal_status, details=output,
-        state_root=state_root,
+        task_id=task_id, start=start, end=end, as_of=as_of,
+        max_amount=max_amount, max_pages=contract_max_pages,
+        platforms=selected_platforms, phase="local-evidence",
+        status=terminal_status, details=output, state_root=state_root,
     )
     output["state_path"] = str(state_path)
     return output
@@ -1675,6 +1852,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--end", required=True)
     parser.add_argument(
         "--as-of",
+        required=True,
         help="当前累计指标/评论的实际采集截面（必须含时区）；"
         "与内容发布截止 --end 分离",
     )
@@ -1723,21 +1901,36 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     values = parser.parse_args(argv)
     if values.full_history and values.start:
         parser.error("--full-history 与 --start 互斥，只能二选一")
+    if not values.full_history and not values.start:
+        parser.error("非 --full-history 模式必须显式提供 --start")
     start = (
         FULL_HISTORY_START
         if values.full_history
-        else _parse_datetime(values.start or DEFAULT_START.isoformat())
+        else _parse_datetime(values.start)
     )
     end = _parse_datetime(values.end)
-    as_of = _parse_datetime(values.as_of) if values.as_of else end
+    as_of = _parse_datetime(values.as_of)
     archive_before = (
         _parse_datetime(values.archive_before) if values.archive_before else None
     )
     task_id = values.task_id or task_id_for(start, end)
+    selected_platforms = _selected_platforms(values.platform)
+    if values.apply and values.phase in {"repair-metrics", "tag"}:
+        _prepare_campaign_contract(
+            task_id=task_id,
+            start=start,
+            end=end,
+            as_of=as_of,
+            max_amount=values.max_amount,
+            max_pages=values.max_pages,
+            platforms=selected_platforms,
+            phase=values.phase,
+            state_root=STATE_ROOT,
+        )
     if values.phase == "discover":
         result = run_discovery_backfill(
             start=start, end=end, task_id=task_id, max_amount=values.max_amount,
-            db_path=values.db, platforms=values.platform,
+            db_path=values.db, platforms=selected_platforms,
             account_limit=values.limit, max_pages_per_account=values.max_pages,
             archive_before=archive_before, workers=values.workers,
             compact=values.compact,
@@ -1748,22 +1941,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     elif values.phase == "content":
         result = run_content_backfill(
             start=start, end=end, task_id=task_id, max_amount=values.max_amount,
-            db_path=values.db, limit=values.limit, platforms=values.platform,
+            db_path=values.db, limit=values.limit, platforms=selected_platforms,
             stages=values.stage, workers=values.workers, compact=values.compact,
             history_only=values.history_only,
             as_of=as_of,
+            contract_max_pages=values.max_pages,
         )
     elif values.phase == "local-evidence":
         result = run_local_evidence_backfill(
             start=start, end=end, task_id=task_id, max_amount=values.max_amount,
             db_path=values.db, limit=values.limit or 100,
-            platforms=values.platform, tagged_only=values.tagged_only,
-            compact=values.compact,
+            platforms=selected_platforms, tagged_only=values.tagged_only,
+            compact=values.compact, as_of=as_of,
+            contract_max_pages=values.max_pages,
         )
     elif values.phase == "repair-metrics":
         result = repair_discovery_placeholder_metrics(
             start=start, end=end, as_of=as_of, db_path=values.db,
-            platforms=values.platform, limit=values.limit,
+            platforms=selected_platforms, limit=values.limit,
             apply_changes=values.apply, history_only=values.history_only,
         )
     elif values.phase == "tag":
@@ -1771,13 +1966,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             parser.error("tag 阶段必须提供 --archive-before")
         result = tag_history_scopes(
             start=start, end=end, archive_before=archive_before,
-            db_path=values.db, platforms=values.platform,
+            db_path=values.db, platforms=selected_platforms,
             apply_changes=values.apply,
         )
     elif values.phase == "status":
         result = summarize_range_status(
             start=start, end=end, db_path=values.db,
-            platforms=values.platform, archive_before=archive_before,
+            platforms=selected_platforms, archive_before=archive_before,
             history_only=values.history_only,
             as_of=as_of,
         )
@@ -1785,9 +1980,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         result = run_repaired_metrics_backfill(
             start=start, end=end, as_of=as_of, task_id=task_id,
             max_amount=values.max_amount, db_path=values.db,
-            platforms=values.platform, limit=values.limit,
+            platforms=selected_platforms, limit=values.limit,
             workers=values.workers, compact=values.compact,
             history_only=values.history_only,
+            contract_max_pages=values.max_pages,
         )
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return 0 if result["status"] not in {"blocked", "partial"} else 2
