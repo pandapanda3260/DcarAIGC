@@ -26,9 +26,9 @@ Claude 的方向大体正确，但“54 个 schema 红灯全是陈旧 fixture”
 
 v12/v13/SPU 部分确实是 fixture 和写死版本断言漂移；但 installer 的 40 个 error 不能全部归类为 fixture。将“v16 结构 + 伪造 `PRAGMA user_version=11`”换成真实 v11 源 fixture 后，还暴露了 installer 自身只验证历史 v11→v13 增量、无法表达当前迁移边界的生产合同漂移。迁移守卫不应放宽；正确做法是使用真实历史源并严格验证声明的新增、删除、重建、manifest append、业务投影和 identity。
 
-目前代码修复大部分已进入工作树，但 **Gate 0 提交、全量回归、正式库迁移、LaunchAgent 加载、自然 02:00 验收、有界内容恢复都尚未完成**。不得把“代码已存在”当作“正式上线”。
+初始交接时，Gate 0、全量回归、正式库迁移、LaunchAgent 加载、自然 02:00 验收和有界内容恢复都未完成。现在以文首“2026-08-18 执行回执摘要”为准：Gate 0、回归、迁根、离线 v16 切换和 disabled plist 渲染已完成；加载、自然 02:00 验收和内容恢复仍受 D 日时间门约束。
 
-## 1. 当前正式基线
+## 1. 切换前正式基线（审计留存）
 
 本次重新扫描得到的正式库身份为：
 
@@ -42,7 +42,7 @@ v12/v13/SPU 部分确实是 fixture 和写死版本断言漂移；但 installer 
 - 6 个 attempt 的 `invocation_source` 全是 `legacy_migration`，正式库还没有一条真正 `scheduled` 里程。
 - canonical operator freeze lock 仍在 `runtime/operator-freeze.lock`，mode 0600。
 
-代码侧已是 schema v16 / `remove-manual-review`，报告合同为 v8.7。因此当前是“代码 v16，正式库 v15，freeze 保护中”，不是可直接重启的完整运行态。
+代码侧已是 schema v16 / `remove-manual-review`，报告合同为 v8.7。上述数值是离线切换前的 v15 审计锚点；当前正式 v16 身份以文首执行回执摘要和项目外 install receipt 为准。
 
 实施人在任何正式步骤前必须重新采样 schema identity、SHA、WAL、`provider_usage` 和 DB holder；上述数值只是 2026-08-18 的基线，不能替代当场验证。
 
