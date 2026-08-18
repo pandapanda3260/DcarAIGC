@@ -538,22 +538,73 @@ class ApiStartupSafetyTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "strict|valid"):
                     api_module.ApiConfig.from_env()
 
-    def test_reconcile_date_is_ineffective_without_writable_scheduler(self) -> None:
+    def test_reconcile_environment_rejects_non_scheduler_and_read_only_modes(
+        self,
+    ) -> None:
+        invalid_environments = (
+            (
+                {
+                    "DCAR_SCHEDULER_ENABLED": "0",
+                    "DCAR_DAILY_CAPTURE_RECONCILE_FROM": "2026-08-21",
+                },
+                "requires DCAR_SCHEDULER_ENABLED=1",
+            ),
+            (
+                {
+                    "DCAR_SCHEDULER_ENABLED": "1",
+                    "DCAR_DAILY_CAPTURE_RECONCILE_FROM": "2026-08-21",
+                    "DCAR_READ_ONLY": "1",
+                },
+                "requires writable mode",
+            ),
+        )
+        for environment, error in invalid_environments:
+            with self.subTest(environment=environment), patch.dict(
+                os.environ,
+                environment,
+                clear=True,
+            ):
+                with self.assertRaisesRegex(RuntimeError, error):
+                    api_module.ApiConfig.from_env()
+
+    def test_invalid_reconcile_config_fails_before_freeze_lock_writer_lock_and_db(
+        self,
+    ) -> None:
         reconcile_from = date(2026, 8, 21)
-        scheduler_disabled = replace(
-            _test_config(self.root / "disabled"),
-            daily_capture_reconcile_from=reconcile_from,
+        invalid_configs = (
+            (
+                replace(
+                    _test_config(self.root / "disabled"),
+                    writer_lock=self.root / "disabled-writer.lock",
+                    daily_capture_reconcile_from=reconcile_from,
+                ),
+                "requires DCAR_SCHEDULER_ENABLED=1",
+            ),
+            (
+                replace(
+                    _test_config(self.root / "read-only"),
+                    writer_lock=self.root / "read-only-writer.lock",
+                    scheduler_enabled=True,
+                    read_only=True,
+                    daily_capture_reconcile_from=reconcile_from,
+                ),
+                "requires writable mode",
+            ),
         )
-        read_only = replace(
-            _test_config(self.root / "read-only"),
-            scheduler_enabled=True,
-            read_only=True,
-            daily_capture_reconcile_from=reconcile_from,
-        )
-        self.assertIsNone(
-            scheduler_disabled.effective_daily_capture_reconcile_from
-        )
-        self.assertIsNone(read_only.effective_daily_capture_reconcile_from)
+        for config, error in invalid_configs:
+            with (
+                self.subTest(error=error),
+                patch.object(api_module, "_uses_formal_database") as formal_check,
+                patch.object(api_module, "_writer_process_lock") as writer_lock,
+                patch.object(api_module, "initialize_database") as initialize,
+            ):
+                with self.assertRaisesRegex(RuntimeError, error):
+                    with TestClient(api_module.create_app(config)):
+                        pass
+                formal_check.assert_not_called()
+                writer_lock.assert_not_called()
+                initialize.assert_not_called()
+                self.assertFalse(config.writer_lock.exists())
 
     def test_scheduler_missing_reconcile_date_fails_before_writer_lock(self) -> None:
         writer_lock = self.root / "missing-date-writer.lock"
@@ -565,7 +616,7 @@ class ApiStartupSafetyTest(unittest.TestCase):
         with patch.object(api_module, "initialize_database") as initialize:
             with self.assertRaisesRegex(
                 RuntimeError,
-                "daily capture reconcile requires an effective date",
+                "DCAR_DAILY_CAPTURE_RECONCILE_FROM is required",
             ):
                 with TestClient(api_module.create_app(config)):
                     pass

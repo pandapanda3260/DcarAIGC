@@ -196,12 +196,7 @@ class ApiConfig:
         reconcile_from = _optional_strict_iso_date(
             "DCAR_DAILY_CAPTURE_RECONCILE_FROM"
         )
-        if scheduler_enabled and reconcile_from is None:
-            raise RuntimeError(
-                "DCAR_DAILY_CAPTURE_RECONCILE_FROM is required when "
-                "DCAR_SCHEDULER_ENABLED=1"
-            )
-        return cls(
+        config = cls(
             db_path=Path(os.environ.get("DCAR_V8_DB", str(DEFAULT_DB))),
             reports_root=Path(
                 os.environ.get("DCAR_V8_REPORTS_ROOT", str(REPORTS_ROOT))
@@ -220,6 +215,27 @@ class ApiConfig:
             read_only=_enabled("DCAR_READ_ONLY"),
             daily_capture_reconcile_from=reconcile_from,
         )
+        config.validate_daily_capture_reconcile_contract()
+        return config
+
+    def validate_daily_capture_reconcile_contract(self) -> None:
+        """Reject reconcile settings that cannot be honored by this runtime."""
+
+        if self.daily_capture_reconcile_from is not None:
+            if not self.scheduler_enabled:
+                raise RuntimeError(
+                    "DCAR_DAILY_CAPTURE_RECONCILE_FROM requires "
+                    "DCAR_SCHEDULER_ENABLED=1"
+                )
+            if self.read_only:
+                raise RuntimeError(
+                    "DCAR_DAILY_CAPTURE_RECONCILE_FROM requires writable mode"
+                )
+        if self.scheduler_enabled and self.daily_capture_reconcile_from is None:
+            raise RuntimeError(
+                "DCAR_DAILY_CAPTURE_RECONCILE_FROM is required when "
+                "DCAR_SCHEDULER_ENABLED=1"
+            )
 
     @property
     def effective_startup_catchup_enabled(self) -> bool:
@@ -227,8 +243,7 @@ class ApiConfig:
 
     @property
     def effective_daily_capture_reconcile_from(self) -> date | None:
-        if self.read_only or not self.scheduler_enabled:
-            return None
+        self.validate_daily_capture_reconcile_contract()
         return self.daily_capture_reconcile_from
 
 
@@ -2031,11 +2046,9 @@ async def lifespan(app: FastAPI):
     config = getattr(app.state, "config", None)
     if not isinstance(config, ApiConfig):
         raise RuntimeError("FastAPI application is missing ApiConfig")
-    if config.scheduler_enabled and config.daily_capture_reconcile_from is None:
-        raise RuntimeError(
-            "daily capture reconcile requires an effective date when "
-            "scheduler is enabled"
-        )
+    # Validate before the freeze check, writer-lock context, or any database
+    # access so an impossible reconcile setting cannot leave runtime sidecars.
+    config.validate_daily_capture_reconcile_contract()
     if _uses_formal_database(config.db_path) and config.operator_freeze_lock.exists():
         # Check the operator freeze before the scheduler lock context: entering
         # that context creates/truncates the lock file even when DB startup is

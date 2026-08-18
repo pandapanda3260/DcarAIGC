@@ -1,0 +1,36 @@
+{
+  "source": {
+    "job_id": "daily_capture",
+    "scheduled_for": "2026-08-10T18:00:00Z",
+    "details_json_sha256": "6caeac3a14fc83a60037c4207254df6ab3396336b36ac944971780c5aa0f2f7b",
+    "projection_note": "Identifier-free projection of the exact status and provider_cost fields consumed by the rollout quality gate; provider_cost is the historical ledger-authoritative max value and equals the provider_usage USD sum for the same task_id."
+  },
+  "quality_gate_projection": {
+    "monitored_accounts": 183,
+    "monitored_contents": 3000,
+    "blocked_providers": [],
+    "budget_max_amount": 8.0,
+    "result_groups": {
+      "discovery": [
+        {"status": "failed", "provider_cost": 0.0, "count": 5},
+        {"status": "succeeded", "provider_cost": 0.001, "count": 146},
+        {"status": "succeeded", "provider_cost": 0.002, "count": 7},
+        {"status": "succeeded", "provider_cost": 0.01, "count": 25}
+      ],
+      "content_updates": [
+        {"status": "partial", "provider_cost": 0.0, "count": 711},
+        {"status": "partial", "provider_cost": 0.001, "count": 100},
+        {"status": "succeeded", "provider_cost": 0.0, "count": 292},
+        {"status": "succeeded", "provider_cost": 0.001, "count": 1627},
+        {"status": "succeeded", "provider_cost": 0.002, "count": 17},
+        {"status": "succeeded", "provider_cost": 0.004, "count": 1},
+        {"status": "succeeded", "provider_cost": 0.006, "count": 1},
+        {"status": "succeeded", "provider_cost": 0.007, "count": 1},
+        {"status": "succeeded", "provider_cost": 0.01, "count": 248},
+        {"status": "succeeded", "provider_cost": 0.018, "count": 1},
+        {"status": "succeeded", "provider_cost": 0.02, "count": 1}
+      ]
+    },
+    "provider_cost": 6.151
+  }
+}

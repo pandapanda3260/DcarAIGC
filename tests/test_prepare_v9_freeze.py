@@ -228,7 +228,7 @@ class ApiConfigTest(unittest.TestCase):
                 "DCAR_SCHEDULER_ENABLED": "1",
                 "DCAR_STARTUP_CATCHUP_ENABLED": "1",
                 "DCAR_DAILY_CAPTURE_RECONCILE_FROM": RECONCILE_FROM.isoformat(),
-                "DCAR_READ_ONLY": "1",
+                "DCAR_READ_ONLY": "0",
             }
             with patch.dict(os.environ, values, clear=True):
                 config = api.ApiConfig.from_env()
@@ -239,7 +239,7 @@ class ApiConfigTest(unittest.TestCase):
         self.assertEqual(config.writer_lock, root / "writer.lock")
         self.assertEqual(config.daily_capture_reconcile_from, RECONCILE_FROM)
         self.assertTrue(config.effective_startup_catchup_enabled)
-        self.assertTrue(config.read_only)
+        self.assertFalse(config.read_only)
 
     def test_local_start_script_keeps_paid_jobs_fail_closed(self) -> None:
         source = (ROOT / "scripts" / "start_web_mvp.sh").read_text(encoding="utf-8")

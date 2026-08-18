@@ -492,7 +492,7 @@ class V8SchedulerTest(unittest.TestCase):
         mismatched = {**baseline, "discovery": baseline["discovery"][:-1]}
         self.assertFalse(daily_capture_quality_gate(mismatched)["passed"])
 
-    def test_daily_capture_quality_gate_rejects_cost_reconciliation_mismatch(
+    def test_daily_capture_quality_gate_rejects_reported_cost_above_ledger(
         self,
     ) -> None:
         details = {
@@ -502,12 +502,90 @@ class V8SchedulerTest(unittest.TestCase):
             "content_updates": [{"status": "succeeded"}],
             "blocked_providers": [],
             "budget_max_amount": 8.0,
-            "reported_provider_cost": 1.0,
-            "ledger_provider_cost": 1.001,
+            "reported_provider_cost": 1.001,
+            "ledger_provider_cost": 1.0,
         }
         result = daily_capture_quality_gate(details)
         self.assertFalse(result["passed"])
-        self.assertFalse(result["checks"]["ledger_matches_details"])
+        self.assertFalse(result["checks"]["ledger_covers_reported"])
+
+    def test_daily_capture_quality_gate_rejects_invalid_cost_values(self) -> None:
+        baseline = {
+            "monitored_accounts": 1,
+            "monitored_contents": 1,
+            "discovery": [{"status": "succeeded"}],
+            "content_updates": [{"status": "succeeded"}],
+            "blocked_providers": [],
+            "budget_max_amount": 8.0,
+            "reported_provider_cost": 1.0,
+            "ledger_provider_cost": 1.0,
+        }
+        for field, value in (
+            ("reported_provider_cost", -0.001),
+            ("ledger_provider_cost", -0.001),
+            ("ledger_provider_cost", float("inf")),
+            ("budget_max_amount", float("nan")),
+        ):
+            with self.subTest(field=field, value=value):
+                result = daily_capture_quality_gate({**baseline, field: value})
+                self.assertFalse(result["passed"])
+                self.assertFalse(result["checks"]["cost_values_valid"])
+
+        for missing_field, check in (
+            ("ledger_provider_cost", "ledger_source_present"),
+            ("budget_max_amount", "budget_declaration_present"),
+        ):
+            with self.subTest(missing_field=missing_field):
+                incomplete = {**baseline}
+                incomplete.pop(missing_field)
+                result = daily_capture_quality_gate(incomplete)
+                self.assertFalse(result["passed"])
+                self.assertFalse(result["checks"][check])
+
+    def test_daily_capture_quality_gate_accepts_production_cost_asymmetry(
+        self,
+    ) -> None:
+        fixture_path = (
+            Path(__file__).parent
+            / "fixtures"
+            / "daily_capture_2026-08-11_quality_gate.json"
+        )
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        projection = fixture["quality_gate_projection"]
+
+        def expand_stage(stage: str) -> list[dict[str, object]]:
+            return [
+                {
+                    "status": group["status"],
+                    "provider_cost": group["provider_cost"],
+                }
+                for group in projection["result_groups"][stage]
+                for _ in range(group["count"])
+            ]
+
+        details = {
+            "monitored_accounts": projection["monitored_accounts"],
+            "monitored_contents": projection["monitored_contents"],
+            "discovery": expand_stage("discovery"),
+            "content_updates": expand_stage("content_updates"),
+            "blocked_providers": projection["blocked_providers"],
+            "budget_max_amount": projection["budget_max_amount"],
+            # The historical payload has neither split field. ``provider_cost``
+            # is its ledger-authoritative max value; the gate must derive the
+            # reported subtotal from the projected result rows above.
+            "provider_cost": projection["provider_cost"],
+        }
+
+        result = daily_capture_quality_gate(details)
+
+        self.assertTrue(result["passed"], result)
+        self.assertTrue(result["checks"]["ledger_covers_reported"])
+        self.assertFalse(
+            result["cost_reconciliation"]["ledger_exactly_matches_reported"]
+        )
+        self.assertEqual(result["cost_reconciliation"]["ledger_minus_reported"], 1.445)
+        self.assertEqual(result["cost_reconciliation"]["reported_provider_cost"], 4.706)
+        self.assertEqual(result["cost_reconciliation"]["ledger_provider_cost"], 6.151)
 
     def test_daily_capture_quality_gate_enforces_fixed_usd_eight_contract(
         self,
@@ -1944,6 +2022,7 @@ class V8SchedulerTest(unittest.TestCase):
         self.assertEqual(calls["metrics"], 2)
         self.assertGreater(ledger_cost, 0)
         self.assertEqual(result["provider_cost"], ledger_cost)
+        self.assertEqual(result["failed_operations"], 1)
 
     def test_xhs_block_opens_one_tikhub_circuit_and_never_uses_rnote(self) -> None:
         upsert_account(

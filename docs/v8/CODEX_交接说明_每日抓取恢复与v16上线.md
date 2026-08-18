@@ -145,7 +145,7 @@ migration lock 的项目外父目录必须由当前用户持有且权限精确�
 
 - `succeeded`：所有最终待执行对象完成。
 - `partial`：有真实成功，也有局部未解决项。`partial` 是终态，包括 `operator_retry` 在内都不重跑同一槽。
-- `failed`：全局 auth/balance/budget 阻断、没有任何有效成功或顶层异常。
+- `failed`：全局 auth/balance/budget 阻断、没有任何有效成功或顶层异常。`budget_blocked` 仍必须落 `failed`；不得为了通过验收提高 USD 8 上限或开启自动重试。
 - `skipped`：没有 enabled 身份等无任务情形。
 
 上线质量门与 scheduler run 状态分离，不篡改 run：
@@ -153,7 +153,7 @@ migration lock 的项目外父目录必须由当前用户持有且权限精确�
 - `len(discovery) == monitored_accounts`，且 succeeded ≥90%。
 - `len(content_updates) == monitored_contents`，且 `succeeded + already_succeeded` ≥60%。
 - `blocked_providers == []`。
-- details 成本与 `provider_usage` ledger 一致，且 task 总额≤USD 8。
+- `provider_usage` ledger 是权威账本。details 上报小计、ledger 和声明预算都必须是有限值，成本非负、预算为正；必须同时满足 `ledger >= details 上报小计`、`ledger <= 声明预算` 和 `ledger <= USD 8`。details 与 ledger 精确相等只作诊断，不影响 `passed`。
 
 2026-08-11 的实测样本为 178/183 discovery 成功、2189/3000 content 成功、`blocked_providers=[]`、USD 6.151，可通过 90%/60% 门。`eligible_contents=61,718`，因此 3,000 只是当天 selected cohort 上限（4.86%），60% 不是全库覆盖率。
 
@@ -232,7 +232,7 @@ git status --short
 - current-day guard 在生效日前、01:59、历史缺口、已有六种状态、跨夜、长睡眠场景下的零历史追跑。
 - 6 个业务 Cron + 1 个 reconcile，启动首次立即、无限 misfire 宽限、coalesce 和单实例。
 - Cron/reconcile 并发时动作 1 次、run 1 行、attempt 1 行，另一个返回重复跳过；同时断言 attempt 部分唯一索引、终态触发器和 append-only。
-- 178/183 + 2189/3000 通过质量门；1/3000、数组长度不等、provider blocked、ledger 不等或超预算均失败。质量失败不改 scheduler run 状态。
+- 178/183 + 2189/3000 通过质量门；1/3000、数组长度不等、provider blocked、非有限/负成本、`ledger < details 上报小计` 或 ledger 超声明预算/USD 8 均失败。`ledger > details 上报小计` 是允许的结构性差异，精确相等只作诊断。质量失败不改 scheduler run 状态。
 - task 预算跨 operation 总额封顶、并发预占、unbilled 释放、缺 cap/错 task/放大 cap 在 provider callback 前失败。
 - range 微秒保真、非 full-history 缺 `--start` 拒绝、`--as-of` 必填、首次 mutation 前合同验证和 formal freeze。
 - `startup_catchup` 严格 report-only，8765 对三个 writer 配置 fail-loud，plist/wrapper 日期不走 `writer.env`。
@@ -297,7 +297,7 @@ plist 为 `RunAtLoad=true`，bootstrap 会立即启动，reconcile 也会立即�
 - stderr 无 preflight exit 78、无日期/成本/凭据拒绝、无 KeepAlive + 300 秒 throttle 崩溃循环。
 - 观察窗内 `provider_usage` 无增长。
 
-禁止付费烟测。等待自然 02:00 后，用 scheduler run/attempt、`quality_gate`、provider ledger 和日志验收。状态为 `succeeded` 或 `partial` 只是必要条件，还必须通过 90%/60% 质量门。
+禁止付费烟测。等待自然 02:00 后，用 scheduler run/attempt、`quality_gate`、provider ledger 和日志验收。状态为 `succeeded` 或 `partial` 只是必要条件，还必须通过 90%/60% 与 ledger 方向性成本门。如出现 `budget_blocked`，本次仍按 `failed` 处理；保持现有上限，不自动重试。
 
 ## 8. 历史槽不补，只做有界内容恢复
 

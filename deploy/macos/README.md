@@ -104,7 +104,9 @@ tail -n 200 "$HOME/Library/Logs/DcarAIGC/writer-worker.stderr.log"
 
 scheduler 必须报告 requested/enabled，`startup_catchup.mode=report_only`，其 results 只能是日报/周报；`daily_capture_reconcile` 必须是 `mode=current_day_only`、`effective_from=D`、`interval_seconds=3600`。稳定观察至少 650 秒，除了 PID/health 稳定，stderr 还必须没有 preflight exit 78、日期拒绝或 KeepAlive/ThrottleInterval 崩溃循环。
 
-禁止手工执行 `daily_capture` 作为烟测；等待已授权的自然 02:00 槽。该槽结束后，状态可以是 `succeeded` 或 `partial`，但还必须通过独立质量门：discovery ≥90%、当天选中 cohort ≥60%、数组计数一致、provider 无阻断、ledger 与 details 一致且不超 USD 8。3,000 是选中 cohort 上限，不是全库覆盖率。
+禁止手工执行 `daily_capture` 作为烟测；等待已授权的自然 02:00 槽。该槽结束后，状态可以是 `succeeded` 或 `partial`，但还必须通过独立质量门：discovery ≥90%、当天选中 cohort ≥60%、数组计数一致、provider 无阻断。`provider_usage` ledger 是权威账本：details 上报小计、ledger 和声明预算必须是有限值，成本非负、预算为正，且同时满足 `ledger >= details 上报小计`、`ledger <= 声明预算`、`ledger <= USD 8`。两者精确相等只作诊断，不影响 `passed`。3,000 是选中 cohort 上限，不是全库覆盖率。
+
+`budget_blocked` 仍是 `failed`，不得为了通过本次验收提高 USD 8 上限或开启自动重试；后续只能按显式授权的 `operator_retry` 流程处理。
 
 ### 睡眠/唤醒语义
 

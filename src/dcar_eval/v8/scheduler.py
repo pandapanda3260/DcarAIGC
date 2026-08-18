@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time as time_module
 from collections import Counter
@@ -1059,15 +1060,34 @@ def run_due_capture(
         item.get("status") not in {"succeeded", "already_succeeded"}
         for item in content_updates
     )
+    completed_content_ids = {
+        int(item["content_id"])
+        for item in content_updates
+        if item.get("content_id") is not None
+        and item.get("status") in {"succeeded", "already_succeeded"}
+    }
+    incomplete_content_ids = {
+        int(item["content_id"])
+        for item in content_updates
+        if item.get("content_id") is not None
+        and item.get("status") not in {"succeeded", "already_succeeded"}
+    }
+    # A metrics-first result and its later content result describe the same
+    # selected content. Count each content once when both have the same outcome,
+    # while retaining a metric-only success/failure that the content result does
+    # not represent (for example an ``already_succeeded`` main-loop result after
+    # a failed metrics-first attempt).
     successful_operations = (
         len(discovery)
         - incomplete_discovery
         + len(content_updates)
         - incomplete_contents
-        + len(metrics_refreshed)
+        + len(metrics_refreshed - completed_content_ids)
     )
     failed_operations = (
-        incomplete_discovery + incomplete_contents + len(unresolved_metrics)
+        incomplete_discovery
+        + incomplete_contents
+        + len(unresolved_metrics - incomplete_content_ids)
     )
     if blocked_providers or successful_operations == 0:
         status = "failed"
@@ -1110,17 +1130,35 @@ def daily_capture_quality_gate(details: Mapping[str, Any]) -> Dict[str, Any]:
         item.get("status") in {"succeeded", "already_succeeded"}
         for item in content_updates
     )
-    reported_cost = round(
-        float(details.get("reported_provider_cost", details.get("provider_cost", 0)) or 0),
-        6,
+    reported_provider_cost = details.get("reported_provider_cost")
+    if reported_provider_cost is None:
+        # The verified 2026-08-11 occurrence predates the split cost fields and
+        # records only the ledger-authoritative ``provider_cost`` total. Rebuild
+        # its return-payload subtotal from the exact rows in details without
+        # pretending that the two sources were equal.
+        reported_provider_cost = sum(
+            float(item.get("provider_cost") or 0)
+            for group in (
+                discovery,
+                list(details.get("metrics_first_results") or []),
+                content_updates,
+            )
+            for item in group
+        )
+    reported_cost = round(float(reported_provider_cost or 0), 6)
+    ledger_source_present = (
+        details.get("ledger_provider_cost") is not None
+        or details.get("provider_cost") is not None
     )
     ledger_cost = round(
         float(details.get("ledger_provider_cost", details.get("provider_cost", 0)) or 0),
         6,
     )
+    budget_declaration_present = details.get("budget_max_amount") is not None
     budget_max = float(
         details.get("budget_max_amount", DAILY_CAPTURE_MAX_AMOUNT)
     )
+    ledger_exactly_matches_reported = abs(reported_cost - ledger_cost) <= 1e-6
     checks = {
         "accounts_complete": len(discovery) == monitored_accounts,
         "contents_complete": len(content_updates) == monitored_contents,
@@ -1135,7 +1173,16 @@ def daily_capture_quality_gate(details: Mapping[str, Any]) -> Dict[str, Any]:
             >= monitored_contents * DAILY_CAPTURE_CONTENT_QUALITY_PERCENT
         ),
         "providers_unblocked": not list(details.get("blocked_providers") or []),
-        "ledger_matches_details": abs(reported_cost - ledger_cost) <= 1e-6,
+        "ledger_source_present": ledger_source_present,
+        "budget_declaration_present": budget_declaration_present,
+        # provider_usage is the authoritative billed ledger. Per-operation
+        # return payloads can structurally under-report billed retries and
+        # post-fetch failures, so equality is diagnostic rather than a gate.
+        "ledger_covers_reported": ledger_cost + 1e-9 >= reported_cost,
+        "cost_values_valid": all(
+            math.isfinite(value) and value >= 0
+            for value in (reported_cost, ledger_cost, budget_max)
+        ),
         "budget_contract": (
             0 < budget_max <= DAILY_CAPTURE_MAX_AMOUNT + 1e-9
         ),
@@ -1155,6 +1202,12 @@ def daily_capture_quality_gate(details: Mapping[str, Any]) -> Dict[str, Any]:
         "content_threshold_percent": DAILY_CAPTURE_CONTENT_QUALITY_PERCENT,
         "declared_budget_max_amount": budget_max,
         "authorized_budget_max_amount": DAILY_CAPTURE_MAX_AMOUNT,
+        "cost_reconciliation": {
+            "reported_provider_cost": reported_cost,
+            "ledger_provider_cost": ledger_cost,
+            "ledger_minus_reported": round(ledger_cost - reported_cost, 6),
+            "ledger_exactly_matches_reported": ledger_exactly_matches_reported,
+        },
     }
 
 
