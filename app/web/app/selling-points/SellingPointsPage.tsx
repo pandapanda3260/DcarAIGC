@@ -106,7 +106,7 @@ export default function SellingPointsPage() {
     await readJson("/api/v8/selling-points/draft", { method: "POST" });
     setData(await readJson<SellingPointResponse>("/api/v8/selling-points/draft"));
     setDraftMode(true);
-    setMessage("已进入隔离草稿；原子激活前不影响生产评估");
+    setMessage("已进入草稿编辑。发布前不会影响当前的评估结果。");
   }
 
   async function beginPoint(point?: SellingPoint) {
@@ -142,10 +142,10 @@ export default function SellingPointsPage() {
       try {
         matcherRule = JSON.parse(form.matcherRuleJson);
       } catch {
-        throw new Error("匹配规则 JSON 格式无效");
+        throw new Error("匹配规则填写格式不正确，请检查后重试。");
       }
       if (!matcherRule || typeof matcherRule !== "object" || Array.isArray(matcherRule)) {
-        throw new Error("匹配规则必须是一个 JSON 对象");
+        throw new Error("匹配规则最外层需要使用大括号，请检查后重试。");
       }
       await readJson(
         editingCode ? `/api/v8/selling-points/items/${editingCode}` : "/api/v8/selling-points/items",
@@ -191,7 +191,7 @@ export default function SellingPointsPage() {
     <>
       {draftMode && (
         <span className="selling-point-activation-note" role="status">
-          草稿须完成评估回填与验收后，由发布流程原子激活
+          草稿完成检查并发布后才会正式生效
         </span>
       )}
       <button className="secondary selling-point-edit-standard" disabled={loading || saving} onClick={() => void beginPoint()}>
@@ -227,7 +227,7 @@ export default function SellingPointsPage() {
                     <div className="selling-point-summary-copy">
                       <span><b>{family.code}</b> {family.title}</span>
                       <strong>{draftMode || !familyHasHits ? "—" : primaryHits.toLocaleString("zh-CN")}</strong>
-                      <small>{draftMode ? "草稿不含命中统计" : familyHasHits ? `primary 命中 · ${familyPoints.length} 项标准` : `${familyPoints.length} 项标准`}</small>
+                      <small>{draftMode ? "草稿不含命中统计" : familyHasHits ? `主要卖点命中 · ${familyPoints.length} 项标准` : `${familyPoints.length} 项标准`}</small>
                     </div>
                   </article>
                 );
@@ -267,9 +267,9 @@ export default function SellingPointsPage() {
                         {draftMode
                           ? "草稿版本"
                           : data.windows
-                            ? `${statWindowLabels[statWindow]} ${windowPrimaryHits.toLocaleString("zh-CN")} 次 primary 命中`
+                            ? `${statWindowLabels[statWindow]} ${windowPrimaryHits.toLocaleString("zh-CN")} 次主要卖点命中`
                             : familyHasHits
-                              ? `${primaryHits.toLocaleString("zh-CN")} 次 primary 命中`
+                              ? `${primaryHits.toLocaleString("zh-CN")} 次主要卖点命中`
                               : "暂无命中统计"}
                       </p>
                       <span className="selling-point-window-control">
@@ -422,7 +422,7 @@ export default function SellingPointsPage() {
               <label className="span-two">名称<input value={form.label} onChange={(event) => setForm({ ...form, label: event.target.value })} /></label>
               <label className="span-two">定义<textarea value={form.definition} onChange={(event) => setForm({ ...form, definition: event.target.value })} /></label>
               <label className="span-two">
-                匹配规则 JSON
+                匹配规则（请按示例格式填写）
                 <textarea
                   className="matcher-rule-editor"
                   value={form.matcherRuleJson}
@@ -431,10 +431,10 @@ export default function SellingPointsPage() {
                 />
               </label>
             </div>
-            <section className="selling-point-projection-preview" aria-label="规则只读投影">
+            <section className="selling-point-projection-preview" aria-label="规则效果预览">
               <header>
-                <strong>规则只读投影</strong>
-                <span>适用场景与证据说明由匹配规则生成，保存后由服务端重新校验并投影。</span>
+                <strong>规则效果预览</strong>
+                <span>系统会根据匹配规则自动生成适用场景和判断依据，并在保存时再次检查。</span>
               </header>
               {projectionPoint ? (
                 <div className="selling-point-projection-grid">
@@ -443,20 +443,20 @@ export default function SellingPointsPage() {
                     <p>{projectionPoint.scenes.length ? projectionPoint.scenes.map(label).join("、") : "无"}</p>
                   </div>
                   <div>
-                    <h4>正向证据</h4>
+                    <h4>会判定为匹配的内容</h4>
                     <p>{projectionPoint.positive_evidence.length ? projectionPoint.positive_evidence.join("；") : "无"}</p>
                   </div>
                   <div>
-                    <h4>负向证据</h4>
+                    <h4>会排除的内容</h4>
                     <p>{projectionPoint.negative_evidence.length ? projectionPoint.negative_evidence.join("；") : "无"}</p>
                   </div>
                   <div>
-                    <h4>边界规则</h4>
+                    <h4>特殊情况</h4>
                     <p>{projectionPoint.boundary_rules.length ? projectionPoint.boundary_rules.join("；") : "无"}</p>
                   </div>
                 </div>
               ) : (
-                <p className="selling-point-projection-empty">新卖点保存并通过规则校验后生成投影。</p>
+                <p className="selling-point-projection-empty">保存并通过检查后，这里会显示适用场景和判断依据。</p>
               )}
             </section>
             <div className="modal-actions">

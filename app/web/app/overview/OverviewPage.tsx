@@ -114,13 +114,13 @@ function ChannelConclusion({ channel, index }: { channel: OverviewChannel; index
   return <section className="panel channel-conclusion" data-channel={channel.platform}>
     <div className="channel-conclusion-head">
       <span className="channel-number" aria-hidden="true">{channelNumber}</span>
-      <div className="channel-heading-copy"><span className="eyebrow">渠道 {channelNumber}</span><div className="channel-title-row"><h3>{channel.label}渠道</h3><span className={`channel-platform-mark ${channel.platform}`} title={brand.label}><Image src={brand.src} alt="" width={17} height={17} unoptimized /></span></div><p>窗口发布 {channel.publication_count} 条 · 证据覆盖 {channel.evidence_coverage_percentage ?? "—"}% · 有效曝光内容 {channel.valid_exposure_items} 条 · 可归类曝光覆盖 {channel.exposure_coverage_percentage ?? "—"}%</p></div>
+      <div className="channel-heading-copy"><span className="eyebrow">渠道 {channelNumber}</span><div className="channel-title-row"><h3>{channel.label}渠道</h3><span className={`channel-platform-mark ${channel.platform}`} title={brand.label}><Image src={brand.src} alt="" width={17} height={17} unoptimized /></span></div><p>所选时间内发布 {channel.publication_count} 条 · 可评估内容 {channel.evidence_coverage_percentage ?? "—"}% · 有曝光数据 {channel.valid_exposure_items} 条 · 已完成曝光分类 {channel.exposure_coverage_percentage ?? "—"}%</p></div>
     </div>
-    <div className="conclusion-subhead"><b>1</b><div><h4>汇总</h4><p>条数指标以该渠道窗口全部发布为分母；曝光分母仅含 view_count&gt;0 的有效曝光，未取得有效曝光不入分母。</p></div></div>
+    <div className="conclusion-subhead"><b>1</b><div><h4>汇总</h4><p>条数占比按所选时间内该平台的全部内容计算；曝光占比只统计曝光量大于 0 的内容。</p></div></div>
     <div className="conclusion-summary-grid">
       {conclusionMetrics.map(([key, label]) => <SummaryMetric key={key} metricKey={key} label={label} metric={channel.summary.metrics[key]} reasonId={`metric-reason-${channel.platform}-summary-${key}`} />)}
     </div>
-    <div className="conclusion-subhead scene-subhead"><b>2</b><div><h4>三个业务场景</h4><p>固定顺序为二手车、新车、媒体-AI小懂；其他和未知内容只进入渠道汇总分母。</p></div></div>
+    <div className="conclusion-subhead scene-subhead"><b>2</b><div><h4>三个业务场景</h4><p>依次展示二手车、新车和媒体-AI小懂；其他和未知内容只计入平台总数，不单独展示。</p></div></div>
     <div className="scene-conclusion-grid">
       {sceneOrder.map((sceneKey) => <SceneConclusion key={sceneKey} channel={channel} sceneKey={sceneKey} />)}
     </div>
@@ -146,20 +146,20 @@ export default function OverviewPage() {
   </div>;
   return (
     <AppShell active="overview" actions={windowSwitch}>
-      {error && <Notice tone="error">读取失败：{error}</Notice>}
-      {!overview && !error ? <Loading label="正在读取 v8 运营数据" /> : (
+      {error && <Notice tone="error">{error}</Notice>}
+      {!overview && !error ? <Loading label="正在加载运营数据" /> : (
         <section className="page-stack overview-dashboard">
           <h2 className="visually-hidden">渠道结论</h2>
           <p className="visually-hidden" aria-live="polite">已切换到{windowLabels[windowKey]}，数据已更新</p>
           {activeWindow && channelOrder.map((key, index) => <ChannelConclusion key={key} channel={activeWindow.channels[key]} index={index} />)}
           <div className="overview-support-grid">
             <article className="panel overview-support-card boundary-card">
-              <div className="support-card-title"><ClockIcon size={19} weight="regular" aria-hidden="true" /><h3>{windowLabels[windowKey]}统计边界</h3></div>
+              <div className="support-card-title"><ClockIcon size={19} weight="regular" aria-hidden="true" /><h3>{windowLabels[windowKey]}统计时间范围</h3></div>
               <dl className="definition-list">
                 <div><dt>开始</dt><dd>{activeWindow ? formatDate(activeWindow.period_start) : "—"}</dd></div>
-                <div><dt>结束（不含）</dt><dd>{activeWindow ? formatDate(activeWindow.period_end) : "—"}</dd></div>
-                <div><dt>窗口发布内容</dt><dd>{activeWindow?.metrics.publication_count?.value ?? "—"} 条</dd></div>
-                <div><dt>V2 / V3 可评分内容</dt><dd>{activeWindow?.eligible_count ?? "—"} 条</dd></div>
+                <div><dt>统计到此日期前一天</dt><dd>{activeWindow ? formatDate(activeWindow.period_end) : "—"}</dd></div>
+                <div><dt>所选时间内发布</dt><dd>{activeWindow?.metrics.publication_count?.value ?? "—"} 条</dd></div>
+                <div><dt>可自动评估的内容</dt><dd>{activeWindow?.eligible_count ?? "—"} 条</dd></div>
                 <div><dt>未关联账号内容</dt><dd>{activeWindow?.unassociated_content_count ?? "—"} 条</dd></div>
               </dl>
             </article>
@@ -167,9 +167,9 @@ export default function OverviewPage() {
               <div className="support-card-title"><ShieldCheckIcon size={19} weight="regular" aria-hidden="true" /><div><h3>数据质量状态</h3><p>缺日期内容不进入任何日期窗口，重复内容单独记录。</p></div></div>
               <div className="quality-grid">
                 <div><strong>{overview?.data_quality.missing_published_at ?? "—"}</strong><span>缺失发布日期</span></div>
-                <div><strong>{overview?.data_quality.duplicate_fingerprint_coverage ?? "—"}%</strong><span>重复指纹覆盖</span></div>
+                <div><strong>{overview?.data_quality.duplicate_fingerprint_coverage ?? "—"}%</strong><span>重复内容识别完成率</span></div>
                 <div><strong>{overview?.data_quality.confirmed_duplicate_count ?? "—"}</strong><span>确认重复内容</span></div>
-                <div><strong>{overview?.data_quality.duplicate_calibration_ready ? "已通过" : "未通过"}</strong><span>150 对定标</span></div>
+                <div><strong>{overview?.data_quality.duplicate_calibration_ready ? "已通过" : "未通过"}</strong><span>重复识别规则校验</span></div>
               </div>
             </article>
           </div>

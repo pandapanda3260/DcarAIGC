@@ -8,7 +8,7 @@ import {
   fromShanghaiDateTimeLocal,
   toShanghaiDateTimeLocal,
 } from "../app/contents/contentForm.ts";
-import { jsonRequest } from "../app/lib/api.ts";
+import { apiErrorMessage, jsonRequest } from "../app/lib/api.ts";
 import {
   metricCompactValue,
   metricEvidence,
@@ -16,6 +16,10 @@ import {
   metricStatus,
   metricUnavailableLabel,
   metricValue,
+  humanizeTaskMessage,
+  humanizeTaskStatus,
+  plainMetricReason,
+  taskWasSuperseded,
 } from "../app/lib/format.ts";
 
 function ratioMetric(status, reason, percentage = 62.05) {
@@ -34,13 +38,13 @@ function ratioMetric(status, reason, percentage = 62.05) {
 
 test("metric presentation uses causes and never publishes a gated number", () => {
   const belowCases = [
-    ["用户身份覆盖率 37.48%，低于 95% 门槛", "身份数据待补齐"],
+    ["用户身份覆盖率 37.48%，低于 95% 门槛", "部分用户身份信息不足"],
     ["用户分类覆盖率 0.0%，低于 100% 门槛", "用户分类未完成"],
-    ["去重有效用户 6 人，低于 30 人门槛", "互动用户少于30人"],
-    ["分类器定标未通过，暂不发布比例", "分类器未通过定标"],
-    ["可归类有效曝光 10/1000，覆盖 1%：低于 90% 发布门槛", "曝光归类待补齐"],
-    ["用户级汽车兴趣占比尚未接入用户聚合，暂不发布", "用户聚合未接入"],
-    ["", "暂不发布"],
+    ["去重有效用户 6 人，低于 30 人门槛", "互动用户少于 30 人"],
+    ["分类器定标未通过，暂不发布比例", "用户分类结果还没完成校验"],
+    ["可归类有效曝光 10/1000，覆盖 1%：低于 90% 发布门槛", "部分曝光还没完成分类"],
+    ["用户级汽车兴趣占比尚未接入用户聚合，暂不发布", "暂时无法按用户汇总"],
+    ["", "暂不显示"],
   ];
   for (const [reason, expected] of belowCases) {
     const metric = ratioMetric("below_threshold", reason);
@@ -48,7 +52,7 @@ test("metric presentation uses causes and never publishes a gated number", () =>
     assert.equal(metricUnavailableLabel(metric), expected);
     assert.equal(metricValue(metric), expected);
     assert.equal(metricCompactValue(metric), expected);
-    assert.equal(metricStatus(metric), "暂不发布");
+    assert.equal(metricStatus(metric), "暂不显示");
     assert.doesNotMatch(`${metricValue(metric)} ${metricStatus(metric)}`, /覆盖不足/);
   }
 
@@ -58,8 +62,8 @@ test("metric presentation uses causes and never publishes a gated number", () =>
     null,
   );
   assert.equal(metricPublishesValue(uncalibrated), false);
-  assert.equal(metricUnavailableLabel(uncalibrated), "重复识别待补齐");
-  assert.equal(metricValue(uncalibrated), "重复识别待补齐");
+  assert.equal(metricUnavailableLabel(uncalibrated), "重复内容识别规则还没完成校验");
+  assert.equal(metricValue(uncalibrated), "重复内容识别规则还没完成校验");
 
   const available = ratioMetric("available", "", 62.05);
   assert.equal(metricPublishesValue(available), true);
@@ -69,14 +73,27 @@ test("metric presentation uses causes and never publishes a gated number", () =>
 
   const sample = ratioMetric("sample_only", "分类器未经金标核对，数值仅供参考", 62.05);
   assert.equal(metricPublishesValue(sample), true);
-  assert.equal(metricCompactValue(sample), "62.05%（仅样本）");
+  assert.equal(metricCompactValue(sample), "62.05%（仅供参考）");
 
   const missingWithValue = { kind: "quantity", value: 1234, unit: "view", status: "missing", coverage_percentage: 0, reason: "" };
   assert.equal(metricPublishesValue(missingWithValue), false);
-  assert.equal(metricValue(missingWithValue), "无数据");
+  assert.equal(metricValue(missingWithValue), "暂无数据");
 
   const availableQuantity = { ...missingWithValue, status: "available" };
   assert.equal(metricValue(availableQuantity), "1,234");
+});
+
+test("user-facing errors and historical task messages stay in plain Chinese", () => {
+  assert.equal(apiErrorMessage([{ loc: ["body", "name"], msg: "invalid" }], 422), "提交的信息有误，请检查后重试。");
+  assert.equal(apiErrorMessage("UNIQUE constraint failed", 409), "数据已经发生变化，请刷新页面后重试。");
+  assert.equal(apiErrorMessage("internal traceback", 500), "服务暂时不可用，请稍后重试。");
+  assert.equal(apiErrorMessage("当前处于只读保护模式：可以查看数据，但暂时不能修改。", 403), "当前处于只读保护模式：可以查看数据，但暂时不能修改。");
+  assert.equal(plainMetricReason("曝光量快照覆盖率为 50.00%，低于 90% 发布阈值"), "有曝光量的数据占 50.00%，低于至少 90% 的要求");
+  assert.equal(plainMetricReason("报告窗口发现覆盖率为 80.00%，低于 90% 发布门槛"), "计划采集完成率为 80.00%，低于至少 90% 的要求");
+  assert.equal(humanizeTaskMessage("revision 1 invalidated from freeze manifest"), "第 1 版报告已作废。");
+  assert.equal(humanizeTaskMessage("已由发现补跑后的新任务替代；revision 1 仅供审计"), "这份旧任务已被更新后的报告替代；第 1 版仅用于保留记录。");
+  assert.equal(taskWasSuperseded("已由发现补跑后的新任务替代；revision 1 仅供审计"), true);
+  assert.equal(humanizeTaskStatus("failed", "已由发现补跑后的新任务替代；revision 1 仅供审计"), "已被替代");
 });
 
 async function render(path = "/overview") {
@@ -210,9 +227,9 @@ test("overview keeps time windows outside the fixed channel conclusion structure
   assert.match(source, /<h3>\{channel\.label\}渠道<\/h3>/);
   assert.match(source, /<h4>汇总<\/h4>/);
   assert.match(source, /<h4>三个业务场景<\/h4>/);
-  assert.match(source, /可归类曝光覆盖 \{channel\.exposure_coverage_percentage/);
+  assert.match(source, /已完成曝光分类 \{channel\.exposure_coverage_percentage/);
   assert.doesNotMatch(source, /曝光交叉覆盖/);
-  assert.match(source, /曝光分母仅含 view_count&gt;0 的有效曝光，未取得有效曝光不入分母/);
+  assert.match(source, /条数占比按所选时间内该平台的全部内容计算；曝光占比只统计曝光量大于 0 的内容/);
   // 未发布数值由统一 presenter 给短语，完整原因同时提供给辅助技术。
   assert.doesNotMatch(source, /coverage-limitation-reason/);
   assert.doesNotMatch(source, /whiteSpace: "normal"/);
@@ -222,7 +239,7 @@ test("overview keeps time windows outside the fixed channel conclusion structure
   assert.match(source, /!publishesValue && <span id=\{reasonId\} className="visually-hidden">\{evidence\}<\/span>/);
   assert.doesNotMatch(source, /unavailableReasonLabels|unavailableStatusLabels|function conclusionValue|function metricEvidence/);
   assert.match(formatSource, /const unavailableReasonLabels/);
-  assert.match(formatSource, /below_threshold:\s*"暂不发布"/);
+  assert.match(formatSource, /below_threshold:\s*"暂不显示"/);
   assert.doesNotMatch(`${source}\n${formatSource}`, /有效样本不足|"覆盖不足"/);
   assert.match(source, /activeWindow\.channels\[key\]/);
   assert.match(source, /className="channel-switch" role="group" aria-label="统计窗口"/);
@@ -233,7 +250,7 @@ test("overview keeps time windows outside the fixed channel conclusion structure
   assert.match(source, /brand-xiaohongshu\.svg/);
   assert.match(source, /sceneIcons[\s\S]*used_car:\s*CarIcon/);
   assert.match(source, /className="overview-support-grid"/);
-  assert.match(source, />\{windowLabels\[windowKey\]\}统计边界</);
+  assert.match(source, />\{windowLabels\[windowKey\]\}统计时间范围</);
   assert.match(source, />数据质量状态</);
   assert.doesNotMatch(source, /运营补充说明|operationalMetrics|operational-details/);
   assert.match(shell, /多渠道内容运营核心指标总览与场景分析/);
@@ -318,16 +335,16 @@ test("selling point standards use E/X/M scenes, scene-local hits, and matcher-on
   }
   assert.match(source, /matcherRuleJson: JSON\.stringify\(point\.matcher_rule \?\? \{\}, null, 2\)/);
   assert.match(source, /JSON\.parse\(form\.matcherRuleJson\)/);
-  assert.match(source, /匹配规则 JSON 格式无效/);
-  assert.match(source, /匹配规则必须是一个 JSON 对象/);
+  assert.match(source, /匹配规则填写格式不正确，请检查后重试。/);
+  assert.match(source, /匹配规则最外层需要使用大括号，请检查后重试。/);
   assert.match(source, /matcher_rule: matcherRule/);
   assert.doesNotMatch(source, /positiveEvidence|negativeEvidence|boundaryRules|businessSceneOptions|type="checkbox"/);
-  assert.match(source, /className="selling-point-projection-preview" aria-label="规则只读投影"/);
+  assert.match(source, /className="selling-point-projection-preview" aria-label="规则效果预览"/);
   assert.match(source, /projectionPoint\.positive_evidence/);
   assert.match(source, /projectionPoint\.negative_evidence/);
   assert.match(source, /projectionPoint\.boundary_rules/);
   assert.doesNotMatch(source, /\/api\/v8\/selling-points\/publish|发布标准/);
-  assert.match(source, /草稿须完成评估回填与验收后，由发布流程原子激活/);
+  assert.match(source, /草稿完成检查并发布后才会正式生效/);
   assert.match(source, /<AppShell active="selling-points" actions=\{shellActions\}>/);
   assert.match(source, /PlusIcon/);
   assert.match(source, /role="region" aria-label=\{`\$\{family\.code\} \$\{family\.title\}卖点标准表格`\} tabIndex=\{0\}/);
@@ -363,7 +380,7 @@ test("spu audience page keeps rule assets, association and 3D stats together", a
   assert.match(wrapper, /<SpuAudiencePage \/>/);
   assert.match(page, /<AppShell active="spu-audience" actions=\{shellActions\}>/);
   assert.match(page, /刷新数据/);
-  assert.match(page, /const shellActions = \([\s\S]*刷新数据[\s\S]*className="secondary spu-shell-action"[\s\S]*新增车型[\s\S]*\);\s*\n\s*return \(/);
+  assert.match(page, /const shellActions = \([\s\S]*重新识别内容[\s\S]*className="secondary spu-shell-action"[\s\S]*新增车型[\s\S]*\);\s*\n\s*return \(/);
   assert.doesNotMatch(page, /className="secondary spu-block-action"/);
   assert.match(styles, /\.spu-shell-action\s*\{[^}]*display:\s*inline-flex;[^}]*align-items:\s*center;[^}]*gap:\s*6px;/);
   assert.doesNotMatch(page, /运行关联/);
@@ -372,7 +389,7 @@ test("spu audience page keeps rule assets, association and 3D stats together", a
   //（"车型 → 人群 → 场景 规则链""规则预期 vs 内容实际"）连同长说明段一并删除，
   // 顺序改由各区块自己的 <h2> 断言；覆盖率总览上提到页首。
   {
-    const sectionOrder = ["<h2 id=\"spu-summary-title\">识别覆盖</h2>", "<h2>车系与款型库</h2>", "<h2>目标人群</h2>", "<h2>用车场景</h2>", "<h2>人群 × 场景映射</h2>", "<h2>覆盖缺口</h2>", "<h2>规则外溢</h2>"];
+    const sectionOrder = ["<h2 id=\"spu-summary-title\">识别完成情况</h2>", "<h2>车系与款型库</h2>", "<h2>目标人群</h2>", "<h2>用车场景</h2>", "<h2>人群对应的用车场景</h2>", "<h2>已配置但没有内容</h2>", "<h2>内容已有但规则未配置</h2>"];
     let previous = -1;
     for (const sectionLabel of sectionOrder) {
       const position = page.indexOf(sectionLabel);
@@ -388,14 +405,14 @@ test("spu audience page keeps rule assets, association and 3D stats together", a
   assert.doesNotMatch(page, /label: "全部" \}/);
   assert.match(page, /stats\?window=last_week/);
   // 车型库并入卖点页式渠道统计列；三维明细表与独立榜单删除
-  assert.match(page, /<th>命中统计<\/th><th>抖音条数占比<\/th><th>抖音曝光占比<\/th><th>小红书条数占比<\/th><th>小红书曝光占比<\/th><th>操作<\/th>/);
+  assert.match(page, /<th>识别结果<\/th><th>抖音条数占比<\/th><th>抖音曝光占比<\/th><th>小红书条数占比<\/th><th>小红书曝光占比<\/th><th>操作<\/th>/);
   assert.match(page, /<th>品牌<\/th><th>车系<\/th><th>款型<\/th><th>目标人群<\/th>/);
   assert.doesNotMatch(page, /<th>识别别名<\/th>/);
   assert.match(page, /识别别名（顿号或逗号分隔）/);
   assert.match(page, /selling-point-hit-value/);
   assert.match(page, /selling-point-share-value/);
   assert.match(page, /条发布/);
-  assert.match(page, /次有效曝光/);
+  assert.match(page, /次曝光/);
   // 车型库使用独立紧凑列宽，不能再被全局 1480px 宽表兜底覆盖
   assert.match(styles, /table:not\(\.selling-point-table\):not\(\.spu-catalog-table\):has\(th:nth-child\(7\)\)\s*\{[^}]*min-width:\s*1480px;/);
   assert.doesNotMatch(styles, /table:not\(\.selling-point-table\):has\(th:nth-child\(7\)\)\s*\{[^}]*min-width:\s*1480px;/);
@@ -407,15 +424,15 @@ test("spu audience page keeps rule assets, association and 3D stats together", a
   assert.match(styles, /\.spu-catalog-table \.selling-point-hit-value\s*\{[^}]*justify-items:\s*center;/);
   assert.match(styles, /\.spu-catalog-table \.selling-point-share-value,[\s\S]*\.spu-catalog-table \.selling-point-hit-empty\s*\{[^}]*text-align:\s*center;/);
   assert.doesNotMatch(page, /车型 × 人群 × 场景 数据表现|spu-detail-table|车型榜|人群榜|场景榜|spu-rollup/);
-  assert.match(page, /<th>内容显式信号<\/th><th>发布条数<\/th><th>曝光量<\/th>/);
+  assert.match(page, /<th>内容中出现的特征<\/th><th>发布条数<\/th><th>曝光量<\/th>/);
   assert.match(page, /<th>负向词<\/th><th>发布条数<\/th><th>曝光量<\/th>/);
   // 人群与场景是两个全宽纵向区块，不在宽屏下压成左右两列
   assert.match(styles, /\.spu-dim-grid\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\);/);
   // 自动保鲜：打开页面增量补算、保存规则后自动全量重算；资产与统计请求互不拖累
   assert.match(page, /associate\?mode=incremental/);
   assert.match(page, /stale_content_count/);
-  assert.match(page, /规则资产读取失败/);
-  assert.match(page, /统计读取失败/);
+  assert.match(page, /车型、人群和场景规则加载失败，请刷新页面重试。/);
+  assert.match(page, /统计数据加载失败，请刷新页面重试。/);
   // 车型库翻页：复用全站 Pagination 组件、放在表格上方（账号页同款），前端切片+末页夹紧
   assert.match(page, /import \{ Pagination \} from "\.\.\/components\/Pagination"/);
   assert.match(page, /import \{\s*filterVehicleSeriesGroups,\s*matchVehicleSeriesGroup,\s*sortVehicleCatalogRows,\s*\} from "\.\/vehicleCatalogSort"/);
@@ -436,7 +453,7 @@ test("spu audience page keeps rule assets, association and 3D stats together", a
   assert.match(styles, /\.spu-catalog-search:focus-within\s*\{[^}]*border-color:\s*var\(--teal\);/);
   assert.doesNotMatch(page, /function pageWindow/);
   // 车型库带"经人群推导"的核心场景列，回应"车型库看不到场景"的反馈
-  assert.match(page, /<th>核心场景（经人群推导）<\/th>/);
+  assert.match(page, /<th>主要用车场景<\/th>/);
   assert.match(page, /coreScenesByAudience/);
   // 页面读写走 v8 API，统计为 GET（只读副本可用），关联为 POST（副本被写保护拦截）
   assert.match(page, /\/api\/v8\/spu-audience\/assets/);
@@ -444,8 +461,8 @@ test("spu audience page keeps rule assets, association and 3D stats together", a
   assert.match(page, /"\/api\/v8\/spu-audience\/associate", \{ method: "POST" \}/);
   assert.match(page, /\/api\/v8\/spu-audience\/spu/);
   // 规则校准区 + 口径脚注（脚注挂在车型库面板底部）
-  assert.match(page, /覆盖缺口/);
-  assert.match(page, /规则外溢/);
+  assert.match(page, /已配置但没有内容/);
+  assert.match(page, /内容已有但规则未配置/);
   assert.match(page, /className="spu-footnotes"/);
   // 车系聚合视图：品牌/车系拆列，车系名提升为主信息；款型点开才出现，残量行改叫「仅识别到车系」
   assert.match(page, /catalogPageGroups\.map/);
@@ -465,12 +482,12 @@ test("spu audience page keeps rule assets, association and 3D stats together", a
   assert.match(styles, /\.spu-series-toggle\s*\{[^}]*color:\s*#74838a;[^}]*font-size:\s*9px;[^}]*font-weight:\s*600;/);
   assert.match(styles, /\.spu-series-toggle:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--teal\);[^}]*outline-offset:\s*2px;/);
   // 主表隐藏完整别名，编辑链路仍可回填普通/歧义别名并随保存请求提交
-  assert.match(page, /歧义别名（需语境确认才计入）/);
+  assert.match(page, /容易混淆的别名（只有上下文明确时才识别）/);
   assert.match(page, /row\.aliases\.filter\(\(item\) => !item\.ambiguous\)/);
   assert.match(page, /row\.aliases\.filter\(\(item\) => item\.ambiguous\)/);
   assert.match(page, /audience_secondary: form\.audienceSecondary \|\| null,\s*aliases,/);
   // 内容列表新增 SPU/人群/场景 三列与筛选，且顺序在卖点列之前；证据等级从卖点列拆出为独立列
-  assert.match(contents, /<th>内容方向<\/th><th>车型<\/th><th>人群<\/th><th>场景<\/th><th>卖点<\/th><th>证据等级<\/th><th>垂直度<\/th>/);
+  assert.match(contents, /<th>内容方向<\/th><th>车型<\/th><th>人群<\/th><th>场景<\/th><th>卖点<\/th><th>资料完整度<\/th><th>垂直度<\/th>/);
   // 界面不暴露独立的英文 "SPU" 文本节点（会被浏览器翻译插件误译成"空间物理单元"）
   assert.doesNotMatch(contents, /<th>SPU<\/th>/);
   assert.doesNotMatch(page, /<th>SPU<\/th>/);
@@ -484,15 +501,15 @@ test("spu audience page keeps rule assets, association and 3D stats together", a
   assert.match(types, /spu_secondary_count: number;/);
   assert.match(contents, /EVIDENCE_LEVEL_HINTS/);
   assert.match(contents, /className="evidence-level-tag" title=\{EVIDENCE_LEVEL_HINTS\[item\.evidence_level\]\}/);
-  // 证据等级展示用「V码-中文短标签」（2026-08-15 Mark 定稿），未知等级回退裸 V 码
-  assert.match(contents, /V3: "V3-信息完整",\s*V2: "V2-媒体存在",\s*V1: "V1-只有文字",\s*V0: "V0-不可用",/);
+  // 资料完整度先说人话，V 码保留在括号里用于核对；未知等级不再裸露内部值。
+  assert.match(contents, /V3: "信息完整（V3）",\s*V2: "有媒体资料（V2）",\s*V1: "只有文字（V1）",\s*V0: "资料不可用（V0）",/);
   assert.match(contents, /\{EVIDENCE_LEVEL_LABELS\[item\.evidence_level\] \?\? item\.evidence_level\}/);
   // 卖点列多行完整显示：不再用单行省略号，V 值也不再挤在卖点下方的 cell-subline 里
   assert.match(styles, /\.content-table \.selling-point-name \{ display: block; white-space: normal; overflow-wrap: anywhere; \}/);
   assert.doesNotMatch(styles, /\.content-table \.selling-point-name \{[^}]*text-overflow/);
   assert.doesNotMatch(contents, /<span className="cell-subline">\{item\.evidence_level/);
   assert.match(contents, /spu_series: filters\.spuSeries \|\| null, audience: filters\.audience \|\| null, scene: filters\.scene \|\| null/);
-  assert.match(contents, /灰区/);
+  assert.match(contents, /车型不确定/);
   // v16 起系统无人工复核：内容页不再有复核状态筛选、待复核/再次复核入口
   assert.doesNotMatch(contents, /复核/);
   assert.doesNotMatch(contents, /review_status|review_queue_id|pending_review_count/);
@@ -502,7 +519,7 @@ test("spu audience page keeps rule assets, association and 3D stats together", a
   assert.match(types, /spu: ContentTagSpu \| null;/);
   assert.match(types, /audience: ContentTagAudience \| null;/);
   assert.match(types, /scenes: ContentTagScene\[\];/);
-  assert.match(formatSource, /content_explicit: "内容显式", rule_prior: "规则推断"/);
+  assert.match(formatSource, /content_explicit: "内容中直接提到", rule_prior: "系统按规则判断"/);
   // 列宽口径：证据等级列拆出后内容表总宽 2126
   assert.match(styles, /\.content-table \{ min-width: 2126px !important; \}/);
   assert.match(styles, /\.main-area\[data-section="spu-audience"\]/);
@@ -536,7 +553,7 @@ test("spu audience page keeps rule assets, association and 3D stats together", a
   assert.match(apiSource, /recover_orphan_association_runs\(/);
   assert.doesNotMatch(page, /数据刷新已在后台启动|数据刷新完成|runParticipatedCount|runLlmFilledCount|const \[message, setMessage\]/);
   assert.match(page, /window\.setInterval/);
-  assert.match(page, /证据完整（V2\/V3）/);
+  assert.match(page, /只处理资料较完整、可以自动评估的内容；其他时间范围的数据不会改变/);
   // 车型库渠道占比的数据源：build_stats 返回分平台桶与发布门槛
   assert.match(spuModule, /"channels": channels,/);
   assert.match(spuModule, /"post_share": post_share,/);
@@ -549,10 +566,10 @@ test("spu audience page keeps rule assets, association and 3D stats together", a
   assert.match(spuModule, /llm_hook/);
   assert.match(spuModule, /def default_llm_hook/);
   assert.match(apiSource, /llm_hook=default_spu_llm_hook\(\)/);
-  assert.match(formatSource, /llm: "大模型补充"/);
+  assert.match(formatSource, /llm: "系统智能判断"/);
   // 「刷新数据」弹窗四选一：先选范围再确认，范围按发布时间、与统计窗口同口径（_window_bounds 同源）
   for (const label of ["昨天", "本周", "上周", "全部内容"]) assert.match(page, new RegExp(`label: "${label}"`));
-  assert.match(page, /选择刷新范围/);
+  assert.match(page, /选择要重新识别的内容范围/);
   assert.match(page, /推荐/);
   assert.match(page, /耗时较长/);
   assert.match(page, /spu-refresh-modal/);
@@ -564,7 +581,7 @@ test("spu audience page keeps rule assets, association and 3D stats together", a
   assert.doesNotMatch(page, /refreshData\(item\.key\)/);
   assert.match(page, /aria-labelledby="spu-refresh-title"/);
   assert.match(page, /event\.key === "Escape"/);
-  assert.match(page, /开始刷新/);
+  assert.match(page, /开始重新识别/);
   assert.match(page, /associate\?mode=\$\{scope\}/);
   assert.match(page, /setRefreshPicker\(true\)/);
   assert.match(styles, /\.spu-refresh-options/);
@@ -607,10 +624,10 @@ test("routes preserve operations and expose read-only evidence workbench", async
   for (const href of ["/overview", "/tasks", "/accounts", "/contents", "/selling-points", "/spu-audience"]) assert.match(shell, new RegExp(`href: "${href}"`));
   assert.match(accounts, /pending_platform_identities/);
   assert.match(accounts, /className="pending-identity-table"/);
-  assert.match(accounts, /<caption className="visually-hidden">待归属平台身份列表<\/caption>/);
-  assert.match(accounts, /<th>平台<\/th><th>平台 UID<\/th><th>昵称<\/th><th>关联内容<\/th>/);
+  assert.match(accounts, /<caption className="visually-hidden">待匹配的平台账号列表<\/caption>/);
+  assert.match(accounts, /<th>平台<\/th><th>平台账号编号<\/th><th>昵称<\/th><th>关联内容<\/th>/);
   assert.doesNotMatch(accounts, /pending-identity-grid/);
-  assert.match(accounts, /一个手机号对应一行账号主数据/);
+  assert.match(accounts, /每个手机号对应一个账号/);
   assert.match(accounts, /className="account-master-table"/);
   assert.match(accounts, /account-master-panel">\s*\n\s*<Pagination /);
   assert.match(accounts, /<Pagination page=\{page\} pageSize=\{pageSize\} total=\{total\} busy=\{fetching \|\| saving\} ariaLabel="账号分页" unitLabel="个账号" placement="top"/);
@@ -622,14 +639,14 @@ test("routes preserve operations and expose read-only evidence workbench", async
   assert.match(pagination, /pagination-\$\{placement\}/);
   assert.match(contents, /<Pagination page=\{page\} pageSize=\{pageSize\} total=\{total\}/);
   assert.doesNotMatch(contents, /function pageWindow/);
-  assert.match(accounts, /以手机号为锚点的账号主数据列表/);
+  assert.match(accounts, /以手机号为唯一标识的账号列表/);
   assert.match(accounts, /className="account-base-group" colSpan=\{4\} scope="colgroup">账号基础信息/);
   assert.match(accounts, /platformKeys\.map\(\(key\) => <th className="account-platform-group"/);
   assert.match(accounts, /className="account-management-group" colSpan=\{2\} scope="colgroup">账号管理/);
   assert.match(accounts, /<PlatformHeaderMark platformKey=\{key\} \/>/);
   assert.match(accounts, /data-platform-columns=\{key\}/);
   assert.match(formatSource, /platformKeys = \["douyin", "xiaohongshu", "wechat_channels", "kuaishou"\]/);
-  assert.match(accounts, /<th className="account-platform-start" scope="col">UID<\/th><th scope="col">是否实名<\/th><th scope="col">昵称<\/th><th className="account-number-cell" scope="col">粉丝量<\/th><th className="account-number-cell" scope="col">关联内容量<\/th>/);
+  assert.match(accounts, /<th className="account-platform-start" scope="col">平台账号编号<\/th><th scope="col">是否实名<\/th><th scope="col">昵称<\/th><th className="account-number-cell" scope="col">粉丝量<\/th><th className="account-number-cell" scope="col">关联内容量<\/th>/);
   assert.match(accounts, /<th className="account-sticky account-phone" scope="row"><strong>\{item\.phone\}<\/strong><\/th>/);
   assert.match(accounts, /<AccountPlatformCells account=\{item\} \/>/);
   assert.match(apiSource, /NULL follower_count/);
@@ -639,10 +656,10 @@ test("routes preserve operations and expose read-only evidence workbench", async
   assert.match(contents, /\/api\/v8\/contents\/validate/);
   assert.match(contents, /\/api\/v8\/contents\/import/);
   assert.match(contents, /\/update-data/);
-  assert.match(contents, /查看证据/);
-  assert.match(contents, /旧规则评估/);
+  assert.match(contents, /查看依据/);
+  assert.match(contents, /结果需更新/);
   assert.match(taskDetail, /display_effective_revision/);
-  assert.match(taskDetail, /历史规则报告，已过时/);
+  assert.match(taskDetail, /这份报告使用的是旧规则，请重新生成后再使用/);
   assert.match(taskDetail, /revision_state === "current"/);
   assert.match(taskDetail, /revision_state === "stale"/);
   assert.doesNotMatch(taskDetail, /revisions\.find\(\(item\) => !item\.invalidated_at\)/);
@@ -650,24 +667,34 @@ test("routes preserve operations and expose read-only evidence workbench", async
   assert.match(tasks, /stale_display_revision/);
   assert.match(tasks, /historical_revision_count/);
   assert.match(evidence, /display_evaluation_id/);
-  assert.match(evidence, /旧规则，已过时/);
-  assert.match(evidence, /当前 release 尚无评估/);
+  assert.match(evidence, /结果需更新/);
+  assert.match(evidence, /这条内容还没有按最新规则完成评估，目前展示的是旧结果/);
   assert.match(evidence, /当前评估摘要/);
-  assert.match(evidence, /ASR 全文/);
-  assert.match(evidence, /OCR 全文/);
+  assert.match(evidence, /语音转写/);
+  assert.match(evidence, /画面文字识别/);
   assert.match(evidence, /评论摘要/);
-  assert.match(evidence, /媒体处理槽/);
+  assert.match(evidence, /媒体处理记录/);
+  assert.match(evidence, /evidence_ready: "已完成"/);
+  assert.match(evidence, /retryable_failed: "处理失败，可以重试"/);
+  assert.match(evidence, /terminal_failed: "处理失败"/);
+  assert.match(evidence, /return processingStatusLabels\[value\] \?\? "状态未知"/);
+  assert.match(evidence, /automatic: "系统自动评估"/);
+  assert.match(evidence, /manual_review: "人工复核"/);
+  assert.match(evidence, /migrated_from_v5: "历史结果"/);
+  assert.match(evidence, /V3: "信息完整（V3）"/);
+  assert.match(evidence, /return labels\[value\] \?\? "资料状态未知"/);
   assert.match(evidence, /allow_paid_refresh/);
   assert.match(evidence, /\/evidence/);
   assert.match(evidence, /\/media\/retry/);
-  // v16 起证据弹窗是纯只读面板：无复核表单、无 reviews 接口调用
-  assert.doesNotMatch(evidence, /复核/);
+  // v16 起证据弹窗是纯只读面板：可以展示历史评估方式，但没有复核提交接口。
   assert.doesNotMatch(evidence, /\/api\/v8\/reviews/);
-  assert.match(evidence, /证据或规则变化后系统会自动重新评估并追加新版本/);
+  assert.match(evidence, /资料或规则更新后，系统会自动重新评估并保留历史结果/);
   assert.match(tasks, /新建自定义报告/);
   assert.match(taskDetail, /\/cancel/);
   assert.match(taskDetail, /\/resume/);
   assert.match(taskDetail, /文件与日志/);
+  assert.match(taskDetail, /!superseded/);
+  assert.match(taskDetail, /技术文件（供排查）/);
   assert.match(sellingPoints, /\/api\/v8\/selling-points\/draft/);
   assert.doesNotMatch(sellingPoints, /\/api\/v8\/selling-points\/publish/);
   assert.match(sellingPoints, /\/api\/v8\/selling-points\/items\/\$\{editingCode\}/);
@@ -746,13 +773,14 @@ test("task detail renders channel conclusions in the platforms tab without fabri
   assert.match(taskDetail, /!metricPublishesValue\(metric\) && <span className="visually-hidden">。完整原因：\{metricEvidence\(metric\)\}<\/span>/);
   assert.doesNotMatch(taskDetail, /unavailableReasonLabels|unavailableConclusionLabels|function conclusionCell/);
   assert.doesNotMatch(`${taskDetail}\n${formatSource}`, /有效样本不足|"覆盖不足"/);
-  assert.match(formatSource, /身份数据待补齐/);
+  assert.match(formatSource, /部分用户身份信息不足/);
   assert.match(formatSource, /用户分类未完成/);
-  assert.match(formatSource, /互动用户少于30人/);
-  assert.match(formatSource, /metric\.status === "sample_only" \? `\$\{value\}（仅样本）` : value/);
-  assert.match(taskDetail, /用户级去重口径/);
-  assert.match(taskDetail, /channel_conclusions\.csv/);
-  assert.match(taskDetail, /没有渠道\/场景结论/);
+  assert.match(formatSource, /互动用户少于 30 人/);
+  assert.match(formatSource, /metric\.status === "sample_only" \? `\$\{value\}（仅供参考）` : value/);
+  assert.match(taskDetail, /同一互动用户只计算一次/);
+  assert.doesNotMatch(taskDetail, /channel_conclusions\.csv/);
+  assert.match(taskDetail, /详细人数和覆盖率可在「文件与日志」中下载查看/);
+  assert.match(taskDetail, /这份旧报告没有平台和场景数据/);
   assert.match(taskDetail, /平台发布分布/);
   assert.match(taskDetail, /platform_dimensions/);
   assert.doesNotMatch(taskDetail, /audience_verticality|互动用户垂直度/);
@@ -789,7 +817,7 @@ test("task detail renders v8.5 and v8.6 quality details without leaking raw valu
 
   // 质量检查在界面上只出现中文名与白话说明，接口字段名不落进 DOM（防止 revision 式英文再回来）
   assert.match(source, /qualityCheckCopy/);
-  for (const name of ["发现覆盖", "详情覆盖", "指标新鲜度", "正式评估覆盖", "核心产物覆盖", "媒体处理终态覆盖", "重复指纹覆盖", "重复识别定标", "周评论证据覆盖"]) {
+  for (const name of ["账号采集完成率", "内容详情采集完成率", "播放和互动数据更新率", "卖点评估完成率", "语音和画面文字识别完成率", "视频和图片处理完成率", "重复内容识别完成率", "重复内容规则校验", "评论采集完成率"]) {
     assert.match(source, new RegExp(name));
   }
   assert.doesNotMatch(source, /<dt>\{key\}<\/dt>|<dt>discovery_coverage<\/dt>|definition-list/);
@@ -797,7 +825,7 @@ test("task detail renders v8.5 and v8.6 quality details without leaking raw valu
   assert.match(source, /key !== "weekly_comment_coverage" \|\| detail\?\.task_type === "weekly"/);
   // 文件与日志：产物名称、大小、事件类型全部转中文，raw 值只留在 title/接口里
   assert.match(source, /fileKindLabels/);
-  assert.match(source, /渠道结论表 CSV/);
+  assert.match(source, /渠道结论表（CSV）/);
   assert.match(source, /formatBytes\(file\.byte_size\)/);
   assert.doesNotMatch(source, /\{file\.file_kind\} · /);
   assert.match(source, /taskEventLabels/);

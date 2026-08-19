@@ -81,7 +81,7 @@ function formatVehicleMeta(row: SpuAssetRow) {
 }
 
 function formatCount(value: number | null | undefined) {
-  if (value == null) return "暂不发布";
+  if (value == null) return "暂不显示";
   return value.toLocaleString("zh-CN");
 }
 
@@ -100,19 +100,19 @@ function formatShare(value: number | null | undefined) {
 // 「刷新数据」弹窗的重算范围（发布时间口径，与统计窗口同源；后端按 V2/V3 预过滤）
 const refreshScopes = [
   {
-    key: "yesterday", label: "昨天", note: "仅刷新昨天发布的有效内容",
+    key: "yesterday", label: "昨天", note: "重新识别昨天发布且资料足够的内容",
     meta: "范围最小，完成最快", icon: CalendarBlankIcon,
   },
   {
-    key: "this_week", label: "本周", note: "刷新本周至今发布的有效内容",
+    key: "this_week", label: "本周", note: "重新识别本周至今发布且资料足够的内容",
     meta: "适合跟进本周新增内容", icon: CalendarDotsIcon,
   },
   {
-    key: "last_week", label: "上周", note: "刷新完整自然周内发布的内容",
+    key: "last_week", label: "上周", note: "重新识别上周发布且资料足够的内容",
     meta: "与默认统计窗口一致", badge: "推荐", icon: CalendarCheckIcon,
   },
   {
-    key: "full", label: "全部内容", note: "重新识别全部证据完整内容",
+    key: "full", label: "全部内容", note: "重新识别全部资料足够的内容",
     meta: "覆盖最广，耗时最长", badge: "耗时较长", icon: DatabaseIcon,
   },
 ] as const;
@@ -165,11 +165,11 @@ export default function SpuAudiencePage() {
           }
         }
       })
-      .catch((reason) => setError(reason instanceof Error ? reason.message : "规则资产读取失败"))
+      .catch((reason) => setError(reason instanceof Error ? reason.message : "车型、人群和场景规则加载失败，请刷新页面重试。"))
       .finally(() => setLoading(false));
     readJson<SpuAudienceStats>("/api/v8/spu-audience/stats?window=last_week")
       .then(setStats)
-      .catch((reason) => setError(reason instanceof Error ? reason.message : "统计读取失败"));
+      .catch((reason) => setError(reason instanceof Error ? reason.message : "统计数据加载失败，请刷新页面重试。"));
   }, []);
 
   const lastRunStatus = assets?.last_run?.status ?? null;
@@ -231,7 +231,7 @@ export default function SpuAudiencePage() {
             if (status === "succeeded") {
               setError("");
             } else {
-              setError("数据刷新失败，请查看刷新记录后重试");
+              setError("内容重新识别没有完成，请稍后重试；如果一直失败，请联系管理员。");
             }
           }
         } catch {
@@ -253,7 +253,7 @@ export default function SpuAudiencePage() {
       );
       await loadAssets();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "数据刷新启动失败");
+      setError(reason instanceof Error ? reason.message : "无法开始重新识别，请稍后重试。");
     } finally {
       refreshRequestRef.current = false;
       setRunning(false);
@@ -316,7 +316,7 @@ export default function SpuAudiencePage() {
         await loadAssets();
       }
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "车型保存失败");
+      setError(reason instanceof Error ? reason.message : "车型保存失败，请检查填写内容后重试。");
     } finally {
       setSaving(false);
     }
@@ -429,7 +429,7 @@ export default function SpuAudiencePage() {
   const shellActions = (
     <>
       <button ref={refreshTriggerRef} className="primary" disabled={loading || associationRunning || Boolean(assets && !assets.ready)} onClick={openRefreshPicker}>
-        {associationRunning ? "数据刷新中…" : "刷新数据"}
+        {associationRunning ? "正在重新识别…" : "重新识别内容"}
       </button>
       <button className="secondary spu-shell-action" disabled={loading || saving || Boolean(assets && !assets.ready)} onClick={() => editSpu()}>
         <PlusIcon size={15} weight="bold" aria-hidden />
@@ -441,20 +441,20 @@ export default function SpuAudiencePage() {
   return (
     <AppShell active="spu-audience" actions={shellActions}>
       <Feedback error={error} onClose={() => setError("")} />
-      {loading ? <Loading label="正在读取SPU人群数据" /> : assets && !assets.ready ? (
-        <section className="page-stack spu-audience-page"><article className="panel"><p>数据库尚未升级到最新结构，SPU人群功能在本环境暂不可用。</p></article></section>
+      {loading ? <Loading label="正在加载车型、人群和场景数据" /> : assets && !assets.ready ? (
+        <section className="page-stack spu-audience-page"><article className="panel"><p>当前数据版本较旧，暂时不能使用 SPU 人群功能。请联系管理员升级后重试。</p></article></section>
       ) : (
         <section className="page-stack spu-audience-page">
           <section className="spu-summary" aria-labelledby="spu-summary-title">
             <header className="spu-summary-head">
-              <h2 id="spu-summary-title">识别覆盖</h2>
+              <h2 id="spu-summary-title">识别完成情况</h2>
               <span className="selling-point-window-control spu-window-control">
                 <label htmlFor="spu-stat-window">统计窗口</label>
                 <select
                   id="spu-stat-window"
                   className="selling-point-window-select"
                   value={statWindow}
-                  onChange={(event) => { setStatWindow(event.target.value); void loadStats(event.target.value, statPlatform).catch((reason) => setError(reason instanceof Error ? reason.message : "统计读取失败")); }}
+                  onChange={(event) => { setStatWindow(event.target.value); void loadStats(event.target.value, statPlatform).catch((reason) => setError(reason instanceof Error ? reason.message : "统计数据加载失败，请刷新页面重试。")); }}
                 >
                   {statWindows.map((item) => <option key={item.key} value={item.key}>{item.label}</option>)}
                 </select>
@@ -462,7 +462,7 @@ export default function SpuAudiencePage() {
                   className="selling-point-window-select"
                   aria-label="统计平台"
                   value={statPlatform}
-                  onChange={(event) => { setStatPlatform(event.target.value); void loadStats(statWindow, event.target.value).catch((reason) => setError(reason instanceof Error ? reason.message : "统计读取失败")); }}
+                  onChange={(event) => { setStatPlatform(event.target.value); void loadStats(statWindow, event.target.value).catch((reason) => setError(reason instanceof Error ? reason.message : "统计数据加载失败，请刷新页面重试。")); }}
                 >
                   <option value="">全部平台</option>
                   <option value="douyin">抖音</option>
@@ -472,11 +472,11 @@ export default function SpuAudiencePage() {
             </header>
             <div className="spu-summary-grid">
               {[
-                { key: "spu", tone: "catalog", icon: <CarIcon size={22} weight="regular" aria-hidden />, label: "车型归类", value: stats?.coverage?.spu_percentage, note: catalogBreakdown },
-                { key: "audience", tone: "audience", icon: <UsersThreeIcon size={22} weight="regular" aria-hidden />, label: "人群归因", value: stats?.coverage?.audience_percentage, note: `P1–P${(assets?.audiences ?? []).length}` },
-                { key: "scene", tone: "scene", icon: <MapTrifoldIcon size={22} weight="regular" aria-hidden />, label: "场景识别", value: stats?.coverage?.scene_percentage, note: `S1–S${(assets?.scenes ?? []).length}` },
-                { key: "trim", tone: "map", icon: <StackIcon size={22} weight="regular" aria-hidden />, label: "款型细化", value: stats?.coverage?.trim_percentage, note: "已细化到款型" },
-                { key: "exposure", tone: "exposure", icon: <EyeIcon size={22} weight="regular" aria-hidden />, label: "曝光覆盖", value: stats?.exposure_gate?.classified_share, note: exposureAvailable ? "曝光可发布" : "低于 90%，暂不发布" },
+                { key: "spu", tone: "catalog", icon: <CarIcon size={22} weight="regular" aria-hidden />, label: "车型识别", value: stats?.coverage?.spu_percentage, note: catalogBreakdown },
+                { key: "audience", tone: "audience", icon: <UsersThreeIcon size={22} weight="regular" aria-hidden />, label: "人群识别", value: stats?.coverage?.audience_percentage, note: `${(assets?.audiences ?? []).length} 类人群` },
+                { key: "scene", tone: "scene", icon: <MapTrifoldIcon size={22} weight="regular" aria-hidden />, label: "场景识别", value: stats?.coverage?.scene_percentage, note: `${(assets?.scenes ?? []).length} 类场景` },
+                { key: "trim", tone: "map", icon: <StackIcon size={22} weight="regular" aria-hidden />, label: "具体款型识别", value: stats?.coverage?.trim_percentage, note: "已识别到具体款型" },
+                { key: "exposure", tone: "exposure", icon: <EyeIcon size={22} weight="regular" aria-hidden />, label: "已完成曝光分类", value: stats?.exposure_gate?.classified_share, note: exposureAvailable ? "数据足够，可以显示曝光占比" : "完成分类的曝光不足 90%，暂不显示曝光占比" },
               ].map((item) => (
                 <article className="spu-summary-item" data-tone={item.tone} key={item.key}>
                   <span className="spu-block-icon">{item.icon}</span>
@@ -527,7 +527,7 @@ export default function SpuAudiencePage() {
             </div>
             <div className="spu-table-wrap" role="region" aria-label="车系与款型库表格" tabIndex={0}>
               <table className="spu-catalog-table">
-                <thead><tr><th>品牌</th><th>车系</th><th>款型</th><th>目标人群</th><th>核心场景（经人群推导）</th><th>命中统计</th><th>抖音条数占比</th><th>抖音曝光占比</th><th>小红书条数占比</th><th>小红书曝光占比</th><th>操作</th></tr></thead>
+                <thead><tr><th>品牌</th><th>车系</th><th>款型</th><th>目标人群</th><th>主要用车场景</th><th>识别结果</th><th>抖音条数占比</th><th>抖音曝光占比</th><th>小红书条数占比</th><th>小红书曝光占比</th><th>操作</th></tr></thead>
                 <tbody>
                   {catalogPageGroups.length === 0 && (
                     <tr className="spu-catalog-empty">
@@ -582,7 +582,7 @@ export default function SpuAudiencePage() {
                             return (
                               <Fragment key={channelKey}>
                                 <td><span className={channel.post_share != null && channel.posts > 0 ? "selling-point-share-value" : "selling-point-hit-empty"} title={channel.post_denominator > 0 ? `${channel.posts.toLocaleString("zh-CN")} / ${channel.post_denominator.toLocaleString("zh-CN")} 条发布` : "窗口内无发布"}>{channel.posts > 0 ? formatShare(channel.post_share) : "—"}</span></td>
-                                <td><span className={channel.view_share != null && (channel.views ?? 0) > 0 ? "selling-point-share-value" : "selling-point-hit-empty"} title={channel.view_share != null ? `${(channel.views ?? 0).toLocaleString("zh-CN")} / ${channel.view_denominator.toLocaleString("zh-CN")} 次有效曝光` : "曝光覆盖不足或窗口内无有效曝光，暂不发布"}>{channel.view_share != null && (channel.views ?? 0) > 0 ? formatShare(channel.view_share) : "—"}</span></td>
+                                <td><span className={channel.view_share != null && (channel.views ?? 0) > 0 ? "selling-point-share-value" : "selling-point-hit-empty"} title={channel.view_share != null ? `${(channel.views ?? 0).toLocaleString("zh-CN")} / ${channel.view_denominator.toLocaleString("zh-CN")} 次曝光` : "曝光数据不足，暂不显示占比"}>{channel.view_share != null && (channel.views ?? 0) > 0 ? formatShare(channel.view_share) : "—"}</span></td>
                               </Fragment>
                             );
                           })}
@@ -611,7 +611,7 @@ export default function SpuAudiencePage() {
                                 return (
                                   <Fragment key={channelKey}>
                                     <td><span className={channel?.post_share != null && channel.posts > 0 ? "selling-point-share-value" : "selling-point-hit-empty"} title={channel && channel.post_denominator > 0 ? `${channel.posts.toLocaleString("zh-CN")} / ${channel.post_denominator.toLocaleString("zh-CN")} 条发布` : "窗口内无发布"}>{channel && channel.posts > 0 ? formatShare(channel.post_share) : "—"}</span></td>
-                                    <td><span className={channel?.view_share != null && (channel?.views ?? 0) > 0 ? "selling-point-share-value" : "selling-point-hit-empty"} title={channel?.view_share != null ? `${(channel.views ?? 0).toLocaleString("zh-CN")} / ${channel.view_denominator.toLocaleString("zh-CN")} 次有效曝光` : "曝光覆盖不足或窗口内无有效曝光，暂不发布"}>{channel?.view_share != null && (channel?.views ?? 0) > 0 ? formatShare(channel.view_share) : "—"}</span></td>
+                                    <td><span className={channel?.view_share != null && (channel?.views ?? 0) > 0 ? "selling-point-share-value" : "selling-point-hit-empty"} title={channel?.view_share != null ? `${(channel.views ?? 0).toLocaleString("zh-CN")} / ${channel.view_denominator.toLocaleString("zh-CN")} 次曝光` : "曝光数据不足，暂不显示占比"}>{channel?.view_share != null && (channel?.views ?? 0) > 0 ? formatShare(channel.view_share) : "—"}</span></td>
                                   </Fragment>
                                 );
                               })}
@@ -638,7 +638,7 @@ export default function SpuAudiencePage() {
                               return (
                                 <Fragment key={channelKey}>
                                   <td><span className={channel?.post_share != null && channel.posts > 0 ? "selling-point-share-value" : "selling-point-hit-empty"} title={channel && channel.post_denominator > 0 ? `${channel.posts.toLocaleString("zh-CN")} / ${channel.post_denominator.toLocaleString("zh-CN")} 条发布` : "窗口内无发布"}>{channel && channel.posts > 0 ? formatShare(channel.post_share) : "—"}</span></td>
-                                  <td><span className={channel?.view_share != null && (channel?.views ?? 0) > 0 ? "selling-point-share-value" : "selling-point-hit-empty"} title={channel?.view_share != null ? `${(channel.views ?? 0).toLocaleString("zh-CN")} / ${channel.view_denominator.toLocaleString("zh-CN")} 次有效曝光` : "曝光覆盖不足或窗口内无有效曝光，暂不发布"}>{channel?.view_share != null && (channel?.views ?? 0) > 0 ? formatShare(channel.view_share) : "—"}</span></td>
+                                  <td><span className={channel?.view_share != null && (channel?.views ?? 0) > 0 ? "selling-point-share-value" : "selling-point-hit-empty"} title={channel?.view_share != null ? `${(channel.views ?? 0).toLocaleString("zh-CN")} / ${channel.view_denominator.toLocaleString("zh-CN")} 次曝光` : "曝光数据不足，暂不显示占比"}>{channel?.view_share != null && (channel?.views ?? 0) > 0 ? formatShare(channel.view_share) : "—"}</span></td>
                                 </Fragment>
                               );
                             })}
@@ -665,11 +665,11 @@ export default function SpuAudiencePage() {
                   <span className="spu-block-icon"><UsersThreeIcon size={20} weight="regular" aria-hidden /></span>
                   <h2>目标人群</h2>
                 </div>
-                <p className="spu-block-meta">P1–P{(assets?.audiences ?? []).length}</p>
+                <p className="spu-block-meta">共 {(assets?.audiences ?? []).length} 类</p>
               </header>
               <div className="spu-table-wrap">
                 <table className="spu-dim-table">
-                  <thead><tr><th>人群</th><th>定义</th><th>内容显式信号</th><th>发布条数</th><th>曝光量</th></tr></thead>
+                  <thead><tr><th>人群</th><th>定义</th><th>内容中出现的特征</th><th>发布条数</th><th>曝光量</th></tr></thead>
                   <tbody>
                     {(assets?.audiences ?? []).map((item) => {
                       const rowStats = audienceStatsByCode.get(item.code);
@@ -687,7 +687,7 @@ export default function SpuAudiencePage() {
                   <span className="spu-block-icon"><MapTrifoldIcon size={20} weight="regular" aria-hidden /></span>
                   <h2>用车场景</h2>
                 </div>
-                <p className="spu-block-meta">S1–S{(assets?.scenes ?? []).length}</p>
+                <p className="spu-block-meta">共 {(assets?.scenes ?? []).length} 类</p>
               </header>
               <div className="spu-table-wrap">
                 <table className="spu-dim-table">
@@ -709,13 +709,13 @@ export default function SpuAudiencePage() {
             <header className="spu-block-head">
               <div className="spu-block-title">
                 <span className="spu-block-icon"><ArrowsLeftRightIcon size={20} weight="regular" aria-hidden /></span>
-                <h2>人群 × 场景映射</h2>
+                  <h2>人群对应的用车场景</h2>
               </div>
-              <p className="spu-block-meta">车型的核心场景由此推导</p>
+                <p className="spu-block-meta">系统按目标人群推算车型的常见场景</p>
             </header>
             <div className="spu-table-wrap">
               <table className="spu-dim-table spu-map-table">
-                <thead><tr><th>人群</th><th>核心场景（经人群推导）</th><th>相关场景</th></tr></thead>
+                <thead><tr><th>人群</th><th>主要场景</th><th>相关场景</th></tr></thead>
                 <tbody>
                   {(assets?.audience_scene_map ?? []).map((row) => (
                     <tr key={row.audience_code}>
@@ -734,12 +734,12 @@ export default function SpuAudiencePage() {
               <header className="spu-block-head">
                 <div className="spu-block-title">
                   <span className="spu-block-icon"><TargetIcon size={20} weight="regular" aria-hidden /></span>
-                  <h2>覆盖缺口</h2>
+                  <h2>已配置但没有内容</h2>
                 </div>
-                <p className="spu-block-meta">规则应覆盖，窗口内无内容<span aria-hidden>·</span>{(stats?.gaps?.missing ?? []).length} 项</p>
+                <p className="spu-block-meta">规则中已配置，但所选时间内没有相关内容<span aria-hidden>·</span>{(stats?.gaps?.missing ?? []).length} 项</p>
               </header>
               <div className="spu-block-body">
-                {(stats?.gaps?.missing ?? []).length === 0 ? <p className="spu-empty-note">当前窗口没有覆盖缺口。</p> : (
+                {(stats?.gaps?.missing ?? []).length === 0 ? <p className="spu-empty-note">当前没有缺少内容的已配置场景。</p> : (
                   <ul className="spu-gap-list">
                     {(stats?.gaps?.missing ?? []).map((gap) => (
                       <li key={`${gap.series}|${gap.scene.code}`}>
@@ -754,12 +754,12 @@ export default function SpuAudiencePage() {
               <header className="spu-block-head">
                 <div className="spu-block-title">
                   <span className="spu-block-icon"><WarningIcon size={20} weight="regular" aria-hidden /></span>
-                  <h2>规则外溢</h2>
+                  <h2>内容已有但规则未配置</h2>
                 </div>
-                <p className="spu-block-meta">内容已出现，映射表未登记<span aria-hidden>·</span>{(stats?.gaps?.overflow ?? []).length} 项</p>
+                <p className="spu-block-meta">内容中已识别到，但规则里还没有配置<span aria-hidden>·</span>{(stats?.gaps?.overflow ?? []).length} 项</p>
               </header>
               <div className="spu-block-body">
-                {(stats?.gaps?.overflow ?? []).length === 0 ? <p className="spu-empty-note">当前窗口没有规则外溢。</p> : (
+                {(stats?.gaps?.overflow ?? []).length === 0 ? <p className="spu-empty-note">当前没有需要补充的规则。</p> : (
                   <ul className="spu-gap-list">
                     {(stats?.gaps?.overflow ?? []).map((gap) => (
                       <li key={`${gap.audience.code}|${gap.scene.code}`}>
@@ -794,22 +794,22 @@ export default function SpuAudiencePage() {
                 <ArrowsClockwiseIcon size={22} weight="bold" />
               </span>
               <div className="spu-refresh-heading">
-                <span className="eyebrow">数据刷新</span>
-                <h2 id="spu-refresh-title">选择刷新范围</h2>
+                <span className="eyebrow">重新识别内容</span>
+                <h2 id="spu-refresh-title">选择要重新识别的内容范围</h2>
               </div>
-              <button type="button" className="spu-refresh-close" onClick={() => setRefreshPicker(false)} aria-label="关闭刷新范围弹窗">
+              <button type="button" className="spu-refresh-close" onClick={() => setRefreshPicker(false)} aria-label="关闭内容范围选择窗口">
                 <XIcon size={18} weight="bold" aria-hidden />
               </button>
             </header>
 
             <div className="spu-refresh-body">
-              <p id="spu-refresh-description" className="spu-refresh-note">按内容发布时间选择范围，口径与页面统计窗口一致；确认后将在后台重新识别。</p>
+              <p id="spu-refresh-description" className="spu-refresh-note">这里的日期范围与页面上选择的统计时间一致。开始后系统会在后台重新识别内容。</p>
               <div className="spu-refresh-guardrail">
                 <ShieldCheckIcon size={18} weight="fill" aria-hidden />
-                <span>仅处理证据完整（V2/V3）的内容，范围外数据不会变化。</span>
+                <span>只处理资料较完整、可以自动评估的内容；其他时间范围的数据不会改变。</span>
               </div>
               <fieldset className="spu-refresh-options">
-                <legend className="visually-hidden">选择要刷新的内容范围</legend>
+                <legend className="visually-hidden">选择要重新识别的内容范围</legend>
                 {refreshScopes.map((item) => {
                   const ScopeIcon = item.icon;
                   const selected = selectedRefreshScope === item.key;
@@ -843,7 +843,7 @@ export default function SpuAudiencePage() {
               <button type="button" className="secondary" onClick={() => setRefreshPicker(false)}>取消</button>
               <button type="button" className="primary" disabled={associationRunning} onClick={() => void refreshData(selectedRefreshScope)}>
                 <ArrowsClockwiseIcon size={16} weight="bold" aria-hidden />
-                开始刷新
+                开始重新识别
               </button>
             </footer>
           </section>
@@ -853,17 +853,17 @@ export default function SpuAudiencePage() {
       {form && (
         <div className="modal-backdrop" role="presentation">
           <section className="modal-panel operation-modal" role="dialog" aria-modal="true" aria-label="编辑车型">
-            <div className="panel-head"><div><span className="eyebrow">车型主数据</span><h3>{form.spuId ? "编辑车型" : "新增车型"}</h3></div><button className="modal-close" onClick={() => setForm(null)} aria-label="关闭">×</button></div>
+            <div className="panel-head"><div><span className="eyebrow">车型资料</span><h3>{form.spuId ? "编辑车型" : "新增车型"}</h3></div><button className="modal-close" onClick={() => setForm(null)} aria-label="关闭">×</button></div>
             <div className="modal-fields">
               <label>品牌<input value={form.brand} disabled={Boolean(form.spuId)} onChange={(event) => setForm({ ...form, brand: event.target.value })} /></label>
               <label>车系<input value={form.series} disabled={Boolean(form.spuId)} onChange={(event) => setForm({ ...form, series: event.target.value })} /></label>
-              <label className="span-two">款型名称（留空表示车系级记录：内容仅识别到车系时计入该行）<input value={form.trimLabel} placeholder="如：2026款 DM-i 55KM 领先型" onChange={(event) => setForm({ ...form, trimLabel: event.target.value })} /></label>
+              <label className="span-two">款型名称（如果不填，系统会把只识别到车系的内容统计到这条记录中）<input value={form.trimLabel} placeholder="如：2026款 DM-i 55KM 领先型" onChange={(event) => setForm({ ...form, trimLabel: event.target.value })} /></label>
               <label>年款<input value={form.modelYear} placeholder="2026" onChange={(event) => setForm({ ...form, modelYear: event.target.value })} /></label>
               <label>能源形式<select value={form.powertrain} onChange={(event) => setForm({ ...form, powertrain: event.target.value })}><option value="">未填</option><option value="ev">纯电</option><option value="phev">插混</option><option value="erev">增程</option><option value="hev">油混</option><option value="ice">燃油</option></select></label>
               <label>车身形式<input value={form.bodyStyle} placeholder="SUV / 轿车 / MPV" onChange={(event) => setForm({ ...form, bodyStyle: event.target.value })} /></label>
               <label>指导价带（万）<span className="spu-price-pair"><input value={form.priceLow} placeholder="下限" onChange={(event) => setForm({ ...form, priceLow: event.target.value })} /><input value={form.priceHigh} placeholder="上限" onChange={(event) => setForm({ ...form, priceHigh: event.target.value })} /></span></label>
               <label className="span-two">识别别名（顿号或逗号分隔）<input value={form.aliases} placeholder="秦PLUS，秦plus" onChange={(event) => setForm({ ...form, aliases: event.target.value })} /></label>
-              <label className="span-two">歧义别名（需语境确认才计入）<input value={form.ambiguousAliases} placeholder="秦" onChange={(event) => setForm({ ...form, ambiguousAliases: event.target.value })} /></label>
+              <label className="span-two">容易混淆的别名（只有上下文明确时才识别）<input value={form.ambiguousAliases} placeholder="秦" onChange={(event) => setForm({ ...form, ambiguousAliases: event.target.value })} /></label>
               <label>主要目标人群<select value={form.audiencePrimary} onChange={(event) => setForm({ ...form, audiencePrimary: event.target.value })}><option value="">未配置</option>{(assets?.audiences ?? []).map((item) => <option key={item.code} value={item.code}>{item.code} {item.label}</option>)}</select></label>
               <label>次要目标人群<select value={form.audienceSecondary} onChange={(event) => setForm({ ...form, audienceSecondary: event.target.value })}><option value="">未配置</option>{(assets?.audiences ?? []).map((item) => <option key={item.code} value={item.code}>{item.code} {item.label}</option>)}</select></label>
             </div>

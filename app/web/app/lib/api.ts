@@ -4,11 +4,31 @@ export function apiUrl(path: string) {
   return `${API_BASE}${path}`;
 }
 
+export function apiErrorMessage(detail: unknown, status: number) {
+  if (status >= 500) return "服务暂时不可用，请稍后重试。";
+  if (status === 422) return "提交的信息有误，请检查后重试。";
+  const text = typeof detail === "string" ? detail.trim() : "";
+  // 后端异常里可能带接口字段名、内部状态或英文堆栈；这些内容只留在日志中。
+  if (text && !/[A-Za-z_]{3,}/.test(text)) return text;
+  if (status === 401) return "登录已过期，请重新登录。";
+  if (status === 403) return "当前操作不可用，请刷新页面后重试。";
+  if (status === 404) return "没有找到需要的数据，请刷新页面后重试。";
+  if (status === 409) return "数据已经发生变化，请刷新页面后重试。";
+  if (status === 429) return "操作太频繁，请稍后再试。";
+  return "操作没有完成，请稍后重试。";
+}
+
 export async function readJson<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(apiUrl(path), init);
+  let response: Response;
+  try {
+    response = await fetch(apiUrl(path), init);
+  } catch (reason) {
+    if (reason instanceof DOMException && reason.name === "AbortError") throw reason;
+    throw new Error("无法连接数据服务，请检查网络或稍后重试。");
+  }
   if (!response.ok) {
-    const body = (await response.json().catch(() => null)) as { detail?: string } | null;
-    throw new Error(body?.detail || `${path} 返回 ${response.status}`);
+    const body = (await response.json().catch(() => null)) as { detail?: unknown } | null;
+    throw new Error(apiErrorMessage(body?.detail, response.status));
   }
   return (await response.json()) as T;
 }

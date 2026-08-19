@@ -131,7 +131,7 @@ export function buildContentSaveOperation(
     };
   }
   if (original === null) {
-    throw new Error("编辑内容缺少原始快照");
+    throw new Error("无法保存：没有找到修改前的数据，请刷新页面后重试。");
   }
   const body = buildContentPatch(original, form);
   return {

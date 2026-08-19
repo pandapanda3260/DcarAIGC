@@ -69,6 +69,9 @@ button:disabled { cursor: not-allowed; opacity: .55; transform: none !important;
 .notice { position: relative; margin: 18px auto -3px; max-width: 1240px; padding: 11px 42px 11px 14px; border: 1px solid #bfded7; border-radius: 10px; background: #edf8f5; color: #176e63; font-size: 12px; display: flex; align-items: center; gap: 9px; }
 .notice > span { width: 19px; height: 19px; border-radius: 50%; background: var(--teal); color: #fff; display: grid; place-items: center; font-weight: 800; }
 .notice button { position: absolute; right: 10px; border: 0; background: transparent; color: #548178; font-size: 17px; }
+.feedback-notice { z-index: 20; margin-bottom: 14px; box-shadow: 0 10px 28px rgba(22, 45, 52, .1); line-height: 1.5; }
+/* Hero 页的首卡用负 margin 悬浮；出现反馈时先恢复普通流，避免首卡向上遮住提示。 */
+.feedback-notice + .page-stack { margin-top: 0; }
 
 .page-stack { max-width: 1240px; margin: 0 auto; padding-top: 24px; display: grid; gap: 22px; }
 .page-stack > * { min-width: 0; }
