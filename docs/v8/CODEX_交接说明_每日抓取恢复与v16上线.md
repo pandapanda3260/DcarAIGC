@@ -292,10 +292,12 @@ plist 为 `RunAtLoad=true`，bootstrap 会立即启动，reconcile 也会立即�
 
 - 8765/8766 分离，8766 health 稳定。
 - scheduler requested/enabled，唯一 scheduler lock 持有。
-- `startup_catchup.mode=report_only`，results 只包含日/周报。
+- `startup_catchup.mode=report_only`、`status=succeeded`、`error=null`。以 D=`2026-08-21` 的正式库只读基线计算，results 必须精确为 12 项：10 个 `daily_report`、2 个 `weekly_report`，每项仅允许 `succeeded` 或 `partial`。不能用 `running` 状态下的空 results 通过验收。
 - reconcile 为 `current_day_only`、`effective_from=D`、`interval_seconds=3600`。
 - stderr 无 preflight exit 78、无日期/成本/凭据拒绝、无 KeepAlive + 300 秒 throttle 崩溃循环。
 - 观察窗内 `provider_usage` 无增长。
+
+若 00:20:50 时 catch-up 仍为 `running`，或任一结果为 `failed`/`deferred`、数量或槽位集合漂移，必须在 01:00 前 bootout + disable、恢复 freeze 并把 D 顺延；禁止让该 writer 继续进入当天 02:00 付费槽。当前只读基线显示两份周报已有 `partial` automatic task，只补 scheduler 收据；真正重新生成报告的是 10 份日报，共 2,174 条 included contents。该数量仅用于 D=`2026-08-21` 的基线验收，D 顺延后必须重新只读计算，不能沿用。
 
 禁止付费烟测。等待自然 02:00 后，用 scheduler run/attempt、`quality_gate`、provider ledger 和日志验收。状态为 `succeeded` 或 `partial` 只是必要条件，还必须通过 90%/60% 与 ledger 方向性成本门。如出现 `budget_blocked`，本次仍按 `failed` 处理；保持现有上限，不自动重试。
 

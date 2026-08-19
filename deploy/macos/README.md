@@ -102,7 +102,7 @@ launchctl print "gui/$(id -u)/cn.tj.dcar.writer-worker"
 tail -n 200 "$HOME/Library/Logs/DcarAIGC/writer-worker.stderr.log"
 ```
 
-scheduler 必须报告 requested/enabled，`startup_catchup.mode=report_only`，其 results 只能是日报/周报；`daily_capture_reconcile` 必须是 `mode=current_day_only`、`effective_from=D`、`interval_seconds=3600`。稳定观察至少 650 秒，除了 PID/health 稳定，stderr 还必须没有 preflight exit 78、日期拒绝或 KeepAlive/ThrottleInterval 崩溃循环。
+scheduler 必须报告 requested/enabled；`daily_capture_reconcile` 必须是 `mode=current_day_only`、`effective_from=D`、`interval_seconds=3600`。以 D=`2026-08-21` 的正式库只读基线计算，`startup_catchup` 必须在观察窗内结束为 `status=succeeded`、`error=null`，并精确返回 12 个结果（10 个 `daily_report`、2 个 `weekly_report`，每项仅允许 `succeeded` 或 `partial`）；不能只检查“results 里没有供应商任务”，因为 `running` 时空 results 也会误通过。稳定观察至少 650 秒，除了 PID/health 稳定，stderr 还必须没有 preflight exit 78、日期拒绝或 KeepAlive/ThrottleInterval 崩溃循环。若 00:20:50 仍为 `running`，或出现 `failed`/`deferred`/结果集漂移，必须在 01:00 前 bootout + disable、恢复 freeze 并顺延 D，禁止让该进程继续进入 02:00 付费槽。
 
 禁止手工执行 `daily_capture` 作为烟测；等待已授权的自然 02:00 槽。该槽结束后，状态可以是 `succeeded` 或 `partial`，但还必须通过独立质量门：discovery ≥90%、当天选中 cohort ≥60%、数组计数一致、provider 无阻断。`provider_usage` ledger 是权威账本：details 上报小计、ledger 和声明预算必须是有限值，成本非负、预算为正，且同时满足 `ledger >= details 上报小计`、`ledger <= 声明预算`、`ledger <= USD 8`。两者精确相等只作诊断，不影响 `passed`。3,000 是选中 cohort 上限，不是全库覆盖率。
 
