@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Iterator
 from unittest.mock import patch
 
+import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.testclient import TestClient
@@ -339,6 +340,10 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
                     origin="https://evil.example",
                 )
                 self.assertEqual(cross_origin_login.status_code, 403)
+                self.assertEqual(
+                    cross_origin_login.json(),
+                    {"detail": "登录页面已失效，请刷新后重新登录"},
+                )
                 self.assertNotIn("set-cookie", cross_origin_login.headers)
 
                 fetch_metadata_login = client.post(
@@ -350,6 +355,10 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
                     },
                 )
                 self.assertEqual(fetch_metadata_login.status_code, 403)
+                self.assertEqual(
+                    fetch_metadata_login.json(),
+                    {"detail": "登录页面已失效，请刷新后重新登录"},
+                )
 
                 missing_marker = client.post(
                     _route(base_path, "/auth/login"),
@@ -357,6 +366,10 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
                     headers={"Origin": ORIGIN},
                 )
                 self.assertEqual(missing_marker.status_code, 403)
+                self.assertEqual(
+                    missing_marker.json(),
+                    {"detail": "登录页面已失效，请刷新后重新登录"},
+                )
 
                 self.assertEqual(self._login(client, base_path).status_code, 200)
                 cross_origin_logout = client.post(
@@ -368,9 +381,31 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
                 )
                 self.assertEqual(cross_origin_logout.status_code, 403)
                 self.assertEqual(
+                    cross_origin_logout.json(),
+                    {"detail": "页面已失效，请刷新后再退出"},
+                )
+                self.assertEqual(
                     client.get(_route(base_path, "/auth/session")).status_code,
                     200,
                 )
+
+    def test_oversized_login_returns_plain_413_contract(self) -> None:
+        for base_path in ("", "/dcar"):
+            with self.subTest(base_path=base_path), self._client(base_path) as (
+                client,
+                _config,
+            ):
+                oversized = self._login(
+                    client,
+                    base_path,
+                    password="x" * (auth_gateway.MAX_LOGIN_BODY_BYTES + 1),
+                )
+                self.assertEqual(oversized.status_code, 413)
+                self.assertEqual(
+                    oversized.json(),
+                    {"detail": "登录信息太长，请刷新页面后重新输入"},
+                )
+                self.assertNotIn("set-cookie", oversized.headers)
 
     def test_login_failures_are_throttled_with_retry_after(self) -> None:
         config = self._config("")
@@ -395,7 +430,45 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
             )
             throttled = self._login(client, "")
             self.assertEqual(throttled.status_code, 429)
+            self.assertEqual(
+                throttled.json(),
+                {"detail": "尝试次数太多，请稍后再登录"},
+            )
             self.assertGreater(int(throttled.headers["retry-after"]), 0)
+
+    def test_unavailable_credential_source_returns_plain_503_contract(self) -> None:
+        with self._client("") as (client, _config), patch.object(
+            auth_gateway.HtpasswdVerifier,
+            "verify",
+            side_effect=OSError("unavailable"),
+        ):
+            unavailable = self._login(client, "")
+        self.assertEqual(unavailable.status_code, 503)
+        self.assertEqual(
+            unavailable.json(),
+            {"detail": "暂时无法登录，请稍后重试"},
+        )
+        self.assertNotIn("set-cookie", unavailable.headers)
+
+    def test_unavailable_upstream_returns_plain_502_contract(self) -> None:
+        def fail_upstream(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("unavailable", request=request)
+
+        config = self._config("")
+        app = auth_gateway.create_app(
+            config,
+            web_transport=httpx.MockTransport(fail_upstream),
+            api_transport=ASGITransport(app=_echo_upstream("api")),
+        )
+        with TestClient(app, base_url=ORIGIN) as client:
+            self.assertEqual(self._login(client, "").status_code, 200)
+            unavailable = client.get("/overview")
+        self.assertEqual(unavailable.status_code, 502)
+        self.assertEqual(
+            unavailable.json(),
+            {"detail": "系统暂时无法加载数据，请稍后重试"},
+        )
+        self.assertEqual(unavailable.headers.get("cache-control"), "no-store")
 
     def test_health_checks_account_source_and_session_store(self) -> None:
         with self._client("") as (client, config):

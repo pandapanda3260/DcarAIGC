@@ -607,7 +607,9 @@ def create_app(
         except httpx.HTTPError:
             LOGGER.exception("upstream request failed: %s", upstream_base)
             return _no_store(
-                JSONResponse({"detail": "上游服务暂时不可用"}, status_code=502)
+                JSONResponse(
+                    {"detail": "系统暂时无法加载数据，请稍后重试"}, status_code=502
+                )
             )
         response = StreamingResponse(
             upstream.aiter_raw(),
@@ -681,12 +683,17 @@ def create_app(
                 request, "login", trusted_proxy=bool(resolved.base_path)
             ):
                 return _no_store(
-                    JSONResponse({"detail": "登录请求来源无效"}, status_code=403)
+                    JSONResponse(
+                        {"detail": "登录页面已失效，请刷新后重新登录"},
+                        status_code=403,
+                    )
                 )
             payload = await _form_payload(request)
             if payload is None:
                 return _no_store(
-                    JSONResponse({"detail": "登录请求过大"}, status_code=413)
+                    JSONResponse(
+                        {"detail": "登录信息太长，请刷新页面后重新输入"}, status_code=413
+                    )
                 )
             username = payload.get("username", "").strip()
             password = payload.get("password", "")
@@ -703,7 +710,7 @@ def create_app(
             if retry_after:
                 return _no_store(
                     JSONResponse(
-                        {"detail": "尝试次数过多，请稍后再试"},
+                        {"detail": "尝试次数太多，请稍后再登录"},
                         status_code=429,
                         headers={"Retry-After": str(retry_after)},
                     )
@@ -715,7 +722,9 @@ def create_app(
             except (OSError, RuntimeError):
                 LOGGER.exception("credential source unavailable during login")
                 return _no_store(
-                    JSONResponse({"detail": "登录服务暂时不可用"}, status_code=503)
+                    JSONResponse(
+                        {"detail": "暂时无法登录，请稍后重试"}, status_code=503
+                    )
                 )
             if not valid:
                 limiter.record_failure(throttle_keys)
@@ -753,7 +762,9 @@ def create_app(
                 request, "logout", trusted_proxy=bool(resolved.base_path)
             ):
                 return _no_store(
-                    JSONResponse({"detail": "退出请求来源无效"}, status_code=403)
+                    JSONResponse(
+                        {"detail": "页面已失效，请刷新后再退出"}, status_code=403
+                    )
                 )
             token = request.cookies.get(SESSION_COOKIE, "")
             await asyncio.to_thread(sessions.revoke, token)

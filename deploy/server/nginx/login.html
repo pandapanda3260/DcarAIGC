@@ -551,7 +551,7 @@
       setLoading(true);
       window.setTimeout(function () {
         setLoading(false);
-        showBanner("info", "本地预览：直接打开文件只能查看样式，不会发送数据。正式登录请访问服务器上的 /dcar/（部署完成后自动跳转到本登录页）。");
+        showBanner("info", "这是登录页的样式预览，无法在这里登录。请打开线上地址后再登录。");
       }, 900);
       return;
     }
@@ -588,11 +588,13 @@
           passwordInput.focus();
           passwordInput.select();
         } else if (response.status === 429) {
-          showBanner("error", detail ? detail + "。" : "尝试次数过多，登录已被暂时锁定，请稍后再试。");
+          showBanner("error", detail ? detail + "。" : "尝试次数太多，请稍后再登录。");
         } else if (response.status === 403) {
-          showBanner("error", detail ? detail + "，请刷新页面后重试。" : "请求来源校验未通过，请刷新页面后重试。");
+          showBanner("error", detail ? detail + "。" : "登录页面已失效，请刷新后重新登录。");
+        } else if (response.status === 413) {
+          showBanner("error", detail ? detail + "。" : "登录信息太长，请刷新页面后重新输入。");
         } else {
-          showBanner("error", detail ? detail + "（" + response.status + "）。" : "登录服务暂时不可用（" + response.status + "），请稍后重试。");
+          showBanner("error", "暂时无法登录，请稍后重试。");
         }
       });
     }).catch(function () {

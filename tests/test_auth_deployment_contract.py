@@ -37,6 +37,30 @@ class AuthDeploymentContractTestCase(unittest.TestCase):
             r"[^}]*justify-content:\s*space-between;",
         )
 
+    def test_login_template_handles_413_and_matches_gateway_error_copy(self) -> None:
+        login = (ROOT / "deploy/server/nginx/login.html").read_text(encoding="utf-8")
+        gateway = (ROOT / "src/dcar_eval/dcar_auth/gateway.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertRegex(
+            login,
+            r"else if \(response\.status === 413\) \{\s*"
+            r'showBanner\("error", detail \? detail \+ "。" : '
+            r'"登录信息太长，请刷新页面后重新输入。"\);',
+        )
+        for message in (
+            "登录页面已失效，请刷新后重新登录",
+            "登录信息太长，请刷新页面后重新输入",
+            "尝试次数太多，请稍后再登录",
+            "暂时无法登录，请稍后重试",
+        ):
+            with self.subTest(message=message):
+                self.assertRegex(
+                    gateway,
+                    rf'\{{"detail":\s*"{re.escape(message)}"\}}',
+                )
+                self.assertIn(f'"{message}。"', login)
+
     def test_compose_uses_the_gateway_as_the_only_published_entry(self) -> None:
         compose = (ROOT / "deploy/server/compose.yml").read_text(encoding="utf-8")
         self.assertIn("  auth:\n", compose)
