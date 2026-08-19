@@ -77,7 +77,7 @@ class V8DuplicateDetectionTest(unittest.TestCase):
                 (
                     "not_calculable",
                     100.0,
-                    "重复内容感知指纹尚未完成定标，重复率暂不可计算",
+                    "重复内容识别规则还没完成校验，暂时无法计算重复率",
                 ),
             ),
             (
@@ -86,7 +86,7 @@ class V8DuplicateDetectionTest(unittest.TestCase):
                 (
                     "below_threshold",
                     89.0,
-                    "感知指纹覆盖率为 89.00%，低于 90% 发布阈值",
+                    "完成重复内容识别的数据占 89.00%，低于至少 90% 的要求",
                 ),
             ),
             (
@@ -100,7 +100,7 @@ class V8DuplicateDetectionTest(unittest.TestCase):
                 (
                     "below_threshold",
                     95.5,
-                    "感知指纹覆盖率为 95.50%，低于 96% 发布阈值",
+                    "完成重复内容识别的数据占 95.50%，低于至少 96% 的要求",
                 ),
             ),
         )

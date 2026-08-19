@@ -341,7 +341,7 @@ def domain_ready(connection: sqlite3.Connection) -> bool:
 def _require_domain(connection: sqlite3.Connection) -> None:
     if not domain_ready(connection):
         raise SpuAudienceError(
-            "数据库尚未升级到 schema v14，SPU人群关联功能不可用；请先在写入端启动一次服务完成迁移"
+            "当前数据库版本太旧，车型人群功能暂时不可用。请先更新本地数据后再试。"
         )
 
 
@@ -2088,9 +2088,9 @@ def build_stats(
             "scene_rollup": _rollup_rows(scene_rollup, "scene"),
             "gaps": {"missing": gaps_missing, "overflow": overflow_rows},
             "footnotes": [
-                "场景为多值维度，按命中即计：跨场景条数求和会大于内容总数；单维上卷已按内容去重。",
-                "曝光量取每条内容最新快照的阅读/播放累计值，仅 view_count>0 计入；已归类曝光覆盖低于 90% 时曝光列不发布。",
-                "主车型唯一：多车系对比内容仅主车型计入统计，其余车系保留在关联明细中。",
-                "自动关联仅处理证据等级 V2/V3 的内容；证据不足与未评估内容计入未归类。",
+                "一条内容可以对应多个场景，所以各场景条数相加可能大于内容总数；每个场景内同一内容只计算一次。",
+                "曝光量使用每条内容最近保存的阅读或播放累计值，只统计曝光量大于 0 的内容；完成分类的曝光低于 90% 时不显示曝光占比。",
+                "一条内容只统计一个主要车型；对比多个车系时，其他车系仍会保留在识别明细中。",
+                "系统只自动处理资料较完整、可以评估的内容；资料不足或尚未评估的内容会显示为未归类。",
             ],
         }

@@ -47,7 +47,7 @@ class V8InsightsTest(unittest.TestCase):
         )
         self.assertIsNone(summary["automotive_user_rate"]["percentage"])
         self.assertIn(
-            "用户聚合", summary["automotive_user_rate"]["reason"]
+            "按用户汇总", summary["automotive_user_rate"]["reason"]
         )
 
     def test_supplied_audience_rate_replaces_the_placeholder(self) -> None:

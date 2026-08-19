@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import fcntl
 import hashlib
+import io
 import json
 import logging
 import os
@@ -93,6 +94,7 @@ from .providers import (
 from .report_export import (
     build_report_detail_workbook,
     build_report_download_bundle,
+    platform_content_id_from_url,
     report_bundle_filename,
 )
 from .reports import (
@@ -106,6 +108,7 @@ from .reports import (
     list_tasks,
     request_task_cancel,
     render_summary_png,
+    render_summary_svg,
     retry_task,
     resume_task,
     run_task,
@@ -415,7 +418,7 @@ def _safe_project_path(value: str) -> Path:
     path = (PROJECT_ROOT / value).resolve()
     root = PROJECT_ROOT.resolve()
     if path != root and root not in path.parents:
-        raise HTTPException(status_code=400, detail="文件路径超出项目目录")
+        raise HTTPException(status_code=400, detail="文件暂时无法读取，请联系管理员。")
     return path
 
 
@@ -439,10 +442,12 @@ def _legacy_formal_report_path(legacy_db_path: Path) -> Path:
                 (LEGACY_REPORT_VERSION,),
             ).fetchone()
     if row is None or not row["output_path"]:
-        raise HTTPException(status_code=404, detail="尚无可用的 v7 正式报告")
+        raise HTTPException(status_code=404, detail="还没有可查看的历史报告。")
     path = _safe_project_path(str(row["output_path"]))
     if not path.exists():
-        raise HTTPException(status_code=404, detail="v7 正式报告文件不存在")
+        raise HTTPException(
+            status_code=404, detail="历史报告文件丢失，请重新生成报告。"
+        )
     return path
 
 
@@ -730,8 +735,8 @@ def _window_summary(
         else "below_threshold"
     )
     evaluation_reason = (
-        f"正式评估覆盖率为 {evaluation_coverage:.2f}%，低于 "
-        f"{evaluation_minimum:g}% 发布阈值"
+        f"卖点评估完成率为 {evaluation_coverage:.2f}%，低于至少 "
+        f"{evaluation_minimum:g}% 的要求"
         if ratio_status == "below_threshold" and evaluation_coverage is not None
         else ""
     )
@@ -767,8 +772,8 @@ def _window_summary(
                 else "below_threshold",
                 coverage_percentage=view_coverage,
                 reason=(
-                    f"曝光量快照覆盖率为 {view_coverage:.2f}%，低于 "
-                    f"{view_minimum:g}% 发布阈值"
+                    f"有曝光量的数据占 {view_coverage:.2f}%，低于至少 "
+                    f"{view_minimum:g}% 的要求"
                     if view_values and (view_coverage or 0) < view_minimum
                     else ""
                 ),
@@ -785,8 +790,8 @@ def _window_summary(
                 else "below_threshold",
                 coverage_percentage=comment_coverage,
                 reason=(
-                    f"评论量快照覆盖率为 {comment_coverage:.2f}%，低于 "
-                    f"{comment_minimum:g}% 发布阈值"
+                    f"有评论数的数据占 {comment_coverage:.2f}%，低于至少 "
+                    f"{comment_minimum:g}% 的要求"
                     if comment_values and (comment_coverage or 0) < comment_minimum
                     else ""
                 ),
@@ -819,19 +824,19 @@ def _window_summary(
                 None,
                 unit="person",
                 status="not_applicable" if total == 0 else "not_calculable",
-                reason="首版没有已验证模型",
+                reason="系统暂时无法计算这项数据。",
             ),
             "estimated_reactivated_users": quantity_metric(
                 None,
                 unit="person",
                 status="not_applicable" if total == 0 else "not_calculable",
-                reason="首版没有已验证模型",
+                reason="系统暂时无法计算这项数据。",
             ),
             "estimated_leads": quantity_metric(
                 None,
                 unit="lead",
                 status="not_applicable" if total == 0 else "not_calculable",
-                reason="首版没有已验证模型",
+                reason="系统暂时无法计算这项数据。",
             ),
         },
         "channels": build_channel_conclusions(
@@ -1643,6 +1648,26 @@ def _ocr_payload_text(payload: Dict[str, Any]) -> str:
     return "\n".join(texts)
 
 
+def _friendly_media_processing_error(value: Any) -> Optional[str]:
+    if not value:
+        return None
+    message = str(value).lower()
+    if "no frames were extracted" in message:
+        return "没有从视频中成功截取画面，请重新处理媒体。"
+    if any(
+        marker in message
+        for marker in ("httperror", "urlerror", "remotedisconnected")
+    ):
+        return "图片或视频下载失败，可能是链接失效或网络异常，请稍后重试。"
+    if "logical image group" in message or "image download incomplete" in message:
+        return "部分图片下载失败，请重新处理媒体。"
+    if "not a playable video" in message:
+        return "下载到的视频无法播放，请重新获取媒体后再试。"
+    if "stale running slot recovered" in message:
+        return "上次处理被中断，系统已恢复，可以重新处理。"
+    return "媒体处理没有完成，请重新尝试；如果一直失败，请联系管理员。"
+
+
 def _content_evidence(
     content_id: int, *, db_path: Path, read_only: bool = False
 ) -> Dict[str, Any]:
@@ -1651,7 +1676,9 @@ def _content_evidence(
             "SELECT * FROM content_items WHERE id=?", (content_id,)
         ).fetchone()
         if content is None:
-            raise HTTPException(status_code=404, detail="内容不存在")
+            raise HTTPException(
+                status_code=404, detail="这条内容已不存在，请刷新列表。"
+            )
         evaluation = display_effective_evaluation(connection, content_id)
         artifact_rows = connection.execute(
             """
@@ -1721,7 +1748,7 @@ def _content_evidence(
     media_items: List[Dict[str, Any]] = []
     media_availability = {
         "status": "missing",
-        "reason": "数据库没有可用的媒体证据记录。",
+        "reason": "还没有可查看的图片或视频。",
     }
     if media_row is not None:
         media_paths = _artifact_media_paths(media_row, read_only=read_only)
@@ -1743,12 +1770,12 @@ def _content_evidence(
         elif read_only:
             media_availability = {
                 "status": "omitted",
-                "reason": "大媒体未随线上薄快照发布，现网也没有可安全复用的同路径同哈希文件。",
+                "reason": "线上版本没有包含这张图片或视频，当前无法查看。请回到本地重新处理并发布。",
             }
         else:
             media_availability = {
                 "status": "missing",
-                "reason": "本地媒体证据文件缺失。",
+                "reason": "本地图片或视频文件丢失，请重新处理媒体。",
             }
     asr_payload = _read_local_json(str(asr_row["local_path"])) if asr_row else {}
     ocr_payload = _read_local_json(str(ocr_row["local_path"])) if ocr_row else {}
@@ -1806,7 +1833,13 @@ def _content_evidence(
             "stored_count": stored_comment_count,
             "top_items": [dict(row) for row in comment_rows],
         },
-        "processing_slots": [dict(row) for row in processing],
+        "processing_slots": [
+            {
+                **dict(row),
+                "error_message": _friendly_media_processing_error(row["error_message"]),
+            }
+            for row in processing
+        ],
     }
 
 
@@ -2096,7 +2129,7 @@ async def read_only_replica_guard(request: Request, call_next):
         return JSONResponse(
             status_code=403,
             content={
-                "detail": "线上只读副本禁止写入；请在本地唯一写入端操作后重新发布快照。"
+                "detail": "当前处于只读保护模式：可以查看数据，但暂时不能新增、编辑或刷新。请等写入服务恢复后再试。"
             },
         )
     return await call_next(request)
@@ -2274,6 +2307,15 @@ def _queue_task_run(
     )
 
 
+def _user_facing_http_error(
+    exc: Exception, *, status_code: int, detail: str
+) -> HTTPException:
+    """Keep technical exception details in logs and return actionable UI copy."""
+
+    LOGGER.warning("request rejected by %s: %s", type(exc).__name__, exc)
+    return HTTPException(status_code=status_code, detail=detail)
+
+
 @router.post("/api/v8/tasks")
 def create_v8_task(
     request: Request, payload: TaskCreateRequest, background: BackgroundTasks
@@ -2291,7 +2333,18 @@ def create_v8_task(
             db_path=config.db_path,
         )
     except ReportTaskError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        error_text = str(exc)
+        if error_text == "manual report period must be closed before creation":
+            detail = "结束日期只能选昨天或更早。"
+        elif error_text.startswith("invalid ISO date") or error_text == "period_start must not be after period_end":
+            detail = "日期范围不正确，请检查开始日期和结束日期。"
+        else:
+            detail = "报告服务暂时不可用，请稍后重试。"
+        raise _user_facing_http_error(
+            exc,
+            status_code=409,
+            detail=detail,
+        ) from exc
     if str(task["task_status"]) in IMPLICIT_RUN_STATUSES:
         _queue_task_run(background, str(task["id"]), config)
     return task
@@ -2302,7 +2355,11 @@ def get_v8_task(request: Request, task_id: str) -> Dict[str, Any]:
     try:
         return get_task(task_id, db_path=_request_config(request).db_path)
     except ReportTaskError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise _user_facing_http_error(
+            exc,
+            status_code=404,
+            detail="找不到这个报告任务，请返回列表刷新后重试。",
+        ) from exc
 
 
 @router.post("/api/v8/tasks/{task_id}/retry")
@@ -2313,7 +2370,11 @@ def retry_v8_task(
     try:
         task = retry_task(task_id, db_path=config.db_path)
     except ReportTaskError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise _user_facing_http_error(
+            exc,
+            status_code=409,
+            detail="当前任务状态不支持重新生成，请刷新后重试。",
+        ) from exc
     _queue_task_run(background, task_id, config)
     return task
 
@@ -2323,7 +2384,11 @@ def cancel_v8_task(request: Request, task_id: str) -> Dict[str, Any]:
     try:
         return request_task_cancel(task_id, db_path=_request_config(request).db_path)
     except ReportTaskError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise _user_facing_http_error(
+            exc,
+            status_code=409,
+            detail="当前任务状态不支持取消，请刷新后重试。",
+        ) from exc
 
 
 @router.post("/api/v8/tasks/{task_id}/resume")
@@ -2334,7 +2399,11 @@ def resume_v8_task(
     try:
         task = resume_task(task_id, db_path=config.db_path)
     except ReportTaskError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise _user_facing_http_error(
+            exc,
+            status_code=409,
+            detail="当前任务状态不支持恢复，请刷新后重试。",
+        ) from exc
     _queue_task_run(background, task_id, config)
     return task
 
@@ -2347,10 +2416,12 @@ def get_v8_task_report(request: Request, task_id: str, revision: int) -> Dict[st
             (task_id, revision),
         ).fetchone()
     if row is None:
-        raise HTTPException(status_code=404, detail="报告 revision 不存在")
+        raise HTTPException(status_code=404, detail="找不到这版报告。")
     path = _safe_project_path(str(row["report_json_path"]))
     if not path.is_file():
-        raise HTTPException(status_code=410, detail="报告文件已登记但本地缺失")
+        raise HTTPException(
+            status_code=410, detail="这份报告的文件丢失了，请重新生成报告。"
+        )
     return json.loads(path.read_text(encoding="utf-8"))
 
 
@@ -2373,10 +2444,12 @@ def download_v8_task_file(
     by_kind = {str(row["file_kind"]): row for row in rows}
     row = next((by_kind[kind] for kind in kinds if kind in by_kind), None)
     if row is None:
-        raise HTTPException(status_code=404, detail="报告文件不存在")
+        raise HTTPException(status_code=404, detail="找不到这份报告文件。")
     path = _safe_project_path(str(row["local_path"]))
     if not path.is_file():
-        raise HTTPException(status_code=410, detail="报告文件已登记但本地缺失")
+        raise HTTPException(
+            status_code=410, detail="这份报告的文件丢失了，请重新生成报告。"
+        )
     media_types = {
         "report-json": "application/json",
         "report-markdown": "text/markdown",
@@ -2395,29 +2468,140 @@ def download_v8_task_file(
 def _verified_report_file(row: Mapping[str, Any]) -> tuple[Path, bytes]:
     path = _safe_project_path(str(row["local_path"]))
     if not path.is_file():
-        raise HTTPException(status_code=410, detail="报告文件已登记但本地缺失")
+        raise HTTPException(
+            status_code=410, detail="这份报告的文件丢失了，请重新生成报告。"
+        )
     try:
         payload = path.read_bytes()
     except OSError as exc:
-        raise HTTPException(status_code=410, detail="报告文件读取失败") from exc
+        raise HTTPException(
+            status_code=410, detail="报告文件无法读取，请重新生成报告。"
+        ) from exc
     expected_size = int(row["byte_size"])
     expected_sha256 = str(row["sha256"])
     if len(payload) != expected_size or hashlib.sha256(payload).hexdigest() != expected_sha256:
-        raise HTTPException(status_code=409, detail="报告文件完整性校验失败")
+        raise HTTPException(
+            status_code=409, detail="报告文件可能已损坏，请重新生成报告。"
+        )
     return path, payload
+
+
+def _report_export_context(
+    request: Request,
+    *,
+    task_id: str,
+    taxonomy_version: str,
+    content_csv: bytes,
+) -> tuple[dict[str, dict[str, str]], dict[str, str]]:
+    """Read-only compatibility projection for fields absent from old revisions."""
+
+    try:
+        source_rows = list(
+            csv.DictReader(io.StringIO(content_csv.decode("utf-8-sig"), newline=""))
+        )
+    except (UnicodeDecodeError, csv.Error) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="这份历史报告缺少下载所需信息，请重新生成一份新报告。",
+        ) from exc
+    with _connect_for_request(request) as connection:
+        current_rows = connection.execute(
+            """
+            SELECT c.id,c.link_id,c.platform,c.platform_content_id,
+                   c.canonical_url,c.content_type
+            FROM task_contents tc
+            JOIN content_items c ON c.id=tc.content_id
+            WHERE tc.task_id=? AND tc.inclusion_status='included'
+            ORDER BY c.id
+            """,
+            (task_id,),
+        ).fetchall()
+        point_rows = connection.execute(
+            """
+            SELECT sp.code,sp.label
+            FROM taxonomy_versions tv
+            JOIN selling_points sp ON sp.taxonomy_id=tv.id
+            WHERE tv.version=?
+            ORDER BY sp.code
+            """,
+            (taxonomy_version,),
+        ).fetchall()
+    current_by_id = {str(row["id"]): row for row in current_rows}
+    enrichment: dict[str, dict[str, str]] = {}
+    required_codes: set[str] = set()
+    for source in source_rows:
+        internal_content_id = str(source.get("content_id") or "").strip()
+        platform = str(source.get("platform") or "").strip()
+        canonical_url = str(source.get("canonical_url") or "").strip()
+        platform_content_id = str(source.get("platform_content_id") or "").strip()
+        content_type = str(source.get("content_type") or "").strip()
+        current = current_by_id.get(internal_content_id)
+        needs_current = not platform_content_id or not content_type
+        if needs_current and current is None:
+            raise HTTPException(
+                status_code=409,
+                detail="这份历史报告缺少下载所需信息，请重新生成一份新报告。",
+            )
+        if needs_current and current is not None:
+            for key, frozen_value in (
+                ("link_id", source.get("link_id")),
+                ("platform", source.get("platform")),
+                ("canonical_url", source.get("canonical_url")),
+            ):
+                if str(current[key] or "") != str(frozen_value or ""):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="这份历史报告缺少下载所需信息，请重新生成一份新报告。",
+                    )
+            platform_content_id = platform_content_id or str(
+                current["platform_content_id"] or ""
+            )
+            content_type = content_type or str(current["content_type"] or "")
+        url_content_id = platform_content_id_from_url(platform, canonical_url)
+        if not url_content_id or (
+            platform_content_id and platform_content_id != url_content_id
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="这份历史报告缺少下载所需信息，请重新生成一份新报告。",
+            )
+        platform_content_id = platform_content_id or url_content_id
+        if not content_type:
+            raise HTTPException(
+                status_code=409,
+                detail="这份历史报告缺少下载所需信息，请重新生成一份新报告。",
+            )
+        enrichment[internal_content_id] = {
+            "platform_content_id": platform_content_id,
+            "content_type": content_type,
+        }
+        code = str(source.get("primary_selling_point_code") or "").strip()
+        label = str(source.get("primary_selling_point_label") or "").strip()
+        if code and not label:
+            required_codes.add(code)
+    selling_point_labels = {
+        str(row["code"]): str(row["label"]) for row in point_rows
+    }
+    missing_codes = sorted(required_codes - set(selling_point_labels))
+    if missing_codes:
+        raise HTTPException(
+            status_code=409,
+            detail="这份历史报告缺少下载所需信息，请重新生成一份新报告。",
+        )
+    return enrichment, selling_point_labels
 
 
 @router.get("/api/v8/tasks/{task_id}/revisions/{revision}/download")
 def download_v8_task_report(
     request: Request, task_id: str, revision: int
 ) -> Response:
-    """Download one immutable revision as an image + native XLSX ZIP bundle."""
+    """Download immutable revision data with the current image export template."""
 
     with _connect_for_request(request) as connection:
         task = connection.execute(
             """
             SELECT t.id,t.name,t.period_start,t.period_end,t.task_status,t.created_at,
-                   rr.created_at revision_created_at
+                   rr.created_at revision_created_at,rr.taxonomy_version
             FROM report_revisions rr
             JOIN report_tasks t ON t.id=rr.task_id
             WHERE rr.task_id=? AND rr.revision=?
@@ -2429,17 +2613,21 @@ def download_v8_task_report(
             SELECT file_kind,local_path,sha256,byte_size
             FROM report_files
             WHERE task_id=? AND revision=? AND status='available'
-              AND file_kind IN ('summary-svg','summary-png','content-csv','channel-csv')
+              AND file_kind IN (
+                  'report-json','summary-svg','summary-png','content-csv','channel-csv'
+              )
             """,
             (task_id, revision),
         ).fetchall()
     if task is None:
-        raise HTTPException(status_code=404, detail="报告 revision 不存在")
+        raise HTTPException(status_code=404, detail="找不到这版报告。")
 
     by_kind = {str(row["file_kind"]): row for row in files}
     content_row = by_kind.get("content-csv")
     if content_row is None:
-        raise HTTPException(status_code=404, detail="报告内容明细不存在")
+        raise HTTPException(
+            status_code=404, detail="这份报告的内容明细丢失了，请重新生成报告。"
+        )
     _, content_csv = _verified_report_file(content_row)
 
     channel_csv = None
@@ -2448,7 +2636,45 @@ def download_v8_task_report(
 
     image_extension: str
     image_bytes: bytes
-    if svg_row := by_kind.get("summary-svg"):
+    derived_svg: Optional[bytes] = None
+    if report_row := by_kind.get("report-json"):
+        _, report_json = _verified_report_file(report_row)
+        try:
+            frozen_report = json.loads(report_json.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            LOGGER.exception(
+                "report image derivation failed: task=%s revision=%s",
+                task_id,
+                revision,
+            )
+            raise HTTPException(
+                status_code=500, detail="报告图片生成失败，请稍后重试。"
+            ) from exc
+        try:
+            derived_svg = render_summary_svg(frozen_report).encode("utf-8")
+        except ValueError:
+            # v8.0/v8.1 predate the registered contract files needed by the
+            # current template. Their archived SVG remains the safe fallback.
+            LOGGER.warning(
+                "current image template unsupported for historical report: "
+                "task=%s revision=%s report_version=%s",
+                task_id,
+                revision,
+                frozen_report.get("report_version"),
+            )
+
+    if derived_svg is not None:
+        with tempfile.TemporaryDirectory(prefix="dcar-report-download-") as directory:
+            svg_path = Path(directory) / "core_summary.svg"
+            svg_path.write_bytes(derived_svg)
+            rendered = Path(directory) / "core_summary.png"
+            if render_summary_png(svg_path, rendered):
+                image_extension = "png"
+                image_bytes = rendered.read_bytes()
+            else:
+                image_extension = "svg"
+                image_bytes = derived_svg
+    elif svg_row := by_kind.get("summary-svg"):
         svg_path, svg_bytes = _verified_report_file(svg_row)
         with tempfile.TemporaryDirectory(prefix="dcar-report-download-") as directory:
             rendered = Path(directory) / "core_summary.png"
@@ -2462,15 +2688,25 @@ def download_v8_task_report(
         _, image_bytes = _verified_report_file(png_row)
         image_extension = "png"
     else:
-        raise HTTPException(status_code=404, detail="报告图片不存在")
+        raise HTTPException(
+            status_code=404, detail="这份报告的图片丢失了，请重新生成报告。"
+        )
 
     task_value = dict(task)
+    content_enrichment, selling_point_labels = _report_export_context(
+        request,
+        task_id=task_id,
+        taxonomy_version=str(task["taxonomy_version"]),
+        content_csv=content_csv,
+    )
     try:
         workbook = build_report_detail_workbook(
             task=task_value,
             revision=revision,
             content_csv=content_csv,
             channel_csv=channel_csv,
+            content_enrichment=content_enrichment,
+            selling_point_labels=selling_point_labels,
         )
         bundle = build_report_download_bundle(
             image_extension=image_extension,
@@ -2481,7 +2717,9 @@ def download_v8_task_report(
         LOGGER.exception(
             "report bundle generation failed: task=%s revision=%s", task_id, revision
         )
-        raise HTTPException(status_code=500, detail="报告下载包生成失败") from exc
+        raise HTTPException(
+            status_code=500, detail="报告打包失败，请稍后重试。"
+        ) from exc
 
     filename = report_bundle_filename(
         task_name=str(task["name"]),
@@ -2522,7 +2760,11 @@ def create_v8_account(
             payload.model_dump(), db_path=_request_config(request).db_path
         )
     except OperationError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise _user_facing_http_error(
+            exc,
+            status_code=409,
+            detail="账号保存失败，请检查手机号和填写内容后重试。",
+        ) from exc
 
 
 @router.patch("/api/v8/accounts/{account_id}")
@@ -2536,7 +2778,11 @@ def patch_v8_account(
             db_path=_request_config(request).db_path,
         )
     except OperationError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise _user_facing_http_error(
+            exc,
+            status_code=409,
+            detail="账号保存失败，请检查手机号和填写内容后重试。",
+        ) from exc
 
 
 @router.post("/api/v8/accounts/import")
@@ -2601,7 +2847,11 @@ def create_v8_content(
             payload.model_dump(), db_path=_request_config(request).db_path
         )
     except OperationError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise _user_facing_http_error(
+            exc,
+            status_code=409,
+            detail="内容保存失败，请检查链接和填写内容后重试。",
+        ) from exc
 
 
 @router.patch("/api/v8/contents/{content_id}")
@@ -2610,7 +2860,7 @@ def patch_v8_content(
 ) -> Dict[str, Any]:
     updates = payload.model_dump(exclude_unset=True)
     if not updates:
-        raise HTTPException(status_code=422, detail="至少提交一个要修改的字段")
+        raise HTTPException(status_code=422, detail="请至少修改一项内容。")
     try:
         return update_content(
             content_id,
@@ -2618,7 +2868,11 @@ def patch_v8_content(
             db_path=_request_config(request).db_path,
         )
     except OperationError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise _user_facing_http_error(
+            exc,
+            status_code=409,
+            detail="内容保存失败，请检查链接和填写内容后重试。",
+        ) from exc
 
 
 @router.post("/api/v8/contents/import")
@@ -2636,7 +2890,11 @@ def update_v8_content_data(request: Request, content_id: int) -> Dict[str, Any]:
     try:
         result = update_content_data(content_id, db_path=db_path)
     except ProviderConfigurationError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise _user_facing_http_error(
+            exc,
+            status_code=409,
+            detail="在线更新服务尚未配置，请联系管理员。",
+        ) from exc
     try:
         # 数据更新后即时补算 车型/人群/场景 标签，让内容列表立刻反映最新证据
         associate_single_content(content_id, db_path=db_path)
@@ -2669,18 +2927,22 @@ def get_v8_content_evidence_file(
             (artifact_id, content_id),
         ).fetchone()
     if row is None:
-        raise HTTPException(status_code=404, detail="媒体证据不存在")
+        raise HTTPException(status_code=404, detail="还没有可查看的图片或视频。")
     config = _request_config(request)
     paths = _artifact_media_paths(row, read_only=config.read_only)
     if not paths:
         if config.read_only:
             raise HTTPException(
                 status_code=410,
-                detail="媒体证据未随线上薄快照发布，且现网没有同路径同哈希文件可复用",
+                detail="线上版本没有包含这张图片或视频，当前无法查看。请回到本地重新处理并发布。",
             )
-        raise HTTPException(status_code=404, detail="媒体证据文件不存在")
+        raise HTTPException(
+            status_code=404, detail="本地图片或视频文件丢失，请重新处理媒体。"
+        )
     if index < 0 or index >= len(paths):
-        raise HTTPException(status_code=404, detail="媒体证据文件不存在")
+        raise HTTPException(
+            status_code=404, detail="本地图片或视频文件丢失，请重新处理媒体。"
+        )
     return FileResponse(paths[index])
 
 
@@ -2701,7 +2963,11 @@ def retry_v8_content_media(
         SlotUnavailable,
         BudgetBlocked,
     ) as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise _user_facing_http_error(
+            exc,
+            status_code=409,
+            detail="媒体重新处理失败，请稍后重试；如果一直失败，请联系管理员。",
+        ) from exc
 
 
 @router.post("/api/v8/media-processing/search")
@@ -2747,8 +3013,13 @@ def search_v8_media_processing(
             """,
             [*parameters, payload.page_size, offset],
         ).fetchall()
+    items = []
+    for row in rows:
+        item = dict(row)
+        item["error_message"] = _friendly_media_processing_error(item.get("error_message"))
+        items.append(item)
     return {
-        "items": [dict(row) for row in rows],
+        "items": items,
         "total": total,
         "slot_status_counts": {
             status: next(
@@ -2786,7 +3057,11 @@ def get_v8_selling_points(request: Request) -> Dict[str, Any]:
             read_only=config.read_only,
         )
     except TaxonomyError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise _user_facing_http_error(
+            exc,
+            status_code=409,
+            detail="卖点标准暂时无法读取，请联系管理员。",
+        ) from exc
 
 
 @router.post("/api/v8/selling-points/draft")
@@ -2794,7 +3069,11 @@ def create_v8_selling_point_draft(request: Request) -> Dict[str, Any]:
     try:
         return ensure_draft(db_path=_request_config(request).db_path)
     except TaxonomyError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise _user_facing_http_error(
+            exc,
+            status_code=409,
+            detail="无法进入草稿编辑，请刷新页面后重试。",
+        ) from exc
 
 
 @router.get("/api/v8/selling-points/draft")
@@ -2802,7 +3081,11 @@ def get_v8_selling_point_draft(request: Request) -> Dict[str, Any]:
     try:
         return list_points(status="draft", db_path=_request_config(request).db_path)
     except TaxonomyError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise _user_facing_http_error(
+            exc,
+            status_code=409,
+            detail="卖点草稿暂时无法读取，请刷新页面后重试。",
+        ) from exc
 
 
 @router.post("/api/v8/selling-points/items")
@@ -2810,15 +3093,21 @@ def create_v8_selling_point(
     request: Request, payload: SellingPointMutationRequest
 ) -> Dict[str, Any]:
     if payload.code is None:
-        raise HTTPException(status_code=422, detail="新增卖点必须提供 code")
+        raise HTTPException(status_code=422, detail="请填写卖点编号。")
     try:
         return create_point(
             payload.model_dump(), db_path=_request_config(request).db_path
         )
     except TaxonomyValidationError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise _user_facing_http_error(
+            exc, status_code=422, detail="卖点填写内容有误，请检查后重试。"
+        ) from exc
     except (TaxonomyError, sqlite3.IntegrityError) as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise _user_facing_http_error(
+            exc,
+            status_code=409,
+            detail="卖点保存失败。请确认编号没有重复，然后刷新页面重试。",
+        ) from exc
 
 
 @router.patch("/api/v8/selling-points/items/{code}")
@@ -2832,9 +3121,15 @@ def update_v8_selling_point(
             db_path=_request_config(request).db_path,
         )
     except TaxonomyValidationError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise _user_facing_http_error(
+            exc, status_code=422, detail="卖点填写内容有误，请检查后重试。"
+        ) from exc
     except (TaxonomyError, sqlite3.IntegrityError) as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise _user_facing_http_error(
+            exc,
+            status_code=409,
+            detail="卖点保存失败，请刷新页面后重试。",
+        ) from exc
 
 
 @router.delete("/api/v8/selling-points/items/{code}")
@@ -2842,9 +3137,13 @@ def delete_v8_selling_point(request: Request, code: str) -> Dict[str, Any]:
     try:
         delete_point(code, db_path=_request_config(request).db_path)
     except TaxonomyValidationError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise _user_facing_http_error(
+            exc, status_code=422, detail="这个卖点暂时无法删除，请刷新页面后重试。"
+        ) from exc
     except TaxonomyError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise _user_facing_http_error(
+            exc, status_code=409, detail="卖点删除失败，请刷新页面后重试。"
+        ) from exc
     return {"code": code, "deleted": True}
 
 
@@ -2853,7 +3152,11 @@ def publish_v8_selling_points(request: Request) -> Dict[str, Any]:
     try:
         return publish_draft(db_path=_request_config(request).db_path)
     except TaxonomyError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise _user_facing_http_error(
+            exc,
+            status_code=409,
+            detail="卖点标准发布失败，请检查草稿后重试。",
+        ) from exc
 
 
 @router.get("/api/v8/spu-audience/assets")
@@ -2864,7 +3167,11 @@ def get_v8_spu_audience_assets(request: Request) -> Dict[str, Any]:
             db_path=config.db_path, read_only=config.read_only
         )
     except SpuAudienceError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise _user_facing_http_error(
+            exc,
+            status_code=409,
+            detail="车型、人群和场景数据暂时无法读取，请刷新页面后重试。",
+        ) from exc
 
 
 @router.get("/api/v8/spu-audience/stats")
@@ -2873,9 +3180,9 @@ def get_v8_spu_audience_stats(
 ) -> Dict[str, Any]:
     config = _request_config(request)
     if window not in STAT_WINDOWS:
-        raise HTTPException(status_code=422, detail=f"不支持的统计窗口：{window}")
+        raise HTTPException(status_code=422, detail="所选统计时间无效，请刷新页面后重试。")
     if platform and platform not in STAT_PLATFORMS:
-        raise HTTPException(status_code=422, detail=f"不支持的统计平台：{platform}")
+        raise HTTPException(status_code=422, detail="所选平台无效，请刷新页面后重试。")
     try:
         return build_spu_audience_stats(
             db_path=config.db_path,
@@ -2884,7 +3191,11 @@ def get_v8_spu_audience_stats(
             read_only=config.read_only,
         )
     except SpuAudienceError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise _user_facing_http_error(
+            exc,
+            status_code=409,
+            detail="统计数据暂时无法读取，请刷新页面后重试。",
+        ) from exc
 
 
 @router.post("/api/v8/spu-audience/associate")
@@ -2900,7 +3211,7 @@ def run_v8_spu_association(
     """
 
     if mode not in {"full", "incremental", "yesterday", "this_week", "last_week"}:
-        raise HTTPException(status_code=422, detail=f"不支持的刷新方式：{mode}")
+        raise HTTPException(status_code=422, detail="所选刷新范围无效，请重新选择。")
     config = _request_config(request)
     since: Optional[str] = None
     scope_window: Optional[str] = None
@@ -2912,7 +3223,11 @@ def run_v8_spu_association(
     try:
         run_id = start_association_run(db_path=config.db_path)
     except SpuAudienceError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise _user_facing_http_error(
+            exc,
+            status_code=409,
+            detail="当前无法开始刷新，请稍后重试。",
+        ) from exc
     background.add_task(
         _run_spu_association_job, config.db_path, run_id, since, scope_window
     )
@@ -2958,7 +3273,11 @@ def upsert_v8_spu(request: Request, payload: SpuUpsertRequest) -> Dict[str, Any]
             payload.model_dump(), db_path=_request_config(request).db_path
         )
     except SpuAudienceError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise _user_facing_http_error(
+            exc,
+            status_code=422,
+            detail="车型填写内容有误，请检查后重试。",
+        ) from exc
 
 
 @router.get("/api/v7/history/reports")
@@ -3059,7 +3378,7 @@ def reject_legacy_writes(legacy_path: str) -> JSONResponse:
     return JSONResponse(
         status_code=409,
         content={
-            "error": "v7 写操作已停用",
+            "error": "旧版页面已经停止修改，请使用当前页面操作。",
             "migration_target": "/api/v8",
             "legacy_path": f"/api/runs/{legacy_path}",
         },

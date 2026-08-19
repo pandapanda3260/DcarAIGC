@@ -193,7 +193,7 @@ class LegacyIdentityBackfillTest(unittest.TestCase):
             # users exist but none classified yet -> held back, never a fake 0%
             self.assertEqual(metric["status"], "below_threshold")
             self.assertIsNone(metric["percentage"])
-            self.assertIn("分类覆盖率", metric["reason"])
+            self.assertIn("完成用户分类的比例", metric["reason"])
             self.assertEqual(quality["classified_user_count"], 0)
             self.assertEqual(quality["classification_coverage_percentage"], 0.0)
             self.assertEqual(quality["user_key_version"], "content-user-hmac-v1")
@@ -258,12 +258,12 @@ class MissingReasonSplitTest(unittest.TestCase):
     def test_not_captured_yet(self) -> None:
         metric = self._rate([3])["metric"]
         self.assertEqual(metric["status"], "missing")
-        self.assertIn("评论尚未采集", metric["reason"])
+        self.assertIn("评论还没有采集", metric["reason"])
 
     def test_captured_but_zero_first_level_comments(self) -> None:
         metric = self._rate([1])["metric"]
         self.assertEqual(metric["status"], "missing")
-        self.assertIn("没有一级评论互动", metric["reason"])
+        self.assertIn("所选时间内没有评论互动", metric["reason"])
 
     def test_comments_without_any_identity(self) -> None:
         _seed_legacy_comment(
@@ -271,7 +271,7 @@ class MissingReasonSplitTest(unittest.TestCase):
         )
         metric = self._rate([1])["metric"]
         self.assertEqual(metric["status"], "missing")
-        self.assertIn("无可识别的用户身份", metric["reason"])
+        self.assertIn("无法识别评论用户", metric["reason"])
         # identity coverage over first-level comments is 0/1 -> gate holds too
         self.assertIsNone(metric["percentage"])
 

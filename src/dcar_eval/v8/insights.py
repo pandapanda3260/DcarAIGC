@@ -37,9 +37,9 @@ def _automotive_user_rate_placeholder(rows: List[Dict[str, Any]]) -> Dict[str, A
     total = len(rows)
     status = "not_applicable" if total == 0 else "not_calculable"
     reason = (
-        "该切片在所选窗口没有发布内容"
+        "所选时间内没有相关内容"
         if total == 0
-        else "用户级汽车兴趣占比尚未接入用户聚合，暂不发布"
+        else "系统暂时无法按用户汇总汽车兴趣占比"
     )
     return ratio_metric(
         None,
@@ -55,13 +55,13 @@ def _score_metric(rows: List[Dict[str, Any]], field: str) -> Dict[str, Any]:
     total = len(rows)
     values = [int(row[field]) for row in rows if row.get(field) is not None]
     if total == 0:
-        status, reason = "not_applicable", "该场景在所选窗口没有发布内容"
+        status, reason = "not_applicable", "所选时间内没有相关内容"
     elif not values:
-        status, reason = "missing", "没有满足评分证据门槛的内容"
+        status, reason = "missing", "没有资料足够、可以评分的内容"
     elif len(values) == total:
         status, reason = "available", ""
     else:
-        status, reason = "sample_only", f"仅 {len(values)}/{total} 条满足评分证据门槛"
+        status, reason = "sample_only", f"只有 {len(values)}/{total} 条内容资料足够，可以评分"
     value = round(sum(values) / len(values)) if values else None
     return score_metric(
         value,
@@ -91,8 +91,8 @@ def _metrics(
     core = [row for row in selling if row.get("primary_tier") == "core"]
     count_status = "available" if channel_total else "not_applicable"
     count_reason = (
-        f"分母为{channel_label}渠道窗口内全部发布 {channel_total} 条"
-        if channel_total else "该渠道在所选窗口没有发布内容"
+        f"按{channel_label}在所选时间内发布的全部 {channel_total} 条内容计算"
+        if channel_total else "所选时间内该平台没有发布内容"
     )
 
     def count_metric(selected: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -109,25 +109,25 @@ def _metrics(
 
     if not channel_total:
         exposure_status = "not_applicable"
-        exposure_reason = "该渠道在所选窗口没有发布内容"
+        exposure_reason = "所选时间内该平台没有发布内容"
     elif total_exposure <= 0 and platform in EXPOSURE_SOURCE_GAPS:
         exposure_status = "not_applicable"
         exposure_reason = EXPOSURE_SOURCE_GAPS[platform]
     elif total_exposure <= 0:
         exposure_status = "missing"
-        exposure_reason = "该渠道窗口没有 view_count > 0 的有效曝光数据"
+        exposure_reason = "所选时间内没有曝光量大于 0 的内容"
     elif exposure_calculable:
         exposure_status = "available"
         exposure_reason = (
-            f"分母为{channel_label}渠道 {valid_exposure_items} 条有效曝光内容的"
-            f"总曝光 {total_exposure}；可归类曝光覆盖 {exposure_coverage}%"
+            f"按{channel_label} {valid_exposure_items} 条有曝光量的内容计算，"
+            f"总曝光 {total_exposure}；已完成分类的曝光占 {exposure_coverage}%"
         )
     else:
         exposure_status = "below_threshold"
         exposure_reason = (
-            f"可归类有效曝光 {classifiable_exposure}/{total_exposure}，覆盖 "
-            f"{exposure_coverage or 0}%：低于 "
-            f"{EXPOSURE_CLASSIFIABLE_COVERAGE_MIN:g}% 发布门槛"
+            f"已完成分类的曝光为 {classifiable_exposure}/{total_exposure}，占 "
+            f"{exposure_coverage or 0}%：低于至少 "
+            f"{EXPOSURE_CLASSIFIABLE_COVERAGE_MIN:g}% 的要求"
         )
 
     def exposure_metric(selected: List[Dict[str, Any]]) -> Dict[str, Any]:

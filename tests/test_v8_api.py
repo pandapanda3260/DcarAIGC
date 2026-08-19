@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import io
 import hashlib
 import json
@@ -15,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from urllib.parse import quote
+from xml.etree import ElementTree
 
 from fastapi.testclient import TestClient
 
@@ -52,6 +54,30 @@ from v8.taxonomy_rule_backfill import backfill_v5_1_matcher_rules
 from tests.v9_report_fixture import activate_v9_report_fixture
 from workflow.storage import connect as legacy_connect
 from workflow.storage import migrate as migrate_legacy
+
+
+_SHEET_NAMESPACE = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+
+
+def _xlsx_sheet_values(payload: bytes) -> list[list[str]]:
+    root = ElementTree.fromstring(payload)
+    rows: list[list[str]] = []
+    for row in root.findall(".//x:sheetData/x:row", _SHEET_NAMESPACE):
+        values: list[str] = []
+        for cell in row.findall("x:c", _SHEET_NAMESPACE):
+            inline = cell.find("x:is", _SHEET_NAMESPACE)
+            if inline is not None:
+                values.append(
+                    "".join(
+                        value.text or ""
+                        for value in inline.findall(".//x:t", _SHEET_NAMESPACE)
+                    )
+                )
+                continue
+            value = cell.find("x:v", _SHEET_NAMESPACE)
+            values.append(value.text if value is not None and value.text else "")
+        rows.append(values)
+    return rows
 
 
 def _test_config(
@@ -935,7 +961,10 @@ class V8ApiTest(unittest.TestCase):
             )
             blocked = replica_client.post("/api/v8/tasks", json={})
             self.assertEqual(blocked.status_code, 403)
-            self.assertIn("只读副本禁止写入", blocked.json()["detail"])
+            self.assertEqual(
+                blocked.json()["detail"],
+                "当前处于只读保护模式：可以查看数据，但暂时不能新增、编辑或刷新。请等写入服务恢复后再试。",
+            )
             self.assertEqual(
                 replica_client.patch("/api/v8/accounts/1", json={}).status_code,
                 403,
@@ -1376,7 +1405,7 @@ class V8ApiTest(unittest.TestCase):
 
         response = self.client.get("/api/v8/selling-points")
         self.assertEqual(response.status_code, 409)
-        self.assertIn("multiple published taxonomies", response.json()["detail"])
+        self.assertEqual(response.json()["detail"], "卖点标准暂时无法读取，请联系管理员。")
         with connect(self.db) as connection:
             after = "\n".join(connection.iterdump())
         self.assertEqual(after, before)
@@ -1406,10 +1435,7 @@ class V8ApiTest(unittest.TestCase):
 
         response = self.client.get("/api/v8/selling-points")
         self.assertEqual(response.status_code, 409)
-        self.assertIn(
-            "active evaluation release does not match published taxonomy",
-            response.json()["detail"],
-        )
+        self.assertEqual(response.json()["detail"], "卖点标准暂时无法读取，请联系管理员。")
         with connect(self.db) as connection:
             after = "\n".join(connection.iterdump())
         self.assertEqual(after, before)
@@ -1931,7 +1957,10 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
                 f"{artifact_ids[0]}/0"
             )
             self.assertEqual(omitted_file.status_code, 410)
-            self.assertIn("薄快照", omitted_file.json()["detail"])
+            self.assertEqual(
+                omitted_file.json()["detail"],
+                "线上版本没有包含这张图片或视频，当前无法查看。请回到本地重新处理并发布。",
+            )
 
         with connect(self.db) as connection:
             connection.execute(
@@ -2126,7 +2155,7 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
 
         response = self.client.post("/api/v8/selling-points/draft")
         self.assertEqual(response.status_code, 409)
-        self.assertIn("already exists with status retired", response.json()["detail"])
+        self.assertEqual(response.json()["detail"], "无法进入草稿编辑，请刷新页面后重试。")
         with connect(self.db) as connection:
             after = "\n".join(connection.iterdump())
         self.assertEqual(after, before)
@@ -2144,6 +2173,22 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
                 ).fetchone()[0]
             )
         self._activate_current_report_release()
+        captured_at = now_utc()
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                INSERT INTO content_items(
+                    link_id,platform,platform_content_id,canonical_url,published_at,
+                    title,content_type,imported_at,created_at,updated_at
+                ) VALUES (
+                    'LONGID','douyin','7668604214154726706',
+                    'https://www.douyin.com/video/7668604214154726706',
+                    '2026-07-01T05:00:00Z','历史导出兼容样本','image',?,?,?
+                )
+                """,
+                (captured_at, captured_at, captured_at),
+            )
+            connection.commit()
         created = self.client.post(
             "/api/v8/tasks",
             json={"period_start": "2026-07-01", "period_end": "2026-07-01"},
@@ -2196,6 +2241,86 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         self.assertEqual(image.status_code, 200)
         self.assertIn(image.headers["content-type"], {"image/svg+xml", "image/png"})
 
+        # A revision keeps its archived image immutable, while the ZIP image is
+        # a current-template derivative of that revision's verified report.json.
+        # Replacing the archived SVG here proves the bundle does not regress to
+        # the legacy three-card artwork for historical revisions.
+        legacy_svg = (
+            b'<svg xmlns="http://www.w3.org/2000/svg" width="1200" '
+            b'height="675"><text>legacy-three-card</text></svg>'
+        )
+        with connect(self.db) as connection:
+            summary_row = connection.execute(
+                """
+                SELECT local_path FROM report_files
+                WHERE task_id=? AND revision=1 AND file_kind='summary-svg'
+                """,
+                (task_id,),
+            ).fetchone()
+            self.assertIsNotNone(summary_row)
+            summary_path = PROJECT_ROOT / str(summary_row["local_path"])
+            summary_path.write_bytes(legacy_svg)
+            connection.execute(
+                """
+                UPDATE report_files SET sha256=?,byte_size=?
+                WHERE task_id=? AND revision=1 AND file_kind='summary-svg'
+                """,
+                (
+                    hashlib.sha256(legacy_svg).hexdigest(),
+                    len(legacy_svg),
+                    task_id,
+                ),
+            )
+            content_row = connection.execute(
+                """
+                SELECT local_path FROM report_files
+                WHERE task_id=? AND revision=1 AND file_kind='content-csv'
+                """,
+                (task_id,),
+            ).fetchone()
+            self.assertIsNotNone(content_row)
+            content_path = PROJECT_ROOT / str(content_row["local_path"])
+            current_content = list(
+                csv.DictReader(
+                    io.StringIO(
+                        content_path.read_text(encoding="utf-8-sig"), newline=""
+                    )
+                )
+            )
+            legacy_fields = [
+                field
+                for field in current_content[0]
+                if field
+                not in {
+                    "platform_content_id",
+                    "content_type",
+                    "primary_selling_point_label",
+                }
+            ]
+            legacy_buffer = io.StringIO(newline="")
+            legacy_writer = csv.DictWriter(
+                legacy_buffer,
+                fieldnames=legacy_fields,
+                extrasaction="ignore",
+                lineterminator="\r\n",
+            )
+            legacy_writer.writeheader()
+            legacy_writer.writerows(current_content)
+            legacy_content = ("\ufeff" + legacy_buffer.getvalue()).encode("utf-8")
+            content_path.write_bytes(legacy_content)
+            connection.execute(
+                """
+                UPDATE report_files SET sha256=?,byte_size=?
+                WHERE task_id=? AND revision=1 AND file_kind='content-csv'
+                """,
+                (
+                    hashlib.sha256(legacy_content).hexdigest(),
+                    len(legacy_content),
+                    task_id,
+                ),
+            )
+            connection.commit()
+
         with connect(self.db) as connection:
             before_download = {
                 "task": tuple(
@@ -2215,6 +2340,17 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
                     (task_id,),
                 ).fetchone()[0],
             }
+        with patch.object(api_module, "render_summary_png", return_value=False):
+            derived = self.client.get(
+                f"/api/v8/tasks/{task_id}/revisions/1/download"
+            )
+        self.assertEqual(derived.status_code, 200)
+        with zipfile.ZipFile(io.BytesIO(derived.content)) as archive:
+            derived_svg = archive.read("01_图片报告.svg")
+        self.assertIn("DCar Insight · 渠道与内容结构".encode(), derived_svg)
+        self.assertIn("账号类型构成".encode(), derived_svg)
+        self.assertNotIn(b"legacy-three-card", derived_svg)
+
         bundle = self.client.get(f"/api/v8/tasks/{task_id}/revisions/1/download")
         self.assertEqual(bundle.status_code, 200)
         self.assertEqual(bundle.headers["content-type"], "application/zip")
@@ -2257,6 +2393,41 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
             self.assertIn("报告说明".encode(), workbook_xml)
             self.assertIn("内容明细".encode(), workbook_xml)
             self.assertIn("渠道结论".encode(), workbook_xml)
+            content_sheet = xlsx.read("xl/worksheets/sheet2.xml")
+        content_values = _xlsx_sheet_values(content_sheet)
+        self.assertEqual(
+            content_values[0],
+            [
+                "周期",
+                "报告任务",
+                "平台作品编号",
+                "系统内容编号",
+                "平台",
+                "内容类型",
+                "发布时间（北京时间）",
+                "内容链接",
+                "标题",
+                "平台账号编号",
+                "账号名称",
+                "账号类型",
+                "内容方向",
+                "资料完整度",
+                "主要卖点编号",
+                "卖点信息",
+                "卖点评分",
+                "内容垂直度",
+                "播放/阅读数",
+                "评论数",
+            ],
+        )
+        historical_row = next(row for row in content_values[1:] if row[3] == "LONGID")
+        self.assertEqual(historical_row[2], "7668604214154726706")
+        self.assertEqual(historical_row[2], historical_row[7].rsplit("/", 1)[-1])
+        self.assertEqual(historical_row[5], "图文")
+        self.assertEqual(historical_row[13], "还没有评估")
+        self.assertEqual(
+            historical_row[14:16], ["卖点资料不足", "卖点资料不足"]
+        )
         with connect(self.db) as connection:
             after_download = {
                 "task": tuple(
@@ -2282,6 +2453,92 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         )
         self.assertEqual(missing_bundle.status_code, 404)
 
+    def test_report_export_context_recovers_url_id_and_rejects_mismatch(
+        self,
+    ) -> None:
+        task = create_task(
+            task_type="custom",
+            period_start="2026-07-01",
+            period_end="2026-07-01",
+            creation_source="manual",
+            db_path=self.db,
+        )
+        canonical_url = "https://www.kuaishou.com/short-video/url-only-123"
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                UPDATE content_items
+                SET platform='kuaishou',platform_content_id=NULL,
+                    canonical_url=?,content_type='video'
+                WHERE id=?
+                """,
+                (canonical_url, self.content_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO task_contents(
+                    task_id,content_id,inclusion_status,reason
+                ) VALUES (?,?,'included','fixture')
+                """,
+                (task["id"], self.content_id),
+            )
+            connection.commit()
+        buffer = io.StringIO(newline="")
+        writer = csv.DictWriter(
+            buffer,
+            fieldnames=(
+                "content_id",
+                "link_id",
+                "platform",
+                "platform_content_id",
+                "canonical_url",
+                "content_type",
+                "primary_selling_point_code",
+                "primary_selling_point_label",
+            ),
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "content_id": self.content_id,
+                "link_id": "A2BC3D",
+                "platform": "kuaishou",
+                "platform_content_id": "",
+                "canonical_url": canonical_url,
+                "content_type": "video",
+                "primary_selling_point_code": "",
+                "primary_selling_point_label": "",
+            }
+        )
+        content_csv = ("\ufeff" + buffer.getvalue()).encode("utf-8")
+        request = SimpleNamespace(app=self.app)
+
+        enrichment, _ = api_module._report_export_context(
+            request,
+            task_id=task["id"],
+            taxonomy_version="selling-points-v5.0",
+            content_csv=content_csv,
+        )
+        self.assertEqual(
+            enrichment[str(self.content_id)]["platform_content_id"],
+            "url-only-123",
+        )
+
+        with connect(self.db) as connection:
+            connection.execute(
+                "UPDATE content_items SET platform_content_id='different' WHERE id=?",
+                (self.content_id,),
+            )
+            connection.commit()
+        with self.assertRaises(api_module.HTTPException) as caught:
+            api_module._report_export_context(
+                request,
+                task_id=task["id"],
+                taxonomy_version="selling-points-v5.0",
+                content_csv=content_csv,
+            )
+        self.assertEqual(caught.exception.status_code, 409)
+
     def test_custom_task_rejects_an_unclosed_period_without_persisting_task(
         self,
     ) -> None:
@@ -2297,7 +2554,7 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         self.assertEqual(rejected.status_code, 409)
         self.assertEqual(
             rejected.json()["detail"],
-            "manual report period must be closed before creation",
+            "结束日期只能选昨天或更早。",
         )
         with connect(self.db) as connection:
             after = connection.execute("SELECT COUNT(*) FROM report_tasks").fetchone()[
@@ -2501,7 +2758,7 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
                     {
                         "platform": "douyin",
                         "canonical_url": "https://www.douyin.com/video/999999999",
-                        "title": "导入的汽车内容",
+                        "title": '=HYPERLINK("https://example.invalid")',
                         "body": "导入的汽车内容完整正文",
                         "published_at": "2026-07-03T08:00:00+08:00",
                     }
@@ -2520,6 +2777,13 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         export_text = exported.content.decode("utf-8-sig")
         self.assertIn("999999999", export_text)
         self.assertIn("evaluation_freshness", export_text.splitlines()[0])
+        exported_rows = list(csv.DictReader(io.StringIO(export_text, newline="")))
+        injected_row = next(
+            row for row in exported_rows if row["platform_content_id"] == "999999999"
+        )
+        self.assertEqual(
+            injected_row["title"], "'=HYPERLINK(\"https://example.invalid\")"
+        )
 
     def test_content_search_filters_by_selling_point(self) -> None:
         # v16 起没有人工改判入口：直接把当前评估设成 C1 命中来构造筛选样本

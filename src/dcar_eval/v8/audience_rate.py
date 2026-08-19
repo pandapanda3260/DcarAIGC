@@ -279,21 +279,21 @@ def _decide_metric(
 
     if publication_count == 0:
         return _MetricDecision(
-            "not_applicable", "该切片在所选窗口没有发布内容"
+            "not_applicable", "所选时间内没有相关内容"
         )
     if candidate_users == 0:
         if evidence_contents == 0:
-            reason = "评论尚未采集，无法计算互动用户"
+            reason = "评论还没有采集，暂时无法计算互动用户"
         elif first_level_comments == 0:
-            reason = "窗口内容没有一级评论互动"
+            reason = "所选时间内没有评论互动"
         else:
-            reason = "有一级评论但均无可识别的用户身份"
+            reason = "有评论，但无法识别评论用户"
         return _MetricDecision("missing", reason)
     if identity_coverage is None or identity_coverage < IDENTITY_COVERAGE_GATE:
         display = identity_coverage if identity_coverage is not None else "未知"
         return _MetricDecision(
             "below_threshold",
-            f"用户身份覆盖率 {display}%，低于 {IDENTITY_COVERAGE_GATE:.0f}% 门槛",
+            f"能够识别用户的评论占 {display}%，低于至少 {IDENTITY_COVERAGE_GATE:.0f}% 的要求",
         )
     if not classification_complete:
         display = (
@@ -303,50 +303,50 @@ def _decide_metric(
         )
         return _MetricDecision(
             "below_threshold",
-            "用户分类覆盖率 "
-            f"{display}%（{classified_users}/{candidate_users}），未覆盖全部候选用户",
+            "完成用户分类的比例为 "
+            f"{display}%（{classified_users}/{candidate_users}），还有用户未完成分类",
         )
     if total_users == 0:
         return _MetricDecision(
             "missing",
-            "候选评论用户均为排除项，没有可进入比例分母的有效用户",
+            "评论用户都不符合统计条件，暂时无法计算比例",
         )
     if classifier_state == "rejected":
         return _MetricDecision(
-            "below_threshold", "分类器定标未通过，暂不发布比例"
+            "below_threshold", "用户分类结果还没完成校验，暂不显示比例"
         )
     if total_users < MIN_USERS_SAMPLE:
         return _MetricDecision(
             "below_threshold",
-            f"去重有效用户 {total_users} 人，低于 {MIN_USERS_SAMPLE} 人门槛",
+            f"去掉重复用户后只有 {total_users} 人，少于至少 {MIN_USERS_SAMPLE} 人的要求",
         )
     if classifier_state == "uncalibrated":
         return _MetricDecision(
-            "sample_only", "分类器未经金标核对，数值仅供参考"
+            "sample_only", "用户分类结果还没有人工核对，数值仅供参考"
         )
     if comment_coverage is None:
-        return _MetricDecision("sample_only", "评论采集覆盖率未知，仅作样本")
+        return _MetricDecision("sample_only", "无法确认评论是否采集完整，结果仅供参考")
     if comment_coverage < COMMENT_COVERAGE_GATE:
         return _MetricDecision(
             "sample_only",
-            f"评论采集覆盖率 {comment_coverage}%，低于 90%，仅作样本",
+            f"已采集评论占 {comment_coverage}%，低于至少 90%，结果仅供参考",
         )
     if capped_content_count > 0:
         return _MetricDecision(
             "sample_only",
-            f"{capped_content_count} 条内容达到 {COMMENT_CAP} 条评论采集上限，仅作样本",
+            f"有 {capped_content_count} 条内容只采集了前 {COMMENT_CAP} 条评论，结果仅供参考",
         )
     if total_users < MIN_USERS_AVAILABLE:
         return _MetricDecision(
             "sample_only",
-            f"去重有效用户 {total_users} 人，处于 30–99 样本区间",
+            f"去掉重复用户后有 {total_users} 人，人数仍然较少，结果仅供参考",
         )
     if approximate_identity_keys:
         return _MetricDecision(
-            "sample_only", "包含历史内容级近似身份键，仅作样本"
+            "sample_only", "部分历史评论用户只能近似识别，数值仅供参考"
         )
     if classifier_state == "conservative":
-        return _MetricDecision("sample_only", "分类器为保守识别，仅作样本")
+        return _MetricDecision("sample_only", "用户分类采用保守判断，数值仅供参考")
     return _MetricDecision("available", "")
 
 

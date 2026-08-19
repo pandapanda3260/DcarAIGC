@@ -79,7 +79,7 @@ class StatusMachineTest(unittest.TestCase):
             classification_complete=False,
         )
         self.assertEqual(decision.status, "below_threshold")
-        self.assertIn("用户分类覆盖率", decision.reason)
+        self.assertIn("完成用户分类的比例", decision.reason)
         self.assertNotIn("定标未通过", decision.reason)
 
     def test_uncalibrated_publishes_capped_at_sample_only(self) -> None:
@@ -114,13 +114,13 @@ class StatusMachineTest(unittest.TestCase):
     def test_capped_comments_can_only_publish_as_sample(self) -> None:
         decision = self._decision(capped_content_count=1)
         self.assertEqual(decision.status, "sample_only")
-        self.assertIn("评论采集上限", decision.reason)
+        self.assertIn("只采集了前 1000 条评论", decision.reason)
         self.assertNotIn("保守识别", decision.reason)
 
     def test_approximate_identity_keys_can_only_publish_as_sample(self) -> None:
         decision = self._decision(approximate_identity_keys=True)
         self.assertEqual(decision.status, "sample_only")
-        self.assertIn("历史内容级近似身份键", decision.reason)
+        self.assertIn("部分历史评论用户只能近似识别", decision.reason)
 
     def test_boundary_examples_from_plan(self) -> None:
         # 92% comment coverage, 96% identity, 100 users -> available
@@ -351,7 +351,7 @@ class SliceRateTest(unittest.TestCase):
         self.assertIsNone(metric["percentage"])
         self.assertEqual(quality["classified_user_count"], 0)
         self.assertEqual(quality["classification_coverage_percentage"], 0.0)
-        self.assertIn("用户分类覆盖率 0.0%", metric["reason"])
+        self.assertIn("完成用户分类的比例为 0.0%", metric["reason"])
 
     def test_latest_classification_overrides_older_automotive_label(self) -> None:
         self._add_user("changed", "秦L真香", label="automotive")

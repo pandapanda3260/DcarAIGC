@@ -68,13 +68,13 @@ def duplicate_metric_decision(
         return (
             "not_calculable",
             coverage,
-            "重复内容感知指纹尚未完成定标，重复率暂不可计算",
+            "重复内容识别规则还没完成校验，暂时无法计算重复率",
         )
     if coverage < threshold:
         return (
             "below_threshold",
             coverage,
-            f"感知指纹覆盖率为 {coverage:.2f}%，低于 {threshold:g}% 发布阈值",
+            f"完成重复内容识别的数据占 {coverage:.2f}%，低于至少 {threshold:g}% 的要求",
         )
     return "available", coverage, ""
 
