@@ -11,6 +11,7 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import unicodedata
 import uuid
 from collections import Counter
 from datetime import date, datetime, time, timedelta, timezone
@@ -42,6 +43,7 @@ from .evaluation_selectors import (
 from .duplicates import FINGERPRINT_VERSION, THRESHOLDS, duplicate_metric_decision
 from .insights import CHANNELS, SCENES, build_channel_conclusions
 from .media_state import media_terminal_states
+from .report_export import formula_safe_csv_value
 from .storage import (
     DEFAULT_DB,
     PROJECT_ROOT,
@@ -62,15 +64,26 @@ IMPLICIT_RUN_STATUSES = {"queued", "failed", "interrupted"}
 _REPORT_ID_BATCH_SIZE = 500
 
 _QUALITY_GATE_LABELS = {
-    "discovery_coverage": "发现覆盖",
-    "detail_coverage": "详情覆盖",
-    "metrics_freshness": "指标新鲜度",
-    "evaluation_coverage": "正式评估覆盖",
-    "core_artifact_coverage": "核心产物覆盖",
-    "media_terminal_coverage": "媒体处理终态覆盖",
-    "duplicate_fingerprint_coverage": "重复指纹覆盖",
-    "weekly_comment_coverage": "周评论证据覆盖",
-    "duplicate_calibration_ready": "重复指纹定标未通过",
+    "discovery_coverage": "账号采集完成率",
+    "detail_coverage": "内容详情采集完成率",
+    "metrics_freshness": "播放和互动数据更新率",
+    "evaluation_coverage": "卖点评估完成率",
+    "core_artifact_coverage": "语音和画面文字识别完成率",
+    "media_terminal_coverage": "视频和图片处理完成率",
+    "duplicate_fingerprint_coverage": "重复内容识别完成率",
+    "weekly_comment_coverage": "评论采集完成率",
+    "duplicate_calibration_ready": "重复内容规则校验",
+}
+
+_TASK_STATUS_LABELS = {
+    "queued": "排队中",
+    "running": "生成中",
+    "succeeded": "已完成",
+    "partial": "部分完成",
+    "failed": "生成失败",
+    "interrupted": "已中断",
+    "cancel_requested": "正在取消",
+    "cancelled": "已取消",
 }
 
 
@@ -108,7 +121,7 @@ def _task_completion_message(report: Mapping[str, Any]) -> str:
         return "报告已生成"
     data_quality = report.get("data_quality")
     if not isinstance(data_quality, Mapping):
-        return "报告已生成；未达发布门槛：数据质量声明缺失"
+        return "报告已生成，但缺少数据质量说明"
     summary = report.get("summary_metrics")
     publications = (
         summary.get("publication_count", {}).get("value")
@@ -129,19 +142,19 @@ def _task_completion_message(report: Mapping[str, Any]) -> str:
     details: List[str] = []
     for failure in failures:
         key = str(failure["key"])
-        label = _QUALITY_GATE_LABELS.get(key, key)
+        label = _QUALITY_GATE_LABELS.get(key, "其他数据检查")
         if failure["kind"] == "boolean":
             details.append(label)
             continue
         actual = failure["actual"]
         required = float(failure["required"])
         if isinstance(actual, (int, float)) and not isinstance(actual, bool):
-            details.append(f"{label} {float(actual):g}%（门槛 {required:g}%）")
+            details.append(f"{label} {float(actual):g}%（要求至少 {required:g}%）")
         else:
-            details.append(f"{label}缺失（门槛 {required:g}%）")
+            details.append(f"{label}缺失（要求至少 {required:g}%）")
     if not details:
         details.append("历史报告未保留细分原因")
-    return "报告已生成；未达发布门槛：" + "、".join(details)
+    return "报告已生成，但以下数据未达到要求：" + "、".join(details)
 
 
 def assert_report_runtime_ready(connection) -> Dict[str, Any]:
@@ -215,9 +228,11 @@ def request_task_cancel(task_id: str, *, db_path: Path = DEFAULT_DB) -> Dict[str
         ).fetchone()
         if task is None:
             raise ReportTaskError(f"task does not exist: {task_id}")
+        if "已由发现补跑后的新任务替代" in str(task["message"] or ""):
+            raise ReportTaskError(f"superseded task cannot be cancelled: {task_id}")
         current = str(task["task_status"])
         if current == "running":
-            next_status, message = "cancel_requested", "已请求取消，等待当前安全点"
+            next_status, message = "cancel_requested", "正在取消，当前步骤完成后会停止"
         elif current in RUNNABLE_STATUSES:
             next_status, message = "cancelled", "任务已取消"
         elif current == "cancel_requested":
@@ -253,10 +268,12 @@ def request_task_cancel(task_id: str, *, db_path: Path = DEFAULT_DB) -> Dict[str
 def resume_task(task_id: str, *, db_path: Path = DEFAULT_DB) -> Dict[str, Any]:
     with connect(db_path) as connection, transaction(connection):
         task = connection.execute(
-            "SELECT task_status FROM report_tasks WHERE id=?", (task_id,)
+            "SELECT task_status,message FROM report_tasks WHERE id=?", (task_id,)
         ).fetchone()
         if task is None:
             raise ReportTaskError(f"task does not exist: {task_id}")
+        if "已由发现补跑后的新任务替代" in str(task["message"] or ""):
+            raise ReportTaskError(f"superseded task cannot be resumed: {task_id}")
         if task["task_status"] != "cancelled":
             raise ReportTaskError(
                 f"task {task_id} cannot be resumed from {task['task_status']}"
@@ -285,10 +302,12 @@ def retry_task(task_id: str, *, db_path: Path = DEFAULT_DB) -> Dict[str, Any]:
 
     with connect(db_path) as connection, transaction(connection):
         task = connection.execute(
-            "SELECT task_status FROM report_tasks WHERE id=?", (task_id,)
+            "SELECT task_status,message FROM report_tasks WHERE id=?", (task_id,)
         ).fetchone()
         if task is None:
             raise ReportTaskError(f"task does not exist: {task_id}")
+        if "已由发现补跑后的新任务替代" in str(task["message"] or ""):
+            raise ReportTaskError(f"superseded task cannot be retried: {task_id}")
         if task["task_status"] not in {"succeeded", "partial", "failed", "interrupted"}:
             raise ReportTaskError(
                 f"task {task_id} cannot create a revision from {task['task_status']}"
@@ -322,7 +341,7 @@ def _acknowledge_cancel(task_id: str, *, db_path: Path) -> bool:
         captured_at = now_utc()
         connection.execute(
             """
-            UPDATE report_tasks SET task_status='cancelled', message='任务已在安全点取消',
+            UPDATE report_tasks SET task_status='cancelled', message='任务已取消',
                 completed_at=?, updated_at=? WHERE id=?
             """,
             (captured_at, captured_at, task_id),
@@ -330,7 +349,7 @@ def _acknowledge_cancel(task_id: str, *, db_path: Path) -> bool:
         connection.execute(
             """
             INSERT INTO task_events(task_id,event_type,message,payload_json,created_at)
-            VALUES (?, 'cancelled', '任务已在安全点取消', '{}', ?)
+            VALUES (?, 'cancelled', '任务已取消', '{}', ?)
             """,
             (task_id, captured_at),
         )
@@ -716,15 +735,15 @@ def _metric_freshness_detail(
     percentage = _percentage(fresh_count, eligible_count)
     if eligible_count == 0:
         status = "not_applicable"
-        reason = "报告窗口没有发布内容"
+        reason = "所选时间内没有发布内容"
     elif percentage is not None and percentage >= minimum_percentage:
         status = "available"
         reason = ""
     else:
         status = "below_threshold"
         reason = (
-            f"固定采集截止点前 36 小时内的新鲜指标覆盖率为 "
-            f"{float(percentage or 0):.2f}%，低于 {minimum_percentage:g}% 发布门槛"
+            f"截止统计前 36 小时内有更新的数据占 "
+            f"{float(percentage or 0):.2f}%，低于至少 {minimum_percentage:g}% 的要求"
         )
     return {
         "status": status,
@@ -966,14 +985,14 @@ def _discovery_coverage_detail(
     if status == "available":
         reason = ""
     elif status == "not_applicable":
-        reason = "没有需要执行发现采集的平台账号"
+        reason = "所选时间内没有需要采集的平台账号"
     elif expected_count <= 0:
-        reason = "没有可验证的历史发现采集 roster，按 0% 处理"
+        reason = "没有找到可核对的历史账号采集记录，因此按 0% 计算"
     else:
         percentage_value = float(percentage) if percentage is not None else 0.0
         reason = (
-            f"报告窗口发现覆盖率为 {percentage_value:.2f}%（{covered_count}/"
-            f"{expected_count}），低于 {minimum_percentage:g}% 发布门槛"
+            f"所选时间内账号采集完成率为 {percentage_value:.2f}%（{covered_count}/"
+            f"{expected_count}），低于至少 {minimum_percentage:g}% 的要求"
         )
     return {
         "status": status,
@@ -1287,25 +1306,25 @@ def _build_report_data(
         else "below_threshold"
     )
     evaluation_reason = (
-        "正式评估覆盖率为 "
-        f"{evaluation_coverage:.2f}%，低于 {evaluation_minimum:g}% 发布阈值"
+        "卖点评估完成率为 "
+        f"{evaluation_coverage:.2f}%，低于至少 {evaluation_minimum:g}% 的要求"
         if eval_status == "below_threshold"
         else ""
     )
     view_reason = (
-        "存量曝光为一次性历史快照，不能解释为当前实时值"
+        "曝光量来自之前保存的数据，不能当作当前实时数据"
         if all_historical
-        else f"曝光量快照覆盖率为 {view_metric_coverage:.2f}%，低于 "
-        f"{view_minimum:g}% 发布阈值"
+        else f"有曝光量的数据占 {view_metric_coverage:.2f}%，低于至少 "
+        f"{view_minimum:g}% 的要求"
         if view_status == "below_threshold" and view_metric_coverage is not None
         else ""
     )
     comment_metric_coverage = _percentage(len(comment_values), total)
     comment_reason = (
-        "存量 valid_unique_commenters 不是评论量，未转换为评论数"
+        "现有数据只有互动人数，没有评论总数"
         if comment_status == "missing"
-        else f"评论量快照覆盖率为 {comment_metric_coverage:.2f}%，低于 "
-        f"{comment_minimum:g}% 发布阈值"
+        else f"有评论数的数据占 {comment_metric_coverage:.2f}%，低于至少 "
+        f"{comment_minimum:g}% 的要求"
         if comment_status == "below_threshold" and comment_metric_coverage is not None
         else ""
     )
@@ -1360,10 +1379,11 @@ def _build_report_data(
         (start_utc, end_utc),
     ).fetchall()
     tier_rows = connection.execute(
-        "SELECT code, tier FROM selling_points WHERE taxonomy_id=?",
+        "SELECT code, tier, label FROM selling_points WHERE taxonomy_id=?",
         (taxonomy["id"],),
     ).fetchall()
     tier_by_code = {str(row["code"]): row["tier"] for row in tier_rows}
+    label_by_code = {str(row["code"]): str(row["label"]) for row in tier_rows}
     conclusion_rows: List[Dict[str, Any]] = []
     for content in contents:
         content_id = int(content["id"])
@@ -1415,8 +1435,10 @@ def _build_report_data(
         details.append(
             {
                 "content_id": content_id,
+                "platform_content_id": content["platform_content_id"],
                 "link_id": content["link_id"],
                 "platform": content["platform"],
+                "content_type": content["content_type"],
                 "published_at": content["published_at"],
                 "canonical_url": content["canonical_url"],
                 "title": content["title"],
@@ -1430,6 +1452,11 @@ def _build_report_data(
                 "primary_selling_point_code": evaluation["primary_selling_point_code"]
                 if evaluation
                 else None,
+                "primary_selling_point_label": (
+                    label_by_code.get(str(evaluation["primary_selling_point_code"]))
+                    if evaluation and evaluation["primary_selling_point_code"]
+                    else None
+                ),
                 "selling_point_score": evaluation["selling_point_score"]
                 if evaluation
                 else None,
@@ -1522,19 +1549,19 @@ def _build_report_data(
                 None,
                 unit="person",
                 status="not_applicable" if total == 0 else "not_calculable",
-                reason="v8 首版没有经过验证的业务预估模型",
+                reason="系统目前没有可靠的业务预估模型",
             ),
             "estimated_reactivated_users": quantity_metric(
                 None,
                 unit="person",
                 status="not_applicable" if total == 0 else "not_calculable",
-                reason="v8 首版没有经过验证的业务预估模型",
+                reason="系统目前没有可靠的业务预估模型",
             ),
             "estimated_leads": quantity_metric(
                 None,
                 unit="lead",
                 status="not_applicable" if total == 0 else "not_calculable",
-                reason="v8 首版没有经过验证的业务预估模型",
+                reason="系统目前没有可靠的业务预估模型",
             ),
         },
         "channels": channel_conclusions,
@@ -1570,31 +1597,46 @@ _CONCLUSION_METRIC_LABELS = (
     ("acquisition_potential", "内容拉新效果预估"),
 )
 _UNPUBLISHED_STATUS_LABELS = {
-    "below_threshold": "暂不发布",
-    "missing": "无数据",
+    "below_threshold": "暂不显示",
+    "missing": "暂无数据",
     "not_applicable": "无适用内容",
-    "not_calculable": "暂无模型",
-    "stale": "数据已过期",
+    "not_calculable": "暂时无法计算",
+    "stale": "数据需要更新",
 }
 #: 按 reason 关键词给出更准确的短语（2026-08-07 决策：按成因显示，
 #: 不再使用泛化样本提示）。关键词与 audience_rate/insights 的
 #: reason 文案保持一致，改动需同步 web 端 unavailableShortLabel。
 _UNPUBLISHED_REASON_LABELS = (
-    ("感知指纹尚未完成定标", "重复指纹待校验"),
-    ("感知指纹覆盖率", "重复指纹待补齐"),
-    ("用户身份覆盖率", "身份数据待补齐"),
+    ("评论还没有采集", "评论未采集"),
+    ("所选时间内没有评论互动", "无评论互动"),
+    ("有评论，但无法识别评论用户", "无可识别用户"),
+    ("重复内容识别规则还没完成校验", "重复内容识别规则还没完成校验"),
+    ("完成重复内容识别的数据占", "重复内容识别还没完成"),
+    ("能够识别用户的评论占", "部分评论用户无法识别"),
+    ("能识别用户身份的评论占", "部分评论用户无法识别"),
+    ("完成用户分类的比例为", "用户分类未完成"),
+    ("去掉重复用户后只有", "互动用户人数不足"),
+    ("去重后只有", "互动用户人数不足"),
+    ("已完成分类的曝光", "部分曝光还没完成分类"),
+    ("用户分类结果还没完成校验", "用户分类结果还没完成校验"),
+    ("系统暂时无法按用户汇总", "暂时无法按用户汇总"),
+    ("没有曝光量大于 0", "暂无有效曝光"),
+    ("资料足够，可以评分", "暂无可评分内容"),
+    ("感知指纹尚未完成定标", "重复内容识别规则还没完成校验"),
+    ("感知指纹覆盖率", "重复内容识别还没完成"),
+    ("用户身份覆盖率", "部分用户身份信息不足"),
     ("用户分类覆盖率", "用户分类未完成"),
-    ("低于 30 人门槛", "互动用户少于30人"),
-    ("可归类有效曝光", "曝光归类待补齐"),
-    ("分类器定标未通过", "分类器核验未通过"),
-    ("用户级汽车兴趣占比尚未接入", "用户聚合未接入"),
+    ("低于 30 人门槛", "互动用户少于 30 人"),
+    ("可归类有效曝光", "部分曝光还没完成分类"),
+    ("分类器定标未通过", "用户分类结果还没完成校验"),
+    ("用户级汽车兴趣占比尚未接入", "暂时无法按用户汇总"),
     ("未提供阅读数", "平台未提供阅读数"),
     ("有效曝光数据", "有效曝光待补齐"),
     ("没有一级评论互动", "无评论互动"),
     ("评论尚未采集", "评论未采集"),
     ("无可识别的用户身份", "无可识别用户"),
     ("评分证据门槛", "暂无可评分内容"),
-    ("兴趣分类尚未运行", "待运行分类器"),
+    ("兴趣分类尚未运行", "系统还没完成用户分类"),
 )
 _PUBLISHED_METRIC_STATUSES = {"available", "sample_only"}
 
@@ -1610,12 +1652,12 @@ def _conclusion_cell(metric: Mapping[str, Any]) -> str:
         if metric.get("value") is not None:
             value = f"{metric['value']}%"
             if metric.get("status") == "sample_only":
-                return f"{value}（仅样本）"
+                return f"{value}（仅供参考）"
             return value
     elif published and metric.get("percentage") is not None:
         value = f"{metric['percentage']}%"
         if metric.get("status") == "sample_only":
-            return f"{value}（仅样本）"
+            return f"{value}（仅供参考）"
         return value
     reason = str(metric.get("reason") or "")
     for needle, label in _UNPUBLISHED_REASON_LABELS:
@@ -1626,15 +1668,15 @@ def _conclusion_cell(metric: Mapping[str, Any]) -> str:
 
 def _markdown(report: Mapping[str, Any]) -> str:
     metrics = report["summary_metrics"]
+    period_start = str(report["scope"]["period_start"])[:10]
+    period_end_exclusive = date.fromisoformat(str(report["scope"]["period_end"])[:10])
+    period_end = (period_end_exclusive - timedelta(days=1)).isoformat()
     lines = [
         f"# {report['task']['name']}",
         "",
-        f"- 报告合同：{report['report_version']}",
-        f"- 评估规则：{report['rule_version']}",
-        f"- 卖点标准：{report['taxonomy_version']}",
-        f"- 任务：{report['metadata']['task_id']} / revision {report['metadata']['revision']}",
-        f"- 任务状态：{report['task']['task_status']}",
-        f"- 统计区间：{report['scope']['period_start']} 至 {report['scope']['period_end']}（右开）",
+        f"- 报告版次：第 {report['metadata']['revision']} 版",
+        f"- 任务状态：{_TASK_STATUS_LABELS.get(str(report['task']['task_status']), '未知')}",
+        f"- 统计日期：{period_start} 至 {period_end}（包含开始和结束当天）",
         "",
         "## 概览",
         "",
@@ -1661,7 +1703,7 @@ def _markdown(report: Mapping[str, Any]) -> str:
                 groups.append((str(group.get("label") or scene), group))
             lines.append(
                 f"### {channel.get('label') or platform}渠道"
-                f"（窗口发布 {channel.get('publication_count', 0)} 条）"
+                f"（报告期内发布 {channel.get('publication_count', 0)} 条）"
             )
             lines.append("")
             header = " | ".join(title for title, _group in groups)
@@ -1676,13 +1718,12 @@ def _markdown(report: Mapping[str, Any]) -> str:
             lines.append("")
         lines.extend(
             [
-                "互动用户汽车兴趣占比为用户级去重口径（汽车兴趣用户数 / 去重互动用户数），"
-                "未达发布门槛的切片不显示比例；各切片的用户量、覆盖率与原因见 "
-                "channel_conclusions.csv。",
+                "同一互动用户只计算一次。样本太少时不显示比例；"
+                "详细人数和覆盖率可在渠道结论表中查看。",
                 "",
             ]
         )
-    lines.extend(["## 数据质量", ""])
+    lines.extend(["## 数据完整度", ""])
     quality_details = report.get("data_quality_details")
     freshness_detail = (
         quality_details.get("metrics_freshness")
@@ -1697,53 +1738,498 @@ def _markdown(report: Mapping[str, Any]) -> str:
     for key, value in report["data_quality"].items():
         if key == "discovery_coverage" and isinstance(discovery_detail, Mapping):
             if discovery_detail.get("status") == "not_applicable":
-                lines.append(f"- {key}: 无适用内容")
+                lines.append(f"- {_QUALITY_GATE_LABELS.get(key, '其他数据检查')}: 无适用内容")
             else:
                 lines.append(
-                    f"- {key}: "
+                    f"- {_QUALITY_GATE_LABELS.get(key, '其他数据检查')}: 账号采集 "
                     f"{discovery_detail.get('covered_identity_occurrence_count', 0)}/"
                     f"{discovery_detail.get('eligible_identity_occurrence_count', 0)}"
-                    f" · occurrence "
+                    f" · 每日采集 "
                     f"{discovery_detail.get('observed_occurrence_count', 0)}/"
                     f"{discovery_detail.get('expected_occurrence_count', 0)}"
                     f" · {value}%"
                 )
         elif key == "metrics_freshness" and isinstance(freshness_detail, Mapping):
             if freshness_detail.get("status") == "not_applicable":
-                lines.append(f"- {key}: 无适用内容")
+                lines.append(f"- {_QUALITY_GATE_LABELS.get(key, '其他数据检查')}: 无适用内容")
             else:
                 lines.append(
-                    f"- {key}: {freshness_detail.get('fresh_count', 0)}/"
+                    f"- {_QUALITY_GATE_LABELS.get(key, '其他数据检查')}: {freshness_detail.get('fresh_count', 0)}/"
                     f"{freshness_detail.get('eligible_count', 0)} · {value}%"
                 )
         elif isinstance(value, bool):
-            lines.append(f"- {key}: {'通过' if value else '未通过'}")
+            lines.append(
+                f"- {_QUALITY_GATE_LABELS.get(key, '其他数据检查')}: "
+                f"{'通过' if value else '未通过'}"
+            )
         elif value is None:
-            lines.append(f"- {key}: 无适用内容")
+            lines.append(f"- {_QUALITY_GATE_LABELS.get(key, '其他数据检查')}: 无适用内容")
         else:
-            lines.append(f"- {key}: {value}%")
+            lines.append(f"- {_QUALITY_GATE_LABELS.get(key, '其他数据检查')}: {value}%")
     lines.extend(
-        ["", "三项业务预估在 v8 首版恒为 `not_calculable`，不会生成推测值。", ""]
+        ["", "系统目前没有可靠的业务预估模型，因此不会生成推测值。", ""]
     )
     return "\n".join(lines)
 
 
-def _svg(report: Mapping[str, Any]) -> str:
-    metrics = report["summary_metrics"]
-    publication = metrics["publication_count"]["value"]
-    verticality = metrics["verticality_rate"]["percentage"]
-    selling = metrics["selling_point_coverage_rate"]["percentage"]
-    title = html.escape(str(report["task"]["name"]))
+_SVG_PLATFORM_LABELS = {
+    "douyin": "抖音",
+    "xiaohongshu": "小红书",
+    "wechat_channels": "视频号",
+    "kuaishou": "快手",
+}
+_SVG_ACCOUNT_TYPE_LABELS = {
+    "mixed_edit": "混剪",
+    "original": "原创",
+    "boutique_ip": "精品 IP",
+    "unknown": "未识别",
+}
+_SVG_DIRECTION_LABELS = {
+    "unknown": "待补齐",
+    "new_car": "新车",
+    "media": "媒体",
+    "used_car": "二手车",
+    "other": "其他",
+}
+_SVG_TASK_STATUS_LABELS = {
+    "succeeded": "已完成",
+    "partial": "部分完成",
+}
+
+
+def _svg_float(value: Any, *, default: float = 0.0) -> float:
+    if isinstance(value, bool):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _svg_percentage(value: Any) -> float:
+    return max(0.0, min(100.0, _svg_float(value)))
+
+
+def _svg_dimensions(report: Mapping[str, Any], key: str) -> Dict[str, Dict[str, Any]]:
+    rows = report.get(key)
+    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+        return {}
+    result: Dict[str, Dict[str, Any]] = {}
+    for item in rows:
+        if not isinstance(item, Mapping):
+            continue
+        item_key = str(item.get("key") or "unknown")
+        result[item_key] = {
+            "count": max(0, int(_svg_float(item.get("count")))),
+            "percentage": _svg_percentage(item.get("percentage")),
+        }
+    return result
+
+
+def _svg_display_text(value: Any, *, max_units: int) -> str:
+    text = "".join(
+        character
+        for character in str(value or "")
+        if character in {"\t", "\n", "\r"}
+        or "\u0020" <= character <= "\ud7ff"
+        or "\ue000" <= character <= "\ufffd"
+        or "\U00010000" <= character <= "\U0010ffff"
+    ).strip()
+    result: List[str] = []
+    units = 0
+    for character in text:
+        character_units = (
+            2 if unicodedata.east_asian_width(character) in {"W", "F"} else 1
+        )
+        if units + character_units > max_units:
+            return html.escape("".join(result).rstrip() + "…")
+        result.append(character)
+        units += character_units
+    return html.escape("".join(result))
+
+
+def _svg_count_font_size(
+    value: int, *, large: int, medium: int, small: int
+) -> int:
+    length = len(f"{value:,}")
+    if length <= 7:
+        return large
+    if length <= 10:
+        return medium
+    return small
+
+
+def _svg_period(report: Mapping[str, Any]) -> tuple[str, str, int]:
+    scope = report.get("scope")
+    if not isinstance(scope, Mapping):
+        return "统计周期未声明", "截止时间未声明", 0
+    try:
+        start = date.fromisoformat(str(scope.get("period_start"))[:10])
+        end_exclusive = date.fromisoformat(str(scope.get("period_end"))[:10])
+        end_inclusive = end_exclusive - timedelta(days=1)
+        days = max(0, (end_exclusive - start).days)
+        if start.year == end_inclusive.year:
+            range_label = (
+                f"{start:%Y.%m.%d}—{end_inclusive:%m.%d}"
+            )
+        else:
+            range_label = f"{start:%Y.%m.%d}—{end_inclusive:%Y.%m.%d}"
+        cutoff_label = f"{end_exclusive:%Y-%m-%d} 00:00"
+        metadata = report.get("metadata")
+        raw_cutoff = (
+            metadata.get("collection_cutoff_at")
+            if isinstance(metadata, Mapping)
+            else None
+        )
+        if isinstance(raw_cutoff, str) and raw_cutoff:
+            try:
+                cutoff = datetime.fromisoformat(raw_cutoff.replace("Z", "+00:00"))
+                if cutoff.tzinfo is not None:
+                    timezone_name = str(scope.get("timezone") or "Asia/Shanghai")
+                    try:
+                        display_timezone = ZoneInfo(timezone_name)
+                    except (KeyError, ValueError):
+                        display_timezone = SHANGHAI
+                    cutoff_label = cutoff.astimezone(display_timezone).strftime(
+                        "%Y-%m-%d %H:%M"
+                    )
+            except ValueError:
+                pass
+        return range_label, cutoff_label, days
+    except (TypeError, ValueError):
+        return "统计周期未声明", "截止时间未声明", 0
+
+
+def _svg_quality_thresholds(report: Mapping[str, Any]) -> Dict[str, float]:
+    contract = load_contract(report_version=str(report.get("report_version") or ""))
+    thresholds = {
+        str(key): float(value)
+        for key, value in contract.get("required_coverage_thresholds", {}).items()
+    }
+    for key, specification in contract.get("required_quality_details", {}).items():
+        if isinstance(specification, Mapping):
+            thresholds[str(key)] = float(specification["minimum_percentage"])
+    return thresholds
+
+
+def render_summary_svg(report: Mapping[str, Any]) -> str:
+    """Render the share image as a self-contained channel insight summary.
+
+    Structural dimensions are safe to show for a partial report. Business-effect
+    metrics are deliberately excluded: the task status, not the handful of
+    quality values visible in this compact image, remains the publication truth.
+    """
+
+    metrics = report.get("summary_metrics")
+    metrics = metrics if isinstance(metrics, Mapping) else {}
+    publication_metric = metrics.get("publication_count")
+    account_metric = metrics.get("active_account_count")
+    publication = max(
+        0,
+        int(
+            _svg_float(
+                publication_metric.get("value")
+                if isinstance(publication_metric, Mapping)
+                else 0
+            )
+        ),
+    )
+    active_accounts = max(
+        0,
+        int(
+            _svg_float(
+                account_metric.get("value")
+                if isinstance(account_metric, Mapping)
+                else 0
+            )
+        ),
+    )
+
+    task = report.get("task")
+    task = task if isinstance(task, Mapping) else {}
+    metadata = report.get("metadata")
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    title = _svg_display_text(task.get("name") or "自定义报告", max_units=54)
+    raw_status = str(task.get("task_status") or "")
+    status = _SVG_TASK_STATUS_LABELS.get(raw_status, "报告已生成")
+    revision = max(1, int(_svg_float(metadata.get("revision"), default=1)))
+
+    platforms = _svg_dimensions(report, "platform_dimensions")
+    platform_rows = sorted(
+        platforms.items(), key=lambda item: item[1]["percentage"], reverse=True
+    )
+    if platform_rows:
+        major_key, major = platform_rows[0]
+    else:
+        major_key, major = "unknown", {"count": 0, "percentage": 0.0}
+    if len(platform_rows) == 2:
+        minor_key, minor = platform_rows[1]
+    elif len(platform_rows) > 2:
+        minor_key = "other"
+        minor = {
+            "count": sum(item["count"] for _, item in platform_rows[1:]),
+            "percentage": sum(
+                item["percentage"] for _, item in platform_rows[1:]
+            ),
+        }
+    else:
+        minor_key, minor = "other", {"count": 0, "percentage": 0.0}
+    major_label = _SVG_PLATFORM_LABELS.get(major_key, major_key)
+    minor_label = _SVG_PLATFORM_LABELS.get(minor_key, "其他平台")
+    major_percentage = _svg_percentage(major["percentage"])
+    minor_percentage = _svg_percentage(minor["percentage"])
+
+    account_types = _svg_dimensions(report, "account_type_dimensions")
+    account_order = ("mixed_edit", "original", "boutique_ip", "unknown")
+    account_colors = {
+        "mixed_edit": "#2db8ad",
+        "original": "#ffcd32",
+        "boutique_ip": "#8ddcd5",
+        "unknown": "#84969b",
+    }
+    account_segments: List[str] = []
+    account_legend: List[str] = []
+    segment_x = 415.0
+    for index, key in enumerate(account_order):
+        value = account_types.get(key, {"count": 0, "percentage": 0.0})
+        percentage = _svg_percentage(value["percentage"])
+        width = 330 * percentage / 100
+        if width > 0:
+            account_segments.append(
+                f'<rect x="{segment_x:.2f}" y="236" width="{width:.2f}" '
+                f'height="42" fill="{account_colors[key]}"/>'
+            )
+            segment_x += width
+        y = 326 + index * 56
+        account_legend.append(
+            f'<circle cx="428" cy="{y - 6}" r="7" fill="{account_colors[key]}"/>'
+            f'<text class="t" x="446" y="{y}" font-size="17">'
+            f'{_SVG_ACCOUNT_TYPE_LABELS[key]}</text>'
+            f'<text class="num" x="738" y="{y}" font-size="19" '
+            f'text-anchor="end" fill="{account_colors[key]}">{percentage:.2f}%</text>'
+        )
+
+    directions = _svg_dimensions(report, "content_direction_dimensions")
+    direction_order = tuple(
+        key
+        for key in ("unknown", "new_car", "media", "used_car", "other")
+        if _svg_percentage(directions.get(key, {}).get("percentage")) > 0
+    )
+    direction_rows: List[str] = []
+    direction_colors = {
+        "unknown": "#ffcd32",
+        "new_car": "#2db8ad",
+        "media": "#58c9c0",
+        "used_car": "#8ddcd5",
+        "other": "#84969b",
+    }
+    for index, key in enumerate(direction_order[:5]):
+        percentage = _svg_percentage(directions[key]["percentage"])
+        y = 238 + index * 43
+        color = direction_colors[key]
+        bar_width = 210 * percentage / 100
+        bar_radius = min(7.0, bar_width / 2)
+        direction_rows.append(
+            f'<text class="font" x="790" y="{y}" font-size="16" '
+            f'fill="{color}">{_SVG_DIRECTION_LABELS[key]}</text>'
+            f'<rect x="875" y="{y - 14}" width="210" height="14" rx="7" '
+            f'fill="#294a53"/>'
+            f'<rect x="875" y="{y - 14}" width="{bar_width:.2f}" '
+            f'height="14" rx="{bar_radius:.2f}" fill="{color}"/>'
+            f'<text class="num" x="1158" y="{y}" font-size="17" '
+            f'text-anchor="end" fill="{color}">{percentage:.2f}%</text>'
+        )
+    if not direction_rows:
+        direction_rows.append(
+            '<text class="m" x="790" y="250" font-size="16">暂无内容方向数据</text>'
+        )
+
+    quality = report.get("data_quality")
+    quality = quality if isinstance(quality, Mapping) else {}
+    thresholds = _svg_quality_thresholds(report)
+    quality_items = (
+        ("discovery_coverage", "账号采集"),
+        ("metrics_freshness", "数据更新"),
+        ("evaluation_coverage", "卖点评估"),
+        ("detail_coverage", "详情采集"),
+        ("media_terminal_coverage", "媒体处理"),
+        ("duplicate_fingerprint_coverage", "重复识别"),
+    )
+    quality_cells: List[str] = []
+    visible_thresholds: List[float] = []
+    for index, (key, label) in enumerate(quality_items):
+        row, column = divmod(index, 3)
+        x = 790 + column * 123
+        label_y = 514 + row * 46
+        value_y = 537 + row * 46
+        raw_value = quality.get(key)
+        has_value = isinstance(raw_value, (int, float)) and not isinstance(
+            raw_value, bool
+        )
+        quality_value = _svg_percentage(raw_value) if has_value else 0.0
+        threshold = thresholds.get(key)
+        if threshold is not None:
+            visible_thresholds.append(threshold)
+        passed = (
+            has_value
+            and threshold is not None
+            and quality_value >= threshold
+        )
+        color = "#2db8ad" if passed else "#ffcd32" if has_value else "#84969b"
+        value_label = f"{quality_value:.2f}%" if has_value else "—"
+        quality_cells.append(
+            f'<text class="m" x="{x + 61}" y="{label_y}" font-size="12" '
+            f'text-anchor="middle">{label}</text>'
+            f'<text class="num" x="{x + 61}" y="{value_y}" font-size="18" '
+            f'text-anchor="middle" fill="{color}">{value_label}</text>'
+        )
+    one_threshold = (
+        visible_thresholds
+        and len({round(value, 4) for value in visible_thresholds}) == 1
+    )
+    threshold_label = (
+        f"各项要求至少 {visible_thresholds[0]:g}%"
+        if one_threshold
+        else "数据完整度按报告规则检查"
+    )
+
+    unknown_percentage = _svg_percentage(
+        directions.get("unknown", {}).get("percentage")
+    )
+    new_car_percentage = _svg_percentage(
+        directions.get("new_car", {}).get("percentage")
+    )
+    if publication:
+        insight_parts = [
+            (
+                f"内容高度集中于{major_label}"
+                if major_percentage >= 80
+                else f"最大渠道为{major_label}（{major_percentage:.2f}%）"
+            )
+        ]
+        if 35 <= new_car_percentage <= 45:
+            insight_parts.append("新车内容约四成")
+        elif new_car_percentage > 0:
+            insight_parts.append(f"新车内容占 {new_car_percentage:.2f}%")
+        if unknown_percentage > 50:
+            insight_parts.append("超过一半内容方向待补齐")
+        elif unknown_percentage > 0:
+            insight_parts.append(f"{unknown_percentage:.2f}% 内容方向待补齐")
+        insight = "已纳入内容中，" + "；".join(insight_parts)
+    else:
+        insight = "报告期内没有发布内容，当前无法分析渠道和内容分布"
+    insight = _svg_display_text(insight, max_units=104)
+    period_label, cutoff_label, period_days = _svg_period(report)
+    timezone_value = str(
+        (report.get("scope") or {}).get("timezone") or "Asia/Shanghai"
+    )
+    timezone_label = "北京时间" if timezone_value == "Asia/Shanghai" else "当地时间"
+    contract = load_contract(report_version=str(report.get("report_version") or ""))
+    failures = quality_gate_failures(
+        quality,
+        data_quality_details=(
+            report.get("data_quality_details")
+            if isinstance(report.get("data_quality_details"), Mapping)
+            else None
+        ),
+        contract=contract,
+        enforce_boolean_quality_gates=bool(publication),
+    )
+    estimated_metrics = tuple(
+        metrics.get(key)
+        for key in (
+            "estimated_new_users",
+            "estimated_reactivated_users",
+            "estimated_leads",
+        )
+    )
+    estimated_statuses = {
+        str(metric.get("status"))
+        for metric in estimated_metrics
+        if isinstance(metric, Mapping)
+    }
+    if estimated_statuses and estimated_statuses <= _PUBLISHED_METRIC_STATUSES:
+        effect_boundary = "拉新、拉活和线索数据可以显示"
+    elif "not_calculable" in estimated_statuses:
+        effect_boundary = "拉新、拉活和线索暂时无法计算"
+    else:
+        effect_boundary = "拉新、拉活和线索暂不显示"
+    quality_boundary = (
+        f"{len(failures)} 项数据未达到要求"
+        if failures
+        else "数据检查已通过"
+    )
+    publication_card_size = _svg_count_font_size(
+        publication, large=29, medium=24, small=19
+    )
+    publication_inline_size = _svg_count_font_size(
+        publication, large=19, medium=16, small=13
+    )
+    publication_donut_size = _svg_count_font_size(
+        publication, large=18, medium=15, small=12
+    )
+    account_card_size = _svg_count_font_size(
+        active_accounts, large=29, medium=24, small=19
+    )
+
     return f"""<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="675" viewBox="0 0 1200 675">
-<rect width="1200" height="675" fill="#102c35"/><rect x="70" y="62" width="10" height="92" rx="5" fill="#d9ff57"/>
-<style>.t{{font-family:-apple-system,BlinkMacSystemFont,'PingFang SC',sans-serif;fill:#fff}}.m{{fill:#91a9b0}}</style>
-<text class="t" x="110" y="105" font-size="24">DCar Insight · v8</text><text class="t" x="110" y="148" font-size="38" font-weight="700">{title}</text>
-<text class="t m" x="75" y="220" font-size="18">{html.escape(str(report["scope"]["period_start"]))} — {html.escape(str(report["scope"]["period_end"]))}</text>
-<rect x="75" y="278" width="320" height="230" rx="18" fill="#173e48"/><rect x="440" y="278" width="320" height="230" rx="18" fill="#173e48"/><rect x="805" y="278" width="320" height="230" rx="18" fill="#173e48"/>
-<text class="t m" x="110" y="330" font-size="18">发布内容</text><text class="t" x="110" y="420" font-size="72" font-weight="700">{publication}</text><text class="t m" x="110" y="465" font-size="17">条</text>
-<text class="t m" x="475" y="330" font-size="18">内容垂直度</text><text class="t" x="475" y="420" font-size="72" font-weight="700">{verticality if verticality is not None else "—"}</text><text class="t m" x="475" y="465" font-size="17">%</text>
-<text class="t m" x="840" y="330" font-size="18">卖点覆盖率</text><text class="t" x="840" y="420" font-size="72" font-weight="700">{selling if selling is not None else "—"}</text><text class="t m" x="840" y="465" font-size="17">%</text>
-<text class="t m" x="75" y="600" font-size="16">状态 {html.escape(str(report["task"]["task_status"]))} · 缺失与低覆盖均按合同显式标记</text>
+<rect width="1200" height="675" fill="#102c35"/>
+<style>
+.font{{font-family:Arial,'PingFang SC','Microsoft YaHei',sans-serif}}
+.t{{font-family:Arial,'PingFang SC','Microsoft YaHei',sans-serif;fill:#f7f8f5}}
+.m{{font-family:Arial,'PingFang SC','Microsoft YaHei',sans-serif;fill:#9eb0b5}}
+.num{{font-family:Inter,Arial,'PingFang SC','Microsoft YaHei',sans-serif;font-weight:700}}
+</style>
+<rect x="40" y="32" width="6" height="70" rx="3" fill="#ffcd32"/>
+<text class="t" x="62" y="52" font-size="17">DCar Insight · 渠道与内容结构</text>
+<text class="t" x="62" y="96" font-size="30" font-weight="700">{title}</text>
+<rect x="1018" y="30" width="142" height="36" rx="18" fill="#ffcd32"/>
+<text x="1089" y="54" font-family="Arial,'PingFang SC','Microsoft YaHei',sans-serif" font-size="16" font-weight="700" text-anchor="middle" fill="#13262d">{status}</text>
+<text class="m" x="1158" y="91" font-size="13" text-anchor="end">第 {revision} 版</text>
+<text class="t" x="40" y="144" font-size="20" font-weight="600">{insight}</text>
+<line x1="40" y1="166" x2="1160" y2="166" stroke="#ffcd32" stroke-width="1.5"/>
+
+<text class="t" x="40" y="204" font-size="18" font-weight="700">平台结构</text>
+<text class="num" x="40" y="276" font-size="54" fill="#f7f8f5">{major_percentage:.2f}%</text>
+<text class="t" x="42" y="311" font-size="25" font-weight="700">{html.escape(major_label)}</text>
+<text x="42" y="340" font-family="Arial,'PingFang SC','Microsoft YaHei',sans-serif" font-size="{publication_inline_size}" font-weight="700" fill="#2db8ad">{major['count']:,} 条</text>
+<circle cx="287" cy="280" r="60" fill="none" stroke="#294a53" stroke-width="18"/>
+<circle cx="287" cy="280" r="60" fill="none" stroke="#2db8ad" stroke-width="18" pathLength="100" stroke-dasharray="{major_percentage:.2f} {100 - major_percentage:.2f}" stroke-linecap="butt" transform="rotate(-90 287 280)"/>
+<text class="m" x="287" y="276" font-size="12" text-anchor="middle">已纳入内容</text>
+<text class="num" x="287" y="300" font-size="{publication_donut_size}" text-anchor="middle" fill="#f7f8f5">{publication:,}</text>
+<line x1="40" y1="372" x2="360" y2="372" stroke="#31505a"/>
+<text class="num" x="42" y="405" font-size="24" fill="#f7f8f5">{minor_percentage:.2f}%</text>
+<text class="t" x="130" y="405" font-size="17">{html.escape(minor_label)}</text>
+<text class="m" x="358" y="405" font-size="15" text-anchor="end">{minor['count']:,} 条</text>
+<rect x="40" y="442" width="148" height="76" rx="13" fill="#173b45"/>
+<text class="num" x="58" y="482" font-size="{publication_card_size}" fill="#f7f8f5">{publication:,}</text>
+<text class="m" x="58" y="505" font-size="13">发布内容</text>
+<rect x="206" y="442" width="154" height="76" rx="13" fill="#173b45"/>
+<text class="num" x="224" y="482" font-size="{account_card_size}" fill="#f7f8f5">{active_accounts:,}</text>
+<text class="m" x="224" y="505" font-size="13">发布账号</text>
+<text class="m" x="40" y="552" font-size="12">结构分布仅描述本报告已纳入内容</text>
+
+<line x1="390" y1="190" x2="390" y2="594" stroke="#31505a"/>
+<text class="t" x="415" y="204" font-size="18" font-weight="700">账号类型构成</text>
+<rect x="415" y="236" width="330" height="42" rx="8" fill="#294a53"/>
+<clipPath id="account-stack"><rect x="415" y="236" width="330" height="42" rx="8"/></clipPath>
+<g clip-path="url(#account-stack)">{''.join(account_segments)}</g>
+{''.join(account_legend)}
+<text class="m" x="415" y="552" font-size="12">按发布内容统计账号类型占比</text>
+
+<line x1="765" y1="190" x2="765" y2="594" stroke="#31505a"/>
+<text class="t" x="790" y="204" font-size="18" font-weight="700">内容方向</text>
+{''.join(direction_rows)}
+<line x1="790" y1="458" x2="1160" y2="458" stroke="#31505a"/>
+<text class="t" x="790" y="480" font-size="17" font-weight="700">数据完整度 · {threshold_label}</text>
+<text x="1158" y="480" font-family="Arial,'PingFang SC','Microsoft YaHei',sans-serif" font-size="11" text-anchor="end" fill="#ffcd32">{quality_boundary}</text>
+<rect x="790" y="492" width="370" height="101" rx="12" fill="#173b45" stroke="#31505a"/>
+{''.join(quality_cells)}
+<text class="m" x="975" y="610" font-size="11" text-anchor="middle">{effect_boundary}</text>
+
+<line x1="40" y1="620" x2="1160" y2="620" stroke="#31505a"/>
+<text class="m" x="40" y="651" font-size="13">报告周期 {period_days} 天 · {period_label}</text>
+<text class="m" x="1160" y="651" font-size="13" text-anchor="end">数据统计至 {cutoff_label} · {timezone_label}</text>
 </svg>
 """
 
@@ -1751,8 +2237,10 @@ def _svg(report: Mapping[str, Any]) -> str:
 def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     fields = [
         "content_id",
+        "platform_content_id",
         "link_id",
         "platform",
+        "content_type",
         "published_at",
         "canonical_url",
         "title",
@@ -1762,6 +2250,7 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         "content_direction",
         "evidence_level",
         "primary_selling_point_code",
+        "primary_selling_point_label",
         "selling_point_score",
         "content_automotive_score",
         "view_count",
@@ -1774,7 +2263,13 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(
+            {
+                field: formula_safe_csv_value(value)
+                for field, value in row.items()
+            }
+            for row in rows
+        )
 
 
 def _write_channel_csv(path: Path, channels: Mapping[str, Any]) -> None:
@@ -1994,7 +2489,7 @@ def _record_task_failure(
     db_path: Path,
 ) -> None:
     failed_at = now_utc()
-    message = str(exc)[:1000]
+    message = "报告生成失败，请重新生成；如果仍然失败，请联系管理员。"
     with connect(db_path) as connection, transaction(connection):
         task = connection.execute(
             "SELECT 1 FROM report_tasks WHERE id=?", (task_id,)
@@ -2086,7 +2581,7 @@ def run_task(
             connection.execute(
                 """
                 UPDATE report_tasks SET task_status='running', progress=10,
-                    message='正在快照报告窗口内容', started_at=?, completed_at=NULL, updated_at=?
+                    message='正在整理报告日期内的内容', started_at=?, completed_at=NULL, updated_at=?
                 WHERE id=?
                 """,
                 (started_at, started_at, task_id),
@@ -2133,7 +2628,7 @@ def run_task(
         advance_task_progress(
             task_id,
             progress=35,
-            message="正在汇总窗口指标与结论",
+            message="正在统计数据并生成结论",
             db_path=db_path,
         )
         with connect(db_path) as connection:
@@ -2148,7 +2643,7 @@ def run_task(
         advance_task_progress(
             task_id,
             progress=65,
-            message="正在写出报告文件",
+            message="正在生成报告文件",
             db_path=db_path,
         )
         temp_paths = {kind: temporary / path.name for kind, path in final_paths.items()}
@@ -2156,7 +2651,9 @@ def run_task(
         temp_paths["content-csv"].parent.mkdir(parents=True, exist_ok=True)
         _write_csv(temp_paths["content-csv"], report["content_details"])
         _write_channel_csv(temp_paths["channel-csv"], report["channels"])
-        temp_paths["summary-svg"].write_text(_svg(report), encoding="utf-8")
+        temp_paths["summary-svg"].write_text(
+            render_summary_svg(report), encoding="utf-8"
+        )
         png_available = render_summary_png(
             temp_paths["summary-svg"], temp_paths["summary-png"]
         )
@@ -2171,7 +2668,7 @@ def run_task(
         advance_task_progress(
             task_id,
             progress=85,
-            message="正在校验并归档 revision",
+            message="正在检查并保存报告版本",
             db_path=db_path,
         )
         validate_report(report)

@@ -14,14 +14,16 @@ import re
 import unicodedata
 import zipfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Sequence
+from urllib.parse import unquote, urlsplit
 from xml.sax.saxutils import escape, quoteattr
 
 
 EXCEL_MAX_ROWS = 1_048_576
 EXCEL_MAX_CELL_CHARS = 32_767
 _INVALID_FILENAME_CHARS = re.compile(r'[\x00-\x1f\x7f<>:"/\\|?*]+')
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@")
 _WINDOWS_RESERVED_FILENAMES = {
     "CON",
     "PRN",
@@ -31,65 +33,144 @@ _WINDOWS_RESERVED_FILENAMES = {
     *(f"LPT{index}" for index in range(1, 10)),
 }
 
-_CONTENT_HEADERS = {
-    "content_id": "内容 ID",
-    "link_id": "链接 ID",
-    "platform": "平台代码",
-    "published_at": "发布时间（UTC）",
-    "canonical_url": "内容链接",
-    "title": "标题",
-    "account_uid": "账号 UID",
-    "account_name": "账号名称",
-    "account_type": "账号类型代码",
-    "content_direction": "内容方向代码",
-    "evidence_level": "证据等级",
-    "primary_selling_point_code": "主卖点编码",
-    "selling_point_score": "卖点评分",
-    "content_automotive_score": "内容垂直度评分",
-    "view_count": "播放量",
-    "comment_count": "评论量",
-    "duplicate_original_link_id": "重复原始链接 ID",
-    "duplicate_method": "重复识别方法",
-    "duplicate_confidence": "重复置信度",
-    "evaluation_current": "是否当前正式评估",
+_CONTENT_EXPORT_COLUMNS = (
+    ("report_period", "周期"),
+    ("report_task", "报告任务"),
+    ("platform_content_id", "平台作品编号"),
+    ("link_id", "系统内容编号"),
+    ("platform", "平台"),
+    ("content_type", "内容类型"),
+    ("published_at_beijing", "发布时间（北京时间）"),
+    ("canonical_url", "内容链接"),
+    ("title", "标题"),
+    ("account_uid", "平台账号编号"),
+    ("account_name", "账号名称"),
+    ("account_type", "账号类型"),
+    ("content_direction", "内容方向"),
+    ("v3_status", "资料完整度"),
+    ("primary_selling_point_code", "主要卖点编号"),
+    ("primary_selling_point_label", "卖点信息"),
+    ("selling_point_score", "卖点评分"),
+    ("content_automotive_score", "内容垂直度"),
+    ("view_count", "播放/阅读数"),
+    ("comment_count", "评论数"),
+)
+
+
+def formula_safe_csv_value(value: Any) -> Any:
+    """Prefix spreadsheet-interpreted CSV text without changing non-text values."""
+
+    if not isinstance(value, str) or not value:
+        return value
+    stripped = value.lstrip()
+    if value[0] in {"\t", "\r", "\n"} or stripped.startswith(
+        _CSV_FORMULA_PREFIXES
+    ):
+        return f"'{value}"
+    return value
+
+
+_CONTENT_REQUIRED_HEADERS = {
+    "content_id",
+    "link_id",
+    "platform",
+    "published_at",
+    "canonical_url",
+    "title",
+    "account_uid",
+    "account_name",
+    "account_type",
+    "content_direction",
+    "evidence_level",
+    "primary_selling_point_code",
+    "selling_point_score",
+    "content_automotive_score",
+    "view_count",
+    "comment_count",
+}
+_MISSING_SELLING_POINT = "卖点资料不足"
+
+_PLATFORM_LABELS = {
+    "douyin": "抖音",
+    "xiaohongshu": "小红书",
+    "wechat_channels": "视频号",
+    "kuaishou": "快手",
+}
+_CONTENT_TYPE_LABELS = {"video": "视频", "image": "图文", "unknown": "未知"}
+_ACCOUNT_TYPE_LABELS = {
+    "boutique_ip": "精品 IP",
+    "original": "原创",
+    "mixed_edit": "混剪",
+    "unknown": "未知",
+}
+_CONTENT_DIRECTION_LABELS = {
+    "new_car": "新车",
+    "used_car": "二手车",
+    "media": "媒体",
+    "other": "其他",
+    "unknown": "未知",
 }
 
 _CHANNEL_HEADERS = {
-    "platform": "平台代码",
+    "platform": "平台内部标识",
     "platform_label": "平台",
-    "scope": "范围代码",
-    "scope_label": "范围",
+    "scope": "统计范围内部标识",
+    "scope_label": "统计范围",
     "publication_count": "发布内容数",
-    "metric": "指标代码",
+    "metric": "指标内部标识",
     "metric_label": "指标",
-    "kind": "指标类型",
-    "status": "发布状态",
+    "kind": "计算方式",
+    "status": "结果状态",
     "value": "数值",
-    "numerator": "分子",
-    "denominator": "分母",
+    "numerator": "符合条件数量",
+    "denominator": "统计总数",
     "percentage": "比例",
     "eligible_count": "可计算内容数",
     "coverage_percentage": "覆盖率",
-    "reason": "口径与说明",
+    "reason": "说明",
     "identity_coverage_percentage": "身份覆盖率",
-    "candidate_user_count": "候选用户数",
+    "candidate_user_count": "待判断用户数",
     "classified_user_count": "已分类用户数",
     "classification_coverage_percentage": "分类覆盖率",
     "comment_collection_coverage_percentage": "评论采集覆盖率",
     "captured_comment_count": "已采集评论数",
-    "declared_comment_count": "声明评论数",
-    "capped_content_count": "触达采集上限内容数",
+    "declared_comment_count": "平台显示的评论数",
+    "capped_content_count": "评论只采集到上限的内容数",
     "audience_definition_version": "人群定义版本",
-    "classifier_version": "分类器版本",
-    "user_key_version": "用户键版本",
-    "evidence_window_start": "证据窗口开始（UTC）",
-    "evidence_window_end": "证据窗口结束（UTC）",
-    "report_cutoff_at": "报告采集截止（UTC）",
-    "warm_up": "是否预热期",
+    "classifier_version": "用户分类规则版本",
+    "user_key_version": "用户去重规则版本",
+    "evidence_window_start": "评论统计开始时间（北京时间）",
+    "evidence_window_end": "评论统计结束时间（北京时间）",
+    "report_cutoff_at": "数据采集截止时间（北京时间）",
+    "warm_up": "是否处于试运行期",
 }
 
+_CHANNEL_VALUE_LABELS = {
+    "kind": {"quantity": "数量", "ratio": "占比", "score": "评分"},
+    "status": {
+        "available": "可用",
+        "below_threshold": "暂不显示",
+        "sample_only": "仅供参考",
+        "not_applicable": "无相关内容",
+        "not_calculable": "暂时无法计算",
+        "missing": "暂无数据",
+        "stale": "需要更新",
+    },
+    "scope": {"summary": "全部", "used_car": "二手车", "new_car": "新车", "media": "媒体"},
+}
+
+_CHANNEL_TECHNICAL_HEADERS = frozenset(
+    {
+        "platform",
+        "scope",
+        "metric",
+        "audience_definition_version",
+        "classifier_version",
+        "user_key_version",
+    }
+)
+
 _INTEGER_HEADERS = {
-    "content_id",
     "selling_point_score",
     "content_automotive_score",
     "view_count",
@@ -115,22 +196,33 @@ _PERCENT_HEADERS = {
 _BOOLEAN_HEADERS = {"evaluation_current", "warm_up"}
 _DATETIME_HEADERS = {
     "published_at",
+    "published_at_beijing",
     "evidence_window_start",
     "evidence_window_end",
     "report_cutoff_at",
 }
 
 _COLUMN_WIDTHS = {
-    "content_id": 12,
-    "link_id": 16,
+    "report_period": 28,
+    "report_task": 34,
+    "platform_content_id": 24,
+    "link_id": 14,
     "platform": 14,
-    "published_at": 22,
-    "canonical_url": 46,
-    "title": 56,
-    "account_uid": 22,
-    "account_name": 24,
-    "account_type": 18,
-    "content_direction": 18,
+    "content_type": 13,
+    "published_at_beijing": 22,
+    "canonical_url": 44,
+    "title": 52,
+    "account_uid": 24,
+    "account_name": 22,
+    "account_type": 16,
+    "content_direction": 16,
+    "v3_status": 18,
+    "primary_selling_point_code": 16,
+    "primary_selling_point_label": 54,
+    "selling_point_score": 13,
+    "content_automotive_score": 13,
+    "view_count": 15,
+    "comment_count": 12,
     "reason": 56,
     "metric": 32,
     "metric_label": 28,
@@ -153,6 +245,7 @@ class _Worksheet:
     auto_filter: str | None = None
     frozen_rows: int = 0
     row_heights: Mapping[int, float] | None = None
+    hidden_columns: Sequence[int] = ()
 
 
 def _valid_xml_char(character: str) -> bool:
@@ -211,10 +304,66 @@ def _parse_datetime(value: str) -> datetime | None:
     return parsed
 
 
+def _parse_beijing_datetime(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed
+    beijing = timezone(timedelta(hours=8))
+    return parsed.astimezone(beijing).replace(tzinfo=None)
+
+
+def _plain_channel_reason(value: str) -> str:
+    text = _clean_text(value).strip()
+    rules = (
+        (r"正式评估覆盖率为 ([\d.]+)%，低于 ([\d.]+)% 发布阈值", r"卖点评估完成率为 \1%，低于至少 \2% 的要求"),
+        (r"曝光量快照覆盖率为 ([\d.]+)%，低于 ([\d.]+)% 发布阈值", r"有曝光量的数据占 \1%，低于至少 \2% 的要求"),
+        (r"评论量快照覆盖率为 ([\d.]+)%，低于 ([\d.]+)% 发布阈值", r"有评论数的数据占 \1%，低于至少 \2% 的要求"),
+        (r"固定采集截止点前 (\d+) 小时内的新鲜指标覆盖率为 ([\d.]+)%，低于 ([\d.]+)% 发布门槛", r"截止统计前 \1 小时内有更新的数据占 \2%，低于至少 \3% 的要求"),
+        (r"报告窗口发现覆盖率为 ([\d.]+)%，低于 ([\d.]+)% 发布门槛", r"计划采集完成率为 \1%，低于至少 \2% 的要求"),
+        (r"感知指纹覆盖率为 ([\d.]+)%，低于 ([\d.]+)% 发布阈值", r"完成重复内容识别的数据占 \1%，低于至少 \2% 的要求"),
+        (r"用户身份覆盖率 ([\d.]+)%，低于 ([\d.]+)% 门槛", r"可识别评论用户的比例为 \1%，低于至少 \2% 的要求"),
+        (r"用户分类覆盖率 ([\d.]+)%，低于 ([\d.]+)% 门槛", r"用户分类完成率为 \1%，低于至少 \2% 的要求"),
+        (r"去重有效用户 (\d+) 人，低于 (\d+) 人门槛", r"去重后有 \1 位互动用户，少于至少 \2 位的要求"),
+        (r"分类器未经金标核对，数值仅供参考", "用户分类规则还没完成人工检查，结果仅供参考"),
+        (r"重复内容感知指纹尚未完成定标，重复率暂不可计算", "重复内容识别规则还没完成校验，暂时无法计算重复率"),
+    )
+    for pattern, replacement in rules:
+        text = re.sub(pattern, replacement, text)
+    replacements = (
+        ("报告窗口", "报告期内"),
+        ("发现覆盖", "计划采集完成率"),
+        ("详情覆盖", "内容详情完整率"),
+        ("指标新鲜度", "播放和互动数据更新率"),
+        ("正式评估覆盖", "卖点评估完成率"),
+        ("媒体处理终态覆盖", "视频和图片处理完成率"),
+        ("重复指纹覆盖", "重复内容识别完成率"),
+        ("周评论证据覆盖", "评论采集完成率"),
+        ("统计口径", "计算方式"),
+        ("分母", "统计总数"),
+        ("发布阈值", "显示要求"),
+        ("发布门槛", "显示要求"),
+    )
+    for old, new in replacements:
+        text = text.replace(old, new)
+    if re.search(r"[A-Za-z_]{3,}|定标|感知指纹|分类器|用户聚合|终态|快照", text):
+        return "数据还不够完整，暂时无法显示结果。"
+    return text
+
+
 def _typed_value(header: str, value: str) -> Any:
     stripped = value.strip()
     if not stripped:
         return None
+    if header == "reason":
+        return _plain_channel_reason(stripped)
+    labels = _CHANNEL_VALUE_LABELS.get(header)
+    if labels is not None:
+        return labels.get(stripped, _clean_text(value))
+    if header == "warm_up":
+        return "是" if stripped.lower() in {"true", "1", "yes"} else "否"
     if header in _BOOLEAN_HEADERS:
         lowered = stripped.lower()
         if lowered in {"true", "1", "yes"}:
@@ -234,7 +383,11 @@ def _typed_value(header: str, value: str) -> Any:
         number = _finite_number(stripped)
         return number if number is not None else _clean_text(value)
     if header in _DATETIME_HEADERS:
-        parsed = _parse_datetime(stripped)
+        parsed = (
+            _parse_beijing_datetime(stripped)
+            if header in {"published_at_beijing", "evidence_window_start", "evidence_window_end", "report_cutoff_at"}
+            else _parse_datetime(stripped)
+        )
         return parsed if parsed is not None else _clean_text(value)
     return _clean_text(value)
 
@@ -277,6 +430,8 @@ def _table_sheet(
     name: str,
     payload: bytes,
     labels: Mapping[str, str],
+    *,
+    hidden_headers: frozenset[str] = frozenset(),
 ) -> tuple[_Worksheet, int]:
     headers, raw_rows = _csv_rows(payload)
     translated = [labels.get(header, header) for header in headers]
@@ -296,6 +451,167 @@ def _table_sheet(
             auto_filter=f"A1:{last_column}{len(rows)}",
             frozen_rows=1,
             row_heights={1: 28},
+            hidden_columns=tuple(
+                index
+                for index, header in enumerate(headers, start=1)
+                if header in hidden_headers
+            ),
+        ),
+        len(raw_rows),
+    )
+
+
+def _source_value(
+    row: Mapping[str, str], enrichment: Mapping[str, Any], key: str
+) -> str:
+    value = row.get(key)
+    if value is None or not value.strip():
+        value = enrichment.get(key)
+    return "" if value is None else _clean_text(value)
+
+
+def platform_content_id_from_url(platform: str, canonical_url: str) -> str:
+    try:
+        path = [unquote(value) for value in urlsplit(canonical_url).path.split("/") if value]
+    except ValueError:
+        return ""
+    marker_paths = {
+        "douyin": (("video",),),
+        "xiaohongshu": (("explore",), ("discovery", "item")),
+        "kuaishou": (("short-video",), ("photo",)),
+        "wechat_channels": (("video",),),
+    }
+    for markers in marker_paths.get(platform, ()):
+        marker_count = len(markers)
+        for index in range(len(path) - marker_count):
+            if tuple(path[index : index + marker_count]) == markers:
+                return path[index + marker_count]
+    return ""
+
+
+def _v3_status(evidence_level: str, content_type: str) -> str:
+    level = evidence_level.strip().upper()
+    if level == "V3":
+        return "资料完整（V3）"
+    if level == "V2":
+        return "资料较完整（V2，图文内容）" if content_type == "image" else "资料较完整（V2）"
+    if level:
+        return f"资料不足（{level}）"
+    return "还没有评估"
+
+
+def _content_sheet(
+    *,
+    task: Mapping[str, Any],
+    payload: bytes,
+    content_enrichment: Mapping[str, Mapping[str, Any]],
+    selling_point_labels: Mapping[str, str],
+) -> tuple[_Worksheet, int]:
+    headers, raw_rows = _csv_rows(payload)
+    missing_headers = sorted(_CONTENT_REQUIRED_HEADERS - set(headers))
+    if missing_headers:
+        raise ValueError(
+            "content detail CSV is missing required headers: "
+            + ", ".join(missing_headers)
+        )
+    period = (
+        f"{_clean_text(task.get('period_start') or '')} 至 "
+        f"{_clean_text(task.get('period_end') or '')}"
+    )
+    task_reference = _clean_text(task.get("id") or task.get("name") or "")
+    output_headers = [label for _, label in _CONTENT_EXPORT_COLUMNS]
+    rows: list[list[Any]] = [output_headers]
+    styles: list[list[int]] = [[1] * len(output_headers)]
+    for raw_row in raw_rows:
+        source = dict(zip(headers, raw_row))
+        internal_content_id = source.get("content_id", "").strip()
+        enrichment = content_enrichment.get(internal_content_id, {})
+        platform = _source_value(source, enrichment, "platform").strip()
+        canonical_url = _source_value(source, enrichment, "canonical_url").strip()
+        enriched_platform_id = _source_value(
+            source, enrichment, "platform_content_id"
+        ).strip()
+        url_platform_id = platform_content_id_from_url(platform, canonical_url)
+        if (
+            enriched_platform_id
+            and url_platform_id
+            and enriched_platform_id != url_platform_id
+        ):
+            raise ValueError(
+                f"platform content ID does not match canonical URL for content {internal_content_id}"
+            )
+        platform_content_id = url_platform_id or enriched_platform_id
+        if not platform_content_id:
+            raise ValueError(
+                f"platform content ID is unavailable for content {internal_content_id}"
+            )
+        content_type = _source_value(source, enrichment, "content_type").strip()
+        if not content_type:
+            raise ValueError(
+                f"content type is unavailable for content {internal_content_id}"
+            )
+        evidence_level = source.get("evidence_level", "")
+        selling_point_code = source.get("primary_selling_point_code", "").strip()
+        if selling_point_code:
+            selling_point_label = _source_value(
+                source, enrichment, "primary_selling_point_label"
+            ).strip() or _clean_text(selling_point_labels.get(selling_point_code) or "")
+            if not selling_point_label:
+                raise ValueError(
+                    f"selling point label is unavailable for code {selling_point_code}"
+                )
+            selling_point_code_value = selling_point_code
+        else:
+            selling_point_code_value = _MISSING_SELLING_POINT
+            selling_point_label = _MISSING_SELLING_POINT
+        values: list[Any] = [
+            period,
+            task_reference,
+            platform_content_id,
+            source.get("link_id", ""),
+            _PLATFORM_LABELS.get(platform, platform),
+            _CONTENT_TYPE_LABELS.get(content_type, content_type),
+            _typed_value("published_at_beijing", source.get("published_at", "")),
+            canonical_url,
+            source.get("title", ""),
+            source.get("account_uid", ""),
+            source.get("account_name", ""),
+            _ACCOUNT_TYPE_LABELS.get(
+                source.get("account_type", ""), source.get("account_type", "")
+            ),
+            _CONTENT_DIRECTION_LABELS.get(
+                source.get("content_direction", ""),
+                source.get("content_direction", ""),
+            ),
+            _v3_status(evidence_level, content_type),
+            selling_point_code_value,
+            selling_point_label,
+            _typed_value("selling_point_score", source.get("selling_point_score", "")),
+            _typed_value(
+                "content_automotive_score",
+                source.get("content_automotive_score", ""),
+            ),
+            _typed_value("view_count", source.get("view_count", "")),
+            _typed_value("comment_count", source.get("comment_count", "")),
+        ]
+        style_headers = [key for key, _ in _CONTENT_EXPORT_COLUMNS]
+        rows.append(values)
+        styles.append(
+            [_style_for(header, value) for header, value in zip(style_headers, values)]
+        )
+    last_column = _column_name(len(output_headers))
+    return (
+        _Worksheet(
+            name="内容明细",
+            rows=rows,
+            styles=styles,
+            widths=[
+                float(_COLUMN_WIDTHS.get(key, max(12, _display_width(label) + 3)))
+                for key, label in _CONTENT_EXPORT_COLUMNS
+            ],
+            auto_filter=f"A1:{last_column}{len(rows)}",
+            frozen_rows=1,
+            row_heights={1: 36},
         ),
         len(raw_rows),
     )
@@ -304,11 +620,18 @@ def _table_sheet(
 def _summary_sheet(
     *, task: Mapping[str, Any], revision: int, content_count: int, channel_count: int
 ) -> _Worksheet:
+    task_status_labels = {
+        "succeeded": "已完成",
+        "partial": "部分完成",
+        "failed": "失败",
+        "cancelled": "已取消",
+    }
+    raw_task_status = _clean_text(task.get("task_status") or "")
     rows: list[list[Any]] = [
         ["DCar 内容运营报告数据明细", None, None, None],
         [None, None, None, None],
         ["任务名称", _clean_text(task.get("name") or ""), None, None],
-        ["任务 ID", _clean_text(task.get("id") or ""), None, None],
+        ["任务编号", _clean_text(task.get("id") or ""), None, None],
         [
             "报告周期",
             f"{_clean_text(task.get('period_start') or '')} 至 {_clean_text(task.get('period_end') or '')}",
@@ -316,9 +639,14 @@ def _summary_sheet(
             None,
         ],
         ["报告版本", f"第 {revision} 版", None, None],
-        ["任务状态", _clean_text(task.get("task_status") or ""), None, None],
+        ["任务状态", task_status_labels.get(raw_task_status, raw_task_status), None, None],
         ["导出内容", "图片报告 + Excel 数据明细", None, None],
-        ["数据口径", "内容明细与渠道结论均来自该 revision 的不可变报告快照", None, None],
+        [
+            "数据说明",
+            "数据来自所选报告版本；旧报告缺少的作品编号和内容类型会从当前内容资料中补全",
+            None,
+            None,
+        ],
         [None, None, None, None],
         ["工作表", "数据行数", None, None],
         ["内容明细", content_count, None, None],
@@ -364,17 +692,25 @@ def build_report_detail_workbook(
     revision: int,
     content_csv: bytes,
     channel_csv: bytes | None,
+    content_enrichment: Mapping[str, Mapping[str, Any]] | None = None,
+    selling_point_labels: Mapping[str, str] | None = None,
 ) -> bytes:
     """Build a typed, styled XLSX from one immutable report revision."""
 
-    content_sheet, content_count = _table_sheet(
-        "内容明细", content_csv, _CONTENT_HEADERS
+    content_sheet, content_count = _content_sheet(
+        task=task,
+        payload=content_csv,
+        content_enrichment=content_enrichment or {},
+        selling_point_labels=selling_point_labels or {},
     )
     channel_sheet: _Worksheet | None = None
     channel_count = 0
     if channel_csv is not None:
         channel_sheet, channel_count = _table_sheet(
-            "渠道结论", channel_csv, _CHANNEL_HEADERS
+            "渠道结论",
+            channel_csv,
+            _CHANNEL_HEADERS,
+            hidden_headers=_CHANNEL_TECHNICAL_HEADERS,
         )
     sheets = [
         _summary_sheet(
@@ -479,8 +815,10 @@ def _sheet_xml(sheet: _Worksheet) -> str:
             'activePane="bottomLeft" state="frozen"/>'
             f'<selection pane="bottomLeft" activeCell="{top_left}" sqref="{top_left}"/>'
         )
+    hidden_columns = set(sheet.hidden_columns)
     columns = "".join(
-        f'<col min="{index}" max="{index}" width="{width}" customWidth="1"/>'
+        f'<col min="{index}" max="{index}" width="{width}" customWidth="1"'
+        f'{" hidden=\"1\"" if index in hidden_columns else ""}/>'
         for index, width in enumerate(sheet.widths, start=1)
     )
     row_xml: list[str] = []

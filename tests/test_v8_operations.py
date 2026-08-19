@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +10,7 @@ from v8.operations import (
     CONTENT_CHILD_MERGE_POLICIES,
     IdentityConflictError,
     OperationError,
+    export_contents_csv,
     import_accounts,
     import_contents,
     normalize_unknown_content_directions,
@@ -87,6 +90,32 @@ class V8OperationsTest(unittest.TestCase):
             connection.commit()
         self.assertIsNotNone(evaluation.lastrowid)
         return int(evaluation.lastrowid)
+
+    def test_contents_csv_neutralizes_spreadsheet_formulas_at_source(self) -> None:
+        content = upsert_content(
+            {
+                "platform": "kuaishou",
+                "platform_content_id": "KS-FORMULA",
+                "canonical_url": "https://www.kuaishou.com/short-video/KS-FORMULA",
+                "title": '=HYPERLINK("https://example.invalid")',
+                "body": "公式注入导出测试",
+                "account_name": "  @SUM(1,1)",
+            },
+            db_path=self.db,
+        )
+        self._insert_legacy_evaluation_history(int(content["id"]))
+
+        rows = list(
+            csv.DictReader(
+                io.StringIO(
+                    export_contents_csv(db_path=self.db).decode("utf-8-sig"),
+                    newline="",
+                )
+            )
+        )
+
+        self.assertEqual(rows[0]["title"], "'=HYPERLINK(\"https://example.invalid\")")
+        self.assertEqual(rows[0]["account_name"], "'@SUM(1,1)")
 
     def test_phone_is_the_account_upsert_key_and_new_import_overwrites(self) -> None:
         created = upsert_account(

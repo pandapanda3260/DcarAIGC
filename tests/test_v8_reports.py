@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import sqlite3
 import tempfile
@@ -200,7 +201,7 @@ class V8ReportTaskTest(unittest.TestCase):
             "status": "below_threshold",
             "reason": "用户身份覆盖率 64.0%，低于 95% 门槛",
         }
-        self.assertEqual(reports_module._conclusion_cell(blocked), "身份数据待补齐")
+        self.assertEqual(reports_module._conclusion_cell(blocked), "部分用户身份信息不足")
         self.assertNotIn("88", reports_module._conclusion_cell(blocked))
         self.assertEqual(
             reports_module._conclusion_cell(
@@ -211,7 +212,7 @@ class V8ReportTaskTest(unittest.TestCase):
                     "reason": "去重有效用户 29 人，低于 30 人门槛",
                 }
             ),
-            "互动用户少于30人",
+            "互动用户少于 30 人",
         )
         self.assertEqual(
             reports_module._conclusion_cell(
@@ -222,7 +223,7 @@ class V8ReportTaskTest(unittest.TestCase):
                     "reason": "",
                 }
             ),
-            "暂不发布",
+            "暂不显示",
         )
         self.assertEqual(
             reports_module._conclusion_cell(
@@ -233,7 +234,7 @@ class V8ReportTaskTest(unittest.TestCase):
                     "reason": "分类器未经金标核对，数值仅供参考",
                 }
             ),
-            "12.5%（仅样本）",
+            "12.5%（仅供参考）",
         )
         self.assertEqual(
             reports_module._conclusion_cell(
@@ -244,7 +245,7 @@ class V8ReportTaskTest(unittest.TestCase):
                     "reason": "重复内容感知指纹尚未完成定标，重复率暂不可计算",
                 }
             ),
-            "重复指纹待校验",
+            "重复内容识别规则还没完成校验",
         )
 
     def tearDown(self) -> None:
@@ -383,8 +384,8 @@ class V8ReportTaskTest(unittest.TestCase):
                 "window_hours": 36,
                 "eligible_basis": "all_window_contents",
                 "reason": (
-                    "固定采集截止点前 36 小时内的新鲜指标覆盖率为 "
-                    "33.33%，低于 90% 发布门槛"
+                    "截止统计前 36 小时内有更新的数据占 "
+                    "33.33%，低于至少 90% 的要求"
                 ),
             },
         )
@@ -781,12 +782,12 @@ class V8ReportTaskTest(unittest.TestCase):
         )
         self.assertFalse(report["data_quality"]["duplicate_calibration_ready"])
         self.assertIn(
-            "尚未完成定标",
+            "还没完成校验",
             report["summary_metrics"]["duplicate_rate"]["reason"],
         )
         state = get_task(task["id"], db_path=self.db)
         self.assertNotIn("覆盖率不足", state["message"])
-        self.assertIn("未达发布门槛", state["message"])
+        self.assertIn("数据未达到要求", state["message"])
         self.assertNotIn("重复指纹定标未通过", state["message"])
         self.assertEqual(report["scope"]["period_end"], "2026-07-02T00:00:00+08:00")
         self.assertEqual(
@@ -835,6 +836,43 @@ class V8ReportTaskTest(unittest.TestCase):
         )
         self.assertEqual(first_path.read_bytes(), first_bytes)
 
+    def test_report_content_csv_neutralizes_spreadsheet_formulas(self) -> None:
+        dangerous_title = '=HYPERLINK("https://example.invalid")'
+        dangerous_account_name = "  +SUM(1,1)"
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                UPDATE content_items
+                SET title=?,raw_account_name=?
+                WHERE id=1
+                """,
+                (dangerous_title, dangerous_account_name),
+            )
+            connection.commit()
+
+        task = create_task(
+            task_type="custom",
+            period_start="2026-07-01",
+            period_end="2026-07-01",
+            creation_source="manual",
+            db_path=self.db,
+        )
+        report = run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
+        state = get_task(task["id"], db_path=self.db)
+        revision_dir = (
+            PROJECT_ROOT / state["revisions"][0]["report_json_path"]
+        ).parent
+        with (revision_dir / "content_details.csv").open(
+            encoding="utf-8-sig", newline=""
+        ) as handle:
+            exported = list(csv.DictReader(handle))
+
+        self.assertEqual(report["content_details"][0]["title"], dangerous_title)
+        self.assertEqual(exported[0]["title"], f"'{dangerous_title}")
+        self.assertEqual(
+            exported[0]["account_name"], f"'{dangerous_account_name}"
+        )
+
     def test_report_keeps_actual_fingerprint_coverage_when_uncalibrated(self) -> None:
         with connect(self.db) as connection:
             connection.execute(
@@ -862,7 +900,7 @@ class V8ReportTaskTest(unittest.TestCase):
         self.assertEqual(duplicate["status"], "not_calculable")
         self.assertEqual(duplicate["coverage_percentage"], 100.0)
         self.assertIsNone(duplicate["percentage"])
-        self.assertIn("尚未完成定标", duplicate["reason"])
+        self.assertIn("还没完成校验", duplicate["reason"])
 
     def test_view_coverage_counts_only_non_null_view_observations(self) -> None:
         captured_at = now_utc()
@@ -921,7 +959,7 @@ class V8ReportTaskTest(unittest.TestCase):
         self.assertEqual(view_metric["coverage_percentage"], 50.0)
         self.assertEqual(
             view_metric["reason"],
-            "曝光量快照覆盖率为 50.00%，低于 90% 发布阈值",
+            "有曝光量的数据占 50.00%，低于至少 90% 的要求",
         )
 
     def test_current_report_publishes_channel_conclusions_without_fabrication(
@@ -994,7 +1032,7 @@ class V8ReportTaskTest(unittest.TestCase):
         self.assertIn("## 渠道结论", markdown)
         self.assertIn("互动用户汽车兴趣占比", markdown)
         self.assertIn("评论未采集", markdown)
-        self.assertIn("曝光归类待补齐", markdown)
+        self.assertIn("部分曝光还没完成分类", markdown)
         self.assertNotIn("覆盖不足", markdown)
         self.assertNotIn("有效样本不足", markdown)
         self.assertNotIn("暂不可计算%", markdown)
@@ -1004,6 +1042,12 @@ class V8ReportTaskTest(unittest.TestCase):
             encoding="utf-8-sig"
         )
         self.assertNotIn("automotive_user_rate", content_csv)
+        self.assertTrue(
+            content_csv.splitlines()[0].startswith(
+                "content_id,platform_content_id,link_id,platform,content_type"
+            )
+        )
+        self.assertIn("primary_selling_point_label", content_csv.splitlines()[0])
 
     def test_revision_read_model_marks_legal_retired_report_stale(self) -> None:
         task = create_task(
@@ -1186,7 +1230,7 @@ class V8ReportTaskTest(unittest.TestCase):
                 "status": "below_threshold",
                 "eligible_count": 2,
                 "coverage_percentage": 50.0,
-                "reason": "正式评估覆盖率为 50.00%，低于 90% 发布阈值",
+                "reason": "卖点评估完成率为 50.00%，低于至少 90% 的要求",
             },
         )
         selling_metric = report["summary_metrics"]["selling_point_coverage_rate"]
@@ -1216,6 +1260,14 @@ class V8ReportTaskTest(unittest.TestCase):
         self.assertEqual(details[eligible_only]["primary_selling_point_code"], "M1")
         self.assertTrue(details[included]["evaluation_current"])
         self.assertEqual(details[included]["primary_selling_point_code"], "X2")
+        self.assertEqual(
+            details[included]["primary_selling_point_label"], "测试卖点 X2"
+        )
+        self.assertEqual(details[included]["content_type"], "video")
+        self.assertEqual(
+            details[included]["platform_content_id"],
+            "matrix-included",
+        )
         self.assertEqual(details[included]["content_direction"], "new_car")
 
     def test_weak_evidence_can_be_media_complete_but_not_formal_eligible(
@@ -1735,7 +1787,7 @@ class V8ReportTaskTest(unittest.TestCase):
 
         state = get_task(task["id"], db_path=self.db)
         self.assertEqual(state["task_status"], "failed")
-        self.assertEqual(state["message"], "relative path failed")
+        self.assertEqual(state["message"], "报告生成失败，请重新生成；如果仍然失败，请联系管理员。")
         self.assertEqual(state["events"][-1]["event_type"], "failed")
         self.assertEqual(list(revision_parent.glob(".revision_001-*")), [])
         self.assertFalse((revision_parent / "revision_001").exists())
@@ -1851,6 +1903,40 @@ class V8ReportTaskTest(unittest.TestCase):
         self.assertIn(
             "retry_requested", [event["event_type"] for event in state["events"]]
         )
+
+    def test_superseded_legacy_task_cannot_be_retried_resumed_or_cancelled(
+        self,
+    ) -> None:
+        task = create_task(
+            task_type="custom",
+            period_start="2026-07-01",
+            period_end="2026-07-01",
+            creation_source="manual",
+            db_path=self.db,
+        )
+        superseded_message = "已由发现补跑后的新任务替代；revision 1 仅供审计"
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                UPDATE report_tasks
+                SET task_status='failed',message=?
+                WHERE id=?
+                """,
+                (superseded_message, task["id"]),
+            )
+            connection.commit()
+
+        with self.assertRaisesRegex(ReportTaskError, "superseded task"):
+            retry_task(task["id"], db_path=self.db)
+        with self.assertRaisesRegex(ReportTaskError, "superseded task"):
+            resume_task(task["id"], db_path=self.db)
+        with self.assertRaisesRegex(ReportTaskError, "superseded task"):
+            request_task_cancel(task["id"], db_path=self.db)
+
+        unchanged = get_task(task["id"], db_path=self.db)
+        self.assertEqual(unchanged["task_status"], "failed")
+        self.assertEqual(unchanged["message"], superseded_message)
+        self.assertEqual(len(unchanged["events"]), 1)
 
     def test_run_publishes_intermediate_progress_stages(self) -> None:
         task = create_task(

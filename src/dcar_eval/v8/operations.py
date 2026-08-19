@@ -20,6 +20,7 @@ from .evaluation_selectors import (
     effective_direction_sql,
 )
 from .migration import generate_link_id, normalize_timestamp
+from .report_export import formula_safe_csv_value
 from .storage import DEFAULT_DB, connect, now_utc, transaction
 
 
@@ -1627,22 +1628,31 @@ def export_contents_csv(*, db_path: Path = DEFAULT_DB) -> bytes:
         for item in rows:
             writer.writerow(
                 {
-                    "link_id": item["link_id"],
-                    "platform": item["platform"],
-                    "platform_content_id": item["platform_content_id"],
-                    "published_at": item["published_at"],
-                    "canonical_url": item["canonical_url"],
-                    "title": item["title"],
-                    "account_uid": item["raw_account_uid"],
-                    "account_name": item["raw_account_name"],
-                    "account_type": item["account_type"],
-                    "content_direction": item["direction"],
-                    "primary_selling_point_code": item["primary_selling_point_code"],
-                    "content_automotive_score": item["content_automotive_score"],
-                    "evaluation_freshness": item["evaluation_freshness"],
-                    "view_count": item["view_count"],
-                    "comment_count": item["comment_count"],
-                    "duplicate_original_link_id": item["duplicate_original_link_id"],
+                    field: formula_safe_csv_value(value)
+                    for field, value in {
+                        "link_id": item["link_id"],
+                        "platform": item["platform"],
+                        "platform_content_id": item["platform_content_id"],
+                        "published_at": item["published_at"],
+                        "canonical_url": item["canonical_url"],
+                        "title": item["title"],
+                        "account_uid": item["raw_account_uid"],
+                        "account_name": item["raw_account_name"],
+                        "account_type": item["account_type"],
+                        "content_direction": item["direction"],
+                        "primary_selling_point_code": item[
+                            "primary_selling_point_code"
+                        ],
+                        "content_automotive_score": item[
+                            "content_automotive_score"
+                        ],
+                        "evaluation_freshness": item["evaluation_freshness"],
+                        "view_count": item["view_count"],
+                        "comment_count": item["comment_count"],
+                        "duplicate_original_link_id": item[
+                            "duplicate_original_link_id"
+                        ],
+                    }.items()
                 }
             )
     return ("\ufeff" + output.getvalue()).encode("utf-8")
