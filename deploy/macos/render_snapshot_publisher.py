@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render the disabled 09:00 snapshot-publisher LaunchAgent template."""
+"""Render the automatic fail-closed snapshot-publisher LaunchAgent template."""
 
 from __future__ import annotations
 
@@ -31,12 +31,16 @@ def render_plist(project_root: Path, home: Path) -> bytes:
         "DCAR_SCHEDULER_ENABLED": "0",
         "DCAR_STARTUP_CATCHUP_ENABLED": "0",
     }
-    if value.get("Label") != LABEL or value.get("Disabled") is not True:
-        raise ValueError("snapshot publisher label or disabled gate is invalid")
+    if value.get("Label") != LABEL or value.get("Disabled") is not False:
+        raise ValueError("snapshot publisher label or enabled state is invalid")
     if schedule != {"Hour": 9, "Minute": 0}:
-        raise ValueError("snapshot publisher must run only at 09:00")
-    if "RunAtLoad" in value or "KeepAlive" in value:
-        raise ValueError("snapshot publisher must not run at load or stay alive")
+        raise ValueError("snapshot publisher must start its daily cycle at 09:00")
+    if value.get("StartInterval") != 3600:
+        raise ValueError("snapshot publisher must reconcile once per hour")
+    if value.get("RunAtLoad") is not True or "KeepAlive" in value:
+        raise ValueError(
+            "snapshot publisher must run at load without becoming a keep-alive job"
+        )
     if any(
         environment.get(key) != expected_value
         for key, expected_value in expected.items()
@@ -66,7 +70,7 @@ def main() -> int:
         raise SystemExit("snapshot publisher wrapper or implementation is missing")
     payload = render_plist(project_root, arguments.home)
     if arguments.check:
-        print(f"valid disabled LaunchAgent: {LABEL} at 09:00")
+        print(f"valid automatic LaunchAgent: {LABEL} from 09:00 with hourly reconcile")
         return 0
     output = arguments.output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -76,8 +80,8 @@ def main() -> int:
     except FileExistsError as exc:
         raise SystemExit(f"refusing to overwrite existing plist: {output}") from exc
     os.chmod(output, 0o644)
-    print(f"rendered disabled LaunchAgent: {output}")
-    print("not loaded; review publisher.env, SSH alias, disk space, and sudo policy")
+    print(f"rendered automatic LaunchAgent: {output}")
+    print("not loaded yet; run launchctl bootstrap after the fail-closed preflight")
     return 0
 
 

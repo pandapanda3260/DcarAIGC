@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
+from unittest.mock import patch
 
 import v8.comment_paging as paging
 import v8.storage as storage
@@ -469,6 +470,96 @@ class CommentPagingTest(unittest.TestCase):
         )
         # page 1 replayed (call 1) then page 2 fetched (call 2)
         self.assertEqual(resume.calls, [1, 2])
+
+    def test_resume_recognizes_stored_provider_exhausted_page(self) -> None:
+        pages = [
+            {
+                "comments": [
+                    _make_comment(
+                        self.hasher,
+                        cid="c01",
+                        raw_uid="u1",
+                        body="最终页已保存",
+                    )
+                ],
+                "declared_total": 1,
+                "has_more": False,
+                "next_cursor": None,
+            }
+        ]
+
+        interrupted = _FakePages(self.connection, 1, pages)
+        with patch.object(
+            paging,
+            "_finalize_run",
+            side_effect=RuntimeError("process stopped after final page commit"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "process stopped"):
+                self._run(interrupted)
+
+        self.assertEqual(
+            int(
+                self.connection.execute(
+                    "SELECT COUNT(*) FROM comment_capture_pages"
+                ).fetchone()[0]
+            ),
+            1,
+        )
+        self.assertEqual(
+            int(
+                self.connection.execute(
+                    "SELECT COUNT(*) FROM comment_evidence_versions"
+                ).fetchone()[0]
+            ),
+            0,
+        )
+
+        resumed = _FakePages(self.connection, 1, pages)
+        result = self._run(resumed)
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["completion_kind"], "provider_exhausted")
+        self.assertEqual(result["stop_reason"], None)
+        self.assertEqual(resumed.calls, [1])
+        run = self.connection.execute(
+            "SELECT status,completion_kind FROM comment_capture_runs"
+        ).fetchone()
+        self.assertEqual(tuple(run), ("succeeded", "provider_exhausted"))
+
+    def test_repeated_partial_finalize_reuses_existing_evidence_id(self) -> None:
+        looping = {
+            "comments": [
+                _make_comment(
+                    self.hasher,
+                    cid="c01",
+                    raw_uid="u1",
+                    body="重复游标",
+                )
+            ],
+            "declared_total": 999,
+            "has_more": True,
+            "next_cursor_params": {"cursor": 0},
+        }
+        pages = [looping, looping]
+
+        first = self._run(_FakePages(self.connection, 1, pages), max_pages=10)
+        second = self._run(_FakePages(self.connection, 1, pages), max_pages=10)
+
+        self.assertEqual(first["status"], "incomplete")
+        self.assertEqual(second["status"], "incomplete")
+        self.assertEqual(second["stop_reason"], "cursor_cycle_detected")
+        self.assertEqual(
+            int(
+                self.connection.execute(
+                    "SELECT COUNT(*) FROM comment_evidence_versions"
+                ).fetchone()[0]
+            ),
+            1,
+        )
+        self.assertEqual(
+            int(self.connection.execute("SELECT COUNT(*) FROM comments").fetchone()[0]),
+            1,
+        )
 
 
 if __name__ == "__main__":

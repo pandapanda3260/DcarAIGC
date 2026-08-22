@@ -14,6 +14,7 @@ import pwd
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import tempfile
 import time
@@ -1106,6 +1107,158 @@ def _rollback_candidates(
     )
 
 
+def _active_snapshot_id(config: InstallConfig) -> str:
+    path = config.active_manifest_path
+    if path.is_symlink() or not path.is_file():
+        raise SnapshotInstallError(
+            "active snapshot manifest must be a regular non-symlink file"
+        )
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SnapshotInstallError("active snapshot manifest is invalid") from exc
+    snapshot_id = None
+    if isinstance(value, dict):
+        snapshot_id = value.get("snapshot_id")
+        if snapshot_id is None and value.get("schema") == (
+            "dcar-read-replica-rollback-receipt-v1"
+        ):
+            snapshot_id = value.get("restored_from_snapshot")
+    if not isinstance(snapshot_id, str) or SNAPSHOT_ID_RE.fullmatch(snapshot_id) is None:
+        raise SnapshotInstallError("active snapshot manifest has no valid snapshot_id")
+    return snapshot_id
+
+
+def _prunable_snapshot_directories(root: Path) -> list[Path]:
+    if not root.exists():
+        return []
+    if root.is_symlink() or not root.is_dir():
+        raise SnapshotInstallError(f"snapshot retention root is unsafe: {root}")
+    return sorted(
+        (
+            path
+            for path in root.iterdir()
+            if SNAPSHOT_ID_RE.fullmatch(path.name)
+            and not path.is_symlink()
+            and path.is_dir()
+        ),
+        key=lambda path: path.name,
+        reverse=True,
+    )
+
+
+def _directory_file_bytes(path: Path) -> int:
+    total = 0
+    for current, directories, files in os.walk(path, topdown=True, followlinks=False):
+        current_path = Path(current)
+        directories[:] = [
+            name for name in directories if not (current_path / name).is_symlink()
+        ]
+        for name in files:
+            candidate = current_path / name
+            metadata = candidate.lstat()
+            if stat.S_ISREG(metadata.st_mode):
+                total += metadata.st_size
+    return total
+
+
+def _prune_snapshot_root(
+    root: Path,
+    *,
+    active_snapshot_id: str,
+    retain_count: int,
+    require_active: bool = False,
+) -> dict[str, Any]:
+    candidates = _prunable_snapshot_directories(root)
+    kept: list[Path] = []
+    active = next(
+        (path for path in candidates if path.name == active_snapshot_id), None
+    )
+    if require_active and active is None:
+        raise SnapshotInstallError(
+            f"active snapshot retention directory is missing: {root / active_snapshot_id}"
+        )
+    if active is not None:
+        kept.append(active)
+    for candidate in candidates:
+        if candidate == active or len(kept) >= retain_count:
+            continue
+        kept.append(candidate)
+    kept_names = {path.name for path in kept}
+    deleted = [path for path in candidates if path.name not in kept_names]
+    reclaimed_bytes = sum(_directory_file_bytes(path) for path in deleted)
+    for path in deleted:
+        if path.is_symlink() or not path.is_dir():
+            raise SnapshotInstallError(
+                f"snapshot directory changed while pruning: {path}"
+            )
+        try:
+            shutil.rmtree(path)
+        except OSError as exc:
+            raise SnapshotInstallError(
+                f"cannot prune snapshot directory: {path}"
+            ) from exc
+    if deleted:
+        _fsync_directory(root)
+    return {
+        "root": str(root),
+        "kept": sorted(kept_names, reverse=True),
+        "deleted": [path.name for path in deleted],
+        "reclaimed_bytes": reclaimed_bytes,
+    }
+
+
+def prune_snapshots(
+    config: InstallConfig,
+    *,
+    incoming_root: Path = Path("/var/lib/dcar-aigc/incoming"),
+    retain_count: int = 3,
+) -> dict[str, Any]:
+    if retain_count < 1:
+        raise SnapshotInstallError("snapshot retain count must be at least 1")
+    incoming_root = incoming_root.expanduser()
+    if not incoming_root.is_absolute():
+        raise SnapshotInstallError("incoming snapshot root must be absolute")
+    expected_incoming_root = config.runtime_root.parent / "incoming"
+    if (
+        incoming_root.is_symlink()
+        or incoming_root.resolve() != expected_incoming_root.resolve()
+    ):
+        raise SnapshotInstallError(
+            "incoming snapshot root must be the managed state-root sibling"
+        )
+    with _install_lock(config):
+        active_snapshot_id = _active_snapshot_id(config)
+        history_candidates = _prunable_snapshot_directories(config.history_root)
+        if not any(
+            path.name == active_snapshot_id for path in history_candidates
+        ):
+            raise SnapshotInstallError(
+                "active snapshot retention directory is missing: "
+                f"{config.history_root / active_snapshot_id}"
+            )
+        incoming = _prune_snapshot_root(
+            incoming_root,
+            active_snapshot_id=active_snapshot_id,
+            retain_count=retain_count,
+        )
+        history = _prune_snapshot_root(
+            config.history_root,
+            active_snapshot_id=active_snapshot_id,
+            retain_count=retain_count,
+            require_active=True,
+        )
+        return {
+            "schema": "dcar-read-replica-prune-receipt-v1",
+            "active_snapshot_id": active_snapshot_id,
+            "retain_count": retain_count,
+            "incoming": incoming,
+            "snapshot_history": history,
+            "reclaimed_bytes": int(incoming["reclaimed_bytes"])
+            + int(history["reclaimed_bytes"]),
+        }
+
+
 def rollback_snapshot(
     config: InstallConfig,
     *,
@@ -1248,6 +1401,16 @@ def _parser() -> argparse.ArgumentParser:
     )
     rollback.add_argument("--snapshot-id")
     _common_arguments(rollback)
+    prune = commands.add_parser(
+        "prune", help="Prune inactive snapshot staging and rollback history."
+    )
+    prune.add_argument(
+        "--incoming-root",
+        type=Path,
+        default=Path("/var/lib/dcar-aigc/incoming"),
+    )
+    prune.add_argument("--retain-count", type=int, default=3)
+    _common_arguments(prune)
     return parser
 
 
@@ -1287,8 +1450,14 @@ def main() -> int:
             }
         elif arguments.command == "install":
             result = install_bundle(arguments.bundle, config)
-        else:
+        elif arguments.command == "rollback":
             result = rollback_snapshot(config, snapshot_id=arguments.snapshot_id)
+        else:
+            result = prune_snapshots(
+                config,
+                incoming_root=arguments.incoming_root,
+                retain_count=arguments.retain_count,
+            )
     except SnapshotInstallError as exc:
         raise SystemExit(f"snapshot operation refused: {exc}") from exc
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))

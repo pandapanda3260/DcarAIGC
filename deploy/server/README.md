@@ -273,14 +273,22 @@ Restart the authentication gateway and Web together when the code release
 changed; a data-only snapshot does not require rebuilding the Web bundle or
 restarting either service.
 
-The publisher does not automatically delete `incoming/<snapshot-id>` after a
-successful install. `--link-dest` hard-links unchanged artifacts, so those
-files do not consume another full copy, but bundle DBs and changed bytes still
-accumulate. Monitor capacity and retain the active staging tree, two previous
-successful trees, and unresolved failed trees. Pruning must be performed by a
-future root-owned, receipt-aware server command that protects the active ID and
-rollback history. Do not use wildcard `rm` or an unaudited cleanup cron; no such
-cleanup is installed by this deployment.
+Before a new automatic publish is built, the publisher invokes the root-owned
+`prune` command. It reads the validated active receipt while holding the
+snapshot install lock, always protects the active snapshot ID, and retains at
+most three valid snapshot-ID directories independently under `incoming` and
+`snapshot-history`. Invalid names, files, symlinks, and `rollback-*` safety
+backups are never deletion candidates. This bounds daily storage growth while
+preserving the active tree and two rollback/staging points.
+
+The same fail-closed cleanup can be inspected manually without wildcard paths:
+
+```sh
+sudo /var/www/dcar-aigc/current/.venv/bin/python \
+  deploy/server/install_snapshot.py prune \
+  --incoming-root /var/lib/dcar-aigc/incoming \
+  --retain-count 3
+```
 
 ## Manual rollback
 

@@ -2,7 +2,7 @@
 
 该目录定义 DcarAIGC 正式拓扑中唯一允许运行调度的 macOS writer。writer 监听 `127.0.0.1:8766`，负责供应商抓取、媒体处理、增量评估和报告任务。日常 UI/API 继续使用 4173/8765，且 8765 固定不启用 scheduler。
 
-仓库不会自动安装、加载或启用任何 LaunchAgent。renderer 只生成 disabled-by-default plist，永不调用 `launchctl`。
+writer renderer 只生成 disabled-by-default plist，永不调用 `launchctl`；writer 仍按生效日人工启用。snapshot publisher plist 是已授权的无人值守任务，但它的 renderer 同样只渲染，必须经过一次本机门禁后由部署流程显式 bootstrap。
 
 ## 安全合同
 
@@ -106,11 +106,11 @@ scheduler 必须报告 requested/enabled；`daily_capture_reconcile` 必须是 `
 
 禁止手工执行 `daily_capture` 作为烟测；等待已授权的自然 02:00 槽。该槽结束后，状态可以是 `succeeded` 或 `partial`，但还必须通过独立质量门：discovery ≥90%、当天选中 cohort ≥60%、数组计数一致、provider 无阻断。`provider_usage` ledger 是权威账本：details 上报小计、ledger 和声明预算必须是有限值，成本非负、预算为正，且同时满足 `ledger >= details 上报小计`、`ledger <= 声明预算`、`ledger <= USD 8`。两者精确相等只作诊断，不影响 `passed`。3,000 是选中 cohort 上限，不是全库覆盖率。
 
-`budget_blocked` 仍是 `failed`，不得为了通过本次验收提高 USD 8 上限或开启自动重试；后续只能按显式授权的 `operator_retry` 流程处理。
+`budget_blocked` 仍是 `failed`，不得为了通过本次验收提高 USD 8 上限或自动重跑该终态。只有 `interrupted` 会由小时 reconcile 以同一 task ID 和剩余预算自动续跑；显式 `operator_retry` 保留为诊断入口。
 
 ### 睡眠/唤醒语义
 
-02:00 Cron 负责低延迟，每小时 reconcile 负责当天正确性。Mac 在 02:00 睡眠、当天稍后唤醒时，只要 writer 仍运行，reconcile 会补当天 02:00 槽；它不会追回昨天或更早槽。白天补抓也不会紧接着追跑 02:20/03:00/07:30、日/周报或 publisher。
+02:00 Cron 负责低延迟，每小时 reconcile 负责当天正确性。Mac 在任一 Cron 时刻睡眠、当天稍后唤醒时，只要 writer 仍运行，reconcile 会按依赖顺序补齐当天已到时的 capture、media、cutoff 和报告槽；它不会追回昨天或更早的 capture。遗漏的日报/周报由独立的小时 report reconcile 补齐，publisher 在完整链路终态前保持 fail-closed。
 
 ## 故意重启、更新、停用和卸载
 
@@ -135,6 +135,53 @@ mkdir -p "$HOME/.Trash/DcarAIGC-launchagents"
 mv "$plist" "$HOME/.Trash/DcarAIGC-launchagents/$label.plist"
 ```
 
-## snapshot publisher：默认停用、按需人工发布
+## snapshot publisher：无人值守自动发布
 
-snapshot publisher 的 LaunchAgent 保持停用且不自动加载，避免无人值守地修改线上只读副本。发布链已统一锁定 report v8.7、schema 16 / `remove-manual-review`；人工发布仍必须通过当日抓取、07:30 媒体截止、运行时身份、数据库一致性、远端容量和安装后 smoke check 全部门禁。`daily_capture=partial` 可发布，`failed` 不可发布；不得通过放宽身份或新鲜度校验消除拒绝。
+publisher 在登录时启动一次、每天 09:00 启动一次，并每小时 reconcile。09:00 前的自动调用只返回 no-op；同一北京自然日成功发布后，后续调用通过项目外 `snapshot_root/automatic-publisher-state.json` 原子成功状态返回 no-op。任务不是 `KeepAlive` 服务，不运行 scheduler、catch-up 或任何供应商调用，也不继承 TikHub key。
+
+09:00 只是当天首次检查，不是假定所有上游工作已完成。每次自动调用必须先在本机通过以下门禁，任一未完成都会在构建快照和连接 SSH 之前退出，等待下一小时重新检查：
+
+1. 唯一 writer 正常并持有 scheduler lock；startup catch-up 必须为 report-only 且不在运行中。若启动时曾 failed/deferred，小时 report reconcile 修复后的当天实际报告槽才是发布依据。
+2. 当天 02:00 capture 为 `succeeded` 或 `partial`；`failed`、`skipped` 均不可发布。
+3. 当天 02:20 download、03:00 processing 和 07:30 cutoff 全部为 `succeeded`。
+4. 当天 08:00 daily report 为 `succeeded` 或 `partial`；周一 08:30 weekly report 也必须为 `succeeded` 或 `partial`。
+5. report v8.7、schema 16 / `remove-manual-review`、evaluation/taxonomy identity、正式 DB、内容新鲜度均一致。
+6. SSH 专用 alias、strict known_hosts、远端有界保留、空间、bundle 校验、安装和安装后 smoke check 全部通过。保留命令始终保护 active snapshot，并分别只保留最近 3 个 incoming/history 快照目录。
+
+`daily_capture=partial` 可发布，但质量门只作为诊断，不得用来放宽上述终态、身份、新鲜度或 USD 8 预算合同。远端发布失败时保留本地快照和远端 incoming 供审计，下一次自动执行仍从全套门禁开始；成功后本地只保留最近 3 个自动快照目录。
+
+项目外配置沿用 `publisher.env.example`，权限必须是 0400 或 0600。首次安装：
+
+```sh
+label="cn.tj.dcar.snapshot-publisher"
+domain="gui/$(id -u)"
+plist="$HOME/Library/LaunchAgents/$label.plist"
+
+install -d -m 0700 "$HOME/Library/Application Support/DcarAIGC"
+install -d -m 0700 "$HOME/Library/Logs/DcarAIGC"
+
+python3 deploy/macos/render_snapshot_publisher.py \
+  --project-root "$PWD" --check
+
+DCAR_PROJECT_ROOT="$PWD" \
+DCAR_PUBLISHER_ENV_FILE="$HOME/Library/Application Support/DcarAIGC/publisher.env" \
+DCAR_V8_DB="$PWD/app/data/dcar_insight.sqlite3" \
+DCAR_LEGACY_DB="$PWD/app/data/web_mvp.sqlite3" \
+DCAR_READ_ONLY=1 DCAR_SCHEDULER_ENABLED=0 DCAR_STARTUP_CATCHUP_ENABLED=0 \
+  deploy/macos/run_snapshot_publisher.sh --check
+
+python3 deploy/macos/render_snapshot_publisher.py \
+  --project-root "$PWD" --output "$plist"
+plutil -lint "$plist"
+launchctl enable "$domain/$label"
+launchctl bootstrap "$domain" "$plist"
+```
+
+不要在安装后执行 `kickstart -k`。更新 plist 时先 `bootout`，将旧 plist 移到备份路径，再重新渲染和 bootstrap；renderer 会拒绝覆盖已有文件。验收：
+
+```sh
+launchctl print-disabled "$domain" | grep "$label"
+launchctl print "$domain/$label"
+tail -n 200 "$HOME/Library/Logs/DcarAIGC/snapshot-publisher.stdout.log"
+tail -n 200 "$HOME/Library/Logs/DcarAIGC/snapshot-publisher.stderr.log"
+```

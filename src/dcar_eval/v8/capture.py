@@ -60,6 +60,8 @@ class SlotUnavailable(RuntimeError):
 class BudgetBlocked(RuntimeError):
     """The budget is absent, inactive, stale or exhausted."""
 
+    error_code = "budget_blocked"
+
 
 class RawResponseIntegrityError(RuntimeError):
     """A stored provider response is absent, unreadable or fails SHA-256 validation."""

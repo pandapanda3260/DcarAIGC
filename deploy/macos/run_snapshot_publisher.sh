@@ -43,9 +43,11 @@ if [[ -n "${DCAR_LEGACY_DB:-}" ]]; then
 fi
 if [[ "${1:-}" == "--check" ]]; then
   arguments+=(--check)
-elif [[ $# -ne 0 ]]; then
+elif [[ $# -eq 0 ]]; then
+  arguments+=(--automatic)
+else
   fail "only the optional --check argument is supported"
 fi
 
 echo "Dcar snapshot publisher starting; provider_calls=0 catchup=0"
-exec /usr/bin/caffeinate -s "$python_bin" "${arguments[@]}"
+exec /usr/bin/caffeinate -i "$python_bin" "${arguments[@]}"

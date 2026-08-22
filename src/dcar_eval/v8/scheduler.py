@@ -185,6 +185,164 @@ def current_day_daily_capture_guard(
     )
 
 
+def _current_day_run_status(
+    job_id: str, occurrence: datetime, *, db_path: Path
+) -> Optional[str]:
+    with connect(db_path) as connection:
+        row = connection.execute(
+            """
+            SELECT status FROM scheduler_runs
+            WHERE job_id=? AND scheduled_for=?
+            """,
+            (job_id, _scheduled_iso(occurrence)),
+        ).fetchone()
+    return None if row is None else str(row["status"])
+
+
+def current_day_pipeline_guard(
+    *,
+    now: datetime,
+    effective_from: date,
+    db_path: Path,
+    reports_root: Path,
+    capture_call_override: Optional[
+        Callable[[str, Mapping[str, Any]], ProviderResult]
+    ],
+) -> Dict[str, Any]:
+    """Reconcile today's due pipeline in dependency order without backfill.
+
+    Paid capture retries automatically only after a process interruption. A
+    terminal capture is never re-run. Unpaid downstream failures retry on the
+    next hourly pass, so sleep cannot silently omit the rest of today's chain.
+    """
+
+    local_now = now.astimezone(SHANGHAI)
+    if local_now.date() < effective_from:
+        return {
+            "status": "before_effective_date",
+            "effective_from": effective_from.isoformat(),
+            "results": [],
+        }
+
+    capture_occurrence = datetime.combine(local_now.date(), time(2, 0), SHANGHAI)
+    if local_now < capture_occurrence:
+        return {"status": "before_today_slot", "results": []}
+
+    results: List[Dict[str, Any]] = []
+    capture_status = _current_day_run_status(
+        "daily_capture", capture_occurrence, db_path=db_path
+    )
+    try:
+        if capture_status == "interrupted":
+            capture_result = execute_job(
+                "daily_capture",
+                capture_occurrence,
+                db_path=db_path,
+                reports_root=reports_root,
+                capture_call_override=capture_call_override,
+                allow_retry=True,
+                invocation_source="scheduled",
+            )
+        else:
+            capture_result = current_day_daily_capture_guard(
+                now=local_now,
+                effective_from=effective_from,
+                db_path=db_path,
+                reports_root=reports_root,
+                capture_call_override=capture_call_override,
+            )
+        results.append(capture_result)
+    except Exception as exc:
+        return {
+            "status": "blocked",
+            "blocked_on": "daily_capture",
+            "error": str(exc),
+            "results": results,
+        }
+
+    capture_status = _current_day_run_status(
+        "daily_capture", capture_occurrence, db_path=db_path
+    )
+    if capture_status in {None, "running"}:
+        return {
+            "status": "waiting",
+            "blocked_on": "daily_capture",
+            "results": results,
+        }
+
+    previous_job_id = "daily_capture"
+    previous_status = capture_status
+    for definition in JOBS[1:]:
+        if definition.day_of_week == "mon" and local_now.weekday() != 0:
+            continue
+        occurrence = datetime.combine(
+            local_now.date(), time(definition.hour, definition.minute), SHANGHAI
+        )
+        if local_now < occurrence:
+            break
+        if previous_status not in TERMINAL_RUN_STATUSES | RETRYABLE_RUN_STATUSES:
+            return {
+                "status": "waiting",
+                "blocked_on": previous_job_id,
+                "results": results,
+            }
+        existing_status = _current_day_run_status(
+            definition.job_id, occurrence, db_path=db_path
+        )
+        if existing_status in TERMINAL_RUN_STATUSES:
+            result = {
+                "job_id": definition.job_id,
+                "status": "already_attempted",
+                "scheduled_for": _scheduled_iso(occurrence),
+                "existing_status": existing_status,
+            }
+        elif existing_status == "running":
+            return {
+                "status": "waiting",
+                "blocked_on": definition.job_id,
+                "results": results,
+            }
+        else:
+            invocation_source = (
+                "startup_report_catchup"
+                if definition.job_id in REPORT_JOB_IDS
+                else "scheduled"
+            )
+            try:
+                result = execute_job(
+                    definition.job_id,
+                    occurrence,
+                    db_path=db_path,
+                    reports_root=reports_root,
+                    capture_call_override=capture_call_override,
+                    allow_retry=(
+                        definition.job_id in REPORT_JOB_IDS
+                        or existing_status in RETRYABLE_RUN_STATUSES
+                    ),
+                    invocation_source=invocation_source,
+                )
+            except Exception as exc:
+                return {
+                    "status": "blocked",
+                    "blocked_on": definition.job_id,
+                    "error": str(exc),
+                    "results": results,
+                }
+        results.append(result)
+        previous_job_id = definition.job_id
+        previous_status = _current_day_run_status(
+            definition.job_id, occurrence, db_path=db_path
+        )
+        if previous_status not in TERMINAL_RUN_STATUSES:
+            return {
+                "status": "waiting",
+                "blocked_on": definition.job_id,
+                "results": results,
+            }
+
+    return {"status": "reconciled", "results": results}
+
+
 def _claim_run(
     job_id: str,
     scheduled_for: datetime,
@@ -230,6 +388,12 @@ def _claim_run(
                     f"unsupported scheduler run status: {current_status}"
                 )
             if not allow_retry:
+                return None
+            if (
+                invocation_source == "scheduled"
+                and job_id == "daily_capture"
+                and current_status != "interrupted"
+            ):
                 return None
             attempt_number = int(
                 connection.execute(
@@ -1461,9 +1625,13 @@ def execute_job(
             raise SchedulerJobError(
                 "startup_report_catchup requires allow_retry=True"
             )
-    if allow_retry and job_id not in REPORT_JOB_IDS and invocation_source != "operator_retry":
+    if (
+        allow_retry
+        and job_id not in REPORT_JOB_IDS
+        and invocation_source not in {"operator_retry", "scheduled"}
+    ):
         raise SchedulerJobError(
-            "non-report scheduler retries require operator_retry authorization"
+            "non-report scheduler retry source is not authorized"
         )
     if invocation_source == "operator_retry" and not allow_retry:
         raise SchedulerJobError("operator_retry requires allow_retry=True")
@@ -1549,6 +1717,24 @@ def _daily_capture_guard_job(
     )
 
 
+def _current_day_pipeline_guard_job(
+    *,
+    effective_from: date,
+    db_path: Path,
+    reports_root: Path,
+    capture_call_override: Optional[
+        Callable[[str, Mapping[str, Any]], ProviderResult]
+    ],
+) -> None:
+    current_day_pipeline_guard(
+        now=datetime.now(SHANGHAI),
+        effective_from=effective_from,
+        db_path=db_path,
+        reports_root=reports_root,
+        capture_call_override=capture_call_override,
+    )
+
+
 def install_jobs(
     scheduler: BackgroundScheduler,
     *,
@@ -1570,9 +1756,9 @@ def install_jobs(
                 "capture_call_override": capture_call_override,
             }
         else:
-            callback = _live_job
+            callback = _current_day_pipeline_guard_job
             kwargs = {
-                "job_id": job.job_id,
+                "effective_from": reconcile_effective_date,
                 "db_path": db_path,
                 "reports_root": reports_root,
                 "capture_call_override": capture_call_override,
@@ -1593,7 +1779,7 @@ def install_jobs(
             misfire_grace_time=3600,
         )
     scheduler.add_job(
-        _daily_capture_guard_job,
+        _current_day_pipeline_guard_job,
         IntervalTrigger(hours=1, timezone=SHANGHAI),
         id="daily_capture_reconcile",
         replace_existing=True,
@@ -1603,6 +1789,17 @@ def install_jobs(
             "reports_root": reports_root,
             "capture_call_override": capture_call_override,
         },
+        next_run_time=datetime.now(SHANGHAI),
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=None,
+    )
+    scheduler.add_job(
+        _report_reconcile_job,
+        IntervalTrigger(hours=1, timezone=SHANGHAI),
+        id="report_reconcile",
+        replace_existing=True,
+        kwargs={"db_path": db_path, "reports_root": reports_root},
         next_run_time=datetime.now(SHANGHAI),
         coalesce=True,
         max_instances=1,
@@ -1786,3 +1983,11 @@ def startup_catchup(
                 }
             )
     return results
+
+
+def _report_reconcile_job(*, db_path: Path, reports_root: Path) -> None:
+    startup_catchup(
+        now=datetime.now(SHANGHAI),
+        db_path=db_path,
+        reports_root=reports_root,
+    )

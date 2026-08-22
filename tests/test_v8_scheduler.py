@@ -27,6 +27,7 @@ from v8.scheduler import (
     _finish_run,
     _select_due_capture_contents,
     current_day_daily_capture_guard,
+    current_day_pipeline_guard,
     daily_capture_quality_gate,
     execute_job,
     install_jobs,
@@ -284,7 +285,9 @@ class V8SchedulerTest(unittest.TestCase):
         after = datetime.now(SHANGHAI)
         jobs = {job.id: str(job.trigger) for job in scheduler.get_jobs()}
         self.assertEqual(
-            set(jobs), {job.job_id for job in JOBS} | {"daily_capture_reconcile"}
+            set(jobs),
+            {job.job_id for job in JOBS}
+            | {"daily_capture_reconcile", "report_reconcile"},
         )
         self.assertIn("hour='2', minute='0'", jobs["daily_capture"])
         self.assertIn("hour='2', minute='20'", jobs["daily_media_download"])
@@ -292,6 +295,21 @@ class V8SchedulerTest(unittest.TestCase):
         self.assertIn("hour='7', minute='30'", jobs["daily_media_cutoff"])
         self.assertIn("hour='8', minute='0'", jobs["daily_report"])
         self.assertIn("day_of_week='mon'", jobs["weekly_report"])
+        self.assertEqual(
+            scheduler.get_job("daily_capture").func.__name__,
+            "_daily_capture_guard_job",
+        )
+        for job_id in {
+            "daily_media_download",
+            "daily_media_processing",
+            "daily_media_cutoff",
+            "daily_report",
+            "weekly_report",
+        }:
+            self.assertEqual(
+                scheduler.get_job(job_id).func.__name__,
+                "_current_day_pipeline_guard_job",
+            )
         reconcile = scheduler.get_job("daily_capture_reconcile")
         self.assertEqual(str(reconcile.trigger), "interval[1:00:00]")
         self.assertTrue(reconcile.coalesce)
@@ -300,6 +318,13 @@ class V8SchedulerTest(unittest.TestCase):
         self.assertGreaterEqual(reconcile.next_run_time, before)
         self.assertLessEqual(reconcile.next_run_time, after)
         self.assertNotIn("daily_capture_reconcile", {job.job_id for job in JOBS})
+        report_reconcile = scheduler.get_job("report_reconcile")
+        self.assertEqual(str(report_reconcile.trigger), "interval[1:00:00]")
+        self.assertTrue(report_reconcile.coalesce)
+        self.assertEqual(report_reconcile.max_instances, 1)
+        self.assertIsNone(report_reconcile.misfire_grace_time)
+        self.assertGreaterEqual(report_reconcile.next_run_time, before)
+        self.assertLessEqual(report_reconcile.next_run_time, after)
 
     def test_install_jobs_requires_all_paid_path_dependencies(self) -> None:
         scheduler = BackgroundScheduler(timezone=SHANGHAI)
@@ -424,6 +449,155 @@ class V8SchedulerTest(unittest.TestCase):
                     ("already_attempted", status),
                 )
         action.assert_not_called()
+
+    def test_hourly_pipeline_reconciles_all_due_jobs_in_dependency_order(self) -> None:
+        current = datetime(2026, 8, 22, 9, 0, tzinfo=SHANGHAI)
+        with (
+            patch(
+                "v8.scheduler._run_job_action",
+                return_value=("succeeded", {}),
+            ),
+            patch(
+                "v8.scheduler._require_report_job_runtime_ready",
+                return_value={},
+            ),
+        ):
+            result = current_day_pipeline_guard(
+                now=current,
+                effective_from=current.date(),
+                db_path=self.db,
+                reports_root=self.reports,
+                capture_call_override=None,
+            )
+
+        self.assertEqual(result["status"], "reconciled")
+        self.assertEqual(
+            [item["job_id"] for item in result["results"]],
+            [
+                "daily_capture",
+                "daily_media_download",
+                "daily_media_processing",
+                "daily_media_cutoff",
+                "daily_report",
+            ],
+        )
+        with connect(self.db) as connection:
+            rows = connection.execute(
+                """
+                SELECT r.job_id,r.status,a.invocation_source
+                FROM scheduler_runs r
+                JOIN scheduler_run_attempts a ON a.scheduler_run_id=r.id
+                ORDER BY r.scheduled_for,r.id
+                """
+            ).fetchall()
+        self.assertEqual([str(row["status"]) for row in rows], ["succeeded"] * 5)
+        self.assertEqual(
+            [str(row["invocation_source"]) for row in rows],
+            [
+                "scheduled",
+                "scheduled",
+                "scheduled",
+                "scheduled",
+                "startup_report_catchup",
+            ],
+        )
+
+    def test_hourly_pipeline_retries_interrupted_capture_with_same_day_slot(self) -> None:
+        occurrence = datetime(2026, 8, 22, 2, 0, tzinfo=SHANGHAI)
+        with connect(self.db) as connection:
+            run = connection.execute(
+                """
+                INSERT INTO scheduler_runs(
+                    job_id,scheduled_for,status,started_at,details_json
+                ) VALUES ('daily_capture',?,'running',?,'{}')
+                """,
+                (
+                    occurrence.astimezone(ZoneInfo("UTC"))
+                    .isoformat(timespec="seconds")
+                    .replace("+00:00", "Z"),
+                    now_utc(),
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO scheduler_run_attempts(
+                    scheduler_run_id,attempt_number,invocation_source,status,
+                    started_at,details_json
+                ) VALUES (?,1,'scheduled','running',?,'{}')
+                """,
+                (int(run.lastrowid), now_utc()),
+            )
+            connection.commit()
+        recover_interrupted_scheduler_runs(db_path=self.db)
+
+        with patch(
+            "v8.scheduler._run_job_action", return_value=("succeeded", {})
+        ):
+            result = current_day_pipeline_guard(
+                now=datetime(2026, 8, 22, 2, 10, tzinfo=SHANGHAI),
+                effective_from=date(2026, 8, 22),
+                db_path=self.db,
+                reports_root=self.reports,
+                capture_call_override=None,
+            )
+
+        self.assertEqual(result["status"], "reconciled")
+        with connect(self.db) as connection:
+            attempts = connection.execute(
+                """
+                SELECT attempt_number,invocation_source,status
+                FROM scheduler_run_attempts ORDER BY attempt_number
+                """
+            ).fetchall()
+        self.assertEqual(
+            [tuple(row) for row in attempts],
+            [(1, "scheduled", "interrupted"), (2, "scheduled", "succeeded")],
+        )
+
+    def test_scheduled_retry_cannot_reclaim_failed_paid_capture(self) -> None:
+        occurrence = datetime(2026, 8, 22, 2, 0, tzinfo=SHANGHAI)
+        scheduled_for = (
+            occurrence.astimezone(ZoneInfo("UTC"))
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
+        with connect(self.db) as connection:
+            run = connection.execute(
+                """
+                INSERT INTO scheduler_runs(
+                    job_id,scheduled_for,status,started_at,completed_at,details_json
+                ) VALUES ('daily_capture',?,'failed',?,?, '{}')
+                """,
+                (scheduled_for, now_utc(), now_utc()),
+            )
+            connection.execute(
+                """
+                INSERT INTO scheduler_run_attempts(
+                    scheduler_run_id,attempt_number,invocation_source,status,
+                    started_at,completed_at,details_json
+                ) VALUES (?,1,'scheduled','failed',?,?, '{}')
+                """,
+                (int(run.lastrowid), now_utc(), now_utc()),
+            )
+            connection.commit()
+
+        with patch("v8.scheduler._run_job_action") as action:
+            result = execute_job(
+                "daily_capture",
+                occurrence,
+                db_path=self.db,
+                reports_root=self.reports,
+                allow_retry=True,
+                invocation_source="scheduled",
+            )
+
+        self.assertEqual(result["status"], "skipped_duplicate")
+        action.assert_not_called()
+        with connect(self.db) as connection:
+            attempts = connection.execute(
+                "SELECT COUNT(*) FROM scheduler_run_attempts"
+            ).fetchone()[0]
+        self.assertEqual(attempts, 1)
 
     def test_current_day_guard_concurrency_claims_one_run_and_attempt(self) -> None:
         start = threading.Barrier(3)
@@ -2078,6 +2252,63 @@ class V8SchedulerTest(unittest.TestCase):
                 for row in connection.execute("SELECT provider FROM provider_usage")
             }
         self.assertNotIn("Rnote", providers)
+
+    def test_task_budget_block_opens_one_tikhub_circuit(self) -> None:
+        for index in range(2):
+            upsert_account(
+                {
+                    "phone": f"138001381{index:02d}",
+                    "platforms": [
+                        {
+                            "platform": "xiaohongshu",
+                            "uid": f"budget-circuit-{index}",
+                        }
+                    ],
+                },
+                db_path=self.db,
+            )
+
+        calls = 0
+
+        def supplier_call(operation, record):
+            nonlocal calls
+            self.assertEqual(operation, "discover_content")
+            calls += 1
+            data = {"items": [], "has_more": True, "next_cursor": "page-2"}
+            return ProviderResult(
+                data,
+                {"operation": operation, "data": data},
+                200,
+                True,
+            )
+
+        result = run_due_capture(
+            datetime(2026, 8, 2, 2, 0, tzinfo=SHANGHAI),
+            db_path=self.db,
+            call_override=supplier_call,
+            max_amount=0.01,
+        )
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(result["blocked_providers"], ["TikHub"])
+        self.assertEqual(
+            [item["status"] for item in result["discovery"]],
+            ["failed", "circuit_break_skipped"],
+        )
+        self.assertEqual(
+            result["discovery"][0]["pages"][-1]["error_code"],
+            "budget_blocked",
+        )
+        with connect(self.db) as connection:
+            amount = float(
+                connection.execute(
+                    """
+                    SELECT COALESCE(SUM(amount), 0) FROM provider_usage
+                    WHERE task_id='daily-capture-2026-08-02-bjt'
+                    """
+                ).fetchone()[0]
+            )
+        self.assertEqual(amount, 0.01)
 
     def test_daily_capture_paginates_until_beijing_window_start(self) -> None:
         upsert_account(

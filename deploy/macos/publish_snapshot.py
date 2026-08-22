@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import sqlite3
 import stat
 import subprocess
@@ -17,9 +18,9 @@ import sys
 import tempfile
 import urllib.error
 import urllib.request
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Callable, Iterator, Mapping, Optional, Sequence
@@ -27,7 +28,9 @@ from zoneinfo import ZoneInfo
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
-TERMINAL_CAPTURE_STATUSES = frozenset({"succeeded", "partial", "skipped"})
+TERMINAL_CAPTURE_STATUSES = frozenset({"succeeded", "partial"})
+TERMINAL_PIPELINE_STATUSES = frozenset({"succeeded"})
+TERMINAL_REPORT_STATUSES = frozenset({"succeeded", "partial"})
 REPORT_CATCHUP_JOB_IDS = frozenset({"daily_report", "weekly_report"})
 REPORT_CATCHUP_TERMINAL_STATUSES = frozenset({"succeeded", "partial", "skipped"})
 SAFE_ALIAS_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
@@ -64,6 +67,24 @@ ARTIFACT_POLICY = {
     "on_optional_missing_or_mismatch": "omitted",
     "delete_unlisted": False,
 }
+AUTOMATIC_STATE_SCHEMA = "dcar-automatic-snapshot-publisher-state-v1"
+AUTOMATIC_STATE_FILENAME = "automatic-publisher-state.json"
+AUTOMATIC_START_HOUR = 9
+# Pre-publish pruning keeps two existing points; the new successful install
+# becomes the third retained point.
+REMOTE_SNAPSHOT_RETAIN_COUNT = 2
+LOCAL_SNAPSHOT_RETAIN_COUNT = 3
+LOCAL_SNAPSHOT_DIR_RE = re.compile(r"snapshot-[0-9]{8}T[0-9]{6}Z")
+AUTOMATIC_STATE_KEYS = frozenset(
+    {
+        "schema",
+        "beijing_date",
+        "snapshot_id",
+        "published_at",
+        "capture_scheduled_for",
+        "database_sha256",
+    }
+)
 ALLOWED_ENV_KEYS = frozenset(
     {
         "DCAR_PUBLISH_SSH_ALIAS",
@@ -115,9 +136,21 @@ class WriterFreshness:
     capture_status: str
     capture_scheduled_for: str
     capture_completed_at: str
+    media_download_status: str
+    media_download_scheduled_for: str
+    media_download_completed_at: str
+    media_processing_status: str
+    media_processing_scheduled_for: str
+    media_processing_completed_at: str
     media_cutoff_status: str
     media_cutoff_scheduled_for: str
     media_cutoff_completed_at: str
+    daily_report_status: str
+    daily_report_scheduled_for: str
+    daily_report_completed_at: str
+    weekly_report_status: Optional[str]
+    weekly_report_scheduled_for: Optional[str]
+    weekly_report_completed_at: Optional[str]
     latest_published_at: str
     content_count: int
     runtime_identity: dict[str, Any]
@@ -134,9 +167,7 @@ def _utc_now() -> str:
     )
 
 
-def _validate_runtime_identity(
-    value: object, *, label: str
-) -> dict[str, Any]:
+def _validate_runtime_identity(value: object, *, label: str) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != RUNTIME_IDENTITY_KEYS:
         raise SnapshotPublishError(f"{label} runtime identity has an invalid shape")
     expected = {
@@ -414,10 +445,11 @@ def check_writer_freshness(
         raise SnapshotPublishError("writer startup catch-up is not report-only")
     if catchup.get("requested") is not True or catchup.get("enabled") is not True:
         raise SnapshotPublishError("writer report-only startup catch-up is not enabled")
-    if catchup.get("status") != "succeeded":
-        raise SnapshotPublishError(
-            "writer report-only startup catch-up has not succeeded"
-        )
+    catchup_status = catchup.get("status")
+    if catchup_status == "running":
+        raise SnapshotPublishError("writer report-only startup catch-up is still running")
+    if catchup_status not in {"succeeded", "failed", "deferred"}:
+        raise SnapshotPublishError("writer report-only startup catch-up status is invalid")
     catchup_results = catchup.get("results")
     if not isinstance(catchup_results, list):
         raise SnapshotPublishError("writer startup catch-up results are invalid")
@@ -432,9 +464,20 @@ def check_writer_freshness(
                 "writer startup catch-up contains a non-report job"
             )
         status = result.get("status")
-        if status not in REPORT_CATCHUP_TERMINAL_STATUSES:
+        if status not in REPORT_CATCHUP_TERMINAL_STATUSES | {
+            "failed",
+            "deferred",
+            "skipped_duplicate",
+        }:
             raise SnapshotPublishError(
-                "writer startup catch-up contains a non-terminal report result"
+                "writer startup catch-up contains an invalid report result"
+            )
+        if (
+            catchup_status == "succeeded"
+            and status not in REPORT_CATCHUP_TERMINAL_STATUSES
+        ):
+            raise SnapshotPublishError(
+                "successful startup catch-up contains a non-terminal report result"
             )
         scheduled_for = result.get("scheduled_for")
         if not isinstance(scheduled_for, str) or not scheduled_for:
@@ -447,7 +490,8 @@ def check_writer_freshness(
                 "writer startup catch-up contains a duplicate report occurrence"
             )
         seen_report_occurrences.add(occurrence_key)
-        report_occurrences.append((str(job_id), scheduled_for, str(status)))
+        if catchup_status == "succeeded":
+            report_occurrences.append((str(job_id), scheduled_for, str(status)))
     connection = sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
     try:
@@ -488,6 +532,20 @@ def check_writer_freshness(
             ORDER BY scheduled_for DESC LIMIT 1
             """
         ).fetchone()
+        media_download = connection.execute(
+            """
+            SELECT scheduled_for,status,completed_at FROM scheduler_runs
+            WHERE job_id='daily_media_download'
+            ORDER BY scheduled_for DESC LIMIT 1
+            """
+        ).fetchone()
+        media_processing = connection.execute(
+            """
+            SELECT scheduled_for,status,completed_at FROM scheduler_runs
+            WHERE job_id='daily_media_processing'
+            ORDER BY scheduled_for DESC LIMIT 1
+            """
+        ).fetchone()
         media_cutoff = connection.execute(
             """
             SELECT scheduled_for,status,completed_at FROM scheduler_runs
@@ -495,6 +553,24 @@ def check_writer_freshness(
             ORDER BY scheduled_for DESC LIMIT 1
             """
         ).fetchone()
+        daily_report = connection.execute(
+            """
+            SELECT scheduled_for,status,completed_at FROM scheduler_runs
+            WHERE job_id='daily_report'
+            ORDER BY scheduled_for DESC LIMIT 1
+            """
+        ).fetchone()
+        weekly_report = (
+            connection.execute(
+                """
+                SELECT scheduled_for,status,completed_at FROM scheduler_runs
+                WHERE job_id='weekly_report'
+                ORDER BY scheduled_for DESC LIMIT 1
+                """
+            ).fetchone()
+            if current.weekday() == 0
+            else None
+        )
         content = connection.execute(
             "SELECT COUNT(*) content_count,MAX(published_at) latest_published_at "
             "FROM content_items"
@@ -515,6 +591,30 @@ def check_writer_freshness(
         allowed_statuses=TERMINAL_CAPTURE_STATUSES,
         current=current,
     )
+    (
+        media_download_status,
+        media_download_scheduled,
+        media_download_completed,
+    ) = _validate_today_run(
+        media_download,
+        job_id="daily_media_download",
+        hour=2,
+        minute=20,
+        allowed_statuses=TERMINAL_PIPELINE_STATUSES,
+        current=current,
+    )
+    (
+        media_processing_status,
+        media_processing_scheduled,
+        media_processing_completed,
+    ) = _validate_today_run(
+        media_processing,
+        job_id="daily_media_processing",
+        hour=3,
+        minute=0,
+        allowed_statuses=TERMINAL_PIPELINE_STATUSES,
+        current=current,
+    )
     cutoff_status, cutoff_scheduled, cutoff_completed = _validate_today_run(
         media_cutoff,
         job_id="daily_media_cutoff",
@@ -523,6 +623,34 @@ def check_writer_freshness(
         allowed_statuses=frozenset({"succeeded"}),
         current=current,
     )
+    (
+        daily_report_status,
+        daily_report_scheduled,
+        daily_report_completed,
+    ) = _validate_today_run(
+        daily_report,
+        job_id="daily_report",
+        hour=8,
+        minute=0,
+        allowed_statuses=TERMINAL_REPORT_STATUSES,
+        current=current,
+    )
+    weekly_report_status: Optional[str] = None
+    weekly_report_scheduled: Optional[datetime] = None
+    weekly_report_completed: Optional[datetime] = None
+    if current.weekday() == 0:
+        (
+            weekly_report_status,
+            weekly_report_scheduled,
+            weekly_report_completed,
+        ) = _validate_today_run(
+            weekly_report,
+            job_id="weekly_report",
+            hour=8,
+            minute=30,
+            allowed_statuses=TERMINAL_REPORT_STATUSES,
+            current=current,
+        )
     content_count = int(content["content_count"])
     if content_count <= 0:
         raise SnapshotPublishError("writer database contains no content")
@@ -543,7 +671,16 @@ def check_writer_freshness(
         )
         if path.exists()
     )
-    newest_required_completion = max(capture_completed, cutoff_completed)
+    required_completions = [
+        capture_completed,
+        media_download_completed,
+        media_processing_completed,
+        cutoff_completed,
+        daily_report_completed,
+    ]
+    if weekly_report_completed is not None:
+        required_completions.append(weekly_report_completed)
+    newest_required_completion = max(required_completions)
     if datetime.fromtimestamp(
         latest_storage_mtime, timezone.utc
     ) < newest_required_completion - timedelta(minutes=5):
@@ -554,9 +691,25 @@ def check_writer_freshness(
         capture_status=capture_status,
         capture_scheduled_for=str(capture["scheduled_for"]),
         capture_completed_at=str(capture["completed_at"]),
+        media_download_status=media_download_status,
+        media_download_scheduled_for=str(media_download["scheduled_for"]),
+        media_download_completed_at=str(media_download["completed_at"]),
+        media_processing_status=media_processing_status,
+        media_processing_scheduled_for=str(media_processing["scheduled_for"]),
+        media_processing_completed_at=str(media_processing["completed_at"]),
         media_cutoff_status=cutoff_status,
         media_cutoff_scheduled_for=str(media_cutoff["scheduled_for"]),
         media_cutoff_completed_at=str(media_cutoff["completed_at"]),
+        daily_report_status=daily_report_status,
+        daily_report_scheduled_for=str(daily_report["scheduled_for"]),
+        daily_report_completed_at=str(daily_report["completed_at"]),
+        weekly_report_status=weekly_report_status,
+        weekly_report_scheduled_for=(
+            str(weekly_report["scheduled_for"]) if weekly_report is not None else None
+        ),
+        weekly_report_completed_at=(
+            str(weekly_report["completed_at"]) if weekly_report is not None else None
+        ),
         latest_published_at=str(content["latest_published_at"]),
         content_count=content_count,
         runtime_identity=runtime_identity,
@@ -725,6 +878,41 @@ def _remote_free_bytes(
     return value
 
 
+def _prune_remote_snapshots(
+    config: PublishConfig,
+    ssh: Sequence[str],
+    *,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    remote = shlex.join(
+        [
+            "sudo",
+            "-n",
+            config.remote_python,
+            config.remote_installer,
+            "prune",
+            "--incoming-root",
+            config.remote_incoming_root,
+            "--retain-count",
+            str(REMOTE_SNAPSHOT_RETAIN_COUNT),
+        ]
+    )
+    output = _run_checked(runner, _remote_command(ssh, remote), timeout=10 * 60)
+    try:
+        value = json.loads(output)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise SnapshotPublishError(
+            "remote snapshot retention returned invalid JSON"
+        ) from exc
+    if (
+        not isinstance(value, dict)
+        or value.get("schema") != "dcar-read-replica-prune-receipt-v1"
+        or value.get("retain_count") != REMOTE_SNAPSHOT_RETAIN_COUNT
+    ):
+        raise SnapshotPublishError("remote snapshot retention receipt is invalid")
+    return dict(value)
+
+
 def _rsync_rsh(ssh: Sequence[str]) -> str:
     return shlex.join(ssh[:-1])
 
@@ -743,6 +931,11 @@ def _write_json_atomic(path: Path, value: Mapping[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        directory_descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
     finally:
         if temporary.exists():
             temporary.unlink()
@@ -769,6 +962,203 @@ def _publisher_lock(snapshot_root: Path) -> Iterator[None]:
         os.close(descriptor)
 
 
+def _automatic_state_path(snapshot_root: Path) -> Path:
+    return snapshot_root / AUTOMATIC_STATE_FILENAME
+
+
+def _state_from_receipt(
+    value: Mapping[str, Any], *, beijing_date: date
+) -> dict[str, Any]:
+    if value.get("schema") != "dcar-snapshot-publisher-receipt-v1":
+        raise SnapshotPublishError("automatic publisher receipt schema is invalid")
+    snapshot_id = value.get("snapshot_id")
+    database_sha256 = value.get("database_sha256")
+    if (
+        not isinstance(snapshot_id, str)
+        or SNAPSHOT_ID_RE.fullmatch(snapshot_id) is None
+    ):
+        raise SnapshotPublishError("automatic publisher receipt snapshot_id is invalid")
+    if (
+        not isinstance(database_sha256, str)
+        or SHA256_RE.fullmatch(database_sha256) is None
+    ):
+        raise SnapshotPublishError(
+            "automatic publisher receipt database SHA-256 is invalid"
+        )
+    published_at = _parse_iso(
+        value.get("published_at"), label="automatic publisher receipt published_at"
+    )
+    capture_scheduled = _parse_iso(
+        value.get("capture_scheduled_for"),
+        label="automatic publisher receipt capture_scheduled_for",
+    )
+    if capture_scheduled.astimezone(SHANGHAI).date() != beijing_date:
+        raise SnapshotPublishError(
+            "automatic publisher receipt does not cover the requested Beijing day"
+        )
+    expected_statuses = {
+        "capture_status": TERMINAL_CAPTURE_STATUSES,
+        "media_download_status": TERMINAL_PIPELINE_STATUSES,
+        "media_processing_status": TERMINAL_PIPELINE_STATUSES,
+        "media_cutoff_status": TERMINAL_PIPELINE_STATUSES,
+        "daily_report_status": TERMINAL_REPORT_STATUSES,
+    }
+    if beijing_date.weekday() == 0:
+        expected_statuses["weekly_report_status"] = TERMINAL_REPORT_STATUSES
+    for key, allowed_statuses in expected_statuses.items():
+        if value.get(key) not in allowed_statuses:
+            raise SnapshotPublishError(
+                f"automatic publisher receipt {key} is not successful"
+            )
+    return {
+        "schema": AUTOMATIC_STATE_SCHEMA,
+        "beijing_date": beijing_date.isoformat(),
+        "snapshot_id": snapshot_id,
+        "published_at": published_at.isoformat(),
+        "capture_scheduled_for": capture_scheduled.isoformat(),
+        "database_sha256": database_sha256,
+    }
+
+
+def _validate_automatic_state(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != AUTOMATIC_STATE_KEYS:
+        raise SnapshotPublishError("automatic publisher state has an invalid shape")
+    if value.get("schema") != AUTOMATIC_STATE_SCHEMA:
+        raise SnapshotPublishError("automatic publisher state schema is invalid")
+    beijing_date_value = value.get("beijing_date")
+    try:
+        parsed_day = date.fromisoformat(str(beijing_date_value))
+    except ValueError as exc:
+        raise SnapshotPublishError(
+            "automatic publisher state Beijing date is invalid"
+        ) from exc
+    snapshot_id = value.get("snapshot_id")
+    database_sha256 = value.get("database_sha256")
+    if (
+        not isinstance(snapshot_id, str)
+        or SNAPSHOT_ID_RE.fullmatch(snapshot_id) is None
+    ):
+        raise SnapshotPublishError("automatic publisher state snapshot_id is invalid")
+    if (
+        not isinstance(database_sha256, str)
+        or SHA256_RE.fullmatch(database_sha256) is None
+    ):
+        raise SnapshotPublishError(
+            "automatic publisher state database SHA-256 is invalid"
+        )
+    _parse_iso(
+        value.get("published_at"), label="automatic publisher state published_at"
+    )
+    capture_scheduled = _parse_iso(
+        value.get("capture_scheduled_for"),
+        label="automatic publisher state capture_scheduled_for",
+    )
+    if capture_scheduled.astimezone(SHANGHAI).date() != parsed_day:
+        raise SnapshotPublishError(
+            "automatic publisher state capture day does not match its Beijing date"
+        )
+    return dict(value)
+
+
+def _read_automatic_state(snapshot_root: Path) -> Optional[dict[str, Any]]:
+    path = _automatic_state_path(snapshot_root)
+    if path.is_symlink():
+        raise SnapshotPublishError("automatic publisher state must not be a symlink")
+    if not path.exists():
+        return None
+    if not path.is_file():
+        raise SnapshotPublishError("automatic publisher state must be a regular file")
+    metadata = path.stat()
+    if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) not in {
+        0o400,
+        0o600,
+    }:
+        raise SnapshotPublishError(
+            "automatic publisher state ownership or mode is unsafe"
+        )
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SnapshotPublishError("automatic publisher state is unreadable") from exc
+    return _validate_automatic_state(value)
+
+
+def _recover_automatic_state(
+    snapshot_root: Path, *, beijing_date: date
+) -> Optional[dict[str, Any]]:
+    if not snapshot_root.exists():
+        return None
+    if snapshot_root.is_symlink() or not snapshot_root.is_dir():
+        raise SnapshotPublishError("snapshot root is unsafe")
+    for receipt_path in sorted(
+        snapshot_root.glob("snapshot-*/publisher-receipt.json"), reverse=True
+    ):
+        if receipt_path.is_symlink() or not receipt_path.is_file():
+            continue
+        try:
+            value = json.loads(receipt_path.read_text(encoding="utf-8"))
+            state = _state_from_receipt(value, beijing_date=beijing_date)
+        except (
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            SnapshotPublishError,
+        ):
+            continue
+        _write_json_atomic(_automatic_state_path(snapshot_root), state)
+        return state
+    return None
+
+
+def _daily_automatic_success(
+    snapshot_root: Path, *, beijing_date: date
+) -> Optional[dict[str, Any]]:
+    state = _read_automatic_state(snapshot_root)
+    if state is not None and state["beijing_date"] == beijing_date.isoformat():
+        return state
+    return _recover_automatic_state(snapshot_root, beijing_date=beijing_date)
+
+
+def _prune_local_snapshots(
+    snapshot_root: Path, *, retain_count: int = LOCAL_SNAPSHOT_RETAIN_COUNT
+) -> list[str]:
+    if retain_count < 1:
+        raise SnapshotPublishError("local snapshot retain count must be positive")
+    if snapshot_root.is_symlink() or not snapshot_root.is_dir():
+        raise SnapshotPublishError("snapshot root is unsafe")
+    candidates = sorted(
+        (
+            path
+            for path in snapshot_root.iterdir()
+            if LOCAL_SNAPSHOT_DIR_RE.fullmatch(path.name)
+            and not path.is_symlink()
+            and path.is_dir()
+        ),
+        key=lambda path: path.name,
+        reverse=True,
+    )
+    deleted: list[str] = []
+    for path in candidates[retain_count:]:
+        if path.is_symlink() or not path.is_dir():
+            raise SnapshotPublishError(
+                f"local snapshot changed while pruning: {path}"
+            )
+        try:
+            shutil.rmtree(path)
+        except OSError as exc:
+            raise SnapshotPublishError(
+                f"cannot prune local snapshot: {path}"
+            ) from exc
+        deleted.append(path.name)
+    if deleted:
+        descriptor = os.open(snapshot_root, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    return sorted(deleted)
+
+
 def publish_snapshot(
     *,
     project_root: Path,
@@ -779,6 +1169,8 @@ def publish_snapshot(
     runner: CommandRunner = subprocess.run,
     fetch_json: JsonFetcher = _default_fetch_json,
     build_snapshot: Optional[BuildSnapshot] = None,
+    automatic_beijing_date: Optional[date] = None,
+    _lock_held: bool = False,
 ) -> dict[str, Any]:
     project_root = project_root.resolve()
     database = _require_regular_local_file(database, label="formal writer database")
@@ -788,7 +1180,8 @@ def publish_snapshot(
         else None
     )
     current = (now or datetime.now(SHANGHAI)).astimezone(SHANGHAI)
-    with _publisher_lock(config.snapshot_root):
+    lock = nullcontext() if _lock_held else _publisher_lock(config.snapshot_root)
+    with lock:
         freshness = check_writer_freshness(
             database,
             now=current,
@@ -796,6 +1189,7 @@ def publish_snapshot(
             fetch_json=fetch_json,
         )
         ssh = _check_ssh_alias(config, runner=runner)
+        remote_prune = _prune_remote_snapshots(config, ssh, runner=runner)
         output = config.snapshot_root / (
             "snapshot-" + current.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         )
@@ -959,9 +1353,23 @@ def publish_snapshot(
             "capture_status": freshness.capture_status,
             "capture_scheduled_for": freshness.capture_scheduled_for,
             "capture_completed_at": freshness.capture_completed_at,
+            "media_download_status": freshness.media_download_status,
+            "media_download_scheduled_for": freshness.media_download_scheduled_for,
+            "media_download_completed_at": freshness.media_download_completed_at,
+            "media_processing_status": freshness.media_processing_status,
+            "media_processing_scheduled_for": (
+                freshness.media_processing_scheduled_for
+            ),
+            "media_processing_completed_at": freshness.media_processing_completed_at,
             "media_cutoff_status": freshness.media_cutoff_status,
             "media_cutoff_scheduled_for": freshness.media_cutoff_scheduled_for,
             "media_cutoff_completed_at": freshness.media_cutoff_completed_at,
+            "daily_report_status": freshness.daily_report_status,
+            "daily_report_scheduled_for": freshness.daily_report_scheduled_for,
+            "daily_report_completed_at": freshness.daily_report_completed_at,
+            "weekly_report_status": freshness.weekly_report_status,
+            "weekly_report_scheduled_for": freshness.weekly_report_scheduled_for,
+            "weekly_report_completed_at": freshness.weekly_report_completed_at,
             "latest_published_at": freshness.latest_published_at,
             "content_count": freshness.content_count,
             "database_sha256": str(manifest["databases"][0]["sha256"]),
@@ -981,9 +1389,64 @@ def publish_snapshot(
             "rsync_dry_run_bundle_bytes": bundle_transfer_bytes,
             "rsync_dry_run_transfer_bytes": transfer_bytes,
             "remote_staging_root": incoming,
+            "remote_retention": remote_prune,
         }
         _write_json_atomic(output / "publisher-receipt.json", receipt)
+        if automatic_beijing_date is not None:
+            state = _state_from_receipt(receipt, beijing_date=automatic_beijing_date)
+            _write_json_atomic(_automatic_state_path(config.snapshot_root), state)
+            _prune_local_snapshots(config.snapshot_root)
         return receipt
+
+
+def publish_snapshot_automatically(
+    *,
+    project_root: Path,
+    database: Path,
+    legacy_database: Optional[Path],
+    config: PublishConfig,
+    now: Optional[datetime] = None,
+    runner: CommandRunner = subprocess.run,
+    fetch_json: JsonFetcher = _default_fetch_json,
+    build_snapshot: Optional[BuildSnapshot] = None,
+) -> dict[str, Any]:
+    current = (now or datetime.now(SHANGHAI)).astimezone(SHANGHAI)
+    current_day = current.date()
+    if current.hour < AUTOMATIC_START_HOUR:
+        return {
+            "status": "before-automatic-window",
+            "beijing_date": current_day.isoformat(),
+            "no_snapshot_built": True,
+            "no_ssh_attempted": True,
+        }
+    with _publisher_lock(config.snapshot_root):
+        prior_success = _daily_automatic_success(
+            config.snapshot_root, beijing_date=current_day
+        )
+        if prior_success is not None:
+            return {
+                "status": "already-published-today",
+                "beijing_date": current_day.isoformat(),
+                "snapshot_id": prior_success["snapshot_id"],
+                "published_at": prior_success["published_at"],
+                "no_snapshot_built": True,
+                "no_ssh_attempted": True,
+            }
+        # Bound failed build/transfer attempts too: two existing directories
+        # plus this attempt can never grow beyond the normal retain count.
+        _prune_local_snapshots(config.snapshot_root, retain_count=2)
+        return publish_snapshot(
+            project_root=project_root,
+            database=database,
+            legacy_database=legacy_database,
+            config=config,
+            now=current,
+            runner=runner,
+            fetch_json=fetch_json,
+            build_snapshot=build_snapshot,
+            automatic_beijing_date=current_day,
+            _lock_held=True,
+        )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -992,10 +1455,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--env-file", type=Path, required=True)
     parser.add_argument("--db", type=Path, required=True)
     parser.add_argument("--legacy-db", type=Path)
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--check",
         action="store_true",
         help="Validate local configuration and writer freshness without building or connecting.",
+    )
+    mode.add_argument(
+        "--automatic",
+        action="store_true",
+        help="Publish once after 09:00 when today's complete local pipeline is ready.",
     )
     return parser
 
@@ -1013,11 +1482,22 @@ def main() -> int:
             result: Mapping[str, Any] = {
                 "status": "local-check-ok",
                 "capture_status": freshness.capture_status,
+                "media_download_status": freshness.media_download_status,
+                "media_processing_status": freshness.media_processing_status,
                 "media_cutoff_status": freshness.media_cutoff_status,
+                "daily_report_status": freshness.daily_report_status,
+                "weekly_report_status": freshness.weekly_report_status,
                 "latest_published_at": freshness.latest_published_at,
                 "no_snapshot_built": True,
                 "no_ssh_attempted": True,
             }
+        elif arguments.automatic:
+            result = publish_snapshot_automatically(
+                project_root=project_root,
+                database=arguments.db,
+                legacy_database=arguments.legacy_db,
+                config=config,
+            )
         else:
             result = publish_snapshot(
                 project_root=project_root,

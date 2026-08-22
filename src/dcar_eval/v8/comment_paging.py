@@ -284,8 +284,11 @@ def capture_content_comments(
     accumulator = _Accumulator()
     cursor: Optional[Mapping[str, Any]] = None
     page_number = 0
+    pages_fetched = 0
     seen_cursor_shas: set[str] = set()
     provider_cost = 0.0
+    completion_kind: Optional[str] = None
+    stop_reason: Optional[str] = None
 
     # Resume: replay already-stored pages to rebuild the cursor + accumulator.
     for stored in existing_pages:
@@ -300,15 +303,29 @@ def capture_content_comments(
             raise
         provider_cost += float(getattr(fetched.result, "amount", 0.0) or 0.0)
         _accumulate_page(accumulator, fetched.result.data)
-        cursor = _load_cursor(stored["next_cursor_json"])
-        if cursor is None:
+        pages_fetched += 1
+        has_more = bool(stored["has_more"])
+        next_cursor = _load_cursor(stored["next_cursor_json"])
+        if has_more and next_cursor is None:
+            stop_reason = "missing_next_cursor"
+            break
+        completion_kind = _decide_stop(
+            accumulator=accumulator,
+            has_more=has_more,
+            next_cursor=next_cursor,
+            comment_cap=comment_cap,
+            coverage_target=coverage_target,
+            pages_fetched=pages_fetched,
+        )
+        cursor = next_cursor
+        if completion_kind is not None:
             break
 
-    completion_kind: Optional[str] = None
-    stop_reason: Optional[str] = None
-    pages_fetched = len(existing_pages)
-
-    while pages_fetched < max_pages:
+    while (
+        completion_kind is None
+        and stop_reason is None
+        and pages_fetched < max_pages
+    ):
         sha = cursor_sha256(cursor)
         if sha in seen_cursor_shas and pages_fetched > 0:
             stop_reason = "cursor_cycle_detected"
@@ -507,8 +524,11 @@ def _finalize_run(
                 now_utc(),
             ),
         )
-        evidence_id = cursor.lastrowid
-        if evidence_id is None:
+        if cursor.rowcount > 0:
+            if cursor.lastrowid is None:
+                raise CommentPagingError("comment evidence insert returned no id")
+            evidence_id = int(cursor.lastrowid)
+        else:
             row = connection.execute(
                 """
                 SELECT id FROM comment_evidence_versions
@@ -516,6 +536,8 @@ def _finalize_run(
                 """,
                 (content_id, window_key, aggregate_sha),
             ).fetchone()
+            if row is None:
+                raise CommentPagingError("comment evidence upsert returned no row")
             evidence_id = int(row["id"])
         insert_comment_rows(
             connection,

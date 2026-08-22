@@ -5,8 +5,10 @@
   <key>Label</key>
   <string>cn.tj.dcar.snapshot-publisher</string>
 
-  <!-- Rendering this template does not enable or load the job. -->
+  <!-- The publisher is fail-closed and contains no scheduler or provider key. -->
   <key>Disabled</key>
+  <false/>
+  <key>RunAtLoad</key>
   <true/>
   <key>StartCalendarInterval</key>
   <dict>
@@ -15,6 +17,8 @@
     <key>Minute</key>
     <integer>0</integer>
   </dict>
+  <key>StartInterval</key>
+  <integer>3600</integer>
   <key>ProcessType</key>
   <string>Background</string>
   <key>LowPriorityIO</key>

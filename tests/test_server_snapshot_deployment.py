@@ -199,6 +199,24 @@ def _create_old_active_database(path: Path) -> None:
         connection.close()
 
 
+def _snapshot_id(day: int) -> str:
+    return f"202608{day:02d}T010000Z-{day:012x}"
+
+
+def _write_active_snapshot(config: object, snapshot_id: str) -> None:
+    config.runtime_root.mkdir(parents=True, exist_ok=True)
+    config.active_manifest_path.write_text(
+        json.dumps({"snapshot_id": snapshot_id}) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_snapshot_directory(root: Path, snapshot_id: str, payload: bytes) -> None:
+    target = root / snapshot_id
+    target.mkdir(parents=True, exist_ok=False)
+    (target / "payload.bin").write_bytes(payload)
+
+
 class ServerSnapshotDeploymentTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -814,6 +832,212 @@ class ServerSnapshotDeploymentTest(unittest.TestCase):
         finally:
             active.close()
         self.assertFalse((config.history_root / manifest["snapshot_id"]).exists())
+
+    def test_prune_retains_active_and_latest_snapshots_per_root(self) -> None:
+        config = self.server_config()
+        incoming = self.root / "server/incoming"
+        snapshot_ids = [_snapshot_id(day) for day in range(1, 6)]
+        active_snapshot_id = snapshot_ids[0]
+        _write_active_snapshot(config, active_snapshot_id)
+        for root in (incoming, config.history_root):
+            for index, snapshot_id in enumerate(snapshot_ids, start=1):
+                _write_snapshot_directory(root, snapshot_id, b"x" * index)
+
+        receipt = installer.prune_snapshots(
+            config,
+            incoming_root=incoming,
+            retain_count=3,
+        )
+
+        expected_kept = {active_snapshot_id, snapshot_ids[-1], snapshot_ids[-2]}
+        expected_deleted = [snapshot_ids[2], snapshot_ids[1]]
+        self.assertEqual(receipt["active_snapshot_id"], active_snapshot_id)
+        self.assertEqual(receipt["retain_count"], 3)
+        self.assertEqual(receipt["incoming"]["deleted"], expected_deleted)
+        self.assertEqual(receipt["snapshot_history"]["deleted"], expected_deleted)
+        self.assertEqual(receipt["incoming"]["reclaimed_bytes"], 5)
+        self.assertEqual(receipt["snapshot_history"]["reclaimed_bytes"], 5)
+        self.assertEqual(receipt["reclaimed_bytes"], 10)
+        for root in (incoming, config.history_root):
+            self.assertEqual(
+                {
+                    path.name
+                    for path in root.iterdir()
+                    if path.is_dir() and installer.SNAPSHOT_ID_RE.fullmatch(path.name)
+                },
+                expected_kept,
+            )
+
+    def test_prune_retain_one_keeps_active_even_when_it_is_oldest(self) -> None:
+        config = self.server_config()
+        incoming = self.root / "server/incoming"
+        snapshot_ids = [_snapshot_id(day) for day in range(1, 4)]
+        active_snapshot_id = snapshot_ids[0]
+        _write_active_snapshot(config, active_snapshot_id)
+        for root in (incoming, config.history_root):
+            for snapshot_id in snapshot_ids:
+                _write_snapshot_directory(root, snapshot_id, b"snapshot")
+
+        receipt = installer.prune_snapshots(
+            config,
+            incoming_root=incoming,
+            retain_count=1,
+        )
+
+        for key, root in (
+            ("incoming", incoming),
+            ("snapshot_history", config.history_root),
+        ):
+            self.assertEqual(receipt[key]["kept"], [active_snapshot_id])
+            self.assertEqual(
+                {path.name for path in root.iterdir() if path.is_dir()},
+                {active_snapshot_id},
+            )
+
+        with self.assertRaisesRegex(installer.SnapshotInstallError, "at least 1"):
+            installer.prune_snapshots(
+                config,
+                incoming_root=incoming,
+                retain_count=0,
+            )
+        self.assertTrue((incoming / active_snapshot_id).is_dir())
+
+    def test_prune_ignores_symlinks_files_and_invalid_directory_names(self) -> None:
+        config = self.server_config()
+        incoming = self.root / "server/incoming"
+        active_snapshot_id = _snapshot_id(10)
+        old_snapshot_id = _snapshot_id(9)
+        symlink_snapshot_id = _snapshot_id(8)
+        file_snapshot_id = _snapshot_id(7)
+        _write_active_snapshot(config, active_snapshot_id)
+        outside = self.root / "outside-snapshot"
+        outside.mkdir()
+        (outside / "must-remain.txt").write_text("safe", encoding="utf-8")
+        for root in (incoming, config.history_root):
+            _write_snapshot_directory(root, active_snapshot_id, b"active")
+            _write_snapshot_directory(root, old_snapshot_id, b"old")
+            root.mkdir(parents=True, exist_ok=True)
+            (root / symlink_snapshot_id).symlink_to(outside, target_is_directory=True)
+            (root / file_snapshot_id).write_text("not a directory", encoding="utf-8")
+            (root / "invalid-snapshot-name").mkdir()
+
+        receipt = installer.prune_snapshots(
+            config,
+            incoming_root=incoming,
+            retain_count=1,
+        )
+
+        for key, root in (
+            ("incoming", incoming),
+            ("snapshot_history", config.history_root),
+        ):
+            self.assertEqual(receipt[key]["deleted"], [old_snapshot_id])
+            self.assertTrue((root / active_snapshot_id).is_dir())
+            self.assertTrue((root / symlink_snapshot_id).is_symlink())
+            self.assertTrue((root / file_snapshot_id).is_file())
+            self.assertTrue((root / "invalid-snapshot-name").is_dir())
+        self.assertEqual(
+            (outside / "must-remain.txt").read_text(encoding="utf-8"), "safe"
+        )
+
+    def test_prune_rejects_unsafe_roots_or_active_manifest_without_deleting(self) -> None:
+        config = self.server_config()
+        incoming = self.root / "server/incoming"
+        active_snapshot_id = _snapshot_id(12)
+        old_snapshot_id = _snapshot_id(11)
+        _write_active_snapshot(config, active_snapshot_id)
+        for root in (incoming, config.history_root):
+            _write_snapshot_directory(root, active_snapshot_id, b"active")
+            _write_snapshot_directory(root, old_snapshot_id, b"old")
+
+        active_manifest = config.active_manifest_path
+        active_manifest.unlink()
+        external_manifest = self.root / "active-snapshot.json"
+        external_manifest.write_text(
+            json.dumps({"snapshot_id": active_snapshot_id}), encoding="utf-8"
+        )
+        active_manifest.symlink_to(external_manifest)
+        with self.assertRaisesRegex(
+            installer.SnapshotInstallError, "regular non-symlink"
+        ):
+            installer.prune_snapshots(config, incoming_root=incoming, retain_count=1)
+        self.assertTrue((incoming / old_snapshot_id).is_dir())
+
+        unrelated = self.root / "unrelated-incoming"
+        unrelated.mkdir()
+        with self.assertRaisesRegex(
+            installer.SnapshotInstallError, "managed state-root sibling"
+        ):
+            installer.prune_snapshots(
+                config,
+                incoming_root=unrelated,
+                retain_count=1,
+            )
+        self.assertTrue((incoming / old_snapshot_id).is_dir())
+
+        incoming_alias = self.root / "incoming-alias"
+        incoming_alias.symlink_to(incoming, target_is_directory=True)
+        with self.assertRaisesRegex(
+            installer.SnapshotInstallError, "managed state-root sibling"
+        ):
+            installer.prune_snapshots(
+                config,
+                incoming_root=incoming_alias,
+                retain_count=1,
+            )
+        self.assertTrue((incoming / old_snapshot_id).is_dir())
+
+    def test_prune_accepts_rollback_receipt_and_requires_active_history(self) -> None:
+        config = self.server_config()
+        incoming = self.root / "server/incoming"
+        active_snapshot_id = _snapshot_id(14)
+        old_snapshot_id = _snapshot_id(13)
+        config.runtime_root.mkdir(parents=True, exist_ok=True)
+        config.active_manifest_path.write_text(
+            json.dumps(
+                {
+                    "schema": "dcar-read-replica-rollback-receipt-v1",
+                    "restored_from_snapshot": active_snapshot_id,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        for root in (incoming, config.history_root):
+            _write_snapshot_directory(root, active_snapshot_id, b"active")
+            _write_snapshot_directory(root, old_snapshot_id, b"old")
+
+        receipt = installer.prune_snapshots(
+            config,
+            incoming_root=incoming,
+            retain_count=1,
+        )
+        self.assertEqual(receipt["active_snapshot_id"], active_snapshot_id)
+        self.assertEqual(receipt["snapshot_history"]["kept"], [active_snapshot_id])
+
+        _write_snapshot_directory(config.history_root, old_snapshot_id, b"old")
+        shutil.rmtree(config.history_root / active_snapshot_id)
+        extra_snapshot_id = _snapshot_id(12)
+        _write_snapshot_directory(incoming, old_snapshot_id, b"old")
+        _write_snapshot_directory(incoming, extra_snapshot_id, b"extra")
+        incoming_before = {path.name for path in incoming.iterdir()}
+        with self.assertRaisesRegex(
+            installer.SnapshotInstallError, "retention directory is missing"
+        ):
+            installer.prune_snapshots(
+                config,
+                incoming_root=incoming,
+                retain_count=1,
+            )
+        self.assertTrue((config.history_root / old_snapshot_id).is_dir())
+        self.assertEqual({path.name for path in incoming.iterdir()}, incoming_before)
+
+    def test_prune_cli_defaults_are_bounded(self) -> None:
+        arguments = installer._parser().parse_args(["prune"])
+        self.assertEqual(
+            arguments.incoming_root, Path("/var/lib/dcar-aigc/incoming")
+        )
+        self.assertEqual(arguments.retain_count, 3)
 
     def test_default_smoke_check_matches_current_replica_api_shape(self) -> None:
         manifest = self.build_bundle()
