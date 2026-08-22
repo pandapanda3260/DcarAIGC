@@ -93,6 +93,24 @@ class V8StorageTest(unittest.TestCase):
                 )
                 self.assertTrue(schema_compatibility_state(connection)["compatible"])
 
+    def test_connect_context_closes_owned_connection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "v8.sqlite3"
+            with connect(database) as connection:
+                connection.execute("CREATE TABLE close_probe(id INTEGER PRIMARY KEY)")
+
+            with self.assertRaisesRegex(sqlite3.ProgrammingError, "closed"):
+                connection.execute("SELECT 1")
+
+            read_only = connect(database, read_only=True)
+            with read_only:
+                count = read_only.execute(
+                    "SELECT COUNT(*) FROM close_probe"
+                ).fetchone()[0]
+                self.assertEqual(count, 0)
+            with self.assertRaisesRegex(sqlite3.ProgrammingError, "closed"):
+                read_only.execute("SELECT 1")
+
     def test_connection_safety_fails_closed_when_foreign_keys_cannot_be_enabled(
         self,
     ) -> None:

@@ -10,7 +10,8 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
+from types import TracebackType
+from typing import Iterator, Literal
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -111,6 +112,31 @@ def is_formal_database_path(
     )
 
 
+class _ClosingSQLiteConnection(sqlite3.Connection):
+    """Preserve SQLite transaction semantics and close managed connections.
+
+    ``sqlite3.Connection.__exit__`` commits or rolls back but deliberately
+    leaves the file descriptor open.  The application consistently treats
+    ``with connect(...)`` as an owned connection scope, so leaving those
+    descriptors open eventually exhausts launchd's per-process file limit
+    during provider-heavy capture jobs.
+
+    Callers that do not use the connection as a context manager retain the
+    normal explicit ``close()`` lifecycle.
+    """
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> Literal[False]:
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 def connect(
     path: Path = DEFAULT_DB, *, read_only: bool | None = None
 ) -> sqlite3.Connection:
@@ -128,6 +154,7 @@ def connect(
             f"{path.resolve().as_uri()}?mode=ro&immutable=1",
             uri=True,
             timeout=10,
+            factory=_ClosingSQLiteConnection,
         )
         connection.row_factory = sqlite3.Row
         try:
@@ -139,7 +166,11 @@ def connect(
         connection.execute("PRAGMA busy_timeout = 10000")
         return connection
     path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path, timeout=10)
+    connection = sqlite3.connect(
+        path,
+        timeout=10,
+        factory=_ClosingSQLiteConnection,
+    )
     connection.row_factory = sqlite3.Row
     try:
         configure_connection_safety(connection)
