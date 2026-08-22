@@ -503,10 +503,35 @@ def _proxy_headers(request: Request, base_path: str) -> dict[str, str]:
     return headers
 
 
-def _response_header_pairs(upstream: httpx.Response) -> list[tuple[bytes, bytes]]:
+def _public_location(value: str, upstream_base: str) -> str:
+    location = urlsplit(value)
+    upstream = urlsplit(upstream_base)
+    if (
+        location.scheme.lower() != upstream.scheme.lower()
+        or location.netloc.lower() != upstream.netloc.lower()
+    ):
+        return value
+    target = location.path or "/"
+    if location.query:
+        target = f"{target}?{location.query}"
+    if location.fragment:
+        target = f"{target}#{location.fragment}"
+    return target
+
+
+def _response_header_pairs(
+    upstream: httpx.Response, upstream_base: str
+) -> list[tuple[bytes, bytes]]:
     blocked = HOP_BY_HOP_HEADERS | _connection_tokens(upstream.headers)
     return [
-        (key.encode("latin-1"), value.encode("latin-1"))
+        (
+            key.encode("latin-1"),
+            (
+                _public_location(value, upstream_base)
+                if key.lower() == "location"
+                else value
+            ).encode("latin-1"),
+        )
         for key, value in upstream.headers.multi_items()
         if key.lower() not in blocked
     ]
@@ -624,7 +649,7 @@ def create_app(
             status_code=upstream.status_code,
             background=BackgroundTask(upstream.aclose),
         )
-        response.raw_headers = _response_header_pairs(upstream)
+        response.raw_headers = _response_header_pairs(upstream, upstream_base)
         return response
 
     def unauthenticated(request: Request, stripped: str) -> Response:

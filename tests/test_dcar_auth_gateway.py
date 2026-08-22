@@ -46,6 +46,26 @@ def _echo_upstream(name: str) -> FastAPI:
         methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     )
     async def echo(request: Request, path: str) -> JSONResponse:
+        if request.url.path.endswith("/internal-redirect"):
+            return Response(
+                status_code=307,
+                headers={
+                    "Location": (
+                        f"http://{name}.test/dcar/overview"
+                        "?window=this-week#summary"
+                    )
+                },
+            )
+        if request.url.path.endswith("/external-redirect"):
+            return Response(
+                status_code=307,
+                headers={"Location": "https://docs.example/help"},
+            )
+        if request.url.path.endswith("/relative-redirect"):
+            return Response(
+                status_code=307,
+                headers={"Location": "/dcar/overview"},
+            )
         if request.url.path.endswith("/compressed.txt"):
             return Response(
                 gzip.compress(COMPRESSED_BODY),
@@ -273,6 +293,29 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
                     {"status": "ok"},
                 )
                 self.assertFalse(config.session_db_path.exists())
+
+    def test_proxy_rewrites_only_internal_absolute_redirects(self) -> None:
+        with self._client("/dcar", bypass_auth=True) as (client, _config):
+            internal = client.get(
+                "/dcar/internal-redirect", follow_redirects=False
+            )
+            self.assertEqual(internal.status_code, 307)
+            self.assertEqual(
+                internal.headers["location"],
+                "/dcar/overview?window=this-week#summary",
+            )
+
+            external = client.get(
+                "/dcar/external-redirect", follow_redirects=False
+            )
+            self.assertEqual(
+                external.headers["location"], "https://docs.example/help"
+            )
+
+            relative = client.get(
+                "/dcar/relative-redirect", follow_redirects=False
+            )
+            self.assertEqual(relative.headers["location"], "/dcar/overview")
 
     def test_correct_and_incorrect_login_and_cookie_attributes(self) -> None:
         for base_path in ("", "/dcar"):
