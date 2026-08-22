@@ -2039,7 +2039,9 @@ class PaidSourceRefreshCanaryTest(unittest.TestCase):
         with self.assertRaises(paid.PaidSourceRefreshError):
             run(Response(b"{}", response_url=url + "&redirected=1"))
 
-    def test_db_commit_wal_window_is_recovered_without_second_detail_call(self) -> None:
+    def test_db_commit_before_finalize_is_recovered_without_second_detail_call(
+        self,
+    ) -> None:
         with patch.object(
             paid.local_controller,
             "_finalize_database",
@@ -2047,12 +2049,10 @@ class PaidSourceRefreshCanaryTest(unittest.TestCase):
         ), self.assertRaises(paid.PaidSourceRefreshError):
             self._run()
         self.assertEqual(self.calls["detail"], 1)
-        self.assertTrue(
-            any(
-                path.exists()
-                for path in (Path(f"{self.db}-wal"), Path(f"{self.db}-shm"))
-            )
-        )
+        # Owned SQLite scopes now close deterministically.  SQLite may
+        # checkpoint and remove the WAL sidecars before the simulated
+        # post-commit finalizer failure, but the committed raw response must
+        # remain resumable without another network call in either layout.
 
         def forbidden(*_args, **_kwargs):
             raise AssertionError("WAL recovery attempted network/key access")
@@ -2117,16 +2117,16 @@ class PaidSourceRefreshCanaryTest(unittest.TestCase):
             ),
         )
 
-    def test_real_sigkill_raw_wal_commit_resumes_zero_network_exactly_once(self) -> None:
+    def test_real_sigkill_after_raw_commit_resumes_zero_network_exactly_once(
+        self,
+    ) -> None:
         marker = self._kill_subprocess_at_marker(mode="raw_wal")
         self.assertEqual(marker.read_text(encoding="utf-8"), "raw-committed\n")
         self.assertEqual(self._subprocess_detail_count(mode="raw_wal"), 1)
-        self.assertTrue(
-            any(
-                path.exists()
-                for path in (Path(f"{self.db}-wal"), Path(f"{self.db}-shm"))
-            )
-        )
+        # A deterministic connection close may checkpoint the committed WAL
+        # before the kill marker.  Recovery correctness is the durable commit
+        # plus the zero-network exactly-once assertions below, not the
+        # incidental presence of SQLite sidecar files.
 
         def forbidden(*_args, **_kwargs):
             raise AssertionError("raw-WAL SIGKILL recovery attempted network")
