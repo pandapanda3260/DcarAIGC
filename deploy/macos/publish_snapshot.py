@@ -527,35 +527,35 @@ def check_writer_freshness(
                 )
         capture = connection.execute(
             """
-            SELECT scheduled_for,status,completed_at FROM scheduler_runs
+            SELECT scheduled_for,status,started_at,completed_at FROM scheduler_runs
             WHERE job_id='daily_capture'
             ORDER BY scheduled_for DESC LIMIT 1
             """
         ).fetchone()
         media_download = connection.execute(
             """
-            SELECT scheduled_for,status,completed_at FROM scheduler_runs
+            SELECT scheduled_for,status,started_at,completed_at FROM scheduler_runs
             WHERE job_id='daily_media_download'
             ORDER BY scheduled_for DESC LIMIT 1
             """
         ).fetchone()
         media_processing = connection.execute(
             """
-            SELECT scheduled_for,status,completed_at FROM scheduler_runs
+            SELECT scheduled_for,status,started_at,completed_at FROM scheduler_runs
             WHERE job_id='daily_media_processing'
             ORDER BY scheduled_for DESC LIMIT 1
             """
         ).fetchone()
         media_cutoff = connection.execute(
             """
-            SELECT scheduled_for,status,completed_at FROM scheduler_runs
+            SELECT scheduled_for,status,started_at,completed_at FROM scheduler_runs
             WHERE job_id='daily_media_cutoff'
             ORDER BY scheduled_for DESC LIMIT 1
             """
         ).fetchone()
         daily_report = connection.execute(
             """
-            SELECT scheduled_for,status,completed_at FROM scheduler_runs
+            SELECT scheduled_for,status,started_at,completed_at FROM scheduler_runs
             WHERE job_id='daily_report'
             ORDER BY scheduled_for DESC LIMIT 1
             """
@@ -563,7 +563,7 @@ def check_writer_freshness(
         weekly_report = (
             connection.execute(
                 """
-                SELECT scheduled_for,status,completed_at FROM scheduler_runs
+                SELECT scheduled_for,status,started_at,completed_at FROM scheduler_runs
                 WHERE job_id='weekly_report'
                 ORDER BY scheduled_for DESC LIMIT 1
                 """
@@ -651,6 +651,31 @@ def check_writer_freshness(
             allowed_statuses=TERMINAL_REPORT_STATUSES,
             current=current,
         )
+    completion_chain = [
+        ("daily_capture", capture, capture_completed),
+        ("daily_media_download", media_download, media_download_completed),
+        ("daily_media_processing", media_processing, media_processing_completed),
+        ("daily_media_cutoff", media_cutoff, cutoff_completed),
+        ("daily_report", daily_report, daily_report_completed),
+    ]
+    if weekly_report_completed is not None:
+        completion_chain.append(("weekly_report", weekly_report, weekly_report_completed))
+    for (upstream_job, _, upstream_completed), (
+        downstream_job,
+        downstream_row,
+        downstream_completed,
+    ) in zip(completion_chain, completion_chain[1:]):
+        assert downstream_row is not None
+        downstream_started = _parse_iso(
+            downstream_row["started_at"], label=f"{downstream_job} started_at"
+        )
+        if (
+            downstream_started < upstream_completed
+            or downstream_completed < upstream_completed
+        ):
+            raise SnapshotPublishError(
+                f"{downstream_job} started before its dependency {upstream_job} completed"
+            )
     content_count = int(content["content_count"])
     if content_count <= 0:
         raise SnapshotPublishError("writer database contains no content")

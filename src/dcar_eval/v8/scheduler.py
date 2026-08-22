@@ -36,6 +36,8 @@ from .reports import (
     ReportTaskError,
     assert_report_runtime_ready,
     create_and_run_task,
+    create_task,
+    retry_task,
 )
 from .storage import (
     BACKFILL_SOURCE_GROUPS,
@@ -100,6 +102,63 @@ class RunClaim:
     scheduler_run_id: int
     attempt_id: int
     attempt_number: int
+    retrying_terminal: bool = False
+    retry_terminal_if_completed_before: Optional[datetime] = None
+    terminal_retry_started_at: Optional[datetime] = None
+
+
+@dataclass(frozen=True)
+class CurrentDayRunState:
+    status: str
+    started_at: Optional[datetime]
+    completed_at: Optional[datetime]
+
+
+_STALE_DEPENDENCY_RETRY_REASON = "stale_dependency_completion"
+
+
+def _stale_retry_details(
+    completed_before: datetime, *, retry_started_at: datetime
+) -> Dict[str, str]:
+    return {
+        "retry_reason": _STALE_DEPENDENCY_RETRY_REASON,
+        "dependency_completed_at": _scheduled_iso(completed_before),
+        "retry_started_at": _scheduled_iso(retry_started_at),
+    }
+
+
+def _stale_retry_completed_before(value: Any) -> Optional[datetime]:
+    if not isinstance(value, Mapping):
+        return None
+    if value.get("retry_reason") != _STALE_DEPENDENCY_RETRY_REASON:
+        return None
+    completed_value = value.get("dependency_completed_at")
+    if not isinstance(completed_value, str) or not completed_value:
+        raise SchedulerJobError("stale dependency retry marker is incomplete")
+    try:
+        completed_at = datetime.fromisoformat(completed_value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise SchedulerJobError("stale dependency retry marker is invalid") from exc
+    if completed_at.tzinfo is None:
+        raise SchedulerJobError("stale dependency retry marker lacks timezone")
+    return completed_at.astimezone(timezone.utc)
+
+
+def _stale_retry_started_at(value: Any) -> Optional[datetime]:
+    if not isinstance(value, Mapping):
+        return None
+    if value.get("retry_reason") != _STALE_DEPENDENCY_RETRY_REASON:
+        return None
+    started_value = value.get("retry_started_at")
+    if not isinstance(started_value, str) or not started_value:
+        raise SchedulerJobError("stale dependency retry start marker is incomplete")
+    try:
+        started_at = datetime.fromisoformat(started_value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise SchedulerJobError("stale dependency retry start marker is invalid") from exc
+    if started_at.tzinfo is None:
+        raise SchedulerJobError("stale dependency retry start marker lacks timezone")
+    return started_at.astimezone(timezone.utc)
 
 
 def _require_report_job_runtime_ready(*, db_path: Path) -> Dict[str, Any]:
@@ -185,18 +244,40 @@ def current_day_daily_capture_guard(
     )
 
 
-def _current_day_run_status(
+def _current_day_run_state(
     job_id: str, occurrence: datetime, *, db_path: Path
-) -> Optional[str]:
+) -> Optional[CurrentDayRunState]:
     with connect(db_path) as connection:
         row = connection.execute(
             """
-            SELECT status FROM scheduler_runs
+            SELECT status,started_at,completed_at FROM scheduler_runs
             WHERE job_id=? AND scheduled_for=?
             """,
             (job_id, _scheduled_iso(occurrence)),
         ).fetchone()
-    return None if row is None else str(row["status"])
+    if row is None:
+        return None
+    timestamps: Dict[str, Optional[datetime]] = {}
+    for field in ("started_at", "completed_at"):
+        timestamps[field] = None
+        if row[field] is None:
+            continue
+        try:
+            parsed = datetime.fromisoformat(
+                str(row[field]).replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise SchedulerJobError(
+                f"invalid {job_id} {field}: {row[field]}"
+            ) from exc
+        if parsed.tzinfo is None:
+            raise SchedulerJobError(f"{job_id} {field} must include timezone")
+        timestamps[field] = parsed.astimezone(timezone.utc)
+    return CurrentDayRunState(
+        status=str(row["status"]),
+        started_at=timestamps["started_at"],
+        completed_at=timestamps["completed_at"],
+    )
 
 
 def current_day_pipeline_guard(
@@ -229,9 +310,10 @@ def current_day_pipeline_guard(
         return {"status": "before_today_slot", "results": []}
 
     results: List[Dict[str, Any]] = []
-    capture_status = _current_day_run_status(
+    capture_state = _current_day_run_state(
         "daily_capture", capture_occurrence, db_path=db_path
     )
+    capture_status = None if capture_state is None else capture_state.status
     try:
         if capture_status == "interrupted":
             capture_result = execute_job(
@@ -260,18 +342,26 @@ def current_day_pipeline_guard(
             "results": results,
         }
 
-    capture_status = _current_day_run_status(
+    capture_state = _current_day_run_state(
         "daily_capture", capture_occurrence, db_path=db_path
     )
+    capture_status = None if capture_state is None else capture_state.status
     if capture_status in {None, "running"}:
         return {
             "status": "waiting",
             "blocked_on": "daily_capture",
             "results": results,
         }
+    if capture_state is None or capture_state.completed_at is None:
+        return {
+            "status": "blocked",
+            "blocked_on": "daily_capture",
+            "error": "daily_capture terminal run is missing completed_at",
+            "results": results,
+        }
 
     previous_job_id = "daily_capture"
-    previous_status = capture_status
+    previous_state = capture_state
     for definition in JOBS[1:]:
         if definition.day_of_week == "mon" and local_now.weekday() != 0:
             continue
@@ -280,16 +370,36 @@ def current_day_pipeline_guard(
         )
         if local_now < occurrence:
             break
-        if previous_status not in TERMINAL_RUN_STATUSES | RETRYABLE_RUN_STATUSES:
+        if previous_state.status not in (
+            TERMINAL_RUN_STATUSES | RETRYABLE_RUN_STATUSES
+        ):
             return {
                 "status": "waiting",
                 "blocked_on": previous_job_id,
                 "results": results,
             }
-        existing_status = _current_day_run_status(
+        if previous_state.completed_at is None:
+            return {
+                "status": "blocked",
+                "blocked_on": previous_job_id,
+                "error": f"{previous_job_id} terminal run is missing completed_at",
+                "results": results,
+            }
+        existing_state = _current_day_run_state(
             definition.job_id, occurrence, db_path=db_path
         )
-        if existing_status in TERMINAL_RUN_STATUSES:
+        existing_status = None if existing_state is None else existing_state.status
+        terminal_is_stale = (
+            existing_state is not None
+            and existing_state.status in TERMINAL_RUN_STATUSES
+            and existing_state.completed_at is not None
+            and (
+                existing_state.started_at is None
+                or existing_state.started_at < previous_state.completed_at
+                or existing_state.completed_at < previous_state.completed_at
+            )
+        )
+        if existing_status in TERMINAL_RUN_STATUSES and not terminal_is_stale:
             result = {
                 "job_id": definition.job_id,
                 "status": "already_attempted",
@@ -318,8 +428,14 @@ def current_day_pipeline_guard(
                     allow_retry=(
                         definition.job_id in REPORT_JOB_IDS
                         or existing_status in RETRYABLE_RUN_STATUSES
+                        or terminal_is_stale
                     ),
                     invocation_source=invocation_source,
+                    retry_terminal_if_completed_before=(
+                        previous_state.completed_at
+                        if terminal_is_stale or existing_status == "interrupted"
+                        else None
+                    ),
                 )
             except Exception as exc:
                 return {
@@ -330,15 +446,16 @@ def current_day_pipeline_guard(
                 }
         results.append(result)
         previous_job_id = definition.job_id
-        previous_status = _current_day_run_status(
+        refreshed_state = _current_day_run_state(
             definition.job_id, occurrence, db_path=db_path
         )
-        if previous_status not in TERMINAL_RUN_STATUSES:
+        if refreshed_state is None or refreshed_state.status not in TERMINAL_RUN_STATUSES:
             return {
                 "status": "waiting",
                 "blocked_on": definition.job_id,
                 "results": results,
             }
+        previous_state = refreshed_state
 
     return {"status": "reconciled", "results": results}
 
@@ -350,9 +467,13 @@ def _claim_run(
     db_path: Path,
     allow_retry: bool,
     invocation_source: str,
+    retry_terminal_if_completed_before: Optional[datetime] = None,
 ) -> Optional[RunClaim]:
     key = _scheduled_iso(scheduled_for)
     started_at = now_utc()
+    claim_started_at = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+    retrying_terminal = False
+    terminal_retry_started_at: Optional[datetime] = None
     if invocation_source not in INVOCATION_SOURCES:
         raise SchedulerJobError(
             f"unsupported scheduler invocation source: {invocation_source}"
@@ -360,7 +481,7 @@ def _claim_run(
     with connect(db_path) as connection, transaction(connection):
         existing = connection.execute(
             """
-            SELECT id,status FROM scheduler_runs
+            SELECT id,status,started_at,completed_at,details_json FROM scheduler_runs
             WHERE job_id=? AND scheduled_for=?
             """,
             (job_id, key),
@@ -381,12 +502,85 @@ def _claim_run(
         else:
             scheduler_run_id = int(existing["id"])
             current_status = str(existing["status"])
-            if current_status == "running" or current_status in TERMINAL_RUN_STATUSES:
+            if current_status == "running":
                 return None
-            if current_status not in RETRYABLE_RUN_STATUSES:
+            try:
+                existing_details = json.loads(str(existing["details_json"] or "{}"))
+            except json.JSONDecodeError as exc:
                 raise SchedulerJobError(
-                    f"unsupported scheduler run status: {current_status}"
+                    f"invalid scheduler retry details for {job_id}"
+                ) from exc
+            persisted_retry_before = _stale_retry_completed_before(existing_details)
+            persisted_retry_started_at = _stale_retry_started_at(existing_details)
+            if retry_terminal_if_completed_before is None:
+                retry_terminal_if_completed_before = persisted_retry_before
+            terminal_retry_started_at = (
+                persisted_retry_started_at or claim_started_at
+            )
+            retrying_terminal = current_status in TERMINAL_RUN_STATUSES
+            if retrying_terminal:
+                if retry_terminal_if_completed_before is None:
+                    return None
+                if job_id == "daily_capture":
+                    raise SchedulerJobError(
+                        "terminal daily_capture runs cannot be retried automatically"
+                    )
+                if not allow_retry:
+                    raise SchedulerJobError(
+                        "terminal downstream retry requires allow_retry=True"
+                    )
+                completed_value = existing["completed_at"]
+                if completed_value is None:
+                    raise SchedulerJobError(
+                        f"terminal {job_id} run is missing completed_at"
+                    )
+                try:
+                    completed_at = datetime.fromisoformat(
+                        str(completed_value).replace("Z", "+00:00")
+                    )
+                except ValueError as exc:
+                    raise SchedulerJobError(
+                        f"invalid terminal {job_id} completed_at: {completed_value}"
+                    ) from exc
+                if completed_at.tzinfo is None:
+                    raise SchedulerJobError(
+                        f"terminal {job_id} completed_at must include timezone"
+                    )
+                started_value = existing["started_at"]
+                started_at_value: Optional[datetime] = None
+                if started_value is not None:
+                    try:
+                        started_at_value = datetime.fromisoformat(
+                            str(started_value).replace("Z", "+00:00")
+                        )
+                    except ValueError as exc:
+                        raise SchedulerJobError(
+                            f"invalid terminal {job_id} started_at: {started_value}"
+                        ) from exc
+                    if started_at_value.tzinfo is None:
+                        raise SchedulerJobError(
+                            f"terminal {job_id} started_at must include timezone"
+                        )
+                dependency_completed = retry_terminal_if_completed_before.astimezone(
+                    timezone.utc
                 )
+                if (
+                    started_at_value is not None
+                    and started_at_value.astimezone(timezone.utc)
+                    >= dependency_completed
+                    and completed_at.astimezone(timezone.utc) >= dependency_completed
+                ):
+                    return None
+            elif (
+                current_status in RETRYABLE_RUN_STATUSES
+                and persisted_retry_before is not None
+            ):
+                retrying_terminal = True
+            if current_status not in RETRYABLE_RUN_STATUSES:
+                if not retrying_terminal:
+                    raise SchedulerJobError(
+                        f"unsupported scheduler run status: {current_status}"
+                    )
             if not allow_retry:
                 return None
             if (
@@ -404,14 +598,41 @@ def _claim_run(
                     (scheduler_run_id,),
                 ).fetchone()[0]
             )
-            updated = connection.execute(
-                """
-                UPDATE scheduler_runs
-                SET status='running',started_at=?,completed_at=NULL,details_json='{}'
-                WHERE id=? AND status IN ('failed','interrupted')
-                """,
-                (started_at, scheduler_run_id),
-            )
+            if retrying_terminal:
+                assert retry_terminal_if_completed_before is not None
+                assert terminal_retry_started_at is not None
+                retry_details_json = json.dumps(
+                    _stale_retry_details(
+                        retry_terminal_if_completed_before,
+                        retry_started_at=terminal_retry_started_at,
+                    ),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                updated = connection.execute(
+                    """
+                    UPDATE scheduler_runs
+                    SET status='running',started_at=?,completed_at=NULL,details_json=?
+                    WHERE id=? AND status=? AND completed_at=?
+                    """,
+                    (
+                        started_at,
+                        retry_details_json,
+                        scheduler_run_id,
+                        current_status,
+                        str(existing["completed_at"]),
+                    ),
+                )
+            else:
+                retry_details_json = "{}"
+                updated = connection.execute(
+                    """
+                    UPDATE scheduler_runs
+                    SET status='running',started_at=?,completed_at=NULL,details_json='{}'
+                    WHERE id=? AND status IN ('failed','interrupted')
+                    """,
+                    (started_at, scheduler_run_id),
+                )
             if updated.rowcount != 1:
                 return None
         attempt = connection.execute(
@@ -419,9 +640,15 @@ def _claim_run(
             INSERT INTO scheduler_run_attempts(
                 scheduler_run_id,attempt_number,invocation_source,status,
                 started_at,details_json
-            ) VALUES (?, ?, ?, 'running', ?, '{}')
+            ) VALUES (?, ?, ?, 'running', ?, ?)
             """,
-            (scheduler_run_id, attempt_number, invocation_source, started_at),
+            (
+                scheduler_run_id,
+                attempt_number,
+                invocation_source,
+                started_at,
+                retry_details_json if existing is not None else "{}",
+            ),
         )
         if attempt.lastrowid is None:
             raise SchedulerJobError("scheduler attempt insert returned no id")
@@ -429,6 +656,17 @@ def _claim_run(
             scheduler_run_id=scheduler_run_id,
             attempt_id=int(attempt.lastrowid),
             attempt_number=attempt_number,
+            retrying_terminal=(existing is not None and retrying_terminal),
+            retry_terminal_if_completed_before=(
+                retry_terminal_if_completed_before
+                if existing is not None and retrying_terminal
+                else None
+            ),
+            terminal_retry_started_at=(
+                terminal_retry_started_at
+                if existing is not None and retrying_terminal
+                else None
+            ),
         )
 
 
@@ -484,15 +722,10 @@ def recover_interrupted_scheduler_runs(*, db_path: Path = DEFAULT_DB) -> int:
     """Fence attempts left running by a previous single-writer process."""
 
     completed_at = now_utc()
-    details_json = json.dumps(
-        {"reason": "writer_process_restarted"},
-        ensure_ascii=False,
-        sort_keys=True,
-    )
     with connect(db_path) as connection, transaction(connection):
         attempts = connection.execute(
             """
-            SELECT id,scheduler_run_id FROM scheduler_run_attempts
+            SELECT id,scheduler_run_id,details_json FROM scheduler_run_attempts
             WHERE status='running' ORDER BY id
             """
         ).fetchall()
@@ -510,6 +743,22 @@ def recover_interrupted_scheduler_runs(*, db_path: Path = DEFAULT_DB) -> int:
                 "running scheduler occurrences and attempts are inconsistent"
             )
         for attempt in attempts:
+            try:
+                interrupted_details = json.loads(str(attempt["details_json"] or "{}"))
+            except json.JSONDecodeError as exc:
+                raise SchedulerJobError(
+                    "running scheduler attempt has invalid details"
+                ) from exc
+            if not isinstance(interrupted_details, dict):
+                raise SchedulerJobError(
+                    "running scheduler attempt details must be an object"
+                )
+            interrupted_details["reason"] = "writer_process_restarted"
+            details_json = json.dumps(
+                interrupted_details,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
             updated_attempt = connection.execute(
                 """
                 UPDATE scheduler_run_attempts
@@ -1518,6 +1767,32 @@ def run_media_cutoff(
     }
 
 
+def _retry_terminal_report_task_if_stale(
+    task: Mapping[str, Any],
+    *,
+    retry_started_at: Optional[datetime],
+    db_path: Path,
+) -> None:
+    if retry_started_at is None or str(task["task_status"]) not in {
+        "succeeded",
+        "partial",
+    }:
+        return
+    completed_value = task.get("completed_at")
+    if not isinstance(completed_value, str) or not completed_value:
+        raise SchedulerJobError("terminal report task is missing completed_at")
+    try:
+        completed_at = datetime.fromisoformat(completed_value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise SchedulerJobError(
+            f"invalid terminal report task completed_at: {completed_value}"
+        ) from exc
+    if completed_at.tzinfo is None:
+        raise SchedulerJobError("terminal report task completed_at must include timezone")
+    if completed_at.astimezone(timezone.utc) < retry_started_at.astimezone(timezone.utc):
+        retry_task(str(task["id"]), db_path=db_path)
+
+
 def _run_job_action(
     job_id: str,
     scheduled_for: datetime,
@@ -1527,6 +1802,8 @@ def _run_job_action(
     capture_call_override: Optional[
         Callable[[str, Mapping[str, Any]], ProviderResult]
     ] = None,
+    retry_terminal_if_completed_before: Optional[datetime] = None,
+    terminal_retry_started_at: Optional[datetime] = None,
 ) -> tuple[str, Dict[str, Any]]:
     if job_id in REPORT_JOB_IDS:
         _require_report_job_runtime_ready(db_path=db_path)
@@ -1566,6 +1843,19 @@ def _run_job_action(
         return "succeeded", run_media_cutoff(scheduled_for, db_path=db_path)
     if job_id == "daily_report":
         target = local_date - timedelta(days=1)
+        if retry_terminal_if_completed_before is not None:
+            existing_task = create_task(
+                task_type="daily",
+                period_start=target.isoformat(),
+                period_end=target.isoformat(),
+                creation_source="automatic",
+                db_path=db_path,
+            )
+            _retry_terminal_report_task_if_stale(
+                existing_task,
+                retry_started_at=terminal_retry_started_at,
+                db_path=db_path,
+            )
         task = create_and_run_task(
             task_type="daily",
             period_start=target.isoformat(),
@@ -1583,6 +1873,19 @@ def _run_job_action(
     if job_id == "weekly_report":
         end = local_date - timedelta(days=1)
         start = end - timedelta(days=6)
+        if retry_terminal_if_completed_before is not None:
+            existing_task = create_task(
+                task_type="weekly",
+                period_start=start.isoformat(),
+                period_end=end.isoformat(),
+                creation_source="automatic",
+                db_path=db_path,
+            )
+            _retry_terminal_report_task_if_stale(
+                existing_task,
+                retry_started_at=terminal_retry_started_at,
+                db_path=db_path,
+            )
         task = create_and_run_task(
             task_type="weekly",
             period_start=start.isoformat(),
@@ -1611,6 +1914,7 @@ def execute_job(
     ] = None,
     allow_retry: bool = False,
     invocation_source: str = "scheduled",
+    retry_terminal_if_completed_before: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     if job_id not in {job.job_id for job in JOBS}:
         raise SchedulerJobError(f"unknown scheduler job: {job_id}")
@@ -1635,6 +1939,15 @@ def execute_job(
         )
     if invocation_source == "operator_retry" and not allow_retry:
         raise SchedulerJobError("operator_retry requires allow_retry=True")
+    if retry_terminal_if_completed_before is not None:
+        if job_id == "daily_capture":
+            raise SchedulerJobError(
+                "terminal daily_capture runs cannot be retried automatically"
+            )
+        if not allow_retry:
+            raise SchedulerJobError(
+                "terminal downstream retry requires allow_retry=True"
+            )
     if job_id in REPORT_JOB_IDS:
         try:
             _require_report_job_runtime_ready(db_path=db_path)
@@ -1651,6 +1964,7 @@ def execute_job(
         db_path=db_path,
         allow_retry=allow_retry,
         invocation_source=invocation_source,
+        retry_terminal_if_completed_before=retry_terminal_if_completed_before,
     )
     if claim is None:
         return {"job_id": job_id, "status": "skipped_duplicate"}
@@ -1661,12 +1975,35 @@ def execute_job(
             db_path=db_path,
             reports_root=reports_root,
             capture_call_override=capture_call_override,
+            retry_terminal_if_completed_before=(
+                claim.retry_terminal_if_completed_before
+                if claim.retrying_terminal
+                else None
+            ),
+            terminal_retry_started_at=(
+                claim.terminal_retry_started_at if claim.retrying_terminal else None
+            ),
         )
     except Exception as exc:
+        failure_details: Dict[str, Any] = {"error": str(exc)}
+        if claim.retrying_terminal:
+            if (
+                claim.retry_terminal_if_completed_before is None
+                or claim.terminal_retry_started_at is None
+            ):
+                raise SchedulerJobError(
+                    "stale terminal retry claim lost its retry marker"
+                ) from exc
+            failure_details.update(
+                _stale_retry_details(
+                    claim.retry_terminal_if_completed_before,
+                    retry_started_at=claim.terminal_retry_started_at,
+                )
+            )
         _finish_run(
             claim,
             status="failed",
-            details={"error": str(exc)},
+            details=failure_details,
             db_path=db_path,
         )
         raise

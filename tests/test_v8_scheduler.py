@@ -502,6 +502,310 @@ class V8SchedulerTest(unittest.TestCase):
             ],
         )
 
+    def test_hourly_pipeline_reruns_only_stale_today_downstream_chain(self) -> None:
+        current = datetime(2026, 8, 22, 9, 0, tzinfo=SHANGHAI)
+        rows = (
+            (
+                "daily_capture",
+                "2026-08-21T18:00:00Z",
+                "partial",
+                "2026-08-21T20:27:00Z",
+            ),
+            (
+                "daily_media_download",
+                "2026-08-21T18:20:00Z",
+                "succeeded",
+                "2026-08-21T21:00:00Z",
+            ),
+            (
+                "daily_media_processing",
+                "2026-08-21T19:00:00Z",
+                "succeeded",
+                "2026-08-21T23:50:00Z",
+            ),
+            (
+                "daily_media_cutoff",
+                "2026-08-21T23:30:00Z",
+                "succeeded",
+                "2026-08-21T23:55:00Z",
+            ),
+            (
+                "daily_report",
+                "2026-08-22T00:00:00Z",
+                "partial",
+                "2026-08-22T00:05:00Z",
+            ),
+        )
+        with connect(self.db) as connection:
+            for job_id, scheduled_for, status, completed_at in rows:
+                run = connection.execute(
+                    """
+                    INSERT INTO scheduler_runs(
+                        job_id,scheduled_for,status,started_at,completed_at,details_json
+                    ) VALUES (?,?,?,?,?,'{}')
+                    """,
+                    (job_id, scheduled_for, status, scheduled_for, completed_at),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO scheduler_run_attempts(
+                        scheduler_run_id,attempt_number,invocation_source,status,
+                        started_at,completed_at,details_json
+                    ) VALUES (?,1,'scheduled',?,?,?,'{}')
+                    """,
+                    (
+                        int(run.lastrowid),
+                        status,
+                        scheduled_for,
+                        completed_at,
+                    ),
+                )
+            historical = connection.execute(
+                """
+                INSERT INTO scheduler_runs(
+                    job_id,scheduled_for,status,started_at,completed_at,details_json
+                ) VALUES ('daily_media_cutoff','2026-08-20T23:30:00Z','succeeded',
+                          '2026-08-20T23:30:00Z','2026-08-20T23:45:00Z','{}')
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO scheduler_run_attempts(
+                    scheduler_run_id,attempt_number,invocation_source,status,
+                    started_at,completed_at,details_json
+                ) VALUES (?,1,'scheduled','succeeded','2026-08-20T23:30:00Z',
+                          '2026-08-20T23:45:00Z','{}')
+                """,
+                (int(historical.lastrowid),),
+            )
+            connection.commit()
+
+        report_task = {
+            "id": "D8-D-20260821-20260821",
+            "task_status": "partial",
+            "completed_at": "2026-08-22T00:05:00Z",
+        }
+        with (
+            patch("v8.scheduler.run_media_cutoff", return_value={}),
+            patch(
+                "v8.scheduler._require_report_job_runtime_ready", return_value={}
+            ),
+            patch("v8.scheduler.create_task", return_value=report_task) as create,
+            patch("v8.scheduler.retry_task", return_value={}) as retry,
+            patch(
+                "v8.scheduler.create_and_run_task", return_value=report_task
+            ) as create_and_run,
+        ):
+            result = current_day_pipeline_guard(
+                now=current,
+                effective_from=current.date(),
+                db_path=self.db,
+                reports_root=self.reports,
+                capture_call_override=None,
+            )
+
+        self.assertEqual(result["status"], "reconciled")
+        create.assert_called_once()
+        retry.assert_called_once_with(report_task["id"], db_path=self.db)
+        create_and_run.assert_called_once()
+        with connect(self.db) as connection:
+            attempts = {
+                str(row["job_id"]): int(row["attempts"])
+                for row in connection.execute(
+                    """
+                    SELECT r.job_id,COUNT(*) attempts
+                    FROM scheduler_runs r
+                    JOIN scheduler_run_attempts a ON a.scheduler_run_id=r.id
+                    WHERE r.scheduled_for>='2026-08-21T18:00:00Z'
+                    GROUP BY r.job_id
+                    """
+                )
+            }
+            historical_attempts = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM scheduler_run_attempts a
+                    JOIN scheduler_runs r ON r.id=a.scheduler_run_id
+                    WHERE r.job_id='daily_media_cutoff'
+                      AND r.scheduled_for='2026-08-20T23:30:00Z'
+                    """
+                ).fetchone()[0]
+            )
+        self.assertEqual(
+            attempts,
+            {
+                "daily_capture": 1,
+                "daily_media_download": 2,
+                "daily_media_processing": 2,
+                "daily_media_cutoff": 2,
+                "daily_report": 2,
+            },
+        )
+        self.assertEqual(historical_attempts, 1)
+
+    def test_interrupted_stale_report_retry_preserves_revision_intent(self) -> None:
+        occurrence = datetime(2026, 8, 22, 8, 0, tzinfo=SHANGHAI)
+        scheduled_for = "2026-08-22T00:00:00Z"
+        dependency_completed = datetime.fromisoformat("2026-08-22T00:10:00+00:00")
+        with connect(self.db) as connection:
+            run = connection.execute(
+                """
+                INSERT INTO scheduler_runs(
+                    job_id,scheduled_for,status,started_at,completed_at,details_json
+                ) VALUES ('daily_report',?,'partial',?,?, '{}')
+                """,
+                (
+                    scheduled_for,
+                    scheduled_for,
+                    "2026-08-22T00:05:00Z",
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO scheduler_run_attempts(
+                    scheduler_run_id,attempt_number,invocation_source,status,
+                    started_at,completed_at,details_json
+                ) VALUES (?,1,'startup_report_catchup','partial',?,?, '{}')
+                """,
+                (
+                    int(run.lastrowid),
+                    scheduled_for,
+                    "2026-08-22T00:05:00Z",
+                ),
+            )
+            connection.commit()
+
+        claim = _claim_run(
+            "daily_report",
+            occurrence,
+            db_path=self.db,
+            allow_retry=True,
+            invocation_source="startup_report_catchup",
+            retry_terminal_if_completed_before=dependency_completed,
+        )
+        self.assertIsNotNone(claim)
+        self.assertEqual(recover_interrupted_scheduler_runs(db_path=self.db), 1)
+
+        report_task = {
+            "id": "D8-D-20260821-20260821",
+            "task_status": "partial",
+            "completed_at": "2026-08-22T00:05:00Z",
+        }
+        with (
+            patch(
+                "v8.scheduler._require_report_job_runtime_ready", return_value={}
+            ),
+            patch("v8.scheduler.create_task", return_value=report_task),
+            patch("v8.scheduler.retry_task", return_value={}) as retry,
+            patch(
+                "v8.scheduler.create_and_run_task", return_value=report_task
+            ),
+        ):
+            result = execute_job(
+                "daily_report",
+                occurrence,
+                db_path=self.db,
+                reports_root=self.reports,
+                allow_retry=True,
+                invocation_source="startup_report_catchup",
+            )
+
+        self.assertEqual((result["status"], result["attempt_number"]), ("partial", 3))
+        retry.assert_called_once_with(report_task["id"], db_path=self.db)
+        with connect(self.db) as connection:
+            attempts = connection.execute(
+                """
+                SELECT attempt_number,status FROM scheduler_run_attempts
+                ORDER BY attempt_number
+                """
+            ).fetchall()
+        self.assertEqual(
+            [tuple(row) for row in attempts],
+            [(1, "partial"), (2, "interrupted"), (3, "partial")],
+        )
+
+    def test_failed_stale_report_retry_preserves_revision_intent(self) -> None:
+        occurrence = datetime(2026, 8, 22, 8, 0, tzinfo=SHANGHAI)
+        dependency_completed = datetime.fromisoformat("2026-08-22T00:10:00+00:00")
+        with connect(self.db) as connection:
+            run = connection.execute(
+                """
+                INSERT INTO scheduler_runs(
+                    job_id,scheduled_for,status,started_at,completed_at,details_json
+                ) VALUES ('daily_report','2026-08-22T00:00:00Z','partial',
+                          '2026-08-22T00:00:00Z','2026-08-22T00:05:00Z','{}')
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO scheduler_run_attempts(
+                    scheduler_run_id,attempt_number,invocation_source,status,
+                    started_at,completed_at,details_json
+                ) VALUES (?,1,'startup_report_catchup','partial',
+                          '2026-08-22T00:00:00Z','2026-08-22T00:05:00Z','{}')
+                """,
+                (int(run.lastrowid),),
+            )
+            connection.commit()
+
+        with (
+            patch(
+                "v8.scheduler._require_report_job_runtime_ready", return_value={}
+            ),
+            patch(
+                "v8.scheduler._run_job_action",
+                side_effect=RuntimeError("report action failed before retry_task"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "before retry_task"):
+                execute_job(
+                    "daily_report",
+                    occurrence,
+                    db_path=self.db,
+                    reports_root=self.reports,
+                    allow_retry=True,
+                    invocation_source="startup_report_catchup",
+                    retry_terminal_if_completed_before=dependency_completed,
+                )
+
+        report_task = {
+            "id": "D8-D-20260821-20260821",
+            "task_status": "partial",
+            "completed_at": "2026-08-22T00:05:00Z",
+        }
+        with (
+            patch(
+                "v8.scheduler._require_report_job_runtime_ready", return_value={}
+            ),
+            patch("v8.scheduler.create_task", return_value=report_task),
+            patch("v8.scheduler.retry_task", return_value={}) as retry,
+            patch(
+                "v8.scheduler.create_and_run_task", return_value=report_task
+            ),
+        ):
+            result = execute_job(
+                "daily_report",
+                occurrence,
+                db_path=self.db,
+                reports_root=self.reports,
+                allow_retry=True,
+                invocation_source="startup_report_catchup",
+            )
+
+        self.assertEqual((result["status"], result["attempt_number"]), ("partial", 3))
+        retry.assert_called_once_with(report_task["id"], db_path=self.db)
+        with connect(self.db) as connection:
+            attempts = connection.execute(
+                """
+                SELECT attempt_number,status FROM scheduler_run_attempts
+                ORDER BY attempt_number
+                """
+            ).fetchall()
+        self.assertEqual(
+            [tuple(row) for row in attempts],
+            [(1, "partial"), (2, "failed"), (3, "partial")],
+        )
+
     def test_hourly_pipeline_retries_interrupted_capture_with_same_day_slot(self) -> None:
         occurrence = datetime(2026, 8, 22, 2, 0, tzinfo=SHANGHAI)
         with connect(self.db) as connection:

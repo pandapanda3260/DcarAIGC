@@ -73,6 +73,7 @@ def _writer_database(
                 job_id TEXT,
                 scheduled_for TEXT,
                 status TEXT,
+                started_at TEXT,
                 completed_at TEXT
             );
             CREATE TABLE scheduler_run_attempts(
@@ -94,14 +95,17 @@ def _writer_database(
             );
             INSERT INTO scheduler_runs VALUES(
                 1,'daily_capture','2026-08-10T18:00:00Z','partial',
+                '2026-08-10T18:00:00Z',
                 '2026-08-10T18:30:00Z'
             );
             INSERT INTO scheduler_runs VALUES(
                 2,'daily_report','2026-08-11T00:00:00Z','partial',
+                '2026-08-11T00:00:00Z',
                 '2026-08-11T00:01:00Z'
             );
             INSERT INTO scheduler_runs VALUES(
                 3,'weekly_report','2026-08-10T00:30:00Z','succeeded',
+                '2026-08-10T00:30:00Z',
                 '2026-08-10T00:31:00Z'
             );
             INSERT INTO scheduler_run_attempts VALUES(
@@ -142,32 +146,35 @@ def _writer_database(
             (weekly_report_status,),
         )
         connection.execute(
-            "INSERT INTO scheduler_runs VALUES(?,?,?,?,?)",
+            "INSERT INTO scheduler_runs VALUES(?,?,?,?,?,?)",
             (
                 4,
                 "daily_media_cutoff",
                 "2026-08-10T23:30:00Z",
                 cutoff_status,
+                "2026-08-10T23:30:00Z",
                 "2026-08-10T23:45:00Z",
             ),
         )
         connection.execute(
-            "INSERT INTO scheduler_runs VALUES(?,?,?,?,?)",
+            "INSERT INTO scheduler_runs VALUES(?,?,?,?,?,?)",
             (
                 5,
                 "daily_media_download",
                 "2026-08-10T18:20:00Z",
                 download_status,
-                "2026-08-10T18:25:00Z",
+                "2026-08-10T18:31:00Z",
+                "2026-08-10T18:35:00Z",
             ),
         )
         connection.execute(
-            "INSERT INTO scheduler_runs VALUES(?,?,?,?,?)",
+            "INSERT INTO scheduler_runs VALUES(?,?,?,?,?,?)",
             (
                 6,
                 "daily_media_processing",
                 "2026-08-10T19:00:00Z",
                 processing_status,
+                "2026-08-10T19:00:00Z",
                 "2026-08-10T19:05:00Z",
             ),
         )
@@ -586,6 +593,69 @@ class MacOSSnapshotPublisherTest(unittest.TestCase):
                         fetch_json=fetch_for(database_name),
                     )
 
+    def test_writer_freshness_rejects_stale_downstream_completion_order(self) -> None:
+        current = datetime(2026, 8, 11, 9, 0, tzinfo=SHANGHAI)
+
+        def fetch_for(database_name: str):
+            def fetch(url: str) -> dict[str, object]:
+                value = _fetch_writer(url)
+                if url.endswith("/health"):
+                    return {**value, "database": database_name}
+                catchup = dict(value["startup_catchup"])
+                catchup["results"] = []
+                return {**value, "startup_catchup": catchup}
+
+            return fetch
+
+        cases = (
+            (
+                "stale-cutoff.sqlite3",
+                "daily_media_processing",
+                "2026-08-10T23:50:00Z",
+                "daily_media_cutoff",
+                "2026-08-10T23:55:00Z",
+            ),
+            (
+                "stale-daily-report.sqlite3",
+                "daily_media_cutoff",
+                "2026-08-11T00:10:00Z",
+                "daily_report",
+                "2026-08-11T00:20:00Z",
+            ),
+        )
+        for (
+            database_name,
+            upstream_job,
+            upstream_completed,
+            stale_job,
+            stale_completed,
+        ) in cases:
+            with self.subTest(database=database_name):
+                database = self.root / database_name
+                _writer_database(
+                    database, latest_published_at="2026-08-10T12:00:00Z"
+                )
+                with sqlite3.connect(database) as connection:
+                    connection.execute(
+                        "UPDATE scheduler_runs SET completed_at=? WHERE job_id=?",
+                        (upstream_completed, upstream_job),
+                    )
+                    connection.execute(
+                        "UPDATE scheduler_runs SET completed_at=? WHERE job_id=?",
+                        (stale_completed, stale_job),
+                    )
+                    connection.commit()
+                with self.assertRaisesRegex(
+                    publisher.SnapshotPublishError,
+                    f"{stale_job} started before its dependency {upstream_job} completed",
+                ):
+                    publisher.check_writer_freshness(
+                        database,
+                        now=current,
+                        maximum_content_lag_days=1,
+                        fetch_json=fetch_for(database_name),
+                    )
+
     def test_writer_freshness_requires_monday_weekly_report(self) -> None:
         database = self.root / "monday.sqlite3"
         _writer_database(
@@ -597,30 +667,35 @@ class MacOSSnapshotPublisherTest(unittest.TestCase):
             replacements = {
                 "daily_capture": (
                     "2026-08-09T18:00:00Z",
+                    "2026-08-09T18:00:00Z",
                     "2026-08-09T18:30:00Z",
                 ),
                 "daily_media_download": (
                     "2026-08-09T18:20:00Z",
-                    "2026-08-09T18:25:00Z",
+                    "2026-08-09T18:31:00Z",
+                    "2026-08-09T18:35:00Z",
                 ),
                 "daily_media_processing": (
+                    "2026-08-09T19:00:00Z",
                     "2026-08-09T19:00:00Z",
                     "2026-08-09T19:05:00Z",
                 ),
                 "daily_media_cutoff": (
                     "2026-08-09T23:30:00Z",
+                    "2026-08-09T23:30:00Z",
                     "2026-08-09T23:45:00Z",
                 ),
                 "daily_report": (
                     "2026-08-10T00:00:00Z",
+                    "2026-08-10T00:00:00Z",
                     "2026-08-10T00:01:00Z",
                 ),
             }
-            for job_id, (scheduled_for, completed_at) in replacements.items():
+            for job_id, (scheduled_for, started_at, completed_at) in replacements.items():
                 connection.execute(
-                    "UPDATE scheduler_runs SET scheduled_for=?,completed_at=? "
+                    "UPDATE scheduler_runs SET scheduled_for=?,started_at=?,completed_at=? "
                     "WHERE job_id=?",
-                    (scheduled_for, completed_at, job_id),
+                    (scheduled_for, started_at, completed_at, job_id),
                 )
             connection.commit()
         timestamp = datetime.fromisoformat("2026-08-10T00:31:00+00:00").timestamp()
@@ -658,6 +733,26 @@ class MacOSSnapshotPublisherTest(unittest.TestCase):
             fetch_json=monday_writer,
         )
         self.assertEqual(value.weekly_report_status, "partial")
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "UPDATE scheduler_runs SET completed_at='2026-08-10T00:40:00Z' "
+                "WHERE job_id='daily_report'"
+            )
+            connection.execute(
+                "UPDATE scheduler_runs SET completed_at='2026-08-10T00:50:00Z' "
+                "WHERE job_id='weekly_report'"
+            )
+            connection.commit()
+        with self.assertRaisesRegex(
+            publisher.SnapshotPublishError,
+            "weekly_report started before its dependency daily_report completed",
+        ):
+            publisher.check_writer_freshness(
+                database,
+                now=datetime(2026, 8, 10, 9, 0, tzinfo=SHANGHAI),
+                maximum_content_lag_days=1,
+                fetch_json=monday_writer,
+            )
 
     def test_writer_freshness_rejects_health_or_database_identity_drift(self) -> None:
         current = datetime(2026, 8, 11, 9, 0, tzinfo=SHANGHAI)
