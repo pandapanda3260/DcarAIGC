@@ -20,6 +20,7 @@ runtime/dependencies/
 # Temporary renders and media used for manual review
 tmp/
 /runtime/
+/outputs/
 /_to_delete/
 __pycache__/
 *.py[cod]

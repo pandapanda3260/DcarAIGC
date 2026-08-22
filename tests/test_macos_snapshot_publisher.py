@@ -41,9 +41,9 @@ publisher = _load_module(
 def _runtime_identity(*, matcher_sha256: str = "a" * 64) -> dict[str, object]:
     return {
         "schema": "dcar-runtime-identity-v1",
-        "report_version": "dcar-content-operations-report-v8.6",
-        "database_schema_version": 13,
-        "database_schema_migration": "scheduler-run-attempt-history",
+        "report_version": CURRENT_REPORT_VERSION,
+        "database_schema_version": SCHEMA_VERSION,
+        "database_schema_migration": CURRENT_SCHEMA_MIGRATION_NAME,
         "active_release_id": "evaluation-v9__selling-points-v5.2",
         "active_release_status": "active",
         "rule_version": "evaluation-v9",
@@ -88,7 +88,7 @@ def _writer_database(
                 status TEXT
             );
             INSERT INTO scheduler_runs VALUES(
-                1,'daily_capture','2026-08-10T18:00:00Z','failed',
+                1,'daily_capture','2026-08-10T18:00:00Z','partial',
                 '2026-08-10T18:30:00Z'
             );
             INSERT INTO scheduler_runs VALUES(
@@ -106,7 +106,7 @@ def _writer_database(
                 2,3,1,'succeeded','2026-08-10T00:31:00Z'
             );
             INSERT INTO schema_migrations VALUES(
-                13,'scheduler-run-attempt-history'
+                16,'remove-manual-review'
             );
             INSERT INTO taxonomy_versions VALUES(
                 'selling-points-v5.2','published'
@@ -119,7 +119,7 @@ def _writer_database(
             );
             """
         )
-        connection.execute("PRAGMA user_version=13")
+        connection.execute("PRAGMA user_version=16")
         connection.execute(
             "INSERT INTO scheduler_runs VALUES(?,?,?,?,?)",
             (
@@ -248,7 +248,7 @@ class MacOSSnapshotPublisherTest(unittest.TestCase):
                     "DCAR_PUBLISH_REMOTE_PYTHON=/var/www/dcar-aigc/current/.venv/bin/python",
                     f"DCAR_PUBLISH_SNAPSHOT_ROOT={self.snapshot_root}",
                     "DCAR_PUBLISH_MIN_REMOTE_FREE_BYTES=5368709120",
-                    "DCAR_PUBLISH_EXPECTED_USER_VERSION=13",
+                    "DCAR_PUBLISH_EXPECTED_USER_VERSION=16",
                     "DCAR_PUBLISH_MAX_CONTENT_LAG_DAYS=1",
                     "",
                 ]
@@ -326,8 +326,8 @@ class MacOSSnapshotPublisherTest(unittest.TestCase):
         with self.assertRaises(publisher.SnapshotPublishError):
             self.config()
 
-    def test_external_environment_pins_schema_13(self) -> None:
-        self.assertEqual(self.config().expected_user_version, 13)
+    def test_external_environment_pins_current_schema(self) -> None:
+        self.assertEqual(self.config().expected_user_version, SCHEMA_VERSION)
 
     def test_publisher_identity_constants_match_current_runtime_contracts(self) -> None:
         self.assertEqual(publisher.EXPECTED_REPORT_VERSION, CURRENT_REPORT_VERSION)
@@ -374,9 +374,9 @@ class MacOSSnapshotPublisherTest(unittest.TestCase):
         self.assertNotIn("PASSWORD=", example)
         self.assertNotIn("PRIVATE_KEY=", example)
         self.assertIn("40,739,188,944", example)
-        self.assertIn("DCAR_PUBLISH_EXPECTED_USER_VERSION=13", example)
+        self.assertIn("DCAR_PUBLISH_EXPECTED_USER_VERSION=16", example)
 
-    def test_writer_freshness_accepts_today_terminal_failure_but_rejects_stale_content(
+    def test_writer_freshness_accepts_today_partial_capture_but_rejects_stale_content(
         self,
     ) -> None:
         current = datetime(2026, 8, 11, 9, 0, tzinfo=SHANGHAI)
@@ -386,9 +386,33 @@ class MacOSSnapshotPublisherTest(unittest.TestCase):
             maximum_content_lag_days=1,
             fetch_json=_fetch_writer,
         )
-        self.assertEqual(value.capture_status, "failed")
+        self.assertEqual(value.capture_status, "partial")
         self.assertEqual(value.media_cutoff_status, "succeeded")
         self.assertEqual(value.latest_published_at, "2026-08-10T12:00:00Z")
+
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE scheduler_runs SET status='failed' WHERE job_id='daily_capture'"
+            )
+            connection.commit()
+        completed_timestamp = datetime.fromisoformat(
+            "2026-08-10T23:45:00+00:00"
+        ).timestamp()
+        os.utime(self.database, (completed_timestamp, completed_timestamp))
+        with self.assertRaisesRegex(
+            publisher.SnapshotPublishError, "status is not publishable: failed"
+        ):
+            publisher.check_writer_freshness(
+                self.database,
+                now=current,
+                maximum_content_lag_days=1,
+                fetch_json=_fetch_writer,
+            )
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE scheduler_runs SET status='partial' WHERE job_id='daily_capture'"
+            )
+            connection.commit()
 
         stale = self.root / "stale.sqlite3"
         _writer_database(stale, latest_published_at="2026-08-08T12:00:00Z")

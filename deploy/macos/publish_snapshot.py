@@ -27,7 +27,7 @@ from zoneinfo import ZoneInfo
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
-TERMINAL_CAPTURE_STATUSES = frozenset({"succeeded", "failed", "skipped"})
+TERMINAL_CAPTURE_STATUSES = frozenset({"succeeded", "partial", "skipped"})
 REPORT_CATCHUP_JOB_IDS = frozenset({"daily_report", "weekly_report"})
 REPORT_CATCHUP_TERMINAL_STATUSES = frozenset({"succeeded", "partial", "skipped"})
 SAFE_ALIAS_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
@@ -35,9 +35,9 @@ SAFE_REMOTE_PATH_RE = re.compile(r"/[A-Za-z0-9_./-]+")
 SNAPSHOT_ID_RE = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 RUNTIME_IDENTITY_SCHEMA = "dcar-runtime-identity-v1"
-EXPECTED_REPORT_VERSION = "dcar-content-operations-report-v8.6"
-EXPECTED_DATABASE_SCHEMA_VERSION = 13
-EXPECTED_DATABASE_SCHEMA_MIGRATION = "scheduler-run-attempt-history"
+EXPECTED_REPORT_VERSION = "dcar-content-operations-report-v8.7"
+EXPECTED_DATABASE_SCHEMA_VERSION = 16
+EXPECTED_DATABASE_SCHEMA_MIGRATION = "remove-manual-review"
 EXPECTED_ACTIVE_RELEASE_ID = "evaluation-v9__selling-points-v5.2"
 EXPECTED_ACTIVE_RELEASE_STATUS = "active"
 EXPECTED_RULE_VERSION = "evaluation-v9"

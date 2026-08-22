@@ -135,14 +135,6 @@ mkdir -p "$HOME/.Trash/DcarAIGC-launchagents"
 mv "$plist" "$HOME/.Trash/DcarAIGC-launchagents/$label.plist"
 ```
 
-## snapshot publisher：已停用、未加载
+## snapshot publisher：默认停用、按需人工发布
 
-snapshot publisher 不属于本轮恢复范围。当前 LaunchAgent 已停用且未加载；不得 render/load/enable/bootstrap/kickstart，不得把它当作 writer 验收的一部分。
-
-源码仍保留，但 publisher 与 server installer 共用的发布身份已有三组明确漂移：
-
-1. `EXPECTED_DATABASE_SCHEMA_VERSION = 13`，而当前代码 schema 为 16。
-2. `EXPECTED_DATABASE_SCHEMA_MIGRATION = "scheduler-run-attempt-history"`，而当前为 `remove-manual-review`。
-3. `EXPECTED_REPORT_VERSION = "dcar-content-operations-report-v8.6"`，而 `pyproject.toml` 和当前报告合同为 v8.7。
-
-这三项未在独立 publisher 升级中同步、测试和端到端验证前，publisher 不可用。本轮只保留已知失败的单测证据，不修改 publisher 逻辑，也不通过放宽身份门禁消红。
+snapshot publisher 的 LaunchAgent 保持停用且不自动加载，避免无人值守地修改线上只读副本。发布链已统一锁定 report v8.7、schema 16 / `remove-manual-review`；人工发布仍必须通过当日抓取、07:30 媒体截止、运行时身份、数据库一致性、远端容量和安装后 smoke check 全部门禁。`daily_capture=partial` 可发布，`failed` 不可发布；不得通过放宽身份或新鲜度校验消除拒绝。

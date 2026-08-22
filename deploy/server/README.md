@@ -135,19 +135,19 @@ so it never copies a live WAL database directly. It then requires
 `quick_check=ok`, zero foreign key violations, the expected schema, and exact
 hashes for report and visible evidence files. It also freezes one
 `dcar-runtime-identity-v1` value from the backup DB and refuses to build unless
-that identity is report v8.6, schema 13 / `scheduler-run-attempt-history`, and
+that identity is report v8.7, schema 16 / `remove-manual-review`, and
 the active `evaluation-v9__selling-points-v5.2` release on the published v5.2
 taxonomy. The matcher SHA-256 is read from that release row, never hard-coded.
 
 ```sh
-cd /Users/mark/Documents/DcarAIGC
+cd /Users/mark/Projects/DcarAIGC
 snapshot_dir="/private/tmp/dcar-snapshot-$(date -u +%Y%m%dT%H%M%SZ)"
 
 .venv/bin/python scripts/build_server_snapshot.py \
   --project-root "$PWD" \
   --db app/data/dcar_insight.sqlite3 \
   --legacy-db app/data/web_mvp.sqlite3 \
-  --expected-user-version 13 \
+  --expected-user-version 16 \
   --output "$snapshot_dir"
 ```
 

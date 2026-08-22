@@ -33,9 +33,9 @@ REQUIRED_RUNTIME_ARTIFACTS = (
 )
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 RUNTIME_IDENTITY_SCHEMA = "dcar-runtime-identity-v1"
-EXPECTED_REPORT_VERSION = "dcar-content-operations-report-v8.6"
-EXPECTED_DATABASE_SCHEMA_VERSION = 13
-EXPECTED_DATABASE_SCHEMA_MIGRATION = "scheduler-run-attempt-history"
+EXPECTED_REPORT_VERSION = "dcar-content-operations-report-v8.7"
+EXPECTED_DATABASE_SCHEMA_VERSION = 16
+EXPECTED_DATABASE_SCHEMA_MIGRATION = "remove-manual-review"
 EXPECTED_ACTIVE_RELEASE_ID = "evaluation-v9__selling-points-v5.2"
 EXPECTED_ACTIVE_RELEASE_STATUS = "active"
 EXPECTED_RULE_VERSION = "evaluation-v9"

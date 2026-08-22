@@ -88,7 +88,7 @@ def _create_main_database(path: Path, project_root: Path) -> None:
     try:
         connection.executescript(
             """
-            PRAGMA user_version=13;
+            PRAGMA user_version=16;
             CREATE TABLE content_items(
                 id INTEGER PRIMARY KEY,
                 published_at TEXT,
@@ -134,7 +134,7 @@ def _create_main_database(path: Path, project_root: Path) -> None:
                 '2026-08-10T18:10:00Z'
             );
             INSERT INTO schema_migrations VALUES(
-                13,'scheduler-run-attempt-history'
+                16,'remove-manual-review'
             );
             INSERT INTO taxonomy_versions VALUES(
                 'selling-points-v5.2','published'
@@ -191,7 +191,7 @@ def _create_old_active_database(path: Path) -> None:
     connection = sqlite3.connect(path)
     try:
         connection.executescript(
-            "PRAGMA user_version=13; CREATE TABLE active_marker(value TEXT);"
+            "PRAGMA user_version=16; CREATE TABLE active_marker(value TEXT);"
             "INSERT INTO active_marker VALUES('old');"
         )
         connection.commit()
@@ -221,7 +221,7 @@ class ServerSnapshotDeploymentTest(unittest.TestCase):
             database=self.database,
             legacy_database=self.legacy_database,
             output=self.bundle,
-            expected_user_version=13,
+            expected_user_version=SCHEMA_VERSION,
         )
 
     def server_config(self) -> object:
@@ -248,9 +248,9 @@ class ServerSnapshotDeploymentTest(unittest.TestCase):
             manifest["runtime_identity"],
             {
                 "schema": "dcar-runtime-identity-v1",
-                "report_version": "dcar-content-operations-report-v8.6",
-                "database_schema_version": 13,
-                "database_schema_migration": "scheduler-run-attempt-history",
+                "report_version": CURRENT_REPORT_VERSION,
+                "database_schema_version": SCHEMA_VERSION,
+                "database_schema_migration": CURRENT_SCHEMA_MIGRATION_NAME,
                 "active_release_id": "evaluation-v9__selling-points-v5.2",
                 "active_release_status": "active",
                 "rule_version": "evaluation-v9",
@@ -284,7 +284,10 @@ class ServerSnapshotDeploymentTest(unittest.TestCase):
         )
         snapshot = sqlite3.connect(self.bundle / "databases/dcar_insight.sqlite3")
         try:
-            self.assertEqual(snapshot.execute("PRAGMA user_version").fetchone()[0], 13)
+            self.assertEqual(
+                snapshot.execute("PRAGMA user_version").fetchone()[0],
+                SCHEMA_VERSION,
+            )
             self.assertEqual(
                 snapshot.execute("SELECT COUNT(*) FROM content_items").fetchone()[0],
                 1,
@@ -292,11 +295,11 @@ class ServerSnapshotDeploymentTest(unittest.TestCase):
         finally:
             snapshot.close()
 
-    def test_server_runbook_pins_schema_13(self) -> None:
+    def test_server_runbook_pins_current_schema(self) -> None:
         runbook = (REPOSITORY_ROOT / "deploy/server/README.md").read_text(
             encoding="utf-8"
         )
-        self.assertIn("--expected-user-version 13", runbook)
+        self.assertIn(f"--expected-user-version {SCHEMA_VERSION}", runbook)
 
     def test_deployment_identity_constants_match_current_runtime_contracts(
         self,
@@ -322,7 +325,7 @@ class ServerSnapshotDeploymentTest(unittest.TestCase):
             """,
             """
             UPDATE schema_migrations
-            SET name='interaction-user-v1-fallback-keys' WHERE version=13
+            SET name='interaction-user-v1-fallback-keys' WHERE version=16
             """,
         ):
             candidate = self.root / f"candidate-{len(list(self.root.glob('candidate-*')))}.sqlite3"
@@ -338,7 +341,7 @@ class ServerSnapshotDeploymentTest(unittest.TestCase):
                     project_root=self.project,
                     database=candidate,
                     output=output,
-                    expected_user_version=13,
+                    expected_user_version=SCHEMA_VERSION,
                 )
             self.assertFalse(output.exists())
 
