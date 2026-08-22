@@ -292,9 +292,11 @@ class MacOSSnapshotPublisherTest(unittest.TestCase):
         _writer_database(self.database, latest_published_at="2026-08-10T12:00:00Z")
         self.fake_home = self.root / "home"
         (self.fake_home / ".ssh").mkdir(parents=True)
-        (self.fake_home / ".ssh/known_hosts").write_text(
+        known_hosts = self.fake_home / ".ssh/known_hosts"
+        known_hosts.write_text(
             "example.invalid ssh-ed25519 public-host-key\n", encoding="utf-8"
         )
+        known_hosts.chmod(0o600)
         identity = self.fake_home / ".ssh/id_ed25519_dcar_test"
         identity.write_text("not-a-real-key", encoding="utf-8")
         identity.chmod(0o600)
