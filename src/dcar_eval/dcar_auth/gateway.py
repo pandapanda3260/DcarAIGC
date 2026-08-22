@@ -26,6 +26,7 @@ from starlette.responses import Response
 LOGGER = logging.getLogger("dcar-auth")
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SESSION_COOKIE = "dcar_session"
+BYPASS_USERNAME = "temporary-bypass"
 DEFAULT_SESSION_SECONDS = 12 * 60 * 60
 REMEMBER_SESSION_SECONDS = 30 * 24 * 60 * 60
 MAX_LOGIN_BODY_BYTES = 16 * 1024
@@ -74,6 +75,7 @@ class AuthGatewayConfig:
     session_db_path: Path
     login_template_path: Path
     secure_cookie: bool
+    bypass_auth: bool = False
     session_seconds: int = DEFAULT_SESSION_SECONDS
     remember_session_seconds: int = REMEMBER_SESSION_SECONDS
     throttle_window_seconds: int = 10 * 60
@@ -129,6 +131,7 @@ class AuthGatewayConfig:
                 )
             ),
             secure_cookie=_enabled("DCAR_AUTH_SECURE_COOKIE", default=True),
+            bypass_auth=_enabled("DCAR_AUTH_BYPASS", default=False),
             session_seconds=int(
                 os.environ.get("DCAR_AUTH_SESSION_SECONDS", DEFAULT_SESSION_SECONDS)
             ),
@@ -524,10 +527,13 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
-        verifier.validate_source()
-        if not resolved.login_template_path.is_file():
-            raise RuntimeError(f"login template is missing: {resolved.login_template_path}")
-        sessions.initialize()
+        if not resolved.bypass_auth:
+            verifier.validate_source()
+            if not resolved.login_template_path.is_file():
+                raise RuntimeError(
+                    f"login template is missing: {resolved.login_template_path}"
+                )
+            sessions.initialize()
         application.state.web_client = httpx.AsyncClient(
             transport=web_transport,
             timeout=httpx.Timeout(60, connect=5),
@@ -555,6 +561,8 @@ def create_app(
     )
 
     async def username_for(request: Request) -> Optional[str]:
+        if resolved.bypass_auth:
+            return BYPASS_USERNAME
         token = request.cookies.get(SESSION_COOKIE, "")
         session = await asyncio.to_thread(sessions.resolve, token)
         if session is None:
@@ -641,14 +649,15 @@ def create_app(
         if stripped == "/auth/health":
             if request.method != "GET":
                 return Response(status_code=405)
-            try:
-                await asyncio.to_thread(verifier.validate_source)
-                await asyncio.to_thread(sessions.healthcheck)
-            except (OSError, RuntimeError, sqlite3.Error):
-                LOGGER.exception("authentication gateway readiness check failed")
-                return _no_store(
-                    JSONResponse({"status": "unavailable"}, status_code=503)
-                )
+            if not resolved.bypass_auth:
+                try:
+                    await asyncio.to_thread(verifier.validate_source)
+                    await asyncio.to_thread(sessions.healthcheck)
+                except (OSError, RuntimeError, sqlite3.Error):
+                    LOGGER.exception("authentication gateway readiness check failed")
+                    return _no_store(
+                        JSONResponse({"status": "unavailable"}, status_code=503)
+                    )
             return _no_store(JSONResponse({"status": "ok"}))
 
         if stripped == "/login":
@@ -657,6 +666,8 @@ def create_app(
             return_to = _safe_return_to(
                 request.query_params.get("return_to", ""), resolved
             )
+            if resolved.bypass_auth:
+                return _no_store(RedirectResponse(return_to, status_code=303))
             if await username_for(request):
                 return _no_store(RedirectResponse(return_to, status_code=303))
             html = resolved.login_template_path.read_text(encoding="utf-8")
@@ -679,6 +690,10 @@ def create_app(
         if stripped == "/auth/login":
             if request.method != "POST":
                 return Response(status_code=405)
+            if resolved.bypass_auth:
+                return _no_store(
+                    JSONResponse({"redirect_to": resolved.route("/overview")})
+                )
             if not _same_origin_post(
                 request, "login", trusted_proxy=bool(resolved.base_path)
             ):
@@ -766,6 +781,12 @@ def create_app(
                         {"detail": "页面已失效，请刷新后再退出"}, status_code=403
                     )
                 )
+            if resolved.bypass_auth:
+                logout_response = JSONResponse(
+                    {"redirect_to": resolved.route("/overview")}
+                )
+                _delete_session_cookie(logout_response, resolved)
+                return _no_store(logout_response)
             token = request.cookies.get(SESSION_COOKIE, "")
             await asyncio.to_thread(sessions.revoke, token)
             logout_response = JSONResponse({"redirect_to": resolved.route("/login")})

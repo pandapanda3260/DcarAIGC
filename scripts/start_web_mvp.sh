@@ -9,7 +9,13 @@ daily_capture_reconcile_from="${DCAR_DAILY_CAPTURE_RECONCILE_FROM:-}"
 auth_root="${DCAR_AUTH_RUNTIME_ROOT:-$project_root/runtime/auth}"
 htpasswd_file="${DCAR_AUTH_HTPASSWD:-$auth_root/users.htpasswd}"
 session_db="${DCAR_AUTH_SESSION_DB:-$auth_root/sessions.sqlite3}"
+auth_bypass="${DCAR_AUTH_BYPASS:-0}"
 reuse_api="${DCAR_REUSE_EXISTING_READ_ONLY_API:-0}"
+
+case "$auth_bypass" in
+  1|true|TRUE|yes|YES|on|ON) auth_bypass=1 ;;
+  *) auth_bypass=0 ;;
+esac
 
 if [[ "$scheduler_enabled" != "0" ]]; then
   echo "DCar Insight 8765 启动失败：DCAR_SCHEDULER_ENABLED 必须为 0；调度仅允许在 8766 writer 运行" >&2
@@ -44,7 +50,7 @@ for port in "${ports[@]}"; do
   fi
 done
 
-if [[ ! -s "$htpasswd_file" ]]; then
+if [[ "$auth_bypass" != "1" && ! -s "$htpasswd_file" ]]; then
   if [[ ! -t 0 ]]; then
     echo "首次启动需要在终端创建本地登录账号：scripts/start_web_mvp.sh" >&2
     exit 78
@@ -56,6 +62,11 @@ fi
 
 cd "$project_root"
 echo "DCar 自动调度：${scheduler_enabled}；启动补跑：${startup_catchup_enabled}"
+if [[ "$auth_bypass" == "1" ]]; then
+  echo "账号密码登录：已临时关闭（当前可免登录访问）"
+else
+  echo "账号密码登录：已启用"
+fi
 api_pid=""
 if [[ "$reuse_api" == "1" ]]; then
   api_health="$(curl -fsS http://127.0.0.1:8765/api/v8/health)" || {
@@ -116,6 +127,7 @@ DCAR_AUTH_HTPASSWD="$htpasswd_file" \
 DCAR_AUTH_SESSION_DB="$session_db" \
 DCAR_AUTH_LOGIN_TEMPLATE="$project_root/deploy/server/nginx/login.html" \
 DCAR_AUTH_SECURE_COOKIE=0 \
+DCAR_AUTH_BYPASS="$auth_bypass" \
 python3 -m uv run --frozen uvicorn dcar_auth.gateway:app \
   --app-dir "$project_root/src/dcar_eval" \
   --host 127.0.0.1 \

@@ -127,7 +127,9 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
         self.addCleanup(verify_patcher.stop)
         self.addCleanup(current_patcher.stop)
 
-    def _config(self, base_path: str) -> auth_gateway.AuthGatewayConfig:
+    def _config(
+        self, base_path: str, *, bypass_auth: bool = False
+    ) -> auth_gateway.AuthGatewayConfig:
         suffix = "root" if not base_path else base_path.strip("/").replace("/", "-")
         return auth_gateway.AuthGatewayConfig(
             base_path=base_path,
@@ -137,15 +139,16 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
             session_db_path=self.root / f"sessions-{suffix}.sqlite3",
             login_template_path=self.login_template,
             secure_cookie=True,
+            bypass_auth=bypass_auth,
             session_seconds=3600,
             remember_session_seconds=86400,
         )
 
     @contextmanager
     def _client(
-        self, base_path: str
+        self, base_path: str, *, bypass_auth: bool = False
     ) -> Iterator[tuple[TestClient, auth_gateway.AuthGatewayConfig]]:
-        config = self._config(base_path)
+        config = self._config(base_path, bypass_auth=bypass_auth)
         app = auth_gateway.create_app(
             config,
             web_transport=ASGITransport(app=_echo_upstream("web")),
@@ -208,6 +211,68 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
                 self.assertIsNone(api.headers.get("location"))
                 self.assertEqual(api.json(), {"detail": "请先登录"})
                 self.assertEqual(api.headers.get("cache-control"), "no-store")
+
+    def test_bypass_mode_proxies_without_login_or_auth_storage(self) -> None:
+        for base_path in ("", "/dcar"):
+            with self.subTest(base_path=base_path), self._client(
+                base_path, bypass_auth=True
+            ) as (client, config):
+                page = client.get(_route(base_path, "/selling-points"))
+                self.assertEqual(page.status_code, 200)
+                self.assertEqual(page.json()["upstream"], "web")
+                self.assertEqual(
+                    page.json()["authenticated_user"],
+                    auth_gateway.BYPASS_USERNAME,
+                )
+
+                api = client.get(_route(base_path, "/api/v8/overview"))
+                self.assertEqual(api.status_code, 200)
+                self.assertEqual(api.json()["upstream"], "api")
+                self.assertEqual(
+                    api.json()["authenticated_user"],
+                    auth_gateway.BYPASS_USERNAME,
+                )
+
+                destination = _route(base_path, "/selling-points?window=this-week")
+                login_page = client.get(
+                    _route(base_path, "/login"),
+                    params={"return_to": destination},
+                    follow_redirects=False,
+                )
+                self.assertEqual(login_page.status_code, 303)
+                self.assertEqual(login_page.headers["location"], destination)
+
+                stale_login = self._login(client, base_path)
+                self.assertEqual(stale_login.status_code, 200)
+                self.assertEqual(
+                    stale_login.json(),
+                    {"redirect_to": _route(base_path, "/overview")},
+                )
+                self.assertNotIn("set-cookie", stale_login.headers)
+
+                session = client.get(_route(base_path, "/auth/session"))
+                self.assertEqual(
+                    session.json(),
+                    {
+                        "authenticated": True,
+                        "username": auth_gateway.BYPASS_USERNAME,
+                    },
+                )
+
+                logout = client.post(
+                    _route(base_path, "/auth/logout"),
+                    headers={"Origin": ORIGIN, "X-Dcar-Request": "logout"},
+                )
+                self.assertEqual(logout.status_code, 200)
+                self.assertEqual(
+                    logout.json(),
+                    {"redirect_to": _route(base_path, "/overview")},
+                )
+                self.assertEqual(
+                    client.get(_route(base_path, "/auth/health")).json(),
+                    {"status": "ok"},
+                )
+                self.assertFalse(config.session_db_path.exists())
 
     def test_correct_and_incorrect_login_and_cookie_attributes(self) -> None:
         for base_path in ("", "/dcar"):
