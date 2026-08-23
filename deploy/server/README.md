@@ -69,14 +69,58 @@ The Douyin control plane ships fail-closed in stage 0:
 ```text
 DOUYIN_AUTHORIZATION_ENABLED=0
 DCAR_DOUYIN_PROVIDER=disabled
+DCAR_DOUYIN_PROXY_URL=http://127.0.0.1:4176
 ```
 
 Create independent random Edge, Machine, Fernet-keyring, and open-id HMAC
 credentials below `/etc/dcar-aigc/credentials`, owned by root and mode `0600`.
 The Edge credential is shared only by `dcar-auth` and the control plane; the
-Machine credential is only for `/internal/v1/*`. Do not install a Douyin Client Secret
-in stage 0. The credential shown in earlier screenshots is considered
-compromised and must be rotated before any real authorization is enabled.
+Machine credential is only for `/internal/v1/*`. The credential shown in
+earlier screenshots is considered compromised. Rotate it in the Douyin console,
+then install only the replacement as
+`/etc/dcar-aigc/credentials/douyin-client-secret`, owned by root and mode `0600`,
+before installing the Stage-1 control unit. The unit exposes it to 4175 only as
+the systemd credential file
+`/run/credentials/dcar-douyin-control.service/douyin-client-secret`; the secret
+itself is not an environment value and the `proxy` account cannot read the
+source file. Keep real authorization and
+the real provider disabled until the provider implementation and canary gates
+pass.
+
+## Restricted Douyin OpenAPI egress
+
+4175 retains `IPAddressDeny=any` plus `IPAddressAllow=localhost`. Its only
+network path to Douyin is an independently sandboxed Squid process on
+`127.0.0.1:4176`. Squid accepts CONNECT only for the exact destination
+`open.douyin.com:443`; subdomains, IP literals, other domains, non-CONNECT
+methods, and other ports are denied. It does not decrypt TLS or cache/log
+request metadata.
+
+Install the Ubuntu Squid package, the dedicated configuration, and its unit
+before restarting 4175:
+
+```sh
+sudo apt-get update
+sudo apt-get install --yes squid
+sudo install -d -o root -g root -m 0755 /etc/squid
+sudo install -o root -g root -m 0644 \
+  deploy/server/squid/dcar-douyin-egress.conf \
+  /etc/squid/dcar-douyin-egress.conf
+sudo install -o root -g root -m 0644 \
+  deploy/server/systemd/dcar-douyin-egress.service \
+  /etc/systemd/system/dcar-douyin-egress.service
+sudo /usr/sbin/squid -k parse -f /etc/squid/dcar-douyin-egress.conf
+sudo systemctl daemon-reload
+sudo systemctl enable --now dcar-douyin-egress.service
+```
+
+The control unit uses the explicit
+`DCAR_DOUYIN_PROXY_URL=http://127.0.0.1:4176` contract. Provider code must use
+that value explicitly with ambient proxy discovery disabled; it must never
+fall back to a direct connection when the proxy is unavailable. The base unit
+still fixes `DOUYIN_AUTHORIZATION_ENABLED=0` and
+`DCAR_DOUYIN_PROVIDER=disabled`, so installing the proxy alone cannot enable a
+real authorization or provider call.
 
 ## Build and install a code release
 
@@ -144,6 +188,8 @@ sudo install -m 0644 deploy/server/systemd/dcar-auth.service \
   /etc/systemd/system/dcar-auth.service
 sudo install -m 0644 deploy/server/systemd/dcar-douyin-control.service \
   /etc/systemd/system/dcar-douyin-control.service
+sudo install -m 0644 deploy/server/systemd/dcar-douyin-egress.service \
+  /etc/systemd/system/dcar-douyin-egress.service
 sudo install -m 0644 deploy/server/systemd/dcar-douyin-vault-backup.service \
   /etc/systemd/system/dcar-douyin-vault-backup.service
 sudo install -m 0644 deploy/server/systemd/dcar-douyin-vault-backup.timer \
@@ -151,9 +197,11 @@ sudo install -m 0644 deploy/server/systemd/dcar-douyin-vault-backup.timer \
 sudo install -m 0755 deploy/server/libexec/dcar-douyin-vault-backup.py \
   /usr/local/libexec/dcar-douyin-vault-backup
 sudo systemctl daemon-reload
-sudo systemctl enable dcar-api dcar-web dcar-douyin-control dcar-auth \
+sudo systemctl enable dcar-api dcar-web dcar-douyin-egress \
+  dcar-douyin-control dcar-auth \
   dcar-douyin-vault-backup.timer
-sudo systemctl start dcar-api dcar-web dcar-douyin-control dcar-auth \
+sudo systemctl start dcar-api dcar-web dcar-douyin-egress \
+  dcar-douyin-control dcar-auth \
   dcar-douyin-vault-backup.timer
 curl -fsS http://127.0.0.1:4173/dcar/auth/health
 curl -fsS -H "X-Dcar-Machine-Key: $(sudo cat /etc/dcar-aigc/credentials/douyin-machine-key)" \
@@ -397,6 +445,38 @@ that tunnel must still supply the independent Machine credential. Stage 0 only
 exposes the authenticated internal health route and does not implement writer
 mutation endpoints.
 
+## Douyin egress acceptance and rollback
+
+Before enabling the real provider, verify that Squid is bound only to loopback,
+the exact Douyin tunnel succeeds, and every negative case fails closed:
+
+```sh
+sudo /usr/sbin/squid -k parse -f /etc/squid/dcar-douyin-egress.conf
+sudo systemctl status dcar-douyin-egress dcar-douyin-control --no-pager
+sudo ss -ltnp | grep '127.0.0.1:4176'
+curl --fail --silent --show-error --head \
+  --proxy http://127.0.0.1:4176 https://open.douyin.com/
+! curl --fail --silent --show-error --head \
+  --proxy http://127.0.0.1:4176 https://example.com/
+! curl --fail --silent --show-error --insecure --head \
+  --proxy http://127.0.0.1:4176 https://1.1.1.1/
+```
+
+Also stop `dcar-douyin-egress` temporarily and confirm a real-provider request
+fails without making a direct connection, then restore the proxy before further
+testing. Do not enable the provider merely to smoke the infrastructure; the
+default-disabled health and page-render smoke remain valid without a Douyin
+request.
+
+To roll this egress layer back, first set
+`DOUYIN_AUTHORIZATION_ENABLED=0` and `DCAR_DOUYIN_PROVIDER=disabled`, restart
+4175, restore the previous `dcar-douyin-control.service`, and reload systemd.
+Only then disable `dcar-douyin-egress`, remove its unit/configuration, and
+restart 4175 again. Removing Squid before disabling the provider is not an
+acceptable rollback because it can strand in-flight refresh or video-list
+requests. Revoke the replacement Client Secret in the Douyin console if the
+rollback is caused by suspected credential exposure.
+
 Post-install acceptance must cover:
 
 - `GET /dcar/api/v8/overview` returns the expected latest published date;
@@ -409,6 +489,11 @@ Post-install acceptance must cover:
   search returns only the documented Douyin projection;
 - `POST /dcar/api/douyin/oauth/start` returns 409 in production stage 0 and no
   request reaches `open.douyin.com`;
+- Squid listens only on `127.0.0.1:4176`, permits only
+  `CONNECT open.douyin.com:443`, and denies subdomains, IP literals, other
+  domains, methods, and ports;
+- stopping Squid makes the real provider fail closed instead of connecting
+  directly;
 - `sudo -u dcar-douyin test -r /etc/nginx/.htpasswd-dcar` and equivalent checks
   for the Auth Session DB and read-replica DB fail;
 - the active snapshot receipt, database SHA-256, schema version, content count,

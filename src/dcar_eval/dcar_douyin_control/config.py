@@ -44,6 +44,7 @@ class DouyinControlConfig:
     provider_authorize_url: str = ""
     provider_token_url: str = ""
     provider_userinfo_url: str = ""
+    provider_proxy_url: str = ""
     callback_url: str = ""
     state_ttl_seconds: int = 10 * 60
     confirmation_ttl_seconds: int = 15 * 60
@@ -58,29 +59,48 @@ class DouyinControlConfig:
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("api_upstream must be an absolute HTTP URL")
         object.__setattr__(self, "api_upstream", normalized_api_upstream)
-        if self.provider_mode not in {"disabled", "mock"}:
-            raise ValueError("stage 0 provider mode must be disabled or mock")
+        if self.provider_mode not in {"disabled", "mock", "douyin"}:
+            raise ValueError("provider mode must be disabled, mock, or douyin")
         if self.authorization_enabled:
-            if self.provider_mode != "mock":
-                raise ValueError("enabled stage 0 authorization requires mock mode")
             if not self.client_key or self.client_secret_path is None:
-                raise ValueError("mock OAuth credentials are required when enabled")
-            for label, value in (
-                ("authorize", self.provider_authorize_url),
-                ("token", self.provider_token_url),
-                ("userinfo", self.provider_userinfo_url),
-            ):
-                self._require_loopback_url(label, value)
+                raise ValueError("OAuth credentials are required when enabled")
+            if len(self.client_key) > 256:
+                raise ValueError("client_key is too long")
+            if self.provider_mode == "mock":
+                for label, value in (
+                    ("authorize", self.provider_authorize_url),
+                    ("token", self.provider_token_url),
+                    ("userinfo", self.provider_userinfo_url),
+                ):
+                    self._require_loopback_url(label, value)
+                if self.provider_proxy_url:
+                    raise ValueError("mock mode must not configure a provider proxy")
+            elif self.provider_mode == "douyin":
+                if any(
+                    (
+                        self.provider_authorize_url,
+                        self.provider_token_url,
+                        self.provider_userinfo_url,
+                    )
+                ):
+                    raise ValueError("douyin provider endpoints are fixed")
+                self._require_loopback_proxy(self.provider_proxy_url)
+            else:
+                raise ValueError("enabled authorization requires a provider")
             callback = urlsplit(self.callback_url)
             expected_path = self.public_route("/oauth/douyin/callback")
             if (
                 callback.scheme not in {"http", "https"}
                 or not callback.netloc
+                or callback.username
+                or callback.password
                 or callback.path != expected_path
                 or callback.query
                 or callback.fragment
             ):
                 raise ValueError("callback_url must be the exact public callback URL")
+            if self.provider_mode == "douyin" and callback.scheme != "https":
+                raise ValueError("douyin callback_url must use HTTPS")
         elif self.provider_mode != "disabled":
             raise ValueError("disabled authorization requires disabled provider mode")
         if not 60 <= self.state_ttl_seconds <= 30 * 60:
@@ -102,14 +122,37 @@ class DouyinControlConfig:
         if not is_loopback or parsed.username or parsed.password or parsed.fragment:
             raise ValueError(f"mock {label} URL must use a loopback host")
 
+    @staticmethod
+    def _require_loopback_proxy(value: str) -> None:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme != "http"
+            or not parsed.hostname
+            or parsed.port is None
+            or parsed.username
+            or parsed.password
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(
+                "douyin provider proxy must be an absolute loopback HTTP URL"
+            )
+        try:
+            is_loopback = ipaddress.ip_address(parsed.hostname).is_loopback
+        except ValueError:
+            is_loopback = parsed.hostname.lower() == "localhost"
+        if not is_loopback:
+            raise ValueError("douyin provider proxy must use a loopback host")
+
     @classmethod
     def from_env(cls) -> "DouyinControlConfig":
-        credential_root = Path(os.environ.get("CREDENTIALS_DIRECTORY", "/run/credentials"))
+        credential_root = Path(
+            os.environ.get("CREDENTIALS_DIRECTORY", "/run/credentials")
+        )
         state_root = PROJECT_ROOT / "runtime" / "douyin-control"
         return cls(
-            public_base_path=os.environ.get(
-                "DCAR_DOUYIN_PUBLIC_BASE_PATH", "/dcar"
-            ),
+            public_base_path=os.environ.get("DCAR_DOUYIN_PUBLIC_BASE_PATH", "/dcar"),
             vault_path=Path(
                 os.environ.get(
                     "DCAR_DOUYIN_VAULT",
@@ -156,12 +199,11 @@ class DouyinControlConfig:
             provider_authorize_url=os.environ.get(
                 "DCAR_DOUYIN_PROVIDER_AUTHORIZE_URL", ""
             ),
-            provider_token_url=os.environ.get(
-                "DCAR_DOUYIN_PROVIDER_TOKEN_URL", ""
-            ),
+            provider_token_url=os.environ.get("DCAR_DOUYIN_PROVIDER_TOKEN_URL", ""),
             provider_userinfo_url=os.environ.get(
                 "DCAR_DOUYIN_PROVIDER_USERINFO_URL", ""
             ),
+            provider_proxy_url=os.environ.get("DCAR_DOUYIN_PROXY_URL", ""),
             callback_url=os.environ.get("DCAR_DOUYIN_CALLBACK_URL", ""),
             state_ttl_seconds=int(
                 os.environ.get("DCAR_DOUYIN_STATE_TTL_SECONDS", "600")

@@ -1,7 +1,7 @@
 [Unit]
 Description=DcarAIGC Douyin Open Platform control plane
-After=network-online.target dcar-api.service
-Wants=network-online.target dcar-api.service
+After=network-online.target dcar-api.service dcar-douyin-egress.service
+Wants=network-online.target dcar-api.service dcar-douyin-egress.service
 ConditionPathIsDirectory=/var/lib/dcar-aigc/douyin-control
 
 [Service]
@@ -15,10 +15,13 @@ Environment=DCAR_DOUYIN_VAULT=/var/lib/dcar-aigc/douyin-control/vault.sqlite3
 Environment=DCAR_DOUYIN_API_UPSTREAM=http://127.0.0.1:8765
 Environment=DOUYIN_AUTHORIZATION_ENABLED=0
 Environment=DCAR_DOUYIN_PROVIDER=disabled
+Environment=DCAR_DOUYIN_PROXY_URL=http://127.0.0.1:4176
+Environment=DCAR_DOUYIN_CLIENT_SECRET_FILE=/run/credentials/dcar-douyin-control.service/douyin-client-secret
 LoadCredential=douyin-edge-key:/etc/dcar-aigc/credentials/douyin-edge-key
 LoadCredential=douyin-machine-key:/etc/dcar-aigc/credentials/douyin-machine-key
 LoadCredential=douyin-fernet-keyring:/etc/dcar-aigc/credentials/douyin-fernet-keyring
 LoadCredential=douyin-open-id-hmac-key:/etc/dcar-aigc/credentials/douyin-open-id-hmac-key
+LoadCredential=douyin-client-secret:/etc/dcar-aigc/credentials/douyin-client-secret
 ExecStart=/var/www/dcar-aigc/current/.venv/bin/python -m uvicorn dcar_douyin_control.app:app --app-dir /var/www/dcar-aigc/current/src/dcar_eval --host 127.0.0.1 --port 4175 --workers 1 --no-access-log
 Restart=on-failure
 RestartSec=5s

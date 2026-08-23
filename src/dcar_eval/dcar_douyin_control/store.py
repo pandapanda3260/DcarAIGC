@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hmac
+import re
 import sqlite3
 import stat
 import time
@@ -13,6 +14,9 @@ from typing import TYPE_CHECKING, Any, Iterator, Mapping, Optional
 if TYPE_CHECKING:
     from .crypto import TokenCipher
 
+
+VAULT_SCHEMA_VERSION = 2
+_AUTHORIZATION_ID_RE = re.compile(r"[0-9a-f]{32}\Z")
 
 
 class StateTransitionError(RuntimeError):
@@ -40,8 +44,43 @@ class VaultStore:
         self._preflight_delete_journal()
         connection = self._connect()
         try:
-            connection.executescript(
-                """
+            current_version = int(
+                connection.execute("PRAGMA user_version").fetchone()[0]
+            )
+            existing_tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+                if not str(row[0]).startswith("sqlite_")
+            }
+            if current_version == 0:
+                vault_tables = {
+                    "oauth_states",
+                    "douyin_authorizations",
+                    "audit_events",
+                }
+                if existing_tables.intersection(vault_tables):
+                    raise RuntimeError(
+                        "Douyin Vault has application tables but no supported schema version"
+                    )
+                self._create_schema_v2(connection)
+            elif current_version == 1:
+                self._migrate_v1_to_v2(connection)
+            elif current_version == VAULT_SCHEMA_VERSION:
+                self._validate_schema_v2(connection)
+            else:
+                raise RuntimeError(
+                    f"Unsupported Douyin Vault schema version: {current_version}"
+                )
+        finally:
+            connection.close()
+        self.path.chmod(0o600)
+
+    @staticmethod
+    def _create_schema_v2(connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            """
                 BEGIN IMMEDIATE;
                 CREATE TABLE IF NOT EXISTS oauth_states(
                     state_digest TEXT PRIMARY KEY,
@@ -95,7 +134,7 @@ class VaultStore:
                 );
 
                 CREATE UNIQUE INDEX IF NOT EXISTS douyin_authorizations_active_target
-                    ON douyin_authorizations(account_id,platform_uid)
+                    ON douyin_authorizations(platform_uid)
                     WHERE status='active';
 
                 CREATE TABLE IF NOT EXISTS audit_events(
@@ -108,16 +147,98 @@ class VaultStore:
                     subject_fingerprint TEXT NOT NULL,
                     request_id TEXT NOT NULL
                 );
-                PRAGMA user_version=1;
+                PRAGMA user_version=2;
                 COMMIT;
+            """
+        )
+
+    @staticmethod
+    def _active_platform_uid_duplicates(
+        connection: sqlite3.Connection,
+    ) -> list[str]:
+        return [
+            str(row[0])
+            for row in connection.execute(
+                """
+                SELECT platform_uid
+                FROM douyin_authorizations
+                WHERE status='active'
+                GROUP BY platform_uid
+                HAVING COUNT(*)>1
+                ORDER BY platform_uid
                 """
             )
+        ]
+
+    @staticmethod
+    def _invalid_authorization_ids(connection: sqlite3.Connection) -> int:
+        return int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM douyin_authorizations
+                WHERE length(id)!=32 OR id GLOB '*[^0-9a-f]*'
+                """
+            ).fetchone()[0]
+        )
+
+    @classmethod
+    def _migrate_v1_to_v2(cls, connection: sqlite3.Connection) -> None:
+        required_tables = {"oauth_states", "douyin_authorizations", "audit_events"}
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        if not required_tables.issubset(tables):
+            raise RuntimeError("Douyin Vault schema v1 is missing required tables")
+        if cls._invalid_authorization_ids(connection):
+            raise RuntimeError("Douyin Vault schema v1 has invalid authorization IDs")
+        duplicates = cls._active_platform_uid_duplicates(connection)
+        if duplicates:
+            raise RuntimeError(
+                "Douyin Vault schema v1 has duplicate active platform_uid values"
+            )
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "DROP INDEX IF EXISTS douyin_authorizations_active_target"
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX douyin_authorizations_active_target
+                ON douyin_authorizations(platform_uid)
+                WHERE status='active'
+                """
+            )
+            connection.execute(f"PRAGMA user_version={VAULT_SCHEMA_VERSION}")
+            connection.commit()
         except BaseException:
             connection.rollback()
             raise
-        finally:
-            connection.close()
-        self.path.chmod(0o600)
+
+    @classmethod
+    def _validate_schema_v2(cls, connection: sqlite3.Connection) -> None:
+        if cls._invalid_authorization_ids(connection):
+            raise RuntimeError("Douyin Vault schema v2 has invalid authorization IDs")
+        duplicates = cls._active_platform_uid_duplicates(connection)
+        if duplicates:
+            raise RuntimeError("Douyin Vault schema v2 violates active UID uniqueness")
+        index = connection.execute(
+            """
+            SELECT sql FROM sqlite_master
+            WHERE type='index' AND name='douyin_authorizations_active_target'
+            """
+        ).fetchone()
+        if index is None or index[0] is None:
+            raise RuntimeError("Douyin Vault schema v2 active UID index is missing")
+        normalized = "".join(str(index[0]).lower().split())
+        if (
+            "on douyin_authorizations(platform_uid)".replace(" ", "")
+            not in normalized
+            or "wherestatus='active'" not in normalized
+        ):
+            raise RuntimeError("Douyin Vault schema v2 active UID index is invalid")
 
     def _preflight_delete_journal(self) -> None:
         connection = sqlite3.connect(self.path, timeout=10.0, isolation_level=None)
@@ -509,19 +630,18 @@ class VaultStore:
             occupied = connection.execute(
                 """
                 SELECT id,open_id_fingerprint FROM douyin_authorizations
-                WHERE account_id=? AND platform_uid=? AND status='active'
+                WHERE platform_uid=? AND status='active'
                 """,
-                (account_id, platform_uid),
+                (platform_uid,),
             ).fetchone()
-            if existing is not None and not hmac.compare_digest(
+            if existing is not None and str(existing["platform_uid"]) != platform_uid:
+                conflict_reason = "open_id_rebind_conflict"
+            elif existing is not None and int(existing["account_id"]) != account_id:
+                conflict_reason = "target_changed"
+            elif existing is not None and not hmac.compare_digest(
                 str(existing["bound_username"]), bound_username
             ):
                 conflict_reason = "owner_conflict"
-            elif existing is not None and str(existing["status"]) == "active" and (
-                int(existing["account_id"]) != account_id
-                or str(existing["platform_uid"]) != platform_uid
-            ):
-                conflict_reason = "open_id_rebind_conflict"
             elif occupied is not None and not hmac.compare_digest(
                 str(occupied["open_id_fingerprint"]), open_id_fingerprint
             ):
@@ -702,6 +822,441 @@ class VaultStore:
                 now=timestamp,
             )
             return True
+
+    @staticmethod
+    def _validate_authorization_id(authorization_id: str) -> None:
+        if _AUTHORIZATION_ID_RE.fullmatch(authorization_id) is None:
+            raise ValueError("authorization_id must be 32 lowercase hex characters")
+
+    def get_active_authorization(
+        self, authorization_id: str
+    ) -> Optional[dict[str, Any]]:
+        self._validate_authorization_id(authorization_id)
+        with self.read_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM douyin_authorizations
+                WHERE id=? AND status='active'
+                """,
+                (authorization_id,),
+            ).fetchone()
+        item = self._row(row)
+        if item is None:
+            return None
+        item["scopes"] = json.loads(str(item.pop("scopes_json")))
+        item["needs_reauthorization"] = bool(item["needs_reauthorization"])
+        return item
+
+    def acquire_refresh_lease(
+        self,
+        authorization_id: str,
+        *,
+        lease_owner: str,
+        lease_seconds: int,
+        actor: str,
+        request_id: str,
+        now: Optional[int] = None,
+    ) -> bool:
+        self._validate_authorization_id(authorization_id)
+        if not lease_owner or lease_seconds <= 0:
+            raise ValueError("refresh lease requires an owner and positive duration")
+        timestamp = int(time.time()) if now is None else now
+        with self.write_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT open_id_fingerprint FROM douyin_authorizations WHERE id=?
+                """,
+                (authorization_id,),
+            ).fetchone()
+            cursor = connection.execute(
+                """
+                UPDATE douyin_authorizations
+                SET refresh_lease_owner=?,refresh_lease_expires_at=?,updated_at=?
+                WHERE id=? AND status='active' AND needs_reauthorization=0
+                  AND (refresh_lease_owner IS NULL
+                       OR refresh_lease_expires_at IS NULL
+                       OR refresh_lease_expires_at<=?
+                       OR refresh_lease_owner=?)
+                """,
+                (
+                    lease_owner,
+                    timestamp + lease_seconds,
+                    timestamp,
+                    authorization_id,
+                    timestamp,
+                    lease_owner,
+                ),
+            )
+            acquired = cursor.rowcount == 1
+            self._audit(
+                connection,
+                actor=actor,
+                action="token_refresh_lease_acquire",
+                result="acquired" if acquired else "rejected",
+                reason_code="ok" if acquired else "lease_unavailable",
+                subject_fingerprint=(
+                    str(row["open_id_fingerprint"])
+                    if row is not None
+                    else authorization_id
+                ),
+                request_id=request_id,
+                now=timestamp,
+            )
+            return acquired
+
+    def release_refresh_lease(
+        self,
+        authorization_id: str,
+        *,
+        lease_owner: str,
+        actor: str,
+        request_id: str,
+        now: Optional[int] = None,
+    ) -> bool:
+        self._validate_authorization_id(authorization_id)
+        if not lease_owner:
+            raise ValueError("refresh lease owner is required")
+        timestamp = int(time.time()) if now is None else now
+        with self.write_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT open_id_fingerprint FROM douyin_authorizations WHERE id=?
+                """,
+                (authorization_id,),
+            ).fetchone()
+            cursor = connection.execute(
+                """
+                UPDATE douyin_authorizations
+                SET refresh_lease_owner=NULL,refresh_lease_expires_at=NULL,
+                    updated_at=?
+                WHERE id=? AND refresh_lease_owner=?
+                """,
+                (timestamp, authorization_id, lease_owner),
+            )
+            released = cursor.rowcount == 1
+            self._audit(
+                connection,
+                actor=actor,
+                action="token_refresh_lease_release",
+                result="released" if released else "rejected",
+                reason_code="ok" if released else "lease_not_owned",
+                subject_fingerprint=(
+                    str(row["open_id_fingerprint"])
+                    if row is not None
+                    else authorization_id
+                ),
+                request_id=request_id,
+                now=timestamp,
+            )
+            return released
+
+    def update_access_token(
+        self,
+        authorization_id: str,
+        *,
+        lease_owner: str,
+        access_token_ciphertext: bytes,
+        access_expires_at: int,
+        key_version: int,
+        actor: str,
+        request_id: str,
+        now: Optional[int] = None,
+    ) -> bool:
+        self._validate_authorization_id(authorization_id)
+        if not lease_owner or not access_token_ciphertext or key_version < 1:
+            raise ValueError("invalid access token update")
+        timestamp = int(time.time()) if now is None else now
+        if access_expires_at <= timestamp:
+            raise ValueError("access token expiry must be in the future")
+        with self.write_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT open_id_fingerprint FROM douyin_authorizations WHERE id=?
+                """,
+                (authorization_id,),
+            ).fetchone()
+            cursor = connection.execute(
+                """
+                UPDATE douyin_authorizations
+                SET access_token_ciphertext=?,access_expires_at=?,key_version=?,
+                    updated_at=?
+                WHERE id=? AND status='active' AND needs_reauthorization=0
+                  AND refresh_lease_owner=? AND refresh_lease_expires_at>?
+                """,
+                (
+                    access_token_ciphertext,
+                    access_expires_at,
+                    key_version,
+                    timestamp,
+                    authorization_id,
+                    lease_owner,
+                    timestamp,
+                ),
+            )
+            updated = cursor.rowcount == 1
+            self._audit(
+                connection,
+                actor=actor,
+                action="access_token_update",
+                result="updated" if updated else "rejected",
+                reason_code="ok" if updated else "refresh_lease_required",
+                subject_fingerprint=(
+                    str(row["open_id_fingerprint"])
+                    if row is not None
+                    else authorization_id
+                ),
+                request_id=request_id,
+                now=timestamp,
+            )
+            return updated
+
+    def update_refreshed_token_bundle(
+        self,
+        authorization_id: str,
+        *,
+        lease_owner: str,
+        access_token_ciphertext: bytes,
+        refresh_token_ciphertext: bytes,
+        access_expires_at: int,
+        refresh_expires_at: int,
+        key_version: int,
+        actor: str,
+        request_id: str,
+        now: Optional[int] = None,
+    ) -> bool:
+        self._validate_authorization_id(authorization_id)
+        if (
+            not lease_owner
+            or not access_token_ciphertext
+            or not refresh_token_ciphertext
+            or key_version < 1
+        ):
+            raise ValueError("invalid refreshed token bundle")
+        timestamp = int(time.time()) if now is None else now
+        if access_expires_at <= timestamp or refresh_expires_at <= timestamp:
+            raise ValueError("refreshed token expiry must be in the future")
+        with self.write_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT open_id_fingerprint FROM douyin_authorizations WHERE id=?
+                """,
+                (authorization_id,),
+            ).fetchone()
+            cursor = connection.execute(
+                """
+                UPDATE douyin_authorizations
+                SET access_token_ciphertext=?,refresh_token_ciphertext=?,
+                    access_expires_at=?,refresh_expires_at=?,key_version=?,
+                    updated_at=?
+                WHERE id=? AND status='active' AND needs_reauthorization=0
+                  AND refresh_lease_owner=? AND refresh_lease_expires_at>?
+                """,
+                (
+                    access_token_ciphertext,
+                    refresh_token_ciphertext,
+                    access_expires_at,
+                    refresh_expires_at,
+                    key_version,
+                    timestamp,
+                    authorization_id,
+                    lease_owner,
+                    timestamp,
+                ),
+            )
+            updated = cursor.rowcount == 1
+            self._audit(
+                connection,
+                actor=actor,
+                action="token_bundle_refresh",
+                result="updated" if updated else "rejected",
+                reason_code="ok" if updated else "refresh_lease_required",
+                subject_fingerprint=(
+                    str(row["open_id_fingerprint"])
+                    if row is not None
+                    else authorization_id
+                ),
+                request_id=request_id,
+                now=timestamp,
+            )
+            return updated
+
+    def rotate_authorization_tokens(
+        self,
+        authorization_id: str,
+        *,
+        lease_owner: str,
+        access_token_ciphertext: bytes,
+        refresh_token_ciphertext: bytes,
+        key_version: int,
+        actor: str,
+        request_id: str,
+        now: Optional[int] = None,
+    ) -> bool:
+        self._validate_authorization_id(authorization_id)
+        if (
+            not lease_owner
+            or not access_token_ciphertext
+            or not refresh_token_ciphertext
+            or key_version < 1
+        ):
+            raise ValueError("invalid token ciphertext rotation")
+        timestamp = int(time.time()) if now is None else now
+        with self.write_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT open_id_fingerprint FROM douyin_authorizations WHERE id=?
+                """,
+                (authorization_id,),
+            ).fetchone()
+            cursor = connection.execute(
+                """
+                UPDATE douyin_authorizations
+                SET access_token_ciphertext=?,refresh_token_ciphertext=?,
+                    key_version=?,updated_at=?
+                WHERE id=? AND status='active' AND needs_reauthorization=0
+                  AND refresh_lease_owner=? AND refresh_lease_expires_at>?
+                """,
+                (
+                    access_token_ciphertext,
+                    refresh_token_ciphertext,
+                    key_version,
+                    timestamp,
+                    authorization_id,
+                    lease_owner,
+                    timestamp,
+                ),
+            )
+            updated = cursor.rowcount == 1
+            self._audit(
+                connection,
+                actor=actor,
+                action="token_ciphertext_rotate",
+                result="updated" if updated else "rejected",
+                reason_code="ok" if updated else "refresh_lease_required",
+                subject_fingerprint=(
+                    str(row["open_id_fingerprint"])
+                    if row is not None
+                    else authorization_id
+                ),
+                request_id=request_id,
+                now=timestamp,
+            )
+            return updated
+
+    def renew_refresh_token(
+        self,
+        authorization_id: str,
+        *,
+        lease_owner: str,
+        refresh_token_ciphertext: bytes,
+        refresh_expires_at: int,
+        key_version: int,
+        actor: str,
+        request_id: str,
+        now: Optional[int] = None,
+    ) -> bool:
+        self._validate_authorization_id(authorization_id)
+        if not lease_owner or not refresh_token_ciphertext or key_version < 1:
+            raise ValueError("invalid refresh token renewal")
+        timestamp = int(time.time()) if now is None else now
+        if refresh_expires_at <= timestamp:
+            raise ValueError("refresh token expiry must be in the future")
+        with self.write_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT open_id_fingerprint,renew_count
+                FROM douyin_authorizations WHERE id=?
+                """,
+                (authorization_id,),
+            ).fetchone()
+            cursor = connection.execute(
+                """
+                UPDATE douyin_authorizations
+                SET refresh_token_ciphertext=?,refresh_expires_at=?,
+                    renew_count=renew_count+1,key_version=?,updated_at=?
+                WHERE id=? AND status='active' AND needs_reauthorization=0
+                  AND renew_count<5
+                  AND refresh_lease_owner=? AND refresh_lease_expires_at>?
+                """,
+                (
+                    refresh_token_ciphertext,
+                    refresh_expires_at,
+                    key_version,
+                    timestamp,
+                    authorization_id,
+                    lease_owner,
+                    timestamp,
+                ),
+            )
+            updated = cursor.rowcount == 1
+            reason_code = "ok"
+            if not updated:
+                reason_code = (
+                    "renew_limit_reached"
+                    if row is not None and int(row["renew_count"]) >= 5
+                    else "refresh_lease_required"
+                )
+            self._audit(
+                connection,
+                actor=actor,
+                action="refresh_token_renew",
+                result="updated" if updated else "rejected",
+                reason_code=reason_code,
+                subject_fingerprint=(
+                    str(row["open_id_fingerprint"])
+                    if row is not None
+                    else authorization_id
+                ),
+                request_id=request_id,
+                now=timestamp,
+            )
+            return updated
+
+    def mark_needs_reauthorization(
+        self,
+        authorization_id: str,
+        *,
+        actor: str,
+        reason_code: str,
+        request_id: str,
+        now: Optional[int] = None,
+    ) -> bool:
+        self._validate_authorization_id(authorization_id)
+        if not reason_code:
+            raise ValueError("reauthorization reason is required")
+        timestamp = int(time.time()) if now is None else now
+        with self.write_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT open_id_fingerprint FROM douyin_authorizations WHERE id=?
+                """,
+                (authorization_id,),
+            ).fetchone()
+            cursor = connection.execute(
+                """
+                UPDATE douyin_authorizations
+                SET needs_reauthorization=1,refresh_lease_owner=NULL,
+                    refresh_lease_expires_at=NULL,updated_at=?
+                WHERE id=? AND status='active' AND needs_reauthorization=0
+                """,
+                (timestamp, authorization_id),
+            )
+            updated = cursor.rowcount == 1
+            self._audit(
+                connection,
+                actor=actor,
+                action="authorization_reauthorization_required",
+                result="marked" if updated else "unchanged",
+                reason_code=reason_code,
+                subject_fingerprint=(
+                    str(row["open_id_fingerprint"])
+                    if row is not None
+                    else authorization_id
+                ),
+                request_id=request_id,
+                now=timestamp,
+            )
+            return updated
 
     def list_authorizations(self, bound_username: str) -> list[dict[str, Any]]:
         with self.read_connection() as connection:

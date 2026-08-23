@@ -1,0 +1,50 @@
+[Unit]
+Description=DcarAIGC Douyin Open Platform restricted egress proxy
+After=network-online.target
+Wants=network-online.target
+ConditionFileNotEmpty=/etc/squid/dcar-douyin-egress.conf
+
+[Service]
+Type=simple
+User=proxy
+Group=proxy
+RuntimeDirectory=dcar-douyin-egress
+RuntimeDirectoryMode=0750
+WorkingDirectory=/run/dcar-douyin-egress
+ExecStartPre=/usr/sbin/squid -k parse -f /etc/squid/dcar-douyin-egress.conf
+ExecStart=/usr/sbin/squid -N -f /etc/squid/dcar-douyin-egress.conf
+ExecReload=/usr/sbin/squid -k reconfigure -f /etc/squid/dcar-douyin-egress.conf
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+UMask=0077
+LimitCORE=0
+
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+SystemCallArchitectures=native
+
+CPUQuota=50%
+MemoryMax=256M
+TasksMax=64
+LimitNOFILE=8192
+
+[Install]
+WantedBy=multi-user.target

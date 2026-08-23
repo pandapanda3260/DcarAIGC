@@ -96,12 +96,14 @@ class DouyinControlBackupTestCase(unittest.TestCase):
         self.assertEqual(self.source.stat().st_mtime_ns, source_mtime)
         with sqlite3.connect(target) as connection:
             self.assertEqual(connection.execute("PRAGMA quick_check").fetchone()[0], "ok")
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
             ciphertext = connection.execute(
                 "SELECT candidate_ciphertext FROM oauth_states WHERE state_digest=?",
                 ("d" * 64,),
             ).fetchone()[0]
         self.assertEqual(ciphertext, b"encrypted-candidate-canary")
         manifest_payload = json.loads(manifest.read_text(encoding="utf-8"))
+        self.assertEqual(manifest_payload["schema"], "dcar-douyin-vault-backup-v2")
         self.assertEqual(manifest_payload["sha256"], result["sha256"])
         self.assertEqual(manifest_payload["counts"]["ciphertext_records"], 1)
         self.assertEqual(list(self.backup_dir.glob("*.partial")), [])

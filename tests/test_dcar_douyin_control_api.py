@@ -10,7 +10,7 @@ import unittest
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qs, urlsplit
 
 from cryptography.fernet import Fernet
@@ -25,6 +25,7 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "src" / "dcar_eval"))
 
 from dcar_douyin_control.app import create_app  # noqa: E402
 from dcar_douyin_control.config import DouyinControlConfig  # noqa: E402
+from dcar_douyin_control.provider import DouyinOAuthClient  # noqa: E402
 from tests.fixtures.mock_douyin_oauth import (  # noqa: E402
     MockDouyinState,
     create_mock_douyin_oauth,
@@ -128,7 +129,10 @@ class DouyinControlApiTestCase(unittest.TestCase):
         credential_root = self.root / "systemd-credentials"
         with patch.dict(
             os.environ,
-            {"CREDENTIALS_DIRECTORY": str(credential_root)},
+            {
+                "CREDENTIALS_DIRECTORY": str(credential_root),
+                "DCAR_DOUYIN_PROXY_URL": "http://127.0.0.1:4176",
+            },
             clear=True,
         ):
             config = DouyinControlConfig.from_env()
@@ -144,6 +148,38 @@ class DouyinControlApiTestCase(unittest.TestCase):
             config.open_id_hmac_key_path,
             credential_root / "douyin-open-id-hmac-key",
         )
+        self.assertEqual(config.provider_proxy_url, "http://127.0.0.1:4176")
+
+    def test_real_provider_wires_token_manager_and_closes_client(self) -> None:
+        config = DouyinControlConfig(
+            public_base_path="/dcar",
+            vault_path=self.root / "real-vault.sqlite3",
+            edge_key_path=self.edge_path,
+            machine_key_path=self.machine_path,
+            fernet_keyring_path=self.keyring_path,
+            open_id_hmac_key_path=self.hmac_path,
+            api_upstream="http://api.test",
+            authorization_enabled=True,
+            provider_mode="douyin",
+            client_key=CLIENT_KEY,
+            client_secret_path=self.secret_path,
+            provider_proxy_url="http://127.0.0.1:4176",
+            callback_url="https://dcar.test/dcar/oauth/douyin/callback",
+        )
+        close = AsyncMock()
+        with (
+            patch.object(DouyinOAuthClient, "__init__", return_value=None),
+            patch.object(DouyinOAuthClient, "aclose", close),
+        ):
+            app = create_app(config, api_transport=ASGITransport(app=AccountUpstream().app))
+            with TestClient(app) as client:
+                response = client.get(
+                    "/internal/v1/health",
+                    headers={"X-Dcar-Machine-Key": MACHINE_KEY},
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertIsNotNone(app.state.token_manager)
+        close.assert_awaited_once()
 
     def _config(self, base_path: str, *, enabled: bool = True) -> DouyinControlConfig:
         suffix = "root" if not base_path else "dcar"
@@ -413,6 +449,16 @@ class DouyinControlApiTestCase(unittest.TestCase):
                 )
                 self.assertEqual(confirm_page.status_code, 200)
                 self.assertIn("Mock 抖音账号", confirm_page.text)
+                self.assertIn('class="avatar"', confirm_page.text)
+                self.assertNotIn("https://avatar.example/mock.png", confirm_page.text)
+                self.assertIn(
+                    "img-src 'self' data:",
+                    confirm_page.headers["content-security-policy"],
+                )
+                self.assertNotIn(
+                    "img-src 'self' data: https:",
+                    confirm_page.headers["content-security-policy"],
+                )
                 self.assertNotIn("access-", confirm_page.text)
                 self.assertNotIn("refresh-", confirm_page.text)
 

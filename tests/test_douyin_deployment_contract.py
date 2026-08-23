@@ -19,8 +19,8 @@ class DouyinDeploymentContractTestCase(unittest.TestCase):
         self.assertIn(
             "ConditionPathIsDirectory=/var/lib/dcar-aigc/douyin-control", unit
         )
-        self.assertIn("After=network-online.target dcar-api.service", unit)
-        self.assertIn("Wants=network-online.target dcar-api.service", unit)
+        self.assertRegex(unit, r"After=.*dcar-douyin-egress\.service")
+        self.assertRegex(unit, r"Wants=.*dcar-douyin-egress\.service")
         self.assertIn("--host 127.0.0.1 --port 4175 --workers 1 --no-access-log", unit)
         self.assertIn("ReadWritePaths=/var/lib/dcar-aigc/douyin-control", unit)
         self.assertEqual(unit.count("ReadWritePaths="), 1)
@@ -31,14 +31,63 @@ class DouyinDeploymentContractTestCase(unittest.TestCase):
         self.assertIn("CapabilityBoundingSet=\n", unit)
         self.assertIn("DOUYIN_AUTHORIZATION_ENABLED=0", unit)
         self.assertIn("DCAR_DOUYIN_PROVIDER=disabled", unit)
-        self.assertNotIn("CLIENT_SECRET", unit)
+        self.assertIn(
+            "DCAR_DOUYIN_PROXY_URL=http://127.0.0.1:4176", unit
+        )
+        self.assertIn(
+            "DCAR_DOUYIN_CLIENT_SECRET_FILE=/run/credentials/"
+            "dcar-douyin-control.service/douyin-client-secret",
+            unit,
+        )
         for credential in (
             "douyin-edge-key",
             "douyin-machine-key",
             "douyin-fernet-keyring",
             "douyin-open-id-hmac-key",
+            "douyin-client-secret",
         ):
             self.assertIn(f"LoadCredential={credential}:", unit)
+
+    def test_douyin_egress_is_loopback_only_exact_and_fail_closed(self) -> None:
+        unit = (
+            ROOT / "deploy/server/systemd/dcar-douyin-egress.service"
+        ).read_text(encoding="utf-8")
+        config = (
+            ROOT / "deploy/server/squid/dcar-douyin-egress.conf"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("User=proxy", unit)
+        self.assertIn("Group=proxy", unit)
+        self.assertIn("NoNewPrivileges=true", unit)
+        self.assertIn("ProtectSystem=strict", unit)
+        self.assertIn("CapabilityBoundingSet=", unit)
+        self.assertIn("RestrictAddressFamilies=AF_INET AF_INET6", unit)
+        self.assertIn(
+            "ExecStart=/usr/sbin/squid -N -f /etc/squid/dcar-douyin-egress.conf",
+            unit,
+        )
+
+        self.assertIn("http_port 127.0.0.1:4176", config)
+        self.assertRegex(
+            config,
+            r"(?m)^acl douyin_openapi dstdomain -n open\.douyin\.com$",
+        )
+        self.assertRegex(config, r"(?m)^acl TLS_port port 443$")
+        self.assertRegex(config, r"(?m)^acl CONNECT method CONNECT$")
+        self.assertRegex(config, r"(?m)^http_access deny !CONNECT$")
+        self.assertRegex(config, r"(?m)^http_access deny !TLS_port$")
+        self.assertRegex(
+            config,
+            r"(?m)^http_access allow localhost CONNECT douyin_openapi TLS_port$",
+        )
+        self.assertRegex(config, r"(?m)^http_access deny all$")
+        self.assertIn("cache deny all", config)
+        self.assertIn("cache_mem 0 KB", config)
+        self.assertIn("maximum_object_size 0 KB", config)
+        self.assertNotIn("cache_dir", config)
+        self.assertIn("access_log none", config)
+        self.assertIn("cache_store_log none", config)
+        self.assertNotIn(".open.douyin.com", config)
 
     def test_auth_unit_depends_on_control_and_uses_edge_credential(self) -> None:
         unit = (ROOT / "deploy/server/systemd/dcar-auth.service").read_text(
@@ -181,6 +230,7 @@ class DouyinDeploymentContractTestCase(unittest.TestCase):
         auth = (ROOT / "deploy/server/AUTH.md").read_text(encoding="utf-8")
         for text in (readme, auth):
             self.assertIn("dcar-douyin-control", text)
+            self.assertIn("dcar-douyin-egress", text)
             self.assertIn("dcar-douyin-vault-backup", text)
             self.assertIn("DOUYIN_AUTHORIZATION_ENABLED=0", text)
             self.assertIn("Client Secret", text)
@@ -201,6 +251,9 @@ class DouyinDeploymentContractTestCase(unittest.TestCase):
             readme,
         )
         self.assertIn("useradd --system --user-group", readme)
+        self.assertIn("squid -k parse", readme)
+        self.assertIn("open.douyin.com:443", readme)
+        self.assertIn("DCAR_DOUYIN_PROXY_URL=http://127.0.0.1:4176", readme)
         self.assertIn("先恢复并 reload 前一版 Nginx", auth)
 
 

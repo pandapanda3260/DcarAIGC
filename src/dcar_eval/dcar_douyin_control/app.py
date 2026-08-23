@@ -9,7 +9,6 @@ import secrets
 import time
 from contextlib import asynccontextmanager, suppress
 from typing import Any, Callable, Optional
-from urllib.parse import urlsplit
 
 import httpx
 from fastapi import FastAPI, Request
@@ -19,8 +18,9 @@ from starlette.responses import Response
 
 from .config import DouyinControlConfig
 from .crypto import TokenCipher, read_shared_key
-from .provider import MockOAuthClient, TokenBundle
+from .provider import DouyinOAuthClient, MockOAuthClient, TokenBundle
 from .store import AuthorizationConflict, StateTransitionError, VaultStore
+from .tokens import DouyinTokenManager
 
 
 REQUESTED_SCOPES = ["user_info", "video.list"]
@@ -199,21 +199,9 @@ def _confirm_html(
     nickname = html.escape(str(candidate.get("nickname") or "未获取昵称"))
     uid = html.escape(str(account["uid"]))
     fingerprint_short = html.escape(fingerprint[:12])
-    avatar_value = str(candidate.get("avatar") or "")
-    avatar_url = urlsplit(avatar_value)
-    avatar_html = ""
-    if (
-        avatar_url.scheme == "https"
-        and avatar_url.netloc
-        and not avatar_url.username
-        and not avatar_url.password
-    ):
-        avatar_html = (
-            f'<p><img src="{html.escape(avatar_value, quote=True)}" '
-            'alt="抖音头像" width="64" height="64" referrerpolicy="no-referrer"></p>'
-        )
+    avatar_html = '<p><span class="avatar" aria-hidden="true">抖</span></p>'
     base_json = json.dumps(base_path, ensure_ascii=False)
-    return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>确认抖音授权</title><style nonce="{nonce}">body{{font-family:Arial,'PingFang SC',sans-serif;background:#f3f6f7;color:#13262d}}main{{max-width:620px;margin:60px auto;background:white;padding:28px;border-radius:14px}}button{{padding:11px 18px;margin-right:8px;border:0;border-radius:8px;background:#102c35;color:white}}button.secondary{{background:#68777d}}</style></head><body><main><h1>确认账号授权</h1><p>业务账号：{operator_name}</p><p>抖音昵称：{nickname}</p>{avatar_html}<p>抖音 UID：{uid}</p><p>Open ID 指纹：{fingerprint_short}</p><button id="confirm">确认绑定</button><button class="secondary" id="reject">拒绝并清除</button><p id="message"></p></main><script nonce="{nonce}">"use strict";const BASE={base_json};async function act(path,marker){{const response=await fetch(BASE+path,{{method:'POST',credentials:'include',headers:{{'Content-Type':'application/json','X-Dcar-Request':marker}},body:'{{}}'}});const data=await response.json();if(!response.ok){{document.getElementById('message').textContent=data.detail||'操作失败';return}}window.location.replace(data.redirect_to)}}document.getElementById('confirm').onclick=()=>act('/api/douyin/oauth/confirm','douyin-oauth-confirm');document.getElementById('reject').onclick=()=>act('/api/douyin/oauth/reject','douyin-oauth-reject');</script></body></html>"""
+    return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>确认抖音授权</title><style nonce="{nonce}">body{{font-family:Arial,'PingFang SC',sans-serif;background:#f3f6f7;color:#13262d}}main{{max-width:620px;margin:60px auto;background:white;padding:28px;border-radius:14px}}.avatar{{display:inline-grid;place-items:center;width:64px;height:64px;border-radius:50%;background:#eef3f4;color:#102c35;font-size:28px;font-weight:700}}button{{padding:11px 18px;margin-right:8px;border:0;border-radius:8px;background:#102c35;color:white}}button.secondary{{background:#68777d}}</style></head><body><main><h1>确认账号授权</h1><p>业务账号：{operator_name}</p><p>抖音昵称：{nickname}</p>{avatar_html}<p>抖音 UID：{uid}</p><p>Open ID 指纹：{fingerprint_short}</p><button id="confirm">确认绑定</button><button class="secondary" id="reject">拒绝并清除</button><p id="message"></p></main><script nonce="{nonce}">"use strict";const BASE={base_json};async function act(path,marker){{const response=await fetch(BASE+path,{{method:'POST',credentials:'include',headers:{{'Content-Type':'application/json','X-Dcar-Request':marker}},body:'{{}}'}});const data=await response.json();if(!response.ok){{document.getElementById('message').textContent=data.detail||'操作失败';return}}window.location.replace(data.redirect_to)}}document.getElementById('confirm').onclick=()=>act('/api/douyin/oauth/confirm','douyin-oauth-confirm');document.getElementById('reject').onclick=()=>act('/api/douyin/oauth/reject','douyin-oauth-reject');</script></body></html>"""
 
 
 def create_app(
@@ -244,15 +232,22 @@ def create_app(
             trust_env=False,
         )
         oauth_client: Optional[httpx.AsyncClient] = None
-        provider: Optional[MockOAuthClient] = None
+        provider: Optional[MockOAuthClient | DouyinOAuthClient] = None
+        token_manager: Optional[DouyinTokenManager] = None
         if resolved.authorization_enabled:
-            oauth_client = httpx.AsyncClient(
-                transport=oauth_transport,
-                timeout=httpx.Timeout(10, connect=2, read=10, write=5, pool=2),
-                follow_redirects=False,
-                trust_env=False,
-            )
-            provider = MockOAuthClient(resolved, oauth_client, clock=clock)
+            if resolved.provider_mode == "mock":
+                oauth_client = httpx.AsyncClient(
+                    transport=oauth_transport,
+                    timeout=httpx.Timeout(10, connect=2, read=10, write=5, pool=2),
+                    follow_redirects=False,
+                    trust_env=False,
+                )
+                provider = MockOAuthClient(resolved, oauth_client, clock=clock)
+            else:
+                provider = DouyinOAuthClient(resolved, clock=clock)
+                token_manager = DouyinTokenManager(
+                    store, cipher, provider, clock=clock
+                )
 
         async def cleanup_expired_states() -> None:
             while True:
@@ -267,6 +262,7 @@ def create_app(
         application.state.api_client = api_client
         application.state.accounts = AccountDirectory(api_client, resolved.api_upstream)
         application.state.provider = provider
+        application.state.token_manager = token_manager
         try:
             yield
         finally:
@@ -276,6 +272,8 @@ def create_app(
             await api_client.aclose()
             if oauth_client is not None:
                 await oauth_client.aclose()
+            if isinstance(provider, DouyinOAuthClient):
+                await provider.aclose()
 
     application = FastAPI(
         title="Dcar Douyin control plane",
@@ -335,7 +333,7 @@ def create_app(
         response = HTMLResponse(_index_html(resolved.public_base_path, nonce))
         response.headers["Content-Security-Policy"] = (
             f"default-src 'self'; style-src 'nonce-{nonce}'; "
-            f"script-src 'nonce-{nonce}'; img-src 'self' data: https:; "
+            f"script-src 'nonce-{nonce}'; img-src 'self' data:; "
             "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"
         )
         response.headers["X-Frame-Options"] = "DENY"
@@ -393,7 +391,9 @@ def create_app(
             request_id=_request_id(request),
             now=now,
         )
-        provider: Optional[MockOAuthClient] = request.app.state.provider
+        provider: Optional[MockOAuthClient | DouyinOAuthClient] = (
+            request.app.state.provider
+        )
         if provider is None:
             return JSONResponse(
                 {"detail": "抖音授权功能尚未启用"}, status_code=409
@@ -537,7 +537,7 @@ def create_app(
         response.headers["Content-Security-Policy"] = (
             f"default-src 'self'; style-src 'nonce-{nonce}'; "
             f"script-src 'nonce-{nonce}'; connect-src 'self'; "
-            "img-src 'self' data: https:; frame-ancestors 'none'; base-uri 'none'"
+            "img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'"
         )
         response.headers["X-Frame-Options"] = "DENY"
         return response
