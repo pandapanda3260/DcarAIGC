@@ -15,6 +15,7 @@ import v8.duplicates as duplicates_module
 from v8.contracts import load_contract
 from v8.duplicates import (
     CALIBRATION_PATH,
+    DuplicateDetectionError,
     FINGERPRINT_VERSION,
     THRESHOLDS,
     _image_phash,
@@ -25,8 +26,10 @@ from v8.duplicates import (
     compare_fingerprints,
     duplicate_metric_decision,
     fingerprint_content,
+    refresh_content_duplicates,
     rebuild_duplicate_relations,
     run_duplicate_fingerprint_queue,
+    update_duplicate_relations_incremental,
 )
 from v8.storage import connect, initialize_database, now_utc
 
@@ -379,7 +382,7 @@ class V8DuplicateDetectionTest(unittest.TestCase):
             [true_candidate],
         )
 
-    def test_queue_rebuilds_relations_only_after_the_full_backlog_is_drained(self) -> None:
+    def test_queue_updates_relations_after_each_batch_without_waiting_for_drain(self) -> None:
         self._content("U2BC3D")
         self._content("V2BC3D")
         rebuilt_payload = {"duplicate_relations": 0}
@@ -387,19 +390,22 @@ class V8DuplicateDetectionTest(unittest.TestCase):
         with (
             patch("v8.duplicates.calibration_ready", return_value=True),
             patch(
-                "v8.duplicates.rebuild_duplicate_relations",
+                "v8.duplicates.update_duplicate_relations_incremental",
                 return_value=rebuilt_payload,
-            ) as rebuild,
+            ) as update,
         ):
             first = run_duplicate_fingerprint_queue(limit=1, db_path=self.db)
             self.assertEqual(first["processed"], 1)
-            self.assertIsNone(first["relations"])
-            rebuild.assert_not_called()
+            self.assertEqual(first["relations"], rebuilt_payload)
+            self.assertTrue(first["truncated"])
+            update.assert_called_once_with([1], db_path=self.db)
 
             second = run_duplicate_fingerprint_queue(limit=1, db_path=self.db)
             self.assertEqual(second["processed"], 1)
             self.assertEqual(second["relations"], rebuilt_payload)
-            rebuild.assert_called_once_with(db_path=self.db)
+            self.assertFalse(second["truncated"])
+            self.assertEqual(update.call_count, 2)
+            update.assert_called_with([2], db_path=self.db)
 
     def test_queue_does_not_rebuild_when_batch_reports_failure_even_if_fingerprint_was_written(self) -> None:
         successful_id = self._content("W2BC3D")
@@ -418,16 +424,207 @@ class V8DuplicateDetectionTest(unittest.TestCase):
                 "v8.duplicates.fingerprint_content",
                 side_effect=fingerprint_then_fail,
             ),
-            patch("v8.duplicates.rebuild_duplicate_relations") as rebuild,
+            patch(
+                "v8.duplicates.update_duplicate_relations_incremental"
+            ) as update,
         ):
             result = run_duplicate_fingerprint_queue(limit=None, db_path=self.db)
 
         self.assertEqual(result["processed"], 1)
         self.assertEqual(result["failed"], 1)
         self.assertEqual(_pending_content_ids(limit=1, db_path=self.db), [])
-        rebuild.assert_not_called()
+        update.assert_called_once_with(
+            [successful_id, content_id], db_path=self.db
+        )
         self.assertEqual(result["failures"][0]["content_id"], content_id)
         self.assertNotEqual(successful_id, content_id)
+
+    def test_queue_scope_does_not_fingerprint_unrelated_content(self) -> None:
+        selected = self._content("Y2BC3D")
+        unrelated = self._content("Z2BC3D")
+        with patch("v8.duplicates.calibration_ready", return_value=False):
+            result = run_duplicate_fingerprint_queue(
+                limit=None,
+                db_path=self.db,
+                scope_content_ids=[selected],
+            )
+        self.assertEqual(result["fingerprinted_content_ids"], [selected])
+        self.assertFalse(result["has_more"])
+        with connect(self.db) as connection:
+            fingerprinted = {
+                int(row[0])
+                for row in connection.execute(
+                    "SELECT DISTINCT content_id FROM duplicate_fingerprints"
+                ).fetchall()
+            }
+        self.assertEqual(fingerprinted, {selected})
+        self.assertNotIn(unrelated, fingerprinted)
+
+    def test_incremental_relations_expand_cluster_and_preserve_unrelated_legacy(self) -> None:
+        content_ids = [
+            self._content(
+                f"I{index}BC3D",
+                published_at=f"2026-07-0{index}T00:00:00Z",
+            )
+            for index in range(1, 6)
+        ]
+        for content_id in content_ids:
+            self._insert_fingerprint(
+                content_id,
+                text_sha256=hashlib.sha256(str(content_id).encode()).hexdigest(),
+                simhash=f"{content_id:016x}",
+            )
+        first, second, third, fourth, unrelated = content_ids
+        with connect(self.db) as connection:
+            connection.executemany(
+                """
+                INSERT INTO duplicate_relations(
+                    duplicate_content_id,original_content_id,method,confidence,
+                    evidence_json,status,created_at
+                ) VALUES (?,?,?,1.0,'{}','confirmed',?)
+                """,
+                (
+                    (second, first, "fingerprint_v1", now_utc()),
+                    (third, second, "text_sha256", now_utc()),
+                    (unrelated, first, "text_sha256", now_utc()),
+                ),
+            )
+            connection.commit()
+
+        matching_pairs = {
+            frozenset((first, second)),
+            frozenset((second, third)),
+            frozenset((third, fourth)),
+        }
+
+        def compare(left: dict[str, object], right: dict[str, object]) -> dict[str, object]:
+            matched = frozenset((int(left["content_id"]), int(right["content_id"]))) in matching_pairs
+            return {"confirmed": matched, "confidence": 0.99, "reasons": ["test"] if matched else []}
+
+        with (
+            patch("v8.duplicates.calibration_ready", return_value=True),
+            patch("v8.duplicates.compare_fingerprints", side_effect=compare),
+        ):
+            result = update_duplicate_relations_incremental(
+                [second], db_path=self.db
+            )
+
+        self.assertEqual(
+            result["affected_content_ids"], [first, second, third, fourth]
+        )
+        self.assertEqual(result["duplicate_relations"], 3)
+        self.assertEqual(result["deleted_text_sha256_relations"], 1)
+        self.assertIsNotNone(result["committed_at"])
+        with connect(self.db) as connection:
+            fingerprint_relations = connection.execute(
+                """
+                SELECT duplicate_content_id,original_content_id
+                FROM duplicate_relations WHERE method='fingerprint_v1'
+                ORDER BY duplicate_content_id
+                """
+            ).fetchall()
+            legacy_relations = connection.execute(
+                """
+                SELECT duplicate_content_id,original_content_id
+                FROM duplicate_relations WHERE method='text_sha256'
+                ORDER BY duplicate_content_id
+                """
+            ).fetchall()
+        self.assertEqual(
+            [tuple(row) for row in fingerprint_relations],
+            [(second, first), (third, first), (fourth, first)],
+        )
+        self.assertEqual([tuple(row) for row in legacy_relations], [(unrelated, first)])
+
+        matching_pairs.clear()
+        matching_pairs.add(frozenset((first, second)))
+        with (
+            patch("v8.duplicates.calibration_ready", return_value=True),
+            patch("v8.duplicates.compare_fingerprints", side_effect=compare),
+        ):
+            split = update_duplicate_relations_incremental([third], db_path=self.db)
+        self.assertEqual(split["affected_content_ids"], [first, second, third, fourth])
+        self.assertEqual(
+            split["changed_content_ids"], [first, second, third, fourth]
+        )
+        with connect(self.db) as connection:
+            after_split = connection.execute(
+                """
+                SELECT duplicate_content_id,original_content_id
+                FROM duplicate_relations WHERE method='fingerprint_v1'
+                ORDER BY duplicate_content_id
+                """
+            ).fetchall()
+        self.assertEqual([tuple(row) for row in after_split], [(second, first)])
+
+    def test_incremental_relations_cas_rejects_changed_current_fingerprint(self) -> None:
+        first = self._content("C1BC3D")
+        second = self._content("C2BC3D")
+        for content_id in (first, second):
+            self._insert_fingerprint(
+                content_id,
+                text_sha256=hashlib.sha256(str(content_id).encode()).hexdigest(),
+                simhash=f"{content_id:016x}",
+            )
+        mutated = False
+
+        def compare(_left: dict[str, object], _right: dict[str, object]) -> dict[str, object]:
+            nonlocal mutated
+            if not mutated:
+                mutated = True
+                with connect(self.db) as connection:
+                    connection.execute(
+                        """
+                        INSERT INTO duplicate_fingerprints(
+                            content_id,fingerprint_version,source_sha256,text_sha256,
+                            media_sha256_json,frame_phashes_json,text_simhash,
+                            text_char_count,payload_json,created_at
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            first,
+                            FINGERPRINT_VERSION,
+                            "f" * 64,
+                            "changed",
+                            "[]",
+                            "[]",
+                            "0000000000000000",
+                            100,
+                            "{}",
+                            "2099-01-01T00:00:00Z",
+                        ),
+                    )
+                    connection.commit()
+            return {"confirmed": False, "confidence": 0.0, "reasons": []}
+
+        with (
+            patch("v8.duplicates.calibration_ready", return_value=True),
+            patch("v8.duplicates.compare_fingerprints", side_effect=compare),
+            self.assertRaisesRegex(DuplicateDetectionError, "current fingerprint changed"),
+        ):
+            update_duplicate_relations_incremental([first], db_path=self.db)
+
+    def test_refresh_uses_incremental_relations_and_formal_rebuild_is_forbidden(self) -> None:
+        content_id = self._content("F1BC3D")
+        with (
+            patch("v8.duplicates.calibration_ready", return_value=True),
+            patch(
+                "v8.duplicates.update_duplicate_relations_incremental",
+                return_value={"changed_content_ids": []},
+            ) as update,
+            patch("v8.duplicates.rebuild_duplicate_relations") as rebuild,
+        ):
+            refresh_content_duplicates(content_id, db_path=self.db)
+        update.assert_called_once_with((content_id,), db_path=self.db)
+        rebuild.assert_not_called()
+
+        alias = self.root / "formal-alias.sqlite3"
+        alias.hardlink_to(self.db)
+        with (
+            patch.object(duplicates_module, "DEFAULT_DB", self.db),
+            self.assertRaisesRegex(DuplicateDetectionError, "formal database"),
+        ):
+            rebuild_duplicate_relations(db_path=alias)
 
     def test_150_pair_calibration_gates_relations_and_uses_earliest_original(self) -> None:
         duplicate_links = [f"D{i:05d}" for i in range(13)]

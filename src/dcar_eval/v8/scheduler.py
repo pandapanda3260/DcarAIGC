@@ -1892,12 +1892,17 @@ def _run_job_action(
             db_path=db_path,
             scope_content_ids=cohort_content_ids,
         )
-        duplicates = run_duplicate_fingerprint_queue(limit=500, db_path=db_path)
+        duplicates = run_duplicate_fingerprint_queue(
+            limit=500,
+            db_path=db_path,
+            scope_content_ids=cohort_content_ids,
+        )
         status = (
             "failed"
             if int(media.get("retryable_failed", 0)) > 0
             or bool(media.get("truncated"))
             or int(duplicates.get("failed", 0)) > 0
+            or bool(duplicates.get("truncated"))
             else "succeeded"
         )
         return status, {"media": media, "duplicates": duplicates}

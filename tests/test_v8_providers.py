@@ -2879,7 +2879,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
     def test_terminal_media_source_requires_explicit_paid_authorization(self) -> None:
         state = self._store_media_source("https://cdn.example/terminal.mp4")
         self._insert_download_slot(
-            str(state["source_sha256"]),
+            str(state["source_artifact_sha256"]),
             status="terminal_failed",
             attempt_count=3,
         )
@@ -2902,7 +2902,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
     def test_stale_terminal_download_is_recovered_before_retry_decision(self) -> None:
         state = self._store_media_source("https://cdn.example/stale-terminal.mp4")
         self._insert_download_slot(
-            str(state["source_sha256"]),
+            str(state["source_artifact_sha256"]),
             status="running",
             attempt_count=3,
         )
@@ -2941,7 +2941,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
     ) -> None:
         state = self._store_media_source("https://cdn.example/terminal.mp4")
         self._insert_download_slot(
-            str(state["source_sha256"]),
+            str(state["source_artifact_sha256"]),
             status="terminal_failed",
             attempt_count=3,
         )
@@ -2986,7 +2986,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
     def test_downstream_media_failures_never_trigger_paid_refresh(self) -> None:
         state = self._store_media_source("https://cdn.example/downloaded.mp4")
         self._insert_download_slot(
-            str(state["source_sha256"]),
+            str(state["source_artifact_sha256"]),
             status="succeeded",
             attempt_count=1,
         )
@@ -3061,7 +3061,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
     ) -> None:
         state = self._store_media_source("https://cdn.example/terminal.mp4")
         self._insert_download_slot(
-            str(state["source_sha256"]),
+            str(state["source_artifact_sha256"]),
             status="terminal_failed",
             attempt_count=3,
         )
@@ -3106,7 +3106,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
         old_url = "https://cdn.example/same-terminal.mp4"
         state = self._store_media_source(old_url)
         self._insert_download_slot(
-            str(state["source_sha256"]),
+            str(state["source_artifact_sha256"]),
             status="terminal_failed",
             attempt_count=3,
         )
@@ -3131,7 +3131,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
     def test_succeeded_lifetime_refresh_slot_prevents_second_paid_call(self) -> None:
         old_state = self._store_media_source("https://cdn.example/terminal.mp4")
         self._insert_download_slot(
-            str(old_state["source_sha256"]),
+            str(old_state["source_artifact_sha256"]),
             status="terminal_failed",
             attempt_count=3,
         )
@@ -3170,7 +3170,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
         )
         self.assertIsNotNone(refreshed_state)
         self._insert_download_slot(
-            str(refreshed_state["source_sha256"]),
+            str(refreshed_state["source_artifact_sha256"]),
             status="terminal_failed",
             attempt_count=3,
         )

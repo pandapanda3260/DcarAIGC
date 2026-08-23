@@ -16,7 +16,11 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
 
 from .capture import BudgetBlocked, ProviderResult
-from .duplicates import fingerprint_content
+from .duplicates import (
+    calibration_ready,
+    fingerprint_content,
+    update_duplicate_relations_incremental,
+)
 from .evaluation import evaluate_content
 from .media import process_content_media
 from .media_state import MediaTerminalDetail, media_terminal_state_details
@@ -1459,6 +1463,7 @@ def run_local_evidence_backfill(
             (*selected_platforms, scope_parameter, _iso(start), _iso(end), limit),
         ).fetchall()
     results: List[Dict[str, Any]] = []
+    fingerprinted_content_ids: List[int] = []
     tags_cleared = 0
     for row in rows:
         content_id = int(row["id"])
@@ -1487,6 +1492,8 @@ def run_local_evidence_backfill(
                     if pre_detail.state == "complete"
                     else None
                 )
+                if duplicate_fingerprint is not None:
+                    fingerprinted_content_ids.append(content_id)
                 tag_released = False
                 if was_tagged:
                     tag_released = _release_history_backfill_tag(
@@ -1590,6 +1597,8 @@ def run_local_evidence_backfill(
                 if detail.state == "complete"
                 else None
             )
+            if duplicate_fingerprint is not None:
+                fingerprinted_content_ids.append(content_id)
             tag_released = False
             if was_tagged:
                 tag_released = _release_history_backfill_tag(
@@ -1620,6 +1629,13 @@ def run_local_evidence_backfill(
                     "backfill_tag_cleared": False,
                 }
             )
+    duplicate_relations = (
+        update_duplicate_relations_incremental(
+            fingerprinted_content_ids, db_path=db_path
+        )
+        if fingerprinted_content_ids and calibration_ready(db_path=db_path)
+        else None
+    )
     failed = sum(
         item["status"] in {"retryable_failed", "terminal_failed"}
         for item in results
@@ -1650,6 +1666,7 @@ def run_local_evidence_backfill(
         "evaluation_release_id": pinned_release_id,
         "tagged_only": tagged_only,
         "tags_cleared": tags_cleared,
+        "duplicate_relations": duplicate_relations,
         "usage": _task_usage(task_id, db_path=db_path),
         "results": compact_results if compact else results,
     }

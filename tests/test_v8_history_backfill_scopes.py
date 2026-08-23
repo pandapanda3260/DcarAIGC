@@ -361,6 +361,11 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
             "v8.range_backfill.fingerprint_content",
             return_value={"source_sha256": "fingerprint"},
         ) as fingerprint, patch(
+            "v8.range_backfill.calibration_ready", return_value=True
+        ), patch(
+            "v8.range_backfill.update_duplicate_relations_incremental",
+            return_value={"changed_content_ids": [pending]},
+        ) as update_relations, patch(
             "v8.range_backfill.media_terminal_state_details",
             side_effect=[
                 {pending: MediaTerminalDetail("pending", "evaluation_pending")},
@@ -380,6 +385,10 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
         self.assertEqual(self._source_group(archived), HISTORY_ARCHIVE_SOURCE_GROUP)
         self.assertEqual(evaluate.call_count, 1)
         self.assertEqual(fingerprint.call_count, 1)
+        update_relations.assert_called_once_with([pending], db_path=self.db)
+        self.assertEqual(
+            result["duplicate_relations"], {"changed_content_ids": [pending]}
+        )
         self.assertEqual(terminal_states.call_count, 3)
         self.assertEqual(result["results"][0]["status"], "complete")
         with patch(

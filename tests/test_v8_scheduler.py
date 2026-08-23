@@ -1884,7 +1884,7 @@ class V8SchedulerTest(unittest.TestCase):
             patch(
                 "v8.scheduler.run_duplicate_fingerprint_queue",
                 return_value=duplicates_ok,
-            ),
+            ) as duplicate_queue,
         ):
             media_failed = execute_job(
                 "daily_media_processing",
@@ -1896,6 +1896,11 @@ class V8SchedulerTest(unittest.TestCase):
         self.assertEqual(media_failed["details"]["media"], retryable_media)
         self.assertEqual(media_failed["details"]["duplicates"], duplicates_ok)
         processing_queue.assert_called_once_with(
+            limit=500,
+            db_path=self.db,
+            scope_content_ids=[],
+        )
+        duplicate_queue.assert_called_once_with(
             limit=500,
             db_path=self.db,
             scope_content_ids=[],

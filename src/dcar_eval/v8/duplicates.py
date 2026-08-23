@@ -9,6 +9,7 @@ import re
 import sqlite3
 import subprocess
 import tempfile
+import time
 from collections import Counter
 from importlib.metadata import version as package_version
 from pathlib import Path
@@ -546,6 +547,10 @@ def calibrate(
 
 
 def rebuild_duplicate_relations(*, db_path: Path = DEFAULT_DB) -> Dict[str, Any]:
+    if is_formal_database_path(db_path, formal_database=DEFAULT_DB):
+        raise DuplicateDetectionError(
+            "full duplicate relation rebuild is forbidden on the formal database"
+        )
     if not calibration_ready(db_path=db_path):
         raise DuplicateDetectionError("duplicate detector calibration has not passed")
     with connect(db_path) as connection:
@@ -626,12 +631,313 @@ def rebuild_duplicate_relations(*, db_path: Path = DEFAULT_DB) -> Dict[str, Any]
     }
 
 
+def update_duplicate_relations_incremental(
+    content_ids: Sequence[int], *, db_path: Path = DEFAULT_DB
+) -> Dict[str, Any]:
+    """Recompute only relation clusters affected by current fingerprints."""
+
+    started = time.perf_counter()
+    seed_ids = sorted({int(content_id) for content_id in content_ids})
+    if not seed_ids:
+        return {
+            "seed_content_ids": [],
+            "affected_content_ids": [],
+            "changed_content_ids": [],
+            "fingerprints": 0,
+            "compared_pairs": 0,
+            "confirmed_edges": 0,
+            "duplicate_groups": 0,
+            "duplicate_relations": 0,
+            "deleted_fingerprint_relations": 0,
+            "inserted_fingerprint_relations": 0,
+            "deleted_text_sha256_relations": 0,
+            "committed_at": None,
+            "elapsed_seconds": round(time.perf_counter() - started, 6),
+        }
+    if not calibration_ready(db_path=db_path):
+        raise DuplicateDetectionError("duplicate detector calibration has not passed")
+
+    with connect(db_path) as connection:
+        fingerprints = _current_fingerprints(connection)
+        relation_rows = [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM duplicate_relations WHERE method=? ORDER BY id",
+                (RELATION_METHOD,),
+            ).fetchall()
+        ]
+    fingerprints_by_id = {
+        int(row["content_id"]): row for row in fingerprints
+    }
+    closure = {content_id for content_id in seed_ids if content_id in fingerprints_by_id}
+    if not closure:
+        raise DuplicateDetectionError("incremental relation seeds have no current fingerprints")
+
+    adjacency: Dict[int, set[int]] = {}
+    for row in relation_rows:
+        if str(row["status"]) != "confirmed":
+            continue
+        left = int(row["duplicate_content_id"])
+        right = int(row["original_content_id"])
+        adjacency.setdefault(left, set()).add(right)
+        adjacency.setdefault(right, set()).add(left)
+
+    comparisons: Dict[tuple[int, int], Dict[str, Any]] = {}
+    all_fingerprint_ids = sorted(fingerprints_by_id)
+    while True:
+        previous = set(closure)
+        for content_id in tuple(closure):
+            closure.update(adjacency.get(content_id, ()))
+        for left_id in sorted(closure & fingerprints_by_id.keys()):
+            for right_id in all_fingerprint_ids:
+                if left_id == right_id:
+                    continue
+                pair = (min(left_id, right_id), max(left_id, right_id))
+                result = comparisons.get(pair)
+                if result is None:
+                    result = compare_fingerprints(
+                        fingerprints_by_id[pair[0]], fingerprints_by_id[pair[1]]
+                    )
+                    comparisons[pair] = result
+                if result["confirmed"]:
+                    closure.add(right_id)
+        if closure == previous:
+            break
+
+    affected_fingerprint_ids = sorted(closure & fingerprints_by_id.keys())
+    parent = {content_id: content_id for content_id in affected_fingerprint_ids}
+
+    def find(value: int) -> int:
+        while parent[value] != value:
+            parent[value] = parent[parent[value]]
+            value = parent[value]
+        return value
+
+    def union(left: int, right: int) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    confirmed_edges: List[Dict[str, Any]] = []
+    affected_set = set(affected_fingerprint_ids)
+    for (left, right), result in comparisons.items():
+        if left not in affected_set or right not in affected_set:
+            continue
+        if result["confirmed"]:
+            union(left, right)
+            confirmed_edges.append({"left": left, "right": right, **result})
+
+    groups: Dict[int, List[Dict[str, Any]]] = {}
+    for content_id in affected_fingerprint_ids:
+        groups.setdefault(find(content_id), []).append(fingerprints_by_id[content_id])
+    desired: List[Dict[str, Any]] = []
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        original_row = min(
+            members,
+            key=lambda row: (
+                str(row.get("published_at") or row.get("imported_at") or ""),
+                int(row["content_id"]),
+            ),
+        )
+        original_id = int(original_row["content_id"])
+        member_ids = {int(row["content_id"]) for row in members}
+        for member in members:
+            duplicate_id = int(member["content_id"])
+            if duplicate_id == original_id:
+                continue
+            candidates = [
+                edge
+                for edge in confirmed_edges
+                if duplicate_id in {int(edge["left"]), int(edge["right"])}
+                and int(edge["left"]) in member_ids
+                and int(edge["right"]) in member_ids
+            ]
+            best = (
+                max(candidates, key=lambda edge: float(edge["confidence"]))
+                if candidates
+                else None
+            )
+            evidence = {
+                "fingerprint_version": FINGERPRINT_VERSION,
+                "thresholds": THRESHOLDS,
+                "cluster_members": sorted(member_ids),
+                "best_edge": best,
+            }
+            desired.append(
+                {
+                    "duplicate_content_id": duplicate_id,
+                    "original_content_id": original_id,
+                    "confidence": float(best["confidence"] if best else 1.0),
+                    "evidence_json": _canonical_json(evidence),
+                    "status": "confirmed",
+                }
+            )
+
+    fingerprint_snapshot = {
+        content_id: (
+            int(fingerprints_by_id[content_id]["id"]),
+            str(fingerprints_by_id[content_id]["source_sha256"]),
+        )
+        for content_id in affected_fingerprint_ids
+    }
+    relation_snapshot = [
+        (
+            int(row["id"]),
+            int(row["duplicate_content_id"]),
+            int(row["original_content_id"]),
+            str(row["status"]),
+            float(row["confidence"]),
+            str(row["evidence_json"]),
+        )
+        for row in relation_rows
+    ]
+    committed_at = now_utc()
+    changed_ids: set[int] = set()
+    deleted_fingerprint = inserted_fingerprint = deleted_text = 0
+    with connect(db_path) as connection, transaction(connection):
+        current_fingerprints = {
+            int(row["content_id"]): row for row in _current_fingerprints(connection)
+        }
+        for content_id, expected in fingerprint_snapshot.items():
+            current = current_fingerprints.get(content_id)
+            actual = (
+                (int(current["id"]), str(current["source_sha256"]))
+                if current is not None
+                else None
+            )
+            if actual != expected:
+                raise DuplicateDetectionError(
+                    f"current fingerprint changed during relation update: {content_id}"
+                )
+        current_relation_rows = [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM duplicate_relations WHERE method=? ORDER BY id",
+                (RELATION_METHOD,),
+            ).fetchall()
+        ]
+        current_relation_snapshot = [
+            (
+                int(row["id"]),
+                int(row["duplicate_content_id"]),
+                int(row["original_content_id"]),
+                str(row["status"]),
+                float(row["confidence"]),
+                str(row["evidence_json"]),
+            )
+            for row in current_relation_rows
+        ]
+        if current_relation_snapshot != relation_snapshot:
+            raise DuplicateDetectionError(
+                "duplicate relations changed during incremental update"
+            )
+
+        touched_existing = {
+            (int(row["duplicate_content_id"]), int(row["original_content_id"])): row
+            for row in current_relation_rows
+            if int(row["duplicate_content_id"]) in closure
+            or int(row["original_content_id"]) in closure
+        }
+        desired_by_pair = {
+            (int(row["duplicate_content_id"]), int(row["original_content_id"])): row
+            for row in desired
+        }
+        delete_ids: List[int] = []
+        insert_rows: List[Dict[str, Any]] = []
+        for pair, row in touched_existing.items():
+            wanted = desired_by_pair.get(pair)
+            unchanged = bool(
+                wanted is not None
+                and str(row["status"]) == wanted["status"]
+                and abs(float(row["confidence"]) - float(wanted["confidence"])) <= 1e-9
+                and str(row["evidence_json"]) == wanted["evidence_json"]
+            )
+            if unchanged:
+                desired_by_pair.pop(pair)
+                continue
+            delete_ids.append(int(row["id"]))
+            changed_ids.update(pair)
+        insert_rows.extend(desired_by_pair.values())
+        for row in insert_rows:
+            changed_ids.update(
+                (int(row["duplicate_content_id"]), int(row["original_content_id"]))
+            )
+        if delete_ids:
+            connection.executemany(
+                "DELETE FROM duplicate_relations WHERE id=?",
+                ((relation_id,) for relation_id in delete_ids),
+            )
+        deleted_fingerprint = len(delete_ids)
+
+        text_rows = connection.execute(
+            "SELECT id,duplicate_content_id,original_content_id "
+            "FROM duplicate_relations WHERE method='text_sha256'"
+        ).fetchall()
+        text_delete_ids = [
+            int(row["id"])
+            for row in text_rows
+            if int(row["duplicate_content_id"]) in affected_set
+            and int(row["original_content_id"]) in affected_set
+        ]
+        for row in text_rows:
+            if int(row["id"]) in text_delete_ids:
+                changed_ids.update(
+                    (
+                        int(row["duplicate_content_id"]),
+                        int(row["original_content_id"]),
+                    )
+                )
+        if text_delete_ids:
+            connection.executemany(
+                "DELETE FROM duplicate_relations WHERE id=?",
+                ((relation_id,) for relation_id in text_delete_ids),
+            )
+        deleted_text = len(text_delete_ids)
+
+        for row in insert_rows:
+            connection.execute(
+                """
+                INSERT INTO duplicate_relations(
+                    duplicate_content_id, original_content_id, method, confidence,
+                    evidence_json, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, 'confirmed', ?)
+                """,
+                (
+                    row["duplicate_content_id"],
+                    row["original_content_id"],
+                    RELATION_METHOD,
+                    row["confidence"],
+                    row["evidence_json"],
+                    committed_at,
+                ),
+            )
+        inserted_fingerprint = len(insert_rows)
+
+    return {
+        "seed_content_ids": seed_ids,
+        "affected_content_ids": sorted(closure),
+        "changed_content_ids": sorted(changed_ids),
+        "fingerprints": len(fingerprints),
+        "compared_pairs": len(comparisons),
+        "confirmed_edges": len(confirmed_edges),
+        "duplicate_groups": sum(len(members) > 1 for members in groups.values()),
+        "duplicate_relations": len(desired),
+        "deleted_fingerprint_relations": deleted_fingerprint,
+        "inserted_fingerprint_relations": inserted_fingerprint,
+        "deleted_text_sha256_relations": deleted_text,
+        "committed_at": committed_at,
+        "elapsed_seconds": round(time.perf_counter() - started, 6),
+    }
+
+
 def refresh_content_duplicates(
     content_id: int, *, db_path: Path = DEFAULT_DB
 ) -> Dict[str, Any]:
     fingerprint = fingerprint_content(content_id, db_path=db_path)
     relations = (
-        rebuild_duplicate_relations(db_path=db_path)
+        update_duplicate_relations_incremental((content_id,), db_path=db_path)
         if calibration_ready(db_path=db_path)
         else None
     )
@@ -643,11 +949,30 @@ def refresh_content_duplicates(
     }
 
 
-def _pending_content_ids(*, limit: Optional[int], db_path: Path) -> List[int]:
+def _pending_content_ids(
+    *,
+    limit: Optional[int],
+    db_path: Path,
+    scope_content_ids: Optional[Sequence[int]] = None,
+) -> List[int]:
     with connect(db_path) as connection:
-        content_rows = connection.execute(
-            "SELECT id FROM content_items ORDER BY id"
-        ).fetchall()
+        if scope_content_ids is None:
+            content_rows = connection.execute(
+                "SELECT id FROM content_items ORDER BY id"
+            ).fetchall()
+        else:
+            scope = list(dict.fromkeys(int(value) for value in scope_content_ids))
+            existing = {
+                int(row["id"])
+                for offset in range(0, len(scope), 500)
+                for row in connection.execute(
+                    "SELECT id FROM content_items WHERE id IN ("
+                    + ",".join("?" for _ in scope[offset : offset + 500])
+                    + ")",
+                    scope[offset : offset + 500],
+                ).fetchall()
+            }
+            content_rows = [{"id": value} for value in scope if value in existing]
         fingerprint_rows = connection.execute(
             """
             SELECT content_id,source_sha256 FROM duplicate_fingerprints
@@ -674,9 +999,14 @@ def _pending_content_ids(*, limit: Optional[int], db_path: Path) -> List[int]:
 
 
 def run_duplicate_fingerprint_queue(
-    *, limit: Optional[int] = 200, db_path: Path = DEFAULT_DB
+    *,
+    limit: Optional[int] = 200,
+    db_path: Path = DEFAULT_DB,
+    scope_content_ids: Optional[Sequence[int]] = None,
 ) -> Dict[str, Any]:
-    content_ids = _pending_content_ids(limit=limit, db_path=db_path)
+    content_ids = _pending_content_ids(
+        limit=limit, db_path=db_path, scope_content_ids=scope_content_ids
+    )
     failures: List[Dict[str, Any]] = []
     processed = 0
     for content_id in content_ids:
@@ -687,15 +1017,30 @@ def run_duplicate_fingerprint_queue(
             failures.append(
                 {"content_id": content_id, "error": f"{type(exc).__name__}: {exc}"[:500]}
             )
-    queue_drained = not _pending_content_ids(limit=1, db_path=db_path)
+    remaining_ids = _pending_content_ids(
+        limit=None, db_path=db_path, scope_content_ids=content_ids
+    )
+    fingerprinted_ids = [
+        content_id for content_id in content_ids if content_id not in set(remaining_ids)
+    ]
+    has_more = bool(
+        _pending_content_ids(
+            limit=1, db_path=db_path, scope_content_ids=scope_content_ids
+        )
+    )
     ready = calibration_ready(db_path=db_path)
     relations: Optional[Dict[str, Any]] = None
-    if processed and not failures and queue_drained and ready:
-        relations = rebuild_duplicate_relations(db_path=db_path)
+    if fingerprinted_ids and ready:
+        relations = update_duplicate_relations_incremental(
+            fingerprinted_ids, db_path=db_path
+        )
     return {
         "candidates": len(content_ids), "processed": processed, "failed": len(failures),
         "failures": failures, "relations": relations,
         "calibration_ready": ready,
+        "fingerprinted_content_ids": fingerprinted_ids,
+        "has_more": has_more,
+        "truncated": has_more,
     }
 
 
