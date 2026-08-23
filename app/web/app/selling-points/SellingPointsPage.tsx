@@ -1,6 +1,7 @@
 "use client";
 
-import { Fragment, useEffect, useState } from "react";
+import { Fragment, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   CarIcon,
   GameControllerIcon,
@@ -9,9 +10,10 @@ import {
   TelevisionIcon,
 } from "@phosphor-icons/react";
 import AppShell from "../components/AppShell";
-import { Feedback, Loading } from "../components/Feedback";
+import { Feedback, Loading, Notice } from "../components/Feedback";
 import { jsonRequest, readJson } from "../lib/api";
 import { label } from "../lib/format";
+import { activeSellingPointsQueryOptions, draftSellingPointsQueryOptions, queryKeys } from "../lib/queries";
 import type {
   BusinessSceneKey,
   OverviewChannelKey,
@@ -43,6 +45,8 @@ const emptyPoint: PointForm = {
   definition: "",
   matcherRuleJson: "{}",
 };
+
+const emptySellingPoints: SellingPointResponse = { taxonomy: null, items: [] };
 
 const standardFamilies = [
   { code: "E", title: "二手车", description: "交易、车况、估值与保障标准", scene: "used_car" },
@@ -84,27 +88,24 @@ function FamilyIcon({ code, size = 22 }: { code: StandardFamilyCode; size?: numb
 }
 
 export default function SellingPointsPage() {
-  const [data, setData] = useState<SellingPointResponse>({ taxonomy: null, items: [] });
   const [statWindow, setStatWindow] = useState<WindowKey>("last_week");
   const [draftMode, setDraftMode] = useState(false);
   const [form, setForm] = useState<PointForm | null>(null);
   const [editingCode, setEditingCode] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
-
-  useEffect(() => {
-    readJson<SellingPointResponse>("/api/v8/selling-points")
-      .then(setData)
-      .catch((reason) => setError(reason instanceof Error ? reason.message : "卖点标准读取失败"))
-      .finally(() => setLoading(false));
-  }, []);
+  const queryClient = useQueryClient();
+  const activeQuery = useQuery({ ...activeSellingPointsQueryOptions(), enabled: !draftMode });
+  const draftQuery = useQuery({ ...draftSellingPointsQueryOptions(), enabled: draftMode });
+  const currentQuery = draftMode ? draftQuery : activeQuery;
+  const data = currentQuery.data ?? emptySellingPoints;
 
   async function ensureDraft() {
     if (draftMode) return;
     await readJson("/api/v8/selling-points/draft", { method: "POST" });
-    setData(await readJson<SellingPointResponse>("/api/v8/selling-points/draft"));
+    await queryClient.invalidateQueries({ queryKey: queryKeys.draftSellingPoints, exact: true });
+    await queryClient.fetchQuery(draftSellingPointsQueryOptions());
     setDraftMode(true);
     setMessage("已进入草稿编辑。发布前不会影响当前的评估结果。");
   }
@@ -157,7 +158,7 @@ export default function SellingPointsPage() {
           matcher_rule: matcherRule,
         }, editingCode ? "PATCH" : "POST"),
       );
-      setData(await readJson<SellingPointResponse>("/api/v8/selling-points/draft"));
+      await queryClient.invalidateQueries({ queryKey: queryKeys.draftSellingPoints, exact: true });
       setForm(null);
       setMessage("卖点草稿已保存");
     } catch (reason) {
@@ -174,7 +175,7 @@ export default function SellingPointsPage() {
     try {
       await ensureDraft();
       await readJson(`/api/v8/selling-points/items/${code}`, { method: "DELETE" });
-      setData(await readJson<SellingPointResponse>("/api/v8/selling-points/draft"));
+      await queryClient.invalidateQueries({ queryKey: queryKeys.draftSellingPoints, exact: true });
       setMessage(`${code} 已从草稿删除`);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "卖点删除失败");
@@ -194,7 +195,7 @@ export default function SellingPointsPage() {
           草稿完成检查并发布后才会正式生效
         </span>
       )}
-      <button className="secondary selling-point-edit-standard" disabled={loading || saving} onClick={() => void beginPoint()}>
+      <button className="secondary selling-point-edit-standard" disabled={currentQuery.isPending || saving} onClick={() => void beginPoint()}>
         <PlusIcon size={16} weight="bold" aria-hidden />
         新增卖点
       </button>
@@ -204,7 +205,8 @@ export default function SellingPointsPage() {
   return (
     <AppShell active="selling-points" actions={shellActions}>
       <Feedback error={error} message={message} onClose={() => { setError(""); setMessage(""); }} />
-      {loading ? <Loading label="正在读取卖点标准……" /> : (
+      {currentQuery.isError && <Notice tone="error">{currentQuery.data ? `数据刷新失败，当前显示上次数据。${currentQuery.error instanceof Error ? currentQuery.error.message : ""}` : currentQuery.error instanceof Error ? currentQuery.error.message : "卖点标准读取失败"}</Notice>}
+      {currentQuery.isPending && !currentQuery.data ? <Loading label="正在读取卖点标准……" /> : (
         <section className="page-stack selling-points-page">
           <section className="selling-point-summary" aria-labelledby="selling-point-summary-title">
             <header className="selling-point-summary-head">

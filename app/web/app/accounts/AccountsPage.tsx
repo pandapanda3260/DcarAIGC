@@ -3,18 +3,16 @@
 import Image from "next/image";
 import { Fragment, useEffect, useState } from "react";
 import { BroadcastIcon, VideoCameraIcon } from "@phosphor-icons/react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import AppShell from "../components/AppShell";
-import { Feedback, Loading } from "../components/Feedback";
+import { Feedback, Loading, Notice } from "../components/Feedback";
 import { Pagination } from "../components/Pagination";
 import { API_BASE, jsonRequest, parseCsv, readJson } from "../lib/api";
 import { label, platformKeys } from "../lib/format";
 import { publicAssetPath } from "../lib/paths";
-import type { Account, PendingPlatformIdentity } from "../lib/types";
-
-type AccountSearchResult = {
-  items: Account[]; total: number; legacy_unassociated_content_count: number;
-  pending_platform_identity_count: number; pending_platform_identities: PendingPlatformIdentity[];
-};
+import { buildAccountSearchRequest, lastPageFor } from "../lib/queryContracts";
+import { accountSearchQueryOptions, queryKeys } from "../lib/queries";
+import type { Account } from "../lib/types";
 type AccountForm = {
   id: number | null; phone: string; operatorName: string; accountType: string;
   contentDirection: string; enabled: boolean;
@@ -56,49 +54,68 @@ function emptyForm(): AccountForm {
 }
 
 export default function AccountsPage() {
-  const [items, setItems] = useState<Account[]>([]);
-  const [pending, setPending] = useState<PendingPlatformIdentity[]>([]);
-  const [pendingCount, setPendingCount] = useState(0);
-  const [unassociated, setUnassociated] = useState(0);
-  const [total, setTotal] = useState(0);
-  const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState(50);
-  const [fetching, setFetching] = useState(false);
   const [query, setQuery] = useState("");
   const [accountType, setAccountType] = useState("");
   const [direction, setDirection] = useState("");
   const [platform, setPlatform] = useState("");
+  const [appliedRequest, setAppliedRequest] = useState(() => buildAccountSearchRequest({
+    query: "", accountType: "", direction: "", platform: "",
+  }, 1, 50));
   const [form, setForm] = useState<AccountForm | null>(null);
-  const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [retrying, setRetrying] = useState(false);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
+  const queryClient = useQueryClient();
+  const accountsQuery = useQuery(accountSearchQueryOptions(appliedRequest));
+  const result = accountsQuery.data;
+  const items = result?.items ?? [];
+  const pending = result?.pending_platform_identities ?? [];
+  const pendingCount = result?.pending_platform_identity_count ?? 0;
+  const unassociated = result?.legacy_unassociated_content_count ?? 0;
+  const total = result?.total ?? 0;
+  const accountsReadFailed = accountsQuery.isLoadingError || retrying;
 
-  async function reload(overrides: Partial<{ query: string; accountType: string; direction: string; platform: string; page: number; pageSize: number }> = {}) {
-    const filters = { query, accountType, direction, platform, ...overrides };
-    const size = overrides.pageSize ?? pageSize;
-    let targetPage = Math.max(1, overrides.page ?? page);
-    setFetching(true);
-    try {
-      const request = (pageNumber: number) => jsonRequest({ page: pageNumber, page_size: size, query: filters.query, account_type: filters.accountType || null, content_direction: filters.direction || null, platform: filters.platform || null });
-      let result = await readJson<AccountSearchResult>("/api/v8/accounts/search", request(targetPage));
-      const lastPage = Math.max(1, Math.ceil(result.total / size));
-      if (targetPage > lastPage) {
-        targetPage = lastPage;
-        result = await readJson<AccountSearchResult>("/api/v8/accounts/search", request(targetPage));
-      }
-      setItems(result.items); setTotal(result.total); setUnassociated(result.legacy_unassociated_content_count);
-      setPendingCount(result.pending_platform_identity_count); setPending(result.pending_platform_identities);
-      setPage(targetPage); setPageSize(size);
-    } catch (reason) { setError(reason instanceof Error ? reason.message : "账号读取失败"); }
-    finally { setLoading(false); setFetching(false); }
+  function retryAccountsRead() {
+    if (retrying) return;
+    setRetrying(true);
+    void accountsQuery.refetch().finally(() => setRetrying(false));
   }
+
+  function applySearch(overrides: Partial<{ query: string; accountType: string; direction: string; platform: string; page: number; pageSize: number }> = {}) {
+    const filters = { query, accountType, direction, platform, ...overrides };
+    const nextRequest = buildAccountSearchRequest(
+      filters,
+      overrides.page ?? appliedRequest.page,
+      overrides.pageSize ?? appliedRequest.page_size,
+    );
+    if (JSON.stringify(nextRequest) === JSON.stringify(appliedRequest)) {
+      if (accountsReadFailed) retryAccountsRead();
+      else void accountsQuery.refetch();
+      return;
+    }
+    setAppliedRequest(nextRequest);
+  }
+
   useEffect(() => {
-    readJson<AccountSearchResult>("/api/v8/accounts/search", jsonRequest({ page: 1, page_size: 50 }))
-      .then((result) => { setItems(result.items); setTotal(result.total); setUnassociated(result.legacy_unassociated_content_count); setPendingCount(result.pending_platform_identity_count); setPending(result.pending_platform_identities); })
-      .catch((reason) => setError(reason instanceof Error ? reason.message : "账号读取失败"))
-      .finally(() => setLoading(false));
-  }, []);
+    if (!result || accountsQuery.isPlaceholderData) return;
+    const lastPage = lastPageFor(result.total, appliedRequest.page_size);
+    if (appliedRequest.page > lastPage) {
+      const timer = window.setTimeout(() => {
+        setAppliedRequest((current) => ({ ...current, page: lastPage }));
+      }, 0);
+      return () => window.clearTimeout(timer);
+    }
+  }, [accountsQuery.isPlaceholderData, appliedRequest.page, appliedRequest.page_size, result]);
+
+  async function invalidateAccountData() {
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: queryKeys.accounts }),
+      queryClient.invalidateQueries({ queryKey: queryKeys.contents }),
+      queryClient.invalidateQueries({ queryKey: queryKeys.overview }),
+      queryClient.invalidateQueries({ queryKey: queryKeys.activeSellingPoints, exact: true }),
+    ]);
+  }
 
   function edit(account?: Account) {
     if (!account) { setForm(emptyForm()); return; }
@@ -116,7 +133,7 @@ export default function AccountsPage() {
         platforms: platformKeys.filter((key) => form.platforms[key].uid.trim()).map((key) => ({ platform: key, uid: form.platforms[key].uid.trim(), nickname: form.platforms[key].nickname, real_name_status: form.platforms[key].realNameStatus })),
       };
       await readJson(form.id ? `/api/v8/accounts/${form.id}` : "/api/v8/accounts", jsonRequest(body, form.id ? "PATCH" : "POST"));
-      const wasEdit = Boolean(form.id); setForm(null); await reload(); setMessage(wasEdit ? "账号已更新" : "账号已新增");
+      const wasEdit = Boolean(form.id); setForm(null); await invalidateAccountData(); setMessage(wasEdit ? "账号已更新" : "账号已新增");
     } catch (reason) { setError(reason instanceof Error ? reason.message : "账号保存失败"); }
     finally { setSaving(false); }
   }
@@ -127,18 +144,19 @@ export default function AccountsPage() {
       const rows = parseCsv(await file.text());
       if (!rows.length) throw new Error("文件中没有可导入的数据。");
       const result = await readJson<{ inserted_rows: number; updated_rows: number; rejected_rows: number }>("/api/v8/accounts/import", jsonRequest({ source_name: file.name, rows }));
-      await reload(); setMessage(`导入完成：新增 ${result.inserted_rows} 条，更新 ${result.updated_rows} 条，${result.rejected_rows} 条未导入。`);
+      await invalidateAccountData(); setMessage(`导入完成：新增 ${result.inserted_rows} 条，更新 ${result.updated_rows} 条，${result.rejected_rows} 条未导入。`);
     } catch (reason) { setError(reason instanceof Error ? reason.message : "账号导入失败"); }
     finally { setSaving(false); }
   }
 
   return <AppShell active="accounts">
     <Feedback error={error} message={message} onClose={() => { setError(""); setMessage(""); }} />
-    {loading ? <Loading label="正在读取账号库" /> : <section className="page-stack wide-stack">
+    {accountsQuery.isError && <Notice tone="error">{accountsQuery.data ? `数据刷新失败，当前显示上次数据。${accountsQuery.error instanceof Error ? accountsQuery.error.message : ""}` : accountsQuery.error instanceof Error ? accountsQuery.error.message : "账号读取失败"}</Notice>}
+    {accountsQuery.isPending && !accountsQuery.data && !accountsReadFailed ? <Loading label="正在读取账号库" /> : <section className="page-stack wide-stack">
       <div className="detail-toolbar"><div><span className="eyebrow">手机号是唯一账号标识</span><h2>账号信息</h2><p>每个手机号对应一个账号；还没采集到粉丝量时显示“—”。</p></div><div className="placeholder-actions"><button className="primary small" onClick={() => edit()}>新增账号</button><a className="secondary button-link" href={`${API_BASE}/api/v8/accounts/export`}>下载账号表格</a><label className="secondary button-link">批量导入<input className="file-input" type="file" accept=".csv,text/csv" disabled={saving} onChange={(event) => { const file = event.target.files?.[0]; if (file) void importCsv(file); event.currentTarget.value = ""; }} /></label></div></div>
-      <div className="filter-bar"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="手机号、运营人员、平台账号编号、昵称" onKeyDown={(event) => { if (event.key === "Enter") void reload({ page: 1 }); }} /><select value={accountType} onChange={(event) => { setAccountType(event.target.value); void reload({ accountType: event.target.value, page: 1 }); }}><option value="">全部账号类型</option><option value="boutique_ip">精品 IP</option><option value="original">原创</option><option value="mixed_edit">混剪</option><option value="unknown">未知</option></select><select value={direction} onChange={(event) => { setDirection(event.target.value); void reload({ direction: event.target.value, page: 1 }); }}><option value="">全部内容方向</option><option value="new_car">新车</option><option value="used_car">二手车</option><option value="media">媒体</option><option value="other">其他</option><option value="unknown">未知</option></select><select value={platform} onChange={(event) => { setPlatform(event.target.value); void reload({ platform: event.target.value, page: 1 }); }}><option value="">全部平台</option>{platformKeys.map((key) => <option key={key} value={key}>{label(key)}</option>)}</select><button className="secondary" onClick={() => void reload({ page: 1 })}>搜索</button><span>{total} 个账号</span></div>
+      <div className="filter-bar"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="手机号、运营人员、平台账号编号、昵称" onKeyDown={(event) => { if (event.key === "Enter") applySearch({ page: 1 }); }} /><select value={accountType} onChange={(event) => { setAccountType(event.target.value); applySearch({ accountType: event.target.value, page: 1 }); }}><option value="">全部账号类型</option><option value="boutique_ip">精品 IP</option><option value="original">原创</option><option value="mixed_edit">混剪</option><option value="unknown">未知</option></select><select value={direction} onChange={(event) => { setDirection(event.target.value); applySearch({ direction: event.target.value, page: 1 }); }}><option value="">全部内容方向</option><option value="new_car">新车</option><option value="used_car">二手车</option><option value="media">媒体</option><option value="other">其他</option><option value="unknown">未知</option></select><select value={platform} onChange={(event) => { setPlatform(event.target.value); applySearch({ platform: event.target.value, page: 1 }); }}><option value="">全部平台</option>{platformKeys.map((key) => <option key={key} value={key}>{label(key)}</option>)}</select><button className="secondary" onClick={() => applySearch({ page: 1 })}>搜索</button><span>{accountsReadFailed ? "读取失败" : `${total} 个账号`}</span></div>
       <article className="panel table-panel account-master-panel">
-        <Pagination page={page} pageSize={pageSize} total={total} busy={fetching || saving} ariaLabel="账号分页" unitLabel="个账号" placement="top" onChange={(next) => void reload(next)} />
+        {!accountsReadFailed && accountsQuery.data && <Pagination page={appliedRequest.page} pageSize={appliedRequest.page_size} total={total} busy={accountsQuery.isFetching || saving} ariaLabel="账号分页" unitLabel="个账号" placement="top" onChange={(next) => applySearch({ page: next.page, pageSize: next.pageSize })} />}
         <div className="table-scroll"><table className="account-master-table">
         <caption className="visually-hidden">以手机号为唯一标识的账号列表</caption>
         <colgroup>
@@ -159,11 +177,12 @@ export default function AccountsPage() {
           <tr className="account-column-row"><th className="account-sticky account-phone" scope="col">手机号</th><th className="account-sticky account-operator" scope="col">运营人员</th><th className="account-sticky account-type" scope="col">账号类型</th><th className="account-sticky account-direction" scope="col">内容方向</th>{platformKeys.map((key) => <Fragment key={key}><th className="account-platform-start" scope="col">平台账号编号</th><th scope="col">是否实名</th><th scope="col">昵称</th><th className="account-number-cell" scope="col">粉丝量</th><th className="account-number-cell" scope="col">关联内容量</th></Fragment>)}<th scope="col">状态</th><th scope="col">操作</th></tr>
         </thead>
         <tbody>
-          {items.map((item) => <tr key={item.id}><th className="account-sticky account-phone" scope="row"><strong>{item.phone}</strong></th><td className="account-sticky account-operator">{item.operator_name || "未填写"}</td><td className="account-sticky account-type">{label(item.account_type)}</td><td className="account-sticky account-direction">{label(item.content_direction)}</td><AccountPlatformCells account={item} /><td>{item.enabled ? "运营中" : "停用"}</td><td><button className="text-button" onClick={() => edit(item)}>修改</button></td></tr>)}
-          {!items.length && <tr><td className="account-master-empty" colSpan={26}>暂无账号，请新增账号或批量导入</td></tr>}
+          {accountsReadFailed && <tr><td className="table-read-error" colSpan={26}><strong>账号读取失败</strong><span>请检查网络后重新加载。</span><button type="button" className="secondary read-error-retry" disabled={retrying} onClick={retryAccountsRead}>{retrying ? "正在重新加载…" : "重新加载"}</button></td></tr>}
+          {!accountsReadFailed && items.map((item) => <tr key={item.id}><th className="account-sticky account-phone" scope="row"><strong>{item.phone}</strong></th><td className="account-sticky account-operator">{item.operator_name || "未填写"}</td><td className="account-sticky account-type">{label(item.account_type)}</td><td className="account-sticky account-direction">{label(item.content_direction)}</td><AccountPlatformCells account={item} /><td>{item.enabled ? "运营中" : "停用"}</td><td><button className="text-button" onClick={() => edit(item)}>修改</button></td></tr>)}
+          {!accountsReadFailed && !items.length && <tr><td className="account-master-empty" colSpan={26}>暂无账号，请新增账号或批量导入</td></tr>}
         </tbody>
       </table></div></article>
-      <article className="panel pending-identity-panel">
+      {!accountsReadFailed && accountsQuery.data && <article className="panel pending-identity-panel">
         <div className="panel-head"><div><span className="eyebrow">等待匹配</span><h3>待匹配的平台账号 · {pendingCount}</h3><p>还有 {unassociated} 条已有内容没有关联手机号。新增或导入账号并匹配平台账号编号后，系统会自动关联。</p></div></div>
         <div className="pending-identity-list table-scroll">
           <table className="pending-identity-table">
@@ -175,7 +194,7 @@ export default function AccountsPage() {
             </tbody>
           </table>
         </div>
-      </article>
+      </article>}
     </section>}
     {form && <div className="modal-backdrop" role="presentation"><section className="modal-panel operation-modal" role="dialog" aria-modal="true" aria-label="编辑账号"><div className="panel-head"><div><span className="eyebrow">账号信息</span><h3>{form.id ? "修改账号" : "新增账号"}</h3></div><button className="modal-close" onClick={() => setForm(null)} aria-label="关闭">×</button></div><div className="modal-fields"><label>手机号<input value={form.phone} onChange={(event) => setForm({ ...form, phone: event.target.value })} /></label><label>运营人员<input value={form.operatorName} onChange={(event) => setForm({ ...form, operatorName: event.target.value })} /></label><label>账号类型<select value={form.accountType} onChange={(event) => setForm({ ...form, accountType: event.target.value })}><option value="unknown">未知</option><option value="boutique_ip">精品 IP</option><option value="original">原创</option><option value="mixed_edit">混剪</option></select></label><label>内容方向<select value={form.contentDirection} onChange={(event) => setForm({ ...form, contentDirection: event.target.value })}><option value="unknown">未知</option><option value="new_car">新车</option><option value="used_car">二手车</option><option value="media">媒体</option><option value="other">其他</option></select></label><label className="toggle-field"><input type="checkbox" checked={form.enabled} onChange={(event) => setForm({ ...form, enabled: event.target.checked })} />运营中</label></div><div className="platform-editor">{platformKeys.map((key) => <fieldset key={key}><legend>{label(key)}</legend><label>平台账号编号<input value={form.platforms[key].uid} onChange={(event) => setForm({ ...form, platforms: { ...form.platforms, [key]: { ...form.platforms[key], uid: event.target.value } } })} /></label><label>实名<select value={form.platforms[key].realNameStatus} onChange={(event) => setForm({ ...form, platforms: { ...form.platforms, [key]: { ...form.platforms[key], realNameStatus: event.target.value } } })}><option value="unknown">未知</option><option value="yes">是</option><option value="no">否</option></select></label><label>昵称<input value={form.platforms[key].nickname} onChange={(event) => setForm({ ...form, platforms: { ...form.platforms, [key]: { ...form.platforms[key], nickname: event.target.value } } })} /></label></fieldset>)}</div><div className="modal-actions"><button className="secondary" onClick={() => setForm(null)}>取消</button><button className="primary" disabled={saving} onClick={() => void save()}>{saving ? "保存中" : "保存账号"}</button></div></section></div>}
   </AppShell>;

@@ -1,18 +1,19 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import AppShell from "../components/AppShell";
 import DateRangePicker, { shiftDays, todayInShanghai } from "../components/DateRangePicker";
 import { Loading, Notice } from "../components/Feedback";
 import { jsonRequest, readJson } from "../lib/api";
 import { formatDate, humanizeTaskMessage, humanizeTaskStatus, label, taskWasSuperseded } from "../lib/format";
+import { isGeneratingTaskStatus } from "../lib/queryContracts";
+import { queryKeys, tasksListQueryOptions } from "../lib/queries";
 import type { Task, TaskDetail } from "../lib/types";
 
 // 报告生成跑在请求之外的后台线程里：创建接口立即返回排队中的任务，
 // 列表卡片靠轮询任务读模型显示真实进度，用户不必停在某个页面等待。
-const GENERATING_STATUSES = new Set(["queued", "running", "cancel_requested"]);
-const POLL_INTERVAL_MS = 1500;
 
 function yesterday() { return shiftDays(todayInShanghai(), -1); }
 
@@ -30,7 +31,7 @@ function revisionText(task: Task) {
 }
 
 function TaskCard({ task }: { task: Task }) {
-  const generating = GENERATING_STATUSES.has(task.task_status);
+  const generating = isGeneratingTaskStatus(task.task_status);
   const progress = Math.max(0, Math.min(100, Math.round(task.progress)));
   return <article className={generating ? "task-card generating" : "task-card"}>
     <div className="task-card-body">
@@ -49,32 +50,22 @@ function TaskCard({ task }: { task: Task }) {
 }
 
 export default function TasksPage() {
-  const [tasks, setTasks] = useState<Task[]>([]);
-  const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [modal, setModal] = useState(false);
-  const [error, setError] = useState("");
   const [createError, setCreateError] = useState("");
+  const [retrying, setRetrying] = useState(false);
   const [form, setForm] = useState({ periodStart: yesterday(), periodEnd: yesterday(), name: "" });
-  const generatingCount = tasks.filter((task) => GENERATING_STATUSES.has(task.task_status)).length;
+  const queryClient = useQueryClient();
+  const tasksQuery = useQuery(tasksListQueryOptions());
+  const tasks = tasksQuery.data?.items ?? [];
+  const generatingCount = tasks.filter((task) => isGeneratingTaskStatus(task.task_status)).length;
+  const tasksReadFailed = tasksQuery.isLoadingError || retrying;
 
-  useEffect(() => {
-    readJson<{ items: Task[] }>("/api/v8/tasks")
-      .then((result) => setTasks(result.items))
-      .catch((reason) => setError(reason instanceof Error ? reason.message : "任务读取失败"))
-      .finally(() => setLoading(false));
-  }, []);
-
-  useEffect(() => {
-    if (!generatingCount) return;
-    let stopped = false;
-    const timer = setInterval(() => {
-      readJson<{ items: Task[] }>("/api/v8/tasks")
-        .then((result) => { if (!stopped) setTasks(result.items); })
-        .catch(() => { /* 生成仍在后台进行：保留上一次快照，等下一次轮询恢复 */ });
-    }, POLL_INTERVAL_MS);
-    return () => { stopped = true; clearInterval(timer); };
-  }, [generatingCount]);
+  function retryTasksRead() {
+    if (retrying) return;
+    setRetrying(true);
+    void tasksQuery.refetch().finally(() => setRetrying(false));
+  }
 
   function openModal() { setCreateError(""); setModal(true); }
   function closeModal() { if (!saving) { setCreateError(""); setModal(false); } }
@@ -84,18 +75,21 @@ export default function TasksPage() {
     setSaving(true); setCreateError("");
     try {
       const task = await readJson<TaskDetail>("/api/v8/tasks", jsonRequest({ period_start: form.periodStart, period_end: form.periodEnd, name: form.name || null }));
-      setTasks((current) => [task, ...current.filter((item) => item.id !== task.id)]);
+      queryClient.setQueryData<{ items: Task[] }>(queryKeys.tasksList, (current) => ({
+        items: [task, ...(current?.items ?? []).filter((item) => item.id !== task.id)],
+      }));
+      await queryClient.invalidateQueries({ queryKey: queryKeys.tasksList, exact: true });
       setModal(false);
     } catch (reason) { setCreateError(reason instanceof Error ? reason.message : "报告创建失败，请检查日期后重试。"); }
     finally { setSaving(false); }
   }
 
   return <AppShell active="tasks">
-    {error && <Notice tone="error">{error}</Notice>}
-    {loading ? <Loading label="正在读取报告任务" /> : <section className="page-stack wide-stack">
-      <div className="detail-toolbar"><div><span className="eyebrow">每次生成都会保留</span><h2>日报、周报与自定义报告</h2><p>报告包含开始和结束当天；重新生成会新增一个版本，旧版本仍会保留。</p></div><div className="placeholder-actions"><button className="primary small" onClick={openModal}>新建任务</button><span className="rule-chip">共 {tasks.length} 个任务{generatingCount > 0 && ` · ${generatingCount} 个生成中`}</span></div></div>
+    {tasksQuery.isError && <Notice tone="error">{tasksQuery.data ? `数据刷新失败，当前显示上次数据。${tasksQuery.error instanceof Error ? tasksQuery.error.message : ""}` : tasksQuery.error instanceof Error ? tasksQuery.error.message : "任务读取失败"}</Notice>}
+    {tasksQuery.isPending && !tasksQuery.data && !tasksReadFailed ? <Loading label="正在读取报告任务" /> : <section className="page-stack wide-stack">
+      <div className="detail-toolbar"><div><span className="eyebrow">每次生成都会保留</span><h2>日报、周报与自定义报告</h2><p>报告包含开始和结束当天；重新生成会新增一个版本，旧版本仍会保留。</p></div><div className="placeholder-actions"><button className="primary small" onClick={openModal}>新建任务</button><span className="rule-chip">{tasksReadFailed ? "读取失败" : `共 ${tasks.length} 个任务${generatingCount > 0 ? ` · ${generatingCount} 个生成中` : ""}`}</span></div></div>
       <div className="task-card-list">{tasks.map((task) => <TaskCard key={task.id} task={task} />)}</div>
-      {tasks.length === 0 && <article className="panel"><div className="empty-state"><strong>还没有报告任务</strong><span>新建后，系统会使用已经保存的数据生成报告。</span></div></article>}
+      {tasksReadFailed ? <article className="panel"><div className="empty-state"><strong>任务读取失败</strong><span>请检查网络后重新加载。</span><button type="button" className="secondary read-error-retry" disabled={retrying} onClick={retryTasksRead}>{retrying ? "正在重新加载…" : "重新加载"}</button></div></article> : tasksQuery.data && tasks.length === 0 && <article className="panel"><div className="empty-state"><strong>还没有报告任务</strong><span>新建后，系统会使用已经保存的数据生成报告。</span></div></article>}
     </section>}
     {modal && <div className="modal-backdrop" role="presentation"><section className="modal-panel range-modal" role="dialog" aria-modal="true" aria-label="新建报告任务">
       <div className="panel-head"><div><span className="eyebrow">自定义报告</span><h3>新建自定义报告</h3><p>只使用已有数据，不会调用收费的数据服务。</p></div><button className="modal-close" onClick={closeModal} disabled={saving} aria-label="关闭">×</button></div>

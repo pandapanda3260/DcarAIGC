@@ -145,6 +145,11 @@ button:disabled { cursor: not-allowed; opacity: .55; transform: none !important;
 .empty-state strong, .empty-state span { display: block; }
 .empty-state strong { color: #52656b; font-size: 12px; }
 .empty-state span { margin-top: 6px; font-size: 10px; }
+.table-read-error { height: 150px; color: #849196 !important; text-align: center !important; }
+.table-read-error strong, .table-read-error span { display: block; }
+.table-read-error strong { color: #52656b; font-size: 12px; }
+.table-read-error span { margin-top: 6px; font-size: 10px; }
+.read-error-retry { min-height: 34px; margin-top: 12px; padding: 0 13px; justify-self: center; }
 
 .form-panel { padding: 28px; }
 .form-panel .section-heading { align-items: flex-start; }
@@ -466,6 +471,7 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
 .cell-subline { display: block; margin-top: 4px; color: #8b989c; }
 .content-table { border-collapse: separate; border-spacing: 0; }
 .content-table th:first-child, .content-table td:first-child { position: sticky; left: 0; z-index: 3; background: #fff; border-right: 1px solid #e6ecee; box-shadow: 8px 0 14px -12px rgba(16, 44, 53, .35); }
+.content-table td.table-read-error { position: static; border-right: 0; box-shadow: none; }
 .content-table thead th:first-child { z-index: 4; background: #edf2f3; }
 .row-actions { display: grid; justify-items: start; gap: 6px; }
 .muted-cell { color: #8b989c; }

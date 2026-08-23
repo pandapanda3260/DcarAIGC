@@ -1269,6 +1269,19 @@ def _content_search(
         )
         LEFT JOIN content_items original ON original.id=duplicate.original_content_id
     """
+    count_from_parts = ["FROM content_items c"]
+    if payload.account_type or payload.content_direction:
+        count_from_parts.append("LEFT JOIN accounts a ON a.id=c.account_id")
+    if payload.selling_point or payload.content_direction:
+        count_from_parts.append(
+            "LEFT JOIN display_effective_evaluations ev ON ev.content_id=c.id"
+        )
+    count_from_sql = " ".join(count_from_parts)
+    count_with_sql = (
+        f"WITH {DISPLAY_EFFECTIVE_EVALUATIONS_CTE} "
+        if payload.selling_point or payload.content_direction
+        else ""
+    )
     offset = (payload.page - 1) * payload.page_size
     with connect(db_path, read_only=read_only) as connection:
         labels_ready = spu_domain_ready(connection)
@@ -1278,8 +1291,7 @@ def _content_search(
             where_sql = f"WHERE {' AND '.join(where)}"
         total = int(
             connection.execute(
-                f"WITH {DISPLAY_EFFECTIVE_EVALUATIONS_CTE} "
-                f"SELECT COUNT(*) {from_sql} {where_sql}",
+                f"{count_with_sql}SELECT COUNT(*) {count_from_sql} {where_sql}",
                 parameters,
             ).fetchone()[0]
         )

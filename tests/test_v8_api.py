@@ -2856,6 +2856,135 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         self.assertEqual(combined.status_code, 200)
         self.assertEqual(combined.json()["total"], 0)
 
+    def test_content_search_total_matches_rows_for_every_count_dependency(self) -> None:
+        captured_at = now_utc()
+        with connect(self.db) as connection:
+            account = connection.execute(
+                """
+                INSERT INTO accounts(
+                    phone,phone_normalized,operator_name,account_type,
+                    content_direction,created_at,updated_at
+                ) VALUES ('13700137000','13700137000','count fixture','original',
+                          'new_car',?,?)
+                """,
+                (captured_at, captured_at),
+            )
+            connection.execute(
+                "UPDATE content_items SET account_id=? WHERE id=?",
+                (account.lastrowid, self.content_id),
+            )
+            connection.execute(
+                """
+                UPDATE evaluation_versions
+                SET primary_selling_point_code='C1',selling_point_score=92,
+                    selling_point_included=1,content_direction='media',
+                    evaluation_status='evaluated',evidence_level='V3',
+                    content_automotive_score=95
+                WHERE id=?
+                """,
+                (self.evaluation_id,),
+            )
+            connection.execute(
+                """
+                INSERT INTO content_items(
+                    link_id,platform,platform_content_id,canonical_url,published_at,
+                    title,body,content_type,imported_at,created_at,updated_at
+                ) VALUES (
+                    'B2CD3E','xiaohongshu','2','https://www.xiaohongshu.com/explore/2',
+                    '2026-07-02T04:00:00Z','其他内容','没有关联标签','image',?,?,?
+                )
+                """,
+                (captured_at, captured_at, captured_at),
+            )
+            connection.execute(
+                """
+                INSERT INTO spu_catalog(
+                    spu_id,brand,series,series_slug,trim_label,is_series_node,
+                    powertrain,body_style,created_at,updated_at
+                ) VALUES ('fixture-series','测试品牌','测试车系','fixture-series',
+                          NULL,1,'ev','suv',?,?)
+                """,
+                (captured_at, captured_at),
+            )
+            connection.execute(
+                """
+                INSERT INTO audience_dim(code,label,definition)
+                VALUES ('P1','家庭用户','测试')
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO scene_dim(code,label,definition)
+                VALUES ('S1','城市通勤','测试')
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO content_spu_links(
+                    content_id,spu_id,resolved_level,is_primary,status,score,
+                    evidence_json,rule_version,created_at
+                ) VALUES (?,'fixture-series','series',1,'confirmed',90,'{}',
+                          'count-fixture',?)
+                """,
+                (self.content_id, captured_at),
+            )
+            connection.execute(
+                """
+                INSERT INTO content_audience_links(
+                    content_id,audience_code,source,conflict_flag,consistency_flag,
+                    evidence_json,rule_version,created_at
+                ) VALUES (?,'P1','content_explicit',0,1,'{}','count-fixture',?)
+                """,
+                (self.content_id, captured_at),
+            )
+            connection.execute(
+                """
+                INSERT INTO content_scene_links(
+                    content_id,scene_code,score,evidence_json,rule_version,created_at
+                ) VALUES (?,'S1',90,'{}','count-fixture',?)
+                """,
+                (self.content_id, captured_at),
+            )
+            connection.commit()
+
+        cases = {
+            "default": {},
+            "query": {"query": "汽车保养"},
+            "platform": {"platform": "douyin"},
+            "account_type": {"account_type": "original"},
+            "content_direction": {"content_direction": "media"},
+            "selling_point": {"selling_point": "C1"},
+            "selling_point_none": {"selling_point": "__none__"},
+            "spu_series": {"spu_series": "fixture-series"},
+            "spu_series_none": {"spu_series": "__none__"},
+            "audience": {"audience": "P1"},
+            "audience_none": {"audience": "__none__"},
+            "scene": {"scene": "S1"},
+            "scene_none": {"scene": "__none__"},
+            "account_and_selling": {
+                "account_type": "original",
+                "selling_point": "C1",
+                "platform": "douyin",
+            },
+            "direction_and_spu_dimensions": {
+                "content_direction": "media",
+                "spu_series": "fixture-series",
+                "audience": "P1",
+                "scene": "S1",
+            },
+        }
+        for name, filters in cases.items():
+            with self.subTest(name=name):
+                response = self.client.post(
+                    "/api/v8/contents/search",
+                    json={**filters, "page": 1, "page_size": 100},
+                )
+                self.assertEqual(response.status_code, 200)
+                value = response.json()
+                expected_total = 2 if name == "default" else 1
+                self.assertEqual(value["total"], expected_total)
+                self.assertEqual(value["total"], len(value["items"]))
+
     def test_update_data_route_returns_provider_execution_result(self) -> None:
         expected = {
             "content_id": self.content_id,

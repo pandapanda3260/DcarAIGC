@@ -1,7 +1,8 @@
 "use client";
 
 import Image from "next/image";
-import { useEffect, useState } from "react";
+import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import {
   CarIcon,
   ClockIcon,
@@ -17,7 +18,6 @@ import {
 } from "@phosphor-icons/react";
 import AppShell from "../components/AppShell";
 import { Loading, Notice } from "../components/Feedback";
-import { readJson } from "../lib/api";
 import {
   formatDate,
   metricEvidence,
@@ -26,11 +26,11 @@ import {
   metricValue,
 } from "../lib/format";
 import { publicAssetPath } from "../lib/paths";
+import { overviewQueryOptions } from "../lib/queries";
 import type {
   BusinessSceneKey,
   ConclusionMetricKey,
   Metric,
-  Overview,
   OverviewChannel,
   OverviewChannelKey,
   WindowKey,
@@ -128,17 +128,9 @@ function ChannelConclusion({ channel, index }: { channel: OverviewChannel; index
 }
 
 export default function OverviewPage() {
-  const [overview, setOverview] = useState<Overview | null>(null);
   const [windowKey, setWindowKey] = useState<WindowKey>("last_week");
-  const [error, setError] = useState("");
-
-  useEffect(() => {
-    const controller = new AbortController();
-    readJson<Overview>("/api/v8/overview", { signal: controller.signal })
-      .then(setOverview)
-      .catch((reason) => { if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : "概览读取失败"); });
-    return () => controller.abort();
-  }, []);
+  const overviewQuery = useQuery(overviewQueryOptions());
+  const overview = overviewQuery.data;
 
   const activeWindow = overview?.windows[windowKey];
   const windowSwitch = <div className="channel-switch" role="group" aria-label="统计窗口">
@@ -146,8 +138,8 @@ export default function OverviewPage() {
   </div>;
   return (
     <AppShell active="overview" actions={windowSwitch}>
-      {error && <Notice tone="error">{error}</Notice>}
-      {!overview && !error ? <Loading label="正在加载运营数据" /> : (
+      {overviewQuery.isError && <Notice tone="error">{overview ? `数据刷新失败，当前显示上次数据。${overviewQuery.error instanceof Error ? overviewQuery.error.message : ""}` : overviewQuery.error instanceof Error ? overviewQuery.error.message : "概览读取失败"}</Notice>}
+      {overviewQuery.isPending && !overview ? <Loading label="正在加载运营数据" /> : (
         <section className="page-stack overview-dashboard">
           <h2 className="visually-hidden">渠道结论</h2>
           <p className="visually-hidden" aria-live="polite">已切换到{windowLabels[windowKey]}，数据已更新</p>

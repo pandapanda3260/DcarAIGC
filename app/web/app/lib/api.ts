@@ -1,5 +1,26 @@
 export const API_BASE = process.env.NEXT_PUBLIC_DCAR_API_BASE ?? "";
 
+export class ApiRequestError extends Error {
+  readonly status: number | null;
+  readonly retryable: boolean;
+
+  constructor(message: string, options: { status?: number | null; retryable?: boolean } = {}) {
+    super(message);
+    this.name = "ApiRequestError";
+    this.status = options.status ?? null;
+    this.retryable = options.retryable ?? false;
+  }
+}
+
+export function isAbortError(reason: unknown) {
+  return reason instanceof Error && reason.name === "AbortError";
+}
+
+export function shouldRetryQuery(failureCount: number, error: unknown) {
+  if (isAbortError(error) || !(error instanceof ApiRequestError)) return false;
+  return error.retryable && failureCount < 1;
+}
+
 export function apiUrl(path: string) {
   return `${API_BASE}${path}`;
 }
@@ -23,12 +44,15 @@ export async function readJson<T>(path: string, init?: RequestInit): Promise<T> 
   try {
     response = await fetch(apiUrl(path), init);
   } catch (reason) {
-    if (reason instanceof DOMException && reason.name === "AbortError") throw reason;
-    throw new Error("无法连接数据服务，请检查网络或稍后重试。");
+    if (isAbortError(reason)) throw reason;
+    throw new ApiRequestError("无法连接数据服务，请检查网络或稍后重试。", { retryable: true });
   }
   if (!response.ok) {
     const body = (await response.json().catch(() => null)) as { detail?: unknown } | null;
-    throw new Error(apiErrorMessage(body?.detail, response.status));
+    throw new ApiRequestError(apiErrorMessage(body?.detail, response.status), {
+      status: response.status,
+      retryable: response.status >= 500,
+    });
   }
   return (await response.json()) as T;
 }

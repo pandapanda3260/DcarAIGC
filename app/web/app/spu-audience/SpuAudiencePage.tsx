@@ -1,6 +1,7 @@
 "use client";
 
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowsClockwiseIcon,
   ArrowsLeftRightIcon,
@@ -21,9 +22,11 @@ import {
   XIcon,
 } from "@phosphor-icons/react";
 import AppShell from "../components/AppShell";
-import { Feedback, Loading } from "../components/Feedback";
+import { Feedback, Loading, Notice } from "../components/Feedback";
 import { Pagination } from "../components/Pagination";
 import { jsonRequest, readJson } from "../lib/api";
+import { didSpuRunReachTerminal, shouldAutoAssociateSpu } from "../lib/queryContracts";
+import { queryKeys, spuAssetsQueryOptions, spuStatsQueryOptions } from "../lib/queries";
 import { VehicleBrandLogo } from "./VehicleBrandLogo";
 import {
   filterVehicleSeriesGroups,
@@ -31,9 +34,8 @@ import {
   sortVehicleCatalogRows,
 } from "./vehicleCatalogSort";
 import type {
+  SpuAssociationRun,
   SpuAssetRow,
-  SpuAudienceAssets,
-  SpuAudienceStats,
 } from "../lib/types";
 
 type SpuForm = {
@@ -119,14 +121,11 @@ const refreshScopes = [
 type RefreshScopeKey = (typeof refreshScopes)[number]["key"];
 
 export default function SpuAudiencePage() {
-  const [assets, setAssets] = useState<SpuAudienceAssets | null>(null);
-  const [stats, setStats] = useState<SpuAudienceStats | null>(null);
   const [statWindow, setStatWindow] = useState<string>("last_week");
   const [statPlatform, setStatPlatform] = useState<string>("");
   const [catalogPage, setCatalogPage] = useState(1);
   const [catalogPageSize, setCatalogPageSize] = useState(20);
   const [catalogQuery, setCatalogQuery] = useState("");
-  const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
   const [saving, setSaving] = useState(false);
   const [refreshPicker, setRefreshPicker] = useState(false);
@@ -134,45 +133,55 @@ export default function SpuAudiencePage() {
   const [expandedSeries, setExpandedSeries] = useState<ReadonlySet<string>>(new Set());
   const [form, setForm] = useState<SpuForm | null>(null);
   const [error, setError] = useState("");
+  const [associationError, setAssociationError] = useState("");
   const refreshTriggerRef = useRef<HTMLButtonElement>(null);
   const refreshDialogRef = useRef<HTMLElement>(null);
   const refreshRequestRef = useRef(false);
+  const autoAssociateEvaluatedRef = useRef(false);
+  const previousRunStatusRef = useRef<SpuAssociationRun["status"] | null>(null);
+  const queryClient = useQueryClient();
+  const assetsQuery = useQuery(spuAssetsQueryOptions());
+  const statsQuery = useQuery(spuStatsQueryOptions(statWindow, statPlatform));
+  const assets = assetsQuery.data ?? null;
+  const stats = statsQuery.data ?? null;
+  const lastRunStatus = assets?.last_run?.status ?? null;
 
-  const loadAssets = useCallback(async () => {
-    const result = await readJson<SpuAudienceAssets>("/api/v8/spu-audience/assets");
-    setAssets(result);
-    return result;
-  }, []);
-
-  const loadStats = useCallback(async (windowKey: string, platform: string) => {
-    const search = new URLSearchParams({ window: windowKey });
-    if (platform) search.set("platform", platform);
-    setStats(await readJson<SpuAudienceStats>(`/api/v8/spu-audience/stats?${search.toString()}`));
-  }, []);
+  const startAssociation = useCallback(async (mode: RefreshScopeKey | "incremental") => {
+    const path = mode === "full"
+      ? "/api/v8/spu-audience/associate"
+      : `/api/v8/spu-audience/associate?mode=${mode}`;
+    await readJson<{ run_id: number; status: string }>(path, { method: "POST" });
+    previousRunStatusRef.current = "running";
+    await queryClient.invalidateQueries({ queryKey: queryKeys.spuAssets, exact: true });
+  }, [queryClient]);
 
   useEffect(() => {
-    // 规则资产与统计各自加载、各自容错：统计接口出错时规则区照常可用
-    readJson<SpuAudienceAssets>("/api/v8/spu-audience/assets")
-      .then(async (assetsResult) => {
-        setAssets(assetsResult);
-        // 有上次刷新后新增/重评估的内容 → 自动增量补算，页面打开即保鲜
-        if (assetsResult.ready && (assetsResult.stale_content_count ?? 0) > 0 && assetsResult.last_run?.status !== "running") {
-          try {
-            await readJson("/api/v8/spu-audience/associate?mode=incremental", { method: "POST" });
-            setAssets(await readJson<SpuAudienceAssets>("/api/v8/spu-audience/assets"));
-          } catch {
-            // 只读副本或并发刷新时静默跳过，等下次打开再补
-          }
-        }
-      })
-      .catch((reason) => setError(reason instanceof Error ? reason.message : "车型、人群和场景规则加载失败，请刷新页面重试。"))
-      .finally(() => setLoading(false));
-    readJson<SpuAudienceStats>("/api/v8/spu-audience/stats?window=last_week")
-      .then(setStats)
-      .catch((reason) => setError(reason instanceof Error ? reason.message : "统计数据加载失败，请刷新页面重试。"));
-  }, []);
+    if (autoAssociateEvaluatedRef.current || !assetsQuery.isFetchedAfterMount || !assetsQuery.data) return;
+    autoAssociateEvaluatedRef.current = true;
+    if (!shouldAutoAssociateSpu(assetsQuery.data)) return;
+    void startAssociation("incremental").catch(() => {
+      // 只读副本或并发刷新时静默跳过，等下次真实读取资产后再判断。
+    });
+  }, [assetsQuery.data, assetsQuery.isFetchedAfterMount, startAssociation]);
 
-  const lastRunStatus = assets?.last_run?.status ?? null;
+  useEffect(() => {
+    const previousStatus = previousRunStatusRef.current;
+    previousRunStatusRef.current = lastRunStatus;
+    if (!didSpuRunReachTerminal(previousStatus, lastRunStatus)) return;
+    void Promise.all([
+      queryClient.invalidateQueries({ queryKey: queryKeys.spuStatsPrefix }),
+      queryClient.invalidateQueries({ queryKey: queryKeys.contents }),
+    ]);
+    const timer = window.setTimeout(() => {
+      if (lastRunStatus === "succeeded") {
+        setAssociationError("");
+      } else {
+        setAssociationError("内容重新识别没有完成，请稍后重试；如果一直失败，请联系管理员。");
+      }
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [lastRunStatus, queryClient]);
+
   useEffect(() => {
     if (!refreshPicker) return;
     const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -215,43 +224,14 @@ export default function SpuAudiencePage() {
     };
   }, [refreshPicker]);
 
-  useEffect(() => {
-    if (lastRunStatus !== "running") return;
-    const timer = window.setInterval(() => {
-      void (async () => {
-        try {
-          const next = await readJson<SpuAudienceAssets>("/api/v8/spu-audience/assets");
-          setAssets(next);
-          const status = next.last_run?.status;
-          if (status && status !== "running") {
-            window.clearInterval(timer);
-            const search = new URLSearchParams({ window: statWindow });
-            if (statPlatform) search.set("platform", statPlatform);
-            setStats(await readJson<SpuAudienceStats>(`/api/v8/spu-audience/stats?${search.toString()}`));
-            if (status === "succeeded") {
-              setError("");
-            } else {
-              setError("内容重新识别没有完成，请稍后重试；如果一直失败，请联系管理员。");
-            }
-          }
-        } catch {
-          // 网络抖动时等下一个轮询周期
-        }
-      })();
-    }, 5000);
-    return () => window.clearInterval(timer);
-  }, [lastRunStatus, statWindow, statPlatform]);
-
   async function refreshData(scope: RefreshScopeKey) {
+    autoAssociateEvaluatedRef.current = true;
     if (refreshRequestRef.current || lastRunStatus === "running") return;
     refreshRequestRef.current = true;
     setRefreshPicker(false);
-    setRunning(true); setError("");
+    setRunning(true); setError(""); setAssociationError("");
     try {
-      await readJson<{ run_id: number; status: string }>(
-        `/api/v8/spu-audience/associate?mode=${scope}`, { method: "POST" },
-      );
-      await loadAssets();
+      await startAssociation(scope);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "无法开始重新识别，请稍后重试。");
     } finally {
@@ -288,7 +268,8 @@ export default function SpuAudiencePage() {
 
   async function saveSpu() {
     if (!form) return;
-    setSaving(true); setError("");
+    autoAssociateEvaluatedRef.current = true;
+    setSaving(true); setError(""); setAssociationError("");
     try {
       const aliases = [
         ...splitWords(form.aliases).map((alias) => ({ alias, alias_type: "official", ambiguous: false })),
@@ -310,10 +291,10 @@ export default function SpuAudiencePage() {
       }));
       setForm(null);
       try {
-        await readJson("/api/v8/spu-audience/associate", { method: "POST" });
-        await loadAssets();
+        await startAssociation("full");
       } catch {
-        await loadAssets();
+        setAssociationError("车型已保存，但无法开始内容重新识别，请稍后点击“重新识别内容”。");
+        await queryClient.invalidateQueries({ queryKey: queryKeys.spuAssets, exact: true });
       }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "车型保存失败，请检查填写内容后重试。");
@@ -428,10 +409,10 @@ export default function SpuAudiencePage() {
 
   const shellActions = (
     <>
-      <button ref={refreshTriggerRef} className="primary" disabled={loading || associationRunning || Boolean(assets && !assets.ready)} onClick={openRefreshPicker}>
+      <button ref={refreshTriggerRef} className="primary" disabled={!assets || associationRunning || !assets.ready} onClick={openRefreshPicker}>
         {associationRunning ? "正在重新识别…" : "重新识别内容"}
       </button>
-      <button className="secondary spu-shell-action" disabled={loading || saving || Boolean(assets && !assets.ready)} onClick={() => editSpu()}>
+      <button className="secondary spu-shell-action" disabled={!assets || saving || !assets.ready} onClick={() => editSpu()}>
         <PlusIcon size={15} weight="bold" aria-hidden />
         新增车型
       </button>
@@ -440,8 +421,12 @@ export default function SpuAudiencePage() {
 
   return (
     <AppShell active="spu-audience" actions={shellActions}>
-      <Feedback error={error} onClose={() => setError("")} />
-      {loading ? <Loading label="正在加载车型、人群和场景数据" /> : assets && !assets.ready ? (
+      <Feedback error={error || associationError} onClose={() => { setError(""); setAssociationError(""); }} />
+      {assetsQuery.isError && <Notice tone="error">{assetsQuery.data ? `规则资产刷新失败，当前显示上次数据。${assetsQuery.error instanceof Error ? assetsQuery.error.message : ""}` : assetsQuery.error instanceof Error ? assetsQuery.error.message : "车型、人群和场景规则加载失败，请刷新页面重试。"}</Notice>}
+      {statsQuery.isError && <Notice tone="error">{statsQuery.data ? `统计数据刷新失败，当前显示上次数据。${statsQuery.error instanceof Error ? statsQuery.error.message : ""}` : statsQuery.error instanceof Error ? statsQuery.error.message : "统计数据加载失败，请刷新页面重试。"}</Notice>}
+      {assetsQuery.isPending && !assets ? <Loading label="正在加载车型、人群和场景数据" /> : !assets ? (
+        <section className="page-stack spu-audience-page"><article className="panel"><p>暂时无法读取车型、人群和场景数据，请稍后重试。</p></article></section>
+      ) : !assets.ready ? (
         <section className="page-stack spu-audience-page"><article className="panel"><p>当前数据版本较旧，暂时不能使用 SPU 人群功能。请联系管理员升级后重试。</p></article></section>
       ) : (
         <section className="page-stack spu-audience-page">
@@ -454,7 +439,7 @@ export default function SpuAudiencePage() {
                   id="spu-stat-window"
                   className="selling-point-window-select"
                   value={statWindow}
-                  onChange={(event) => { setStatWindow(event.target.value); void loadStats(event.target.value, statPlatform).catch((reason) => setError(reason instanceof Error ? reason.message : "统计数据加载失败，请刷新页面重试。")); }}
+                  onChange={(event) => setStatWindow(event.target.value)}
                 >
                   {statWindows.map((item) => <option key={item.key} value={item.key}>{item.label}</option>)}
                 </select>
@@ -462,7 +447,7 @@ export default function SpuAudiencePage() {
                   className="selling-point-window-select"
                   aria-label="统计平台"
                   value={statPlatform}
-                  onChange={(event) => { setStatPlatform(event.target.value); void loadStats(statWindow, event.target.value).catch((reason) => setError(reason instanceof Error ? reason.message : "统计数据加载失败，请刷新页面重试。")); }}
+                  onChange={(event) => setStatPlatform(event.target.value)}
                 >
                   <option value="">全部平台</option>
                   <option value="douyin">抖音</option>

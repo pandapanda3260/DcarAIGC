@@ -1,9 +1,10 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
+import { useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import AppShell from "../../components/AppShell";
-import { Feedback, Loading } from "../../components/Feedback";
+import { Feedback, Loading, Notice } from "../../components/Feedback";
 import { API_BASE, readJson } from "../../lib/api";
 import {
   formatBytes,
@@ -19,12 +20,12 @@ import {
   plainMetricReason,
   taskWasSuperseded,
 } from "../../lib/format";
-import type { BusinessSceneKey, ConclusionMetricKey, Metric, OverviewChannelKey, ReportView, TaskDetail } from "../../lib/types";
+import { isGeneratingTaskStatus } from "../../lib/queryContracts";
+import { queryKeys, taskDetailQueryOptions, taskReportQueryOptions } from "../../lib/queries";
+import type { BusinessSceneKey, ConclusionMetricKey, Metric, OverviewChannelKey, ReportView } from "../../lib/types";
 
 const tabs = [["summary", "报告概览"], ["platforms", "平台维度"], ["dimensions", "账号 / 方向"], ["contents", "内容明细"], ["files", "文件与日志"]] as const;
 // 重新生成同样跑在后台：详情页轮询任务读模型，进度与阶段文案跟任务列表卡片一致。
-const GENERATING_STATUSES = new Set(["queued", "running", "cancel_requested"]);
-const POLL_INTERVAL_MS = 1500;
 const taskActionPaths = { retry: "/retry", cancel: "/cancel", resume: "/resume" } as const;
 const channelOrder: OverviewChannelKey[] = ["douyin", "xiaohongshu"];
 const sceneOrder: BusinessSceneKey[] = ["used_car", "new_car", "media"];
@@ -164,42 +165,32 @@ function MetricText({ metric, compact = false }: { metric?: Metric; compact?: bo
 }
 
 export default function TaskDetailPage({ taskId }: { taskId: string }) {
-  const [detail, setDetail] = useState<TaskDetail | null>(null);
-  const [report, setReport] = useState<ReportView | null>(null);
   const [tab, setTab] = useState<(typeof tabs)[number][0]>("summary");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
-
-  const load = useCallback(async () => {
-    const next = await readJson<TaskDetail>(`/api/v8/tasks/${taskId}`);
-    setDetail(next);
-    const display = next.display_effective_revision;
-    setReport(display ? await readJson<ReportView>(`/api/v8/tasks/${taskId}/revisions/${display.revision}/report`) : null);
-  }, [taskId]);
-  useEffect(() => {
-    let stopped = false;
-    Promise.resolve().then(load).catch((reason) => { if (!stopped) setError(reason instanceof Error ? reason.message : "任务详情读取失败"); });
-    return () => { stopped = true; };
-  }, [load]);
+  const queryClient = useQueryClient();
+  const detailQuery = useQuery(taskDetailQueryOptions(taskId));
+  const detail = detailQuery.data;
+  const displayRevision = detail?.display_effective_revision?.revision;
+  const reportQuery = useQuery(taskReportQueryOptions(taskId, displayRevision));
+  const report = reportQuery.data ?? null;
 
   async function action(kind: "retry" | "cancel" | "resume") {
     setSaving(true); setError(""); setMessage("");
     try {
       await readJson(`/api/v8/tasks/${taskId}${taskActionPaths[kind]}`, { method: "POST" });
-      await load();
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: queryKeys.taskDetail(taskId), exact: true }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.tasksList, exact: true }),
+      ]);
       setMessage(kind === "cancel" ? "正在取消任务。" : kind === "resume" ? "任务已恢复，正在重新生成报告。" : "已开始重新生成报告。");
     } catch (reason) { setError(reason instanceof Error ? reason.message : "任务操作失败"); }
     finally { setSaving(false); }
   }
 
-  const generating = Boolean(detail && GENERATING_STATUSES.has(detail.task_status));
+  const generating = Boolean(detail && isGeneratingTaskStatus(detail.task_status));
   const progress = detail ? Math.max(0, Math.min(100, Math.round(detail.progress))) : 0;
-  useEffect(() => {
-    if (!generating) return;
-    const timer = setInterval(() => { void load().catch(() => { /* 后台仍在生成：保留上一次快照，等下一次轮询 */ }); }, POLL_INTERVAL_MS);
-    return () => clearInterval(timer);
-  }, [generating, load]);
   const superseded = taskWasSuperseded(detail?.message);
   const cancellable = detail && !superseded && ["queued", "running", "partial", "failed", "interrupted", "cancel_requested"].includes(detail.task_status);
   const retryable = detail && !superseded && ["succeeded", "partial", "failed", "interrupted"].includes(detail.task_status);
@@ -222,7 +213,9 @@ export default function TaskDetailPage({ taskId }: { taskId: string }) {
   ] : [];
   return <AppShell active="tasks" actions={<Link className="secondary button-link" href="/tasks">返回任务</Link>}>
     <Feedback error={error} message={message} onClose={() => { setError(""); setMessage(""); }} />
-    {!detail ? <Loading label="正在读取任务详情" /> : <section className="page-stack wide-stack">
+    {detailQuery.isError && <Notice tone="error">{detail ? `数据刷新失败，当前显示上次数据。${detailQuery.error instanceof Error ? detailQuery.error.message : ""}` : detailQuery.error instanceof Error ? detailQuery.error.message : "任务详情读取失败"}</Notice>}
+    {reportQuery.isError && <Notice tone="error">{reportQuery.error instanceof Error ? reportQuery.error.message : "报告读取失败"}</Notice>}
+    {detailQuery.isPending && !detail ? <Loading label="正在读取任务详情" /> : !detail ? <section className="page-stack wide-stack"><article className="panel"><div className="empty-state"><strong>暂时无法读取任务详情</strong><span>请稍后重试。</span></div></article></section> : <section className="page-stack wide-stack">
       <div className="detail-toolbar"><div><span className="eyebrow">任务编号：{detail.id}</span><h2>{detail.name}</h2><p>{formatDate(detail.period_start)} — {formatDate(detail.period_end)} · {humanizeTaskStatus(detail.task_status, detail.message)} · {humanizeTaskMessage(detail.message) || "无附加说明"}</p></div><div>
         {detail.display_effective_revision && <a className="primary button-link report-download-button" href={`${API_BASE}/api/v8/tasks/${encodeURIComponent(detail.id)}/revisions/${detail.display_effective_revision.revision}/download`} download title={`下载当前展示的第 ${detail.display_effective_revision.revision} 版报告图片和 Excel 明细`}>下载报告</a>}
         {retryable && <button className="secondary" disabled={saving} onClick={() => void action("retry")}>重新生成报告</button>}
