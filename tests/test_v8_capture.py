@@ -23,6 +23,7 @@ from v8.capture import (
     execute_account_fetch,
     execute_content_fetch,
     load_succeeded_raw_response,
+    mark_succeeded_fetch_slot_retryable_failure,
     recover_stale_fetch_slots,
 )
 from v8.storage import connect, initialize_database, now_utc
@@ -731,6 +732,81 @@ class V8CaptureTest(unittest.TestCase):
             usage = connection.execute("SELECT * FROM provider_usage").fetchone()
         self.assertEqual(usage["task_id"], task_id)
         self.assertEqual(usage["amount"], 0.008)
+
+    def test_successful_account_fetch_can_be_reopened_after_materialization_failure(
+        self,
+    ) -> None:
+        outcome = execute_account_fetch(
+            account_id=1,
+            stage="discovery",
+            window_key="openapi:page:0",
+            provider="DouyinOpenAPI",
+            adapter_version="douyin-openapi-video-list-v1",
+            operation="douyin_openapi_video_list",
+            db_path=self.db,
+            raw_root=self.raw,
+            call=lambda: ProviderResult(
+                {"items": [{"platform_content_id": "123456789"}]},
+                {"data": {"list": [{"item_id": "123456789"}]}},
+                200,
+                False,
+            ),
+        )
+        with connect(self.db) as connection:
+            before_attempt = dict(
+                connection.execute(
+                    "SELECT * FROM fetch_attempts WHERE id=?", (outcome.attempt_id,)
+                ).fetchone()
+            )
+            before_raw = dict(
+                connection.execute(
+                    "SELECT * FROM provider_raw_responses WHERE id=?",
+                    (outcome.raw_response_id,),
+                ).fetchone()
+            )
+
+        changed = mark_succeeded_fetch_slot_retryable_failure(
+            db_path=self.db,
+            slot_id=outcome.slot_id,
+            error_code="derived_materialization_failed",
+            error_message="content write interrupted",
+        )
+
+        self.assertEqual(changed["status"], "retryable_failed")
+        with connect(self.db) as connection:
+            slot = connection.execute(
+                "SELECT * FROM fetch_slots WHERE id=?", (outcome.slot_id,)
+            ).fetchone()
+            after_attempt = dict(
+                connection.execute(
+                    "SELECT * FROM fetch_attempts WHERE id=?", (outcome.attempt_id,)
+                ).fetchone()
+            )
+            after_raw = dict(
+                connection.execute(
+                    "SELECT * FROM provider_raw_responses WHERE id=?",
+                    (outcome.raw_response_id,),
+                ).fetchone()
+            )
+        self.assertEqual(slot["last_error_code"], "derived_materialization_failed")
+        self.assertEqual(slot["attempt_count"], 1)
+        self.assertEqual(after_attempt, before_attempt)
+        self.assertEqual(after_raw, before_raw)
+
+        with self.assertRaisesRegex(RuntimeError, "cannot become retryable"):
+            mark_succeeded_fetch_slot_retryable_failure(
+                db_path=self.db,
+                slot_id=outcome.slot_id,
+                error_code="derived_materialization_failed",
+                error_message="duplicate transition",
+            )
+        with self.assertRaisesRegex(ValueError, "derived_materialization_failed"):
+            mark_succeeded_fetch_slot_retryable_failure(
+                db_path=self.db,
+                slot_id=outcome.slot_id,
+                error_code="some_other_error",
+                error_message="wrong code",
+            )
 
     def test_budget_is_fail_closed_and_quality_gate_is_quantified(self) -> None:
         with self.assertRaises(BudgetBlocked):

@@ -1884,6 +1884,10 @@ def _materialize_discovery_stages(
     metrics_window_key: str,
     discovery_operation: str,
     source_raw_response_id: int,
+    provider: str,
+    derived_adapter_version: str,
+    derived_operations: Mapping[str, str],
+    zero_view_is_authoritative: bool,
     db_path: Path,
     materialize_detail: bool = True,
     materialize_metrics: bool = True,
@@ -1930,16 +1934,19 @@ def _materialize_discovery_stages(
                 },
             )
         )
-    # The account-post discovery endpoints can expose engagement counters while
-    # returning a placeholder zero for views.  That zero is not authoritative
-    # exposure and must not close the paid daily statistics slot; otherwise the
-    # dedicated statistics endpoint is skipped for the whole window.
+    # Some account-post discovery endpoints return a placeholder zero for
+    # views, while Douyin OpenAPI returns an authoritative zero.  The caller
+    # owns that provider-specific contract so a missing exposure value never
+    # accidentally closes the daily statistics slot.
     if materialize_metrics:
         discovery_view_count = metrics.get("view_count")
         has_authoritative_discovery_exposure = (
             isinstance(discovery_view_count, (int, float))
             and not isinstance(discovery_view_count, bool)
-            and discovery_view_count > 0
+            and (
+                discovery_view_count > 0
+                or (zero_view_is_authoritative and discovery_view_count == 0)
+            )
         )
         if has_authoritative_discovery_exposure:
             stage_values.append(("metrics", metrics_window_key, metrics))
@@ -1984,7 +1991,11 @@ def _materialize_discovery_stages(
         stage for stage in ("detail", "metrics") if stage not in expected
     ]
     for stage, window_key, data in stage_values:
-        _, _, operation, _ = STAGE_CONFIG[(platform, stage)]
+        operation = str(derived_operations.get(stage) or "").strip()
+        if not operation:
+            raise ProviderConfigurationError(
+                f"missing derived discovery operation for {stage}"
+            )
         try:
             fetch_kwargs: Dict[str, Any] = {}
             if derived_raw_root is not None:
@@ -1993,8 +2004,8 @@ def _materialize_discovery_stages(
                 content_id=content_id,
                 stage=stage,
                 window_key=window_key,
-                provider="TikHub",
-                adapter_version="tikhub-discovery-derived-v8.1",
+                provider=provider,
+                adapter_version=derived_adapter_version,
                 operation=operation,
                 call=partial(
                     _derived_discovery_result,
@@ -2115,6 +2126,190 @@ def _materialize_discovery_stages(
                 }
             )
     return output
+
+
+def materialize_account_discovery_page(
+    *,
+    account_id: int,
+    platform: str,
+    account_uid: str,
+    page: Mapping[str, Any],
+    source_raw_response_id: int,
+    metrics_window_key: str,
+    discovery_operation: str,
+    provider: str,
+    derived_adapter_version: str,
+    derived_operations: Mapping[str, str],
+    zero_view_is_authoritative: bool,
+    db_path: Path = DEFAULT_DB,
+    published_start: Optional[datetime] = None,
+    published_end: Optional[datetime] = None,
+    materialize_detail: bool = True,
+    materialize_existing_stages: bool = True,
+    new_content_source_group: Optional[Callable[[str], str]] = None,
+    derived_raw_root: Optional[Path] = None,
+    media_root: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Apply one already-captured account discovery page to shared storage.
+
+    The caller must first persist the complete provider page through
+    ``execute_account_fetch`` and pass that raw-response id here.  This keeps
+    identity, evidence, detail and metric writes on the same path for paid
+    TikHub discovery and zero-cost Douyin OpenAPI discovery.
+    """
+
+    if platform not in {"douyin", "xiaohongshu"}:
+        raise ProviderConfigurationError(f"unsupported platform: {platform}")
+    if not provider.strip() or not derived_adapter_version.strip():
+        raise ProviderConfigurationError(
+            "provider and derived_adapter_version are required"
+        )
+    with connect(db_path) as connection:
+        identity = connection.execute(
+            """
+            SELECT nickname FROM account_platform_identities
+            WHERE account_id=? AND platform=? AND uid=?
+            """,
+            (account_id, platform, account_uid),
+        ).fetchone()
+        source_raw = connection.execute(
+            """
+            SELECT pr.id
+            FROM provider_raw_responses pr
+            JOIN fetch_attempts fa ON fa.id=pr.fetch_attempt_id
+            JOIN fetch_slots fs ON fs.id=fa.slot_id
+            WHERE pr.id=? AND fs.account_id=? AND fs.stage='discovery'
+              AND pr.provider=? AND pr.operation=?
+            """,
+            (
+                source_raw_response_id,
+                account_id,
+                provider,
+                discovery_operation,
+            ),
+        ).fetchone()
+    if identity is None:
+        raise ProviderConfigurationError("账号平台身份不存在或已变化")
+    if source_raw is None:
+        raise ProviderConfigurationError("作品列表原始响应与账号不匹配")
+
+    inserted = 0
+    updated = 0
+    derived_created = 0
+    derived_replayed = 0
+    derived_already_succeeded = 0
+    derived_skipped = 0
+    derived_failures: List[Dict[str, Any]] = []
+    content_changes: List[Dict[str, Any]] = []
+    page_items = [
+        dict(item) for item in page.get("items") or [] if isinstance(item, Mapping)
+    ]
+    persisted_items: List[Dict[str, Any]] = []
+    missing_published_at_count = 0
+    for item in page_items:
+        published_iso = _timestamp_iso(item.get("published_at"))
+        if published_start is not None or published_end is not None:
+            if published_iso is None:
+                missing_published_at_count += 1
+                continue
+            published = datetime.fromisoformat(published_iso.replace("Z", "+00:00"))
+            if published_start is not None and published < published_start:
+                continue
+            if published_end is not None and published > published_end:
+                continue
+        if published_iso is not None:
+            item["published_at"] = published_iso
+        persisted_items.append(item)
+        source_group_on_insert = (
+            new_content_source_group(published_iso)
+            if new_content_source_group is not None and published_iso is not None
+            else ""
+        )
+        value = {
+            **dict(item),
+            "account_uid": account_uid,
+            "account_name": item.get("account_name") or identity["nickname"],
+            # Discovery text is often blank or truncated.  It can seed a new
+            # content row but must not overwrite richer detail/manual text.
+            "_preserve_existing_content_fields": True,
+        }
+        result = upsert_content(
+            value,
+            db_path=db_path,
+            source_group_on_insert=source_group_on_insert,
+        )
+        content_id = int(result["id"])
+        content_changes.append(
+            {"content_id": content_id, "action": str(result["action"])}
+        )
+        inserted += int(result["action"] == "inserted")
+        updated += int(result["action"] == "updated")
+        if result["action"] == "inserted" or materialize_existing_stages:
+            derived = _materialize_discovery_stages(
+                content_id=content_id,
+                item=item,
+                account_uid=account_uid,
+                metrics_window_key=metrics_window_key,
+                discovery_operation=discovery_operation,
+                source_raw_response_id=source_raw_response_id,
+                provider=provider,
+                derived_adapter_version=derived_adapter_version,
+                derived_operations=derived_operations,
+                zero_view_is_authoritative=zero_view_is_authoritative,
+                db_path=db_path,
+                materialize_detail=materialize_detail,
+                derived_raw_root=derived_raw_root,
+                media_root=media_root,
+            )
+        else:
+            derived = {
+                "created": [],
+                "replayed": [],
+                "already_succeeded": [],
+                "skipped": ["detail", "metrics"],
+                "failed": [],
+            }
+        derived_created += len(derived["created"])
+        derived_replayed += len(derived["replayed"])
+        derived_already_succeeded += len(derived["already_succeeded"])
+        derived_skipped += len(derived["skipped"])
+        derived_failures.extend(derived["failed"])
+
+    if missing_published_at_count:
+        derived_failures.append(
+            {
+                "stage": "discovery",
+                "error_code": "missing_published_at",
+                "message": (
+                    f"{missing_published_at_count} items have no usable published_at; "
+                    "kept in raw response for quarantine/manual resolution"
+                ),
+            }
+        )
+    if not derived_failures:
+        _mark_raw_response_applied(source_raw_response_id, db_path=db_path)
+    return {
+        "inserted": inserted,
+        "updated": updated,
+        "page_item_count": len(page_items),
+        "persisted_item_count": len(persisted_items),
+        "missing_published_at_count": missing_published_at_count,
+        "content_changes": content_changes,
+        "derived_stages": {
+            "created": derived_created,
+            "replayed": derived_replayed,
+            "already_succeeded": derived_already_succeeded,
+            "skipped": derived_skipped,
+            "failures": derived_failures,
+        },
+        "page_published_at": [
+            value
+            for value in (
+                _timestamp_iso(item.get("published_at")) for item in page_items
+            )
+            if value is not None
+        ],
+    }
 
 
 def discover_account_content(
@@ -2334,86 +2529,29 @@ def discover_account_content(
     else:
         page_slot_id = outcome.slot_id
     costs += page_amount
-    inserted = 0
-    updated = 0
-    derived_created = 0
-    derived_replayed = 0
-    derived_already_succeeded = 0
-    derived_skipped = 0
-    derived_failures: List[Dict[str, Any]] = []
-    content_changes: List[Dict[str, Any]] = []
-    page_items = [
-        dict(item) for item in page_data.get("items") or [] if isinstance(item, Mapping)
-    ]
-    persisted_items: List[Dict[str, Any]] = []
-    missing_published_at_count = 0
     try:
-        for item in page_items:
-            published_iso = _timestamp_iso(item.get("published_at"))
-            if published_start is not None or published_end is not None:
-                if published_iso is None:
-                    missing_published_at_count += 1
-                    continue
-                published = datetime.fromisoformat(published_iso.replace("Z", "+00:00"))
-                if published_start is not None and published < published_start:
-                    continue
-                if published_end is not None and published > published_end:
-                    continue
-            if published_iso is not None:
-                item["published_at"] = published_iso
-            persisted_items.append(item)
-            source_group_on_insert = (
-                new_content_source_group(published_iso)
-                if new_content_source_group is not None
-                and published_iso is not None
-                else ""
-            )
-            value = {
-                **dict(item),
-                "account_uid": uid,
-                "account_name": item.get("account_name") or identity["nickname"],
-                # 作品列表页的文本经常为空或截断版，只能补空，
-                # 不能覆盖已由详情/人工入库的富文本。
-                "_preserve_existing_content_fields": True,
-            }
-            result = upsert_content(
-                value,
-                db_path=db_path,
-                source_group_on_insert=source_group_on_insert,
-            )
-            content_id = int(result["id"])
-            content_changes.append(
-                {"content_id": content_id, "action": str(result["action"])}
-            )
-            inserted += int(result["action"] == "inserted")
-            updated += int(result["action"] == "updated")
-            if (
-                result["action"] == "inserted"
-                or materialize_existing_discovery_stages
-            ):
-                derived = _materialize_discovery_stages(
-                    content_id=content_id,
-                    item=item,
-                    account_uid=uid,
-                    metrics_window_key=target_day.isoformat(),
-                    discovery_operation=operation,
-                    source_raw_response_id=int(page_raw_response_id),
-                    db_path=db_path,
-                    materialize_detail=materialize_discovery_detail,
-                )
-            else:
-                derived = {
-                    "created": [],
-                    "replayed": [],
-                    "already_succeeded": [],
-                    "skipped": ["detail", "metrics"],
-                    "failed": [],
-                }
-            derived_created += len(derived["created"])
-            derived_replayed += len(derived["replayed"])
-            derived_already_succeeded += len(derived["already_succeeded"])
-            derived_skipped += len(derived["skipped"])
-            derived_failures.extend(derived["failed"])
+        materialized = materialize_account_discovery_page(
+            account_id=account_id,
+            platform=platform,
+            account_uid=uid,
+            page=page_data,
+            source_raw_response_id=int(page_raw_response_id),
+            metrics_window_key=target_day.isoformat(),
+            discovery_operation=operation,
+            provider=provider,
+            derived_adapter_version="tikhub-discovery-derived-v8.1",
+            derived_operations={
+                "detail": STAGE_CONFIG[(platform, "detail")][2],
+                "metrics": STAGE_CONFIG[(platform, "metrics")][2],
+            },
+            zero_view_is_authoritative=False,
+            db_path=db_path,
+            published_start=published_start,
+            published_end=published_end,
+            materialize_detail=materialize_discovery_detail,
+            materialize_existing_stages=materialize_existing_discovery_stages,
+            new_content_source_group=new_content_source_group,
+        )
     except IdentityConflictError as error:
         mark_fetch_slot_terminal_failure(
             db_path=db_path,
@@ -2423,19 +2561,8 @@ def discover_account_content(
         )
         error.provider_cost = round(costs, 6)
         raise
-    if missing_published_at_count:
-        derived_failures.append(
-            {
-                "stage": "discovery",
-                "error_code": "missing_published_at",
-                "message": (
-                    f"{missing_published_at_count} items have no usable published_at; "
-                    "kept in raw response for quarantine/manual resolution"
-                ),
-            }
-        )
-    if not derived_failures:
-        _mark_raw_response_applied(int(page_raw_response_id), db_path=db_path)
+    derived = materialized["derived_stages"]
+    derived_failures = list(derived["failures"])
     return {
         "account_id": account_id,
         "platform": platform,
@@ -2448,29 +2575,19 @@ def discover_account_content(
         ),
         "replayed": replayed,
         "reference_status": reference_status,
-        "inserted": inserted,
-        "updated": updated,
+        "inserted": materialized["inserted"],
+        "updated": materialized["updated"],
         "provider_cost": round(costs, 6),
         "next_cursor": page_data.get("next_cursor"),
         "has_more": _bool(page_data.get("has_more")),
-        "page_item_count": len(page_items),
-        "persisted_item_count": len(persisted_items),
-        "missing_published_at_count": missing_published_at_count,
-        "content_changes": content_changes,
-        "derived_stages": {
-            "created": derived_created,
-            "replayed": derived_replayed,
-            "already_succeeded": derived_already_succeeded,
-            "skipped": derived_skipped,
-            "failures": derived_failures,
-        },
-        "page_published_at": [
-            value
-            for value in (
-                _timestamp_iso(item.get("published_at")) for item in page_items
-            )
-            if value is not None
+        "page_item_count": materialized["page_item_count"],
+        "persisted_item_count": materialized["persisted_item_count"],
+        "missing_published_at_count": materialized[
+            "missing_published_at_count"
         ],
+        "content_changes": materialized["content_changes"],
+        "derived_stages": derived,
+        "page_published_at": materialized["page_published_at"],
     }
 
 

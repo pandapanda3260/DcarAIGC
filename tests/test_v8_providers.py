@@ -14,7 +14,12 @@ from unittest.mock import patch
 
 import v8.capture as capture_module
 import v8.media as media_module
-from v8.capture import CaptureError, ProviderResult, SlotUnavailable
+from v8.capture import (
+    CaptureError,
+    ProviderResult,
+    SlotUnavailable,
+    execute_account_fetch,
+)
 from v8.evaluation import evaluate_content
 from v8.matcher_dsl import POINT_IDS, POINT_SCENES
 from v8.operations import IdentityConflictError, upsert_account, upsert_content
@@ -36,6 +41,7 @@ from v8.providers import (
     _xhs_call,
     _xhs_media_urls,
     discover_account_content,
+    materialize_account_discovery_page,
     materialize_zero_comment_evidence,
     retry_content_media,
     update_content_data,
@@ -850,6 +856,222 @@ class V8ProviderUpdateTest(unittest.TestCase):
             "missing_from_statistics_response",
         )
         self.assertEqual(observation_count, 4)
+
+    def test_openapi_discovery_zero_view_is_authoritative_in_shared_materializer(
+        self,
+    ) -> None:
+        account = upsert_account(
+            {
+                "phone": "13800138031",
+                "platforms": [
+                    {
+                        "platform": "douyin",
+                        "uid": "6677889901",
+                        "nickname": "开放平台零播放号",
+                    }
+                ],
+            },
+            db_path=self.db,
+        )
+        page = {
+            "items": [
+                {
+                    "platform": "douyin",
+                    "platform_content_id": "776655443322",
+                    "canonical_url": "https://www.douyin.com/video/776655443322",
+                    "title": "刚发布零播放",
+                    "body": "刚发布零播放",
+                    "published_at": "2026-08-23T00:30:00Z",
+                    "content_type": "video",
+                    "metrics": {
+                        "view_count": 0,
+                        "comment_count": 0,
+                        "like_count": 0,
+                        "share_count": 0,
+                    },
+                }
+            ],
+            "has_more": False,
+            "next_cursor": 0,
+        }
+        fetched = execute_account_fetch(
+            account_id=int(account["id"]),
+            stage="discovery",
+            window_key="2026-08-23:openapi:page:0",
+            provider="DouyinOpenAPI",
+            adapter_version="douyin-openapi-video-list-v1",
+            operation="douyin_openapi_video_list",
+            db_path=self.db,
+            raw_root=self.root / "openapi-raw",
+            call=lambda: ProviderResult(
+                page,
+                {"data": {"list": [{"item_id": "776655443322"}]}},
+                200,
+                False,
+            ),
+        )
+
+        result = materialize_account_discovery_page(
+            account_id=int(account["id"]),
+            platform="douyin",
+            account_uid="6677889901",
+            page=page,
+            source_raw_response_id=fetched.raw_response_id,
+            metrics_window_key="2026-08-23",
+            discovery_operation="douyin_openapi_video_list",
+            provider="DouyinOpenAPI",
+            derived_adapter_version="douyin-openapi-video-list-derived-v1",
+            derived_operations={
+                "detail": "douyin_openapi_video_list_detail_derived",
+                "metrics": "douyin_openapi_video_list_metrics_derived",
+            },
+            zero_view_is_authoritative=True,
+            db_path=self.db,
+            derived_raw_root=self.root / "openapi-derived-raw",
+        )
+
+        self.assertEqual(result["inserted"], 1)
+        self.assertEqual(result["derived_stages"]["created"], 1)
+        self.assertEqual(result["derived_stages"]["skipped"], 1)
+        with connect(self.db) as connection:
+            content = connection.execute(
+                "SELECT id FROM content_items WHERE platform_content_id='776655443322'"
+            ).fetchone()
+            slot = connection.execute(
+                """
+                SELECT provider,adapter_version,status
+                FROM fetch_slots
+                WHERE content_id=? AND stage='metrics'
+                """,
+                (content["id"],),
+            ).fetchone()
+            snapshot = connection.execute(
+                """
+                SELECT view_count,status,raw_response_id
+                FROM content_metric_snapshots
+                WHERE content_id=? AND window_key='2026-08-23'
+                """,
+                (content["id"],),
+            ).fetchone()
+            observation = connection.execute(
+                """
+                SELECT view_count,status FROM content_metric_observations
+                WHERE content_id=? ORDER BY id DESC LIMIT 1
+                """,
+                (content["id"],),
+            ).fetchone()
+            sources = connection.execute(
+                """
+                SELECT source FROM provider_raw_responses
+                WHERE id=? OR id=? ORDER BY id
+                """,
+                (fetched.raw_response_id, snapshot["raw_response_id"]),
+            ).fetchall()
+        self.assertEqual(
+            tuple(slot),
+            (
+                "DouyinOpenAPI",
+                "douyin-openapi-video-list-derived-v1",
+                "succeeded",
+            ),
+        )
+        self.assertEqual(tuple(snapshot)[:2], (0, "available"))
+        self.assertEqual(tuple(observation), (0, "available"))
+        self.assertEqual([row["source"] for row in sources], [
+            "live_applied",
+            "derived_applied",
+        ])
+
+    def test_openapi_discovery_missing_view_does_not_create_successful_metrics_slot(
+        self,
+    ) -> None:
+        account = upsert_account(
+            {
+                "phone": "13800138032",
+                "platforms": [
+                    {
+                        "platform": "douyin",
+                        "uid": "6677889902",
+                        "nickname": "开放平台缺播放号",
+                    }
+                ],
+            },
+            db_path=self.db,
+        )
+        page = {
+            "items": [
+                {
+                    "platform": "douyin",
+                    "platform_content_id": "776655443323",
+                    "canonical_url": "https://www.douyin.com/video/776655443323",
+                    "title": "缺少播放字段",
+                    "published_at": "2026-08-23T00:40:00Z",
+                    "content_type": "video",
+                    "metrics": {"comment_count": 2, "like_count": 9},
+                }
+            ]
+        }
+        fetched = execute_account_fetch(
+            account_id=int(account["id"]),
+            stage="discovery",
+            window_key="2026-08-23:openapi:page:1",
+            provider="DouyinOpenAPI",
+            adapter_version="douyin-openapi-video-list-v1",
+            operation="douyin_openapi_video_list",
+            db_path=self.db,
+            raw_root=self.root / "openapi-raw",
+            call=lambda: ProviderResult(page, {"data": {"list": [{}]}}, 200, False),
+        )
+
+        result = materialize_account_discovery_page(
+            account_id=int(account["id"]),
+            platform="douyin",
+            account_uid="6677889902",
+            page=page,
+            source_raw_response_id=fetched.raw_response_id,
+            metrics_window_key="2026-08-23",
+            discovery_operation="douyin_openapi_video_list",
+            provider="DouyinOpenAPI",
+            derived_adapter_version="douyin-openapi-video-list-derived-v1",
+            derived_operations={
+                "detail": "douyin_openapi_video_list_detail_derived",
+                "metrics": "douyin_openapi_video_list_metrics_derived",
+            },
+            zero_view_is_authoritative=True,
+            db_path=self.db,
+            derived_raw_root=self.root / "openapi-derived-raw",
+        )
+
+        self.assertEqual(result["derived_stages"]["created"], 0)
+        self.assertEqual(result["derived_stages"]["skipped"], 2)
+        with connect(self.db) as connection:
+            content = connection.execute(
+                "SELECT id FROM content_items WHERE platform_content_id='776655443323'"
+            ).fetchone()
+            metrics_slot = connection.execute(
+                """
+                SELECT id FROM fetch_slots
+                WHERE content_id=? AND stage='metrics'
+                """,
+                (content["id"],),
+            ).fetchone()
+            snapshot = connection.execute(
+                """
+                SELECT view_count,comment_count,like_count,status
+                FROM content_metric_snapshots WHERE content_id=?
+                """,
+                (content["id"],),
+            ).fetchone()
+            observation = connection.execute(
+                """
+                SELECT view_count,status FROM content_metric_observations
+                WHERE content_id=? ORDER BY id DESC LIMIT 1
+                """,
+                (content["id"],),
+            ).fetchone()
+        self.assertIsNone(metrics_slot)
+        self.assertEqual(tuple(snapshot), (None, 2, 9, "missing"))
+        self.assertEqual(tuple(observation), (None, "missing"))
 
     def test_douyin_numeric_uid_resolves_through_profile_endpoint(self) -> None:
         payload = {
