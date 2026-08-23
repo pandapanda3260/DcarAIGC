@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>cn.tj.dcar.douyin-sync-tunnel</string>
+  <key>Disabled</key>
+  <true/>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>WorkingDirectory</key>
+  <string>__PROJECT_ROOT_XML__</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PROJECT_ROOT_XML__/deploy/macos/run_douyin_sync_tunnel.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>DCAR_PROJECT_ROOT</key>
+    <string>__PROJECT_ROOT_XML__</string>
+    <key>DCAR_DOUYIN_SYNC_ENV_FILE</key>
+    <string>__HOME_XML__/Library/Application Support/DcarAIGC/douyin-sync.env</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>__HOME_XML__/Library/Logs/DcarAIGC/douyin-sync-tunnel.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME_XML__/Library/Logs/DcarAIGC/douyin-sync-tunnel.stderr.log</string>
+</dict>
+</plist>

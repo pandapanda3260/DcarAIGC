@@ -1,0 +1,1 @@
+command="/usr/sbin/nologin",restrict,port-forwarding,permitopen="127.0.0.1:4175" ssh-ed25519 REPLACE_WITH_DEDICATED_DOUYIN_SYNC_PUBLIC_KEY dcar-douyin-sync

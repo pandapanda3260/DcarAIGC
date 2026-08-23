@@ -133,6 +133,10 @@ JOBS = (
     JobDefinition("daily_report", 8, 0),
     JobDefinition("weekly_report", 8, 30, "mon"),
 )
+DOUYIN_OPENAPI_RECONCILE_JOB_ID = "douyin_openapi_reconcile"
+DOUYIN_OPENAPI_RECONCILE_GUARD_JOB_ID = "douyin_openapi_reconcile_guard"
+DOUYIN_OPENAPI_RECONCILE_HOUR = 2
+DAILY_CAPTURE_START_DELAY_MINUTES = 10
 REPORT_JOB_IDS = frozenset({"daily_report", "weekly_report"})
 TERMINAL_RUN_STATUSES = frozenset({"succeeded", "partial", "skipped"})
 RETRYABLE_RUN_STATUSES = frozenset({"failed", "interrupted"})
@@ -161,6 +165,9 @@ class CurrentDayRunState:
     status: str
     started_at: Optional[datetime]
     completed_at: Optional[datetime]
+
+
+DouyinOpenApiRunner = Callable[..., Mapping[str, Any]]
 
 
 _STALE_DEPENDENCY_RETRY_REASON = "stale_dependency_completion"
@@ -285,11 +292,14 @@ def current_day_daily_capture_guard(
         Callable[[str, Mapping[str, Any]], ProviderResult]
     ],
 ) -> Dict[str, Any]:
-    """Run only today's exact 02:00 capture occurrence, at most once.
+    """Run today's logical 02:00 capture after the OpenAPI completion buffer.
 
-    This deliberately does not use :func:`latest_occurrence`: before 02:00 that
-    helper points at yesterday, which would turn a residency guard into an
-    unbounded historical backfill mechanism.
+    The OpenAPI reconciliation owns the same 02:00 coverage boundary and starts
+    first.  The daily capture remains logically scheduled for 02:00 so a
+    successful receipt covers its complete discovery interval; if OpenAPI is
+    still running or failed after this short buffer, normal TikHub fallback is
+    used.  This deliberately does not use :func:`latest_occurrence`, which
+    would point at yesterday before today's slot.
     """
 
     local_now = now.astimezone(SHANGHAI)
@@ -300,7 +310,8 @@ def current_day_daily_capture_guard(
             "effective_from": effective_from.isoformat(),
         }
     occurrence = datetime.combine(local_now.date(), time(2, 0), SHANGHAI)
-    if local_now < occurrence:
+    not_before = occurrence + timedelta(minutes=DAILY_CAPTURE_START_DELAY_MINUTES)
+    if local_now < not_before:
         return {
             "job_id": "daily_capture",
             "status": "before_today_slot",
@@ -871,6 +882,178 @@ def recover_interrupted_scheduler_runs(*, db_path: Path = DEFAULT_DB) -> int:
         return len(attempts)
 
 
+def _default_douyin_openapi_runner(
+    *, scheduled_for: datetime, db_path: Path
+) -> Mapping[str, Any]:
+    # Keep the scheduler importable while the OpenAPI integration is disabled.
+    # The concrete writer-side implementation is loaded only when this job runs.
+    from .douyin_openapi_sync import run_douyin_openapi_reconcile
+
+    return run_douyin_openapi_reconcile(
+        scheduled_for=scheduled_for,
+        db_path=db_path,
+    )
+
+
+def _validate_douyin_openapi_details(
+    value: Mapping[str, Any],
+) -> tuple[str, Dict[str, Any]]:
+    details = dict(value)
+    if set(details) != {"window_start", "coverage_end", "accounts"}:
+        raise SchedulerJobError("Douyin OpenAPI receipt fields are invalid")
+    window_start = details.get("window_start")
+    coverage_end = details.get("coverage_end")
+    accounts = details.get("accounts")
+    if not isinstance(window_start, str) or not window_start:
+        raise SchedulerJobError("Douyin OpenAPI receipt is missing window_start")
+    if not isinstance(coverage_end, str) or not coverage_end:
+        raise SchedulerJobError("Douyin OpenAPI receipt is missing coverage_end")
+    if not isinstance(accounts, list):
+        raise SchedulerJobError("Douyin OpenAPI receipt accounts must be a list")
+
+    account_statuses: List[str] = []
+    seen_identities: set[tuple[int, str]] = set()
+    for account in accounts:
+        if not isinstance(account, Mapping):
+            raise SchedulerJobError("Douyin OpenAPI account receipt must be an object")
+        required_fields = {
+            "account_id",
+            "platform_uid",
+            "status",
+            "coverage_start",
+            "coverage_end",
+            "coverage_complete",
+            "pagination_complete",
+            "materialization_complete",
+            "pages_fetched",
+            "items_discovered",
+        }
+        account_fields = set(account)
+        if not required_fields <= account_fields or not account_fields <= (
+            required_fields | {"error_code"}
+        ):
+            raise SchedulerJobError("Douyin OpenAPI account receipt fields are invalid")
+        account_id = account.get("account_id")
+        platform_uid = account.get("platform_uid")
+        status = account.get("status")
+        if (
+            isinstance(account_id, bool)
+            or not isinstance(account_id, int)
+            or account_id <= 0
+            or not isinstance(platform_uid, str)
+            or not 6 <= len(platform_uid) <= 24
+            or not platform_uid.isdigit()
+        ):
+            raise SchedulerJobError("Douyin OpenAPI account identity is invalid")
+        identity = (account_id, platform_uid)
+        if identity in seen_identities:
+            raise SchedulerJobError("Douyin OpenAPI account receipt is duplicated")
+        seen_identities.add(identity)
+        if status not in {"succeeded", "partial", "failed"}:
+            raise SchedulerJobError("Douyin OpenAPI account status is invalid")
+        error_code = account.get("error_code")
+        if (status == "succeeded" and "error_code" in account) or (
+            status != "succeeded"
+            and (
+                not isinstance(error_code, str)
+                or not error_code
+                or len(error_code) > 128
+                or any(
+                    character not in "abcdefghijklmnopqrstuvwxyz0123456789_"
+                    for character in error_code
+                )
+            )
+        ):
+            raise SchedulerJobError("Douyin OpenAPI account error_code is invalid")
+        if account.get("coverage_start") != window_start:
+            raise SchedulerJobError("Douyin OpenAPI account coverage_start drifted")
+        if account.get("coverage_end") != coverage_end:
+            raise SchedulerJobError("Douyin OpenAPI account coverage_end drifted")
+        for field in (
+            "coverage_complete",
+            "pagination_complete",
+            "materialization_complete",
+        ):
+            if not isinstance(account.get(field), bool):
+                raise SchedulerJobError(
+                    f"Douyin OpenAPI account {field} must be boolean"
+                )
+        for field in ("pages_fetched", "items_discovered"):
+            number = account.get(field)
+            if isinstance(number, bool) or not isinstance(number, int) or number < 0:
+                raise SchedulerJobError(
+                    f"Douyin OpenAPI account {field} must be non-negative"
+                )
+        if status == "succeeded" and (
+            account.get("coverage_complete") is not True
+            or account.get("pagination_complete") is not True
+            or account.get("materialization_complete") is not True
+            or account.get("pages_fetched", 0) < 1
+        ):
+            raise SchedulerJobError("Douyin OpenAPI succeeded receipt is incomplete")
+        account_statuses.append(str(status))
+
+    if not account_statuses:
+        run_status = "skipped"
+    elif all(status == "failed" for status in account_statuses):
+        run_status = "failed"
+    elif all(status == "succeeded" for status in account_statuses) and all(
+        account.get("coverage_complete") is True
+        and account.get("pagination_complete") is True
+        and account.get("materialization_complete") is True
+        for account in accounts
+    ):
+        run_status = "succeeded"
+    else:
+        run_status = "partial"
+    details["status"] = run_status
+    return run_status, details
+
+
+def execute_douyin_openapi_reconcile(
+    scheduled_for: datetime,
+    *,
+    db_path: Path = DEFAULT_DB,
+    runner: Optional[DouyinOpenApiRunner] = None,
+    allow_retry: bool = False,
+) -> Dict[str, Any]:
+    """Execute the independent OpenAPI occurrence outside the fixed pipeline."""
+
+    claim = _claim_run(
+        DOUYIN_OPENAPI_RECONCILE_JOB_ID,
+        scheduled_for,
+        db_path=db_path,
+        allow_retry=allow_retry,
+        invocation_source="scheduled",
+    )
+    if claim is None:
+        return {
+            "job_id": DOUYIN_OPENAPI_RECONCILE_JOB_ID,
+            "status": "skipped_duplicate",
+        }
+    action = runner or _default_douyin_openapi_runner
+    try:
+        raw_details = action(scheduled_for=scheduled_for, db_path=db_path)
+        if not isinstance(raw_details, Mapping):
+            raise SchedulerJobError("Douyin OpenAPI runner must return an object")
+        status, details = _validate_douyin_openapi_details(raw_details)
+    except Exception:
+        _finish_run(
+            claim,
+            status="failed",
+            details={"error_code": "douyin_openapi_reconcile_failed"},
+            db_path=db_path,
+        )
+        raise
+    _finish_run(claim, status=status, details=details, db_path=db_path)
+    return {
+        "job_id": DOUYIN_OPENAPI_RECONCILE_JOB_ID,
+        "status": status,
+        "attempt_number": claim.attempt_number,
+        "details": details,
+    }
+
+
 def prepare_due_capture_slots(
     scheduled_for: datetime,
     *,
@@ -1137,6 +1320,138 @@ def _select_due_capture_contents(
     return due[:content_limit]
 
 
+def _douyin_openapi_receipts_for_day(
+    local_day: date,
+    *,
+    db_path: Path,
+    required_start: datetime,
+    required_end: datetime,
+) -> Dict[tuple[int, str], Dict[str, Any]]:
+    occurrence = datetime.combine(
+        local_day,
+        time(DOUYIN_OPENAPI_RECONCILE_HOUR, 0),
+        SHANGHAI,
+    )
+    with connect(db_path) as connection:
+        row = connection.execute(
+            """
+            SELECT status,details_json FROM scheduler_runs
+            WHERE job_id=? AND scheduled_for=?
+            """,
+            (
+                DOUYIN_OPENAPI_RECONCILE_JOB_ID,
+                _scheduled_iso(occurrence),
+            ),
+        ).fetchone()
+    if row is None or str(row["status"]) not in {"succeeded", "partial"}:
+        return {}
+    try:
+        details = json.loads(str(row["details_json"] or "{}"))
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(details, Mapping):
+        return {}
+    window_start = details.get("window_start")
+    coverage_end = details.get("coverage_end")
+    accounts = details.get("accounts")
+    if (
+        not isinstance(window_start, str)
+        or not window_start
+        or not isinstance(coverage_end, str)
+        or not coverage_end
+        or not isinstance(accounts, list)
+    ):
+        return {}
+    try:
+        receipt_start = datetime.fromisoformat(window_start.replace("Z", "+00:00"))
+        receipt_end = datetime.fromisoformat(coverage_end.replace("Z", "+00:00"))
+    except ValueError:
+        return {}
+    if (
+        receipt_start.tzinfo is None
+        or receipt_end.tzinfo is None
+        or receipt_start.astimezone(timezone.utc)
+        > required_start.astimezone(timezone.utc)
+        or receipt_end.astimezone(timezone.utc)
+        < required_end.astimezone(timezone.utc)
+    ):
+        return {}
+
+    receipts: Dict[tuple[int, str], Dict[str, Any]] = {}
+    invalid_identities: set[tuple[int, str]] = set()
+    for value in accounts:
+        if not isinstance(value, Mapping):
+            continue
+        account_id = value.get("account_id")
+        platform_uid = value.get("platform_uid")
+        if (
+            isinstance(account_id, bool)
+            or not isinstance(account_id, int)
+            or account_id <= 0
+            or not isinstance(platform_uid, str)
+            or not platform_uid
+        ):
+            continue
+        identity = (account_id, platform_uid)
+        if identity in receipts:
+            invalid_identities.add(identity)
+            continue
+        pages_fetched = value.get("pages_fetched")
+        items_discovered = value.get("items_discovered")
+        complete = (
+            value.get("status") == "succeeded"
+            and value.get("coverage_start") == window_start
+            and value.get("coverage_end") == coverage_end
+            and value.get("coverage_complete") is True
+            and value.get("pagination_complete") is True
+            and value.get("materialization_complete") is True
+            and not isinstance(pages_fetched, bool)
+            and isinstance(pages_fetched, int)
+            and pages_fetched >= 1
+            and not isinstance(items_discovered, bool)
+            and isinstance(items_discovered, int)
+            and items_discovered >= 0
+        )
+        if complete:
+            receipts[identity] = dict(value)
+    for identity in invalid_identities:
+        receipts.pop(identity, None)
+    return receipts
+
+
+def _synthetic_openapi_discovery(
+    identity: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+) -> Dict[str, Any]:
+    pages_fetched = int(receipt["pages_fetched"])
+    pages = [
+        {
+            "page": 1,
+            "status": "succeeded",
+            "has_more": False,
+            "source_pages_fetched": pages_fetched,
+            "missing_published_at_count": 0,
+            "derived_stages": {"failures": []},
+            "provider_cost": 0.0,
+        }
+    ]
+    return {
+        "account_id": int(identity["account_id"]),
+        "platform": "douyin",
+        "platform_uid": str(identity["uid"]),
+        "provider": "DouyinOpenAPI",
+        "status": "succeeded",
+        "pages": pages,
+        "stopped_reason": "provider_exhausted",
+        "inserted": 0,
+        "updated": 0,
+        "items_discovered": int(receipt["items_discovered"]),
+        "coverage_start": str(receipt["coverage_start"]),
+        "coverage_end": str(receipt["coverage_end"]),
+        "provider_cost": 0.0,
+    }
+
+
 def run_due_capture(
     scheduled_for: datetime,
     *,
@@ -1174,7 +1489,21 @@ def run_due_capture(
         local_day - timedelta(days=1), time.min, SHANGHAI
     ).astimezone(timezone.utc)
     discovery_end = scheduled_for.astimezone(timezone.utc)
+    openapi_receipts = _douyin_openapi_receipts_for_day(
+        local_day,
+        db_path=db_path,
+        required_start=discovery_start,
+        required_end=discovery_end,
+    )
     for identity in identities:
+        openapi_receipt = openapi_receipts.get(
+            (int(identity["account_id"]), str(identity["uid"]))
+        )
+        if str(identity["platform"]) == "douyin" and openapi_receipt is not None:
+            discovery.append(
+                _synthetic_openapi_discovery(identity, openapi_receipt)
+            )
+            continue
         if capture_circuit.is_set():
             discovery.append(
                 {
@@ -2193,6 +2522,63 @@ def _current_day_pipeline_guard_job(
     )
 
 
+def _douyin_openapi_live_job(
+    *,
+    db_path: Path,
+    runner: Optional[DouyinOpenApiRunner],
+) -> None:
+    definition = JobDefinition(
+        DOUYIN_OPENAPI_RECONCILE_JOB_ID,
+        DOUYIN_OPENAPI_RECONCILE_HOUR,
+        0,
+    )
+    occurrence = latest_occurrence(definition, datetime.now(SHANGHAI))
+    execute_douyin_openapi_reconcile(
+        occurrence,
+        db_path=db_path,
+        runner=runner,
+    )
+
+
+def douyin_openapi_reconcile_guard(
+    *,
+    now: datetime,
+    effective_from: date,
+    db_path: Path,
+    runner: Optional[DouyinOpenApiRunner] = None,
+) -> Dict[str, Any]:
+    local_now = now.astimezone(SHANGHAI)
+    if local_now.date() < effective_from:
+        return {"status": "before_effective_date"}
+    occurrence = datetime.combine(
+        local_now.date(),
+        time(DOUYIN_OPENAPI_RECONCILE_HOUR, 0),
+        SHANGHAI,
+    )
+    if local_now < occurrence:
+        return {"status": "before_today_slot"}
+    return execute_douyin_openapi_reconcile(
+        occurrence,
+        db_path=db_path,
+        runner=runner,
+        allow_retry=True,
+    )
+
+
+def _douyin_openapi_reconcile_guard_job(
+    *,
+    effective_from: date,
+    db_path: Path,
+    runner: Optional[DouyinOpenApiRunner],
+) -> None:
+    douyin_openapi_reconcile_guard(
+        now=datetime.now(SHANGHAI),
+        effective_from=effective_from,
+        db_path=db_path,
+        runner=runner,
+    )
+
+
 def install_jobs(
     scheduler: BackgroundScheduler,
     *,
@@ -2202,6 +2588,7 @@ def install_jobs(
         Callable[[str, Mapping[str, Any]], ProviderResult]
     ],
     reconcile_effective_date: date,
+    douyin_openapi_runner: Optional[DouyinOpenApiRunner] = None,
 ) -> None:
     for job in JOBS:
         callback: Callable[..., None]
@@ -2221,11 +2608,16 @@ def install_jobs(
                 "reports_root": reports_root,
                 "capture_call_override": capture_call_override,
             }
+        trigger_minute = (
+            DAILY_CAPTURE_START_DELAY_MINUTES
+            if job.job_id == "daily_capture"
+            else job.minute
+        )
         scheduler.add_job(
             callback,
             CronTrigger(
                 hour=job.hour,
-                minute=job.minute,
+                minute=trigger_minute,
                 day_of_week=job.day_of_week,
                 timezone=SHANGHAI,
             ),
@@ -2236,6 +2628,38 @@ def install_jobs(
             max_instances=1,
             misfire_grace_time=3600,
         )
+    scheduler.add_job(
+        _douyin_openapi_live_job,
+        CronTrigger(
+            hour=DOUYIN_OPENAPI_RECONCILE_HOUR,
+            minute=0,
+            timezone=SHANGHAI,
+        ),
+        id=DOUYIN_OPENAPI_RECONCILE_JOB_ID,
+        replace_existing=True,
+        kwargs={
+            "db_path": db_path,
+            "runner": douyin_openapi_runner,
+        },
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+    scheduler.add_job(
+        _douyin_openapi_reconcile_guard_job,
+        IntervalTrigger(hours=1, timezone=SHANGHAI),
+        id=DOUYIN_OPENAPI_RECONCILE_GUARD_JOB_ID,
+        replace_existing=True,
+        kwargs={
+            "effective_from": reconcile_effective_date,
+            "db_path": db_path,
+            "runner": douyin_openapi_runner,
+        },
+        next_run_time=datetime.now(SHANGHAI),
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=None,
+    )
     scheduler.add_job(
         _current_day_pipeline_guard_job,
         IntervalTrigger(hours=1, timezone=SHANGHAI),

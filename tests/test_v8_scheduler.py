@@ -18,10 +18,12 @@ from v8.duplicates import FINGERPRINT_VERSION
 from v8.matcher_dsl import POINT_IDS, POINT_SCENES
 from v8.media_state import MediaTerminalDetail
 from v8.operations import IdentityConflictError, upsert_account
-from v8.reports import ReportTaskError
+from v8.reports import ReportTaskError, _parse_daily_capture_receipt
 from v8.scheduler import (
     DAILY_CAPTURE_CONTENT_LIMIT,
     DAILY_CAPTURE_MAX_AMOUNT,
+    DOUYIN_OPENAPI_RECONCILE_GUARD_JOB_ID,
+    DOUYIN_OPENAPI_RECONCILE_JOB_ID,
     JOBS,
     SchedulerJobError,
     _claim_run,
@@ -32,6 +34,8 @@ from v8.scheduler import (
     current_day_daily_capture_guard,
     current_day_pipeline_guard,
     daily_capture_quality_gate,
+    douyin_openapi_reconcile_guard,
+    execute_douyin_openapi_reconcile,
     execute_job,
     install_jobs,
     latest_occurrence,
@@ -273,7 +277,71 @@ class V8SchedulerTest(unittest.TestCase):
             )
             connection.commit()
 
-    def test_six_fixed_jobs_and_hourly_reconcile_are_registered(self) -> None:
+    @staticmethod
+    def _openapi_details(accounts):
+        return {
+            "window_start": "2026-07-26T16:00:00Z",
+            "coverage_end": "2026-08-01T18:00:00Z",
+            "accounts": accounts,
+        }
+
+    @classmethod
+    def _openapi_account_receipt(
+        cls,
+        *,
+        account_id: int,
+        platform_uid: str,
+        status: str = "succeeded",
+        complete: bool = True,
+        pages_fetched: int = 1,
+        items_discovered: int = 0,
+    ):
+        return {
+            "account_id": account_id,
+            "platform_uid": platform_uid,
+            "status": status,
+            "coverage_start": "2026-07-26T16:00:00Z",
+            "coverage_end": "2026-08-01T18:00:00Z",
+            "coverage_complete": complete,
+            "pagination_complete": complete,
+            "materialization_complete": complete,
+            "pages_fetched": pages_fetched,
+            "items_discovered": items_discovered,
+            **({"error_code": "fixture_failure"} if status != "succeeded" else {}),
+        }
+
+    def _insert_openapi_run(
+        self,
+        *,
+        local_day: date,
+        status: str,
+        details,
+    ) -> None:
+        occurrence = datetime.combine(
+            local_day,
+            datetime.min.time().replace(hour=2),
+            SHANGHAI,
+        ).astimezone(ZoneInfo("UTC"))
+        scheduled_for = occurrence.isoformat().replace("+00:00", "Z")
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                INSERT INTO scheduler_runs(
+                    job_id,scheduled_for,status,started_at,completed_at,details_json
+                ) VALUES (?,?,?,?,?,?)
+                """,
+                (
+                    DOUYIN_OPENAPI_RECONCILE_JOB_ID,
+                    scheduled_for,
+                    status,
+                    scheduled_for,
+                    None if status == "running" else scheduled_for,
+                    json.dumps(details, ensure_ascii=False, sort_keys=True),
+                ),
+            )
+            connection.commit()
+
+    def test_six_fixed_jobs_and_independent_reconciles_are_registered(self) -> None:
         scheduler = BackgroundScheduler(timezone=SHANGHAI)
         before = datetime.now(SHANGHAI)
         install_jobs(
@@ -290,9 +358,15 @@ class V8SchedulerTest(unittest.TestCase):
         self.assertEqual(
             set(jobs),
             {job.job_id for job in JOBS}
-            | {"daily_capture_reconcile", "report_reconcile"},
+            | {
+                "daily_capture_reconcile",
+                "report_reconcile",
+                DOUYIN_OPENAPI_RECONCILE_JOB_ID,
+                DOUYIN_OPENAPI_RECONCILE_GUARD_JOB_ID,
+            },
         )
-        self.assertIn("hour='2', minute='0'", jobs["daily_capture"])
+        self.assertEqual(len(JOBS), 6)
+        self.assertIn("hour='2', minute='10'", jobs["daily_capture"])
         self.assertIn("hour='2', minute='20'", jobs["daily_media_download"])
         self.assertIn("hour='3', minute='0'", jobs["daily_media_processing"])
         self.assertIn("hour='7', minute='30'", jobs["daily_media_cutoff"])
@@ -321,6 +395,20 @@ class V8SchedulerTest(unittest.TestCase):
         self.assertGreaterEqual(reconcile.next_run_time, before)
         self.assertLessEqual(reconcile.next_run_time, after)
         self.assertNotIn("daily_capture_reconcile", {job.job_id for job in JOBS})
+        self.assertNotIn(
+            DOUYIN_OPENAPI_RECONCILE_JOB_ID,
+            {job.job_id for job in JOBS},
+        )
+        openapi = scheduler.get_job(DOUYIN_OPENAPI_RECONCILE_JOB_ID)
+        self.assertIn("hour='2', minute='0'", str(openapi.trigger))
+        self.assertEqual(openapi.func.__name__, "_douyin_openapi_live_job")
+        openapi_guard = scheduler.get_job(DOUYIN_OPENAPI_RECONCILE_GUARD_JOB_ID)
+        self.assertEqual(str(openapi_guard.trigger), "interval[1:00:00]")
+        self.assertTrue(openapi_guard.coalesce)
+        self.assertEqual(openapi_guard.max_instances, 1)
+        self.assertIsNone(openapi_guard.misfire_grace_time)
+        self.assertGreaterEqual(openapi_guard.next_run_time, before)
+        self.assertLessEqual(openapi_guard.next_run_time, after)
         report_reconcile = scheduler.get_job("report_reconcile")
         self.assertEqual(str(report_reconcile.trigger), "interval[1:00:00]")
         self.assertTrue(report_reconcile.coalesce)
@@ -338,7 +426,209 @@ class V8SchedulerTest(unittest.TestCase):
                 reports_root=self.reports,
             )
 
-    def test_current_day_guard_never_scans_yesterday_or_before_two(self) -> None:
+    def test_openapi_reconcile_uses_free_job_id_and_persists_receipts(self) -> None:
+        occurrence = datetime(2026, 8, 2, 2, 0, tzinfo=SHANGHAI)
+        calls = []
+
+        def runner(*, scheduled_for, db_path):
+            calls.append((scheduled_for, db_path))
+            return self._openapi_details(
+                [
+                    self._openapi_account_receipt(
+                        account_id=7,
+                        platform_uid="99887766",
+                        items_discovered=3,
+                    )
+                ]
+            )
+
+        result = execute_douyin_openapi_reconcile(
+            occurrence,
+            db_path=self.db,
+            runner=runner,
+        )
+        duplicate = execute_douyin_openapi_reconcile(
+            occurrence,
+            db_path=self.db,
+            runner=runner,
+        )
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["details"]["accounts"][0]["items_discovered"], 3)
+        self.assertEqual(duplicate["status"], "skipped_duplicate")
+        self.assertEqual(calls, [(occurrence, self.db)])
+        with self.assertRaisesRegex(SchedulerJobError, "unknown scheduler job"):
+            execute_job(
+                DOUYIN_OPENAPI_RECONCILE_JOB_ID,
+                occurrence,
+                db_path=self.db,
+                reports_root=self.reports,
+            )
+        with connect(self.db) as connection:
+            run = connection.execute(
+                """
+                SELECT status,details_json FROM scheduler_runs
+                WHERE job_id=? AND scheduled_for='2026-08-01T18:00:00Z'
+                """,
+                (DOUYIN_OPENAPI_RECONCILE_JOB_ID,),
+            ).fetchone()
+            attempts = connection.execute(
+                """
+                SELECT COUNT(*) FROM scheduler_run_attempts a
+                JOIN scheduler_runs r ON r.id=a.scheduler_run_id
+                WHERE r.job_id=?
+                """,
+                (DOUYIN_OPENAPI_RECONCILE_JOB_ID,),
+            ).fetchone()[0]
+        self.assertEqual(run["status"], "succeeded")
+        self.assertEqual(json.loads(run["details_json"])["status"], "succeeded")
+        self.assertEqual(attempts, 1)
+
+    def test_openapi_reconcile_statuses_and_hourly_failed_retry(self) -> None:
+        occurrence = datetime(2026, 8, 2, 2, 0, tzinfo=SHANGHAI)
+        failed = execute_douyin_openapi_reconcile(
+            occurrence,
+            db_path=self.db,
+            runner=lambda **_kwargs: self._openapi_details(
+                [
+                    self._openapi_account_receipt(
+                        account_id=7,
+                        platform_uid="99887766",
+                        status="failed",
+                        complete=False,
+                        pages_fetched=0,
+                    )
+                ]
+            ),
+        )
+        self.assertEqual(failed["status"], "failed")
+
+        recovered = douyin_openapi_reconcile_guard(
+            now=datetime(2026, 8, 2, 3, 0, tzinfo=SHANGHAI),
+            effective_from=date(2026, 8, 2),
+            db_path=self.db,
+            runner=lambda **_kwargs: self._openapi_details(
+                [
+                    self._openapi_account_receipt(
+                        account_id=7,
+                        platform_uid="99887766",
+                    )
+                ]
+            ),
+        )
+        self.assertEqual((recovered["status"], recovered["attempt_number"]), ("succeeded", 2))
+
+        skipped = execute_douyin_openapi_reconcile(
+            datetime(2026, 8, 3, 2, 0, tzinfo=SHANGHAI),
+            db_path=self.db,
+            runner=lambda **_kwargs: self._openapi_details([]),
+        )
+        partial = execute_douyin_openapi_reconcile(
+            datetime(2026, 8, 4, 2, 0, tzinfo=SHANGHAI),
+            db_path=self.db,
+            runner=lambda **_kwargs: self._openapi_details(
+                [
+                    self._openapi_account_receipt(
+                        account_id=7,
+                        platform_uid="99887766",
+                    ),
+                    self._openapi_account_receipt(
+                        account_id=8,
+                        platform_uid="99887767",
+                        status="partial",
+                        complete=False,
+                    ),
+                ]
+            ),
+        )
+        self.assertEqual(skipped["status"], "skipped")
+        self.assertEqual(partial["status"], "partial")
+
+    def test_openapi_reconcile_rejects_extra_fields_and_scrubs_exceptions(self) -> None:
+        occurrence = datetime(2026, 8, 5, 2, 0, tzinfo=SHANGHAI)
+        leaked = self._openapi_details(
+            [
+                {
+                    **self._openapi_account_receipt(
+                        account_id=7,
+                        platform_uid="99887766",
+                    ),
+                    "authorization_id": "1" * 32,
+                }
+            ]
+        )
+        with self.assertRaisesRegex(SchedulerJobError, "fields are invalid"):
+            execute_douyin_openapi_reconcile(
+                occurrence,
+                db_path=self.db,
+                runner=lambda **_kwargs: leaked,
+            )
+        with connect(self.db) as connection:
+            details = connection.execute(
+                """
+                SELECT details_json FROM scheduler_runs
+                WHERE job_id=? AND scheduled_for=?
+                """,
+                (
+                    DOUYIN_OPENAPI_RECONCILE_JOB_ID,
+                    "2026-08-04T18:00:00Z",
+                ),
+            ).fetchone()["details_json"]
+        self.assertNotIn("authorization_id", details)
+        self.assertEqual(
+            json.loads(details),
+            {"error_code": "douyin_openapi_reconcile_failed"},
+        )
+
+        secret = "MACHINE-KEY-CANARY"
+        with self.assertRaisesRegex(RuntimeError, secret):
+            execute_douyin_openapi_reconcile(
+                datetime(2026, 8, 6, 2, 0, tzinfo=SHANGHAI),
+                db_path=self.db,
+                runner=lambda **_kwargs: (_ for _ in ()).throw(RuntimeError(secret)),
+            )
+        with connect(self.db) as connection:
+            stored = connection.execute(
+                """
+                SELECT details_json FROM scheduler_runs
+                WHERE job_id=? AND scheduled_for=?
+                """,
+                (
+                    DOUYIN_OPENAPI_RECONCILE_JOB_ID,
+                    "2026-08-05T18:00:00Z",
+                ),
+            ).fetchone()["details_json"]
+        self.assertNotIn(secret, stored)
+        self.assertEqual(
+            json.loads(stored),
+            {"error_code": "douyin_openapi_reconcile_failed"},
+        )
+
+    def test_interruption_recovery_is_generic_for_openapi_job(self) -> None:
+        occurrence = datetime(2026, 8, 2, 2, 0, tzinfo=SHANGHAI)
+        claim = _claim_run(
+            DOUYIN_OPENAPI_RECONCILE_JOB_ID,
+            occurrence,
+            db_path=self.db,
+            allow_retry=False,
+            invocation_source="scheduled",
+        )
+        self.assertIsNotNone(claim)
+        self.assertEqual(recover_interrupted_scheduler_runs(db_path=self.db), 1)
+        with connect(self.db) as connection:
+            run = connection.execute(
+                "SELECT status,details_json FROM scheduler_runs WHERE job_id=?",
+                (DOUYIN_OPENAPI_RECONCILE_JOB_ID,),
+            ).fetchone()
+        self.assertEqual(run["status"], "interrupted")
+        self.assertEqual(
+            json.loads(run["details_json"])["reason"],
+            "writer_process_restarted",
+        )
+
+    def test_current_day_guard_never_scans_yesterday_or_before_completion_buffer(
+        self,
+    ) -> None:
         with connect(self.db) as connection:
             connection.execute(
                 """
@@ -359,6 +649,17 @@ class V8SchedulerTest(unittest.TestCase):
             )
         self.assertEqual(result["status"], "before_today_slot")
         action.assert_not_called()
+        with patch("v8.scheduler.execute_job") as buffered_action:
+            buffered = current_day_daily_capture_guard(
+                now=datetime(2026, 8, 20, 2, 9, tzinfo=SHANGHAI),
+                effective_from=date(2026, 8, 20),
+                db_path=self.db,
+                reports_root=self.reports,
+                capture_call_override=None,
+            )
+        self.assertEqual(buffered["status"], "before_today_slot")
+        self.assertEqual(buffered["scheduled_for"], "2026-08-19T18:00:00Z")
+        buffered_action.assert_not_called()
         with connect(self.db) as connection:
             self.assertEqual(
                 connection.execute(
@@ -914,7 +1215,7 @@ class V8SchedulerTest(unittest.TestCase):
             start.wait()
             results.append(
                 current_day_daily_capture_guard(
-                    now=datetime(2026, 8, 20, 2, 5, tzinfo=SHANGHAI),
+                    now=datetime(2026, 8, 20, 2, 10, tzinfo=SHANGHAI),
                     effective_from=date(2026, 8, 20),
                     db_path=self.db,
                     reports_root=self.reports,
@@ -3435,6 +3736,269 @@ class V8SchedulerTest(unittest.TestCase):
                 """
             ).fetchone()
         self.assertEqual(run["status"], "failed")
+
+    def test_daily_capture_mixes_openapi_success_with_tikhub_fallback(self) -> None:
+        douyin = upsert_account(
+            {
+                "phone": "13800138201",
+                "platforms": [
+                    {"platform": "douyin", "uid": "99888201", "nickname": "开放平台"}
+                ],
+            },
+            db_path=self.db,
+        )
+        xhs = upsert_account(
+            {
+                "phone": "13800138202",
+                "platforms": [
+                    {
+                        "platform": "xiaohongshu",
+                        "uid": "67f6657f000000000e02c201",
+                        "nickname": "兜底账号",
+                    }
+                ],
+            },
+            db_path=self.db,
+        )
+        self._insert_openapi_run(
+            local_day=date(2026, 8, 2),
+            status="partial",
+            details=self._openapi_details(
+                [
+                    self._openapi_account_receipt(
+                        account_id=int(douyin["id"]),
+                        platform_uid="99888201",
+                        pages_fetched=2,
+                        items_discovered=7,
+                    ),
+                    self._openapi_account_receipt(
+                        account_id=int(xhs["id"]),
+                        platform_uid="67f6657f000000000e02c201",
+                        status="failed",
+                        complete=False,
+                        pages_fetched=0,
+                    ),
+                ]
+            ),
+        )
+        calls = []
+
+        def supplier_call(operation, record):
+            calls.append((operation, record.get("platform")))
+            self.assertEqual(record.get("platform"), "xiaohongshu")
+            data = {"items": [], "has_more": False}
+            return ProviderResult(
+                data,
+                {"operation": operation, "data": data},
+                200,
+                False,
+            )
+
+        result = run_due_capture(
+            datetime(2026, 8, 2, 2, 0, tzinfo=SHANGHAI),
+            db_path=self.db,
+            call_override=supplier_call,
+        )
+
+        self.assertEqual(result["status"], "succeeded", result)
+        self.assertEqual(calls, [("discover_content", "xiaohongshu")])
+        by_platform = {item["platform"]: item for item in result["discovery"]}
+        openapi = by_platform["douyin"]
+        self.assertEqual(openapi["provider"], "DouyinOpenAPI")
+        self.assertEqual(openapi["provider_cost"], 0.0)
+        self.assertEqual(openapi["items_discovered"], 7)
+        self.assertEqual([page["page"] for page in openapi["pages"]], [1])
+        self.assertEqual(openapi["pages"][0]["source_pages_fetched"], 2)
+        self.assertTrue(result["quality_gate"]["passed"], result)
+        parsed = _parse_daily_capture_receipt(
+            json.dumps(result, ensure_ascii=False, sort_keys=True)
+        )
+        self.assertEqual(parsed["covered"], 2)
+
+    def test_daily_capture_falls_back_when_openapi_misses_the_two_oclock_tail(
+        self,
+    ) -> None:
+        account = upsert_account(
+            {
+                "phone": "13800138204",
+                "platforms": [
+                    {"platform": "douyin", "uid": "99888204", "nickname": "尾段账号"}
+                ],
+            },
+            db_path=self.db,
+        )
+        account_id = int(account["id"])
+        receipt = self._openapi_details(
+            [
+                self._openapi_account_receipt(
+                    account_id=account_id,
+                    platform_uid="99888204",
+                )
+            ]
+        )
+        receipt["coverage_end"] = "2026-08-01T17:00:00Z"
+        receipt["accounts"][0]["coverage_end"] = "2026-08-01T17:00:00Z"
+        self._insert_openapi_run(
+            local_day=date(2026, 8, 2),
+            status="succeeded",
+            details=receipt,
+        )
+        published_at = int(
+            datetime(2026, 8, 2, 1, 30, tzinfo=SHANGHAI).timestamp()
+        )
+        calls = []
+
+        def supplier_call(operation, _record):
+            calls.append(operation)
+            if operation == "resolve_account":
+                data = {"reference": "MS4wLjAB" + "x" * 40}
+            elif operation == "discover_content":
+                data = {
+                    "items": [
+                        {
+                            "platform": "douyin",
+                            "platform_content_id": "900000008204",
+                            "canonical_url": "https://www.douyin.com/video/900000008204",
+                            "title": "01:30 发布作品",
+                            "body": "01:30 发布作品",
+                            "published_at": published_at,
+                            "content_type": "video",
+                            "account_uid": "99888204",
+                            "account_name": "尾段账号",
+                            "media_urls": ["https://example.invalid/video.mp4"],
+                            "metrics": {
+                                "view_count": 1,
+                                "comment_count": 0,
+                                "like_count": 0,
+                                "share_count": 0,
+                                "collect_count": 0,
+                            },
+                        }
+                    ],
+                    "has_more": False,
+                    "next_cursor": None,
+                }
+            else:
+                raise AssertionError(f"unexpected paid operation: {operation}")
+            return ProviderResult(
+                data,
+                {"operation": operation, "data": data},
+                200,
+                False,
+            )
+
+        result = run_due_capture(
+            datetime(2026, 8, 2, 2, 0, tzinfo=SHANGHAI),
+            db_path=self.db,
+            call_override=supplier_call,
+        )
+
+        self.assertEqual(result["discovery"][0]["provider_cost"], 0.0)
+        self.assertEqual(calls, ["resolve_account", "discover_content"])
+        with connect(self.db) as connection:
+            stored = connection.execute(
+                "SELECT platform_content_id FROM content_items"
+            ).fetchone()[0]
+        self.assertEqual(stored, "900000008204")
+
+    def test_daily_capture_falls_back_for_incomplete_or_damaged_receipt(self) -> None:
+        account = upsert_account(
+            {
+                "phone": "13800138203",
+                "platforms": [
+                    {"platform": "douyin", "uid": "99888203", "nickname": "兜底抖音"}
+                ],
+            },
+            db_path=self.db,
+        )
+        account_id = int(account["id"])
+        cases = (
+            (
+                date(2026, 8, 2),
+                "partial",
+                self._openapi_details(
+                    [
+                        self._openapi_account_receipt(
+                            account_id=account_id,
+                            platform_uid="99888203",
+                            status="partial",
+                            complete=False,
+                        )
+                    ]
+                ),
+            ),
+            (
+                date(2026, 8, 3),
+                "succeeded",
+                {"window_start": "x", "coverage_end": "y", "accounts": "bad"},
+            ),
+            (
+                date(2026, 8, 4),
+                "running",
+                self._openapi_details(
+                    [
+                        self._openapi_account_receipt(
+                            account_id=account_id,
+                            platform_uid="99888203",
+                        )
+                    ]
+                ),
+            ),
+            (
+                date(2026, 8, 5),
+                "succeeded",
+                self._openapi_details(
+                    [
+                        self._openapi_account_receipt(
+                            account_id=account_id,
+                            platform_uid="99888204",
+                        )
+                    ]
+                ),
+            ),
+        )
+        calls = []
+
+        def supplier_call(operation, record):
+            calls.append((operation, record.get("platform")))
+            if operation == "resolve_account":
+                data = {"reference": "MS4wLjAB" + "x" * 40}
+            else:
+                data = {"items": [], "has_more": False}
+            return ProviderResult(
+                data,
+                {"operation": operation, "data": data},
+                200,
+                False,
+            )
+
+        for local_day, status, details in cases:
+            with self.subTest(local_day=local_day, status=status):
+                self._insert_openapi_run(
+                    local_day=local_day,
+                    status=status,
+                    details=details,
+                )
+                before = len(calls)
+                result = run_due_capture(
+                    datetime.combine(
+                        local_day,
+                        datetime.min.time().replace(hour=2),
+                        SHANGHAI,
+                    ),
+                    db_path=self.db,
+                    call_override=supplier_call,
+                )
+                self.assertGreater(len(calls), before)
+                self.assertEqual(result["discovery"][0].get("provider"), None)
+        before = len(calls)
+        missing = run_due_capture(
+            datetime(2026, 8, 6, 2, 0, tzinfo=SHANGHAI),
+            db_path=self.db,
+            call_override=supplier_call,
+        )
+        self.assertGreater(len(calls), before)
+        self.assertIsNone(missing["discovery"][0].get("provider"))
 
 
 if __name__ == "__main__":

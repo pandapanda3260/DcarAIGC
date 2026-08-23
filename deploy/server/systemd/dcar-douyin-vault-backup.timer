@@ -1,0 +1,10 @@
+[Unit]
+Description=Hourly DcarAIGC Douyin token Vault backup
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+Unit=dcar-douyin-vault-backup.service
+
+[Install]
+WantedBy=timers.target

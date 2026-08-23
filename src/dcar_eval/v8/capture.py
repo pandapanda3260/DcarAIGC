@@ -604,6 +604,60 @@ def mark_fetch_slot_terminal_failure(
     }
 
 
+def mark_succeeded_fetch_slot_retryable_failure(
+    *,
+    db_path: Path,
+    slot_id: int,
+    error_code: str,
+    error_message: str,
+) -> Dict[str, Any]:
+    """Reopen a successful fetch when only its derived materialization failed.
+
+    The provider attempt and raw response remain the immutable evidence of the
+    successful call.  This transition is deliberately narrower than the normal
+    capture failure path: callers may only reopen a succeeded slot, and only
+    for the shared discovery materializer failure handled by the writer.
+    """
+
+    if error_code != "derived_materialization_failed":
+        raise ValueError(
+            "error_code must be derived_materialization_failed"
+        )
+    captured_at = now_utc()
+    with connect(db_path) as connection, transaction(connection):
+        row = connection.execute(
+            "SELECT * FROM fetch_slots WHERE id=?", (slot_id,)
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(f"fetch slot does not exist: {slot_id}")
+        if row["status"] != "succeeded":
+            raise RuntimeError(
+                f"fetch slot {slot_id} cannot become retryable from {row['status']}"
+            )
+        finished_at = str(row["finished_at"] or captured_at)
+        connection.execute(
+            """
+            UPDATE fetch_slots
+            SET status='retryable_failed',last_error_code=?,last_error_message=?,
+                finished_at=?,updated_at=?
+            WHERE id=? AND status='succeeded'
+            """,
+            (
+                error_code,
+                error_message[:500],
+                finished_at,
+                captured_at,
+                slot_id,
+            ),
+        )
+    return {
+        "slot_id": slot_id,
+        "status": "retryable_failed",
+        "error_code": error_code,
+        "finished_at": finished_at,
+    }
+
+
 def activate_pilot_budget(
     budget_id: str,
     *,

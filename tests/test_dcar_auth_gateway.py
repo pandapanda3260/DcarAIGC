@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import os
 import sqlite3
 import sys
 import tempfile
@@ -28,6 +29,7 @@ from dcar_auth import gateway as auth_gateway  # noqa: E402
 ORIGIN = "https://dcar.test"
 USERNAME = "operator"
 PASSWORD = "correct-password"
+EDGE_KEY = "gateway-edge-test-key-32-bytes-minimum"
 COMPRESSED_BODY = b"compressed proxy response\n" * 128
 REAL_VALIDATE_SOURCE = auth_gateway.HtpasswdVerifier.validate_source
 REAL_VERIFY = auth_gateway.HtpasswdVerifier.verify
@@ -66,6 +68,25 @@ def _echo_upstream(name: str) -> FastAPI:
                 status_code=307,
                 headers={"Location": "/dcar/overview"},
             )
+        if request.url.path.endswith("/stripped-redirect"):
+            destination = {
+                "api": "/api/v8/tasks/",
+                "douyin": "/douyin/confirm",
+                "web": "/assets/app.css",
+            }[name]
+            return Response(
+                status_code=307,
+                headers={"Location": f"http://{name}.test{destination}"},
+            )
+        if request.url.path.endswith("/set-cookie"):
+            response = JSONResponse({"upstream": name})
+            response.headers.append(
+                "Set-Cookie", "dcar_session=evil; Path=/dcar; HttpOnly"
+            )
+            response.headers.append(
+                "Set-Cookie", "douyin_upstream=evil; Path=/dcar"
+            )
+            return response
         if request.url.path.endswith("/compressed.txt"):
             return Response(
                 gzip.compress(COMPRESSED_BODY),
@@ -98,6 +119,15 @@ def _echo_upstream(name: str) -> FastAPI:
                 ),
                 "authorization": request.headers.get("authorization"),
                 "cookie": request.headers.get("cookie"),
+                "session_binding": request.headers.get(
+                    "x-dcar-session-binding"
+                ),
+                "edge_key": request.headers.get("x-dcar-edge-key"),
+                "verified_action": request.headers.get(
+                    "x-dcar-verified-action"
+                ),
+                "forged_custom": request.headers.get("x-dcar-forged-custom"),
+                "dcar_request": request.headers.get("x-dcar-request"),
             }
         )
 
@@ -148,9 +178,16 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
         self.addCleanup(current_patcher.stop)
 
     def _config(
-        self, base_path: str, *, bypass_auth: bool = False
+        self,
+        base_path: str,
+        *,
+        bypass_auth: bool = False,
+        douyin_enabled: bool = False,
     ) -> auth_gateway.AuthGatewayConfig:
         suffix = "root" if not base_path else base_path.strip("/").replace("/", "-")
+        edge_key_path = self.root / f"edge-key-{suffix}"
+        if douyin_enabled:
+            edge_key_path.write_text(EDGE_KEY + "\n", encoding="utf-8")
         return auth_gateway.AuthGatewayConfig(
             base_path=base_path,
             web_upstream="http://web.test",
@@ -160,19 +197,49 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
             login_template_path=self.login_template,
             secure_cookie=True,
             bypass_auth=bypass_auth,
+            douyin_upstream=("http://douyin.test" if douyin_enabled else None),
+            douyin_edge_key_path=(edge_key_path if douyin_enabled else None),
             session_seconds=3600,
             remember_session_seconds=86400,
         )
 
+    def test_from_env_uses_systemd_credentials_directory_for_douyin(self) -> None:
+        credential_root = self.root / "systemd-credentials"
+        with patch.dict(
+            os.environ,
+            {
+                "DCAR_AUTH_DOUYIN_UPSTREAM": "http://127.0.0.1:4175",
+                "CREDENTIALS_DIRECTORY": str(credential_root),
+            },
+            clear=True,
+        ):
+            config = auth_gateway.AuthGatewayConfig.from_env()
+        self.assertEqual(
+            config.douyin_edge_key_path, credential_root / "douyin-edge-key"
+        )
+
     @contextmanager
     def _client(
-        self, base_path: str, *, bypass_auth: bool = False
+        self,
+        base_path: str,
+        *,
+        bypass_auth: bool = False,
+        douyin_enabled: bool = False,
     ) -> Iterator[tuple[TestClient, auth_gateway.AuthGatewayConfig]]:
-        config = self._config(base_path, bypass_auth=bypass_auth)
+        config = self._config(
+            base_path,
+            bypass_auth=bypass_auth,
+            douyin_enabled=douyin_enabled,
+        )
         app = auth_gateway.create_app(
             config,
             web_transport=ASGITransport(app=_echo_upstream("web")),
             api_transport=ASGITransport(app=_echo_upstream("api")),
+            douyin_transport=(
+                ASGITransport(app=_echo_upstream("douyin"))
+                if douyin_enabled
+                else None
+            ),
         )
         with TestClient(app, base_url=ORIGIN) as client:
             yield client, config
@@ -294,6 +361,310 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
                 )
                 self.assertFalse(config.session_db_path.exists())
 
+    def test_douyin_routes_are_disabled_by_default_and_bypass_is_forbidden(
+        self,
+    ) -> None:
+        for base_path in ("", "/dcar"):
+            with self.subTest(base_path=base_path), self._client(base_path) as (
+                client,
+                _config,
+            ):
+                page = client.get(
+                    _route(base_path, "/douyin"), follow_redirects=False
+                )
+                self.assertEqual(page.status_code, 302)
+                api = client.get(_route(base_path, "/api/douyin/authorizations"))
+                self.assertEqual(api.status_code, 401)
+                self.assertEqual(self._login(client, base_path).status_code, 200)
+                disabled = client.get(_route(base_path, "/douyin"))
+                self.assertEqual(disabled.status_code, 404)
+
+            with self.subTest(base_path=base_path, bypass=True), self._client(
+                base_path,
+                bypass_auth=True,
+                douyin_enabled=True,
+            ) as (client, _config):
+                for path in (
+                    "/douyin",
+                    "/api/douyin/authorizations",
+                    "/oauth/douyin/callback?code=secret&state=secret",
+                ):
+                    with self.subTest(path=path):
+                        response = client.get(_route(base_path, path))
+                        self.assertEqual(response.status_code, 403)
+                        self.assertEqual(response.json(), {"detail": "当前模式禁止抖音授权"})
+
+    def test_douyin_boundary_routes_do_not_capture_adjacent_prefixes(self) -> None:
+        for base_path in ("", "/dcar"):
+            with self.subTest(base_path=base_path), self._client(
+                base_path, douyin_enabled=True
+            ) as (client, _config):
+                self.assertEqual(self._login(client, base_path).status_code, 200)
+                for path in (
+                    "/douyin-evil",
+                    "/api/douyin-evil",
+                    "/oauth/douyin/callback-extra",
+                    "/oauth/douyin/callback/",
+                ):
+                    response = client.get(_route(base_path, path))
+                    self.assertEqual(response.status_code, 200)
+                    expected = "api" if path.startswith("/api/") else "web"
+                    self.assertEqual(response.json()["upstream"], expected)
+
+    def test_unauthenticated_douyin_callback_discards_sensitive_query(self) -> None:
+        for base_path in ("", "/dcar"):
+            with self.subTest(base_path=base_path), self._client(
+                base_path, douyin_enabled=True
+            ) as (client, _config):
+                response = client.get(
+                    _route(
+                        base_path,
+                        "/oauth/douyin/callback?code=code-canary&state=state-canary",
+                    ),
+                    headers={
+                        "Sec-Fetch-Mode": "navigate",
+                        "Sec-Fetch-Dest": "document",
+                        "Sec-Fetch-Site": "cross-site",
+                    },
+                    follow_redirects=False,
+                )
+                self.assertEqual(response.status_code, 303)
+                self.assertEqual(
+                    response.headers["location"],
+                    _route(base_path, "/login")
+                    + "?notice=douyin-session-required&return_to="
+                    + ("%2Fdcar%2Fdouyin" if base_path else "%2Fdouyin"),
+                )
+                self.assertNotIn("code-canary", response.headers["location"])
+                self.assertNotIn("state-canary", response.headers["location"])
+                self.assertEqual(response.headers["cache-control"], "no-store")
+                self.assertEqual(response.headers["referrer-policy"], "no-referrer")
+
+                head = client.head(
+                    _route(base_path, "/oauth/douyin/callback"),
+                    follow_redirects=False,
+                )
+                self.assertEqual(head.status_code, 405)
+                self.assertIsNone(head.headers.get("location"))
+
+    def test_douyin_callback_requires_top_level_navigation_metadata(self) -> None:
+        for base_path in ("", "/dcar"):
+            with self.subTest(base_path=base_path), self._client(
+                base_path, douyin_enabled=True
+            ) as (client, _config):
+                self.assertEqual(self._login(client, base_path).status_code, 200)
+                for headers in (
+                    {"Sec-Fetch-Mode": "cors"},
+                    {"Sec-Fetch-Dest": "iframe"},
+                    {"Sec-Fetch-Site": "same-origin"},
+                ):
+                    response = client.get(
+                        _route(base_path, "/oauth/douyin/callback"),
+                        headers=headers,
+                    )
+                    self.assertEqual(response.status_code, 403)
+                valid = client.get(
+                    _route(base_path, "/oauth/douyin/callback"),
+                    headers={
+                        "Sec-Fetch-Mode": "navigate",
+                        "Sec-Fetch-Dest": "document",
+                        "Sec-Fetch-Site": "cross-site",
+                    },
+                )
+                self.assertEqual(valid.status_code, 200)
+                self.assertEqual(valid.json()["upstream"], "douyin")
+
+    def test_douyin_proxy_validates_origin_and_replaces_all_trusted_headers(
+        self,
+    ) -> None:
+        for base_path in ("", "/dcar"):
+            with self.subTest(base_path=base_path), self._client(
+                base_path, douyin_enabled=True
+            ) as (client, _config):
+                self.assertEqual(self._login(client, base_path).status_code, 200)
+                response = client.post(
+                    _route(base_path, "/api/douyin/accounts/search"),
+                    content='{"query":"中文 %_"}',
+                    headers={
+                        "Content-Type": "application/json",
+                        "Origin": ORIGIN,
+                        "X-Dcar-Request": "douyin-accounts-search",
+                        "X-Dcar-Authenticated-User": "attacker",
+                        "X-Dcar-Session-Binding": "attacker-binding",
+                        "X-Dcar-Edge-Key": "attacker-edge-key",
+                        "X-Dcar-Verified-Action": "attacker-action",
+                        "X-Dcar-Forged-Custom": "attacker-custom",
+                    },
+                )
+                self.assertEqual(response.status_code, 200)
+                payload = response.json()
+                self.assertEqual(payload["upstream"], "douyin")
+                self.assertEqual(payload["path"], "/api/douyin/accounts/search")
+                self.assertEqual(payload["body"], '{"query":"中文 %_"}')
+                self.assertEqual(payload["authenticated_user"], USERNAME)
+                self.assertRegex(payload["session_binding"], r"^[0-9a-f]{64}$")
+                self.assertEqual(payload["edge_key"], EDGE_KEY)
+                self.assertEqual(
+                    payload["verified_action"], "douyin-accounts-search"
+                )
+                self.assertIsNone(payload["forged_custom"])
+                self.assertIsNone(payload["dcar_request"])
+                self.assertIsNone(payload["cookie"])
+
+                actions = {
+                    "/api/douyin/oauth/start": "douyin-oauth-start",
+                    "/api/douyin/oauth/confirm": "douyin-oauth-confirm",
+                    "/api/douyin/oauth/reject": "douyin-oauth-reject",
+                    "/api/douyin/authorizations/unbind": (
+                        "douyin-authorization-unbind"
+                    ),
+                }
+                for path, action in actions.items():
+                    routed = client.post(
+                        _route(base_path, path),
+                        content="{}",
+                        headers={
+                            "Origin": ORIGIN,
+                            "X-Dcar-Request": action,
+                        },
+                    )
+                    self.assertEqual(routed.status_code, 200)
+                    self.assertEqual(routed.json()["verified_action"], action)
+
+                for headers in (
+                    {
+                        "Origin": "https://evil.example",
+                        "X-Dcar-Request": "douyin-accounts-search",
+                    },
+                    {"Origin": ORIGIN},
+                    {
+                        "Origin": ORIGIN,
+                        "X-Dcar-Request": "douyin-oauth-start",
+                    },
+                ):
+                    rejected = client.post(
+                        _route(base_path, "/api/douyin/accounts/search"),
+                        content="{}",
+                        headers=headers,
+                    )
+                    self.assertEqual(rejected.status_code, 403)
+
+    def test_douyin_proxy_drops_all_upstream_set_cookie_headers(self) -> None:
+        for base_path in ("", "/dcar"):
+            with self.subTest(base_path=base_path), self._client(
+                base_path, douyin_enabled=True
+            ) as (client, _config):
+                self.assertEqual(self._login(client, base_path).status_code, 200)
+                session_before = client.cookies.get(auth_gateway.SESSION_COOKIE)
+
+                response = client.get(_route(base_path, "/douyin/set-cookie"))
+
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.headers.get_list("set-cookie"), [])
+                self.assertEqual(
+                    client.cookies.get(auth_gateway.SESSION_COOKIE), session_before
+                )
+                session = client.get(_route(base_path, "/auth/session"))
+                self.assertEqual(session.status_code, 200)
+                self.assertEqual(session.json()["username"], USERNAME)
+
+    def test_douyin_routes_reject_methods_other_than_get_and_post(self) -> None:
+        for base_path in ("", "/dcar"):
+            with self.subTest(base_path=base_path), self._client(
+                base_path, douyin_enabled=True
+            ) as (client, _config):
+                target = _route(base_path, "/api/douyin/oauth/start")
+                for authenticated in (False, True):
+                    if authenticated:
+                        self.assertEqual(
+                            self._login(client, base_path).status_code, 200
+                        )
+                    for method in ("HEAD", "PUT", "PATCH", "DELETE", "OPTIONS"):
+                        with self.subTest(
+                            authenticated=authenticated, method=method
+                        ):
+                            response = client.request(
+                                method,
+                                target,
+                                content=b"x"
+                                * (auth_gateway.MAX_DOUYIN_BODY_BYTES + 1),
+                                headers={
+                                    "X-Dcar-Authenticated-User": "attacker",
+                                    "X-Dcar-Edge-Key": "attacker-edge-key",
+                                },
+                            )
+                            self.assertEqual(response.status_code, 405)
+                            self.assertEqual(response.headers["allow"], "GET, POST")
+                            self.assertEqual(
+                                response.headers["cache-control"], "no-store"
+                            )
+
+            with self.subTest(base_path=base_path, bypass=True), self._client(
+                base_path, bypass_auth=True, douyin_enabled=True
+            ) as (client, _config):
+                for method in ("HEAD", "PUT", "PATCH", "DELETE", "OPTIONS"):
+                    response = client.request(
+                        method,
+                        _route(base_path, "/api/douyin/oauth/start"),
+                        content=b"untrusted-body",
+                    )
+                    self.assertEqual(response.status_code, 405)
+                    self.assertEqual(response.headers["allow"], "GET, POST")
+
+    def test_douyin_post_body_is_bounded_and_requires_content_length(self) -> None:
+        with self._client("", douyin_enabled=True) as (client, _config):
+            self.assertEqual(self._login(client, "").status_code, 200)
+            headers = {
+                "Origin": ORIGIN,
+                "X-Dcar-Request": "douyin-oauth-start",
+                "Content-Type": "application/json",
+            }
+            missing = client.post(
+                "/api/douyin/oauth/start",
+                content=(chunk for chunk in (b"{}",)),
+                headers=headers,
+            )
+            self.assertEqual(missing.status_code, 411)
+            oversized = client.post(
+                "/api/douyin/oauth/start",
+                content=b"x" * (auth_gateway.MAX_DOUYIN_BODY_BYTES + 1),
+                headers=headers,
+            )
+            self.assertEqual(oversized.status_code, 413)
+            accepted = client.post(
+                "/api/douyin/oauth/start",
+                content=b"x" * auth_gateway.MAX_DOUYIN_BODY_BYTES,
+                headers=headers,
+            )
+            self.assertEqual(accepted.status_code, 200)
+            self.assertEqual(
+                len(accepted.json()["body"]), auth_gateway.MAX_DOUYIN_BODY_BYTES
+            )
+
+    def test_douyin_upstream_requires_a_nonempty_edge_key_file(self) -> None:
+        missing_path = self.root / "missing-edge-key"
+        config = auth_gateway.AuthGatewayConfig(
+            **{
+                **self._config("").__dict__,
+                "douyin_upstream": "http://douyin.test",
+                "douyin_edge_key_path": missing_path,
+            }
+        )
+        app = auth_gateway.create_app(
+            config,
+            web_transport=ASGITransport(app=_echo_upstream("web")),
+            api_transport=ASGITransport(app=_echo_upstream("api")),
+            douyin_transport=ASGITransport(app=_echo_upstream("douyin")),
+        )
+        with self.assertRaises(FileNotFoundError), TestClient(app, base_url=ORIGIN):
+            pass
+
+        missing_path.write_text("\n", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "invalid format"), TestClient(
+            app, base_url=ORIGIN
+        ):
+            pass
+
     def test_proxy_rewrites_only_internal_absolute_redirects(self) -> None:
         with self._client("/dcar", bypass_auth=True) as (client, _config):
             internal = client.get(
@@ -316,6 +687,30 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
                 "/dcar/relative-redirect", follow_redirects=False
             )
             self.assertEqual(relative.headers["location"], "/dcar/overview")
+
+        with self._client("/dcar") as (client, _config):
+            self.assertEqual(self._login(client, "/dcar").status_code, 200)
+            api = client.get(
+                "/dcar/api/stripped-redirect", follow_redirects=False
+            )
+            self.assertEqual(api.status_code, 307)
+            self.assertEqual(api.headers["location"], "/dcar/api/v8/tasks/")
+
+        with self._client("/dcar", douyin_enabled=True) as (client, _config):
+            self.assertEqual(self._login(client, "/dcar").status_code, 200)
+            douyin = client.get(
+                "/dcar/douyin/stripped-redirect", follow_redirects=False
+            )
+            self.assertEqual(douyin.status_code, 307)
+            self.assertEqual(douyin.headers["location"], "/dcar/douyin/confirm")
+
+        with self._client("/dcar") as (client, _config):
+            self.assertEqual(self._login(client, "/dcar").status_code, 200)
+            asset = client.get(
+                "/dcar/assets/stripped-redirect", follow_redirects=False
+            )
+            self.assertEqual(asset.status_code, 307)
+            self.assertEqual(asset.headers["location"], "/dcar/assets/app.css")
 
     def test_correct_and_incorrect_login_and_cookie_attributes(self) -> None:
         for base_path in ("", "/dcar"):

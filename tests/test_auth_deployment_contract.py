@@ -61,11 +61,22 @@ class AuthDeploymentContractTestCase(unittest.TestCase):
                 )
                 self.assertIn(f'"{message}。"', login)
 
-    def test_compose_uses_the_gateway_as_the_only_published_entry(self) -> None:
+    def test_login_template_only_renders_the_fixed_douyin_session_notice(self) -> None:
+        login = (ROOT / "deploy/server/nginx/login.html").read_text(encoding="utf-8")
+        self.assertIn('params.get("notice")', login)
+        self.assertIn('notice === "douyin-session-required"', login)
+        self.assertIn(
+            'showBanner("info", "登录状态已失效，请重新登录后再次发起授权。")',
+            login,
+        )
+        self.assertNotIn("showBanner(\"info\", notice)", login)
+
+    def test_compose_publishes_only_the_gateway_and_loopback_control(self) -> None:
         compose = (ROOT / "deploy/server/compose.yml").read_text(encoding="utf-8")
         self.assertIn("  auth:\n", compose)
         self.assertIn("dcar_auth.gateway:app", compose)
         self.assertIn('127.0.0.1:4173:4173', compose)
+        self.assertIn('127.0.0.1:4175:4175', compose)
         self.assertIn("DCAR_AUTH_WEB_UPSTREAM: http://web:4174", compose)
         self.assertIn("DCAR_AUTH_API_UPSTREAM: http://api:8765", compose)
         self.assertIn("DCAR_AUTH_SESSION_DB: /var/lib/dcar-aigc/auth/sessions.sqlite3", compose)
@@ -90,7 +101,17 @@ class AuthDeploymentContractTestCase(unittest.TestCase):
         )
         dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8")
         self.assertIn("src/dcar_eval/dcar_auth", api_image)
+        self.assertIn("src/dcar_eval/dcar_douyin_control", api_image)
+        self.assertIn("ARG PIP_INDEX_URL", api_image)
+        self.assertIn("ARG PIP_EXTRA_INDEX_URL", api_image)
+        self.assertIn("ARG PIP_FIND_LINKS", api_image)
+        self.assertIn("ARG PIP_NO_INDEX", api_image)
+        self.assertIn("ARG PIP_TRUSTED_HOST", api_image)
+        self.assertNotIn("ENV PIP_INDEX_URL", api_image)
+        self.assertNotIn("ENV PIP_EXTRA_INDEX_URL", api_image)
+        self.assertNotIn("ENV PIP_FIND_LINKS", api_image)
         self.assertIn("!src/dcar_eval/dcar_auth/**", dockerignore)
+        self.assertIn("!src/dcar_eval/dcar_douyin_control/**", dockerignore)
         self.assertIn("deploy/server/nginx/login.html", api_image)
         self.assertIn("EXPOSE 4174", web_image)
         self.assertIn("dcar_auth.gateway:app", unit)
