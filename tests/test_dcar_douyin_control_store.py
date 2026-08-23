@@ -468,6 +468,36 @@ class DouyinControlStoreTestCase(unittest.TestCase):
         self.assertNotIn("scopes_json", listed[0])
         self.assertNotIn("key_version", listed[0])
 
+    def test_machine_authorization_projection_excludes_identity_and_tokens(self) -> None:
+        candidate, fingerprint = self._pending(digest="8" * 64)
+        created = self.store.confirm_authorization(
+            state_digest="8" * 64,
+            bound_username="operator",
+            session_binding="a" * 64,
+            open_id_fingerprint=fingerprint,
+            candidate=candidate,
+            cipher=self.cipher,
+            request_id="confirm-machine-list",
+            now=1_900_000_010,
+        )
+        items = self.store.list_active_authorizations()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["id"], created["id"])
+        self.assertEqual(
+            set(items[0]),
+            {
+                "id",
+                "account_id",
+                "platform_uid",
+                "access_expires_at",
+                "refresh_expires_at",
+                "renew_count",
+                "scopes",
+                "needs_reauthorization",
+                "updated_at",
+            },
+        )
+
     def test_token_lifecycle_lease_updates_limit_and_reauthorization_audit(self) -> None:
         candidate, fingerprint = self._pending(digest="9" * 64)
         created = self.store.confirm_authorization(

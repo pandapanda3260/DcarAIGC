@@ -23,6 +23,7 @@ from dcar_douyin_control.tokens import (  # noqa: E402
     DouyinTokenManager,
     ReauthorizationRequired,
 )
+from dcar_douyin_control.store import VaultStore  # noqa: E402
 
 
 AUTHORIZATION_ID = "a" * 32
@@ -163,12 +164,12 @@ class DouyinTokenManagerTest(unittest.IsolatedAsyncioTestCase):
             "open_id_fingerprint": self.cipher.open_id_fingerprint(open_id),
             "access_token_ciphertext": selected.encrypt(
                 AUTHORIZATION_ID,
-                "access_token",
+                "access",
                 {"open_id": open_id, "token": "access-old"},
             ),
             "refresh_token_ciphertext": selected.encrypt(
                 AUTHORIZATION_ID,
-                "refresh_token",
+                "refresh",
                 {"open_id": open_id, "token": "refresh-old"},
             ),
             "access_expires_at": access_expires_at,
@@ -189,6 +190,67 @@ class DouyinTokenManagerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(access.access_token, "access-old")
         self.assertEqual(store.calls, ["get"])
         self.assertEqual(provider.refresh_calls, 0)
+
+    async def test_reads_tokens_written_by_real_vault_confirmation(self) -> None:
+        store = VaultStore(self.root / "vault.sqlite3")
+        store.initialize()
+        state_digest = "b" * 64
+        candidate = {
+            "open_id": "open-id",
+            "access_token": "access-old",
+            "refresh_token": "refresh-old",
+            "access_expires_at": NOW + 3600,
+            "refresh_expires_at": NOW + 10 * 24 * 60 * 60,
+            "scopes": ["user_info", "video.list"],
+            "nickname": "账号",
+            "avatar": "",
+        }
+        store.create_state(
+            state_digest=state_digest,
+            bound_username="operator",
+            session_binding="a" * 64,
+            account_id=7,
+            platform_uid="123456789",
+            scopes=["user_info", "video.list"],
+            expires_at=NOW + 600,
+            request_id="start",
+            now=NOW,
+        )
+        store.begin_exchange(
+            state_digest,
+            "operator",
+            "a" * 64,
+            request_id="callback",
+            now=NOW + 1,
+        )
+        fingerprint = self.cipher.open_id_fingerprint("open-id")
+        store.store_candidate(
+            state_digest=state_digest,
+            ciphertext=self.cipher.encrypt(
+                state_digest, "oauth_candidate", candidate
+            ),
+            open_id_fingerprint=fingerprint,
+            confirmation_expires_at=NOW + 300,
+            request_id="callback",
+            now=NOW + 2,
+        )
+        created = store.confirm_authorization(
+            state_digest=state_digest,
+            bound_username="operator",
+            session_binding="a" * 64,
+            open_id_fingerprint=fingerprint,
+            candidate=candidate,
+            cipher=self.cipher,
+            request_id="confirm",
+            now=NOW + 3,
+        )
+        manager = DouyinTokenManager(
+            store, self.cipher, FakeProvider(), clock=lambda: NOW + 4  # type: ignore[arg-type]
+        )
+        access = await manager.authorized_access(
+            str(created["id"]), actor="machine", request_id="request"
+        )
+        self.assertEqual(access.access_token, "access-old")
 
     async def test_expiring_access_atomically_refreshes_both_tokens(self) -> None:
         store = FakeStore(self.row(access_expires_at=NOW + 60))

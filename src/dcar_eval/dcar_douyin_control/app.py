@@ -18,9 +18,18 @@ from starlette.responses import Response
 
 from .config import DouyinControlConfig
 from .crypto import TokenCipher, read_shared_key
-from .provider import DouyinOAuthClient, MockOAuthClient, TokenBundle
+from .provider import (
+    DouyinOAuthClient,
+    DouyinProviderError,
+    MockOAuthClient,
+    TokenBundle,
+)
 from .store import AuthorizationConflict, StateTransitionError, VaultStore
-from .tokens import DouyinTokenManager
+from .tokens import (
+    DouyinTokenManager,
+    ReauthorizationRequired,
+    TokenLifecycleError,
+)
 
 
 REQUESTED_SCOPES = ["user_info", "video.list"]
@@ -53,6 +62,14 @@ class UnbindPayload(BaseModel):
 
     authorization_id: str = Field(min_length=32, max_length=32, pattern=r"^[0-9a-f]+$")
     expected_version: int = Field(ge=1)
+
+
+class VideoListPagePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    authorization_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    cursor: int = Field(ge=0, le=2**63 - 1)
+    count: int = Field(ge=1, le=20)
 
 
 def _no_store(response: Response) -> Response:
@@ -326,6 +343,79 @@ def create_app(
     async def internal_health(request: Request) -> dict[str, Any]:
         health = await asyncio.to_thread(request.app.state.store.healthcheck)
         return {"status": "ok", "vault": health}
+
+    @application.get("/internal/v1/authorizations")
+    async def internal_authorizations(request: Request) -> dict[str, Any]:
+        items = await asyncio.to_thread(
+            request.app.state.store.list_active_authorizations
+        )
+        return {
+            "items": [
+                {
+                    "authorization_id": item["id"],
+                    **{key: value for key, value in item.items() if key != "id"},
+                }
+                for item in items
+            ]
+        }
+
+    @application.post("/internal/v1/video-list/page")
+    async def internal_video_list_page(
+        request: Request, payload: VideoListPagePayload
+    ) -> Response:
+        token_manager = request.app.state.token_manager
+        if token_manager is None:
+            return JSONResponse(
+                {"detail": "douyin_provider_unavailable"}, status_code=503
+            )
+        try:
+            page = await token_manager.video_list_page(
+                payload.authorization_id,
+                cursor=payload.cursor,
+                count=payload.count,
+                actor="machine:douyin-openapi-sync",
+                request_id=_request_id(request),
+            )
+        except ReauthorizationRequired as exc:
+            return JSONResponse(
+                {
+                    "detail": "douyin_reauthorization_required",
+                    "reason": exc.reason,
+                },
+                status_code=409,
+            )
+        except TokenLifecycleError as exc:
+            if exc.reason == "authorization_not_found":
+                return JSONResponse(
+                    {
+                        "detail": "douyin_authorization_not_found",
+                        "reason": exc.reason,
+                    },
+                    status_code=404,
+                )
+            if exc.reason == "refresh_busy":
+                return JSONResponse(
+                    {
+                        "detail": "douyin_token_temporarily_unavailable",
+                        "reason": exc.reason,
+                    },
+                    status_code=503,
+                    headers={"Retry-After": "1"},
+                )
+            return JSONResponse(
+                {"detail": "douyin_token_error", "reason": exc.reason},
+                status_code=502,
+            )
+        except DouyinProviderError as exc:
+            return JSONResponse(
+                {
+                    "detail": "douyin_provider_error",
+                    "operation": exc.operation,
+                    "reason": exc.category,
+                },
+                status_code=502,
+            )
+        return JSONResponse(page.as_dict())
 
     @application.get("/douyin", response_class=HTMLResponse)
     async def index() -> HTMLResponse:

@@ -185,3 +185,91 @@ launchctl print "$domain/$label"
 tail -n 200 "$HOME/Library/Logs/DcarAIGC/snapshot-publisher.stdout.log"
 tail -n 200 "$HOME/Library/Logs/DcarAIGC/snapshot-publisher.stderr.log"
 ```
+
+## Douyin OpenAPI sync tunnel
+
+This is a separate, no-shell SSH channel for the future OpenAPI sync. It does
+not read `writer.env`, does not use the writer or publisher SSH alias, and does
+not run anything from `.venv`. The server must first install the dedicated
+`dcar-douyin-sync` user, restricted key and sshd Match block described in
+`deploy/server/README.md`.
+
+Create a dedicated key and alias. Verify the server host-key fingerprint over
+an independent trusted channel before adding it to the standard
+`~/.ssh/known_hosts`; do not accept a first-use prompt from the LaunchAgent.
+
+```sshconfig
+Host dcar-douyin-sync-prod
+    HostName your.server.example
+    User dcar-douyin-sync
+    IdentityFile ~/.ssh/id_ed25519_dcar_douyin_sync
+    IdentitiesOnly yes
+```
+
+Install the independent Machine credential and strict sync environment outside
+the repository. The env parser accepts only the three keys in the example,
+rejects duplicates/unknown entries, and fixes the local listener to
+`127.0.0.1:14175`. The remote destination is hard-coded as
+`127.0.0.1:4175`.
+
+```sh
+install -d -m 0700 "$HOME/Library/Application Support/DcarAIGC"
+install -d -m 0700 "$HOME/Library/Application Support/DcarAIGC/runtime"
+install -d -m 0700 "$HOME/Library/Logs/DcarAIGC"
+install -m 0600 deploy/macos/douyin-sync.env.example \
+  "$HOME/Library/Application Support/DcarAIGC/douyin-sync.env"
+install -m 0600 /secure/input/douyin-machine-key \
+  "$HOME/Library/Application Support/DcarAIGC/douyin-machine-key"
+```
+
+Edit only the alias and absolute Machine-key-file path in `douyin-sync.env`.
+Render and inspect the disabled-by-default LaunchAgent, then start it through
+the bounded start script:
+
+```sh
+label="cn.tj.dcar.douyin-sync-tunnel"
+plist="$HOME/Library/LaunchAgents/$label.plist"
+
+python3 deploy/macos/render_douyin_sync_tunnel.py \
+  --project-root "$PWD" --check
+python3 deploy/macos/render_douyin_sync_tunnel.py \
+  --project-root "$PWD" --output "$plist"
+plutil -lint "$plist"
+deploy/macos/start_douyin_sync_tunnel.sh
+```
+
+The foreground LaunchAgent process uses `ExitOnForwardFailure=yes`, strict
+known_hosts, a dedicated safe IdentityFile, `ServerAliveInterval=30`,
+`ServerAliveCountMax=3`, and exactly
+`-L 127.0.0.1:14175:127.0.0.1:4175`. Preflight rejects an alias that declares
+any other local, remote or dynamic forward. The control socket is stored in the
+project-external runtime directory.
+
+Acceptance is read-only and does not call Douyin or the writer:
+
+```sh
+DCAR_DOUYIN_SYNC_ENV_FILE="$HOME/Library/Application Support/DcarAIGC/douyin-sync.env" \
+  deploy/macos/check_douyin_sync_tunnel.sh
+lsof -nP -iTCP:14175 -sTCP:LISTEN
+launchctl print "gui/$(id -u)/cn.tj.dcar.douyin-sync-tunnel"
+```
+
+The health script first checks the SSH control connection, then calls only
+`/internal/v1/health` through loopback with the Machine credential supplied on
+curl configuration stdin (not its process arguments). Also verify a direct
+shell request and a forward to any destination other than
+`127.0.0.1:4175` fail on the server.
+
+Rollback and uninstall are recoverable and do not touch the writer plist,
+writer env, writer venv, Machine key, private SSH key or known_hosts:
+
+```sh
+label="cn.tj.dcar.douyin-sync-tunnel"
+plist="$HOME/Library/LaunchAgents/$label.plist"
+deploy/macos/stop_douyin_sync_tunnel.sh
+mkdir -p "$HOME/.Trash/DcarAIGC-launchagents"
+mv "$plist" "$HOME/.Trash/DcarAIGC-launchagents/$label.plist"
+```
+
+After Mac rollback is complete, follow the server-side rollback sequence to
+lock the dedicated account and recoverably remove its sshd Match block.

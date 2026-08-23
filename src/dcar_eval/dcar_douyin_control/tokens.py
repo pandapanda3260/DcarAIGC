@@ -14,6 +14,8 @@ from .store import VaultStore
 ACCESS_REFRESH_LEEWAY_SECONDS = 5 * 60
 REFRESH_RENEW_WINDOW_SECONDS = 3 * 24 * 60 * 60
 REFRESH_LEASE_SECONDS = 60
+ACCESS_CIPHERTEXT_KIND = "access"
+REFRESH_CIPHERTEXT_KIND = "refresh"
 
 
 class TokenLifecycleError(RuntimeError):
@@ -191,7 +193,7 @@ class DouyinTokenManager:
                 renewed = await self._provider.renew_refresh_token(refresh["token"])
                 refresh = {"open_id": refresh["open_id"], "token": renewed.refresh_token}
                 refresh_ciphertext = self._cipher.encrypt(
-                    authorization_id, "refresh_token", refresh
+                    authorization_id, REFRESH_CIPHERTEXT_KIND, refresh
                 )
                 renewed_ok = await asyncio.to_thread(
                     self._store.renew_refresh_token,
@@ -235,10 +237,10 @@ class DouyinTokenManager:
                 access = {"open_id": bundle.open_id, "token": bundle.access_token}
                 refresh = {"open_id": bundle.open_id, "token": bundle.refresh_token}
                 access_ciphertext = self._cipher.encrypt(
-                    authorization_id, "access_token", access
+                    authorization_id, ACCESS_CIPHERTEXT_KIND, access
                 )
                 refresh_ciphertext = self._cipher.encrypt(
-                    authorization_id, "refresh_token", refresh
+                    authorization_id, REFRESH_CIPHERTEXT_KIND, refresh
                 )
                 updated = await asyncio.to_thread(
                     self._store.update_refreshed_token_bundle,
@@ -295,12 +297,12 @@ class DouyinTokenManager:
     ) -> tuple[dict[str, str], dict[str, str]]:
         access = self._cipher.decrypt(
             authorization_id,
-            "access_token",
+            ACCESS_CIPHERTEXT_KIND,
             bytes(row["access_token_ciphertext"]),
         )
         refresh = self._cipher.decrypt(
             authorization_id,
-            "refresh_token",
+            REFRESH_CIPHERTEXT_KIND,
             bytes(row["refresh_token_ciphertext"]),
         )
         for payload in (access, refresh):

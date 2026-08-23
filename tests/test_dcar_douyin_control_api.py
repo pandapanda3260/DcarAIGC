@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, cast
 from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qs, urlsplit
 
@@ -17,7 +17,7 @@ from cryptography.fernet import Fernet
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
-from httpx import ASGITransport
+from httpx import ASGITransport, Response as HttpxResponse
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -25,7 +25,15 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "src" / "dcar_eval"))
 
 from dcar_douyin_control.app import create_app  # noqa: E402
 from dcar_douyin_control.config import DouyinControlConfig  # noqa: E402
-from dcar_douyin_control.provider import DouyinOAuthClient  # noqa: E402
+from dcar_douyin_control.provider import (  # noqa: E402
+    DouyinOAuthClient,
+    DouyinProviderError,
+    VideoListPage,
+)
+from dcar_douyin_control.tokens import (  # noqa: E402
+    ReauthorizationRequired,
+    TokenLifecycleError,
+)
 from tests.fixtures.mock_douyin_oauth import (  # noqa: E402
     MockDouyinState,
     create_mock_douyin_oauth,
@@ -271,7 +279,7 @@ class DouyinControlApiTestCase(unittest.TestCase):
         base_path: str,
         *,
         callback_headers: dict[str, str] | None = None,
-    ) -> tuple[str, object, str]:
+    ) -> tuple[str, HttpxResponse, str]:
         start = control.post(
             "/api/douyin/oauth/start",
             headers=self._headers("douyin-oauth-start"),
@@ -336,6 +344,210 @@ class DouyinControlApiTestCase(unittest.TestCase):
                     ).status_code,
                     403,
                 )
+
+    def test_machine_authorization_projection_and_video_list_page(self) -> None:
+        with self._clients("") as (control, provider, _accounts, _state):
+            _state_value, callback, _callback_target = self._start_and_callback(
+                control, provider, ""
+            )
+            self.assertEqual(callback.status_code, 303)
+            confirmed = control.post(
+                "/api/douyin/oauth/confirm",
+                headers=self._headers("douyin-oauth-confirm"),
+                json={},
+            )
+            self.assertEqual(confirmed.status_code, 200, confirmed.text)
+            authorization_id = confirmed.json()["authorization"]["id"]
+
+            listed = control.get(
+                "/internal/v1/authorizations",
+                headers={"X-Dcar-Machine-Key": MACHINE_KEY},
+            )
+            self.assertEqual(listed.status_code, 200, listed.text)
+            self.assertEqual(
+                control.get("/internal/v1/authorizations").status_code, 403
+            )
+            self.assertEqual(
+                control.get(
+                    "/internal/v1/authorizations",
+                    headers={
+                        "X-Dcar-Machine-Key": MACHINE_KEY,
+                        "X-Dcar-Edge-Key": EDGE_KEY,
+                    },
+                ).status_code,
+                403,
+            )
+            self.assertEqual(len(listed.json()["items"]), 1)
+            self.assertEqual(
+                listed.json()["items"][0]["authorization_id"], authorization_id
+            )
+            self.assertNotIn("id", listed.json()["items"][0])
+            serialized = json.dumps(listed.json(), ensure_ascii=False)
+            for forbidden in (
+                "mock-open-id",
+                "open_id",
+                "access_token",
+                "refresh_token",
+                "nickname",
+                "avatar",
+                USERNAME,
+            ):
+                self.assertNotIn(forbidden, serialized)
+            self.assertEqual(listed.headers["cache-control"], "no-store")
+
+            manager = AsyncMock()
+            manager.video_list_page.return_value = VideoListPage(
+                captured_at=NOW,
+                cursor=20,
+                has_more=True,
+                items=[{"item_id": "1234567890123456789", "title": "作品"}],
+            )
+            cast(FastAPI, control.app).state.token_manager = manager
+            page = control.post(
+                "/internal/v1/video-list/page",
+                headers={
+                    "X-Dcar-Machine-Key": MACHINE_KEY,
+                    "X-Request-ID": "machine-request-1",
+                },
+                json={
+                    "authorization_id": authorization_id,
+                    "cursor": 0,
+                    "count": 20,
+                },
+            )
+            self.assertEqual(page.status_code, 200, page.text)
+            self.assertEqual(
+                page.json(),
+                {
+                    "captured_at": NOW,
+                    "cursor": 20,
+                    "has_more": True,
+                    "items": [
+                        {"item_id": "1234567890123456789", "title": "作品"}
+                    ],
+                },
+            )
+            self.assertEqual(page.headers["cache-control"], "no-store")
+            manager.video_list_page.assert_awaited_once_with(
+                authorization_id,
+                cursor=0,
+                count=20,
+                actor="machine:douyin-openapi-sync",
+                request_id="machine-request-1",
+            )
+
+            unbound = control.post(
+                "/api/douyin/authorizations/unbind",
+                headers=self._headers("douyin-authorization-unbind"),
+                json={
+                    "authorization_id": authorization_id,
+                    "expected_version": confirmed.json()["authorization"]["version"],
+                },
+            )
+            self.assertEqual(unbound.status_code, 200, unbound.text)
+            listed_after_unbind = control.get(
+                "/internal/v1/authorizations",
+                headers={"X-Dcar-Machine-Key": MACHINE_KEY},
+            )
+            self.assertEqual(listed_after_unbind.json(), {"items": []})
+
+    def test_machine_video_list_validation_auth_and_stable_errors(self) -> None:
+        authorization_id = "1" * 32
+        payload = {
+            "authorization_id": authorization_id,
+            "cursor": 0,
+            "count": 20,
+        }
+        with self._clients("") as (control, _provider, _accounts, _state):
+            unavailable = control.post(
+                "/internal/v1/video-list/page",
+                headers={"X-Dcar-Machine-Key": MACHINE_KEY},
+                json=payload,
+            )
+            self.assertEqual(unavailable.status_code, 503)
+            self.assertEqual(
+                unavailable.json(), {"detail": "douyin_provider_unavailable"}
+            )
+            self.assertEqual(unavailable.headers["cache-control"], "no-store")
+
+            manager = AsyncMock()
+            cast(FastAPI, control.app).state.token_manager = manager
+            forbidden = control.post(
+                "/internal/v1/video-list/page", json=payload
+            )
+            self.assertEqual(forbidden.status_code, 403)
+            self.assertEqual(forbidden.headers["cache-control"], "no-store")
+            mixed_boundary = control.post(
+                "/internal/v1/video-list/page",
+                headers={
+                    "X-Dcar-Machine-Key": MACHINE_KEY,
+                    "X-Dcar-Edge-Key": EDGE_KEY,
+                },
+                json=payload,
+            )
+            self.assertEqual(mixed_boundary.status_code, 403)
+
+            invalid_payloads = [
+                {**payload, "authorization_id": "A" * 32},
+                {**payload, "authorization_id": "1" * 31},
+                {**payload, "cursor": -1},
+                {**payload, "count": 0},
+                {**payload, "count": 21},
+                {**payload, "unexpected": True},
+            ]
+            for invalid in invalid_payloads:
+                with self.subTest(invalid=invalid):
+                    response = control.post(
+                        "/internal/v1/video-list/page",
+                        headers={"X-Dcar-Machine-Key": MACHINE_KEY},
+                        json=invalid,
+                    )
+                    self.assertEqual(response.status_code, 422, response.text)
+                    self.assertEqual(response.headers["cache-control"], "no-store")
+            manager.video_list_page.assert_not_awaited()
+
+            cases = [
+                (
+                    ReauthorizationRequired("refresh_token_expired"),
+                    409,
+                    "douyin_reauthorization_required",
+                ),
+                (
+                    TokenLifecycleError("authorization_not_found"),
+                    404,
+                    "douyin_authorization_not_found",
+                ),
+                (
+                    TokenLifecycleError("refresh_busy"),
+                    503,
+                    "douyin_token_temporarily_unavailable",
+                ),
+                (
+                    TokenLifecycleError("ciphertext_payload_invalid"),
+                    502,
+                    "douyin_token_error",
+                ),
+                (
+                    DouyinProviderError("video_list", "network_error"),
+                    502,
+                    "douyin_provider_error",
+                ),
+            ]
+            for error, expected_status, expected_detail in cases:
+                with self.subTest(error=error):
+                    manager.video_list_page.side_effect = error
+                    response = control.post(
+                        "/internal/v1/video-list/page",
+                        headers={"X-Dcar-Machine-Key": MACHINE_KEY},
+                        json=payload,
+                    )
+                    self.assertEqual(response.status_code, expected_status, response.text)
+                    self.assertEqual(response.json()["detail"], expected_detail)
+                    self.assertNotIn(str(error), response.text)
+                    self.assertEqual(response.headers["cache-control"], "no-store")
+                    if isinstance(error, TokenLifecycleError):
+                        self.assertEqual(response.json()["reason"], error.reason)
+            self.assertEqual(manager.video_list_page.await_count, len(cases))
 
     def test_account_search_preserves_query_and_returns_only_safe_projection(self) -> None:
         for query in ("", "中文", " ", "%", "_", "甲" * 100):

@@ -437,13 +437,65 @@ sudo systemctl list-timers dcar-douyin-vault-backup.timer --no-pager
 
 ## Restricted Mac tunnel
 
-The future writer channel uses a dedicated SSH account and key. Its
-`authorized_keys` entry must include
-`restrict,port-forwarding,permitopen="127.0.0.1:4175"`; do not grant a shell,
-PTY, agent forwarding, or arbitrary destination forwarding. A request through
-that tunnel must still supply the independent Machine credential. Stage 0 only
-exposes the authenticated internal health route and does not implement writer
-mutation endpoints.
+The Mac sync channel uses its own `dcar-douyin-sync` SSH account, key and alias;
+it must not reuse the `dcar-prod` publisher account or key. Install the checked
+sshd Match block and a reviewed public key (replace the placeholder in the
+example before installation):
+
+```sh
+sudo id -u dcar-douyin-sync >/dev/null 2>&1 \
+  || sudo useradd --system --create-home \
+    --home-dir /var/lib/dcar-douyin-sync \
+    --shell /usr/sbin/nologin dcar-douyin-sync
+sudo install -d -o dcar-douyin-sync -g dcar-douyin-sync -m 0700 \
+  /var/lib/dcar-douyin-sync/.ssh
+sudo install -o dcar-douyin-sync -g dcar-douyin-sync -m 0600 \
+  /tmp/dcar-douyin-sync.authorized_keys \
+  /var/lib/dcar-douyin-sync/.ssh/authorized_keys
+sudo install -o root -g root -m 0644 \
+  deploy/server/ssh/60-dcar-douyin-sync.conf \
+  /etc/ssh/sshd_config.d/60-dcar-douyin-sync.conf
+sudo sshd -t
+sudo systemctl reload ssh
+```
+
+The installed `authorized_keys` entry must contain
+`command="/usr/sbin/nologin",restrict,port-forwarding,permitopen="127.0.0.1:4175"`.
+The account shell and forced command deny shell/session requests. The Match
+block permits only client-local forwarding to `127.0.0.1:4175`; it denies PTY,
+X11, agent, remote/dynamic destination, tunnel-device and password access.
+Every HTTP request through the permitted tunnel must still carry the separate
+Machine credential; SSH authentication does not replace application
+authentication.
+
+Validate the effective Match block before allowing the Mac to connect:
+
+```sh
+sudo sshd -T -C user=dcar-douyin-sync,host=localhost,addr=127.0.0.1 \
+  | grep -E '^(allowtcpforwarding|permitopen|permittty|x11forwarding|allowagentforwarding|forcecommand) '
+```
+
+Acceptance requires `allowtcpforwarding local`, exactly
+`permitopen 127.0.0.1:4175`, and all interactive capabilities disabled. A
+normal `ssh dcar-douyin-sync-prod` shell request must fail, while the documented
+Mac `ssh -N` tunnel and Machine-authenticated health request succeed. A forward
+to any other destination or port must fail.
+
+Rollback starts on the Mac: stop and disable its tunnel LaunchAgent first.
+Then lock the server account and recoverably remove the Match block before
+reloading sshd:
+
+```sh
+sudo usermod -L dcar-douyin-sync
+sudo install -d -o root -g root -m 0700 /root/dcar-ssh-rollback
+sudo mv /etc/ssh/sshd_config.d/60-dcar-douyin-sync.conf \
+  /root/dcar-ssh-rollback/60-dcar-douyin-sync.conf
+sudo sshd -t
+sudo systemctl reload ssh
+```
+
+Keep the account home and `authorized_keys` until the rollback has been
+accepted so the change remains recoverable.
 
 ## Douyin egress acceptance and rollback
 

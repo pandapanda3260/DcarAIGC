@@ -1258,6 +1258,27 @@ class VaultStore:
             )
             return updated
 
+    def list_active_authorizations(self) -> list[dict[str, Any]]:
+        """Return the machine-facing authorization projection without secrets."""
+        with self.read_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT id,account_id,platform_uid,access_expires_at,
+                       refresh_expires_at,renew_count,scopes_json,
+                       needs_reauthorization,updated_at
+                FROM douyin_authorizations
+                WHERE status='active'
+                ORDER BY account_id,id
+                """
+            ).fetchall()
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["scopes"] = json.loads(str(item.pop("scopes_json")))
+            item["needs_reauthorization"] = bool(item["needs_reauthorization"])
+            items.append(item)
+        return items
+
     def list_authorizations(self, bound_username: str) -> list[dict[str, Any]]:
         with self.read_connection() as connection:
             rows = connection.execute(
