@@ -37,6 +37,8 @@ DEFAULT_MANIFEST = (
 )
 DEFAULT_RAW_ROOT = PROJECT_ROOT / "data/cache/v8/raw_responses"
 DEFAULT_MEDIA_ROOT = PROJECT_ROOT / "data/cache/v8/media"
+DERIVED_ADAPTER_VERSION = "tikhub-discovery-derived-v8.1"
+ZERO_VIEW_IS_AUTHORITATIVE = False
 
 
 class CacheReplayError(RuntimeError):
@@ -606,7 +608,7 @@ def _derived_only_provider_calls(derived_raw_root: Path) -> Iterator[None]:
             raise CacheReplayError("缓存重放调用了非 derived provider adapter")
         if kwargs.get("provider") != "TikHub" or kwargs.get(
             "adapter_version"
-        ) != "tikhub-discovery-derived-v8.1":
+        ) != DERIVED_ADAPTER_VERSION:
             raise CacheReplayError("缓存重放 provider 元数据不符合零付费合同")
         if kwargs.get("stage") != "detail" or kwargs.get("window_key") != "lifetime":
             raise CacheReplayError("缓存重放只允许 detail/lifetime 派生槽")
@@ -758,6 +760,13 @@ def apply_replay_plan(
     try:
         with _zero_network(), _derived_only_provider_calls(derived_raw_root):
             for candidate in selected:
+                detail_config = providers.STAGE_CONFIG[(candidate.platform, "detail")]
+                metrics_config = providers.STAGE_CONFIG[(candidate.platform, "metrics")]
+                provider = str(detail_config[0])
+                if provider != str(metrics_config[0]):
+                    raise CacheReplayError(
+                        f"内容 {candidate.content_id} 派生阶段 provider 合同不一致"
+                    )
                 result = providers._materialize_discovery_stages(
                     content_id=candidate.content_id,
                     item=candidate.item,
@@ -765,6 +774,13 @@ def apply_replay_plan(
                     metrics_window_key=plan.metrics_window_key,
                     discovery_operation=candidate.operation,
                     source_raw_response_id=candidate.raw_response_id,
+                    provider=provider,
+                    derived_adapter_version=DERIVED_ADAPTER_VERSION,
+                    derived_operations={
+                        "detail": str(detail_config[2]),
+                        "metrics": str(metrics_config[2]),
+                    },
+                    zero_view_is_authoritative=ZERO_VIEW_IS_AUTHORITATIVE,
                     db_path=db_path,
                     materialize_detail=True,
                     materialize_metrics=False,
