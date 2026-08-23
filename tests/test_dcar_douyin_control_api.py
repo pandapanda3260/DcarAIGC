@@ -243,7 +243,9 @@ class DouyinControlApiTestCase(unittest.TestCase):
         )
         self.assertEqual(start.status_code, 200, start.text)
         authorize_url = start.json()["authorize_url"]
-        state = parse_qs(urlsplit(authorize_url).query)["state"][0]
+        authorize_query = parse_qs(urlsplit(authorize_url).query)
+        self.assertEqual(authorize_query["scope"], ["user_info,video.list"])
+        state = authorize_query["state"][0]
         authorized = provider.get(authorize_url)
         self.assertEqual(authorized.status_code, 303)
         callback_target = self._upstream_target(

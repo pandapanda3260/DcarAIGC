@@ -23,7 +23,7 @@ from .provider import MockOAuthClient, TokenBundle
 from .store import AuthorizationConflict, StateTransitionError, VaultStore
 
 
-REQUESTED_SCOPES = ["user_info", "video.list", "renew_refresh_token"]
+REQUESTED_SCOPES = ["user_info", "video.list"]
 POST_ACTIONS = {
     "/api/douyin/accounts/search": "douyin-accounts-search",
     "/api/douyin/oauth/start": "douyin-oauth-start",

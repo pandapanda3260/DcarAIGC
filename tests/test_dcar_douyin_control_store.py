@@ -51,7 +51,7 @@ class DouyinControlStoreTestCase(unittest.TestCase):
             "refresh_token": "refresh-canary",
             "access_expires_at": 2_000_000_000,
             "refresh_expires_at": 2_000_100_000,
-            "scopes": ["user_info", "video.list", "renew_refresh_token"],
+            "scopes": ["user_info", "video.list"],
             "nickname": "测试账号",
             "avatar": "",
         }
@@ -75,7 +75,7 @@ class DouyinControlStoreTestCase(unittest.TestCase):
             session_binding=binding,
             account_id=account_id,
             platform_uid=platform_uid,
-            scopes=["user_info", "video.list", "renew_refresh_token"],
+            scopes=["user_info", "video.list"],
             expires_at=now + 600,
             request_id="request-start",
             now=now,
