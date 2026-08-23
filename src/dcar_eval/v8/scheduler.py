@@ -50,12 +50,10 @@ from .storage import (
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
-#: 2026-08-07 调整：$3/1200 条追不上报表 90% 指标新鲜度门槛（当天 1,014 条
-#: 指标刷新被 budget_blocked 顺延，metrics_freshness 跌到 22%，日报恒为
-#: 部分完成）。上调总预算并把指标刷新排到详情/评论之前执行——statistics
-#: 单价极低（douyin $0.001/条），3000 条上限下指标段最多花 $3，剩余预算
-#: 天然留给贵操作，便宜的新鲜度刷新不再被饿死。
-DAILY_CAPTURE_MAX_AMOUNT = 8.0
+#: Daily provider spend is a task-wide ceiling across every operation.  The
+#: amount is reserved under BEGIN IMMEDIATE in capture.py, so concurrent
+#: workers cannot split the allowance by provider operation.
+DAILY_CAPTURE_MAX_AMOUNT = 20.0
 DAILY_CAPTURE_CONTENT_LIMIT = 3000
 DAILY_DISCOVERY_MAX_PAGES = 20
 DAILY_CAPTURE_WORKERS = 4
@@ -63,9 +61,55 @@ DAILY_CAPTURE_MAX_ATTEMPTS = 2
 DAILY_CAPTURE_RETRY_DELAY_SECONDS = 1.0
 DAILY_CAPTURE_DISCOVERY_QUALITY_PERCENT = 90
 DAILY_CAPTURE_CONTENT_QUALITY_PERCENT = 60
-CAPTURE_CIRCUIT_BREAK_CODES = frozenset(
-    {"provider_balance_blocked", "provider_auth_blocked", "budget_blocked"}
+CAPTURE_PROVIDER_FATAL_CODES = frozenset(
+    {"provider_balance_blocked", "provider_auth_blocked"}
 )
+CAPTURE_BUDGET_FATAL_CODES = frozenset(
+    {"budget_blocked", "budget_daily_quota_exhausted"}
+)
+CAPTURE_ALLOWED_STOP_CODES = frozenset({"task_budget_exhausted"})
+CAPTURE_CIRCUIT_BREAK_CODES = frozenset(
+    CAPTURE_PROVIDER_FATAL_CODES
+    | CAPTURE_BUDGET_FATAL_CODES
+    | CAPTURE_ALLOWED_STOP_CODES
+)
+
+
+class _CaptureCircuit:
+    """Thread-safe stop signal retaining the structured trigger evidence."""
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self._lock = threading.Lock()
+        self._counts: Counter[str] = Counter()
+
+    def is_set(self) -> bool:
+        return self._event.is_set()
+
+    def record(self, error_code: Any) -> bool:
+        code = str(error_code or "")
+        if code not in CAPTURE_CIRCUIT_BREAK_CODES:
+            return False
+        with self._lock:
+            self._counts[code] += 1
+            self._event.set()
+        return True
+
+    def record_result(self, result: Mapping[str, Any]) -> None:
+        stages = list(result.get("stages") or [])
+        if stages:
+            for stage in stages:
+                if isinstance(stage, Mapping):
+                    self.record(stage.get("error_code"))
+            return
+        self.record(result.get("error_code"))
+
+    def snapshot(self) -> Dict[str, int]:
+        with self._lock:
+            return {
+                code: int(self._counts.get(code, 0))
+                for code in sorted(CAPTURE_CIRCUIT_BREAK_CODES)
+            }
 
 
 @dataclass(frozen=True)
@@ -1080,14 +1124,13 @@ def run_due_capture(
         }
 
     discovery: List[Dict[str, Any]] = []
-    blocked_providers: set[str] = set()
+    capture_circuit = _CaptureCircuit()
     discovery_start = datetime.combine(
         local_day - timedelta(days=1), time.min, SHANGHAI
     ).astimezone(timezone.utc)
     discovery_end = scheduled_for.astimezone(timezone.utc)
     for identity in identities:
-        provider = "TikHub"
-        if provider in blocked_providers:
+        if capture_circuit.is_set():
             discovery.append(
                 {
                     "account_id": identity["account_id"],
@@ -1161,8 +1204,7 @@ def run_due_capture(
                 )
                 account_status = "failed"
                 stopped_reason = str(error_code)
-                if error_code in CAPTURE_CIRCUIT_BREAK_CODES:
-                    blocked_providers.add(provider)
+                capture_circuit.record(error_code)
                 break
             pages.append({"page": page_number, **page})
             if page.get("status") == "partial":
@@ -1220,10 +1262,6 @@ def run_due_capture(
         content_limit=content_limit,
     )
 
-    provider_blocked = threading.Event()
-    if "TikHub" in blocked_providers:
-        provider_blocked.set()
-
     # ---- 指标优先段：先刷完全部到期指标（便宜、保新鲜度），再跑详情/评论 ----
     metrics_targets = [dict(c) for c in contents if c["metrics_needed"]]
     metrics_refreshed: set[int] = set()
@@ -1234,11 +1272,13 @@ def run_due_capture(
         "attempted": len(metrics_targets),
         "succeeded": 0,
         "budget_blocked": 0,
+        "task_budget_exhausted": 0,
+        "budget_daily_quota_exhausted": 0,
         "failed": 0,
     }
 
     def refresh_metrics_only(content: Mapping[str, Any]) -> Dict[str, Any]:
-        if provider_blocked.is_set():
+        if capture_circuit.is_set():
             return {"content_id": content["id"], "status": "circuit_break_skipped"}
         try:
             result = update_content_data(
@@ -1253,23 +1293,13 @@ def run_due_capture(
             )
         except Exception as exc:
             error_code = getattr(exc, "error_code", type(exc).__name__)
-            if error_code in CAPTURE_CIRCUIT_BREAK_CODES:
-                provider_blocked.set()
+            capture_circuit.record(error_code)
             return {
                 "content_id": content["id"],
                 "status": "failed",
                 "error_code": error_code,
             }
-        blocked_code = next(
-            (
-                item.get("error_code")
-                for item in result.get("stages", [])
-                if item.get("error_code") in CAPTURE_CIRCUIT_BREAK_CODES
-            ),
-            None,
-        )
-        if blocked_code:
-            provider_blocked.set()
+        capture_circuit.record_result(result)
         return result
 
     if metrics_targets:
@@ -1296,8 +1326,12 @@ def run_due_capture(
                 or result.get("error_code")
                 or ""
             )
-            if error_code == "budget_blocked":
-                metrics_first_summary["budget_blocked"] += 1
+            if error_code in {
+                "budget_blocked",
+                "task_budget_exhausted",
+                "budget_daily_quota_exhausted",
+            }:
+                metrics_first_summary[error_code] += 1
             else:
                 metrics_first_summary["failed"] += 1
             retryable = bool((metric_stage or {}).get("retryable"))
@@ -1309,7 +1343,7 @@ def run_due_capture(
     # ---- 指标优先段结束；未刷成功的指标在主循环里按剩余总预算继续尝试 ----
 
     def update_one_content(content: Mapping[str, Any]) -> Dict[str, Any]:
-        if provider_blocked.is_set():
+        if capture_circuit.is_set():
             return {"content_id": content["id"], "status": "circuit_break_skipped"}
         stages: List[str] = []
         if content["detail_needed"]:
@@ -1333,24 +1367,14 @@ def run_due_capture(
             )
         except Exception as exc:
             error_code = getattr(exc, "error_code", type(exc).__name__)
-            if error_code in CAPTURE_CIRCUIT_BREAK_CODES:
-                provider_blocked.set()
+            capture_circuit.record(error_code)
             return {
                 "content_id": content["id"],
                 "status": "failed",
                 "error_code": error_code,
                 "message": str(exc),
             }
-        blocked = next(
-            (
-                item.get("error_code")
-                for item in result["stages"]
-                if item.get("error_code") in CAPTURE_CIRCUIT_BREAK_CODES
-            ),
-            None,
-        )
-        if blocked:
-            provider_blocked.set()
+        capture_circuit.record_result(result)
         return result
 
     workers = min(DAILY_CAPTURE_WORKERS, max(1, len(contents)))
@@ -1396,8 +1420,15 @@ def run_due_capture(
                     task_id=task_id,
                     task_max_amount=max_amount,
                 )
-            except Exception:
-                return index, initial
+            except Exception as exc:
+                error_code = getattr(exc, "error_code", type(exc).__name__)
+                capture_circuit.record(error_code)
+                return index, {
+                    **initial,
+                    "retry_error_code": str(error_code),
+                    "retry_error_message": str(exc)[:500],
+                }
+            capture_circuit.record_result(retry_result)
             retried_by_stage = {
                 str(stage["stage"]): stage for stage in retry_result.get("stages", [])
             }
@@ -1439,9 +1470,6 @@ def run_due_capture(
                     for stage in retry_result.get("stages", [])
                 ):
                     metrics_refreshed.add(int(contents[index]["id"]))
-    if provider_blocked.is_set():
-        blocked_providers.add("TikHub")
-
     unresolved_metrics = {
         int(content["id"]) for content in metrics_targets
     } - metrics_refreshed
@@ -1502,14 +1530,12 @@ def run_due_capture(
         + incomplete_contents
         + len(unresolved_metrics - incomplete_content_ids)
     )
-    if blocked_providers or successful_operations == 0:
-        status = "failed"
-    elif failed_operations:
-        status = "partial"
-    else:
-        status = "succeeded"
+    circuit_break_counts = capture_circuit.snapshot()
+    provider_fatal_count = sum(
+        circuit_break_counts.get(code, 0) for code in CAPTURE_PROVIDER_FATAL_CODES
+    )
+    blocked_providers = ["TikHub"] if provider_fatal_count else []
     details = {
-        "status": status,
         "task_id": task_id,
         "budget_max_amount": max_amount,
         "content_limit": content_limit,
@@ -1519,13 +1545,30 @@ def run_due_capture(
         "metrics_first": metrics_first_summary,
         "discovery": discovery,
         "content_updates": content_updates,
-        "blocked_providers": sorted(blocked_providers),
+        "blocked_providers": blocked_providers,
+        "circuit_break_counts": circuit_break_counts,
+        "successful_operations": successful_operations,
         "failed_operations": failed_operations,
         "reported_provider_cost": reported_provider_cost,
         "ledger_provider_cost": ledger_provider_cost,
         "provider_cost": provider_cost,
     }
-    details["quality_gate"] = daily_capture_quality_gate(details)
+    quality_gate = daily_capture_quality_gate(details)
+    fatal_count = sum(
+        circuit_break_counts.get(code, 0)
+        for code in CAPTURE_PROVIDER_FATAL_CODES | CAPTURE_BUDGET_FATAL_CODES
+    )
+    allowed_stop_count = sum(
+        circuit_break_counts.get(code, 0) for code in CAPTURE_ALLOWED_STOP_CODES
+    )
+    if fatal_count or successful_operations == 0 or not quality_gate["passed"]:
+        status = "failed"
+    elif failed_operations or allowed_stop_count:
+        status = "partial"
+    else:
+        status = "succeeded"
+    details["status"] = status
+    details["quality_gate"] = quality_gate
     return details
 
 
@@ -1571,6 +1614,28 @@ def daily_capture_quality_gate(details: Mapping[str, Any]) -> Dict[str, Any]:
     budget_max = float(
         details.get("budget_max_amount", DAILY_CAPTURE_MAX_AMOUNT)
     )
+    raw_circuit_counts = details.get("circuit_break_counts") or {}
+    circuit_break_counts = {
+        str(code): max(0, int(count or 0))
+        for code, count in (
+            raw_circuit_counts.items()
+            if isinstance(raw_circuit_counts, Mapping)
+            else []
+        )
+    }
+    provider_fatal_count = sum(
+        circuit_break_counts.get(code, 0) for code in CAPTURE_PROVIDER_FATAL_CODES
+    )
+    budget_fatal_count = sum(
+        circuit_break_counts.get(code, 0) for code in CAPTURE_BUDGET_FATAL_CODES
+    )
+    successful_operations = int(
+        details.get(
+            "successful_operations",
+            discovery_succeeded + content_succeeded,
+        )
+        or 0
+    )
     ledger_exactly_matches_reported = abs(reported_cost - ledger_cost) <= 1e-6
     checks = {
         "accounts_complete": len(discovery) == monitored_accounts,
@@ -1585,7 +1650,12 @@ def daily_capture_quality_gate(details: Mapping[str, Any]) -> Dict[str, Any]:
             or content_succeeded * 100
             >= monitored_contents * DAILY_CAPTURE_CONTENT_QUALITY_PERCENT
         ),
-        "providers_unblocked": not list(details.get("blocked_providers") or []),
+        "providers_unblocked": (
+            not list(details.get("blocked_providers") or [])
+            and provider_fatal_count == 0
+        ),
+        "budget_contract_unblocked": budget_fatal_count == 0,
+        "successful_operations_present": successful_operations > 0,
         "ledger_source_present": ledger_source_present,
         "budget_declaration_present": budget_declaration_present,
         # provider_usage is the authoritative billed ledger. Per-operation
@@ -1615,6 +1685,7 @@ def daily_capture_quality_gate(details: Mapping[str, Any]) -> Dict[str, Any]:
         "content_threshold_percent": DAILY_CAPTURE_CONTENT_QUALITY_PERCENT,
         "declared_budget_max_amount": budget_max,
         "authorized_budget_max_amount": DAILY_CAPTURE_MAX_AMOUNT,
+        "circuit_break_counts": circuit_break_counts,
         "cost_reconciliation": {
             "reported_provider_cost": reported_cost,
             "ledger_provider_cost": ledger_cost,

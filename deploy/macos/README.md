@@ -8,7 +8,7 @@ writer renderer 只生成 disabled-by-default plist，永不调用 `launchctl`�
 
 - 同一时刻只能有一个 scheduled writer。Ubuntu 副本和 8765 均必须保持 `DCAR_SCHEDULER_ENABLED=0` 和 `DCAR_STARTUP_CATCHUP_ENABLED=0`。
 - writer 使用 `DCAR_SCHEDULER_ENABLED=1` 和 `DCAR_STARTUP_CATCHUP_ENABLED=1`，但 startup catch-up 严格为 `report_only`：只可创建/重试 `daily_report` 和 `weekly_report`，不运行 capture、media 或 cutoff，不产生供应商费用。
-- 每日 capture 的 task 总额硬顶为 USD 8。只有运营者明确批准循环成本并在 `writer.env` 写入固定 acknowledgement 后才能启用。
+- 每日 capture 的 task 总额硬顶为 USD 20。只有运营者明确批准循环成本并在 `writer.env` 写入固定 acknowledgement 后才能启用。
 - TikHub API key 不得进入 plist 或 `writer.env`。`writer.env` 只允许 `TIKHUB_API_KEY_FILE`、`DCAR_DAILY_COST_AUTHORIZATION`、空行和注释；其他条目都会 exit 78。
 - `DCAR_DAILY_CAPTURE_RECONCILE_FROM` 只能由 plist 继承，必须是真实且规范的 `YYYY-MM-DD`。不得将它写进 `writer.env`。
 - scheduler 锁在 `$HOME/Library/Application Support/DcarAIGC/runtime/writer-worker.lock`，不在 checkout 里。`writer_lock.held=true` 只证明唯一 scheduler 进程锁已持有，不证明数据库没有其他非调度写进者。
@@ -18,7 +18,7 @@ writer renderer 只生成 disabled-by-default plist，永不调用 `launchctl`�
 
 ## 1. 准备项目外 writer 配置
 
-只在 USD 8 循环上限已批准后执行。复制示例到项目外，修改绝对 key-file 路径，并保护文件。`DCAR_DAILY_COST_AUTHORIZATION` 只能在审批后设为 `I_ACKNOWLEDGE_DAILY_PROVIDER_LIMIT_USD_8`。
+只在 USD 20 循环上限已批准后执行。复制示例到项目外，修改绝对 key-file 路径，并保护文件。`DCAR_DAILY_COST_AUTHORIZATION` 只能在审批后设为 `I_ACKNOWLEDGE_DAILY_PROVIDER_LIMIT_USD_20`。
 
 ```sh
 install -d -m 0700 "$HOME/Library/Application Support/DcarAIGC"
@@ -104,9 +104,9 @@ tail -n 200 "$HOME/Library/Logs/DcarAIGC/writer-worker.stderr.log"
 
 scheduler 必须报告 requested/enabled；`daily_capture_reconcile` 必须是 `mode=current_day_only`、`effective_from=D`、`interval_seconds=3600`。以 D=`2026-08-21` 的正式库只读基线计算，`startup_catchup` 必须在观察窗内结束为 `status=succeeded`、`error=null`，并精确返回 12 个结果（10 个 `daily_report`、2 个 `weekly_report`，每项仅允许 `succeeded` 或 `partial`）；不能只检查“results 里没有供应商任务”，因为 `running` 时空 results 也会误通过。稳定观察至少 650 秒，除了 PID/health 稳定，stderr 还必须没有 preflight exit 78、日期拒绝或 KeepAlive/ThrottleInterval 崩溃循环。若 00:20:50 仍为 `running`，或出现 `failed`/`deferred`/结果集漂移，必须在 01:00 前 bootout + disable、恢复 freeze 并顺延 D，禁止让该进程继续进入 02:00 付费槽。
 
-禁止手工执行 `daily_capture` 作为烟测；等待已授权的自然 02:00 槽。该槽结束后，状态可以是 `succeeded` 或 `partial`，但还必须通过独立质量门：discovery ≥90%、当天选中 cohort ≥60%、数组计数一致、provider 无阻断。`provider_usage` ledger 是权威账本：details 上报小计、ledger 和声明预算必须是有限值，成本非负、预算为正，且同时满足 `ledger >= details 上报小计`、`ledger <= 声明预算`、`ledger <= USD 8`。两者精确相等只作诊断，不影响 `passed`。3,000 是选中 cohort 上限，不是全库覆盖率。
+禁止手工执行 `daily_capture` 作为烟测；等待已授权的自然 02:00 槽。该槽结束后，状态可以是 `succeeded` 或 `partial`，但还必须通过独立质量门：discovery ≥90%、当天选中 cohort ≥60%、数组计数一致、provider 无阻断。`provider_usage` ledger 是权威账本：details 上报小计、ledger 和声明预算必须是有限值，成本非负、预算为正，且同时满足 `ledger >= details 上报小计`、`ledger <= 声明预算`、`ledger <= USD 20`。两者精确相等只作诊断，不影响 `passed`。3,000 是选中 cohort 上限，不是全库覆盖率。
 
-`budget_blocked` 仍是 `failed`，不得为了通过本次验收提高 USD 8 上限或自动重跑该终态。只有 `interrupted` 会由小时 reconcile 以同一 task ID 和剩余预算自动续跑；显式 `operator_retry` 保留为诊断入口。
+task 总额耗尽以 `task_budget_exhausted` 单独记录，质量门通过时为 `partial`；通用 `budget_blocked` 与每日请求次数耗尽仍为 `failed`。只有 `interrupted` 会由小时 reconcile 以同一 task ID 和剩余预算自动续跑；显式 `operator_retry` 保留为诊断入口。
 
 ### 睡眠/唤醒语义
 
@@ -148,7 +148,7 @@ publisher 在登录时启动一次、每天 09:00 启动一次，并每小时 re
 5. report v8.7、schema 16 / `remove-manual-review`、evaluation/taxonomy identity、正式 DB、内容新鲜度均一致。
 6. SSH 专用 alias、strict known_hosts、远端有界保留、空间、bundle 校验、安装和安装后 smoke check 全部通过。保留命令始终保护 active snapshot，并分别只保留最近 3 个 incoming/history 快照目录。
 
-`daily_capture=partial` 可发布，但质量门只作为诊断，不得用来放宽上述终态、身份、新鲜度或 USD 8 预算合同。远端发布失败时保留本地快照和远端 incoming 供审计，下一次自动执行仍从全套门禁开始；成功后本地只保留最近 3 个自动快照目录。
+`daily_capture=partial` 可发布，但质量门只作为诊断，不得用来放宽上述终态、身份、新鲜度或 USD 20 预算合同。远端发布失败时保留本地快照和远端 incoming 供审计，下一次自动执行仍从全套门禁开始；成功后本地只保留最近 3 个自动快照目录。
 
 项目外配置沿用 `publisher.env.example`，权限必须是 0400 或 0600。首次安装：
 

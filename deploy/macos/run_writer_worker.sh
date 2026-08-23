@@ -64,8 +64,8 @@ while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
   esac
 done < "$writer_env"
 
-[[ "$cost_authorization" == "I_ACKNOWLEDGE_DAILY_PROVIDER_LIMIT_USD_8" ]] || \
-  fail "daily USD 8 provider budget has not been explicitly authorized"
+[[ "$cost_authorization" == "I_ACKNOWLEDGE_DAILY_PROVIDER_LIMIT_USD_20" ]] || \
+  fail "daily USD 20 provider budget has not been explicitly authorized"
 [[ -n "$tikhub_key_file" && "$tikhub_key_file" = /* ]] || \
   fail "TIKHUB_API_KEY_FILE must be an absolute external path"
 [[ -f "$tikhub_key_file" && ! -L "$tikhub_key_file" ]] || \

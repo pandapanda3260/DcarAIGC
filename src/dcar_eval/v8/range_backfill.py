@@ -59,6 +59,8 @@ BLOCKING_CODES = {
     "provider_balance_blocked",
     "provider_auth_blocked",
     "budget_blocked",
+    "task_budget_exhausted",
+    "budget_daily_quota_exhausted",
     "BudgetBlocked",
 }
 

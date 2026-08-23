@@ -108,7 +108,7 @@ class FullHistoryWrapperTest(unittest.TestCase):
             runner,
             "run_command",
             side_effect=[
-                self._discovery_result("blocked", "budget_blocked"),
+                self._discovery_result("blocked", "task_budget_exhausted"),
                 self._discovery_result("succeeded", None),
             ],
         ) as command, patch.object(runner, "save_state"), patch.object(

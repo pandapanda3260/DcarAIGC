@@ -2997,6 +2997,8 @@ def update_content_data(
                     "provider_balance_blocked",
                     "provider_auth_blocked",
                     "budget_blocked",
+                    "task_budget_exhausted",
+                    "budget_daily_quota_exhausted",
                 }:
                     break
             continue
@@ -3262,6 +3264,8 @@ def update_content_data(
                 "provider_balance_blocked",
                 "provider_auth_blocked",
                 "budget_blocked",
+                "task_budget_exhausted",
+                "budget_daily_quota_exhausted",
             }:
                 break
     media_result: Optional[Dict[str, Any]] = None

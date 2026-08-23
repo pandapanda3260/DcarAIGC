@@ -63,6 +63,18 @@ class BudgetBlocked(RuntimeError):
     error_code = "budget_blocked"
 
 
+class TaskBudgetExhausted(BudgetBlocked):
+    """The shared task-level amount ceiling has been exhausted."""
+
+    error_code = "task_budget_exhausted"
+
+
+class DailyAttemptQuotaExhausted(BudgetBlocked):
+    """The budget batch has exhausted its Beijing-day attempt quota."""
+
+    error_code = "budget_daily_quota_exhausted"
+
+
 class RawResponseIntegrityError(RuntimeError):
     """A stored provider response is absent, unreadable or fails SHA-256 validation."""
 
@@ -651,6 +663,18 @@ def _reserve_budget(
         if abs(float(row["max_amount"]) - float(task_max_amount)) > 1e-9:
             raise BudgetBlocked("task budget max_amount does not match runtime ceiling")
     unit_price = float(row["verified_unit_price"])
+    # The task ceiling is the authoritative cross-operation stop. Check it
+    # before per-operation and daily-attempt limits so callers can distinguish
+    # an expected end-of-task stop from a broken budget contract.
+    if task_id is not None and task_max_amount is not None:
+        task_amount = float(
+            connection.execute(
+                "SELECT COALESCE(SUM(amount), 0) FROM provider_usage WHERE task_id=?",
+                (task_id,),
+            ).fetchone()[0]
+        )
+        if task_amount + unit_price > task_max_amount + 1e-9:
+            raise TaskBudgetExhausted("task amount ceiling reached")
     consumed_requests = int(row["consumed_requests"])
     consumed_amount = float(row["consumed_amount"])
     if consumed_requests >= int(row["max_billable_requests"]):
@@ -669,7 +693,7 @@ def _reserve_budget(
     ).fetchone()
     daily_attempts = int(usage["attempts"])
     if daily_attempts >= int(row["daily_quota"]):
-        raise BudgetBlocked("daily attempt quota reached")
+        raise DailyAttemptQuotaExhausted("daily attempt quota reached")
     total_attempts = int(
         connection.execute(
             "SELECT COALESCE(SUM(request_attempts), 0) FROM provider_usage WHERE budget_batch_id=?",
@@ -678,16 +702,6 @@ def _reserve_budget(
     )
     if row["status"] == "pilot" and total_attempts >= int(row["pilot_size"]):
         raise BudgetBlocked("pilot sample is complete and awaits quality gate")
-    if task_id is not None and task_max_amount is not None:
-        task_amount = float(
-            connection.execute(
-                "SELECT COALESCE(SUM(amount), 0) FROM provider_usage WHERE task_id=?",
-                (task_id,),
-            ).fetchone()[0]
-        )
-        if task_amount + unit_price > task_max_amount + 1e-9:
-            raise BudgetBlocked("task amount ceiling reached")
-
     cursor = connection.execute(
         """
         INSERT INTO provider_usage(
@@ -850,23 +864,30 @@ def _execute_claimed_fetch(
                     task_max_amount=task_max_amount,
                 )
     except Exception as exc:
+        error_code = str(getattr(exc, "error_code", type(exc).__name__))
         with connect(db_path) as connection, transaction(connection):
             finished_at = now_utc()
             connection.execute(
                 """
                 UPDATE fetch_attempts
-                SET response_finished_at=?, error_code='budget_blocked', error_message=?
+                SET response_finished_at=?, error_code=?, error_message=?
                 WHERE id=?
                 """,
-                (finished_at, str(exc)[:500], claim.attempt_id),
+                (finished_at, error_code, str(exc)[:500], claim.attempt_id),
             )
             connection.execute(
                 """
                 UPDATE fetch_slots
-                SET status='retryable_failed', last_error_code='budget_blocked',
+                SET status='retryable_failed', last_error_code=?,
                     last_error_message=?, finished_at=?, updated_at=? WHERE id=?
                 """,
-                (str(exc)[:500], finished_at, finished_at, claim.slot_id),
+                (
+                    error_code,
+                    str(exc)[:500],
+                    finished_at,
+                    finished_at,
+                    claim.slot_id,
+                ),
             )
         raise
 

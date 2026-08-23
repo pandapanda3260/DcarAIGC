@@ -1065,7 +1065,7 @@ class V8SchedulerTest(unittest.TestCase):
         self.assertEqual(result["cost_reconciliation"]["reported_provider_cost"], 4.706)
         self.assertEqual(result["cost_reconciliation"]["ledger_provider_cost"], 6.151)
 
-    def test_daily_capture_quality_gate_enforces_fixed_usd_eight_contract(
+    def test_daily_capture_quality_gate_enforces_fixed_usd_twenty_contract(
         self,
     ) -> None:
         baseline = {
@@ -1078,15 +1078,16 @@ class V8SchedulerTest(unittest.TestCase):
             "reported_provider_cost": 1.0,
             "ledger_provider_cost": 1.0,
         }
-        enlarged_contract = {**baseline, "budget_max_amount": 9.0}
+        enlarged_contract = {**baseline, "budget_max_amount": 20.001}
         enlarged_result = daily_capture_quality_gate(enlarged_contract)
         self.assertFalse(enlarged_result["passed"])
         self.assertFalse(enlarged_result["checks"]["budget_contract"])
 
         overspent = {
             **baseline,
-            "reported_provider_cost": 8.001,
-            "ledger_provider_cost": 8.001,
+            "budget_max_amount": 20.0,
+            "reported_provider_cost": 20.001,
+            "ledger_provider_cost": 20.001,
         }
         overspent_result = daily_capture_quality_gate(overspent)
         self.assertFalse(overspent_result["passed"])
@@ -2496,7 +2497,8 @@ class V8SchedulerTest(unittest.TestCase):
                     """
                 ).fetchone()[0]
             )
-        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["status"], "failed")
+        self.assertFalse(result["quality_gate"]["passed"])
         self.assertEqual(calls["metrics"], 2)
         self.assertGreater(ledger_cost, 0)
         self.assertEqual(result["provider_cost"], ledger_cost)
@@ -2594,15 +2596,19 @@ class V8SchedulerTest(unittest.TestCase):
         )
 
         self.assertEqual(calls, 1)
-        self.assertEqual(result["blocked_providers"], ["TikHub"])
+        self.assertEqual(result["blocked_providers"], [])
         self.assertEqual(
             [item["status"] for item in result["discovery"]],
             ["failed", "circuit_break_skipped"],
         )
         self.assertEqual(
             result["discovery"][0]["pages"][-1]["error_code"],
-            "budget_blocked",
+            "task_budget_exhausted",
         )
+        self.assertEqual(
+            result["circuit_break_counts"]["task_budget_exhausted"], 1
+        )
+        self.assertFalse(result["quality_gate"]["passed"])
         with connect(self.db) as connection:
             amount = float(
                 connection.execute(
@@ -2613,6 +2619,74 @@ class V8SchedulerTest(unittest.TestCase):
                 ).fetchone()[0]
             )
         self.assertEqual(amount, 0.01)
+
+    def test_task_budget_exhaustion_is_partial_after_quality_floor(self) -> None:
+        upsert_account(
+            {
+                "phone": "13800138991",
+                "platforms": [{"platform": "douyin", "uid": "quality-budget"}],
+            },
+            db_path=self.db,
+        )
+        contents = [
+            {
+                "id": content_id,
+                "detail_needed": True,
+                "metrics_needed": False,
+                "comments_needed": False,
+            }
+            for content_id in (1, 2, 3)
+        ]
+
+        def update_result(content_id, **_kwargs):
+            if content_id == 3:
+                return {
+                    "content_id": content_id,
+                    "status": "partial",
+                    "stages": [
+                        {
+                            "stage": "detail",
+                            "status": "failed",
+                            "error_code": "task_budget_exhausted",
+                            "retryable": False,
+                        }
+                    ],
+                    "provider_cost": 0.0,
+                }
+            return {
+                "content_id": content_id,
+                "status": "succeeded",
+                "stages": [{"stage": "detail", "status": "succeeded"}],
+                "provider_cost": 0.0,
+            }
+
+        discovery = {
+            "status": "succeeded",
+            "has_more": False,
+            "page_published_at": [],
+            "inserted": 0,
+            "updated": 0,
+            "provider_cost": 0.0,
+        }
+        with patch(
+            "v8.scheduler._select_due_capture_contents", return_value=contents
+        ), patch(
+            "v8.scheduler.discover_account_content", return_value=discovery
+        ), patch(
+            "v8.scheduler.update_content_data", side_effect=update_result
+        ):
+            result = run_due_capture(
+                datetime(2026, 8, 2, 2, 0, tzinfo=SHANGHAI),
+                db_path=self.db,
+            )
+
+        self.assertEqual(result["status"], "partial")
+        self.assertTrue(result["quality_gate"]["passed"])
+        self.assertEqual(result["blocked_providers"], [])
+        self.assertEqual(result["failed_operations"], 1)
+        self.assertEqual(
+            result["circuit_break_counts"]["task_budget_exhausted"], 1
+        )
 
     def test_daily_capture_paginates_until_beijing_window_start(self) -> None:
         upsert_account(

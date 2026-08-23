@@ -15,9 +15,11 @@ import v8.capture as capture_module
 from v8.capture import (
     BudgetBlocked,
     CaptureError,
+    DailyAttemptQuotaExhausted,
     ProviderResult,
     RawResponseIntegrityError,
     SlotUnavailable,
+    TaskBudgetExhausted,
     activate_pilot_budget,
     evaluate_pilot_gate,
     execute_account_fetch,
@@ -449,7 +451,7 @@ class V8CaptureTest(unittest.TestCase):
             provider_called = True
             return ProviderResult({}, {}, 200, True)
 
-        with self.assertRaises(BudgetBlocked):
+        with self.assertRaises(TaskBudgetExhausted):
             execute_content_fetch(
                 content_id=1,
                 stage="media_source_refresh",
@@ -470,13 +472,75 @@ class V8CaptureTest(unittest.TestCase):
             blocked_slot = connection.execute(
                 "SELECT status,last_error_code FROM fetch_slots WHERE window_key='range-page-2'"
             ).fetchone()
+            blocked_attempt = connection.execute(
+                """
+                SELECT error_code FROM fetch_attempts fa
+                JOIN fetch_slots fs ON fs.id=fa.slot_id
+                WHERE fs.window_key='range-page-2'
+                """
+            ).fetchone()
         self.assertEqual(len(usage), 1)
         self.assertEqual(usage[0]["task_id"], task_id)
         self.assertEqual(usage[0]["amount"], 0.008)
         self.assertEqual(
             (blocked_slot["status"], blocked_slot["last_error_code"]),
-            ("retryable_failed", "budget_blocked"),
+            ("retryable_failed", "task_budget_exhausted"),
         )
+        self.assertEqual(blocked_attempt["error_code"], "task_budget_exhausted")
+
+    def test_daily_quota_has_structured_error_code_in_slot_and_attempt(self) -> None:
+        task_id = "daily-quota-structured"
+        operation = "xiaohongshu_video_detail"
+        max_amount = 0.016
+        budget_id = self._insert_task_budget(
+            task_id=task_id,
+            operation=operation,
+            max_amount=max_amount,
+        )
+        with connect(self.db) as connection:
+            connection.execute(
+                "UPDATE provider_budget_batches SET daily_quota=1 WHERE id=?",
+                (budget_id,),
+            )
+            connection.commit()
+        execute_content_fetch(
+            content_id=1,
+            stage="detail",
+            window_key="quota-first",
+            provider="Rnote",
+            adapter_version="rnote-video-v8.0",
+            operation=operation,
+            budget_id=budget_id,
+            task_id=task_id,
+            task_max_amount=max_amount,
+            db_path=self.db,
+            raw_root=self.raw,
+            call=lambda: ProviderResult({"ok": True}, {"ok": True}, 200, True),
+        )
+        with self.assertRaises(DailyAttemptQuotaExhausted):
+            execute_content_fetch(
+                content_id=1,
+                stage="detail",
+                window_key="quota-second",
+                provider="Rnote",
+                adapter_version="rnote-video-v8.0",
+                operation=operation,
+                budget_id=budget_id,
+                task_id=task_id,
+                task_max_amount=max_amount,
+                db_path=self.db,
+                raw_root=self.raw,
+                call=lambda: ProviderResult({}, {}, 200, True),
+            )
+        with connect(self.db) as connection:
+            row = connection.execute(
+                """
+                SELECT fs.last_error_code,fa.error_code
+                FROM fetch_slots fs JOIN fetch_attempts fa ON fa.slot_id=fs.id
+                WHERE fs.window_key='quota-second'
+                """
+            ).fetchone()
+        self.assertEqual(tuple(row), ("budget_daily_quota_exhausted",) * 2)
 
     def test_unbilled_call_releases_task_capacity_for_another_operation(self) -> None:
         task_id = "backfill-unbilled-release"

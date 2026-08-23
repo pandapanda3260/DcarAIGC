@@ -97,7 +97,7 @@ class MacOSWriterDeploymentTest(unittest.TestCase):
         example = (MACOS_DEPLOY / "writer.env.example").read_text(encoding="utf-8")
         readme = (MACOS_DEPLOY / "README.md").read_text(encoding="utf-8")
 
-        self.assertIn("I_ACKNOWLEDGE_DAILY_PROVIDER_LIMIT_USD_8", wrapper)
+        self.assertIn("I_ACKNOWLEDGE_DAILY_PROVIDER_LIMIT_USD_20", wrapper)
         self.assertIn("TIKHUB_API_KEY_FILE", wrapper)
         self.assertIn("export DCAR_STARTUP_CATCHUP_ENABLED=1", wrapper)
         self.assertIn(
@@ -119,8 +119,8 @@ class MacOSWriterDeploymentTest(unittest.TestCase):
             example,
             re.compile(r"^DCAR_DAILY_COST_AUTHORIZATION=$", re.MULTILINE),
         )
-        self.assertNotIn("I_ACKNOWLEDGE_DAILY_PROVIDER_LIMIT_USD_8", example)
-        self.assertIn("USD 8", readme)
+        self.assertNotIn("I_ACKNOWLEDGE_DAILY_PROVIDER_LIMIT_USD_20", example)
+        self.assertIn("USD 20", readme)
         self.assertIn("Mac 接交流电、网络正常，且计划窗口内不睡眠", readme)
         self.assertIn("renderer 只生成 disabled-by-default plist，永不调用 `launchctl`", readme)
         self.assertIn("startup catch-up 严格为 `report_only`", readme)

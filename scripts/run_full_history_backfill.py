@@ -656,7 +656,7 @@ def phase_discover(
                 "禁止进入报价与下游阶段",
                 2,
             )
-        if result.get("stopped_reason") not in {"budget_blocked", "BudgetBlocked"}:
+        if result.get("stopped_reason") != "task_budget_exhausted":
             state["phases"]["discover"] = "blocked"
             save_state(state)
             raise AbortRun(
