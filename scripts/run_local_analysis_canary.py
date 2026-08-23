@@ -3035,6 +3035,22 @@ def _source_image_download_binding(source: Mapping[str, Any]) -> str:
     )
 
 
+def _source_artifact_sha256(source: Mapping[str, Any]) -> str:
+    """Return the frozen media_source artifact identity used by download slots."""
+
+    artifact = source.get("artifact")
+    artifact_file = source.get("artifact_file")
+    value = artifact.get("sha256") if isinstance(artifact, Mapping) else None
+    if (
+        type(value) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", value) is None
+        or not isinstance(artifact_file, Mapping)
+        or artifact_file.get("sha256") != value
+    ):
+        raise LocalAnalysisCanaryError("contract media_source artifact SHA漂移")
+    return value
+
+
 def _image_manifest_output_paths(
     manifest_path: Path,
     body: Mapping[str, Any],
@@ -3620,11 +3636,7 @@ def _validate_content_processing(
         )
     expected_slots: dict[str, tuple[str, str, int]] = {
         "download": (
-            (
-                str(source["artifact_body"]["source_sha256"])
-                if media_kind == "video"
-                else _source_image_download_binding(source)
-            ),
+            _source_artifact_sha256(source),
             (
                 media_module.VIDEO_DOWNLOAD_VERSION
                 if media_kind == "video"
@@ -5731,11 +5743,12 @@ def _current_contract_upstream_sha(
     download_artifact = artifacts.get(download_name)
     if download_artifact is None:
         raise LocalAnalysisCanaryError("running slot缺少current download artifact")
-    download_source_sha = (
+    logical_download_sha = (
         str(source["artifact_body"]["source_sha256"])
         if media_kind == "video"
         else _source_image_download_binding(source)
     )
+    download_slot_source_sha = _source_artifact_sha256(source)
     download_version = (
         media_module.VIDEO_DOWNLOAD_VERSION
         if media_kind == "video"
@@ -5747,7 +5760,7 @@ def _current_contract_upstream_sha(
         WHERE content_id=? AND source_sha256=? AND processor_type='download'
           AND processor_version=?
         """,
-        (content_id, download_source_sha, download_version),
+        (content_id, download_slot_source_sha, download_version),
     ).fetchall()
     if (
         len(download_slots) != 1
@@ -5763,14 +5776,14 @@ def _current_contract_upstream_sha(
             paths.media_root
             / link_id
             / "downloads"
-            / download_source_sha
+            / logical_download_sha
             / "source.mp4"
         ).resolve()
         if _resolve_artifact_path(str(download_artifact["local_path"])) != expected_path:
             raise LocalAnalysisCanaryError("running slot video download路径漂移")
         expected_metadata = {
             "source_count": len(_source_urls(source)),
-            "source_sha256": download_source_sha,
+            "source_sha256": logical_download_sha,
         }
         try:
             metadata = json.loads(str(download_artifact["metadata_json"]))
@@ -5936,11 +5949,7 @@ def _validate_owned_running_slot(
     media_kind = str(source["artifact_body"]["media_kind"])
     versions = media_module.processor_versions()
     if processor_type == "download":
-        expected_sha = (
-            str(source["artifact_body"]["source_sha256"])
-            if media_kind == "video"
-            else _source_image_download_binding(source)
-        )
+        expected_sha = _source_artifact_sha256(source)
         expected_version = (
             media_module.VIDEO_DOWNLOAD_VERSION
             if media_kind == "video"

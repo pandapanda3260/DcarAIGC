@@ -835,12 +835,21 @@ class LocalAnalysisCanaryControllerTest(unittest.TestCase):
             encoding="utf-8",
         )
         versions = media.processor_versions()
-        _, source_sha = media._media_source_identity("video", urls)
         with closing(connect(self.db)) as connection:
+            source_artifact = connection.execute(
+                """
+                SELECT sha256 FROM evidence_artifacts
+                WHERE content_id=? AND artifact_type='media_source'
+                  AND status='available' AND processor_version=?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (content_id, media.MEDIA_SOURCE_VERSION),
+            ).fetchone()
+            self.assertIsNotNone(source_artifact)
             download_slot_id, cached = media._claim_processing_slot(
                 connection,
                 content_id=content_id,
-                source_sha256=source_sha,
+                source_sha256=str(source_artifact["sha256"]),
                 processor_type="download",
                 processor_version=media.VIDEO_DOWNLOAD_VERSION,
             )
@@ -2890,7 +2899,7 @@ class LocalAnalysisCanaryControllerTest(unittest.TestCase):
         sources = {
             int(source["content"]["id"]): source for source in contract["sources"]
         }
-        _, source_sha256 = media._media_source_identity("video", self.urls)
+        source_sha256 = canary._source_artifact_sha256(contract["sources"][0])
         stale = (
             datetime.now(timezone.utc)
             - timedelta(seconds=media.STALE_MEDIA_SLOT_SECONDS + 10)
@@ -3116,7 +3125,6 @@ class LocalAnalysisCanaryControllerTest(unittest.TestCase):
 
     def _insert_running_download(self, *, stale: bool, source_sha: str | None = None) -> None:
         (self.run_root / "state.json").unlink(missing_ok=True)
-        _, expected_source_sha = media._media_source_identity("video", self.urls)
         updated_at = (
             datetime.now(timezone.utc)
             - timedelta(seconds=media.STALE_MEDIA_SLOT_SECONDS + 10)
@@ -3124,6 +3132,17 @@ class LocalAnalysisCanaryControllerTest(unittest.TestCase):
             else datetime.now(timezone.utc)
         ).isoformat(timespec="seconds")
         with closing(connect(self.db)) as connection:
+            source_artifact = connection.execute(
+                """
+                SELECT sha256 FROM evidence_artifacts
+                WHERE content_id=1 AND artifact_type='media_source'
+                  AND status='available' AND processor_version=?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (media.MEDIA_SOURCE_VERSION,),
+            ).fetchone()
+            self.assertIsNotNone(source_artifact)
+            expected_source_sha = str(source_artifact["sha256"])
             connection.execute(
                 """
                 INSERT INTO media_processing_slots(
@@ -3172,9 +3191,11 @@ class LocalAnalysisCanaryControllerTest(unittest.TestCase):
                 {
                     "slot_id": 1,
                     "content_id": 1,
-                    "source_sha256": media._media_source_identity(
-                        "video", self.urls
-                    )[1],
+                    "source_sha256": canary._source_artifact_sha256(
+                        json.loads((self.run_root / "run-contract.json").read_text())[
+                            "sources"
+                        ][0]
+                    ),
                     "processor_type": "download",
                     "processor_version": media.VIDEO_DOWNLOAD_VERSION,
                     "from_attempt_count": 1,
@@ -3613,9 +3634,9 @@ class LocalAnalysisCanaryControllerTest(unittest.TestCase):
         self.assertEqual(tuple(row), ("running", 1, None))
 
     def test_real_retryable_slot_attempt_two_is_frozen_and_receipted(self) -> None:
-        self._freeze_failed_contract()
+        contract = self._freeze_failed_contract()
         (self.run_root / "state.json").unlink()
-        _, source_sha = media._media_source_identity("video", self.urls)
+        source_sha = canary._source_artifact_sha256(contract["sources"][0])
 
         def fail_download() -> Path:
             raise RuntimeError("real first download attempt failed")
@@ -3726,7 +3747,7 @@ class LocalAnalysisCanaryControllerTest(unittest.TestCase):
             ).fetchone()
         self.assertEqual(
             row["source_sha256"],
-            contract["sources"][0]["artifact_body"]["source_sha256"],
+            canary._source_artifact_sha256(contract["sources"][0]),
         )
 
         with patch.object(canary, "_process_identity", return_value=None):
@@ -4056,7 +4077,8 @@ class LocalAnalysisCanaryControllerTest(unittest.TestCase):
         self._configure_douyin_image_source([[image_urls[0]], [image_urls[1]]])
         contract = self._freeze_failed_contract()
         source = contract["sources"][0]
-        source_sha = canary._source_image_download_binding(source)
+        slot_source_sha = canary._source_artifact_sha256(source)
+        download_binding_sha = canary._source_image_download_binding(source)
         stale = (
             datetime.now(timezone.utc)
             - timedelta(seconds=media.STALE_MEDIA_SLOT_SECONDS + 10)
@@ -4067,7 +4089,7 @@ class LocalAnalysisCanaryControllerTest(unittest.TestCase):
                 "content_id,source_sha256,processor_type,processor_version,status,"
                 "attempt_count,created_at,updated_at) VALUES "
                 "(1,?,'download',?,'running',1,?,?)",
-                (source_sha, media.IMAGE_DOWNLOAD_VERSION, stale, stale),
+                (slot_source_sha, media.IMAGE_DOWNLOAD_VERSION, stale, stale),
             )
             connection.commit()
         self._finalize(self.db)
@@ -4121,7 +4143,7 @@ class LocalAnalysisCanaryControllerTest(unittest.TestCase):
             self.media_root
             / "C4N4RY"
             / "downloads"
-            / source_sha
+            / download_binding_sha
             / "images"
         )
         images_root.mkdir(parents=True)
@@ -4141,7 +4163,7 @@ class LocalAnalysisCanaryControllerTest(unittest.TestCase):
                     "source_count": len(groups),
                     "source_sha256": source["artifact_body"]["source_sha256"],
                     "image_groups_sha256": source["image_groups_sha256"],
-                    "download_binding_sha256": source_sha,
+                    "download_binding_sha256": download_binding_sha,
                     "image_paths": [media._relative(path) for path in image_paths],
                     "frames": [
                         {
