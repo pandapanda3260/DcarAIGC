@@ -150,7 +150,7 @@ publisher 在登录时启动一次、每天 09:00 启动一次，并每小时 re
 
 `daily_capture=partial` 可发布，但质量门只作为诊断，不得用来放宽上述终态、身份、新鲜度或 USD 20 预算合同。远端发布失败时保留本地快照和远端 incoming 供审计，下一次自动执行仍从全套门禁开始；成功后本地只保留最近 3 个自动快照目录。
 
-项目外配置沿用 `publisher.env.example`，权限必须是 0400 或 0600。首次安装：
+项目外配置沿用 `publisher.env.example`，权限必须是 0400 或 0600。publisher 的 SSH 私钥必须放在后台可读的项目外目录（推荐 `$HOME/Library/Application Support/DcarAIGC/credentials/`），不得放在受 TCC 限制的 `Documents`。SSH alias 必须使用该 `IdentityFile`、`IdentitiesOnly yes` 和 `IdentityAgent none`。首次安装：
 
 ```sh
 label="cn.tj.dcar.snapshot-publisher"
@@ -170,12 +170,23 @@ DCAR_LEGACY_DB="$PWD/app/data/web_mvp.sqlite3" \
 DCAR_READ_ONLY=1 DCAR_SCHEDULER_ENABLED=0 DCAR_STARTUP_CATCHUP_ENABLED=0 \
   deploy/macos/run_snapshot_publisher.sh --check
 
+# 使用与 LaunchAgent 相同的 wrapper 执行真实 SSH 只读检查；
+# 不构建快照、不 rsync、不安装、不写本地 publisher state。
+DCAR_PROJECT_ROOT="$PWD" \
+DCAR_PUBLISHER_ENV_FILE="$HOME/Library/Application Support/DcarAIGC/publisher.env" \
+DCAR_V8_DB="$PWD/app/data/dcar_insight.sqlite3" \
+DCAR_LEGACY_DB="$PWD/app/data/web_mvp.sqlite3" \
+DCAR_READ_ONLY=1 DCAR_SCHEDULER_ENABLED=0 DCAR_STARTUP_CATCHUP_ENABLED=0 \
+  deploy/macos/run_snapshot_publisher.sh --remote-check
+
 python3 deploy/macos/render_snapshot_publisher.py \
   --project-root "$PWD" --output "$plist"
 plutil -lint "$plist"
 launchctl enable "$domain/$label"
 launchctl bootstrap "$domain" "$plist"
 ```
+
+安装前的发布意图会原子写入 `snapshot-publisher-pending.json`。安装后只有远端 active receipt、snapshot ID、DB SHA、schema/runtime 和 API 全部一致才写成功回执；下一小时会自动区分“新版已健康”、“旧版已恢复”和“未知远端状态”。只有确认的安装不匹配才触发 installer rollback；SSH/远端 API 瞬时失败保留 pending，不回滚可能健康的新版。
 
 不要在安装后执行 `kickstart -k`。更新 plist 时先 `bootout`，将旧 plist 移到备份路径，再重新渲染和 bootstrap；renderer 会拒绝覆盖已有文件。验收：
 
