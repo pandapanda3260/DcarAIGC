@@ -1599,7 +1599,7 @@ class V8ReportTaskTest(unittest.TestCase):
                 """
                 INSERT INTO scheduler_runs(
                     job_id,scheduled_for,status,started_at,completed_at,details_json
-                ) VALUES ('daily_capture','2026-07-03T18:00:00Z','failed',
+                ) VALUES ('daily_capture','2026-07-03T18:00:00Z','partial',
                           '2026-07-03T18:00:00Z','2026-07-03T19:00:00Z',?)
                 """,
                 (json.dumps(receipt, ensure_ascii=False, sort_keys=True),),
@@ -1689,6 +1689,55 @@ class V8ReportTaskTest(unittest.TestCase):
             ["eligible_identity_occurrence_count"],
             4,
         )
+
+    def test_pipeline_observation_uses_first_scheduled_attempt_and_valid_receipts(
+        self,
+    ) -> None:
+        empty_receipt = json.dumps(
+            {"monitored_accounts": 0, "discovery": []}, sort_keys=True
+        )
+        with connect(self.db) as connection:
+            run_id = int(
+                connection.execute(
+                    """
+                    INSERT INTO scheduler_runs(
+                        job_id,scheduled_for,status,started_at,completed_at,details_json
+                    ) VALUES ('daily_capture','2026-08-21T18:00:00Z','partial',
+                              '2026-08-21T18:00:00Z','2026-08-21T19:00:00Z',?)
+                    """,
+                    (empty_receipt,),
+                ).lastrowid
+            )
+            connection.execute(
+                """
+                INSERT INTO scheduler_run_attempts(
+                    scheduler_run_id,attempt_number,invocation_source,status,
+                    started_at,completed_at,details_json
+                ) VALUES (?,1,'scheduled','partial',
+                          '2026-08-21T18:00:00Z','2026-08-21T19:00:00Z','{}')
+                """,
+                (run_id,),
+            )
+            connection.execute(
+                """
+                INSERT INTO scheduler_runs(
+                    job_id,scheduled_for,status,started_at,completed_at,details_json
+                ) VALUES ('daily_capture','2026-08-22T18:00:00Z','failed',
+                          '2026-08-22T18:00:00Z','2026-08-22T19:00:00Z',?)
+                """,
+                (empty_receipt,),
+            )
+            connection.commit()
+            detail = reports_module._pipeline_observation_detail(
+                connection,
+                {"period_start": "2026-08-20", "period_end": "2026-08-22"},
+                generated_at="2026-08-23T00:00:00Z",
+            )
+        self.assertEqual(detail["capture_observation_start_date"], "2026-08-21")
+        self.assertEqual(detail["legacy_unobserved_dates"], ["2026-08-20"])
+        self.assertEqual(detail["zero_content_dates"], ["2026-08-21"])
+        self.assertEqual(detail["pipeline_gap_dates"], ["2026-08-22"])
+        self.assertEqual(detail["status"], "incomplete")
 
     def test_discovery_receipt_rejects_invalid_terminal_or_roster(self) -> None:
         invalid_terminal = reports_module._parse_daily_capture_receipt(

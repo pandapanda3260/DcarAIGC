@@ -14,6 +14,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 import v8.capture as capture_module
 from v8.capture import CaptureError, ProviderResult
+from v8.duplicates import FINGERPRINT_VERSION
 from v8.matcher_dsl import POINT_IDS, POINT_SCENES
 from v8.media_state import MediaTerminalDetail
 from v8.operations import IdentityConflictError, upsert_account
@@ -26,6 +27,7 @@ from v8.scheduler import (
     _claim_run,
     _daily_media_cohort,
     _finish_run,
+    _report_catchup_occurrences,
     _select_due_capture_contents,
     current_day_daily_capture_guard,
     current_day_pipeline_guard,
@@ -1131,7 +1133,7 @@ class V8SchedulerTest(unittest.TestCase):
         second = execute_job(
             "daily_report", occurrence, db_path=self.db, reports_root=self.reports
         )
-        self.assertEqual(first["status"], "succeeded")
+        self.assertEqual(first["status"], "partial")
         self.assertEqual(second["status"], "skipped_duplicate")
         with connect(self.db) as connection:
             task = connection.execute("SELECT * FROM report_tasks").fetchone()
@@ -1198,7 +1200,109 @@ class V8SchedulerTest(unittest.TestCase):
         completed = execute_job(
             "daily_report", occurrence, db_path=self.db, reports_root=self.reports
         )
-        self.assertEqual(completed["status"], "succeeded")
+        self.assertEqual(completed["status"], "partial")
+
+    def test_weekly_report_defers_before_claim_until_sunday_daily_is_terminal(
+        self,
+    ) -> None:
+        occurrence = datetime(2026, 8, 24, 8, 30, tzinfo=SHANGHAI)
+        deferred = execute_job(
+            "weekly_report",
+            occurrence,
+            db_path=self.db,
+            reports_root=self.reports,
+            allow_retry=True,
+            invocation_source="startup_report_catchup",
+        )
+        self.assertEqual(deferred["status"], "deferred")
+        self.assertEqual(deferred["reason"], "weekly_daily_dependency_not_ready")
+        with connect(self.db) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM scheduler_runs").fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM scheduler_run_attempts"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM report_tasks").fetchone()[0],
+                0,
+            )
+            connection.execute(
+                """
+                INSERT INTO scheduler_runs(
+                    job_id,scheduled_for,status,started_at,completed_at,details_json
+                ) VALUES ('daily_report','2026-08-24T00:00:00Z','partial',
+                          '2026-08-24T00:00:00Z','2026-08-24T00:05:00Z','{}')
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO report_tasks(
+                    id,task_type,name,period_start,period_end,creation_source,
+                    task_status,progress,message,created_at,started_at,completed_at,updated_at
+                ) VALUES ('D8-D-20260823-20260823','daily','2026-08-23 日报',
+                          '2026-08-23','2026-08-23','automatic','partial',100,'完成',
+                          '2026-08-24T00:00:00Z','2026-08-24T00:00:00Z',
+                          '2026-08-24T00:05:00Z','2026-08-24T00:05:00Z')
+                """
+            )
+            connection.commit()
+        with patch(
+            "v8.scheduler._run_job_action",
+            return_value=("partial", {"task_id": "weekly", "task_status": "partial"}),
+        ):
+            completed = execute_job(
+                "weekly_report",
+                occurrence,
+                db_path=self.db,
+                reports_root=self.reports,
+                allow_retry=True,
+                invocation_source="startup_report_catchup",
+            )
+        self.assertEqual(completed["status"], "partial")
+
+    def test_report_catchup_enumerates_natural_days_from_scheduled_capture(
+        self,
+    ) -> None:
+        with connect(self.db) as connection:
+            run_id = int(
+                connection.execute(
+                    """
+                    INSERT INTO scheduler_runs(
+                        job_id,scheduled_for,status,started_at,completed_at,details_json
+                    ) VALUES ('daily_capture','2026-08-21T18:00:00Z','interrupted',
+                              '2026-08-21T18:00:00Z','2026-08-21T18:05:00Z','{}')
+                    """
+                ).lastrowid
+            )
+            connection.execute(
+                """
+                INSERT INTO scheduler_run_attempts(
+                    scheduler_run_id,attempt_number,invocation_source,status,
+                    started_at,completed_at,details_json
+                ) VALUES (?,1,'scheduled','interrupted',
+                          '2026-08-21T18:00:00Z','2026-08-21T18:05:00Z','{}')
+                """,
+                (run_id,),
+            )
+            connection.commit()
+        occurrences = _report_catchup_occurrences(
+            current=datetime(2026, 8, 24, 9, 0, tzinfo=SHANGHAI),
+            db_path=self.db,
+        )
+        self.assertEqual(
+            [(job_id, occurrence.isoformat()) for job_id, occurrence in occurrences],
+            [
+                ("daily_report", "2026-08-22T08:00:00+08:00"),
+                ("daily_report", "2026-08-23T08:00:00+08:00"),
+                ("daily_report", "2026-08-24T08:00:00+08:00"),
+                ("weekly_report", "2026-08-24T08:30:00+08:00"),
+            ],
+        )
 
     def test_second_report_guard_fails_before_task_creation(self) -> None:
         occurrence = datetime(2026, 8, 3, 8, 0, tzinfo=SHANGHAI)
@@ -1794,6 +1898,87 @@ class V8SchedulerTest(unittest.TestCase):
         processing.assert_not_called()
         cutoff.assert_not_called()
 
+    def test_report_reconcile_revises_terminal_report_for_new_duplicate_input(
+        self,
+    ) -> None:
+        occurrence = datetime(2026, 8, 2, 8, 0, tzinfo=SHANGHAI)
+        first = execute_job(
+            "daily_report", occurrence, db_path=self.db, reports_root=self.reports
+        )
+        self.assertEqual(first["status"], "partial")
+        with connect(self.db) as connection:
+            connection.execute(
+                """
+                UPDATE scheduler_runs
+                SET started_at='2026-08-02T00:00:00Z',
+                    completed_at='2026-08-02T00:10:00Z'
+                WHERE job_id='daily_report' AND scheduled_for='2026-08-02T00:00:00Z'
+                """
+            )
+            connection.execute(
+                """
+                UPDATE report_tasks
+                SET started_at='2026-08-02T00:00:00Z',
+                    completed_at='2026-08-02T00:09:00Z',
+                    updated_at='2026-08-02T00:09:00Z'
+                WHERE id='D8-D-20260801-20260801'
+                """
+            )
+            content_id = int(
+                connection.execute(
+                    """
+                    INSERT INTO content_items(
+                        link_id,platform,platform_content_id,canonical_url,content_type,
+                        published_at,imported_at,created_at,updated_at
+                    ) VALUES ('STALE1','douyin','stale-01',
+                              'https://www.douyin.com/video/stale-01','video',
+                              '2026-08-01T01:00:00Z','2026-08-03T00:00:00Z',
+                              '2026-08-03T00:00:00Z','2026-08-03T00:00:00Z')
+                    """
+                ).lastrowid
+            )
+            connection.execute(
+                """
+                INSERT INTO duplicate_fingerprints(
+                    content_id,fingerprint_version,source_sha256,text_sha256,
+                    media_sha256_json,frame_phashes_json,text_char_count,
+                    asr_char_count,ocr_char_count,payload_json,created_at
+                ) VALUES (?,?,?,'', '[]','[]',0,0,0,'{}','2026-08-03T00:00:00Z')
+                """,
+                (content_id, FINGERPRINT_VERSION, "a" * 64),
+            )
+            connection.commit()
+
+        results = startup_catchup(
+            now=datetime(2026, 8, 3, 9, 0, tzinfo=SHANGHAI),
+            db_path=self.db,
+            reports_root=self.reports,
+        )
+        daily = [item for item in results if item["job_id"] == "daily_report"]
+        self.assertEqual(
+            [(item["status"], item["attempt_number"]) for item in daily],
+            [("partial", 2)],
+        )
+        with connect(self.db) as connection:
+            revisions = connection.execute(
+                """
+                SELECT revision,report_json_path FROM report_revisions
+                WHERE task_id='D8-D-20260801-20260801' ORDER BY revision
+                """
+            ).fetchall()
+        self.assertEqual([int(row["revision"]) for row in revisions], [1, 2])
+        revised = json.loads(
+            (PROJECT_ROOT / str(revisions[-1]["report_json_path"])).read_text()
+        )
+        self.assertEqual(revised["summary_metrics"]["publication_count"]["value"], 1)
+
+        second = startup_catchup(
+            now=datetime(2026, 8, 3, 10, 0, tzinfo=SHANGHAI),
+            db_path=self.db,
+            reports_root=self.reports,
+        )
+        self.assertFalse(any(item["job_id"] == "daily_report" for item in second))
+
     def test_missing_august_fifth_and_seventh_reports_are_partial_once(self) -> None:
         from v8.reports import create_task, get_task
 
@@ -1850,7 +2035,7 @@ class V8SchedulerTest(unittest.TestCase):
         weekly = [item for item in first if item["job_id"] == "weekly_report"]
         self.assertEqual(
             [(item["scheduled_for"], item["status"]) for item in weekly],
-            [("2026-08-10T00:30:00Z", "partial")],
+            [("2026-08-10T00:30:00Z", "deferred")],
         )
         for task_id in ("D8-D-20260805-20260805", "D8-D-20260807-20260807"):
             task = get_task(task_id, db_path=self.db)
@@ -1861,7 +2046,10 @@ class V8SchedulerTest(unittest.TestCase):
             db_path=self.db,
             reports_root=self.reports,
         )
-        self.assertEqual(second, [])
+        self.assertEqual(
+            [(item["job_id"], item["status"]) for item in second],
+            [("weekly_report", "deferred")],
+        )
         for task_id in ("D8-D-20260805-20260805", "D8-D-20260807-20260807"):
             self.assertEqual(len(get_task(task_id, db_path=self.db)["revisions"]), 1)
 

@@ -464,6 +464,37 @@ class V8ContractTest(unittest.TestCase):
                     ],
                 )
 
+    def test_optional_pipeline_observation_gaps_force_partial(self) -> None:
+        report = valid_report()
+        report["data_quality_details"]["pipeline_observation"] = {
+            "status": "incomplete",
+            "capture_observation_start_date": "2026-08-21",
+            "expected_dates": ["2026-08-20", "2026-08-21"],
+            "legacy_unobserved_dates": ["2026-08-20"],
+            "pipeline_gap_dates": [],
+            "zero_content_dates": ["2026-08-21"],
+        }
+        report["task"]["task_status"] = "partial"
+        validate_report(report)
+        self.assertEqual(
+            expected_terminal_task_status(
+                report["data_quality"],
+                data_quality_details=report["data_quality_details"],
+            ),
+            "partial",
+        )
+        self.assertIn(
+            "pipeline_observation",
+            {
+                failure["key"]
+                for failure in quality_gate_failures(
+                    report["data_quality"],
+                    data_quality_details=report["data_quality_details"],
+                )
+            },
+        )
+        validate_report(valid_report())
+
     def test_structured_discovery_controls_task_status_at_ninety_percent(self) -> None:
         report = valid_report()
         report["data_quality"]["discovery_coverage"] = 89.0

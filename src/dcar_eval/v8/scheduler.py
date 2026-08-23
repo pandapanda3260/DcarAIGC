@@ -22,7 +22,11 @@ from apscheduler.triggers.interval import (  # type: ignore[import-untyped]
 
 from .capture import ProviderResult, ensure_content_slot
 from .contracts import load_contract
-from .duplicates import run_duplicate_fingerprint_queue
+from .duplicates import (
+    FINGERPRINT_VERSION,
+    RELATION_METHOD,
+    run_duplicate_fingerprint_queue,
+)
 from .evaluation import evaluate_content
 from .media import (
     MEDIA_QUEUE_BATCH_LIMIT,
@@ -34,6 +38,7 @@ from .providers import STAGE_CONFIG, discover_account_content, update_content_da
 from .reports import (
     REPORTS_ROOT,
     ReportTaskError,
+    _automatic_capture_observation_start_date,
     assert_report_runtime_ready,
     create_and_run_task,
     create_task,
@@ -208,6 +213,46 @@ def _stale_retry_started_at(value: Any) -> Optional[datetime]:
 def _require_report_job_runtime_ready(*, db_path: Path) -> Dict[str, Any]:
     with connect(db_path) as connection:
         return assert_report_runtime_ready(connection)
+
+
+def _weekly_daily_dependency(
+    scheduled_for: datetime, *, db_path: Path
+) -> Dict[str, Any]:
+    report_day = scheduled_for.astimezone(SHANGHAI).date() - timedelta(days=1)
+    daily_occurrence = datetime.combine(
+        report_day + timedelta(days=1), time(8, 0), SHANGHAI
+    )
+    with connect(db_path) as connection:
+        run = connection.execute(
+            """
+            SELECT status,completed_at FROM scheduler_runs
+            WHERE job_id='daily_report' AND scheduled_for=?
+            """,
+            (_scheduled_iso(daily_occurrence),),
+        ).fetchone()
+        task = connection.execute(
+            """
+            SELECT task_status,completed_at FROM report_tasks
+            WHERE task_type='daily' AND period_start=? AND period_end=?
+              AND creation_source='automatic'
+            """,
+            (report_day.isoformat(), report_day.isoformat()),
+        ).fetchone()
+    ready = bool(
+        run is not None
+        and str(run["status"]) in {"succeeded", "partial"}
+        and run["completed_at"]
+        and task is not None
+        and str(task["task_status"]) in {"succeeded", "partial"}
+        and task["completed_at"]
+    )
+    return {
+        "ready": ready,
+        "report_day": report_day.isoformat(),
+        "daily_scheduled_for": _scheduled_iso(daily_occurrence),
+        "daily_run_status": None if run is None else str(run["status"]),
+        "daily_task_status": None if task is None else str(task["task_status"]),
+    }
 
 
 def _scheduled_iso(value: datetime) -> str:
@@ -2015,6 +2060,15 @@ def execute_job(
             raise SchedulerJobError(
                 "terminal downstream retry requires allow_retry=True"
             )
+    if job_id == "weekly_report":
+        dependency = _weekly_daily_dependency(scheduled_for, db_path=db_path)
+        if not dependency["ready"]:
+            return {
+                "job_id": job_id,
+                "status": "deferred",
+                "reason": "weekly_daily_dependency_not_ready",
+                "dependency": dependency,
+            }
     if job_id in REPORT_JOB_IDS:
         try:
             _require_report_job_runtime_ready(db_path=db_path)
@@ -2224,10 +2278,101 @@ def _report_occurrence(
     raise SchedulerJobError(f"not a report job: {job_id}")
 
 
+def _report_period(job_id: str, occurrence: datetime) -> tuple[date, date]:
+    end = occurrence.astimezone(SHANGHAI).date() - timedelta(days=1)
+    if job_id == "daily_report":
+        return end, end
+    if job_id == "weekly_report":
+        return end - timedelta(days=6), end
+    raise SchedulerJobError(f"not a report job: {job_id}")
+
+
+def _report_duplicate_input_retry_before(
+    job_id: str, occurrence: datetime, *, db_path: Path
+) -> Optional[datetime]:
+    period_start, period_end = _report_period(job_id, occurrence)
+    start_utc = datetime.combine(period_start, time.min, SHANGHAI).astimezone(
+        timezone.utc
+    )
+    end_utc = datetime.combine(
+        period_end + timedelta(days=1), time.min, SHANGHAI
+    ).astimezone(timezone.utc)
+    start_key = _scheduled_iso(start_utc)
+    end_key = _scheduled_iso(end_utc)
+    with connect(db_path) as connection:
+        run = connection.execute(
+            """
+            SELECT status,completed_at FROM scheduler_runs
+            WHERE job_id=? AND scheduled_for=?
+            """,
+            (job_id, _scheduled_iso(occurrence)),
+        ).fetchone()
+        task_type = "daily" if job_id == "daily_report" else "weekly"
+        task = connection.execute(
+            """
+            SELECT task_status,completed_at FROM report_tasks
+            WHERE task_type=? AND period_start=? AND period_end=?
+              AND creation_source='automatic'
+            """,
+            (task_type, period_start.isoformat(), period_end.isoformat()),
+        ).fetchone()
+        watermark = connection.execute(
+            """
+            SELECT MAX(changed_at) FROM (
+                SELECT df.created_at AS changed_at
+                FROM duplicate_fingerprints df
+                JOIN content_items c ON c.id=df.content_id
+                WHERE df.fingerprint_version=?
+                  AND c.published_at>=? AND c.published_at<?
+                UNION ALL
+                SELECT dr.created_at AS changed_at
+                FROM duplicate_relations dr
+                JOIN content_items c ON c.id=dr.duplicate_content_id
+                WHERE dr.method=?
+                  AND c.published_at>=? AND c.published_at<?
+            )
+            """,
+            (
+                FINGERPRINT_VERSION,
+                start_key,
+                end_key,
+                RELATION_METHOD,
+                start_key,
+                end_key,
+            ),
+        ).fetchone()[0]
+    if (
+        run is None
+        or str(run["status"]) not in TERMINAL_RUN_STATUSES
+        or not run["completed_at"]
+        or task is None
+        or str(task["task_status"]) not in {"succeeded", "partial"}
+        or not task["completed_at"]
+        or watermark is None
+    ):
+        return None
+
+    def parse_utc(value: Any, label: str) -> datetime:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise SchedulerJobError(f"invalid {label}: {value}") from exc
+        if parsed.tzinfo is None:
+            raise SchedulerJobError(f"{label} must include timezone")
+        return parsed.astimezone(timezone.utc)
+
+    watermark_at = parse_utc(watermark, "duplicate input watermark")
+    task_completed_at = parse_utc(task["completed_at"], "report task completed_at")
+    if watermark_at <= task_completed_at:
+        return None
+    run_completed_at = parse_utc(run["completed_at"], "report run completed_at")
+    return max(watermark_at, run_completed_at + timedelta(seconds=1))
+
+
 def _report_catchup_occurrences(
     *, current: datetime, db_path: Path
 ) -> List[tuple[str, datetime]]:
-    """Return every due failed/interrupted or content-backed missing report slot."""
+    """Return due failed/interrupted and natural-day missing report slots."""
 
     current = current.astimezone(SHANGHAI)
     candidates: set[tuple[str, datetime]] = set()
@@ -2253,8 +2398,8 @@ def _report_catchup_occurrences(
             ORDER BY period_start,period_end
             """
         ).fetchall()
-        daily_anchor: Optional[date] = None
-        weekly_anchor: Optional[date] = None
+        observation_anchor = _automatic_capture_observation_start_date(connection)
+        daily_anchor: Optional[date] = observation_anchor
         for task in automatic_tasks:
             task_type = str(task["task_type"])
             start = date.fromisoformat(str(task["period_start"]))
@@ -2265,32 +2410,14 @@ def _report_catchup_occurrences(
             )
             if occurrence <= current:
                 candidates.add((job_id, occurrence))
-            if task_type == "daily" and (daily_anchor is None or start < daily_anchor):
+            if task_type == "daily" and daily_anchor is None:
                 daily_anchor = start
-            if task_type == "weekly" and (
-                weekly_anchor is None or start < weekly_anchor
-            ):
-                weekly_anchor = start
 
         latest_daily = latest_occurrence(
             next(job for job in JOBS if job.job_id == "daily_report"), current
         )
         if daily_anchor is None:
             daily_anchor = latest_daily.date() - timedelta(days=1)
-        content_days = [
-            date.fromisoformat(str(row["report_day"]))
-            for row in connection.execute(
-                """
-                SELECT DISTINCT date(datetime(published_at), '+8 hours') report_day
-                FROM content_items
-                WHERE published_at IS NOT NULL
-                  AND date(datetime(published_at), '+8 hours')>=?
-                ORDER BY report_day
-                """,
-                (daily_anchor.isoformat(),),
-            )
-            if row["report_day"] is not None
-        ]
         existing = {
             (str(row["job_id"]), str(row["scheduled_for"]))
             for row in connection.execute(
@@ -2300,7 +2427,29 @@ def _report_catchup_occurrences(
                 """
             )
         }
-        for report_day in content_days:
+        if observation_anchor is not None:
+            report_days: List[date] = []
+            report_day = daily_anchor
+            latest_report_day = latest_daily.date() - timedelta(days=1)
+            while report_day <= latest_report_day:
+                report_days.append(report_day)
+                report_day += timedelta(days=1)
+        else:
+            report_days = [
+                date.fromisoformat(str(row["report_day"]))
+                for row in connection.execute(
+                    """
+                    SELECT DISTINCT date(datetime(published_at), '+8 hours') report_day
+                    FROM content_items
+                    WHERE published_at IS NOT NULL
+                      AND date(datetime(published_at), '+8 hours')>=?
+                    ORDER BY report_day
+                    """,
+                    (daily_anchor.isoformat(),),
+                )
+                if row["report_day"] is not None
+            ]
+        for report_day in report_days:
             occurrence = _report_occurrence(
                 "daily_report", period_start=report_day, period_end=report_day
             )
@@ -2310,26 +2459,33 @@ def _report_catchup_occurrences(
             ):
                 candidates.add(("daily_report", occurrence))
 
-        if weekly_anchor is None:
-            weekly_anchor = daily_anchor + timedelta(
-                days=(-daily_anchor.weekday()) % 7
+        if observation_anchor is not None:
+            week_starts = []
+            week_start = daily_anchor - timedelta(days=daily_anchor.weekday())
+            while _report_occurrence(
+                "weekly_report",
+                period_start=week_start,
+                period_end=week_start + timedelta(days=6),
+            ) <= current:
+                week_starts.append(week_start)
+                week_start += timedelta(days=7)
+        else:
+            week_starts = sorted(
+                {
+                    report_day - timedelta(days=report_day.weekday())
+                    for report_day in report_days
+                }
             )
-        if weekly_anchor is not None:
-            weeks = {
-                report_day - timedelta(days=report_day.weekday())
-                for report_day in content_days
-                if report_day >= weekly_anchor
-            }
-            for week_start in weeks:
-                week_end = week_start + timedelta(days=6)
-                occurrence = _report_occurrence(
-                    "weekly_report", period_start=week_start, period_end=week_end
-                )
-                if (
-                    occurrence <= current
-                    and ("weekly_report", _scheduled_iso(occurrence)) not in existing
-                ):
-                    candidates.add(("weekly_report", occurrence))
+        for week_start in week_starts:
+            week_end = week_start + timedelta(days=6)
+            occurrence = _report_occurrence(
+                "weekly_report", period_start=week_start, period_end=week_end
+            )
+            if (
+                occurrence <= current
+                and ("weekly_report", _scheduled_iso(occurrence)) not in existing
+            ):
+                candidates.add(("weekly_report", occurrence))
 
     terminal: set[tuple[str, str]] = set()
     with connect(db_path) as connection:
@@ -2343,11 +2499,24 @@ def _report_catchup_occurrences(
                 """
             )
         }
+    stale_terminal: set[tuple[str, str]] = set()
+    for job_id, scheduled_for in terminal:
+        occurrence = datetime.fromisoformat(
+            scheduled_for.replace("Z", "+00:00")
+        ).astimezone(SHANGHAI)
+        if occurrence > current:
+            continue
+        if _report_duplicate_input_retry_before(
+            job_id, occurrence, db_path=db_path
+        ) is not None:
+            candidates.add((job_id, occurrence))
+            stale_terminal.add((job_id, scheduled_for))
     return sorted(
         (
             (job_id, occurrence)
             for job_id, occurrence in candidates
             if (job_id, _scheduled_iso(occurrence)) not in terminal
+            or (job_id, _scheduled_iso(occurrence)) in stale_terminal
         ),
         key=lambda item: (item[1], item[0]),
     )
@@ -2367,6 +2536,11 @@ def startup_catchup(
         current=current, db_path=db_path
     ):
         try:
+            retry_terminal_if_completed_before = (
+                _report_duplicate_input_retry_before(
+                    job_id, occurrence, db_path=db_path
+                )
+            )
             result = execute_job(
                 job_id,
                 occurrence,
@@ -2374,6 +2548,7 @@ def startup_catchup(
                 reports_root=reports_root,
                 allow_retry=True,
                 invocation_source="startup_report_catchup",
+                retry_terminal_if_completed_before=retry_terminal_if_completed_before,
             )
             result["scheduled_for"] = _scheduled_iso(occurrence)
             results.append(result)

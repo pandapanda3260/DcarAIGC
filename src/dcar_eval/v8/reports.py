@@ -73,6 +73,7 @@ _QUALITY_GATE_LABELS = {
     "duplicate_fingerprint_coverage": "重复内容识别完成率",
     "weekly_comment_coverage": "评论采集完成率",
     "duplicate_calibration_ready": "重复内容规则校验",
+    "pipeline_observation": "每日抓取观测完整度",
 }
 
 _TASK_STATUS_LABELS = {
@@ -617,7 +618,7 @@ def _snapshot_task_contents(connection, task: Mapping[str, Any]) -> None:
             "SELECT COUNT(*) FROM task_contents WHERE task_id=?", (task["id"],)
         ).fetchone()[0]
     )
-    if existing:
+    if existing and str(task["creation_source"]) != "automatic":
         return
     start_utc, end_utc = period_bounds(
         str(task["period_start"]), str(task["period_end"])
@@ -634,6 +635,8 @@ def _snapshot_task_contents(connection, task: Mapping[str, Any]) -> None:
             """
             INSERT INTO task_contents(task_id, content_id, inclusion_status, reason)
             VALUES (?, ?, 'included', '发布日期位于任务自然日边界内')
+            ON CONFLICT(task_id,content_id) DO UPDATE SET
+                inclusion_status='included',reason=excluded.reason
             """,
             (task["id"], row["id"]),
         )
@@ -645,6 +648,7 @@ def _snapshot_task_contents(connection, task: Mapping[str, Any]) -> None:
             """
             INSERT INTO task_contents(task_id, content_id, inclusion_status, reason)
             VALUES (?, ?, 'excluded_missing_boundary', '发布日期缺失，不能归入报告区间')
+            ON CONFLICT(task_id,content_id) DO NOTHING
             """,
             (task["id"], row["id"]),
         )
@@ -794,20 +798,26 @@ def _parse_daily_capture_receipt(details_json: str) -> Dict[str, Any]:
     try:
         details = json.loads(details_json)
     except (TypeError, json.JSONDecodeError):
-        details = {}
-    if not isinstance(details, Mapping):
+        details = None
+    details_valid = isinstance(details, Mapping)
+    if not details_valid:
         details = {}
     monitored_value = details.get("monitored_accounts")
-    monitored_accounts = (
+    monitored_valid = (
         int(monitored_value)
         if isinstance(monitored_value, int)
         and not isinstance(monitored_value, bool)
         and monitored_value >= 0
-        else 0
+        else None
     )
+    monitored_accounts = monitored_valid or 0
     discovery = details.get("discovery")
     rows = discovery if isinstance(discovery, list) else []
+    discovery_valid = isinstance(discovery, list) and all(
+        isinstance(item, Mapping) for item in discovery
+    )
     by_identity: Dict[tuple[int, str], List[Mapping[str, Any]]] = {}
+    discovered_content_count = 0
     for item in rows:
         if not isinstance(item, Mapping):
             continue
@@ -820,6 +830,20 @@ def _parse_daily_capture_receipt(details_json: str) -> Dict[str, Any]:
         ):
             continue
         by_identity.setdefault((account_id, str(platform)), []).append(item)
+        for key in ("inserted", "updated"):
+            value = item.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                discovered_content_count += value
+    content_count_observed = all(
+        all(
+            isinstance(item.get(key), int)
+            and not isinstance(item.get(key), bool)
+            and int(item[key]) >= 0
+            for key in ("inserted", "updated")
+        )
+        for item in rows
+        if isinstance(item, Mapping)
+    )
 
     successful: set[tuple[int, str]] = set()
     for identity, items in by_identity.items():
@@ -866,30 +890,127 @@ def _parse_daily_capture_receipt(details_json: str) -> Dict[str, Any]:
             successful.add(identity)
     roster_count = len(by_identity)
     roster_matches_monitored = roster_count == monitored_accounts
+    receipt_valid = bool(
+        details_valid
+        and monitored_valid is not None
+        and discovery_valid
+        and roster_matches_monitored
+        and all(len(items) == 1 for items in by_identity.values())
+    )
+    fully_observed = receipt_valid and len(successful) == monitored_accounts
     return {
+        "valid": receipt_valid,
         "covered": len(successful) if roster_matches_monitored else 0,
         "expected": max(monitored_accounts, roster_count),
         "roster_count": roster_count,
         "roster_matches_monitored": roster_matches_monitored,
+        "fully_observed": fully_observed,
+        "discovered_content_count": discovered_content_count,
+        "empty_discovery": (
+            fully_observed and content_count_observed and discovered_content_count == 0
+        ),
     }
+
+
+def _automatic_capture_observation_start_date(
+    connection, *, generated_at: Optional[str] = None
+) -> Optional[date]:
+    parameters: List[Any] = []
+    generated_filter = ""
+    if generated_at is not None:
+        generated_filter = " AND julianday(sra.started_at)<=julianday(?)"
+        parameters.append(generated_at)
+    row = connection.execute(
+        f"""
+        SELECT sr.scheduled_for
+        FROM scheduler_run_attempts sra
+        JOIN scheduler_runs sr ON sr.id=sra.scheduler_run_id
+        WHERE sr.job_id='daily_capture'
+          AND sra.invocation_source='scheduled'
+          {generated_filter}
+        ORDER BY sr.scheduled_for,sra.attempt_number
+        LIMIT 1
+        """,
+        parameters,
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        occurrence = datetime.fromisoformat(
+            str(row["scheduled_for"]).replace("Z", "+00:00")
+        )
+    except ValueError as exc:
+        raise ReportTaskError("scheduled daily capture occurrence is invalid") from exc
+    if occurrence.tzinfo is None:
+        raise ReportTaskError("scheduled daily capture occurrence lacks timezone")
+    return occurrence.astimezone(SHANGHAI).date() - timedelta(days=1)
 
 
 def _daily_capture_receipts(
     connection, *, generated_at: str
 ) -> Dict[str, Dict[str, Any]]:
-    return {
-        str(row["scheduled_for"]): _parse_daily_capture_receipt(
-            str(row["details_json"] or "{}")
-        )
-        for row in connection.execute(
+    receipts: Dict[str, Dict[str, Any]] = {}
+    for row in connection.execute(
             """
-            SELECT scheduled_for,details_json FROM scheduler_runs
+            SELECT scheduled_for,status,details_json FROM scheduler_runs
             WHERE job_id='daily_capture' AND completed_at IS NOT NULL
+              AND status IN ('succeeded','partial')
               AND julianday(completed_at)<=julianday(?)
             ORDER BY scheduled_for
             """,
             (generated_at,),
-        ).fetchall()
+        ).fetchall():
+        receipt = _parse_daily_capture_receipt(str(row["details_json"] or "{}"))
+        if receipt["valid"]:
+            receipts[str(row["scheduled_for"])] = receipt
+    return receipts
+
+
+def _pipeline_observation_detail(
+    connection,
+    task: Mapping[str, Any],
+    *,
+    generated_at: str,
+    receipts: Optional[Mapping[str, Mapping[str, Any]]] = None,
+) -> Dict[str, Any]:
+    start = _date(str(task["period_start"]))
+    end = _date(str(task["period_end"]))
+    observation_start = _automatic_capture_observation_start_date(
+        connection, generated_at=generated_at
+    )
+    capture_receipts = receipts or _daily_capture_receipts(
+        connection, generated_at=generated_at
+    )
+    expected_dates: List[str] = []
+    legacy_unobserved_dates: List[str] = []
+    pipeline_gap_dates: List[str] = []
+    zero_content_dates: List[str] = []
+    current = start
+    while current <= end:
+        day = current.isoformat()
+        expected_dates.append(day)
+        receipt = capture_receipts.get(_daily_capture_occurrence_for(current))
+        if receipt is None:
+            if observation_start is None or current < observation_start:
+                legacy_unobserved_dates.append(day)
+            else:
+                pipeline_gap_dates.append(day)
+        elif bool(receipt.get("empty_discovery")):
+            zero_content_dates.append(day)
+        current += timedelta(days=1)
+    return {
+        "status": (
+            "complete"
+            if not legacy_unobserved_dates and not pipeline_gap_dates
+            else "incomplete"
+        ),
+        "capture_observation_start_date": (
+            observation_start.isoformat() if observation_start is not None else None
+        ),
+        "expected_dates": expected_dates,
+        "legacy_unobserved_dates": legacy_unobserved_dates,
+        "pipeline_gap_dates": pipeline_gap_dates,
+        "zero_content_dates": zero_content_dates,
     }
 
 
@@ -1091,6 +1212,11 @@ def _build_report_data(
         generated_at=generated_at,
         minimum_percentage=float(discovery_contract["minimum_percentage"]),
     )
+    pipeline_observation = _pipeline_observation_detail(
+        connection,
+        task,
+        generated_at=generated_at,
+    )
     freshness_detail = _metric_freshness_detail(
         connection,
         ids,
@@ -1261,6 +1387,7 @@ def _build_report_data(
         data_quality_details={
             "discovery_coverage": discovery_detail,
             "metrics_freshness": freshness_detail,
+            "pipeline_observation": pipeline_observation,
         },
         enforce_boolean_quality_gates=bool(total),
     )
@@ -1499,6 +1626,7 @@ def _build_report_data(
         "data_quality_details": {
             "discovery_coverage": discovery_detail,
             "metrics_freshness": freshness_detail,
+            "pipeline_observation": pipeline_observation,
         },
         "summary_metrics": {
             "publication_count": quantity_metric(
@@ -1735,6 +1863,11 @@ def _markdown(report: Mapping[str, Any]) -> str:
         if isinstance(quality_details, Mapping)
         else None
     )
+    pipeline_observation = (
+        quality_details.get("pipeline_observation")
+        if isinstance(quality_details, Mapping)
+        else None
+    )
     for key, value in report["data_quality"].items():
         if key == "discovery_coverage" and isinstance(discovery_detail, Mapping):
             if discovery_detail.get("status") == "not_applicable":
@@ -1766,6 +1899,15 @@ def _markdown(report: Mapping[str, Any]) -> str:
             lines.append(f"- {_QUALITY_GATE_LABELS.get(key, '其他数据检查')}: 无适用内容")
         else:
             lines.append(f"- {_QUALITY_GATE_LABELS.get(key, '其他数据检查')}: {value}%")
+    if isinstance(pipeline_observation, Mapping):
+        legacy_dates = list(pipeline_observation.get("legacy_unobserved_dates") or [])
+        gap_dates = list(pipeline_observation.get("pipeline_gap_dates") or [])
+        if legacy_dates:
+            lines.append("- 自动抓取启用前未观测日期：" + "、".join(map(str, legacy_dates)))
+        if gap_dates:
+            lines.append("- 自动抓取流程缺口日期：" + "、".join(map(str, gap_dates)))
+        if not legacy_dates and not gap_dates:
+            lines.append("- 每日抓取观测完整度：通过")
     lines.extend(
         ["", "系统目前没有可靠的业务预估模型，因此不会生成推测值。", ""]
     )

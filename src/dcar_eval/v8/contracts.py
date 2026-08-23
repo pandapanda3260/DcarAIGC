@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
@@ -206,6 +206,37 @@ def quality_gate_failures(
                 }
             )
     details = data_quality_details or {}
+    pipeline_observation = (
+        details.get("pipeline_observation")
+        if isinstance(details, Mapping)
+        else None
+    )
+    if pipeline_observation is not None:
+        legacy_gaps = (
+            pipeline_observation.get("legacy_unobserved_dates")
+            if isinstance(pipeline_observation, Mapping)
+            else None
+        )
+        pipeline_gaps = (
+            pipeline_observation.get("pipeline_gap_dates")
+            if isinstance(pipeline_observation, Mapping)
+            else None
+        )
+        complete = (
+            isinstance(legacy_gaps, list)
+            and isinstance(pipeline_gaps, list)
+            and not legacy_gaps
+            and not pipeline_gaps
+        )
+        if not complete:
+            failures.append(
+                {
+                    "key": "pipeline_observation",
+                    "kind": "boolean",
+                    "actual": False,
+                    "required": True,
+                }
+            )
     for key, spec in active_contract.get("required_quality_details", {}).items():
         detail = details.get(key) if isinstance(details, Mapping) else None
         minimum = float(spec["minimum_percentage"])
@@ -784,6 +815,49 @@ def _validate_data_quality_details(
     if not isinstance(details, Mapping):
         errors.append("$.data_quality_details must be an object")
         return
+    pipeline_observation = details.get("pipeline_observation")
+    if pipeline_observation is not None:
+        path = "$.data_quality_details.pipeline_observation"
+        if not isinstance(pipeline_observation, Mapping):
+            errors.append(f"{path} must be an object")
+        else:
+            status = pipeline_observation.get("status")
+            if status not in {"complete", "incomplete"}:
+                errors.append(f"{path}.status is invalid")
+            observation_start = pipeline_observation.get(
+                "capture_observation_start_date"
+            )
+            if observation_start is not None:
+                try:
+                    date.fromisoformat(str(observation_start))
+                except ValueError:
+                    errors.append(
+                        f"{path}.capture_observation_start_date must be an ISO date or null"
+                    )
+            gap_count = 0
+            for key in (
+                "expected_dates",
+                "legacy_unobserved_dates",
+                "pipeline_gap_dates",
+                "zero_content_dates",
+            ):
+                values = pipeline_observation.get(key)
+                if not isinstance(values, list):
+                    errors.append(f"{path}.{key} must be an array")
+                    continue
+                parsed_values: List[str] = []
+                for value in values:
+                    try:
+                        parsed_values.append(date.fromisoformat(str(value)).isoformat())
+                    except ValueError:
+                        errors.append(f"{path}.{key} contains an invalid ISO date")
+                if parsed_values != sorted(set(parsed_values)):
+                    errors.append(f"{path}.{key} must be sorted and unique")
+                if key in {"legacy_unobserved_dates", "pipeline_gap_dates"}:
+                    gap_count += len(values)
+            expected_status = "incomplete" if gap_count else "complete"
+            if status in {"complete", "incomplete"} and status != expected_status:
+                errors.append(f"{path}.status must be {expected_status}")
     if (
         isinstance(publication_value, bool)
         or not isinstance(publication_value, int)
