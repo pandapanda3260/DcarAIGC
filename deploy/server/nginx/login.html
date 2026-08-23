@@ -506,6 +506,14 @@
   }
   function hideBanner() { banner.hidden = true; }
 
+  try {
+    var params = new URLSearchParams(window.location.search);
+    var notice = params.get("notice");
+    if (notice === "douyin-session-required") {
+      showBanner("info", "登录状态已失效，请重新登录后再次发起授权。");
+    }
+  } catch (_) { /* 未识别的提示参数保持静默 */ }
+
   forgotBtn.addEventListener("click", function () {
     showBanner("info", "本系统密码由管理员统一管理，如需重置请联系管理员。");
   });

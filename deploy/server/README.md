@@ -19,6 +19,7 @@ only reads the active DB, reports, and cache. The publisher writes only below
 stopped.
 
 ```sh
+sudo install -d -o root -g dcar-aigc -m 0751 /var/lib/dcar-aigc
 sudo install -d -o root -g dcar-aigc -m 0750 \
   /var/lib/dcar-aigc/db \
   /var/lib/dcar-aigc/reports \
@@ -27,6 +28,14 @@ sudo install -d -o dcar-aigc -g dcar-aigc -m 0750 \
   /var/lib/dcar-aigc/incoming
 sudo install -d -o dcar-aigc -g dcar-aigc -m 0700 \
   /var/lib/dcar-aigc/auth
+sudo id -u dcar-douyin >/dev/null 2>&1 \
+  || sudo useradd --system --user-group --home-dir /nonexistent \
+    --shell /usr/sbin/nologin dcar-douyin
+sudo install -d -o dcar-douyin -g dcar-douyin -m 0700 \
+  /var/lib/dcar-aigc/douyin-control
+sudo install -d -o root -g root -m 0700 \
+  /var/backups/dcar-aigc/douyin-control \
+  /etc/dcar-aigc/credentials
 sudo install -d -o root -g root -m 0755 /var/lib/dcar-aigc/runtime
 ```
 
@@ -55,6 +64,20 @@ Do not configure `TIKHUB_API_KEY` or `TIKHUB_API_KEY_FILE` on the read replica.
 If a future designated writer uses a credential file, keep it outside the
 repository with restrictive permissions and point `TIKHUB_API_KEY_FILE` to it.
 
+The Douyin control plane ships fail-closed in stage 0:
+
+```text
+DOUYIN_AUTHORIZATION_ENABLED=0
+DCAR_DOUYIN_PROVIDER=disabled
+```
+
+Create independent random Edge, Machine, Fernet-keyring, and open-id HMAC
+credentials below `/etc/dcar-aigc/credentials`, owned by root and mode `0600`.
+The Edge credential is shared only by `dcar-auth` and the control plane; the
+Machine credential is only for `/internal/v1/*`. Do not install a Douyin Client Secret
+in stage 0. The credential shown in earlier screenshots is considered
+compromised and must be rotated before any real authorization is enabled.
+
 ## Build and install a code release
 
 Use a versioned directory under `/var/www/dcar-aigc/releases` and update the
@@ -63,6 +86,8 @@ The browser-facing values must be present at build time; systemd runtime
 variables cannot rewrite an already-built client bundle.
 
 ```sh
+sudo install -d -o root -g root -m 0755 \
+  /var/www/dcar-aigc /var/www/dcar-aigc/releases /var/www/dcar-aigc/runtime
 cd /var/www/dcar-aigc/releases/<release>
 /var/www/dcar-aigc/runtime/python-3.12.13/bin/python3 -m venv .venv
 .venv/bin/pip install -r deploy/server/requirements-api.txt
@@ -85,20 +110,26 @@ a symlink or hard-link clone that lets a later install mutate the rollback
 environment.
 
 Keep each release's `.venv` inside that release. Installing a new dependency
-must not mutate the running or rollback release. After temporary-port API/Web/
-authentication smoke checks pass, stop the authentication gateway, Web and API
-first, then switch `current` atomically:
+must not mutate the running or rollback release. The stage-0 release process
+must not invoke the snapshot installer. The unattended publisher may continue
+to reconcile; its installer blocks on the same snapshot-install lock, so the
+code-release critical section must remain short. The release script first takes
+that lock with non-blocking `flock -n` and exits without changing anything if
+the lock is held. After temporary-port API/Web/Auth/Control smoke checks pass,
+stop the four services, then switch `current` atomically:
 
 ```sh
-sudo systemctl stop dcar-auth dcar-web dcar-api
+sudo systemctl stop dcar-auth dcar-douyin-control dcar-web dcar-api
 ln -s /var/www/dcar-aigc/releases/<release> /var/www/dcar-aigc/current.next
 mv -Tf /var/www/dcar-aigc/current.next /var/www/dcar-aigc/current
 ```
 
-Record the previous symlink target and unit files before this step. If any
-service or the public-path smoke check fails, stop the three new services, restore
-that exact symlink and the prior units, reload systemd, and start the previous
-three services. Before a code-only rollback, verify that the previous release supports
+Record the previous symlink target and unit/Nginx files before this step. If any
+service or the public-path smoke check fails, first restore the previous Nginx
+configuration and reload it so no request reaches a stopped control plane; then
+stop the four new services, restore that exact symlink and the prior units,
+reload systemd, and start the previous four services. Before a code-only rollback,
+verify that the previous release supports
 the active SQLite `user_version`; otherwise roll back its matching data snapshot
 at the same time.
 
@@ -111,10 +142,22 @@ sudo install -m 0644 deploy/server/systemd/dcar-web.service \
   /etc/systemd/system/dcar-web.service
 sudo install -m 0644 deploy/server/systemd/dcar-auth.service \
   /etc/systemd/system/dcar-auth.service
+sudo install -m 0644 deploy/server/systemd/dcar-douyin-control.service \
+  /etc/systemd/system/dcar-douyin-control.service
+sudo install -m 0644 deploy/server/systemd/dcar-douyin-vault-backup.service \
+  /etc/systemd/system/dcar-douyin-vault-backup.service
+sudo install -m 0644 deploy/server/systemd/dcar-douyin-vault-backup.timer \
+  /etc/systemd/system/dcar-douyin-vault-backup.timer
+sudo install -m 0755 deploy/server/libexec/dcar-douyin-vault-backup.py \
+  /usr/local/libexec/dcar-douyin-vault-backup
 sudo systemctl daemon-reload
-sudo systemctl enable dcar-api dcar-web dcar-auth
-sudo systemctl start dcar-api dcar-web dcar-auth
+sudo systemctl enable dcar-api dcar-web dcar-douyin-control dcar-auth \
+  dcar-douyin-vault-backup.timer
+sudo systemctl start dcar-api dcar-web dcar-douyin-control dcar-auth \
+  dcar-douyin-vault-backup.timer
 curl -fsS http://127.0.0.1:4173/dcar/auth/health
+curl -fsS -H "X-Dcar-Machine-Key: $(sudo cat /etc/dcar-aigc/credentials/douyin-machine-key)" \
+  http://127.0.0.1:4175/internal/v1/health
 sudo nginx -t
 sudo systemctl reload nginx
 ```
@@ -177,10 +220,11 @@ The examples below assume an operator-configured SSH alias named `dcar-prod`.
 Use an SSH identity dedicated to this server with `IdentitiesOnly yes`; never
 put a password or private key in this repository.
 
-The 09:00 disabled-by-default publisher is documented in
-`deploy/macos/README.md`. It performs the freshness, SSH, free-space, and rsync
-dry-run gates automatically. The layout below documents its server contract;
-do not rsync artifacts directly into active cache or report roots.
+The unattended publisher is documented in `deploy/macos/README.md`. It runs at
+login, at 09:00, and performs hourly reconciliation. It performs the freshness,
+SSH, free-space, and rsync dry-run gates automatically. The layout below
+documents its server contract; do not rsync artifacts directly into active
+cache or report roots.
 
 Read the snapshot ID without interpolating untrusted shell output:
 
@@ -269,9 +313,9 @@ the active DB SHA-256, schema version, content count, latest published date, and
 the full runtime identity with the manifest. It also requires read-only mode,
 scheduler requested/enabled both false, and startup catch-up unrequested.
 
-Restart the authentication gateway and Web together when the code release
-changed; a data-only snapshot does not require rebuilding the Web bundle or
-restarting either service.
+Restart Control, the authentication gateway, and Web together when the code
+release changed; a data-only snapshot does not require rebuilding the Web bundle
+or restarting those services.
 
 Before a new automatic publish is built, the publisher invokes the root-owned
 `prune` command. It reads the validated active receipt while holding the
@@ -310,13 +354,48 @@ the API.
 
 ## Public Nginx path
 
-Install `deploy/server/nginx/dcar-proxy.conf` inside the existing TLS server
-block. Nginx sends all `/dcar/` traffic to the authentication gateway on 4173;
-the gateway keeps opaque, revocable Sessions in `/var/lib/dcar-aigc/auth`, then
-forwards authenticated Web traffic to 4174 and API traffic to 8765. All three
-ports stay bound to server loopback. The existing htpasswd file remains the
-account source, but browser HTTP Basic authentication is no longer used. See `AUTH.md` for the
-complete login, logout and acceptance contract.
+Install `deploy/server/nginx/dcar-http.conf` in the Nginx `http` context and
+`deploy/server/nginx/dcar-proxy.conf` inside the existing TLS server block.
+Nginx sends all `/dcar/` traffic, including the exact quiet Douyin callback, to
+the authentication gateway on 4173. The gateway keeps opaque, revocable
+Sessions in `/var/lib/dcar-aigc/auth`, then forwards authenticated Web traffic
+to 4174, API traffic to 8765, and bounded Douyin control traffic to 4175. All
+four ports stay bound to server loopback. The callback location disables access
+logging, raises error logging to `crit`, rate-limits GET, and never bypasses the
+gateway. The existing htpasswd file remains the account source, but browser HTTP
+Basic authentication is no longer used. See `AUTH.md` for the complete login,
+logout and acceptance contract.
+
+## Douyin Vault backup
+
+The Vault deliberately uses SQLite rollback-journal (`journal_mode=DELETE`),
+not WAL. The service enforces this at startup and sets `synchronous=EXTRA` on
+every connection. The root-run backup helper opens the source read-only, waits
+for an ordinary shared lock, uses SQLite `Connection.backup()`, and validates
+`quick_check`, foreign keys, schema, tables, and encrypted BLOB columns before
+atomically installing a mode-`0600` backup and manifest. It also works while
+4175 is stopped. It fails closed if WAL/SHM or a hot rollback journal is present.
+
+Before enabling the timer, run one offline backup and verify the timer:
+
+```sh
+sudo systemctl stop dcar-douyin-control
+sudo systemctl start dcar-douyin-vault-backup.service
+sudo systemctl status dcar-douyin-vault-backup.service --no-pager
+sudo systemctl start dcar-douyin-control
+sudo systemctl enable --now dcar-douyin-vault-backup.timer
+sudo systemctl list-timers dcar-douyin-vault-backup.timer --no-pager
+```
+
+## Restricted Mac tunnel
+
+The future writer channel uses a dedicated SSH account and key. Its
+`authorized_keys` entry must include
+`restrict,port-forwarding,permitopen="127.0.0.1:4175"`; do not grant a shell,
+PTY, agent forwarding, or arbitrary destination forwarding. A request through
+that tunnel must still supply the independent Machine credential. Stage 0 only
+exposes the authenticated internal health route and does not implement writer
+mutation endpoints.
 
 Post-install acceptance must cover:
 
@@ -325,4 +404,13 @@ Post-install acceptance must cover:
 - `GET /dcar/api/v8/scheduler` reports both scheduling gates off;
 - one report download passes its registered hash; omitted large evidence returns
   a clear unavailable response instead of a server error;
-- write endpoints are rejected by read-replica mode.
+- write endpoints are rejected by read-replica mode;
+- `GET /dcar/douyin` renders through the authenticated gateway and account
+  search returns only the documented Douyin projection;
+- `POST /dcar/api/douyin/oauth/start` returns 409 in production stage 0 and no
+  request reaches `open.douyin.com`;
+- `sudo -u dcar-douyin test -r /etc/nginx/.htpasswd-dcar` and equivalent checks
+  for the Auth Session DB and read-replica DB fail;
+- the active snapshot receipt, database SHA-256, schema version, content count,
+  and latest published timestamp are unchanged by the code release;
+- an offline Vault backup passes while 4175 is stopped.

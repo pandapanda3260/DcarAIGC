@@ -1,6 +1,7 @@
 # UI/API-only runtime. Media ASR/OCR dependencies (mlx, mlx-whisper, torch)
 # are intentionally excluded from the Linux server image.
 apscheduler==3.11.3
+cryptography==50.0.0
 fastapi==0.128.7
 huggingface-hub==1.26.0
 httpx==0.28.1

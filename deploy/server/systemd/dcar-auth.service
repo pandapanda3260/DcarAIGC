@@ -1,7 +1,7 @@
 [Unit]
 Description=DcarAIGC authentication gateway
-After=network-online.target dcar-api.service dcar-web.service
-Wants=network-online.target dcar-api.service dcar-web.service
+After=network-online.target dcar-api.service dcar-douyin-control.service dcar-web.service
+Wants=network-online.target dcar-api.service dcar-douyin-control.service dcar-web.service
 ConditionFileNotEmpty=/etc/nginx/.htpasswd-dcar
 ConditionPathIsDirectory=/var/lib/dcar-aigc/auth
 
@@ -14,10 +14,12 @@ Environment=PYTHONPATH=/var/www/dcar-aigc/current/src/dcar_eval
 Environment=DCAR_AUTH_BASE_PATH=/dcar
 Environment=DCAR_AUTH_WEB_UPSTREAM=http://127.0.0.1:4174
 Environment=DCAR_AUTH_API_UPSTREAM=http://127.0.0.1:8765
+Environment=DCAR_AUTH_DOUYIN_UPSTREAM=http://127.0.0.1:4175
 Environment=DCAR_AUTH_HTPASSWD=/etc/nginx/.htpasswd-dcar
 Environment=DCAR_AUTH_SESSION_DB=/var/lib/dcar-aigc/auth/sessions.sqlite3
 Environment=DCAR_AUTH_LOGIN_TEMPLATE=/var/www/dcar-aigc/current/deploy/server/nginx/login.html
 Environment=DCAR_AUTH_SECURE_COOKIE=1
+LoadCredential=douyin-edge-key:/etc/dcar-aigc/credentials/douyin-edge-key
 ExecStart=/var/www/dcar-aigc/current/.venv/bin/python -m uvicorn dcar_auth.gateway:app --app-dir /var/www/dcar-aigc/current/src/dcar_eval --host 127.0.0.1 --port 4173 --workers 1 --no-access-log
 Restart=on-failure
 RestartSec=5s

@@ -1,0 +1,29 @@
+[Unit]
+Description=Back up the DcarAIGC Douyin token Vault
+ConditionPathIsDirectory=/var/lib/dcar-aigc/douyin-control
+ConditionPathIsDirectory=/var/backups/dcar-aigc/douyin-control
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/dcar-douyin-vault-backup --source /var/lib/dcar-aigc/douyin-control/vault.sqlite3 --backup-dir /var/backups/dcar-aigc/douyin-control
+TimeoutStartSec=60s
+UMask=0077
+
+PrivateNetwork=true
+RestrictAddressFamilies=AF_UNIX
+ReadOnlyPaths=/var/lib/dcar-aigc/douyin-control
+ReadWritePaths=/var/backups/dcar-aigc/douyin-control
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+
+CPUQuota=50%
+MemoryMax=256M
+TasksMax=32
+LimitNOFILE=1024

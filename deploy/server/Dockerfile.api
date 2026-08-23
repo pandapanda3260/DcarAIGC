@@ -14,6 +14,12 @@ RUN apt-get update \
     && groupadd --gid 10001 dcar \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin dcar
 
+ARG PIP_INDEX_URL
+ARG PIP_EXTRA_INDEX_URL
+ARG PIP_FIND_LINKS
+ARG PIP_NO_INDEX
+ARG PIP_TRUSTED_HOST
+
 COPY deploy/server/requirements-api.txt /tmp/requirements-api.txt
 RUN python -m pip install --requirement /tmp/requirements-api.txt \
     && rm /tmp/requirements-api.txt
@@ -27,6 +33,7 @@ COPY --chown=dcar:dcar src/dcar_eval/rebuild_channel_evaluation_v4.py /app/src/d
 COPY --chown=dcar:dcar src/dcar_eval/three_proposition_scoring.py /app/src/dcar_eval/three_proposition_scoring.py
 COPY --chown=dcar:dcar src/dcar_eval/v8 /app/src/dcar_eval/v8
 COPY --chown=dcar:dcar src/dcar_eval/dcar_auth /app/src/dcar_eval/dcar_auth
+COPY --chown=dcar:dcar src/dcar_eval/dcar_douyin_control /app/src/dcar_eval/dcar_douyin_control
 COPY --chown=dcar:dcar src/dcar_eval/workflow/__init__.py /app/src/dcar_eval/workflow/__init__.py
 COPY --chown=dcar:dcar src/dcar_eval/workflow/contracts.py /app/src/dcar_eval/workflow/contracts.py
 COPY --chown=dcar:dcar src/dcar_eval/workflow/privacy.py /app/src/dcar_eval/workflow/privacy.py
@@ -42,6 +49,6 @@ RUN mkdir -p \
 
 USER dcar:dcar
 
-EXPOSE 8765
+EXPOSE 8765 4175
 
 CMD ["python", "-m", "uvicorn", "v8.api:app", "--app-dir", "/app/src/dcar_eval", "--host", "0.0.0.0", "--port", "8765", "--workers", "1", "--no-access-log"]

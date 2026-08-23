@@ -111,6 +111,101 @@ services:
         max-size: 10m
         max-file: "5"
 
+  control:
+    build:
+      context: ../..
+      dockerfile: deploy/server/Dockerfile.api
+    image: dcar-aigc-api:local
+    user: "10002:10002"
+    restart: unless-stopped
+    init: true
+    command:
+      - python
+      - -m
+      - uvicorn
+      - dcar_douyin_control.app:app
+      - --app-dir
+      - /app/src/dcar_eval
+      - --host
+      - 0.0.0.0
+      - --port
+      - "4175"
+      - --workers
+      - "1"
+      - --no-access-log
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      DCAR_DOUYIN_PUBLIC_BASE_PATH: /dcar
+      DCAR_DOUYIN_VAULT: /var/lib/dcar-aigc/douyin-control/vault.sqlite3
+      DCAR_DOUYIN_API_UPSTREAM: http://api:8765
+      DOUYIN_AUTHORIZATION_ENABLED: "0"
+      DCAR_DOUYIN_PROVIDER: disabled
+      DCAR_DOUYIN_EDGE_KEY_FILE: /run/secrets/douyin-edge-key
+      DCAR_DOUYIN_MACHINE_KEY_FILE: /run/secrets/douyin-machine-key
+      DCAR_DOUYIN_FERNET_KEYRING_FILE: /run/secrets/douyin-fernet-keyring
+      DCAR_DOUYIN_OPEN_ID_HMAC_KEY_FILE: /run/secrets/douyin-open-id-hmac-key
+    expose:
+      - "4175"
+    ports:
+      - "127.0.0.1:4175:4175"
+    volumes:
+      - type: bind
+        source: ${DCAR_DOUYIN_VAULT_ROOT:-/var/lib/dcar-aigc/douyin-control-compose}
+        target: /var/lib/dcar-aigc/douyin-control
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${DCAR_DOUYIN_CREDENTIAL_ROOT:-/var/lib/dcar-aigc/douyin-compose-credentials}/edge.key
+        target: /run/secrets/douyin-edge-key
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${DCAR_DOUYIN_CREDENTIAL_ROOT:-/var/lib/dcar-aigc/douyin-compose-credentials}/machine.key
+        target: /run/secrets/douyin-machine-key
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${DCAR_DOUYIN_CREDENTIAL_ROOT:-/var/lib/dcar-aigc/douyin-compose-credentials}/fernet.keys
+        target: /run/secrets/douyin-fernet-keyring
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${DCAR_DOUYIN_CREDENTIAL_ROOT:-/var/lib/dcar-aigc/douyin-compose-credentials}/open-id-hmac.key
+        target: /run/secrets/douyin-open-id-hmac-key
+        read_only: true
+        bind:
+          create_host_path: false
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    cpus: 1.0
+    mem_limit: 512m
+    pids_limit: 128
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import pathlib,urllib.request; key=pathlib.Path('/run/secrets/douyin-machine-key').read_text().strip(); request=urllib.request.Request('http://127.0.0.1:4175/internal/v1/health',headers={'X-Dcar-Machine-Key':key}); urllib.request.urlopen(request,timeout=5).read()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
   auth:
     build:
       context: ../..
@@ -137,10 +232,14 @@ services:
         condition: service_healthy
       web:
         condition: service_healthy
+      control:
+        condition: service_healthy
     environment:
       DCAR_AUTH_BASE_PATH: /dcar
       DCAR_AUTH_WEB_UPSTREAM: http://web:4174
       DCAR_AUTH_API_UPSTREAM: http://api:8765
+      DCAR_AUTH_DOUYIN_UPSTREAM: http://control:4175
+      DCAR_AUTH_DOUYIN_EDGE_KEY_FILE: /run/secrets/douyin-edge-key
       DCAR_AUTH_HTPASSWD: /run/secrets/dcar-htpasswd
       DCAR_AUTH_SESSION_DB: /var/lib/dcar-aigc/auth/sessions.sqlite3
       DCAR_AUTH_LOGIN_TEMPLATE: /app/deploy/server/nginx/login.html
@@ -151,6 +250,12 @@ services:
       - type: bind
         source: ${DCAR_AUTH_CREDENTIAL_ROOT:-/var/lib/dcar-aigc/auth-compose-credentials}/users.htpasswd
         target: /run/secrets/dcar-htpasswd
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${DCAR_DOUYIN_CREDENTIAL_ROOT:-/var/lib/dcar-aigc/douyin-compose-credentials}/edge.key
+        target: /run/secrets/douyin-edge-key
         read_only: true
         bind:
           create_host_path: false

@@ -1,0 +1,49 @@
+[Unit]
+Description=DcarAIGC Douyin Open Platform control plane
+After=network-online.target dcar-api.service
+Wants=network-online.target dcar-api.service
+ConditionPathIsDirectory=/var/lib/dcar-aigc/douyin-control
+
+[Service]
+Type=simple
+User=dcar-douyin
+Group=dcar-douyin
+WorkingDirectory=/var/www/dcar-aigc/current
+Environment=PYTHONPATH=/var/www/dcar-aigc/current/src/dcar_eval
+Environment=DCAR_DOUYIN_PUBLIC_BASE_PATH=/dcar
+Environment=DCAR_DOUYIN_VAULT=/var/lib/dcar-aigc/douyin-control/vault.sqlite3
+Environment=DCAR_DOUYIN_API_UPSTREAM=http://127.0.0.1:8765
+Environment=DOUYIN_AUTHORIZATION_ENABLED=0
+Environment=DCAR_DOUYIN_PROVIDER=disabled
+LoadCredential=douyin-edge-key:/etc/dcar-aigc/credentials/douyin-edge-key
+LoadCredential=douyin-machine-key:/etc/dcar-aigc/credentials/douyin-machine-key
+LoadCredential=douyin-fernet-keyring:/etc/dcar-aigc/credentials/douyin-fernet-keyring
+LoadCredential=douyin-open-id-hmac-key:/etc/dcar-aigc/credentials/douyin-open-id-hmac-key
+ExecStart=/var/www/dcar-aigc/current/.venv/bin/python -m uvicorn dcar_douyin_control.app:app --app-dir /var/www/dcar-aigc/current/src/dcar_eval --host 127.0.0.1 --port 4175 --workers 1 --no-access-log
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+UMask=0077
+
+ReadWritePaths=/var/lib/dcar-aigc/douyin-control
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+
+CPUQuota=100%
+MemoryMax=512M
+TasksMax=128
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

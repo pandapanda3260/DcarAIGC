@@ -30,7 +30,16 @@ BYPASS_USERNAME = "temporary-bypass"
 DEFAULT_SESSION_SECONDS = 12 * 60 * 60
 REMEMBER_SESSION_SECONDS = 30 * 24 * 60 * 60
 MAX_LOGIN_BODY_BYTES = 16 * 1024
+MAX_DOUYIN_BODY_BYTES = 64 * 1024
 PROXY_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+DOUYIN_CALLBACK_PATH = "/oauth/douyin/callback"
+DOUYIN_POST_ACTIONS = {
+    "/api/douyin/accounts/search": "douyin-accounts-search",
+    "/api/douyin/oauth/start": "douyin-oauth-start",
+    "/api/douyin/oauth/confirm": "douyin-oauth-confirm",
+    "/api/douyin/oauth/reject": "douyin-oauth-reject",
+    "/api/douyin/authorizations/unbind": "douyin-authorization-unbind",
+}
 HOP_BY_HOP_HEADERS = frozenset(
     {
         "connection",
@@ -76,6 +85,8 @@ class AuthGatewayConfig:
     login_template_path: Path
     secure_cookie: bool
     bypass_auth: bool = False
+    douyin_upstream: Optional[str] = None
+    douyin_edge_key_path: Optional[Path] = None
     session_seconds: int = DEFAULT_SESSION_SECONDS
     remember_session_seconds: int = REMEMBER_SESSION_SECONDS
     throttle_window_seconds: int = 10 * 60
@@ -91,6 +102,20 @@ class AuthGatewayConfig:
             parsed = urlsplit(value)
             if parsed.scheme not in {"http", "https"} or not parsed.netloc:
                 raise ValueError(f"{name} must be an absolute HTTP URL")
+        if self.douyin_upstream:
+            normalized_douyin_upstream = self.douyin_upstream.rstrip("/")
+            parsed = urlsplit(normalized_douyin_upstream)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValueError("douyin_upstream must be an absolute HTTP URL")
+            if self.douyin_edge_key_path is None:
+                raise ValueError(
+                    "douyin_edge_key_path is required when douyin_upstream is configured"
+                )
+            object.__setattr__(self, "douyin_upstream", normalized_douyin_upstream)
+        elif self.douyin_edge_key_path is not None:
+            raise ValueError(
+                "douyin_edge_key_path must not be configured without douyin_upstream"
+            )
         if not 60 <= self.session_seconds <= 31 * 24 * 60 * 60:
             raise ValueError("session_seconds must be between 60 seconds and 31 days")
         if not self.session_seconds <= self.remember_session_seconds <= 90 * 24 * 60 * 60:
@@ -104,6 +129,13 @@ class AuthGatewayConfig:
 
     @classmethod
     def from_env(cls) -> "AuthGatewayConfig":
+        douyin_upstream = os.environ.get("DCAR_AUTH_DOUYIN_UPSTREAM", "").strip()
+        douyin_edge_key_file = os.environ.get(
+            "DCAR_AUTH_DOUYIN_EDGE_KEY_FILE", ""
+        ).strip()
+        credential_root = Path(
+            os.environ.get("CREDENTIALS_DIRECTORY", "/run/credentials")
+        )
         return cls(
             base_path=os.environ.get("DCAR_AUTH_BASE_PATH", ""),
             web_upstream=os.environ.get(
@@ -132,6 +164,14 @@ class AuthGatewayConfig:
             ),
             secure_cookie=_enabled("DCAR_AUTH_SECURE_COOKIE", default=True),
             bypass_auth=_enabled("DCAR_AUTH_BYPASS", default=False),
+            douyin_upstream=(douyin_upstream.rstrip("/") if douyin_upstream else None),
+            douyin_edge_key_path=(
+                Path(douyin_edge_key_file)
+                if douyin_edge_key_file
+                else credential_root / "douyin-edge-key"
+                if douyin_upstream
+                else None
+            ),
             session_seconds=int(
                 os.environ.get("DCAR_AUTH_SESSION_SECONDS", DEFAULT_SESSION_SECONDS)
             ),
@@ -371,6 +411,38 @@ def _stripped_path(path: str, base_path: str) -> Optional[str]:
     return None
 
 
+def _path_has_prefix(path: str, prefix: str) -> bool:
+    return path == prefix or path.startswith(f"{prefix}/")
+
+
+def _is_douyin_path(path: str) -> bool:
+    return (
+        _path_has_prefix(path, "/douyin")
+        or _path_has_prefix(path, "/api/douyin")
+        or path == DOUYIN_CALLBACK_PATH
+    )
+
+
+def _valid_douyin_callback_navigation(request: Request) -> bool:
+    expected_values = {
+        "sec-fetch-mode": {"navigate"},
+        "sec-fetch-dest": {"document"},
+        "sec-fetch-site": {"cross-site", "none"},
+    }
+    return all(
+        header not in request.headers
+        or request.headers[header].lower() in allowed
+        for header, allowed in expected_values.items()
+    )
+
+
+def _read_edge_key(path: Path) -> str:
+    value = path.read_text(encoding="utf-8").strip()
+    if not 32 <= len(value) <= 512 or any(ord(character) < 33 for character in value):
+        raise RuntimeError("Douyin gateway credential has an invalid format")
+    return value
+
+
 def _web_upstream_path(
     path: str, stripped_path: str, raw_path: bytes
 ) -> Optional[str]:
@@ -471,12 +543,14 @@ def _connection_tokens(headers: httpx.Headers | Mapping[str, str]) -> set[str]:
     return {token.strip().lower() for token in value.split(",") if token.strip()}
 
 
-def _proxy_headers(request: Request, base_path: str) -> dict[str, str]:
+def _proxy_headers(
+    request: Request, base_path: str, *, strip_all_dcar: bool = False
+) -> dict[str, str]:
     blocked = HOP_BY_HOP_HEADERS | _connection_tokens(request.headers)
     headers: dict[str, str] = {}
     for key, value in request.headers.items():
         lower = key.lower()
-        if lower in blocked or lower in {
+        if (strip_all_dcar and lower.startswith("x-dcar-")) or lower in blocked or lower in {
             "host",
             "content-length",
             "cookie",
@@ -503,7 +577,13 @@ def _proxy_headers(request: Request, base_path: str) -> dict[str, str]:
     return headers
 
 
-def _public_location(value: str, upstream_base: str) -> str:
+def _public_location(
+    value: str,
+    upstream_base: str,
+    *,
+    public_base_path: str = "",
+    restore_base_path: bool = False,
+) -> str:
     location = urlsplit(value)
     upstream = urlsplit(upstream_base)
     if (
@@ -512,6 +592,13 @@ def _public_location(value: str, upstream_base: str) -> str:
     ):
         return value
     target = location.path or "/"
+    if (
+        restore_base_path
+        and public_base_path
+        and target != public_base_path
+        and not target.startswith(f"{public_base_path}/")
+    ):
+        target = f"{public_base_path}{target if target.startswith('/') else '/' + target}"
     if location.query:
         target = f"{target}?{location.query}"
     if location.fragment:
@@ -520,20 +607,31 @@ def _public_location(value: str, upstream_base: str) -> str:
 
 
 def _response_header_pairs(
-    upstream: httpx.Response, upstream_base: str
+    upstream: httpx.Response,
+    upstream_base: str,
+    *,
+    public_base_path: str = "",
+    restore_base_path: bool = False,
+    strip_set_cookie: bool = False,
 ) -> list[tuple[bytes, bytes]]:
     blocked = HOP_BY_HOP_HEADERS | _connection_tokens(upstream.headers)
     return [
         (
             key.encode("latin-1"),
             (
-                _public_location(value, upstream_base)
+                _public_location(
+                    value,
+                    upstream_base,
+                    public_base_path=public_base_path,
+                    restore_base_path=restore_base_path,
+                )
                 if key.lower() == "location"
                 else value
             ).encode("latin-1"),
         )
         for key, value in upstream.headers.multi_items()
         if key.lower() not in blocked
+        and not (strip_set_cookie and key.lower() == "set-cookie")
     ]
 
 
@@ -542,6 +640,7 @@ def create_app(
     *,
     web_transport: Optional[httpx.AsyncBaseTransport] = None,
     api_transport: Optional[httpx.AsyncBaseTransport] = None,
+    douyin_transport: Optional[httpx.AsyncBaseTransport] = None,
 ) -> FastAPI:
     resolved = config or AuthGatewayConfig.from_env()
     verifier = HtpasswdVerifier(resolved.htpasswd_path)
@@ -559,6 +658,11 @@ def create_app(
                     f"login template is missing: {resolved.login_template_path}"
                 )
             sessions.initialize()
+        application.state.douyin_edge_key = (
+            _read_edge_key(resolved.douyin_edge_key_path)
+            if resolved.douyin_edge_key_path is not None
+            else None
+        )
         application.state.web_client = httpx.AsyncClient(
             transport=web_transport,
             timeout=httpx.Timeout(60, connect=5),
@@ -571,11 +675,23 @@ def create_app(
             follow_redirects=False,
             trust_env=False,
         )
+        application.state.douyin_client = (
+            httpx.AsyncClient(
+                transport=douyin_transport,
+                timeout=httpx.Timeout(5, connect=2, read=5, write=5, pool=2),
+                follow_redirects=False,
+                trust_env=False,
+            )
+            if resolved.douyin_upstream is not None
+            else None
+        )
         try:
             yield
         finally:
             await application.state.web_client.aclose()
             await application.state.api_client.aclose()
+            if application.state.douyin_client is not None:
+                await application.state.douyin_client.aclose()
 
     application = FastAPI(
         title="Dcar Sentinel authentication gateway",
@@ -612,6 +728,11 @@ def create_app(
         upstream_path: str,
         client: httpx.AsyncClient,
         username: str,
+        strip_all_dcar: bool = False,
+        extra_headers: Optional[Mapping[str, str]] = None,
+        buffered_body: Optional[bytes] = None,
+        restore_base_path: bool = False,
+        strip_set_cookie: bool = False,
     ) -> Response:
         url = f"{upstream_base}{upstream_path}"
         if request.url.query:
@@ -621,8 +742,12 @@ def create_app(
             async for chunk in request.stream():
                 yield chunk
 
-        headers = _proxy_headers(request, resolved.base_path)
+        headers = _proxy_headers(
+            request, resolved.base_path, strip_all_dcar=strip_all_dcar
+        )
         headers["X-Dcar-Authenticated-User"] = username
+        if extra_headers:
+            headers.update(extra_headers)
         try:
             upstream = await client.send(
                 client.build_request(
@@ -630,9 +755,13 @@ def create_app(
                     url,
                     headers=headers,
                     content=(
-                        body_stream()
-                        if request.method not in {"GET", "HEAD"}
-                        else b""
+                        buffered_body
+                        if buffered_body is not None
+                        else (
+                            body_stream()
+                            if request.method not in {"GET", "HEAD"}
+                            else b""
+                        )
                     ),
                 ),
                 stream=True,
@@ -649,12 +778,28 @@ def create_app(
             status_code=upstream.status_code,
             background=BackgroundTask(upstream.aclose),
         )
-        response.raw_headers = _response_header_pairs(upstream, upstream_base)
+        response.raw_headers = _response_header_pairs(
+            upstream,
+            upstream_base,
+            public_base_path=resolved.base_path,
+            restore_base_path=restore_base_path,
+            strip_set_cookie=strip_set_cookie,
+        )
         return response
 
     def unauthenticated(request: Request, stripped: str) -> Response:
-        if stripped == "/api" or stripped.startswith("/api/"):
-            response: Response = JSONResponse({"detail": "请先登录"}, status_code=401)
+        response: Response
+        if stripped == DOUYIN_CALLBACK_PATH:
+            return_to = quote(resolved.route("/douyin"), safe="")
+            response = RedirectResponse(
+                resolved.route("/login")
+                + "?notice=douyin-session-required&return_to="
+                + return_to,
+                status_code=303,
+            )
+            response.headers["Referrer-Policy"] = "no-referrer"
+        elif stripped == "/api" or stripped.startswith("/api/"):
+            response = JSONResponse({"detail": "请先登录"}, status_code=401)
         else:
             target = quote(_request_target(request), safe="")
             response = RedirectResponse(
@@ -670,6 +815,12 @@ def create_app(
         stripped = _stripped_path(request.url.path, resolved.base_path)
         if stripped is None:
             return Response(status_code=404)
+        if _is_douyin_path(stripped) and request.method not in {"GET", "POST"}:
+            return _no_store(
+                Response(status_code=405, headers={"Allow": "GET, POST"})
+            )
+        if stripped == DOUYIN_CALLBACK_PATH and request.method != "GET":
+            return _no_store(Response(status_code=405, headers={"Allow": "GET"}))
 
         if stripped == "/auth/health":
             if request.method != "GET":
@@ -837,6 +988,91 @@ def create_app(
         if not authenticated_username:
             return unauthenticated(request, stripped)
 
+        if _is_douyin_path(stripped):
+            if resolved.bypass_auth:
+                return _no_store(
+                    JSONResponse(
+                        {"detail": "当前模式禁止抖音授权"}, status_code=403
+                    )
+                )
+            if resolved.douyin_upstream is None:
+                return Response(status_code=404)
+            if stripped == DOUYIN_CALLBACK_PATH:
+                if not _valid_douyin_callback_navigation(request):
+                    return _no_store(
+                        JSONResponse(
+                            {"detail": "授权回调来源无效"}, status_code=403
+                        )
+                    )
+
+            verified_action: Optional[str] = None
+            buffered_body: Optional[bytes] = None
+            if request.method == "POST":
+                verified_action = DOUYIN_POST_ACTIONS.get(stripped)
+                if verified_action is None:
+                    return Response(status_code=404)
+                if not _same_origin_post(
+                    request,
+                    verified_action,
+                    trusted_proxy=bool(resolved.base_path),
+                ):
+                    return _no_store(
+                        JSONResponse(
+                            {"detail": "页面已失效，请刷新后重试"}, status_code=403
+                        )
+                    )
+                content_length = request.headers.get("content-length")
+                if content_length is None:
+                    return _no_store(
+                        JSONResponse({"detail": "请求长度缺失"}, status_code=411)
+                    )
+                try:
+                    declared_length = int(content_length)
+                except ValueError:
+                    return _no_store(
+                        JSONResponse({"detail": "请求长度无效"}, status_code=400)
+                    )
+                if declared_length < 0:
+                    return _no_store(
+                        JSONResponse({"detail": "请求长度无效"}, status_code=400)
+                    )
+                if declared_length > MAX_DOUYIN_BODY_BYTES:
+                    return _no_store(
+                        JSONResponse({"detail": "请求内容过大"}, status_code=413)
+                    )
+                buffered_body = await request.body()
+                if len(buffered_body) > MAX_DOUYIN_BODY_BYTES:
+                    return _no_store(
+                        JSONResponse({"detail": "请求内容过大"}, status_code=413)
+                    )
+
+            token = request.cookies.get(SESSION_COOKIE, "")
+            extra_headers = {
+                "X-Dcar-Edge-Key": request.app.state.douyin_edge_key,
+                "X-Dcar-Session-Binding": SessionStore._token_hash(token),
+            }
+            if verified_action is not None:
+                extra_headers["X-Dcar-Verified-Action"] = verified_action
+            douyin_client = request.app.state.douyin_client
+            if douyin_client is None:
+                return Response(status_code=404)
+            response = await proxy_request(
+                request,
+                upstream_base=resolved.douyin_upstream,
+                upstream_path=stripped,
+                client=douyin_client,
+                username=authenticated_username,
+                strip_all_dcar=True,
+                extra_headers=extra_headers,
+                buffered_body=buffered_body,
+                restore_base_path=True,
+                strip_set_cookie=True,
+            )
+            if stripped == DOUYIN_CALLBACK_PATH:
+                response.headers["Referrer-Policy"] = "no-referrer"
+                _no_store(response)
+            return response
+
         if stripped == "/api" or stripped.startswith("/api/"):
             return await proxy_request(
                 request,
@@ -844,6 +1080,7 @@ def create_app(
                 upstream_path=stripped,
                 client=request.app.state.api_client,
                 username=authenticated_username,
+                restore_base_path=True,
             )
         web_upstream_path = _web_upstream_path(
             request.url.path,
@@ -858,6 +1095,7 @@ def create_app(
             upstream_path=web_upstream_path,
             client=request.app.state.web_client,
             username=authenticated_username,
+            restore_base_path=(web_upstream_path != request.url.path),
         )
 
     return application
