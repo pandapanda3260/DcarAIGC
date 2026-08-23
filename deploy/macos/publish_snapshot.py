@@ -69,6 +69,9 @@ ARTIFACT_POLICY = {
 }
 AUTOMATIC_STATE_SCHEMA = "dcar-automatic-snapshot-publisher-state-v1"
 AUTOMATIC_STATE_FILENAME = "automatic-publisher-state.json"
+PENDING_STATE_SCHEMA = "dcar-snapshot-publisher-pending-v1"
+PENDING_STATE_FILENAME = "snapshot-publisher-pending.json"
+REMOTE_PROBE_SCHEMA = "dcar-remote-publisher-probe-v1"
 AUTOMATIC_START_HOUR = 9
 # Pre-publish pruning keeps two existing points; the new successful install
 # becomes the third retained point.
@@ -83,6 +86,20 @@ AUTOMATIC_STATE_KEYS = frozenset(
         "published_at",
         "capture_scheduled_for",
         "database_sha256",
+    }
+)
+PENDING_STATE_KEYS = frozenset(
+    {
+        "schema",
+        "beijing_date",
+        "snapshot_id",
+        "database_sha256",
+        "runtime_identity",
+        "previous_snapshot_id",
+        "previous_database_sha256",
+        "previous_runtime_identity",
+        "output_name",
+        "receipt",
     }
 )
 ALLOWED_ENV_KEYS = frozenset(
@@ -769,7 +786,12 @@ def _run_checked(
     }
     if environment is not None:
         kwargs["env"] = dict(environment)
-    completed = runner(list(arguments), **kwargs)
+    try:
+        completed = runner(list(arguments), **kwargs)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SnapshotPublishError(
+            f"command could not complete ({Path(arguments[0]).name}): {exc}"
+        ) from exc
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "").strip()[-1000:]
         raise SnapshotPublishError(
@@ -800,6 +822,8 @@ def _ssh_arguments(config: PublishConfig) -> list[str]:
         "KbdInteractiveAuthentication=no",
         "-o",
         "IdentitiesOnly=yes",
+        "-o",
+        "IdentityAgent=none",
         "-o",
         "StrictHostKeyChecking=yes",
         "-o",
@@ -837,6 +861,242 @@ def _check_ssh_alias(
     if not existing_identities:
         raise SnapshotPublishError("SSH alias has no readable dedicated IdentityFile")
     return ssh
+
+
+def _json_command_output(output: str, *, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(output)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise SnapshotPublishError(f"{label} returned invalid JSON") from exc
+    if not isinstance(value, dict):
+        raise SnapshotPublishError(f"{label} returned non-object JSON")
+    return dict(value)
+
+
+def _remote_probe(
+    config: PublishConfig,
+    ssh: Sequence[str],
+    *,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    code = """
+import json
+import os
+import subprocess
+import sys
+import urllib.request
+from pathlib import Path
+
+project_root = Path(sys.argv[1])
+state_root = Path(sys.argv[2])
+python_path = Path(sys.argv[3])
+installer = Path(sys.argv[4])
+
+def fetch(url):
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/json", "User-Agent": "DcarRemoteProbe/1"},
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        if response.status != 200:
+            raise RuntimeError(f"unexpected HTTP status {response.status}: {url}")
+        value = json.loads(response.read().decode("utf-8"))
+        if not isinstance(value, dict):
+            raise RuntimeError(f"non-object JSON: {url}")
+        return value
+
+services = {
+    service: subprocess.run(
+        ["systemctl", "is-active", service],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    ).stdout.strip()
+    for service in ("dcar-api.service", "dcar-web.service", "dcar-auth.service")
+}
+directories = {
+    name: (state_root / name).is_dir()
+    for name in ("db", "cache", "reports", "runtime", "incoming")
+}
+active_path = state_root / "runtime" / "active-snapshot.json"
+active = json.loads(active_path.read_text(encoding="utf-8"))
+stat = os.statvfs(state_root)
+print(json.dumps({
+    "schema": "dcar-remote-publisher-probe-v1",
+    "current_release": str(project_root.resolve(strict=True)),
+    "python_ready": python_path.is_file() and os.access(python_path, os.X_OK),
+    "installer_ready": installer.is_file(),
+    "services": services,
+    "directories": directories,
+    "free_bytes": stat.f_bavail * stat.f_frsize,
+    "active_receipt": active,
+    "health": fetch("http://127.0.0.1:8765/api/v8/health"),
+    "overview": fetch("http://127.0.0.1:8765/api/v8/overview"),
+    "scheduler": fetch("http://127.0.0.1:8765/api/v8/scheduler"),
+}, sort_keys=True))
+""".strip()
+    command = shlex.join(
+        [
+            config.remote_python,
+            "-c",
+            code,
+            config.remote_project_root,
+            config.remote_state_root,
+            config.remote_python,
+            config.remote_installer,
+        ]
+    )
+    output = _run_checked(runner, _remote_command(ssh, command), timeout=60)
+    return _json_command_output(output, label="remote publisher probe")
+
+
+def _active_snapshot_id(active_receipt: Mapping[str, Any]) -> Optional[str]:
+    schema = active_receipt.get("schema")
+    key = (
+        "snapshot_id"
+        if schema == "dcar-read-replica-install-receipt-v1"
+        else "restored_from_snapshot"
+    )
+    value = active_receipt.get(key)
+    return (
+        str(value)
+        if isinstance(value, str) and SNAPSHOT_ID_RE.fullmatch(value)
+        else None
+    )
+
+
+def _validate_remote_probe(
+    value: object,
+    *,
+    config: PublishConfig,
+    expected_snapshot_id: Optional[str] = None,
+    expected_database_sha256: Optional[str] = None,
+    expected_runtime_identity: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or value.get("schema") != REMOTE_PROBE_SCHEMA:
+        raise SnapshotPublishError("remote publisher probe has an invalid shape")
+    current_release = value.get("current_release")
+    if (
+        not isinstance(current_release, str)
+        or not current_release.startswith("/")
+        or value.get("python_ready") is not True
+        or value.get("installer_ready") is not True
+    ):
+        raise SnapshotPublishError("remote release or publisher installer is not ready")
+    services = value.get("services")
+    if not isinstance(services, dict) or services != {
+        "dcar-api.service": "active",
+        "dcar-web.service": "active",
+        "dcar-auth.service": "active",
+    }:
+        raise SnapshotPublishError("remote Dcar services are not all active")
+    directories = value.get("directories")
+    if not isinstance(directories, dict) or not directories or not all(
+        item is True for item in directories.values()
+    ):
+        raise SnapshotPublishError("remote snapshot directories are incomplete")
+    free_bytes = value.get("free_bytes")
+    if not isinstance(free_bytes, int) or free_bytes <= 0:
+        raise SnapshotPublishError("remote publisher probe returned invalid free space")
+    health = value.get("health")
+    overview = value.get("overview")
+    scheduler = value.get("scheduler")
+    if not isinstance(health, dict) or health.get("status") != "ok":
+        raise SnapshotPublishError("remote API health is not ok")
+    if health.get("read_only") is not True:
+        raise SnapshotPublishError("remote API is not read-only")
+    if not isinstance(overview, dict) or overview.get("status") != "ready":
+        raise SnapshotPublishError("remote overview is not ready")
+    if (
+        not isinstance(scheduler, dict)
+        or scheduler.get("read_only") is not True
+        or scheduler.get("requested")
+        or scheduler.get("enabled")
+    ):
+        raise SnapshotPublishError("remote scheduler safety state is invalid")
+    database_state = health.get("database_state")
+    if not isinstance(database_state, dict):
+        raise SnapshotPublishError("remote health omitted database identity")
+    database_sha256 = database_state.get("sha256")
+    if not isinstance(database_sha256, str) or SHA256_RE.fullmatch(
+        database_sha256
+    ) is None:
+        raise SnapshotPublishError("remote health database SHA-256 is invalid")
+    if database_state.get("user_version") != config.expected_user_version:
+        raise SnapshotPublishError("remote health schema version is invalid")
+    runtime_identity = _validate_runtime_identity(
+        database_state.get("runtime_identity"), label="remote health"
+    )
+    active_receipt = value.get("active_receipt")
+    if not isinstance(active_receipt, dict) or _active_snapshot_id(active_receipt) is None:
+        raise SnapshotPublishError("remote active snapshot receipt is invalid")
+    if active_receipt.get("schema") == "dcar-read-replica-install-receipt-v1":
+        receipt_shas = active_receipt.get("database_sha256")
+        if (
+            not isinstance(receipt_shas, dict)
+            or receipt_shas.get("dcar_insight.sqlite3") != database_sha256
+            or active_receipt.get("runtime_identity") != runtime_identity
+        ):
+            raise SnapshotPublishError(
+                "remote active receipt does not match the active database"
+            )
+    if expected_snapshot_id is not None and _active_snapshot_id(
+        active_receipt
+    ) != expected_snapshot_id:
+        raise SnapshotPublishError("remote active snapshot_id does not match the publish")
+    if (
+        expected_database_sha256 is not None
+        and database_sha256 != expected_database_sha256
+    ):
+        raise SnapshotPublishError("remote active database SHA-256 does not match")
+    if (
+        expected_runtime_identity is not None
+        and runtime_identity != dict(expected_runtime_identity)
+    ):
+        raise SnapshotPublishError("remote active runtime identity does not match")
+    return {
+        "current_release": current_release,
+        "free_bytes": free_bytes,
+        "snapshot_id": _active_snapshot_id(active_receipt),
+        "database_sha256": database_sha256,
+        "runtime_identity": runtime_identity,
+        "active_receipt": dict(active_receipt),
+    }
+
+
+def _check_remote_sudo(
+    config: PublishConfig,
+    ssh: Sequence[str],
+    *,
+    runner: CommandRunner,
+) -> None:
+    command = shlex.join(
+        ["sudo", "-n", config.remote_python, config.remote_installer, "--help"]
+    )
+    _run_checked(runner, _remote_command(ssh, command), timeout=30)
+
+
+def remote_check(
+    config: PublishConfig, *, runner: CommandRunner = subprocess.run
+) -> dict[str, Any]:
+    ssh = _check_ssh_alias(config, runner=runner)
+    _check_remote_sudo(config, ssh, runner=runner)
+    result = _validate_remote_probe(
+        _remote_probe(config, ssh, runner=runner), config=config
+    )
+    return {
+        "status": "remote-check-ok",
+        "current_release": result["current_release"],
+        "snapshot_id": result["snapshot_id"],
+        "database_sha256": result["database_sha256"],
+        "database_schema_version": config.expected_user_version,
+        "report_version": EXPECTED_REPORT_VERSION,
+        "remote_free_bytes": result["free_bytes"],
+        "services": ["dcar-api.service", "dcar-web.service", "dcar-auth.service"],
+        "no_snapshot_built": True,
+        "no_remote_write": True,
+    }
 
 
 def _remote_command(ssh: Sequence[str], command: str) -> list[str]:
@@ -938,6 +1198,44 @@ def _prune_remote_snapshots(
     return dict(value)
 
 
+def _remote_installer_operation(
+    config: PublishConfig,
+    ssh: Sequence[str],
+    operation: str,
+    *,
+    runner: CommandRunner,
+    bundle: Optional[str] = None,
+    snapshot_id: Optional[str] = None,
+) -> dict[str, Any]:
+    arguments = [
+        "sudo",
+        "-n",
+        config.remote_python,
+        config.remote_installer,
+        operation,
+    ]
+    if bundle is not None:
+        arguments.extend(["--bundle", bundle])
+    if snapshot_id is not None:
+        arguments.extend(["--snapshot-id", snapshot_id])
+    output = _run_checked(
+        runner,
+        _remote_command(ssh, shlex.join(arguments)),
+        timeout=60 * 60,
+    )
+    value = _json_command_output(output, label=f"remote {operation}")
+    if operation == "verify":
+        if value.get("status") != "verified" or value.get("snapshot_id") is None:
+            raise SnapshotPublishError("remote verify receipt is invalid")
+    elif operation == "install":
+        if value.get("schema") != "dcar-read-replica-install-receipt-v1":
+            raise SnapshotPublishError("remote install receipt is invalid")
+    elif operation == "rollback":
+        if value.get("schema") != "dcar-read-replica-rollback-receipt-v1":
+            raise SnapshotPublishError("remote rollback receipt is invalid")
+    return value
+
+
 def _rsync_rsh(ssh: Sequence[str]) -> str:
     return shlex.join(ssh[:-1])
 
@@ -989,6 +1287,96 @@ def _publisher_lock(snapshot_root: Path) -> Iterator[None]:
 
 def _automatic_state_path(snapshot_root: Path) -> Path:
     return snapshot_root / AUTOMATIC_STATE_FILENAME
+
+
+def _pending_state_path(snapshot_root: Path) -> Path:
+    return snapshot_root / PENDING_STATE_FILENAME
+
+
+def _validate_pending_state(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != PENDING_STATE_KEYS:
+        raise SnapshotPublishError("publisher pending state has an invalid shape")
+    if value.get("schema") != PENDING_STATE_SCHEMA:
+        raise SnapshotPublishError("publisher pending state schema is invalid")
+    snapshot_id = value.get("snapshot_id")
+    database_sha256 = value.get("database_sha256")
+    previous_snapshot_id = value.get("previous_snapshot_id")
+    previous_database_sha256 = value.get("previous_database_sha256")
+    output_name = value.get("output_name")
+    if not isinstance(snapshot_id, str) or SNAPSHOT_ID_RE.fullmatch(snapshot_id) is None:
+        raise SnapshotPublishError("publisher pending snapshot_id is invalid")
+    if not isinstance(database_sha256, str) or SHA256_RE.fullmatch(
+        database_sha256
+    ) is None:
+        raise SnapshotPublishError("publisher pending database SHA-256 is invalid")
+    if previous_snapshot_id is not None and (
+        not isinstance(previous_snapshot_id, str)
+        or SNAPSHOT_ID_RE.fullmatch(previous_snapshot_id) is None
+    ):
+        raise SnapshotPublishError("publisher previous snapshot_id is invalid")
+    if not isinstance(previous_database_sha256, str) or SHA256_RE.fullmatch(
+        previous_database_sha256
+    ) is None:
+        raise SnapshotPublishError("publisher previous database SHA-256 is invalid")
+    if not isinstance(output_name, str) or LOCAL_SNAPSHOT_DIR_RE.fullmatch(
+        output_name
+    ) is None:
+        raise SnapshotPublishError("publisher pending output directory is invalid")
+    _validate_runtime_identity(value.get("runtime_identity"), label="publisher pending")
+    _validate_runtime_identity(
+        value.get("previous_runtime_identity"), label="publisher previous"
+    )
+    beijing_date_value = value.get("beijing_date")
+    if beijing_date_value is not None:
+        try:
+            date.fromisoformat(str(beijing_date_value))
+        except ValueError as exc:
+            raise SnapshotPublishError(
+                "publisher pending Beijing date is invalid"
+            ) from exc
+    receipt = value.get("receipt")
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("snapshot_id") != snapshot_id
+        or receipt.get("database_sha256") != database_sha256
+    ):
+        raise SnapshotPublishError("publisher pending receipt is invalid")
+    return dict(value)
+
+
+def _read_pending_state(snapshot_root: Path) -> Optional[dict[str, Any]]:
+    path = _pending_state_path(snapshot_root)
+    if path.is_symlink():
+        raise SnapshotPublishError("publisher pending state must not be a symlink")
+    if not path.exists():
+        return None
+    if not path.is_file():
+        raise SnapshotPublishError("publisher pending state must be a regular file")
+    metadata = path.stat()
+    if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) not in {
+        0o400,
+        0o600,
+    }:
+        raise SnapshotPublishError("publisher pending state permissions are unsafe")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SnapshotPublishError("publisher pending state is unreadable") from exc
+    return _validate_pending_state(value)
+
+
+def _clear_pending_state(snapshot_root: Path) -> None:
+    path = _pending_state_path(snapshot_root)
+    if path.is_symlink():
+        raise SnapshotPublishError("publisher pending state must not be a symlink")
+    if not path.exists():
+        return
+    path.unlink()
+    descriptor = os.open(snapshot_root, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _state_from_receipt(
@@ -1184,6 +1572,53 @@ def _prune_local_snapshots(
     return sorted(deleted)
 
 
+def _finish_pending_publish(
+    config: PublishConfig, pending: Mapping[str, Any]
+) -> dict[str, Any]:
+    output = config.snapshot_root / str(pending["output_name"])
+    if output.parent != config.snapshot_root or output.is_symlink() or not output.is_dir():
+        raise SnapshotPublishError("pending snapshot output is missing or unsafe")
+    receipt = dict(pending["receipt"])
+    _write_json_atomic(output / "publisher-receipt.json", receipt)
+    beijing_date_value = pending.get("beijing_date")
+    if beijing_date_value is not None:
+        beijing_date = date.fromisoformat(str(beijing_date_value))
+        state = _state_from_receipt(receipt, beijing_date=beijing_date)
+        _write_json_atomic(_automatic_state_path(config.snapshot_root), state)
+    _clear_pending_state(config.snapshot_root)
+    _prune_local_snapshots(config.snapshot_root)
+    return receipt
+
+
+def _reconcile_pending_publish(
+    config: PublishConfig,
+    ssh: Sequence[str],
+    *,
+    runner: CommandRunner,
+) -> Optional[dict[str, Any]]:
+    pending = _read_pending_state(config.snapshot_root)
+    if pending is None:
+        return None
+    remote = _validate_remote_probe(
+        _remote_probe(config, ssh, runner=runner), config=config
+    )
+    if (
+        remote["snapshot_id"] == pending["snapshot_id"]
+        and remote["database_sha256"] == pending["database_sha256"]
+        and remote["runtime_identity"] == pending["runtime_identity"]
+    ):
+        return _finish_pending_publish(config, pending)
+    if (
+        remote["database_sha256"] == pending["previous_database_sha256"]
+        and remote["runtime_identity"] == pending["previous_runtime_identity"]
+    ):
+        _clear_pending_state(config.snapshot_root)
+        return None
+    raise SnapshotPublishError(
+        "pending publish matches neither the new nor previous healthy remote snapshot"
+    )
+
+
 def publish_snapshot(
     *,
     project_root: Path,
@@ -1214,6 +1649,12 @@ def publish_snapshot(
             fetch_json=fetch_json,
         )
         ssh = _check_ssh_alias(config, runner=runner)
+        reconciled = _reconcile_pending_publish(config, ssh, runner=runner)
+        if reconciled is not None:
+            return reconciled
+        previous_remote = _validate_remote_probe(
+            _remote_probe(config, ssh, runner=runner), config=config
+        )
         remote_prune = _prune_remote_snapshots(config, ssh, runner=runner)
         output = config.snapshot_root / (
             "snapshot-" + current.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -1358,19 +1799,15 @@ def publish_snapshot(
                 "remote free space fell below the reserve after staging; "
                 "active data was not changed"
             )
-        for operation in ("verify", "install"):
-            remote = shlex.join(
-                [
-                    "sudo",
-                    "-n",
-                    config.remote_python,
-                    config.remote_installer,
-                    operation,
-                    "--bundle",
-                    incoming_bundle,
-                ]
-            )
-            _run_checked(runner, _remote_command(ssh, remote), timeout=60 * 60)
+        verify_receipt = _remote_installer_operation(
+            config,
+            ssh,
+            "verify",
+            runner=runner,
+            bundle=incoming_bundle,
+        )
+        if verify_receipt.get("snapshot_id") != snapshot_id:
+            raise SnapshotPublishError("remote verify snapshot_id does not match")
         receipt = {
             "schema": "dcar-snapshot-publisher-receipt-v1",
             "snapshot_id": snapshot_id,
@@ -1416,12 +1853,120 @@ def publish_snapshot(
             "remote_staging_root": incoming,
             "remote_retention": remote_prune,
         }
-        _write_json_atomic(output / "publisher-receipt.json", receipt)
-        if automatic_beijing_date is not None:
-            state = _state_from_receipt(receipt, beijing_date=automatic_beijing_date)
-            _write_json_atomic(_automatic_state_path(config.snapshot_root), state)
-            _prune_local_snapshots(config.snapshot_root)
-        return receipt
+        pending = {
+            "schema": PENDING_STATE_SCHEMA,
+            "beijing_date": (
+                automatic_beijing_date.isoformat()
+                if automatic_beijing_date is not None
+                else None
+            ),
+            "snapshot_id": snapshot_id,
+            "database_sha256": receipt["database_sha256"],
+            "runtime_identity": manifest_runtime_identity,
+            "previous_snapshot_id": previous_remote["snapshot_id"],
+            "previous_database_sha256": previous_remote["database_sha256"],
+            "previous_runtime_identity": previous_remote["runtime_identity"],
+            "output_name": output.name,
+            "receipt": receipt,
+        }
+        _validate_pending_state(pending)
+        _write_json_atomic(_pending_state_path(config.snapshot_root), pending)
+        try:
+            install_receipt = _remote_installer_operation(
+                config,
+                ssh,
+                "install",
+                runner=runner,
+                bundle=incoming_bundle,
+            )
+        except SnapshotPublishError as install_error:
+            try:
+                remote_after_error = _validate_remote_probe(
+                    _remote_probe(config, ssh, runner=runner), config=config
+                )
+            except SnapshotPublishError as probe_error:
+                raise SnapshotPublishError(
+                    "remote install outcome is unknown; pending state retained"
+                ) from probe_error
+            if (
+                remote_after_error["snapshot_id"] == snapshot_id
+                and remote_after_error["database_sha256"]
+                == receipt["database_sha256"]
+                and remote_after_error["runtime_identity"]
+                == manifest_runtime_identity
+            ):
+                return _finish_pending_publish(config, pending)
+            if (
+                remote_after_error["database_sha256"]
+                == previous_remote["database_sha256"]
+                and remote_after_error["runtime_identity"]
+                == previous_remote["runtime_identity"]
+            ):
+                _clear_pending_state(config.snapshot_root)
+                raise install_error
+            raise SnapshotPublishError(
+                "failed install did not restore the previous remote snapshot; "
+                "pending state retained"
+            ) from install_error
+        if (
+            install_receipt.get("snapshot_id") != snapshot_id
+            or install_receipt.get("database_sha256", {}).get(
+                "dcar_insight.sqlite3"
+            )
+            != receipt["database_sha256"]
+            or install_receipt.get("runtime_identity") != manifest_runtime_identity
+        ):
+            install_mismatch: Optional[SnapshotPublishError] = SnapshotPublishError(
+                "remote install receipt does not match the verified snapshot"
+            )
+        else:
+            try:
+                remote_probe_value = _remote_probe(config, ssh, runner=runner)
+            except SnapshotPublishError as probe_error:
+                raise SnapshotPublishError(
+                    "post-install remote verification is temporarily unavailable; "
+                    "healthy remote state was not rolled back and pending state was retained"
+                ) from probe_error
+            try:
+                _validate_remote_probe(
+                    remote_probe_value,
+                    config=config,
+                    expected_snapshot_id=snapshot_id,
+                    expected_database_sha256=str(receipt["database_sha256"]),
+                    expected_runtime_identity=manifest_runtime_identity,
+                )
+            except SnapshotPublishError as exc:
+                install_mismatch = exc
+            else:
+                install_mismatch = None
+        if install_mismatch is not None:
+            try:
+                _remote_installer_operation(
+                    config,
+                    ssh,
+                    "rollback",
+                    runner=runner,
+                    snapshot_id=snapshot_id,
+                )
+                _validate_remote_probe(
+                    _remote_probe(config, ssh, runner=runner),
+                    config=config,
+                    expected_database_sha256=str(
+                        previous_remote["database_sha256"]
+                    ),
+                    expected_runtime_identity=previous_remote["runtime_identity"],
+                )
+            except SnapshotPublishError as rollback_error:
+                raise SnapshotPublishError(
+                    "post-install validation failed and rollback could not be verified; "
+                    "pending state retained"
+                ) from rollback_error
+            _clear_pending_state(config.snapshot_root)
+            raise SnapshotPublishError(
+                f"post-install validation failed; previous snapshot restored: "
+                f"{install_mismatch}"
+            ) from install_mismatch
+        return _finish_pending_publish(config, pending)
 
 
 def publish_snapshot_automatically(
@@ -1457,6 +2002,11 @@ def publish_snapshot_automatically(
                 "no_snapshot_built": True,
                 "no_ssh_attempted": True,
             }
+        if _read_pending_state(config.snapshot_root) is not None:
+            ssh = _check_ssh_alias(config, runner=runner)
+            reconciled = _reconcile_pending_publish(config, ssh, runner=runner)
+            if reconciled is not None:
+                return reconciled
         # Bound failed build/transfer attempts too: two existing directories
         # plus this attempt can never grow beyond the normal retain count.
         _prune_local_snapshots(config.snapshot_root, retain_count=2)
@@ -1485,6 +2035,11 @@ def _parser() -> argparse.ArgumentParser:
         "--check",
         action="store_true",
         help="Validate local configuration and writer freshness without building or connecting.",
+    )
+    mode.add_argument(
+        "--remote-check",
+        action="store_true",
+        help="Run read-only SSH, service, receipt, schema, runtime, and API checks.",
     )
     mode.add_argument(
         "--automatic",
@@ -1516,6 +2071,8 @@ def main() -> int:
                 "no_snapshot_built": True,
                 "no_ssh_attempted": True,
             }
+        elif arguments.remote_check:
+            result = remote_check(config)
         elif arguments.automatic:
             result = publish_snapshot_automatically(
                 project_root=project_root,

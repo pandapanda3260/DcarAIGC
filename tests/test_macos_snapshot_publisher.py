@@ -232,11 +232,64 @@ class FakeRunner:
         free_bytes: int = 100_000_000_000,
         dry_run_bytes: int = 1_024,
         fail_install: bool = False,
+        install_mismatch: bool = False,
+        fail_probe_after_install: bool = False,
     ):
         self.free_bytes = free_bytes
         self.dry_run_bytes = dry_run_bytes
         self.fail_install = fail_install
+        self.install_mismatch = install_mismatch
+        self.fail_probe_after_install = fail_probe_after_install
+        self.active_snapshot_id = "20260810T010000Z-bbbbbbbbbbbb"
+        self.active_database_sha256 = "b" * 64
+        self.install_attempted = False
         self.commands: list[list[str]] = []
+
+    def probe(self) -> dict[str, object]:
+        runtime_identity = _runtime_identity()
+        active_receipt: dict[str, object] = {
+            "schema": "dcar-read-replica-install-receipt-v1",
+            "snapshot_id": self.active_snapshot_id,
+            "database_sha256": {
+                "dcar_insight.sqlite3": self.active_database_sha256
+            },
+            "runtime_identity": runtime_identity,
+        }
+        return {
+            "schema": publisher.REMOTE_PROBE_SCHEMA,
+            "current_release": "/var/www/dcar-aigc/releases/test-release",
+            "python_ready": True,
+            "installer_ready": True,
+            "services": {
+                "dcar-api.service": "active",
+                "dcar-web.service": "active",
+                "dcar-auth.service": "active",
+            },
+            "directories": {
+                "db": True,
+                "cache": True,
+                "reports": True,
+                "runtime": True,
+                "incoming": True,
+            },
+            "free_bytes": self.free_bytes,
+            "active_receipt": active_receipt,
+            "health": {
+                "status": "ok",
+                "read_only": True,
+                "database_state": {
+                    "sha256": self.active_database_sha256,
+                    "user_version": 16,
+                    "runtime_identity": runtime_identity,
+                },
+            },
+            "overview": {"status": "ready"},
+            "scheduler": {
+                "read_only": True,
+                "requested": False,
+                "enabled": False,
+            },
+        }
 
     def __call__(
         self, arguments: list[str], **_: object
@@ -249,6 +302,52 @@ class FakeRunner:
                 arguments,
                 0,
                 stdout=f"hostname example.invalid\nuser deploy\nidentityfile {identity}\n",
+                stderr="",
+            )
+        if "dcar-remote-publisher-probe-v1" in rendered:
+            if self.fail_probe_after_install and self.install_attempted:
+                return subprocess.CompletedProcess(
+                    arguments, 255, stdout="", stderr="temporary network failure"
+                )
+            return subprocess.CompletedProcess(
+                arguments, 0, stdout=json.dumps(self.probe()) + "\n", stderr=""
+            )
+        if " install --bundle " in f" {rendered} ":
+            self.install_attempted = True
+            if self.fail_install:
+                return subprocess.CompletedProcess(
+                    arguments, 1, stdout="", stderr="remote install refused"
+                )
+            self.active_snapshot_id = "20260811T010000Z-aaaaaaaaaaaa"
+            self.active_database_sha256 = (
+                "c" * 64 if self.install_mismatch else "a" * 64
+            )
+            return subprocess.CompletedProcess(
+                arguments,
+                0,
+                stdout=json.dumps(
+                    {
+                        "schema": "dcar-read-replica-install-receipt-v1",
+                        "snapshot_id": "20260811T010000Z-aaaaaaaaaaaa",
+                        "database_sha256": {"dcar_insight.sqlite3": "a" * 64},
+                        "runtime_identity": _runtime_identity(),
+                    }
+                )
+                + "\n",
+                stderr="",
+            )
+        if " rollback " in f" {rendered} ":
+            self.active_database_sha256 = "b" * 64
+            return subprocess.CompletedProcess(
+                arguments,
+                0,
+                stdout=json.dumps(
+                    {
+                        "schema": "dcar-read-replica-rollback-receipt-v1",
+                        "restored_from_snapshot": "20260811T010000Z-aaaaaaaaaaaa",
+                    }
+                )
+                + "\n",
                 stderr="",
             )
         if "statvfs" in rendered:
@@ -282,9 +381,18 @@ class FakeRunner:
                 + "\n",
                 stderr="",
             )
-        if self.fail_install and " install --bundle " in f" {rendered} ":
+        if " verify --bundle " in f" {rendered} ":
             return subprocess.CompletedProcess(
-                arguments, 1, stdout="", stderr="remote install refused"
+                arguments,
+                0,
+                stdout=json.dumps(
+                    {
+                        "status": "verified",
+                        "snapshot_id": "20260811T010000Z-aaaaaaaaaaaa",
+                    }
+                )
+                + "\n",
+                stderr="",
             )
         return subprocess.CompletedProcess(arguments, 0, stdout="{}\n", stderr="")
 
@@ -353,6 +461,40 @@ class MacOSSnapshotPublisherTest(unittest.TestCase):
             "file_byte_size": 71_303_168,
             "optional_reuse_byte_size": 40_667_885_776,
         }
+
+    def write_pending_state(self) -> dict[str, object]:
+        self.snapshot_root.mkdir(mode=0o700)
+        output = self.snapshot_root / "snapshot-20260811T010000Z"
+        output.mkdir(exist_ok=True)
+        receipt: dict[str, object] = {
+            "schema": "dcar-snapshot-publisher-receipt-v1",
+            "snapshot_id": "20260811T010000Z-aaaaaaaaaaaa",
+            "published_at": "2026-08-11T01:01:00Z",
+            "capture_scheduled_for": "2026-08-10T18:00:00Z",
+            "capture_status": "partial",
+            "media_download_status": "succeeded",
+            "media_processing_status": "succeeded",
+            "media_cutoff_status": "succeeded",
+            "daily_report_status": "partial",
+            "weekly_report_status": None,
+            "database_sha256": "a" * 64,
+        }
+        pending: dict[str, object] = {
+            "schema": publisher.PENDING_STATE_SCHEMA,
+            "beijing_date": "2026-08-11",
+            "snapshot_id": "20260811T010000Z-aaaaaaaaaaaa",
+            "database_sha256": "a" * 64,
+            "runtime_identity": _runtime_identity(),
+            "previous_snapshot_id": "20260810T010000Z-bbbbbbbbbbbb",
+            "previous_database_sha256": "b" * 64,
+            "previous_runtime_identity": _runtime_identity(),
+            "output_name": output.name,
+            "receipt": receipt,
+        }
+        publisher._write_json_atomic(
+            self.snapshot_root / publisher.PENDING_STATE_FILENAME, pending
+        )
+        return pending
 
     def test_launch_agent_is_enabled_and_reconciles_hourly_from_0900(self) -> None:
         template = (
@@ -439,12 +581,29 @@ class MacOSSnapshotPublisherTest(unittest.TestCase):
         self.assertIn('"${DCAR_STARTUP_CATCHUP_ENABLED:-}" == "0"', wrapper)
         self.assertIn("/usr/bin/caffeinate -i", wrapper)
         self.assertIn("arguments+=(--automatic)", wrapper)
+        self.assertIn("unset SSH_AUTH_SOCK", wrapper)
+        self.assertIn("arguments+=(--remote-check)", wrapper)
         self.assertIn("TIKHUB_API_KEY_FILE", wrapper)
         self.assertNotIn("TIKHUB_API_KEY=", example)
         self.assertNotIn("PASSWORD=", example)
         self.assertNotIn("PRIVATE_KEY=", example)
         self.assertIn("40,739,188,944", example)
         self.assertIn("DCAR_PUBLISH_EXPECTED_USER_VERSION=16", example)
+
+    def test_remote_check_is_read_only_and_uses_no_local_state(self) -> None:
+        runner = FakeRunner()
+        with patch.object(publisher.Path, "home", return_value=self.fake_home):
+            result = publisher.remote_check(self.config(), runner=runner)
+        self.assertEqual(result["status"], "remote-check-ok")
+        self.assertTrue(result["no_remote_write"])
+        self.assertFalse(self.snapshot_root.exists())
+        rendered = "\n".join(" ".join(command) for command in runner.commands)
+        self.assertIn("IdentityAgent=none", rendered)
+        self.assertIn(" --help", rendered)
+        self.assertNotIn(" prune ", f" {rendered} ")
+        self.assertNotIn(" install ", f" {rendered} ")
+        self.assertNotIn(" rollback ", f" {rendered} ")
+        self.assertNotIn("rsync", rendered)
 
     def test_writer_freshness_accepts_today_partial_capture_but_rejects_stale_content(
         self,
@@ -1140,6 +1299,61 @@ class MacOSSnapshotPublisherTest(unittest.TestCase):
         self.assertTrue(state_path.is_file())
         self.assertEqual(len(runner.commands), command_count)
 
+    def test_pending_new_remote_completes_without_rebuild(self) -> None:
+        self.write_pending_state()
+        runner = FakeRunner()
+        runner.active_snapshot_id = "20260811T010000Z-aaaaaaaaaaaa"
+        runner.active_database_sha256 = "a" * 64
+        with patch.object(publisher.Path, "home", return_value=self.fake_home):
+            result = publisher.publish_snapshot_automatically(
+                project_root=self.project,
+                database=self.database,
+                legacy_database=None,
+                config=self.config(),
+                now=datetime(2026, 8, 11, 12, 0, tzinfo=SHANGHAI),
+                runner=runner,
+                fetch_json=lambda _url: self.fail("pending reconcile queried writer"),
+                build_snapshot=lambda **_arguments: self.fail(
+                    "pending reconcile rebuilt snapshot"
+                ),
+            )
+        self.assertEqual(result["snapshot_id"], runner.active_snapshot_id)
+        self.assertFalse(
+            (self.snapshot_root / publisher.PENDING_STATE_FILENAME).exists()
+        )
+        self.assertTrue(
+            (self.snapshot_root / publisher.AUTOMATIC_STATE_FILENAME).is_file()
+        )
+
+    def test_pending_previous_remote_clears_for_retry(self) -> None:
+        self.write_pending_state()
+        runner = FakeRunner()
+        with patch.object(publisher.Path, "home", return_value=self.fake_home):
+            ssh = publisher._check_ssh_alias(self.config(), runner=runner)
+            result = publisher._reconcile_pending_publish(
+                self.config(), ssh, runner=runner
+            )
+        self.assertIsNone(result)
+        self.assertFalse(
+            (self.snapshot_root / publisher.PENDING_STATE_FILENAME).exists()
+        )
+
+    def test_pending_unknown_remote_blocks_and_is_retained(self) -> None:
+        self.write_pending_state()
+        runner = FakeRunner()
+        runner.active_database_sha256 = "c" * 64
+        with (
+            patch.object(publisher.Path, "home", return_value=self.fake_home),
+            self.assertRaisesRegex(
+                publisher.SnapshotPublishError, "matches neither"
+            ),
+        ):
+            ssh = publisher._check_ssh_alias(self.config(), runner=runner)
+            publisher._reconcile_pending_publish(self.config(), ssh, runner=runner)
+        self.assertTrue(
+            (self.snapshot_root / publisher.PENDING_STATE_FILENAME).is_file()
+        )
+
     def test_automatic_state_recovery_ignores_old_unpublishable_receipt(self) -> None:
         self.snapshot_root.mkdir(mode=0o700)
         output = self.snapshot_root / "snapshot-20260811T010000Z"
@@ -1421,6 +1635,59 @@ class MacOSSnapshotPublisherTest(unittest.TestCase):
         rendered = "\n".join(" ".join(command) for command in runner.commands)
         self.assertNotIn(" rm ", f" {rendered} ")
         self.assertNotIn("--delete", rendered)
+
+    def test_post_install_identity_mismatch_rolls_back_and_clears_pending(
+        self,
+    ) -> None:
+        runner = FakeRunner(install_mismatch=True)
+        with (
+            patch.object(publisher.Path, "home", return_value=self.fake_home),
+            self.assertRaisesRegex(
+                publisher.SnapshotPublishError, "previous snapshot restored"
+            ),
+        ):
+            publisher.publish_snapshot(
+                project_root=self.project,
+                database=self.database,
+                legacy_database=None,
+                config=self.config(),
+                now=datetime(2026, 8, 11, 9, 0, tzinfo=SHANGHAI),
+                runner=runner,
+                fetch_json=_fetch_writer,
+                build_snapshot=self.fake_builder,
+            )
+        rendered = "\n".join(" ".join(command) for command in runner.commands)
+        self.assertIn(" rollback ", f" {rendered} ")
+        self.assertEqual(runner.active_database_sha256, "b" * 64)
+        self.assertFalse(
+            (self.snapshot_root / publisher.PENDING_STATE_FILENAME).exists()
+        )
+
+    def test_post_install_network_failure_retains_pending_without_rollback(
+        self,
+    ) -> None:
+        runner = FakeRunner(fail_probe_after_install=True)
+        with (
+            patch.object(publisher.Path, "home", return_value=self.fake_home),
+            self.assertRaisesRegex(
+                publisher.SnapshotPublishError, "temporarily unavailable"
+            ),
+        ):
+            publisher.publish_snapshot(
+                project_root=self.project,
+                database=self.database,
+                legacy_database=None,
+                config=self.config(),
+                now=datetime(2026, 8, 11, 9, 0, tzinfo=SHANGHAI),
+                runner=runner,
+                fetch_json=_fetch_writer,
+                build_snapshot=self.fake_builder,
+            )
+        rendered = "\n".join(" ".join(command) for command in runner.commands)
+        self.assertNotIn(" rollback ", f" {rendered} ")
+        self.assertTrue(
+            (self.snapshot_root / publisher.PENDING_STATE_FILENAME).is_file()
+        )
 
 
 if __name__ == "__main__":

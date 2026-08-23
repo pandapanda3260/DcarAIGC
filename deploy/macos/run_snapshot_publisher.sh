@@ -1,6 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 umask 077
+unset SSH_AUTH_SOCK
 
 fail() {
   echo "Dcar snapshot publisher preflight failed: $*" >&2
@@ -43,10 +44,12 @@ if [[ -n "${DCAR_LEGACY_DB:-}" ]]; then
 fi
 if [[ "${1:-}" == "--check" ]]; then
   arguments+=(--check)
+elif [[ "${1:-}" == "--remote-check" ]]; then
+  arguments+=(--remote-check)
 elif [[ $# -eq 0 ]]; then
   arguments+=(--automatic)
 else
-  fail "only the optional --check argument is supported"
+  fail "only the optional --check or --remote-check argument is supported"
 fi
 
 echo "Dcar snapshot publisher starting; provider_calls=0 catchup=0"
