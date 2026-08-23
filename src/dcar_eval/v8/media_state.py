@@ -12,10 +12,8 @@ from .media import (
     IMAGE_DOWNLOAD_VERSION,
     MAX_MEDIA_DOWNLOAD_ATTEMPTS,
     MAX_MEDIA_PROCESSING_ATTEMPTS,
-    MediaProcessingError,
-    _effective_download_slot,
-    _matching_download_slots,
-    _validated_recovery_media_source,
+    MEDIA_SOURCE_VERSION,
+    VIDEO_DOWNLOAD_VERSION,
     processor_versions,
 )
 
@@ -337,6 +335,25 @@ def media_terminal_state_details(
             )
         ] = row
 
+    latest_sources: dict[int, sqlite3.Row] = {}
+    for chunk in chunks:
+        placeholders = ",".join("?" for _ in chunk)
+        for row in connection.execute(
+            f"""
+            SELECT * FROM (
+                SELECT content_id,sha256,processor_version,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY content_id ORDER BY id DESC
+                       ) AS selector_rank
+                FROM evidence_artifacts
+                WHERE artifact_type='media_source' AND status='available'
+                  AND content_id IN ({placeholders})
+            ) WHERE selector_rank=1
+            """,
+            chunk,
+        ).fetchall():
+            latest_sources[int(row["content_id"])] = row
+
     evaluations: dict[int, sqlite3.Row] = {}
     for chunk in chunks:
         placeholders = ",".join("?" for _ in chunk)
@@ -404,43 +421,23 @@ def media_terminal_state_details(
         ):
             result[content_id] = MediaTerminalDetail("complete", "complete")
             continue
-        try:
-            _source_row, source, _urls, flat_source_sha256 = (
-                _validated_recovery_media_source(
-                    connection,
-                    content_id=content_id,
-                )
-            )
-            effective_download = _effective_download_slot(
-                _matching_download_slots(
-                    connection,
-                    content_id=content_id,
-                    source=source,
-                )
-            )
-        except (MediaProcessingError, OSError):
-            continue
-        download_row = (
-            slots_by_id.get(int(effective_download["id"]))
-            if effective_download is not None
-            else None
-        )
-        if download_row is None and (
-            content["platform"] == "douyin" and content["content_type"] == "image"
+        source_row = latest_sources.get(content_id)
+        if (
+            source_row is None
+            or source_row["processor_version"] != MEDIA_SOURCE_VERSION
+            or not _valid_sha256(source_row["sha256"])
         ):
-            download_identity = _douyin_image_download_identity(
-                slots_by_content.get(content_id, []),
-                flat_source_sha256=flat_source_sha256,
-                content_id=content_id,
-            )
-            if download_identity is not None:
-                download_sha256, download_version = download_identity
-                download_row = slot_for(
-                    content_id,
-                    download_sha256,
-                    "download",
-                    download_version,
-                )
+            continue
+        download_row = slot_for(
+            content_id,
+            str(source_row["sha256"]),
+            "download",
+            (
+                VIDEO_DOWNLOAD_VERSION
+                if content["content_type"] == "video"
+                else IMAGE_DOWNLOAD_VERSION
+            ),
+        )
         download_outcome, media_artifact = _slot_artifact(
             download_row,
             content_id=content_id,

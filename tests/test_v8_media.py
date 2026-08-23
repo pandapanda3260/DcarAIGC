@@ -2140,7 +2140,7 @@ class V8MediaTest(unittest.TestCase):
             )
         self.assertEqual(after, before)
 
-    def test_image_download_binding_separates_same_urls_with_different_groups(
+    def test_artifact_slot_rejects_conflicting_groups_for_the_same_source(
         self,
     ) -> None:
         urls = [
@@ -2209,42 +2209,41 @@ class V8MediaTest(unittest.TestCase):
             maximum_bytes=10_000,
             reuse_existing=False,
         )
-        second = media.download_image_sources(
-            1,
-            urls,
-            db_path=self.db,
-            media_root=output_root,
-            frozen_image_groups=second_groups,
-            urlopen_fn=open_image,
-            maximum_bytes=10_000,
-            reuse_existing=False,
-        )
+        with self.assertRaisesRegex(
+            media.MediaProcessingError, "cached download slot artifact evidence drifted"
+        ):
+            media.download_image_sources(
+                1,
+                urls,
+                db_path=self.db,
+                media_root=output_root,
+                frozen_image_groups=second_groups,
+                urlopen_fn=open_image,
+                maximum_bytes=10_000,
+                reuse_existing=False,
+            )
 
-        self.assertNotEqual(first.id, second.id)
-        self.assertNotEqual(first.local_path, second.local_path)
         self.assertIn(first_binding, first.local_path)
-        self.assertIn(second_binding, second.local_path)
-        self.assertEqual(calls, [urls[0], urls[2], urls[0], urls[1]])
+        self.assertEqual(calls, [urls[0], urls[2]])
         with connect(self.db) as connection:
             slots = connection.execute(
                 "SELECT source_sha256,status FROM media_processing_slots "
                 "WHERE content_id=1 AND processor_type='download' ORDER BY id"
             ).fetchall()
+            current_source_sha256 = connection.execute(
+                "SELECT sha256 FROM evidence_artifacts WHERE content_id=1 "
+                "AND artifact_type='media_source' ORDER BY id DESC LIMIT 1"
+            ).fetchone()[0]
             artifacts = connection.execute(
                 "SELECT local_path,metadata_json FROM evidence_artifacts "
-                "WHERE id IN (?,?) ORDER BY id",
-                (first.id, second.id),
+                "WHERE id=? ORDER BY id",
+                (first.id,),
             ).fetchall()
         self.assertEqual(
             [(row["source_sha256"], row["status"]) for row in slots],
-            [(first_binding, "succeeded"), (second_binding, "succeeded")],
+            [(current_source_sha256, "succeeded")],
         )
-        for row, groups_sha, binding in zip(
-            artifacts,
-            (first_groups_sha, second_groups_sha),
-            (first_binding, second_binding),
-            strict=True,
-        ):
+        for row in artifacts:
             metadata = json.loads(row["metadata_json"])
             self.assertEqual(
                 metadata,
@@ -2252,14 +2251,14 @@ class V8MediaTest(unittest.TestCase):
                     "source_count": 2,
                     "source_url_count": 4,
                     "source_sha256": flat_sha,
-                    "image_groups_sha256": groups_sha,
-                    "download_binding_sha256": binding,
+                    "image_groups_sha256": first_groups_sha,
+                    "download_binding_sha256": first_binding,
                 },
             )
             manifest = json.loads(Path(row["local_path"]).read_text())
             self.assertEqual(manifest["source_sha256"], flat_sha)
-            self.assertEqual(manifest["image_groups_sha256"], groups_sha)
-            self.assertEqual(manifest["download_binding_sha256"], binding)
+            self.assertEqual(manifest["image_groups_sha256"], first_groups_sha)
+            self.assertEqual(manifest["download_binding_sha256"], first_binding)
 
     def test_cached_grouped_image_download_revalidates_exact_closure(self) -> None:
         urls = [
@@ -4205,6 +4204,56 @@ class V8MediaTest(unittest.TestCase):
         self.assertEqual(state["download_slot"]["attempt_count"], 1)
         self.assertIsNone(state["download_slot"]["output_artifact_id"])
 
+    def test_corrupt_source_is_claimed_by_artifact_sha_and_stops_after_three_attempts(
+        self,
+    ) -> None:
+        media_root = self.root / "corrupt-source-slot"
+        with patch.object(media, "MEDIA_ROOT", media_root):
+            source = media.store_media_source_manifest(
+                1,
+                media_kind="video",
+                urls=["https://cdn.example/corrupt-source.mp4"],
+                raw_response_id=991,
+                db_path=self.db,
+            )
+            assert source is not None
+            Path(source.local_path).write_text("{broken", encoding="utf-8")
+            with patch.object(
+                media,
+                "_download_video",
+                side_effect=AssertionError("network must not run for corrupt source"),
+            ) as download:
+                attempts = [
+                    media.run_media_download_queue(
+                        limit=1, max_workers=1, db_path=self.db
+                    )
+                    for _ in range(3)
+                ]
+
+        download.assert_not_called()
+        self.assertEqual(
+            [item["retryable_failed"] for item in attempts], [1, 1, 0]
+        )
+        self.assertEqual(
+            [item["terminal_failed"] for item in attempts], [0, 0, 1]
+        )
+        with connect(self.db) as connection:
+            source_sha256 = connection.execute(
+                "SELECT sha256 FROM evidence_artifacts WHERE id=?", (source.id,)
+            ).fetchone()[0]
+            slot = connection.execute(
+                "SELECT source_sha256,status,attempt_count FROM media_processing_slots "
+                "WHERE content_id=1 AND processor_type='download'"
+            ).fetchone()
+        self.assertEqual(slot["source_sha256"], source_sha256)
+        self.assertNotEqual(
+            slot["source_sha256"],
+            media._media_source_identity(
+                "video", ["https://cdn.example/corrupt-source.mp4"]
+            )[1],
+        )
+        self.assertEqual((slot["status"], slot["attempt_count"]), ("terminal_failed", 3))
+
     def test_generic_douyin_state_and_queues_fail_closed_but_explicit_groups_reuse(
         self,
     ) -> None:
@@ -4321,7 +4370,8 @@ class V8MediaTest(unittest.TestCase):
 
         self.assertIsNotNone(state)
         assert state is not None
-        self.assertIsNone(state["download_slot"])
+        self.assertEqual(state["download_slot"]["status"], "succeeded")
+        self.assertEqual(state["download_slot"]["output_artifact_id"], artifact.id)
         self.assertEqual(download_queue["candidates"], 0)
         self.assertEqual(process_queue["candidates"], 0)
         self.assertEqual(repeated_process["candidates"], 0)
@@ -4329,19 +4379,33 @@ class V8MediaTest(unittest.TestCase):
         urlopen.assert_not_called()
         ocr.assert_called_once()
         with connect(self.db) as connection:
+            current_counts = (
+                connection.execute(
+                    "SELECT COUNT(*) FROM media_processing_slots "
+                    "WHERE content_id=1 AND processor_type='download'"
+                ).fetchone()[0],
+                connection.execute(
+                    "SELECT COUNT(*) FROM evidence_artifacts "
+                    "WHERE content_id=1 AND artifact_type='media_manifest'"
+                ).fetchone()[0],
+            )
             self.assertEqual(
-                (
-                    connection.execute(
-                        "SELECT COUNT(*) FROM media_processing_slots "
-                        "WHERE content_id=1 AND processor_type='download'"
-                    ).fetchone()[0],
-                    connection.execute(
-                        "SELECT COUNT(*) FROM evidence_artifacts "
-                        "WHERE content_id=1 AND artifact_type='media_manifest'"
-                    ).fetchone()[0],
-                ),
+                current_counts,
                 download_counts_before,
             )
+            current_source_sha256 = connection.execute(
+                "SELECT sha256 FROM evidence_artifacts "
+                "WHERE content_id=1 AND artifact_type='media_source' "
+                "ORDER BY id DESC LIMIT 1"
+            ).fetchone()[0]
+            migrated = connection.execute(
+                "SELECT status,source_sha256,output_artifact_id "
+                "FROM media_processing_slots WHERE content_id=1 "
+                "AND processor_type='download' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            self.assertEqual(migrated["status"], "succeeded")
+            self.assertEqual(migrated["source_sha256"], current_source_sha256)
+            self.assertEqual(migrated["output_artifact_id"], artifact.id)
 
         forged_groups = media.douyin_image_source_groups(urls, [urls])
         forged_groups_sha256 = media.image_groups_sha256(forged_groups)
@@ -4647,7 +4711,7 @@ class V8MediaTest(unittest.TestCase):
                     content_id=content_id,
                     artifact_type="media_source",
                     path=source,
-                    processor_version="queue-order-test",
+                    processor_version=media.MEDIA_SOURCE_VERSION,
                 )
             connection.commit()
 
@@ -4679,6 +4743,7 @@ class V8MediaTest(unittest.TestCase):
             stage="download",
             limit=3,
             db_path=self.db,
+            scope_content_ids=None,
         )
         self.assertEqual([item.args[0] for item in process.call_args_list], [1, 2])
         self.assertEqual(result["candidates"], 2)
@@ -4726,6 +4791,7 @@ class V8MediaTest(unittest.TestCase):
             stage="process",
             limit=3,
             db_path=self.db,
+            scope_content_ids=None,
         )
         self.assertEqual([item.args[0] for item in process.call_args_list], [1, 2])
         self.assertEqual(result["candidates"], 2)
@@ -4745,6 +4811,7 @@ class V8MediaTest(unittest.TestCase):
             stage="download",
             limit=media.MEDIA_QUEUE_BATCH_LIMIT + 1,
             db_path=self.db,
+            scope_content_ids=None,
         )
         self.assertEqual(media.MEDIA_QUEUE_BATCH_LIMIT, 500)
         self.assertFalse(result["has_more"])

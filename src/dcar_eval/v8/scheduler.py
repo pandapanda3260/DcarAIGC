@@ -1695,6 +1695,33 @@ def daily_capture_quality_gate(details: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _daily_media_cohort(
+    scheduled_for: datetime, *, db_path: Path
+) -> tuple[List[int], str, str]:
+    """Return the report-day content cohort for an automatic run on D."""
+
+    local_day = scheduled_for.astimezone(SHANGHAI).date()
+    report_day = local_day - timedelta(days=1)
+    start = datetime.combine(report_day, time.min, SHANGHAI).astimezone(timezone.utc)
+    end = start + timedelta(days=1)
+    start_iso = start.isoformat(timespec="seconds").replace("+00:00", "Z")
+    end_iso = end.isoformat(timespec="seconds").replace("+00:00", "Z")
+    with connect(db_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT c.id
+            FROM content_items c
+            WHERE c.platform IN ('douyin','xiaohongshu')
+              AND c.content_type IN ('video','image')
+              AND COALESCE(c.source_group,'') NOT IN (?,?)
+              AND c.published_at>=? AND c.published_at<?
+            ORDER BY c.id
+            """,
+            (*BACKFILL_SOURCE_GROUPS, start_iso, end_iso),
+        ).fetchall()
+    return [int(row["id"]) for row in rows], start_iso, end_iso
+
+
 def run_media_cutoff(
     scheduled_for: datetime,
     *,
@@ -1702,49 +1729,10 @@ def run_media_cutoff(
 ) -> Dict[str, Any]:
     """Evaluate completed media DAGs at the daily cutoff."""
 
-    local_day = scheduled_for.astimezone(SHANGHAI).date()
-    start = datetime.combine(local_day, time.min, SHANGHAI).astimezone(timezone.utc)
-    end = start + timedelta(days=1)
-    start_iso = start.isoformat(timespec="seconds").replace("+00:00", "Z")
-    end_iso = end.isoformat(timespec="seconds").replace("+00:00", "Z")
+    coverage_content_ids, start_iso, end_iso = _daily_media_cohort(
+        scheduled_for, db_path=db_path
+    )
     with connect(db_path) as connection:
-        coverage_rows = connection.execute(
-            """
-            SELECT c.id
-            FROM content_items c
-            WHERE c.platform IN ('douyin','xiaohongshu')
-              AND c.content_type IN ('video','image')
-              -- 全量历史回溯批量入库的内容不适用“当日媒体截止”闸门：
-              -- 它们的媒体与评估由 range_backfill local-evidence 阶段按窗口推进，
-              -- 标记清除后自然回归本闸门管辖。
-              AND COALESCE(c.source_group,'') NOT IN (?,?)
-              AND (
-                (c.source_group='' AND c.imported_at>=? AND c.imported_at<?)
-                OR EXISTS(
-                    SELECT 1 FROM provider_raw_responses pr
-                    WHERE pr.content_id=c.id AND pr.operation IN (
-                        'douyin_video_detail','xiaohongshu_note_detail'
-                    ) AND pr.captured_at>=? AND pr.captured_at<?
-                )
-              )
-            ORDER BY c.id
-            """,
-            (*BACKFILL_SOURCE_GROUPS, start_iso, end_iso, start_iso, end_iso),
-        ).fetchall()
-        backlog_rows = connection.execute(
-            """
-            SELECT DISTINCT c.id
-            FROM content_items c
-            JOIN evidence_artifacts ea ON ea.content_id=c.id
-            WHERE c.platform IN ('douyin','xiaohongshu')
-              AND c.content_type IN ('video','image')
-              AND COALESCE(c.source_group,'') NOT IN (?,?)
-              AND ea.artifact_type='media_source'
-              AND ea.status='available'
-            ORDER BY c.id
-            """,
-            BACKFILL_SOURCE_GROUPS,
-        ).fetchall()
         releases = connection.execute(
             "SELECT id FROM evaluation_releases WHERE status='active' ORDER BY id"
         ).fetchall()
@@ -1753,19 +1741,14 @@ def run_media_cutoff(
                 "daily media cutoff requires exactly one active evaluation release"
             )
         release_id = str(releases[0]["id"])
-        coverage_content_ids = [int(row["id"]) for row in coverage_rows]
-        backlog_content_ids = [int(row["id"]) for row in backlog_rows]
-        state_content_ids = list(
-            dict.fromkeys([*coverage_content_ids, *backlog_content_ids])
-        )
         initial_states = media_terminal_state_details(
-            connection, release_id, state_content_ids
+            connection, release_id, coverage_content_ids
         )
 
     evaluation_results: List[Dict[str, Any]] = []
     evaluation_content_ids = [
         content_id
-        for content_id in backlog_content_ids
+        for content_id in coverage_content_ids
         if initial_states[content_id].reason == "evaluation_pending"
     ]
     for content_id in evaluation_content_ids:
@@ -1885,9 +1868,13 @@ def _run_job_action(
         )
         return str(details.pop("status")), details
     if job_id == "daily_media_download":
+        cohort_content_ids, _window_start, _window_end = _daily_media_cohort(
+            scheduled_for, db_path=db_path
+        )
         fresh_content = run_media_download_queue(
             limit=MEDIA_QUEUE_BATCH_LIMIT,
             db_path=db_path,
+            scope_content_ids=cohort_content_ids,
         )
         status = (
             "failed"
@@ -1897,9 +1884,13 @@ def _run_job_action(
         )
         return status, {"fresh_content": fresh_content}
     if job_id == "daily_media_processing":
+        cohort_content_ids, _window_start, _window_end = _daily_media_cohort(
+            scheduled_for, db_path=db_path
+        )
         media = run_media_processing_queue(
             limit=MEDIA_QUEUE_BATCH_LIMIT,
             db_path=db_path,
+            scope_content_ids=cohort_content_ids,
         )
         duplicates = run_duplicate_fingerprint_queue(limit=500, db_path=db_path)
         status = (

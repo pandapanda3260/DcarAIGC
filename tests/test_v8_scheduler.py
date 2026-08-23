@@ -24,6 +24,7 @@ from v8.scheduler import (
     JOBS,
     SchedulerJobError,
     _claim_run,
+    _daily_media_cohort,
     _finish_run,
     _select_due_capture_contents,
     current_day_daily_capture_guard,
@@ -202,9 +203,9 @@ class V8SchedulerTest(unittest.TestCase):
                 """
                 INSERT INTO content_items(
                     link_id,platform,platform_content_id,canonical_url,title,body,
-                    content_type,source_group,imported_at,created_at,updated_at
+                    content_type,source_group,published_at,imported_at,created_at,updated_at
                 ) VALUES (?, 'douyin', ?, ?, '媒体截止内容', '汽车内容',
-                          'video', ?, ?, ?, ?)
+                          'video', ?, '2026-08-01T04:00:00Z', ?, ?, ?)
                 """,
                 (
                     f"C{index:05d}",
@@ -1365,6 +1366,7 @@ class V8SchedulerTest(unittest.TestCase):
         download_queue.assert_called_once_with(
             limit=500,
             db_path=self.db,
+            scope_content_ids=[],
         )
         self.assertEqual(retryable["status"], "failed")
         self.assertEqual(retryable["details"]["fresh_content"], retryable_result)
@@ -1896,6 +1898,7 @@ class V8SchedulerTest(unittest.TestCase):
         processing_queue.assert_called_once_with(
             limit=500,
             db_path=self.db,
+            scope_content_ids=[],
         )
 
         media_ok = {
@@ -3014,7 +3017,7 @@ class V8SchedulerTest(unittest.TestCase):
     def test_media_cutoff_keeps_scope_to_eligible_content(self) -> None:
         self._insert_media_cutoff_content(1)
         self._insert_media_cutoff_content(
-            2, source_group="30-account-random-sample"
+            2, source_group="history-backfill"
         )
 
         result = run_media_cutoff(
@@ -3036,6 +3039,37 @@ class V8SchedulerTest(unittest.TestCase):
         self.assertEqual(result["threshold"], 90.0)
         self.assertEqual(result["threshold_status"], "below_threshold")
         self.assertNotIn("manual_required", result)
+
+    def test_daily_media_cohort_uses_previous_bjt_day_and_half_open_bounds(
+        self,
+    ) -> None:
+        included = self._insert_media_cutoff_content(101)
+        end_boundary = self._insert_media_cutoff_content(102)
+        archived = self._insert_media_cutoff_content(
+            103, source_group="history-archive"
+        )
+        with connect(self.db) as connection:
+            connection.execute(
+                "UPDATE content_items SET published_at=? WHERE id=?",
+                ("2026-07-31T16:00:00Z", included),
+            )
+            connection.execute(
+                "UPDATE content_items SET published_at=? WHERE id=?",
+                ("2026-08-01T16:00:00Z", end_boundary),
+            )
+            connection.execute(
+                "UPDATE content_items SET published_at=? WHERE id=?",
+                ("2026-08-01T00:00:00Z", archived),
+            )
+            connection.commit()
+
+        content_ids, start, end = _daily_media_cohort(
+            datetime(2026, 8, 2, 2, 20, tzinfo=SHANGHAI), db_path=self.db
+        )
+
+        self.assertEqual(content_ids, [included])
+        self.assertEqual(start, "2026-07-31T16:00:00Z")
+        self.assertEqual(end, "2026-08-01T16:00:00Z")
 
     def test_media_cutoff_evaluates_only_pending_evaluations_and_uses_ninety(
         self,
@@ -3103,18 +3137,10 @@ class V8SchedulerTest(unittest.TestCase):
         # v16 起媒体截止不再触碰任何队列：结果里没有队列字段
         self.assertNotIn("resolved_media_queue_rows", result)
 
-    def test_media_cutoff_evaluates_completed_dag_on_the_next_day(self) -> None:
+    def test_media_cutoff_does_not_carry_previous_report_day_into_next_day(self) -> None:
         content_id = self._insert_media_cutoff_content(20)
         self._insert_media_source_artifact(content_id)
         processing = {content_id: MediaTerminalDetail("pending", "frames_pending")}
-        evaluation_pending = {
-            content_id: MediaTerminalDetail("pending", "evaluation_pending")
-        }
-        evaluated = {
-            content_id: MediaTerminalDetail(
-                "terminal_insufficient", "terminal_insufficient"
-            )
-        }
 
         with (
             patch(
@@ -3122,8 +3148,8 @@ class V8SchedulerTest(unittest.TestCase):
                 side_effect=(
                     processing,
                     processing,
-                    evaluation_pending,
-                    evaluated,
+                    {},
+                    {},
                 ),
             ),
             patch(
@@ -3148,32 +3174,20 @@ class V8SchedulerTest(unittest.TestCase):
         self.assertEqual(first["evaluation"]["candidates"], 0)
         self.assertEqual(first["terminal_coverage"], 0.0)
         self.assertEqual(second["candidates"], 0)
-        self.assertEqual(second["evaluation"]["candidates"], 1)
+        self.assertEqual(second["evaluation"]["candidates"], 0)
         self.assertEqual(second["terminal_coverage"], 100.0)
-        evaluate.assert_called_once_with(
-            content_id,
-            db_path=self.db,
-            expected_active_release_id=V9_FIXTURE_RELEASE_ID,
-        )
+        evaluate.assert_not_called()
 
-    def test_media_cutoff_does_not_evaluate_unrelated_global_content(self) -> None:
+    def test_media_cutoff_does_not_evaluate_unrelated_previous_day_content(self) -> None:
         evaluation_pending_id = self._insert_media_cutoff_content(30)
         processing_id = self._insert_media_cutoff_content(31)
         no_source_id = self._insert_media_cutoff_content(32)
         self._insert_media_source_artifact(evaluation_pending_id)
         self._insert_media_source_artifact(processing_id)
-        initial_states = {
-            evaluation_pending_id: MediaTerminalDetail("pending", "evaluation_pending"),
-            processing_id: MediaTerminalDetail("pending", "ocr_pending"),
-        }
-        final_states = {
-            evaluation_pending_id: MediaTerminalDetail("complete", "complete")
-        }
-
         with (
             patch(
                 "v8.scheduler.media_terminal_state_details",
-                side_effect=(initial_states, final_states),
+                side_effect=({}, {}),
             ) as state_details,
             patch(
                 "v8.scheduler.evaluate_content",
@@ -3190,17 +3204,13 @@ class V8SchedulerTest(unittest.TestCase):
             )
 
         self.assertEqual(result["candidates"], 0)
-        self.assertEqual(result["evaluation"]["candidates"], 1)
+        self.assertEqual(result["evaluation"]["candidates"], 0)
         self.assertEqual(
             state_details.call_args_list[0].args[2],
-            [evaluation_pending_id, processing_id],
+            [],
         )
         self.assertNotIn(no_source_id, state_details.call_args_list[0].args[2])
-        evaluate.assert_called_once_with(
-            evaluation_pending_id,
-            db_path=self.db,
-            expected_active_release_id=V9_FIXTURE_RELEASE_ID,
-        )
+        evaluate.assert_not_called()
 
     def test_media_cutoff_evaluation_failure_marks_the_run_failed(
         self,

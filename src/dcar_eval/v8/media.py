@@ -1232,19 +1232,24 @@ def _run_processing_slot(
     cached_validator: Optional[
         Callable[[sqlite3.Connection, Artifact, _PrivateFileEvidence], None]
     ] = None,
+    preclaimed_slot_id: Optional[int] = None,
 ) -> Artifact:
     _before_processing_slot_claim(content_id, processor_type)
     with connect(db_path) as connection, transaction(connection):
         if claim_validator is not None:
             claim_validator(connection)
-        slot_id, cached = _claim_processing_slot(
-            connection,
-            content_id=content_id,
-            source_sha256=source_sha256,
-            processor_type=processor_type,
-            processor_version=processor_version,
-            source_aliases=source_aliases,
-        )
+        if preclaimed_slot_id is None:
+            slot_id, cached = _claim_processing_slot(
+                connection,
+                content_id=content_id,
+                source_sha256=source_sha256,
+                processor_type=processor_type,
+                processor_version=processor_version,
+                source_aliases=source_aliases,
+            )
+        else:
+            slot_id = preclaimed_slot_id
+            cached = None
         claimed_row = connection.execute(
             """
             SELECT id,content_id,source_sha256,processor_type,processor_version,
@@ -1255,6 +1260,15 @@ def _run_processing_slot(
         ).fetchone()
         if claimed_row is None:
             raise MediaProcessingError("claimed media slot disappeared")
+        if preclaimed_slot_id is not None and (
+            claimed_row["content_id"] != content_id
+            or claimed_row["source_sha256"] != source_sha256
+            or claimed_row["processor_type"] != processor_type
+            or claimed_row["processor_version"] != processor_version
+            or claimed_row["status"] != "running"
+            or claimed_row["output_artifact_id"] is not None
+        ):
+            raise MediaProcessingError("preclaimed media slot identity drifted")
         if cached is not None:
             artifact_row = connection.execute(
                 "SELECT * FROM evidence_artifacts WHERE id=?", (cached.id,)
@@ -2062,6 +2076,8 @@ def download_video_sources(
     download_urls: Optional[Iterable[str]] = None,
     reuse_existing: bool = True,
     maximum_duration_seconds: Optional[float] = None,
+    _slot_source_sha256: Optional[str] = None,
+    _preclaimed_slot_id: Optional[int] = None,
 ) -> Artifact:
     values, source_sha256 = _media_source_identity("video", urls)
     if not values:
@@ -2178,20 +2194,35 @@ def download_video_sources(
             maximum_duration_seconds=maximum_duration_seconds,
         )
 
+    effective_slot_source_sha256 = (
+        _slot_source_sha256
+        or (
+            str(source_rows[0]["sha256"])
+            if source_rows
+            and source_rows[0]["processor_version"] == MEDIA_SOURCE_VERSION
+            and _valid_sha256(source_rows[0]["sha256"])
+            else source_sha256
+        )
+    )
     return _run_processing_slot(
         db_path=db_path,
         content_id=content_id,
-        source_sha256=source_sha256,
+        source_sha256=effective_slot_source_sha256,
         processor_type="download",
         processor_version=VIDEO_DOWNLOAD_VERSION,
         artifact_type="media",
         produce=produce,
         metadata={"source_count": len(values), "source_sha256": source_sha256},
-        source_aliases=(legacy_sha256,),
+        source_aliases=(
+            (legacy_sha256,)
+            if effective_slot_source_sha256 == source_sha256
+            else ()
+        ),
         expected_output_path=target,
         expected_output_root=effective_media_root,
         claim_validator=revalidate_context,
         commit_validator=revalidate_context,
+        preclaimed_slot_id=_preclaimed_slot_id,
     )
 
 
@@ -2955,6 +2986,8 @@ def download_image_sources(
     download_urls: Optional[Iterable[str]] = None,
     frozen_image_groups: Optional[Iterable[Mapping[str, Any]]] = None,
     reuse_existing: bool = True,
+    _slot_source_sha256: Optional[str] = None,
+    _preclaimed_slot_id: Optional[int] = None,
 ) -> Artifact:
     raw_values = list(urls)
     if any(type(value) is not str for value in raw_values):
@@ -3123,10 +3156,19 @@ def download_image_sources(
             expected_metadata=expected_metadata,
         )
 
+    effective_slot_source_sha256 = (
+        _slot_source_sha256
+        or (
+            str(source_rows[0]["sha256"])
+            if source_rows[0]["processor_version"] == MEDIA_SOURCE_VERSION
+            and _valid_sha256(source_rows[0]["sha256"])
+            else download_binding_sha256
+        )
+    )
     return _run_processing_slot(
         db_path=db_path,
         content_id=content_id,
-        source_sha256=download_binding_sha256,
+        source_sha256=effective_slot_source_sha256,
         processor_type="download",
         processor_version=IMAGE_DOWNLOAD_VERSION,
         artifact_type="media_manifest",
@@ -3137,6 +3179,7 @@ def download_image_sources(
         cached_validator=validate_cached,
         claim_validator=revalidate_context,
         commit_validator=revalidate_context,
+        preclaimed_slot_id=_preclaimed_slot_id,
     )
 
 
@@ -4110,17 +4153,38 @@ def _validate_cached_image_download(
     row = connection.execute(
         "SELECT * FROM evidence_artifacts WHERE id=?", (artifact.id,)
     ).fetchone()
-    slots = connection.execute(
+    source_row = connection.execute(
         """
-        SELECT * FROM media_processing_slots
-        WHERE content_id=? AND source_sha256=? AND processor_type='download'
-          AND processor_version=? AND output_artifact_id=?
+        SELECT sha256 FROM evidence_artifacts
+        WHERE content_id=? AND artifact_type='media_source'
+          AND status='available' AND processor_version=?
+        ORDER BY id DESC LIMIT 1
         """,
-        (content_id, binding_sha256, IMAGE_DOWNLOAD_VERSION, artifact.id),
+        (content_id, MEDIA_SOURCE_VERSION),
+    ).fetchone()
+    accepted_slot_sources = {binding_sha256}
+    if source_row is not None and _valid_sha256(source_row["sha256"]):
+        accepted_slot_sources.add(str(source_row["sha256"]))
+    placeholders = ",".join("?" for _ in accepted_slot_sources)
+    slots = connection.execute(
+        f"""
+        SELECT * FROM media_processing_slots
+        WHERE content_id=? AND source_sha256 IN ({placeholders})
+          AND processor_type='download'
+          AND processor_version=? AND output_artifact_id=?
+        ORDER BY CASE WHEN source_sha256=? THEN 0 ELSE 1 END,id DESC
+        """,
+        (
+            content_id,
+            *sorted(accepted_slot_sources),
+            IMAGE_DOWNLOAD_VERSION,
+            artifact.id,
+            str(source_row["sha256"]) if source_row is not None else binding_sha256,
+        ),
     ).fetchall()
     if (
         row is None
-        or len(slots) != 1
+        or not slots
         or slots[0]["status"] != "succeeded"
         or type(slots[0]["attempt_count"]) is not int
         or slots[0]["attempt_count"] <= 0
@@ -4244,7 +4308,7 @@ def _validate_current_image_manifest_source(
     content: sqlite3.Row,
     manifest_path: Path,
     manifest_body: Mapping[str, Any],
-    slot_source_sha256: str,
+    download_binding_sha256: str,
     frozen_image_groups: Optional[Iterable[Mapping[str, Any]]] = None,
 ) -> List[_PrivateFileEvidence]:
     """Bind a current image manifest to its immutable media-source evidence."""
@@ -4283,7 +4347,7 @@ def _validate_current_image_manifest_source(
     binding_sha256 = image_download_binding_sha256(
         source_sha256, image_groups_sha256(groups)
     )
-    if binding_sha256 != slot_source_sha256:
+    if binding_sha256 != download_binding_sha256:
         raise MediaProcessingError(
             "image manifest download binding does not match current source slot"
         )
@@ -4305,6 +4369,7 @@ def _revalidate_image_ocr_inputs(
     manifest_body: Mapping[str, Any],
     artifact_metadata: Mapping[str, Any],
     slot_source_sha256: str,
+    download_binding_sha256: str,
     frozen_image_groups: Optional[Iterable[Mapping[str, Any]]],
     expected_frames: List[_PrivateFileEvidence],
     media_root: Path,
@@ -4346,12 +4411,14 @@ def _revalidate_image_ocr_inputs(
         """,
         (content_id, IMAGE_DOWNLOAD_VERSION, manifest_artifact_id),
     ).fetchall()
+    current_slots = [
+        slot for slot in slots if slot["source_sha256"] == slot_source_sha256
+    ]
     if (
-        len(slots) != 1
-        or slots[0]["status"] != "succeeded"
-        or type(slots[0]["attempt_count"]) is not int
-        or slots[0]["attempt_count"] <= 0
-        or slots[0]["source_sha256"] != slot_source_sha256
+        len(current_slots) != 1
+        or current_slots[0]["status"] != "succeeded"
+        or type(current_slots[0]["attempt_count"]) is not int
+        or current_slots[0]["attempt_count"] <= 0
     ):
         raise MediaProcessingError("image download slot changed before OCR commit")
     link_id = content["link_id"]
@@ -4361,7 +4428,7 @@ def _revalidate_image_ocr_inputs(
         media_root
         / link_id
         / "downloads"
-        / slot_source_sha256
+        / download_binding_sha256
         / "images"
         / "manifest.json"
     )
@@ -4384,7 +4451,7 @@ def _revalidate_image_ocr_inputs(
         content=content,
         manifest_path=manifest_evidence.path,
         manifest_body=manifest_body,
-        slot_source_sha256=slot_source_sha256,
+        download_binding_sha256=download_binding_sha256,
         frozen_image_groups=frozen_image_groups,
     )
     if len(current_frames) != len(expected_frames):
@@ -4523,15 +4590,32 @@ def process_image_evidence(
             """,
             (content_id, IMAGE_DOWNLOAD_VERSION, int(row["id"])),
         ).fetchall()
+        source_row = connection.execute(
+            """
+            SELECT sha256 FROM evidence_artifacts
+            WHERE content_id=? AND artifact_type='media_source'
+              AND status='available' AND processor_version=?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (content_id, MEDIA_SOURCE_VERSION),
+        ).fetchone()
+        current_slots = [
+            slot
+            for slot in slots
+            if source_row is not None and slot["source_sha256"] == source_row["sha256"]
+        ]
         if (
-            len(slots) != 1
-            or str(slots[0]["status"] or "") != "succeeded"
-            or int(slots[0]["attempt_count"] or 0) <= 0
+            source_row is None
+            or not _valid_sha256(source_row["sha256"])
+            or len(current_slots) != 1
+            or str(current_slots[0]["status"] or "") != "succeeded"
+            or int(current_slots[0]["attempt_count"] or 0) <= 0
         ):
             raise MediaProcessingError(
-                "image manifest is not bound to a succeeded current download slot"
+                "image manifest is not bound to a succeeded current source download slot"
             )
-        slot_source_sha256 = str(slots[0]["source_sha256"] or "")
+        slot_source_sha256 = str(current_slots[0]["source_sha256"])
+        download_binding_sha256 = str(body.get("download_binding_sha256") or "")
         link_id = str(content["link_id"] or "")
         if not link_id or Path(link_id).name != link_id or link_id in {".", ".."}:
             raise MediaProcessingError("image content link_id is not a safe basename")
@@ -4539,7 +4623,7 @@ def process_image_evidence(
             effective_media_root
             / link_id
             / "downloads"
-            / slot_source_sha256
+            / download_binding_sha256
             / "images"
             / "manifest.json"
         )
@@ -4562,7 +4646,7 @@ def process_image_evidence(
             "source_url_count": source_url_count,
             "source_sha256": body.get("source_sha256"),
             "image_groups_sha256": body.get("image_groups_sha256"),
-            "download_binding_sha256": slot_source_sha256,
+            "download_binding_sha256": download_binding_sha256,
         }
         metadata_is_current = (
             set(artifact_metadata) == expected_metadata_keys
@@ -4571,11 +4655,11 @@ def process_image_evidence(
             and _valid_sha256(body.get("source_sha256"))
             and _valid_sha256(body.get("image_groups_sha256"))
             and _valid_sha256(body.get("download_binding_sha256"))
-            and body.get("download_binding_sha256") == slot_source_sha256
-            and len(slot_source_sha256) == 64
+            and body.get("download_binding_sha256") == download_binding_sha256
+            and len(download_binding_sha256) == 64
             and all(
                 character in "0123456789abcdef"
-                for character in slot_source_sha256
+                for character in download_binding_sha256
             )
         )
         if not metadata_is_current:
@@ -4588,7 +4672,7 @@ def process_image_evidence(
             content=content,
             manifest_path=resolved_manifest,
             manifest_body=body,
-            slot_source_sha256=slot_source_sha256,
+            download_binding_sha256=download_binding_sha256,
             frozen_image_groups=frozen_image_groups,
         )
         media_manifest = Artifact(
@@ -4610,6 +4694,7 @@ def process_image_evidence(
             manifest_body=body,
             artifact_metadata=artifact_metadata,
             slot_source_sha256=slot_source_sha256,
+            download_binding_sha256=download_binding_sha256,
             frozen_image_groups=frozen_image_groups,
             expected_frames=frame_evidence,
             media_root=effective_media_root,
@@ -4659,19 +4744,28 @@ def process_image_evidence(
     return {"media": media_manifest, "ocr": ocr}
 
 
-def _latest_media_source(content_id: int, *, db_path: Path) -> Optional[Dict[str, Any]]:
+def _latest_media_source_artifact(
+    content_id: int, *, db_path: Path
+) -> Optional[Dict[str, Any]]:
+    """Return the latest source ledger row without opening its local file."""
+
     with connect(db_path) as connection:
         row = connection.execute(
             """
-            SELECT local_path FROM evidence_artifacts
+            SELECT * FROM evidence_artifacts
             WHERE content_id=? AND artifact_type='media_source' AND status='available'
             ORDER BY id DESC LIMIT 1
             """,
             (content_id,),
         ).fetchone()
-    if row is None:
+    return dict(row) if row is not None else None
+
+
+def _latest_media_source(content_id: int, *, db_path: Path) -> Optional[Dict[str, Any]]:
+    artifact = _latest_media_source_artifact(content_id, db_path=db_path)
+    if artifact is None:
         return None
-    value = _read_json_object(_resolved(str(row["local_path"])))
+    value = _read_json_object(_resolved(str(artifact["local_path"])))
     media_kind_value = value.get("media_kind")
     if type(media_kind_value) is not str:
         return None
@@ -4692,7 +4786,158 @@ def _latest_media_source(content_id: int, *, db_path: Path) -> Optional[Dict[str
         "media_kind": media_kind,
         "urls": urls,
         "source_sha256": source_sha256,
+        "source_artifact_id": int(artifact["id"]),
+        "source_artifact_sha256": str(artifact["sha256"]),
+        "source_processor_version": str(artifact["processor_version"]),
     }
+
+
+def _mark_claimed_download_failed(
+    *, db_path: Path, slot_id: int, error: BaseException
+) -> None:
+    with connect(db_path) as connection, transaction(connection):
+        connection.execute(
+            """
+            UPDATE media_processing_slots
+            SET status=CASE WHEN attempt_count>=? THEN 'terminal_failed'
+                            ELSE 'retryable_failed' END,
+                error_message=?,updated_at=?
+            WHERE id=? AND processor_type='download' AND status='running'
+              AND output_artifact_id IS NULL
+            """,
+            (
+                MAX_MEDIA_DOWNLOAD_ATTEMPTS,
+                f"{type(error).__name__}: {error}"[:500],
+                now_utc(),
+                slot_id,
+            ),
+        )
+
+
+def _claim_current_source_download(
+    *, content_id: int, source: Mapping[str, Any], db_path: Path
+) -> tuple[int, Optional[Artifact]]:
+    artifact_sha256 = source.get("sha256")
+    if not _valid_sha256(artifact_sha256):
+        raise MediaProcessingError("current media source ledger sha256 is invalid")
+    if source.get("processor_version") != MEDIA_SOURCE_VERSION:
+        raise MediaProcessingError("download is not bound to current source")
+    with connect(db_path) as connection, transaction(connection):
+        current = connection.execute(
+            """
+            SELECT id,sha256,processor_version FROM evidence_artifacts
+            WHERE content_id=? AND artifact_type='media_source' AND status='available'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (content_id,),
+        ).fetchone()
+        content = connection.execute(
+            "SELECT content_type FROM content_items WHERE id=?", (content_id,)
+        ).fetchone()
+        if (
+            current is None
+            or current["id"] != source.get("id")
+            or current["sha256"] != artifact_sha256
+            or current["processor_version"] != MEDIA_SOURCE_VERSION
+            or content is None
+            or content["content_type"] not in {"video", "image"}
+        ):
+            raise MediaProcessingError("current media source ledger identity changed")
+        processor_version = (
+            VIDEO_DOWNLOAD_VERSION
+            if content["content_type"] == "video"
+            else IMAGE_DOWNLOAD_VERSION
+        )
+        return _claim_processing_slot(
+            connection,
+            content_id=content_id,
+            source_sha256=str(artifact_sha256),
+            processor_type="download",
+            processor_version=processor_version,
+        )
+
+
+def _legacy_download_succeeded(
+    *,
+    content_id: int,
+    media_kind: str,
+    urls: List[str],
+    platform: str,
+    frozen_image_groups: Optional[Iterable[Mapping[str, Any]]],
+    db_path: Path,
+) -> bool:
+    logical_sha256 = _media_source_identity(media_kind, urls)[1]
+    if media_kind == "image":
+        groups = (
+            image_source_groups(urls, platform=platform)
+            if frozen_image_groups is None
+            else validate_frozen_image_groups(
+                urls, frozen_image_groups, platform=platform
+            )
+        )
+        identities = [
+            image_download_binding_sha256(
+                logical_sha256, image_groups_sha256(groups)
+            )
+        ]
+        versions = [IMAGE_DOWNLOAD_VERSION]
+    else:
+        identities = [logical_sha256, _legacy_media_source_sha256(urls)]
+        versions = sorted(_download_versions("video"))
+    identity_placeholders = ",".join("?" for _ in identities)
+    version_placeholders = ",".join("?" for _ in versions)
+    with connect(db_path) as connection:
+        row = connection.execute(
+            f"""
+            SELECT 1 FROM media_processing_slots
+            WHERE content_id=? AND processor_type='download'
+              AND source_sha256 IN ({identity_placeholders})
+              AND processor_version IN ({version_placeholders})
+              AND status='succeeded' AND output_artifact_id IS NOT NULL
+            LIMIT 1
+            """,
+            (content_id, *identities, *versions),
+        ).fetchone()
+    return row is not None
+
+
+def _complete_claimed_download_from_artifact(
+    *, db_path: Path, slot_id: int, source_artifact: Mapping[str, Any], artifact: Artifact
+) -> None:
+    with connect(db_path) as connection, transaction(connection):
+        current = connection.execute(
+            """
+            SELECT id,sha256,processor_version FROM evidence_artifacts
+            WHERE content_id=? AND artifact_type='media_source' AND status='available'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (artifact.content_id,),
+        ).fetchone()
+        if (
+            current is None
+            or current["id"] != source_artifact.get("id")
+            or current["sha256"] != source_artifact.get("sha256")
+            or current["processor_version"] != MEDIA_SOURCE_VERSION
+        ):
+            raise MediaProcessingError("media source changed during slot migration")
+        cursor = connection.execute(
+            """
+            UPDATE media_processing_slots
+            SET status='succeeded',output_artifact_id=?,error_message=NULL,updated_at=?
+            WHERE id=? AND content_id=? AND source_sha256=?
+              AND processor_type='download' AND status='running'
+              AND output_artifact_id IS NULL
+            """,
+            (
+                artifact.id,
+                now_utc(),
+                slot_id,
+                artifact.content_id,
+                source_artifact["sha256"],
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise MediaProcessingError("claimed download slot changed during migration")
 
 
 def _matching_download_slots(
@@ -4701,69 +4946,35 @@ def _matching_download_slots(
     content_id: int,
     source: Dict[str, Any],
 ) -> List[sqlite3.Row]:
-    urls = [str(value) for value in source.get("urls", [])]
     media_kind = str(source["media_kind"])
-    if media_kind == "image":
-        content = connection.execute(
-            "SELECT platform,content_type FROM content_items WHERE id=?",
-            (content_id,),
-        ).fetchone()
-        if content is None or content["content_type"] != media_kind:
-            return []
-        if content["platform"] == "douyin":
-            return []
-        groups = image_source_groups(
-            urls, platform=str(content["platform"] or "")
-        )
-        identities = [
-            image_download_binding_sha256(
-                str(source["source_sha256"]), image_groups_sha256(groups)
-            )
-        ]
-    else:
-        content = connection.execute(
-            "SELECT content_type FROM content_items WHERE id=?", (content_id,)
-        ).fetchone()
-        if content is None or content["content_type"] != media_kind:
-            return []
-        identities = list(
-            dict.fromkeys(
-                [
-                    str(source["source_sha256"]),
-                    _legacy_media_source_sha256(urls),
-                ]
-            )
-        )
-    placeholders = ",".join("?" for _ in identities)
-    versions = sorted(_download_versions(str(source["media_kind"])))
-    version_placeholders = ",".join("?" for _ in versions)
+    content = connection.execute(
+        "SELECT content_type FROM content_items WHERE id=?", (content_id,)
+    ).fetchone()
+    artifact_sha256 = source.get("source_artifact_sha256")
+    if (
+        content is None
+        or content["content_type"] != media_kind
+        or not _valid_sha256(artifact_sha256)
+        or source.get("source_processor_version") != MEDIA_SOURCE_VERSION
+    ):
+        return []
+    processor_version = (
+        VIDEO_DOWNLOAD_VERSION if media_kind == "video" else IMAGE_DOWNLOAD_VERSION
+    )
     return connection.execute(
-        f"""
+        """
         SELECT * FROM media_processing_slots
         WHERE content_id=? AND processor_type='download'
-          AND source_sha256 IN ({placeholders})
-          AND processor_version IN ({version_placeholders})
+          AND source_sha256=? AND processor_version=?
         ORDER BY id DESC
         """,
-        (content_id, *identities, *versions),
+        (content_id, artifact_sha256, processor_version),
     ).fetchall()
 
 
 def _effective_download_slot(rows: Iterable[sqlite3.Row]) -> Optional[sqlite3.Row]:
     values = list(rows)
-    succeeded = next((row for row in values if row["status"] == "succeeded"), None)
-    if succeeded is not None:
-        return succeeded
-    terminal = next(
-        (
-            row
-            for row in values
-            if row["status"] == "terminal_failed"
-            or int(row["attempt_count"]) >= MAX_MEDIA_DOWNLOAD_ATTEMPTS
-        ),
-        None,
-    )
-    return terminal or (values[0] if values else None)
+    return max(values, key=lambda row: int(row["id"])) if values else None
 
 
 def get_media_source_state(
@@ -4816,6 +5027,7 @@ def get_media_source_state(
         "media_kind": str(source["media_kind"]),
         "urls": list(source["urls"]),
         "source_sha256": str(source["source_sha256"]),
+        "source_artifact_sha256": str(source["source_artifact_sha256"]),
         "download_slot": slot,
     }
 
@@ -4869,8 +5081,8 @@ def process_content_media(
     reuse_existing_downloads: bool = True,
     maximum_video_duration_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
-    source = _latest_media_source(content_id, db_path=db_path)
-    if source is None:
+    source_artifact = _latest_media_source_artifact(content_id, db_path=db_path)
+    if source_artifact is None:
         existing = _existing_complete_evidence(content_id, db_path=db_path)
         if existing is not None:
             return {
@@ -4880,7 +5092,14 @@ def process_content_media(
                 "artifacts": existing,
             }
         return {"content_id": content_id, "status": "no_source"}
-    media_kind = str(source.get("media_kind") or "")
+    if source_artifact.get("processor_version") != MEDIA_SOURCE_VERSION:
+        return {
+            "content_id": content_id,
+            "status": "legacy_source_skipped",
+            "source_processor_version": str(
+                source_artifact.get("processor_version") or ""
+            ),
+        }
     with connect(db_path) as connection:
         content = connection.execute(
             "SELECT content_type,platform FROM content_items WHERE id=?",
@@ -4890,32 +5109,127 @@ def process_content_media(
         content is None
         or type(content["content_type"]) is not str
         or type(content["platform"]) is not str
-        or content["content_type"] != media_kind
+        or content["content_type"] not in {"video", "image"}
     ):
         raise MediaProcessingError(
             "current media source kind does not match content type"
         )
-    urls = [str(value) for value in source.get("urls", []) if isinstance(value, str)]
-    if media_kind == "video":
-        media = download_video_sources(
-            content_id,
-            urls,
-            db_path=db_path,
-            media_root=media_root,
-            urlopen_fn=urlopen_fn,
-            maximum_bytes=maximum_download_bytes,
-            require_exact_response_url=require_exact_response_url,
-            download_urls=download_urls,
-            reuse_existing=reuse_existing_downloads,
-            maximum_duration_seconds=maximum_video_duration_seconds,
+    media_kind = str(content["content_type"])
+    try:
+        source_metadata = json.loads(str(source_artifact.get("metadata_json") or ""))
+    except json.JSONDecodeError as exc:
+        raise MediaProcessingError("current media source metadata is invalid") from exc
+    if (
+        not isinstance(source_metadata, dict)
+        or source_metadata.get("media_kind") != media_kind
+    ):
+        raise MediaProcessingError(
+            "current media source kind does not match content type"
         )
-        if download_only:
-            return {
-                "content_id": content_id,
-                "status": "downloaded",
-                "media_kind": media_kind,
-                "artifact_id": media.id,
-            }
+    slot_id, cached_media = _claim_current_source_download(
+        content_id=content_id,
+        source=source_artifact,
+        db_path=db_path,
+    )
+    if cached_media is not None:
+        media = cached_media
+    else:
+        try:
+            with connect(db_path) as connection:
+                source_row = connection.execute(
+                    "SELECT * FROM evidence_artifacts WHERE id=?",
+                    (source_artifact["id"],),
+                ).fetchone()
+            if source_row is None:
+                raise MediaProcessingError("claimed media source disappeared")
+            urls, _logical_source_sha256 = _validated_media_source(
+                source_row, expected_media_kind=media_kind
+            )
+            effective_groups = frozen_image_groups
+            if (
+                media_kind == "image"
+                and effective_groups is None
+                and content["platform"] == "douyin"
+            ):
+                raise MediaProcessingError(
+                    "Douyin image processing requires frozen discovery groups"
+                )
+            reuse_legacy = _legacy_download_succeeded(
+                content_id=content_id,
+                media_kind=media_kind,
+                urls=urls,
+                platform=str(content["platform"]),
+                frozen_image_groups=effective_groups,
+                db_path=db_path,
+            )
+            if media_kind == "video":
+                media = download_video_sources(
+                    content_id,
+                    urls,
+                    db_path=db_path,
+                    media_root=media_root,
+                    urlopen_fn=urlopen_fn,
+                    maximum_bytes=maximum_download_bytes,
+                    require_exact_response_url=require_exact_response_url,
+                    download_urls=download_urls,
+                    reuse_existing=reuse_existing_downloads,
+                    maximum_duration_seconds=maximum_video_duration_seconds,
+                    _slot_source_sha256=(
+                        _logical_source_sha256
+                        if reuse_legacy
+                        else str(source_artifact["sha256"])
+                    ),
+                    _preclaimed_slot_id=None if reuse_legacy else slot_id,
+                )
+            else:
+                media = download_image_sources(
+                    content_id,
+                    urls,
+                    db_path=db_path,
+                    media_root=media_root,
+                    urlopen_fn=urlopen_fn,
+                    maximum_bytes=maximum_download_bytes,
+                    require_exact_response_url=require_exact_response_url,
+                    download_urls=download_urls,
+                    frozen_image_groups=effective_groups,
+                    reuse_existing=reuse_existing_downloads,
+                    _slot_source_sha256=(
+                        image_download_binding_sha256(
+                            _logical_source_sha256,
+                            image_groups_sha256(
+                                validate_frozen_image_groups(
+                                    urls,
+                                    effective_groups
+                                    or image_source_groups(
+                                        urls, platform=str(content["platform"])
+                                    ),
+                                    platform=str(content["platform"]),
+                                )
+                            ),
+                        )
+                        if reuse_legacy
+                        else str(source_artifact["sha256"])
+                    ),
+                    _preclaimed_slot_id=None if reuse_legacy else slot_id,
+                )
+            if reuse_legacy:
+                _complete_claimed_download_from_artifact(
+                    db_path=db_path,
+                    slot_id=slot_id,
+                    source_artifact=source_artifact,
+                    artifact=media,
+                )
+        except Exception as exc:
+            _mark_claimed_download_failed(db_path=db_path, slot_id=slot_id, error=exc)
+            raise
+    if download_only:
+        return {
+            "content_id": content_id,
+            "status": "downloaded",
+            "media_kind": media_kind,
+            "artifact_id": media.id,
+        }
+    if media_kind == "video":
         artifacts = process_video_evidence(
             content_id,
             _resolved(media.local_path),
@@ -4932,25 +5246,6 @@ def process_content_media(
                 raise MediaProcessingError(
                     "Douyin image processing requires frozen discovery groups"
                 )
-        media = download_image_sources(
-            content_id,
-            urls,
-            db_path=db_path,
-            media_root=media_root,
-            urlopen_fn=urlopen_fn,
-            maximum_bytes=maximum_download_bytes,
-            require_exact_response_url=require_exact_response_url,
-            download_urls=download_urls,
-            frozen_image_groups=effective_groups,
-            reuse_existing=reuse_existing_downloads,
-        )
-        if download_only:
-            return {
-                "content_id": content_id,
-                "status": "downloaded",
-                "media_kind": media_kind,
-                "artifact_id": media.id,
-            }
         artifacts = process_image_evidence(
             content_id,
             _resolved(media.local_path),
@@ -5049,7 +5344,17 @@ def _validated_recovery_media_source(
         != json.dumps(expected_metadata, ensure_ascii=False, sort_keys=True)
     ):
         raise MediaProcessingError("current media source evidence drifted")
-    return row, body, urls, source_sha256
+    return (
+        row,
+        {
+            **body,
+            "source_artifact_id": int(row["id"]),
+            "source_artifact_sha256": str(row["sha256"]),
+            "source_processor_version": str(row["processor_version"]),
+        },
+        urls,
+        source_sha256,
+    )
 
 
 def _validated_recovery_artifact(
@@ -5122,7 +5427,7 @@ def _current_recovery_download(
     if content is None:
         return None
     try:
-        _row, body, urls, flat_source_sha256 = _validated_recovery_media_source(
+        source_row, body, urls, flat_source_sha256 = _validated_recovery_media_source(
             connection, content_id=content_id
         )
         link_id = _validated_link_id(content["link_id"])
@@ -5138,22 +5443,25 @@ def _current_recovery_download(
             return None
         groups = image_source_groups(urls, platform=platform)
         groups_sha256 = image_groups_sha256(groups)
-        source_sha256 = image_download_binding_sha256(
+        logical_source_sha256 = image_download_binding_sha256(
             flat_source_sha256, groups_sha256
         )
         processor_version = IMAGE_DOWNLOAD_VERSION
     else:
-        source_sha256 = flat_source_sha256
+        logical_source_sha256 = flat_source_sha256
         processor_version = VIDEO_DOWNLOAD_VERSION
+    source_artifact_sha256 = str(source_row["sha256"] or "")
+    if not _valid_sha256(source_artifact_sha256):
+        return None
     if not require_succeeded:
-        return source_sha256, processor_version, None
+        return source_artifact_sha256, processor_version, None
     slots = connection.execute(
         """
         SELECT * FROM media_processing_slots
         WHERE content_id=? AND source_sha256=? AND processor_type='download'
           AND processor_version=?
         """,
-        (content_id, source_sha256, processor_version),
+        (content_id, source_artifact_sha256, processor_version),
     ).fetchall()
     if (
         len(slots) != 1
@@ -5172,7 +5480,11 @@ def _current_recovery_download(
             artifact_type="media",
             processor_version=VIDEO_DOWNLOAD_VERSION,
             expected_path=(
-                MEDIA_ROOT / link_id / "downloads" / source_sha256 / "source.mp4"
+                MEDIA_ROOT
+                / link_id
+                / "downloads"
+                / logical_source_sha256
+                / "source.mp4"
             ),
             expected_root=MEDIA_ROOT,
             expected_metadata={
@@ -5185,7 +5497,7 @@ def _current_recovery_download(
             MEDIA_ROOT
             / link_id
             / "downloads"
-            / source_sha256
+            / logical_source_sha256
             / "images"
             / "manifest.json"
         )
@@ -5229,14 +5541,14 @@ def _current_recovery_download(
                     "source_url_count": len(urls),
                     "source_sha256": flat_source_sha256,
                     "image_groups_sha256": image_groups_sha256(groups or []),
-                    "download_binding_sha256": source_sha256,
+                    "download_binding_sha256": logical_source_sha256,
                 },
             )
         except MediaProcessingError:
             return None
     if artifact is None:
         return None
-    return source_sha256, processor_version, artifact
+    return source_artifact_sha256, processor_version, artifact
 
 
 def _current_recovery_frames_artifact(
@@ -5517,37 +5829,74 @@ def _queue_content_ids(
     stage: str,
     limit: int,
     db_path: Path,
+    scope_content_ids: Optional[Iterable[int]] = None,
 ) -> List[int]:
     if stage not in {"download", "process"}:
         raise ValueError(f"unknown media queue stage: {stage}")
+    scoped_ids = (
+        None
+        if scope_content_ids is None
+        else list(dict.fromkeys(int(value) for value in scope_content_ids))
+    )
+    if scoped_ids == []:
+        return []
+    scope_clause = ""
+    scope_parameters: List[Any] = []
+    if scoped_ids is not None:
+        scope_placeholders = ",".join("?" for _ in scoped_ids)
+        scope_clause = f" WHERE c.id IN ({scope_placeholders})"
+        scope_parameters = list(scoped_ids)
     with connect(db_path) as connection:
         rows = connection.execute(
-            """
+            f"""
             SELECT c.id,c.content_type,c.platform,
-                   (SELECT source.local_path
-                    FROM evidence_artifacts source
-                    WHERE source.content_id=c.id
-                      AND source.artifact_type='media_source'
-                      AND source.status='available'
-                    ORDER BY source.id DESC LIMIT 1) AS source_path
+                   source.id AS source_artifact_id,
+                   source.sha256 AS source_artifact_sha256,
+                   source.processor_version AS source_processor_version
             FROM content_items c
-            WHERE EXISTS (
-                SELECT 1 FROM evidence_artifacts source
-                WHERE source.content_id=c.id AND source.artifact_type='media_source'
-                  AND source.status='available'
+            JOIN evidence_artifacts source ON source.id=(
+                SELECT current_source.id FROM evidence_artifacts current_source
+                WHERE current_source.content_id=c.id
+                  AND current_source.artifact_type='media_source'
+                  AND current_source.status='available'
+                ORDER BY current_source.id DESC LIMIT 1
             )
+            {scope_clause}
             ORDER BY (c.published_at IS NULL) ASC, c.published_at DESC, c.id DESC
             """,
+            scope_parameters,
         ).fetchall()
+        slot_scope_clause = ""
+        slot_scope_parameters: List[Any] = []
+        if scoped_ids is not None:
+            slot_scope_clause = (
+                " WHERE content_id IN ("
+                + ",".join("?" for _ in scoped_ids)
+                + ")"
+            )
+            slot_scope_parameters = list(scoped_ids)
         slot_rows = connection.execute(
-            """
+            f"""
             SELECT id,content_id,source_sha256,processor_type,processor_version,
                    status,attempt_count,output_artifact_id
             FROM media_processing_slots
-            """
+            {slot_scope_clause}
+            """,
+            slot_scope_parameters,
         ).fetchall()
+        artifact_scope_clause = ""
+        artifact_scope_parameters: List[Any] = []
+        if scoped_ids is not None:
+            artifact_scope_clause = (
+                " AND content_id IN ("
+                + ",".join("?" for _ in scoped_ids)
+                + ")"
+            )
+            artifact_scope_parameters = list(scoped_ids)
         artifact_rows = connection.execute(
-            "SELECT id,sha256 FROM evidence_artifacts WHERE status='available'"
+            "SELECT id,sha256 FROM evidence_artifacts "
+            f"WHERE status='available'{artifact_scope_clause}",
+            artifact_scope_parameters,
         ).fetchall()
     slots_by_content: Dict[int, List[sqlite3.Row]] = {}
     for slot_row in slot_rows:
@@ -5587,33 +5936,26 @@ def _queue_content_ids(
     selected: List[int] = []
     for row in rows:
         content_id = int(row["id"])
-        source = _read_json_object(_resolved(str(row["source_path"] or "")))
         platform = str(row["platform"] or "")
-        media_kind = source.get("media_kind")
-        identity = _download_slot_identity(
-            source,
-            platform=platform,
-            content_type=row["content_type"],
+        media_kind = str(row["content_type"] or "")
+        source_sha256 = row["source_artifact_sha256"]
+        if (
+            media_kind not in {"video", "image"}
+            or row["source_processor_version"] != MEDIA_SOURCE_VERSION
+            or not _valid_sha256(source_sha256)
+            or (media_kind == "image" and platform == "douyin")
+        ):
+            continue
+        download_version = (
+            VIDEO_DOWNLOAD_VERSION if media_kind == "video" else IMAGE_DOWNLOAD_VERSION
         )
-        if identity is None:
-            continue
-        source_sha256, _download_version = identity
-        media_kind = str(media_kind or "")
-        raw_urls = source.get("urls", [])
-        if not isinstance(raw_urls, list):
-            continue
-        normalized_urls, _ = _media_source_identity(media_kind, raw_urls)
-        source_identities = {source_sha256}
-        if media_kind == "video":
-            source_identities.add(_legacy_media_source_sha256(normalized_urls))
-        allowed_download_versions = _download_versions(media_kind)
         content_slots = slots_by_content.get(content_id, [])
         download_slots = [
             item
             for item in content_slots
             if item["processor_type"] == "download"
-            and item["source_sha256"] in source_identities
-            and item["processor_version"] in allowed_download_versions
+            and item["source_sha256"] == source_sha256
+            and item["processor_version"] == download_version
         ]
         effective_download = _effective_download_slot(download_slots)
         if stage == "download":
@@ -5689,11 +6031,24 @@ def _queue_recovery_scope_content_ids(
     stage: str,
     limit: int,
     db_path: Path,
+    scope_content_ids: Optional[Iterable[int]] = None,
 ) -> List[int]:
     processor_types = (
         ("download",) if stage == "download" else ("frames", "asr", "ocr")
     )
     placeholders = ",".join("?" for _ in processor_types)
+    scoped_ids = (
+        None
+        if scope_content_ids is None
+        else list(dict.fromkeys(int(value) for value in scope_content_ids))
+    )
+    if scoped_ids == []:
+        return []
+    scope_clause = ""
+    scope_parameters: List[Any] = []
+    if scoped_ids is not None:
+        scope_clause = " AND c.id IN (" + ",".join("?" for _ in scoped_ids) + ")"
+        scope_parameters = list(scoped_ids)
     with connect(db_path) as connection:
         rows = connection.execute(
             f"""
@@ -5708,11 +6063,13 @@ def _queue_recovery_scope_content_ids(
                     AND source.artifact_type='media_source'
                     AND source.status='available'
               )
+              {scope_clause}
             ORDER BY (c.published_at IS NULL) ASC,c.published_at DESC,c.id DESC
             LIMIT ?
             """,
             (
                 *processor_types,
+                *scope_parameters,
                 limit,
             ),
         ).fetchall()
@@ -5724,6 +6081,7 @@ def run_media_download_queue(
     limit: int = MEDIA_QUEUE_BATCH_LIMIT,
     max_workers: int = MEDIA_DOWNLOAD_WORKERS,
     db_path: Path = DEFAULT_DB,
+    scope_content_ids: Optional[Iterable[int]] = None,
 ) -> Dict[str, Any]:
     if limit < 0:
         raise ValueError("media queue limit must be non-negative")
@@ -5743,6 +6101,7 @@ def run_media_download_queue(
         stage="download",
         limit=limit,
         db_path=db_path,
+        scope_content_ids=scope_content_ids,
     )
     stale_recovery = recover_stale_media_processing_slots(
         db_path=db_path,
@@ -5750,7 +6109,10 @@ def run_media_download_queue(
         content_ids=recovery_scope,
     )
     probed_content_ids = _queue_content_ids(
-        stage="download", limit=limit + 1, db_path=db_path,
+        stage="download",
+        limit=limit + 1,
+        db_path=db_path,
+        scope_content_ids=scope_content_ids,
     )
     truncated = len(probed_content_ids) > limit
     content_ids = probed_content_ids[:limit]
@@ -5759,11 +6121,28 @@ def run_media_download_queue(
         try:
             return process_content_media(content_id, download_only=True, db_path=db_path)
         except Exception as exc:
-            state = get_media_source_state(content_id, db_path=db_path)
-            slot = state.get("download_slot") if state is not None else None
+            with connect(db_path) as connection:
+                slot = connection.execute(
+                    """
+                    SELECT slot.status,slot.attempt_count
+                    FROM evidence_artifacts source
+                    JOIN media_processing_slots slot
+                      ON slot.content_id=source.content_id
+                     AND slot.source_sha256=source.sha256
+                     AND slot.processor_type='download'
+                    WHERE source.content_id=? AND source.artifact_type='media_source'
+                      AND source.status='available'
+                    ORDER BY source.id DESC,slot.id DESC LIMIT 1
+                    """,
+                    (content_id,),
+                ).fetchone()
             status = (
                 "terminal_failed"
-                if isinstance(slot, dict) and slot.get("status") == "terminal_failed"
+                if slot is not None
+                and (
+                    slot["status"] == "terminal_failed"
+                    or int(slot["attempt_count"]) >= MAX_MEDIA_DOWNLOAD_ATTEMPTS
+                )
                 else "retryable_failed"
             )
             return {
@@ -5794,6 +6173,7 @@ def run_media_processing_queue(
     *,
     limit: int = MEDIA_QUEUE_BATCH_LIMIT,
     db_path: Path = DEFAULT_DB,
+    scope_content_ids: Optional[Iterable[int]] = None,
 ) -> Dict[str, Any]:
     if limit < 0:
         raise ValueError("media queue limit must be non-negative")
@@ -5814,6 +6194,7 @@ def run_media_processing_queue(
         stage="process",
         limit=limit,
         db_path=db_path,
+        scope_content_ids=scope_content_ids,
     )
     stale_recovery = recover_stale_media_processing_slots(
         db_path=db_path,
@@ -5826,7 +6207,10 @@ def run_media_processing_queue(
         content_ids=recovery_scope,
     )
     probed_content_ids = _queue_content_ids(
-        stage="process", limit=limit + 1, db_path=db_path,
+        stage="process",
+        limit=limit + 1,
+        db_path=db_path,
+        scope_content_ids=scope_content_ids,
     )
     truncated = len(probed_content_ids) > limit
     content_ids = probed_content_ids[:limit]

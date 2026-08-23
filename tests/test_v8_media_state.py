@@ -122,7 +122,7 @@ class V8MediaTerminalStateTest(unittest.TestCase):
             "source_sha256": source_sha256,
             "raw_response_id": raw_response_id,
         }
-        connection.execute(
+        cursor = connection.execute(
             """
             INSERT INTO evidence_artifacts(
                 content_id,artifact_type,local_path,status,byte_size,sha256,
@@ -140,7 +140,8 @@ class V8MediaTerminalStateTest(unittest.TestCase):
                 self._timestamp(1),
             ),
         )
-        return source_sha256, normalized_urls
+        assert cursor.lastrowid is not None
+        return media.file_sha256(path), normalized_urls
 
     def _artifact(
         self,
@@ -291,10 +292,6 @@ class V8MediaTerminalStateTest(unittest.TestCase):
         urls: list[str],
     ) -> tuple[str, None, str]:
         versions = media.processor_versions()
-        groups = media.image_source_groups(urls, platform="xiaohongshu")
-        binding_sha256 = media.image_download_binding_sha256(
-            source_sha256, media.image_groups_sha256(groups)
-        )
         manifest_id, manifest_sha256 = self._artifact(
             connection,
             content_id,
@@ -305,7 +302,7 @@ class V8MediaTerminalStateTest(unittest.TestCase):
         self._slot(
             connection,
             content_id,
-            source_sha256=binding_sha256,
+            source_sha256=source_sha256,
             processor_type="download",
             processor_version=media.IMAGE_DOWNLOAD_VERSION,
             status="succeeded",
@@ -526,7 +523,7 @@ class V8MediaTerminalStateTest(unittest.TestCase):
             MediaTerminalDetail("terminal_failed", "download_terminal_failed"),
         )
 
-    def test_old_source_is_ignored_but_same_source_legacy_terminal_blocks(self) -> None:
+    def test_old_and_legacy_source_slots_do_not_override_current_artifact_slot(self) -> None:
         with connect(self.db) as connection:
             source_changed_id = self._content(connection)
             old_source, _urls = self._source(
@@ -562,10 +559,10 @@ class V8MediaTerminalStateTest(unittest.TestCase):
             )
         self.assertEqual(
             states,
-            {source_changed_id: "pending", old_version_id: "terminal_failed"},
+            {source_changed_id: "pending", old_version_id: "pending"},
         )
 
-    def test_same_source_legacy_succeeded_download_reuses_current_dag(self) -> None:
+    def test_same_source_legacy_success_is_pending_until_artifact_slot_migration(self) -> None:
         with connect(self.db) as connection:
             content_id = self._content(connection)
             _source_sha256, urls = self._source(
@@ -593,9 +590,7 @@ class V8MediaTerminalStateTest(unittest.TestCase):
             )
         self.assertEqual(
             details[content_id],
-            MediaTerminalDetail(
-                "terminal_insufficient", "terminal_insufficient"
-            ),
+            MediaTerminalDetail("pending", "download_pending"),
         )
 
     def test_v1_envelope_mismatched_to_current_dag_remains_pending(self) -> None:
