@@ -51,8 +51,10 @@ NOW = 1_900_000_000
 
 
 class AccountUpstream:
-    def __init__(self) -> None:
+    def __init__(self, *, resolver_outcome: str = "matched") -> None:
         self.calls: list[dict[str, object]] = []
+        self.resolve_calls: list[list[str]] = []
+        self.resolver_outcome = resolver_outcome
         self.app = FastAPI()
 
         @self.app.post("/api/v8/accounts/search")
@@ -90,6 +92,53 @@ class AccountUpstream:
                         {"platform": "douyin", "uid": "pending-secret"}
                     ],
                 }
+            )
+
+        @self.app.post("/api/v8/accounts/resolve-douyin-videos")
+        async def resolve_douyin_videos(request: Request) -> JSONResponse:
+            payload = await request.json()
+            video_ids = [str(value) for value in payload.get("video_ids", [])]
+            self.resolve_calls.append(video_ids)
+            if self.resolver_outcome == "unavailable":
+                return JSONResponse({"detail": "resolver unavailable"}, status_code=503)
+            if self.resolver_outcome == "matched":
+                return JSONResponse(
+                    {
+                        "status": "matched",
+                        "matched_account": {
+                            "account_id": 7,
+                            "platform_uid": PLATFORM_UID,
+                        },
+                        "candidate_accounts": [],
+                        "unmatched_video_ids": [],
+                        "matched_video_count": len(video_ids),
+                    }
+                )
+            if self.resolver_outcome == "ambiguous":
+                return JSONResponse(
+                    {
+                        "status": "ambiguous",
+                        "matched_account": None,
+                        "candidate_accounts": [
+                            {"account_id": 7, "platform_uid": PLATFORM_UID},
+                            {"account_id": 8, "platform_uid": "987654321"},
+                        ],
+                        "unmatched_video_ids": [],
+                        "matched_video_count": len(video_ids),
+                    }
+                )
+            if self.resolver_outcome == "unmatched":
+                return JSONResponse(
+                    {
+                        "status": "unmatched",
+                        "matched_account": None,
+                        "candidate_accounts": [],
+                        "unmatched_video_ids": video_ids,
+                        "matched_video_count": 0,
+                    }
+                )
+            raise AssertionError(
+                f"unsupported resolver outcome: {self.resolver_outcome}"
             )
 
     @staticmethod
@@ -179,7 +228,9 @@ class DouyinControlApiTestCase(unittest.TestCase):
             patch.object(DouyinOAuthClient, "__init__", return_value=None),
             patch.object(DouyinOAuthClient, "aclose", close),
         ):
-            app = create_app(config, api_transport=ASGITransport(app=AccountUpstream().app))
+            app = create_app(
+                config, api_transport=ASGITransport(app=AccountUpstream().app)
+            )
             with TestClient(app) as client:
                 response = client.get(
                     "/internal/v1/health",
@@ -189,8 +240,16 @@ class DouyinControlApiTestCase(unittest.TestCase):
                 self.assertIsNotNone(app.state.token_manager)
         close.assert_awaited_once()
 
-    def _config(self, base_path: str, *, enabled: bool = True) -> DouyinControlConfig:
+    def _config(
+        self,
+        base_path: str,
+        *,
+        enabled: bool = True,
+        vault_namespace: str = "",
+    ) -> DouyinControlConfig:
         suffix = "root" if not base_path else "dcar"
+        if vault_namespace:
+            suffix = f"{suffix}-{vault_namespace}"
         return DouyinControlConfig(
             public_base_path=base_path,
             vault_path=self.root / f"vault-{suffix}.sqlite3",
@@ -213,9 +272,7 @@ class DouyinControlApiTestCase(unittest.TestCase):
                 "http://127.0.0.1:4199/oauth/userinfo/" if enabled else ""
             ),
             callback_url=(
-                f"https://dcar.test{base_path}/oauth/douyin/callback"
-                if enabled
-                else ""
+                f"https://dcar.test{base_path}/oauth/douyin/callback" if enabled else ""
             ),
         )
 
@@ -242,12 +299,18 @@ class DouyinControlApiTestCase(unittest.TestCase):
         *,
         enabled: bool = True,
         provider_state: MockDouyinState | None = None,
+        resolver_outcome: str = "matched",
+        vault_namespace: str = "",
     ) -> Iterator[tuple[TestClient, TestClient, AccountUpstream, MockDouyinState]]:
-        accounts = AccountUpstream()
+        accounts = AccountUpstream(resolver_outcome=resolver_outcome)
         state = provider_state or MockDouyinState(CLIENT_KEY, CLIENT_SECRET)
         mock_app = create_mock_douyin_oauth(state)
         control_app = create_app(
-            self._config(base_path, enabled=enabled),
+            self._config(
+                base_path,
+                enabled=enabled,
+                vault_namespace=vault_namespace,
+            ),
             api_transport=ASGITransport(app=accounts.app),
             oauth_transport=ASGITransport(app=mock_app) if enabled else None,
             clock=lambda: NOW,
@@ -283,7 +346,7 @@ class DouyinControlApiTestCase(unittest.TestCase):
         start = control.post(
             "/api/douyin/oauth/start",
             headers=self._headers("douyin-oauth-start"),
-            json={"account_id": 7, "platform_uid": PLATFORM_UID},
+            json={},
         )
         self.assertEqual(start.status_code, 200, start.text)
         authorize_url = start.json()["authorize_url"]
@@ -304,11 +367,14 @@ class DouyinControlApiTestCase(unittest.TestCase):
 
     def test_trust_boundary_pages_and_internal_health(self) -> None:
         for base_path in ("", "/dcar"):
-            with self.subTest(base_path=base_path), self._clients(base_path) as (
-                control,
-                _provider,
-                _accounts,
-                _state,
+            with (
+                self.subTest(base_path=base_path),
+                self._clients(base_path) as (
+                    control,
+                    _provider,
+                    _accounts,
+                    _state,
+                ),
             ):
                 self.assertEqual(control.get("/douyin").status_code, 403)
                 self.assertEqual(
@@ -317,10 +383,14 @@ class DouyinControlApiTestCase(unittest.TestCase):
                     ).status_code,
                     403,
                 )
-                page = control.get("/douyin", headers=self._headers())
-                self.assertEqual(page.status_code, 200)
-                self.assertIn("抖音账号授权", page.text)
-                self.assertIn("script-src 'nonce-", page.headers["content-security-policy"])
+                page = control.get(
+                    "/douyin", headers=self._headers(), follow_redirects=False
+                )
+                self.assertEqual(page.status_code, 303)
+                self.assertEqual(
+                    page.headers["location"],
+                    f"{base_path}/accounts/douyin-authorization",
+                )
                 self.assertEqual(page.headers["cache-control"], "no-store")
                 self.assertEqual(
                     control.get("/douyin/", headers=self._headers()).status_code, 404
@@ -345,19 +415,46 @@ class DouyinControlApiTestCase(unittest.TestCase):
                     403,
                 )
 
+                old_routes = [
+                    ("GET", "/douyin/confirm", None),
+                    ("POST", "/api/douyin/oauth/confirm", "douyin-oauth-confirm"),
+                    ("POST", "/api/douyin/oauth/reject", "douyin-oauth-reject"),
+                ]
+                for method, path, action in old_routes:
+                    with self.subTest(base_path=base_path, old_route=path):
+                        response = control.request(
+                            method,
+                            path,
+                            headers=self._headers(action),
+                            json={} if method == "POST" else None,
+                        )
+                        self.assertEqual(
+                            response.status_code,
+                            404 if method == "GET" else 403,
+                            response.text,
+                        )
+
     def test_machine_authorization_projection_and_video_list_page(self) -> None:
-        with self._clients("") as (control, provider, _accounts, _state):
+        with self._clients("") as (control, provider, accounts, _state):
             _state_value, callback, _callback_target = self._start_and_callback(
                 control, provider, ""
             )
             self.assertEqual(callback.status_code, 303)
-            confirmed = control.post(
-                "/api/douyin/oauth/confirm",
-                headers=self._headers("douyin-oauth-confirm"),
-                json={},
+            self.assertEqual(
+                callback.headers["location"],
+                "/accounts/douyin-authorization?notice=oauth-completed",
             )
-            self.assertEqual(confirmed.status_code, 200, confirmed.text)
-            authorization_id = confirmed.json()["authorization"]["id"]
+            self.assertEqual(accounts.resolve_calls, [["mock-video-id"]])
+            browser_list = control.get(
+                "/api/douyin/authorizations", headers=self._headers()
+            )
+            self.assertEqual(browser_list.status_code, 200, browser_list.text)
+            self.assertEqual(len(browser_list.json()["items"]), 1)
+            authorization = browser_list.json()["items"][0]
+            self.assertEqual(authorization["status"], "active")
+            self.assertEqual(authorization["account_id"], 7)
+            self.assertEqual(authorization["platform_uid"], PLATFORM_UID)
+            authorization_id = authorization["id"]
 
             listed = control.get(
                 "/internal/v1/authorizations",
@@ -422,9 +519,7 @@ class DouyinControlApiTestCase(unittest.TestCase):
                     "captured_at": NOW,
                     "cursor": 20,
                     "has_more": True,
-                    "items": [
-                        {"item_id": "1234567890123456789", "title": "作品"}
-                    ],
+                    "items": [{"item_id": "1234567890123456789", "title": "作品"}],
                 },
             )
             self.assertEqual(page.headers["cache-control"], "no-store")
@@ -438,10 +533,12 @@ class DouyinControlApiTestCase(unittest.TestCase):
 
             unbound = control.post(
                 "/api/douyin/authorizations/unbind",
-                headers=self._headers("douyin-authorization-unbind"),
+                headers=self._headers(
+                    "douyin-authorization-unbind", username="second-operator"
+                ),
                 json={
                     "authorization_id": authorization_id,
-                    "expected_version": confirmed.json()["authorization"]["version"],
+                    "expected_version": authorization["version"],
                 },
             )
             self.assertEqual(unbound.status_code, 200, unbound.text)
@@ -472,9 +569,7 @@ class DouyinControlApiTestCase(unittest.TestCase):
 
             manager = AsyncMock()
             cast(FastAPI, control.app).state.token_manager = manager
-            forbidden = control.post(
-                "/internal/v1/video-list/page", json=payload
-            )
+            forbidden = control.post("/internal/v1/video-list/page", json=payload)
             self.assertEqual(forbidden.status_code, 403)
             self.assertEqual(forbidden.headers["cache-control"], "no-store")
             mixed_boundary = control.post(
@@ -541,7 +636,9 @@ class DouyinControlApiTestCase(unittest.TestCase):
                         headers={"X-Dcar-Machine-Key": MACHINE_KEY},
                         json=payload,
                     )
-                    self.assertEqual(response.status_code, expected_status, response.text)
+                    self.assertEqual(
+                        response.status_code, expected_status, response.text
+                    )
                     self.assertEqual(response.json()["detail"], expected_detail)
                     self.assertNotIn(str(error), response.text)
                     self.assertEqual(response.headers["cache-control"], "no-store")
@@ -549,13 +646,18 @@ class DouyinControlApiTestCase(unittest.TestCase):
                         self.assertEqual(response.json()["reason"], error.reason)
             self.assertEqual(manager.video_list_page.await_count, len(cases))
 
-    def test_account_search_preserves_query_and_returns_only_safe_projection(self) -> None:
+    def test_account_search_preserves_query_and_returns_only_safe_projection(
+        self,
+    ) -> None:
         for query in ("", "中文", " ", "%", "_", "甲" * 100):
-            with self.subTest(query=query), self._clients("") as (
-                control,
-                _provider,
-                accounts,
-                _state,
+            with (
+                self.subTest(query=query),
+                self._clients("") as (
+                    control,
+                    _provider,
+                    accounts,
+                    _state,
+                ),
             ):
                 response = control.post(
                     "/api/douyin/accounts/search",
@@ -612,7 +714,7 @@ class DouyinControlApiTestCase(unittest.TestCase):
             start = control.post(
                 "/api/douyin/oauth/start",
                 headers=self._headers("douyin-oauth-start"),
-                json={"account_id": 7, "platform_uid": PLATFORM_UID},
+                json={},
             )
             self.assertEqual(start.status_code, 409)
             self.assertEqual(accounts.calls, [])
@@ -624,71 +726,101 @@ class DouyinControlApiTestCase(unittest.TestCase):
             self.assertEqual(callback.status_code, 303)
             self.assertNotIn("code-canary", callback.headers["location"])
             self.assertNotIn("s" * 32, callback.headers["location"])
-            confirm = control.post(
+            old_confirm = control.post(
                 "/api/douyin/oauth/confirm",
                 headers=self._headers("douyin-oauth-confirm"),
                 json={},
             )
-            self.assertEqual(confirm.status_code, 409)
+            self.assertEqual(old_confirm.status_code, 403)
             self.assertEqual(state.token_calls, 0)
             self.assertEqual(state.userinfo_calls, 0)
 
-    def test_mock_oauth_end_to_end_replay_and_unbind(self) -> None:
+    def test_oauth_start_requires_fixed_marker_and_empty_object(self) -> None:
+        with self._clients("", vault_namespace="start-contract") as (
+            control,
+            _provider,
+            _accounts,
+            state,
+        ):
+            missing_marker = control.post(
+                "/api/douyin/oauth/start", headers=self._headers(), json={}
+            )
+            self.assertEqual(missing_marker.status_code, 403)
+            extra = control.post(
+                "/api/douyin/oauth/start",
+                headers=self._headers("douyin-oauth-start"),
+                json={"account_id": 7},
+            )
+            self.assertEqual(extra.status_code, 422, extra.text)
+            started = control.post(
+                "/api/douyin/oauth/start",
+                headers=self._headers("douyin-oauth-start"),
+                json={},
+            )
+            self.assertEqual(started.status_code, 200, started.text)
+            self.assertIn("authorize_url", started.json())
+            self.assertEqual(state.token_calls, 0)
+            self.assertEqual(state.userinfo_calls, 0)
+
+    def test_mock_oauth_auto_matches_replays_safely_and_unbinds(self) -> None:
         for base_path in ("", "/dcar"):
-            with self.subTest(base_path=base_path), self._clients(base_path) as (
-                control,
-                provider,
-                accounts,
-                state,
+            with (
+                self.subTest(base_path=base_path),
+                self._clients(base_path) as (
+                    control,
+                    provider,
+                    accounts,
+                    state,
+                ),
             ):
                 state_value, callback, callback_target = self._start_and_callback(
                     control, provider, base_path
                 )
                 self.assertEqual(callback.status_code, 303)
                 self.assertEqual(
-                    callback.headers["location"], f"{base_path}/douyin/confirm"
+                    callback.headers["location"],
+                    f"{base_path}/accounts/douyin-authorization?notice=oauth-completed",
                 )
                 self.assertNotIn(state_value, callback.headers["location"])
                 self.assertNotIn("access-", callback.text)
                 self.assertEqual(state.token_calls, 1)
                 self.assertEqual(state.userinfo_calls, 1)
-                self.assertGreaterEqual(
-                    sum(call["query"] == PLATFORM_UID for call in accounts.calls), 2
-                )
-
-                confirm_page = control.get(
-                    "/douyin/confirm", headers=self._headers(), follow_redirects=False
-                )
-                self.assertEqual(confirm_page.status_code, 200)
-                self.assertIn("Mock 抖音账号", confirm_page.text)
-                self.assertIn('class="avatar"', confirm_page.text)
-                self.assertNotIn("https://avatar.example/mock.png", confirm_page.text)
-                self.assertIn(
-                    "img-src 'self' data:",
-                    confirm_page.headers["content-security-policy"],
-                )
-                self.assertNotIn(
-                    "img-src 'self' data: https:",
-                    confirm_page.headers["content-security-policy"],
-                )
-                self.assertNotIn("access-", confirm_page.text)
-                self.assertNotIn("refresh-", confirm_page.text)
-
-                confirmed = control.post(
-                    "/api/douyin/oauth/confirm",
-                    headers=self._headers("douyin-oauth-confirm"),
-                    json={},
-                )
-                self.assertEqual(confirmed.status_code, 200, confirmed.text)
-                item = confirmed.json()["authorization"]
+                self.assertEqual(accounts.resolve_calls, [["mock-video-id"]])
                 listed = control.get(
                     "/api/douyin/authorizations", headers=self._headers()
                 )
                 self.assertEqual(listed.status_code, 200)
+                self.assertEqual(len(listed.json()["items"]), 1)
+                item = listed.json()["items"][0]
+                self.assertEqual(item["status"], "active")
+                self.assertEqual(item["account_id"], 7)
+                self.assertEqual(item["platform_uid"], PLATFORM_UID)
                 serialized = json.dumps(listed.json())
                 self.assertNotIn("access-", serialized)
                 self.assertNotIn("refresh-", serialized)
                 self.assertNotIn("mock-open-id", serialized)
+                statuses = control.get(
+                    "/api/douyin/authorization-statuses", headers=self._headers()
+                )
+                self.assertEqual(statuses.status_code, 200, statuses.text)
+                self.assertEqual(
+                    statuses.json()["items"][0],
+                    {
+                        "id": item["id"],
+                        "account_id": 7,
+                        "platform_uid": PLATFORM_UID,
+                        "status": "active",
+                        "match_reason": None,
+                        "refresh_expires_at": NOW + 30 * 24 * 60 * 60,
+                        "needs_reauthorization": False,
+                        "updated_at": NOW,
+                        "authorized": True,
+                        "scopes": ["user_info", "video.list"],
+                    },
+                )
+                self.assertNotIn("access-", json.dumps(statuses.json()))
+                self.assertNotIn("refresh-", json.dumps(statuses.json()))
+                self.assertNotIn("mock-open-id", json.dumps(statuses.json()))
 
                 replay = control.get(
                     callback_target, headers=self._headers(), follow_redirects=False
@@ -707,7 +839,9 @@ class DouyinControlApiTestCase(unittest.TestCase):
                 self.assertEqual(version_conflict.status_code, 409)
                 unbound = control.post(
                     "/api/douyin/authorizations/unbind",
-                    headers=self._headers("douyin-authorization-unbind"),
+                    headers=self._headers(
+                        "douyin-authorization-unbind", username="replacement-operator"
+                    ),
                     json={
                         "authorization_id": item["id"],
                         "expected_version": item["version"],
@@ -729,7 +863,167 @@ class DouyinControlApiTestCase(unittest.TestCase):
                 self.assertNotIn(b"access-", vault_bytes)
                 self.assertNotIn(b"refresh-", vault_bytes)
 
-    def test_wrong_session_does_not_consume_state_and_userinfo_can_degrade(self) -> None:
+    def test_auto_match_pending_reasons_and_manual_match(self) -> None:
+        reason_by_outcome = {
+            "unmatched": "no_match",
+            "ambiguous": "ambiguous_match",
+            "unavailable": "auto_match_unavailable",
+        }
+        for outcome, expected_reason in reason_by_outcome.items():
+            with (
+                self.subTest(outcome=outcome),
+                self._clients(
+                    "",
+                    resolver_outcome=outcome,
+                    vault_namespace=outcome,
+                ) as (
+                    control,
+                    provider,
+                    accounts,
+                    _state,
+                ),
+            ):
+                _state_value, callback, _callback_target = self._start_and_callback(
+                    control, provider, ""
+                )
+                self.assertEqual(callback.status_code, 303, callback.text)
+                self.assertEqual(
+                    callback.headers["location"],
+                    "/accounts/douyin-authorization?notice=oauth-completed",
+                )
+                listed = control.get(
+                    "/api/douyin/authorizations", headers=self._headers()
+                )
+                self.assertEqual(listed.status_code, 200, listed.text)
+                self.assertEqual(len(listed.json()["items"]), 1)
+                pending = listed.json()["items"][0]
+                self.assertEqual(pending["status"], "pending_match")
+                self.assertEqual(pending["match_reason"], expected_reason)
+                self.assertIsNone(pending["account_id"])
+                self.assertIsNone(pending["platform_uid"])
+                self.assertEqual(accounts.resolve_calls, [["mock-video-id"]])
+
+                statuses = control.get(
+                    "/api/douyin/authorization-statuses", headers=self._headers()
+                )
+                self.assertEqual(statuses.status_code, 200, statuses.text)
+                self.assertFalse(statuses.json()["items"][0]["authorized"])
+                self.assertNotIn("access-", json.dumps(statuses.json()))
+                self.assertNotIn("refresh-", json.dumps(statuses.json()))
+
+                stale = control.post(
+                    "/api/douyin/authorizations/match",
+                    headers=self._headers("douyin-authorization-match"),
+                    json={
+                        "authorization_id": pending["id"],
+                        "account_id": 7,
+                        "platform_uid": PLATFORM_UID,
+                        "expected_version": pending["version"] + 1,
+                    },
+                )
+                self.assertEqual(stale.status_code, 409, stale.text)
+
+                matched = control.post(
+                    "/api/douyin/authorizations/match",
+                    headers=self._headers(
+                        "douyin-authorization-match", username="manual-operator"
+                    ),
+                    json={
+                        "authorization_id": pending["id"],
+                        "account_id": 7,
+                        "platform_uid": PLATFORM_UID,
+                        "expected_version": pending["version"],
+                    },
+                )
+                self.assertEqual(matched.status_code, 200, matched.text)
+                self.assertEqual(matched.json()["authorization"]["status"], "active")
+                self.assertEqual(matched.json()["authorization"]["account_id"], 7)
+                self.assertEqual(
+                    matched.json()["authorization"]["platform_uid"], PLATFORM_UID
+                )
+                self.assertGreaterEqual(len(accounts.calls), 2)
+
+    def test_reauthorization_requires_current_version_and_same_open_id(self) -> None:
+        provider_state = MockDouyinState(CLIENT_KEY, CLIENT_SECRET)
+        with self._clients("", provider_state=provider_state) as (
+            control,
+            provider,
+            accounts,
+            _state,
+        ):
+            _state_value, callback, _callback_target = self._start_and_callback(
+                control, provider, ""
+            )
+            self.assertEqual(callback.status_code, 303)
+            item = control.get(
+                "/api/douyin/authorizations", headers=self._headers()
+            ).json()["items"][0]
+
+            stale = control.post(
+                "/api/douyin/authorizations/reauthorize",
+                headers=self._headers("douyin-authorization-reauthorize"),
+                json={
+                    "authorization_id": item["id"],
+                    "expected_version": item["version"] + 1,
+                },
+            )
+            self.assertEqual(stale.status_code, 409, stale.text)
+
+            reauthorize = control.post(
+                "/api/douyin/authorizations/reauthorize",
+                headers=self._headers("douyin-authorization-reauthorize"),
+                json={
+                    "authorization_id": item["id"],
+                    "expected_version": item["version"],
+                },
+            )
+            self.assertEqual(reauthorize.status_code, 200, reauthorize.text)
+            authorized = provider.get(reauthorize.json()["authorize_url"])
+            callback_target = self._upstream_target(authorized.headers["location"], "")
+            callback = control.get(
+                callback_target, headers=self._headers(), follow_redirects=False
+            )
+            self.assertEqual(callback.status_code, 303)
+            refreshed = control.get(
+                "/api/douyin/authorizations", headers=self._headers()
+            ).json()["items"][0]
+            self.assertEqual(refreshed["id"], item["id"])
+            self.assertEqual(refreshed["status"], "active")
+            self.assertEqual(refreshed["version"], item["version"] + 1)
+            self.assertEqual(accounts.resolve_calls, [["mock-video-id"]])
+
+            reauthorize_again = control.post(
+                "/api/douyin/authorizations/reauthorize",
+                headers=self._headers("douyin-authorization-reauthorize"),
+                json={
+                    "authorization_id": refreshed["id"],
+                    "expected_version": refreshed["version"],
+                },
+            )
+            self.assertEqual(reauthorize_again.status_code, 200)
+            provider_state.open_id = "mock-open-id-wrong-account"
+            wrong_authorized = provider.get(reauthorize_again.json()["authorize_url"])
+            wrong_target = self._upstream_target(
+                wrong_authorized.headers["location"], ""
+            )
+            wrong = control.get(
+                wrong_target, headers=self._headers(), follow_redirects=False
+            )
+            self.assertEqual(wrong.status_code, 303)
+            self.assertEqual(
+                wrong.headers["location"],
+                "/accounts/douyin-authorization?notice=oauth-conflict",
+            )
+            preserved = control.get(
+                "/api/douyin/authorizations", headers=self._headers()
+            ).json()["items"]
+            self.assertEqual(len(preserved), 1)
+            self.assertEqual(preserved[0]["id"], item["id"])
+            self.assertEqual(preserved[0]["status"], "active")
+
+    def test_wrong_session_does_not_consume_state_and_userinfo_can_degrade(
+        self,
+    ) -> None:
         provider_state = MockDouyinState(CLIENT_KEY, CLIENT_SECRET)
         provider_state.userinfo_failure = True
         with self._clients("", provider_state=provider_state) as (
@@ -741,13 +1035,11 @@ class DouyinControlApiTestCase(unittest.TestCase):
             start = control.post(
                 "/api/douyin/oauth/start",
                 headers=self._headers("douyin-oauth-start"),
-                json={"account_id": 7, "platform_uid": PLATFORM_UID},
+                json={},
             )
             authorize_url = start.json()["authorize_url"]
             authorized = provider.get(authorize_url)
-            callback_target = self._upstream_target(
-                authorized.headers["location"], ""
-            )
+            callback_target = self._upstream_target(authorized.headers["location"], "")
             wrong = control.get(
                 callback_target,
                 headers=self._headers(binding="b" * 64),
@@ -761,9 +1053,13 @@ class DouyinControlApiTestCase(unittest.TestCase):
             self.assertEqual(correct.status_code, 303)
             self.assertEqual(state.token_calls, 1)
             self.assertEqual(state.userinfo_calls, 1)
-            page = control.get("/douyin/confirm", headers=self._headers())
-            self.assertEqual(page.status_code, 200)
-            self.assertIn("未获取昵称", page.text)
+            self.assertEqual(
+                correct.headers["location"],
+                "/accounts/douyin-authorization?notice=oauth-completed",
+            )
+            listed = control.get("/api/douyin/authorizations", headers=self._headers())
+            self.assertEqual(listed.status_code, 200, listed.text)
+            self.assertEqual(listed.json()["items"][0]["status"], "active")
 
     def test_control_package_never_imports_v8_or_exposes_mock_route(self) -> None:
         package_root = REPOSITORY_ROOT / "src" / "dcar_eval" / "dcar_douyin_control"

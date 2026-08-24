@@ -65,6 +65,17 @@ export function jsonRequest(body: unknown, method = "POST"): RequestInit {
   };
 }
 
+export function markedJsonRequest(body: unknown, marker: string): RequestInit {
+  return {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Dcar-Request": marker,
+    },
+    body: JSON.stringify(body),
+  };
+}
+
 export function parseCsv(text: string): Array<Record<string, string>> {
   const rows: string[][] = [];
   let row: string[] = [];

@@ -580,6 +580,53 @@ class MockOAuthClient:
         except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
             raise RuntimeError("mock_userinfo_failed") from exc
 
+    async def video_list_page(
+        self,
+        *,
+        access_token: str,
+        open_id: str,
+        cursor: int,
+        count: int = 20,
+    ) -> VideoListPage:
+        if not access_token or not open_id:
+            raise RuntimeError("mock_video_list_invalid_credentials")
+        if isinstance(cursor, bool) or not 0 <= cursor <= 2**63 - 1:
+            raise ValueError("cursor is invalid")
+        if isinstance(count, bool) or not 1 <= count <= 20:
+            raise ValueError("count must be between 1 and 20")
+        items = (
+            [
+                {
+                    "video_id": "mock-video-id",
+                    "title": "Mock 作品",
+                    "create_time": int(self._clock()) - 60,
+                    "is_top": False,
+                    "is_reviewed": True,
+                    "video_status": 1,
+                    "share_url": "https://www.douyin.com/video/mock-video-id",
+                    "item_id": None,
+                    "media_type": 2,
+                    "cover": None,
+                    "statistics": {
+                        "forward_count": 0,
+                        "comment_count": 0,
+                        "digg_count": 0,
+                        "download_count": 0,
+                        "play_count": 0,
+                        "share_count": 0,
+                    },
+                }
+            ]
+            if cursor == 0
+            else []
+        )
+        return VideoListPage(
+            captured_at=int(self._clock()),
+            cursor=1 if items else cursor,
+            has_more=False,
+            items=items[:count],
+        )
+
     @staticmethod
     def _data_envelope(payload: Any) -> dict[str, Any]:
         if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):

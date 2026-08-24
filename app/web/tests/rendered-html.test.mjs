@@ -111,6 +111,7 @@ test("server-renders every real v8 product route", async () => {
   const expectations = [
     ["/overview", "数据概览"], ["/tasks", "数据报告任务"],
     ["/tasks/D8-TEST", "数据报告任务"], ["/accounts", "运营账号"],
+    ["/accounts/douyin-authorization", "抖音开放平台授权"],
     ["/contents", "内容数据"], ["/selling-points", "卖点标准"],
     ["/spu-audience", "SPU人群"],
   ];
@@ -133,6 +134,40 @@ test("server-renders every real v8 product route", async () => {
     assert.match(html, /class="loading-screen"/);
     assert.doesNotMatch(html, /codex-preview|Your site is taking shape|Starter Project/i);
   }
+});
+
+test("douyin authorization management uses the official scan flow and fixed trusted markers", async () => {
+  const [source, queries, api] = await Promise.all([
+    readFile(new URL("../app/accounts/douyin-authorization/DouyinAuthorizationPage.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/lib/queries.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/lib/api.ts", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(source, /<AppShell active="accounts">/);
+  assert.match(source, /href="\/accounts">返回账号页<\/Link>/);
+  assert.match(source, /className="primary"[\s\S]*开始扫码授权/);
+  assert.match(source, /markedJsonRequest\(\{\}, "douyin-oauth-start"\)/);
+  assert.match(source, /window\.location\.assign\(result\.authorize_url\)/);
+  assert.doesNotMatch(source, /account_id[^\n]*douyin-oauth-start|选择业务账号[^\n]*开始扫码授权/);
+  assert.match(source, /"\/api\/douyin\/accounts\/search"[\s\S]*"douyin-accounts-search"/);
+  assert.match(source, /"\/api\/douyin\/authorizations\/match"[\s\S]*"douyin-authorization-match"/);
+  assert.match(source, /"\/api\/douyin\/authorizations\/reauthorize"[\s\S]*"douyin-authorization-reauthorize"/);
+  assert.match(source, /"\/api\/douyin\/authorizations\/unbind"[\s\S]*"douyin-authorization-unbind"/);
+  assert.match(source, /item\.status !== "pending_match"[\s\S]*重新授权/);
+  assert.match(source, /item\.status === "active"[\s\S]*解绑/);
+  assert.match(source, /item\.status === "pending_match"[\s\S]*人工匹配业务账号/);
+  assert.match(source, /new BroadcastChannel\(CALLBACK_CHANNEL\)/);
+  assert.match(source, /window\.opener\.postMessage\(CALLBACK_MESSAGE, window\.location\.origin\)/);
+  assert.doesNotMatch(source, /postMessage\([^\n]+,\s*["']\*["']/);
+  assert.match(source, /const noticeCopy: Record/);
+  assert.match(source, /const callbackNotice = noticeCopy\[notice\] \?\? null/);
+  assert.match(source, /const queryError = authorizationsQuery\.isError[\s\S]*statusesQuery\.isError/);
+  assert.match(source, /\{queryError && <Notice tone="error">\{queryError\}<\/Notice>\}/);
+  assert.doesNotMatch(source, /authorizationsQuery\.isError && <Notice|statusesQuery\.isError && <Notice/);
+  assert.doesNotMatch(source, /avatar|<img|<Image/);
+  assert.match(queries, /douyinAuthorizationsQueryOptions[\s\S]*readDouyinAuthorizations/);
+  assert.match(queries, /douyinAuthorizationStatusesQueryOptions[\s\S]*queryFn: \(\) => readJson<DouyinAuthorizationStatusesResult>\("\/api\/douyin\/authorization-statuses"\)[\s\S]*staleTime: 0[\s\S]*refetchOnMount: "always"[\s\S]*refetchOnWindowFocus: "always"/);
+  assert.match(api, /"X-Dcar-Request": marker/);
 });
 
 test("root redirects to overview instead of keeping hidden client-side view state", async () => {
@@ -666,15 +701,30 @@ test("routes preserve operations and expose read-only evidence workbench", async
   assert.match(contents, /if \(!contentsQuery\.data \|\| contentsQuery\.isPlaceholderData\) return;[\s\S]*lastPageFor\(contentsQuery\.data\.total, appliedRequest\.page_size\)[\s\S]*\{ \.\.\.current, page: lastPage \}/);
   assert.doesNotMatch(contents, /function pageWindow/);
   assert.match(accounts, /以手机号为唯一标识的账号列表/);
+  assert.match(accounts, /新增账号<\/button><Link className="secondary button-link" href="\/accounts\/douyin-authorization">账号授权<\/Link><a className="secondary button-link"[^>]+>下载账号表格<\/a><label className="secondary button-link">批量导入/);
+  assert.match(accounts, /useQuery\(douyinAuthorizationStatusesQueryOptions\(\)\)/);
+  assert.match(accounts, /filter\(\(item\) => item\.account_id != null && item\.authorized\)/);
+  assert.match(accounts, /isPending && !douyinAuthorizationStatusesQuery\.data\) return "查询中"/);
+  assert.match(accounts, /douyinAuthorizationStatusesQuery\.isError\) return "状态异常"/);
+  assert.match(accounts, /authorizedAccountIds\.has\(accountId\) \? "已授权" : "未授权"/);
   assert.match(accounts, /className="account-base-group" colSpan=\{4\} scope="colgroup">账号基础信息/);
   assert.match(accounts, /platformKeys\.map\(\(key\) => <th className="account-platform-group"/);
+  assert.match(accounts, /colSpan=\{key === "douyin" \? 6 : 5\}/);
   assert.match(accounts, /className="account-management-group" colSpan=\{2\} scope="colgroup">账号管理/);
   assert.match(accounts, /<PlatformHeaderMark platformKey=\{key\} \/>/);
   assert.match(accounts, /data-platform-columns=\{key\}/);
+  assert.match(accounts, /key === "douyin" && <col className="account-douyin-authorization-col" \/>/);
   assert.match(formatSource, /platformKeys = \["douyin", "xiaohongshu", "wechat_channels", "kuaishou"\]/);
-  assert.match(accounts, /<th className="account-platform-start" scope="col">平台账号编号<\/th><th scope="col">是否实名<\/th><th scope="col">昵称<\/th><th className="account-number-cell" scope="col">粉丝量<\/th><th className="account-number-cell" scope="col">关联内容量<\/th>/);
+  assert.match(accounts, /<th className="account-platform-start" scope="col">平台账号编号<\/th><th scope="col">是否实名<\/th>\{key === "douyin" && <th scope="col">抖音开平授权<\/th>\}<th scope="col">昵称<\/th><th className="account-number-cell" scope="col">粉丝量<\/th><th className="account-number-cell" scope="col">关联内容量<\/th>/);
+  assert.match(accounts, /platformKey === "douyin" && <td className="account-douyin-authorization-cell">\{douyinAuthorizationStatus\}<\/td>/);
   assert.match(accounts, /<th className="account-sticky account-phone" scope="row"><strong>\{item\.phone\}<\/strong><\/th>/);
-  assert.match(accounts, /<AccountPlatformCells account=\{item\} \/>/);
+  assert.match(accounts, /<AccountPlatformCells account=\{item\} douyinAuthorizationStatus=\{douyinAuthorizationStatus\(item\.id\)\} \/>/);
+  assert.match(accounts, /new BroadcastChannel\("dcar-douyin-authorization"\)/);
+  assert.match(accounts, /event\.origin !== window\.location\.origin \|\| !receivesAuthorizationUpdate\(event\.data\)/);
+  assert.match(accounts, /data\.type === "dcar-douyin-authorization-updated"/);
+  assert.match(accounts, /channel\?\.close\(\)[\s\S]*window\.removeEventListener\("message", handleWindowMessage\)/);
+  assert.match(accounts, /className="table-read-error" colSpan=\{27\}/);
+  assert.match(accounts, /className="account-master-empty" colSpan=\{27\}/);
   assert.match(apiSource, /NULL follower_count/);
   assert.match(apiSource, /COUNT\(c\.id\) content_count/);
   assert.match(accounts, /\/api\/v8\/accounts\/import/);

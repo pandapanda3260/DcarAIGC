@@ -47,8 +47,8 @@ def _validate_database(path: Path) -> dict[str, int]:
             raise RuntimeError("Vault backup quick_check failed")
         if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise RuntimeError("Vault backup foreign_key_check failed")
-        if int(connection.execute("PRAGMA user_version").fetchone()[0]) != 2:
-            raise RuntimeError("Vault backup schema version is not 2")
+        if int(connection.execute("PRAGMA user_version").fetchone()[0]) != 3:
+            raise RuntimeError("Vault backup schema version is not 3")
         tables = {
             str(row[0])
             for row in connection.execute(
@@ -244,7 +244,7 @@ def create_backup(source_path: Path, backup_dir: Path) -> dict[str, object]:
     _write_manifest(
         manifest_partial,
         {
-            "schema": "dcar-douyin-vault-backup-v2",
+            "schema": "dcar-douyin-vault-backup-v3",
             "created_at": stamp,
             "filename": final_path.name,
             "sha256": backup_sha256,

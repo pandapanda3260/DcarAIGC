@@ -3,8 +3,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
-import html
-import json
 import secrets
 import time
 from contextlib import asynccontextmanager, suppress
@@ -12,7 +10,7 @@ from typing import Any, Callable, Optional
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.responses import Response
 
@@ -36,8 +34,8 @@ REQUESTED_SCOPES = ["user_info", "video.list"]
 POST_ACTIONS = {
     "/api/douyin/accounts/search": "douyin-accounts-search",
     "/api/douyin/oauth/start": "douyin-oauth-start",
-    "/api/douyin/oauth/confirm": "douyin-oauth-confirm",
-    "/api/douyin/oauth/reject": "douyin-oauth-reject",
+    "/api/douyin/authorizations/match": "douyin-authorization-match",
+    "/api/douyin/authorizations/reauthorize": "douyin-authorization-reauthorize",
     "/api/douyin/authorizations/unbind": "douyin-authorization-unbind",
 }
 
@@ -53,8 +51,21 @@ class AccountSearchPayload(BaseModel):
 class OAuthStartPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+
+class AuthorizationMatchPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    authorization_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     account_id: int = Field(ge=1)
     platform_uid: str = Field(pattern=r"^\d{6,24}$")
+    expected_version: int = Field(ge=1)
+
+
+class ReauthorizePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    authorization_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    expected_version: int = Field(ge=1)
 
 
 class UnbindPayload(BaseModel):
@@ -184,41 +195,43 @@ class AccountDirectory:
                 raise RuntimeError("account_directory_invalid")
         raise RuntimeError("account_identity_unavailable")
 
-
-def _index_html(base_path: str, nonce: str) -> str:
-    base_json = json.dumps(base_path, ensure_ascii=False)
-    return f"""<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>抖音账号授权 · Dcar Sentinel</title>
-<style nonce="{nonce}">
-body{{font-family:Arial,'PingFang SC',sans-serif;margin:0;background:#f3f6f7;color:#13262d}}
-main{{max-width:820px;margin:48px auto;padding:0 20px}}section{{background:#fff;padding:24px;border-radius:14px;box-shadow:0 8px 28px #102c3518}}
-h1{{margin-top:0}}form{{display:flex;gap:8px}}input{{flex:1;padding:11px;border:1px solid #cad5d8;border-radius:8px}}button{{padding:10px 16px;border:0;border-radius:8px;background:#102c35;color:white;cursor:pointer}}article{{border-top:1px solid #e4eaec;padding:14px 0}}.muted{{color:#68777d}}.error{{color:#a74343}}
-</style></head><body><main><section><h1>抖音账号授权</h1>
-<p class="muted">选择已建档的抖音账号。授权确认前不会写入正式业务库。</p>
-<form id="search"><input id="query" maxlength="100" placeholder="账号名、昵称或 UID"><button>搜索</button></form>
-<div id="message" role="status"></div><div id="items"></div><div><button id="previous">上一页</button><button id="next">下一页</button></div></section></main>
-<script nonce="{nonce}">"use strict";const BASE={base_json};const items=document.getElementById('items');const message=document.getElementById('message');const previous=document.getElementById('previous');const next=document.getElementById('next');let currentPage=1;
-async function search(page){{message.textContent='加载中…';items.textContent='';const query=document.getElementById('query').value;const response=await fetch(BASE+'/api/douyin/accounts/search',{{method:'POST',credentials:'include',headers:{{'Content-Type':'application/json','X-Dcar-Request':'douyin-accounts-search'}},body:JSON.stringify({{query:query,page:page,page_size:50}})}});const data=await response.json();if(!response.ok)throw new Error(data.detail||'账号加载失败');currentPage=data.page;previous.disabled=currentPage<=1;next.disabled=currentPage*data.page_size>=data.total;message.textContent=data.items.length?'':'没有找到可授权的抖音账号';data.items.forEach(account=>{{const row=document.createElement('article');const title=document.createElement('strong');title.textContent=(account.operator_name||'未命名账号')+' · '+(account.nickname||account.uid);const button=document.createElement('button');button.textContent='发起授权';button.style.float='right';button.onclick=async()=>{{button.disabled=true;const start=await fetch(BASE+'/api/douyin/oauth/start',{{method:'POST',credentials:'include',headers:{{'Content-Type':'application/json','X-Dcar-Request':'douyin-oauth-start'}},body:JSON.stringify({{account_id:account.account_id,platform_uid:account.uid}})}});const result=await start.json();if(!start.ok){{button.disabled=false;message.textContent=result.detail||'暂时无法发起授权';return}}window.location.assign(result.authorize_url)}};row.append(title,button);items.append(row)}});}}
-function showError(error){{message.className='error';message.textContent=error.message}}document.getElementById('search').addEventListener('submit',event=>{{event.preventDefault();search(1).catch(showError)}});previous.onclick=()=>search(currentPage-1).catch(showError);next.onclick=()=>search(currentPage+1).catch(showError);search(1).catch(showError);
-</script></body></html>"""
-
-
-def _confirm_html(
-    base_path: str,
-    account: dict[str, Any],
-    candidate: dict[str, Any],
-    fingerprint: str,
-    nonce: str,
-) -> str:
-    operator_name = html.escape(str(account.get("operator_name") or "未命名账号"))
-    nickname = html.escape(str(candidate.get("nickname") or "未获取昵称"))
-    uid = html.escape(str(account["uid"]))
-    fingerprint_short = html.escape(fingerprint[:12])
-    avatar_html = '<p><span class="avatar" aria-hidden="true">抖</span></p>'
-    base_json = json.dumps(base_path, ensure_ascii=False)
-    return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>确认抖音授权</title><style nonce="{nonce}">body{{font-family:Arial,'PingFang SC',sans-serif;background:#f3f6f7;color:#13262d}}main{{max-width:620px;margin:60px auto;background:white;padding:28px;border-radius:14px}}.avatar{{display:inline-grid;place-items:center;width:64px;height:64px;border-radius:50%;background:#eef3f4;color:#102c35;font-size:28px;font-weight:700}}button{{padding:11px 18px;margin-right:8px;border:0;border-radius:8px;background:#102c35;color:white}}button.secondary{{background:#68777d}}</style></head><body><main><h1>确认账号授权</h1><p>业务账号：{operator_name}</p><p>抖音昵称：{nickname}</p>{avatar_html}<p>抖音 UID：{uid}</p><p>Open ID 指纹：{fingerprint_short}</p><button id="confirm">确认绑定</button><button class="secondary" id="reject">拒绝并清除</button><p id="message"></p></main><script nonce="{nonce}">"use strict";const BASE={base_json};async function act(path,marker){{const response=await fetch(BASE+path,{{method:'POST',credentials:'include',headers:{{'Content-Type':'application/json','X-Dcar-Request':marker}},body:'{{}}'}});const data=await response.json();if(!response.ok){{document.getElementById('message').textContent=data.detail||'操作失败';return}}window.location.replace(data.redirect_to)}}document.getElementById('confirm').onclick=()=>act('/api/douyin/oauth/confirm','douyin-oauth-confirm');document.getElementById('reject').onclick=()=>act('/api/douyin/oauth/reject','douyin-oauth-reject');</script></body></html>"""
+    async def resolve_douyin_videos(self, video_ids: list[str]) -> dict[str, Any]:
+        try:
+            response = await self.client.post(
+                f"{self.api_upstream}/api/v8/accounts/resolve-douyin-videos",
+                json={"video_ids": video_ids},
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise RuntimeError("account_resolver_unavailable") from exc
+        if not isinstance(payload, dict) or payload.get("status") not in {
+            "matched",
+            "unmatched",
+            "ambiguous",
+        }:
+            raise RuntimeError("account_resolver_invalid")
+        if payload["status"] == "matched":
+            matched = payload.get("matched_account")
+            if not isinstance(matched, dict):
+                raise RuntimeError("account_resolver_invalid")
+            try:
+                account_id = int(matched["account_id"])
+                platform_uid = str(matched["platform_uid"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError("account_resolver_invalid") from exc
+            if account_id < 1 or not (
+                6 <= len(platform_uid) <= 24
+                and platform_uid.isascii()
+                and platform_uid.isdigit()
+            ):
+                raise RuntimeError("account_resolver_invalid")
+            return {
+                "status": "matched",
+                "account_id": account_id,
+                "platform_uid": platform_uid,
+            }
+        return {"status": str(payload["status"])}
 
 
 def create_app(
@@ -417,17 +430,52 @@ def create_app(
             )
         return JSONResponse(page.as_dict())
 
-    @application.get("/douyin", response_class=HTMLResponse)
-    async def index() -> HTMLResponse:
-        nonce = secrets.token_urlsafe(18)
-        response = HTMLResponse(_index_html(resolved.public_base_path, nonce))
-        response.headers["Content-Security-Policy"] = (
-            f"default-src 'self'; style-src 'nonce-{nonce}'; "
-            f"script-src 'nonce-{nonce}'; img-src 'self' data:; "
-            "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"
+    def authorization_page(notice: str = "") -> str:
+        target = resolved.public_route("/accounts/douyin-authorization")
+        if notice:
+            return f"{target}?notice={notice}"
+        return target
+
+    async def start_authorization(
+        request: Request,
+        *,
+        target_authorization_id: str | None = None,
+        target_authorization_version: int | None = None,
+    ) -> Response:
+        if not resolved.authorization_enabled:
+            return JSONResponse(
+                {"detail": "抖音授权功能尚未启用"}, status_code=409
+            )
+        username, session_binding = _identity(request)
+        state = secrets.token_urlsafe(32)
+        state_digest = hashlib.sha256(state.encode("utf-8")).hexdigest()
+        now = int(clock())
+        await asyncio.to_thread(
+            request.app.state.store.create_state,
+            state_digest=state_digest,
+            bound_username=username,
+            session_binding=session_binding,
+            scopes=REQUESTED_SCOPES,
+            expires_at=now + resolved.state_ttl_seconds,
+            request_id=_request_id(request),
+            target_authorization_id=target_authorization_id,
+            target_authorization_version=target_authorization_version,
+            now=now,
         )
-        response.headers["X-Frame-Options"] = "DENY"
-        return response
+        provider: Optional[MockOAuthClient | DouyinOAuthClient] = (
+            request.app.state.provider
+        )
+        if provider is None:
+            return JSONResponse(
+                {"detail": "抖音授权功能尚未启用"}, status_code=409
+            )
+        return JSONResponse(
+            {"authorize_url": provider.authorization_url(state, REQUESTED_SCOPES)}
+        )
+
+    @application.get("/douyin")
+    async def index() -> RedirectResponse:
+        return RedirectResponse(authorization_page(), status_code=303)
 
     @application.post("/api/douyin/accounts/search")
     async def account_search(
@@ -452,44 +500,8 @@ def create_app(
 
     @application.post("/api/douyin/oauth/start")
     async def oauth_start(request: Request, payload: OAuthStartPayload) -> Response:
-        if not resolved.authorization_enabled:
-            return JSONResponse(
-                {"detail": "抖音授权功能尚未启用"}, status_code=409
-            )
-        try:
-            await request.app.state.accounts.require_account(
-                account_id=payload.account_id,
-                platform_uid=payload.platform_uid,
-            )
-        except RuntimeError:
-            return JSONResponse(
-                {"detail": "所选抖音账号已失效，请重新选择"}, status_code=409
-            )
-        username, session_binding = _identity(request)
-        state = secrets.token_urlsafe(32)
-        state_digest = hashlib.sha256(state.encode("utf-8")).hexdigest()
-        now = int(clock())
-        await asyncio.to_thread(
-            request.app.state.store.create_state,
-            state_digest=state_digest,
-            bound_username=username,
-            session_binding=session_binding,
-            account_id=payload.account_id,
-            platform_uid=payload.platform_uid,
-            scopes=REQUESTED_SCOPES,
-            expires_at=now + resolved.state_ttl_seconds,
-            request_id=_request_id(request),
-            now=now,
-        )
-        provider: Optional[MockOAuthClient | DouyinOAuthClient] = (
-            request.app.state.provider
-        )
-        if provider is None:
-            return JSONResponse(
-                {"detail": "抖音授权功能尚未启用"}, status_code=409
-            )
-        authorize_url = provider.authorization_url(state, REQUESTED_SCOPES)
-        return JSONResponse({"authorize_url": authorize_url})
+        del payload
+        return await start_authorization(request)
 
     @application.get("/oauth/douyin/callback")
     async def oauth_callback(
@@ -499,7 +511,7 @@ def create_app(
     ) -> Response:
         if not resolved.authorization_enabled:
             return RedirectResponse(
-                resolved.public_route("/douyin?notice=oauth-disabled"),
+                authorization_page("oauth-disabled"),
                 status_code=303,
             )
         if (
@@ -509,7 +521,7 @@ def create_app(
             or not 20 <= len(state) <= 256
         ):
             return RedirectResponse(
-                resolved.public_route("/douyin?notice=oauth-invalid-response"),
+                authorization_page("oauth-invalid-response"),
                 status_code=303,
             )
         username, session_binding = _identity(request)
@@ -526,12 +538,12 @@ def create_app(
             )
         except StateTransitionError:
             return RedirectResponse(
-                resolved.public_route("/douyin?notice=oauth-state-invalid"),
+                authorization_page("oauth-state-invalid"),
                 status_code=303,
             )
         except Exception:
             return RedirectResponse(
-                resolved.public_route("/douyin?notice=oauth-failed"),
+                authorization_page("oauth-failed"),
                 status_code=303,
             )
         try:
@@ -541,7 +553,7 @@ def create_app(
             bundle: TokenBundle = await provider.exchange_code(code)
             try:
                 profile = await provider.userinfo(bundle)
-            except RuntimeError:
+            except (DouyinProviderError, RuntimeError):
                 profile = {"nickname": "", "avatar": ""}
             open_id_fingerprint = request.app.state.cipher.open_id_fingerprint(
                 bundle.open_id
@@ -556,19 +568,73 @@ def create_app(
                 "nickname": str(profile.get("nickname") or ""),
                 "avatar": str(profile.get("avatar") or ""),
             }
-            ciphertext = request.app.state.cipher.encrypt(
-                state_digest, "oauth_candidate", candidate
-            )
-            await asyncio.to_thread(
-                request.app.state.store.store_candidate,
+            staged = await asyncio.to_thread(
+                request.app.state.store.stage_authorization_candidate,
                 state_digest=state_digest,
-                ciphertext=ciphertext,
+                bound_username=username,
+                session_binding=session_binding,
                 open_id_fingerprint=open_id_fingerprint,
-                confirmation_expires_at=(
-                    int(clock()) + resolved.confirmation_ttl_seconds
-                ),
+                candidate=candidate,
+                cipher=request.app.state.cipher,
                 request_id=request_id,
                 now=int(clock()),
+            )
+            if not bool(staged["already_active"]):
+                outcome = "unavailable"
+                matched_account_id: int | None = None
+                matched_platform_uid: str | None = None
+                try:
+                    page = await provider.video_list_page(
+                        access_token=bundle.access_token,
+                        open_id=bundle.open_id,
+                        cursor=0,
+                        count=20,
+                    )
+                    video_ids = [
+                        str(item["video_id"])
+                        for item in page.items
+                        if isinstance(item, dict) and item.get("video_id")
+                    ]
+                    if video_ids:
+                        resolved_match = (
+                            await request.app.state.accounts.resolve_douyin_videos(
+                                video_ids
+                            )
+                        )
+                        outcome = str(resolved_match["status"])
+                        if outcome == "matched":
+                            matched_account_id = int(resolved_match["account_id"])
+                            matched_platform_uid = str(
+                                resolved_match["platform_uid"]
+                            )
+                    else:
+                        outcome = "unmatched"
+                except (DouyinProviderError, RuntimeError, TypeError, ValueError):
+                    outcome = "unavailable"
+                await asyncio.to_thread(
+                    request.app.state.store.finalize_auto_match,
+                    state_digest=state_digest,
+                    authorization_id=str(staged["id"]),
+                    expected_version=int(staged["version"]),
+                    outcome=outcome,
+                    actor=username,
+                    request_id=request_id,
+                    account_id=matched_account_id,
+                    platform_uid=matched_platform_uid,
+                    now=int(clock()),
+                )
+        except AuthorizationConflict as exc:
+            with suppress(Exception):
+                await asyncio.to_thread(
+                    request.app.state.store.fail_state,
+                    state_digest,
+                    exc.reason_code,
+                    request_id=request_id,
+                    actor=username,
+                    now=int(clock()),
+                )
+            return RedirectResponse(
+                authorization_page("oauth-conflict"), status_code=303
             )
         except Exception:
             with suppress(Exception):
@@ -581,133 +647,76 @@ def create_app(
                     now=int(clock()),
                 )
             return RedirectResponse(
-                resolved.public_route("/douyin?notice=oauth-failed"),
+                authorization_page("oauth-failed"),
                 status_code=303,
             )
         return RedirectResponse(
-            resolved.public_route("/douyin/confirm"), status_code=303
+            authorization_page("oauth-completed"), status_code=303
         )
 
-    @application.get("/douyin/confirm", response_class=HTMLResponse)
-    async def confirmation_page(request: Request) -> Response:
-        username, session_binding = _identity(request)
-        pending = await asyncio.to_thread(
-            request.app.state.store.current_pending,
-            username,
-            session_binding,
-            now=int(clock()),
-        )
-        if pending is None:
-            return RedirectResponse(resolved.public_route("/douyin"), status_code=303)
-        try:
-            candidate = request.app.state.cipher.decrypt(
-                str(pending["state_digest"]),
-                "oauth_candidate",
-                bytes(pending["candidate_ciphertext"]),
-            )
-            account = await request.app.state.accounts.require_account(
-                account_id=int(pending["account_id"]),
-                platform_uid=str(pending["platform_uid"]),
-            )
-        except (RuntimeError, TypeError, ValueError):
-            return RedirectResponse(
-                resolved.public_route("/douyin?notice=confirmation-invalid"),
-                status_code=303,
-            )
-        nonce = secrets.token_urlsafe(18)
-        response = HTMLResponse(
-            _confirm_html(
-                resolved.public_base_path,
-                account,
-                candidate,
-                str(pending["candidate_open_id_fingerprint"]),
-                nonce,
-            )
-        )
-        response.headers["Content-Security-Policy"] = (
-            f"default-src 'self'; style-src 'nonce-{nonce}'; "
-            f"script-src 'nonce-{nonce}'; connect-src 'self'; "
-            "img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'"
-        )
-        response.headers["X-Frame-Options"] = "DENY"
-        return response
+    @application.get("/api/douyin/authorizations")
+    async def authorizations(request: Request) -> dict[str, Any]:
+        items = await asyncio.to_thread(request.app.state.store.list_authorizations)
+        return {"items": items}
 
-    @application.post("/api/douyin/oauth/confirm")
-    async def oauth_confirm(request: Request) -> Response:
-        if not resolved.authorization_enabled:
-            return JSONResponse(
-                {"detail": "抖音授权功能尚未启用"}, status_code=409
-            )
-        username, session_binding = _identity(request)
-        pending = await asyncio.to_thread(
-            request.app.state.store.current_pending,
-            username,
-            session_binding,
+    @application.get("/api/douyin/authorization-statuses")
+    async def authorization_statuses(request: Request) -> dict[str, Any]:
+        items = await asyncio.to_thread(
+            request.app.state.store.authorization_statuses,
             now=int(clock()),
         )
-        if pending is None:
-            return JSONResponse({"detail": "没有待确认的授权"}, status_code=409)
+        return {"items": items}
+
+    @application.post("/api/douyin/authorizations/match")
+    async def authorization_match(
+        request: Request, payload: AuthorizationMatchPayload
+    ) -> Response:
+        username, _binding = _identity(request)
         try:
-            account = await request.app.state.accounts.require_account(
-                account_id=int(pending["account_id"]),
-                platform_uid=str(pending["platform_uid"]),
-            )
-            del account
-            state_digest = str(pending["state_digest"])
-            candidate = request.app.state.cipher.decrypt(
-                state_digest,
-                "oauth_candidate",
-                bytes(pending["candidate_ciphertext"]),
-            )
-            open_id_fingerprint = request.app.state.cipher.open_id_fingerprint(
-                str(candidate["open_id"])
+            await request.app.state.accounts.require_account(
+                account_id=payload.account_id,
+                platform_uid=payload.platform_uid,
             )
             result = await asyncio.to_thread(
-                request.app.state.store.confirm_authorization,
-                state_digest=state_digest,
-                bound_username=username,
-                session_binding=session_binding,
-                open_id_fingerprint=open_id_fingerprint,
-                candidate=candidate,
-                cipher=request.app.state.cipher,
+                request.app.state.store.manual_match,
+                authorization_id=payload.authorization_id,
+                account_id=payload.account_id,
+                platform_uid=payload.platform_uid,
+                expected_version=payload.expected_version,
+                actor=username,
                 request_id=_request_id(request),
                 now=int(clock()),
             )
         except AuthorizationConflict as exc:
             return JSONResponse(
-                {"detail": "该抖音账号或业务账号已被其他授权占用", "reason": exc.reason_code},
+                {"detail": "授权状态已变化，请刷新后重试", "reason": exc.reason_code},
                 status_code=409,
             )
-        except (RuntimeError, KeyError, TypeError, ValueError):
-            return JSONResponse({"detail": "待确认授权已失效"}, status_code=409)
-        return JSONResponse(
-            {
-                "authorization": result,
-                "redirect_to": resolved.public_route("/douyin"),
-            }
-        )
+        except RuntimeError:
+            return JSONResponse(
+                {"detail": "所选抖音账号已失效，请重新选择"}, status_code=409
+            )
+        return JSONResponse({"authorization": result})
 
-    @application.post("/api/douyin/oauth/reject")
-    async def oauth_reject(request: Request) -> Response:
-        username, session_binding = _identity(request)
-        rejected = await asyncio.to_thread(
-            request.app.state.store.reject_current,
-            username,
-            session_binding,
-            request_id=_request_id(request),
-            now=int(clock()),
+    @application.post("/api/douyin/authorizations/reauthorize")
+    async def authorization_reauthorize(
+        request: Request, payload: ReauthorizePayload
+    ) -> Response:
+        authorization = await asyncio.to_thread(
+            request.app.state.store.get_authorization,
+            payload.authorization_id,
         )
-        if not rejected:
-            return JSONResponse({"detail": "没有待处理的授权"}, status_code=409)
-        return JSONResponse({"redirect_to": resolved.public_route("/douyin")})
-
-    @application.get("/api/douyin/authorizations")
-    async def authorizations(request: Request) -> dict[str, Any]:
-        username, _binding = _identity(request)
-        items = await asyncio.to_thread(
-            request.app.state.store.list_authorizations, username
+        if authorization is None:
+            return JSONResponse({"detail": "未找到授权"}, status_code=404)
+        if int(authorization["version"]) != payload.expected_version:
+            return JSONResponse(
+                {"detail": "授权状态已变化，请刷新后重试"}, status_code=409
+            )
+        return await start_authorization(
+            request,
+            target_authorization_id=payload.authorization_id,
+            target_authorization_version=payload.expected_version,
         )
-        return {"items": items}
 
     @application.post("/api/douyin/authorizations/unbind")
     async def authorization_unbind(
@@ -717,7 +726,7 @@ def create_app(
         try:
             unbound = await asyncio.to_thread(
                 request.app.state.store.unbind,
-                bound_username=username,
+                actor=username,
                 authorization_id=payload.authorization_id,
                 expected_version=payload.expected_version,
                 request_id=_request_id(request),

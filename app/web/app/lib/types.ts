@@ -206,6 +206,52 @@ export type Account = {
   platforms: PlatformIdentity[];
 };
 
+export type DouyinAuthorizationState = "active" | "unbound" | "pending_match";
+
+export type DouyinAuthorization = {
+  id: string;
+  bound_username: string;
+  account_id: number | null;
+  platform_uid: string | null;
+  access_expires_at: number | null;
+  refresh_expires_at: number | null;
+  renew_count: number;
+  scopes: string[];
+  version: number;
+  needs_reauthorization: boolean;
+  status: DouyinAuthorizationState;
+  match_reason: string | null;
+  updated_at: number;
+};
+
+export type DouyinAuthorizationStatus = {
+  id: string;
+  account_id: number | null;
+  platform_uid: string | null;
+  status: DouyinAuthorizationState;
+  match_reason: string | null;
+  refresh_expires_at: number | null;
+  needs_reauthorization: boolean;
+  updated_at: number;
+  authorized: boolean;
+  scopes: string[];
+};
+
+export type DouyinAccountDirectoryItem = {
+  account_id: number;
+  operator_name: string;
+  enabled: boolean;
+  uid: string;
+  nickname: string;
+};
+
+export type DouyinAccountDirectoryResult = {
+  items: DouyinAccountDirectoryItem[];
+  total: number;
+  page: number;
+  page_size: number;
+};
+
 export type ContentTagSpu = {
   spu_id: string;
   series: string;

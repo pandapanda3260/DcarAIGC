@@ -179,7 +179,7 @@ test("provider is SSR-safe and cached read query functions do not consume AbortS
   assert.match(client, /retry:\s*shouldRetryQuery/);
 
   assert.doesNotMatch(queries, /\bAbortController\b|\bsignal\b|QueryFunctionContext/);
-  assert.equal((queries.match(/queryFn:\s*\(\)\s*=>/g) ?? []).length, 10);
+  assert.equal((queries.match(/queryFn:\s*\(\)\s*=>/g) ?? []).length, 11);
   assert.match(queries, /activeSellingPointsQueryOptions[\s\S]*?staleTime:\s*60_000,[\s\S]*?refetchOnWindowFocus:\s*true/);
   assert.match(queries, /taskReportQueryOptions[\s\S]*?enabled:\s*Boolean\(revision\),[\s\S]*?staleTime:\s*Infinity/);
   assert.equal(JSON.parse(packageJson).dependencies["@tanstack/react-query"], "5.101.4");
@@ -210,7 +210,7 @@ test("list read failures stay distinct from real empty states and expose retry",
 
   assert.match(accounts, /const accountsReadFailed = accountsQuery\.isLoadingError \|\| retrying/);
   assert.match(accounts, /accountsReadFailed \? "读取失败" : `\$\{total\} 个账号`/);
-  assert.match(accounts, /className="table-read-error" colSpan=\{26\}/);
+  assert.match(accounts, /className="table-read-error" colSpan=\{27\}/);
   assert.match(accounts, /setRetrying\(true\);[\s\S]*accountsQuery\.refetch\(\)\.finally\(\(\) => setRetrying\(false\)\)/);
   assert.match(accounts, /disabled=\{retrying\} onClick=\{retryAccountsRead\}>\{retrying \? "正在重新加载…" : "重新加载"\}/);
   assert.match(accounts, /accountsQuery\.isPending && !accountsQuery\.data && !accountsReadFailed/);

@@ -5,6 +5,8 @@ import type { AccountSearchRequest, ContentSearchRequest } from "./queryContract
 import type {
   Account,
   ContentItem,
+  DouyinAuthorization,
+  DouyinAuthorizationStatus,
   Overview,
   PendingPlatformIdentity,
   ReportView,
@@ -23,6 +25,12 @@ export type AccountSearchResult = {
   pending_platform_identity_count: number;
   pending_platform_identities: PendingPlatformIdentity[];
 };
+export type DouyinAuthorizationsResult = { items: DouyinAuthorization[] };
+export type DouyinAuthorizationStatusesResult = { items: DouyinAuthorizationStatus[] };
+
+function readDouyinAuthorizations() {
+  return readJson<DouyinAuthorizationsResult>("/api/douyin/authorizations");
+}
 
 export const queryKeys = {
   overview: ["overview"] as const,
@@ -30,6 +38,8 @@ export const queryKeys = {
   contentSearch: (request: ContentSearchRequest) => ["contents", "search", request] as const,
   accounts: ["accounts"] as const,
   accountSearch: (request: AccountSearchRequest) => ["accounts", "search", request] as const,
+  douyinAuthorizations: ["douyin", "authorizations"] as const,
+  authorizationStatuses: ["douyin", "authorization-statuses"] as const,
   sellingPoints: ["selling-points"] as const,
   activeSellingPoints: ["selling-points", "active"] as const,
   draftSellingPoints: ["selling-points", "draft"] as const,
@@ -63,6 +73,25 @@ export function accountSearchQueryOptions(request: AccountSearchRequest) {
     queryKey: queryKeys.accountSearch(request),
     queryFn: () => readJson<AccountSearchResult>("/api/v8/accounts/search", jsonRequest(request)),
     placeholderData: keepPreviousData,
+  });
+}
+
+export function douyinAuthorizationsQueryOptions() {
+  return queryOptions({
+    queryKey: queryKeys.douyinAuthorizations,
+    queryFn: readDouyinAuthorizations,
+    staleTime: 0,
+    refetchOnMount: "always",
+  });
+}
+
+export function douyinAuthorizationStatusesQueryOptions() {
+  return queryOptions({
+    queryKey: queryKeys.authorizationStatuses,
+    queryFn: () => readJson<DouyinAuthorizationStatusesResult>("/api/douyin/authorization-statuses"),
+    staleTime: 0,
+    refetchOnMount: "always",
+    refetchOnWindowFocus: "always",
   });
 }
 

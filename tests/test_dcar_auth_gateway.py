@@ -512,15 +512,40 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
                 self.assertIsNone(payload["cookie"])
 
                 actions = {
-                    "/api/douyin/oauth/start": "douyin-oauth-start",
-                    "/api/douyin/oauth/confirm": "douyin-oauth-confirm",
-                    "/api/douyin/oauth/reject": "douyin-oauth-reject",
+                    "/api/douyin/oauth/start": ("douyin-oauth-start", "{}"),
+                    "/api/douyin/authorizations/match": (
+                        "douyin-authorization-match",
+                        '{"authorization_id":"auth-1","account_id":7,'
+                        '"platform_uid":"uid-7","expected_version":3}',
+                    ),
+                    "/api/douyin/authorizations/reauthorize": (
+                        "douyin-authorization-reauthorize",
+                        '{"authorization_id":"auth-1","expected_version":3}',
+                    ),
                     "/api/douyin/authorizations/unbind": (
-                        "douyin-authorization-unbind"
+                        "douyin-authorization-unbind",
+                        '{"authorization_id":"auth-1","expected_version":3}',
                     ),
                 }
-                for path, action in actions.items():
+                for path, (action, body) in actions.items():
                     routed = client.post(
+                        _route(base_path, path),
+                        content=body,
+                        headers={
+                            "Origin": ORIGIN,
+                            "X-Dcar-Request": action,
+                        },
+                    )
+                    self.assertEqual(routed.status_code, 200)
+                    self.assertEqual(routed.json()["path"], path)
+                    self.assertEqual(routed.json()["body"], body)
+                    self.assertEqual(routed.json()["verified_action"], action)
+
+                for path, action in (
+                    ("/api/douyin/oauth/confirm", "douyin-oauth-confirm"),
+                    ("/api/douyin/oauth/reject", "douyin-oauth-reject"),
+                ):
+                    removed = client.post(
                         _route(base_path, path),
                         content="{}",
                         headers={
@@ -528,8 +553,7 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
                             "X-Dcar-Request": action,
                         },
                     )
-                    self.assertEqual(routed.status_code, 200)
-                    self.assertEqual(routed.json()["verified_action"], action)
+                    self.assertEqual(removed.status_code, 404)
 
                 for headers in (
                     {

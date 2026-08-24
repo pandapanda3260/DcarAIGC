@@ -36,8 +36,8 @@ DOUYIN_CALLBACK_PATH = "/oauth/douyin/callback"
 DOUYIN_POST_ACTIONS = {
     "/api/douyin/accounts/search": "douyin-accounts-search",
     "/api/douyin/oauth/start": "douyin-oauth-start",
-    "/api/douyin/oauth/confirm": "douyin-oauth-confirm",
-    "/api/douyin/oauth/reject": "douyin-oauth-reject",
+    "/api/douyin/authorizations/match": "douyin-authorization-match",
+    "/api/douyin/authorizations/reauthorize": "douyin-authorization-reauthorize",
     "/api/douyin/authorizations/unbind": "douyin-authorization-unbind",
 }
 HOP_BY_HOP_HEADERS = frozenset(

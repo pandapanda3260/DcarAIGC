@@ -959,6 +959,12 @@ class V8ApiTest(unittest.TestCase):
                 replica_client.post("/api/v8/accounts/search", json={}).status_code,
                 200,
             )
+            resolved = replica_client.post(
+                "/api/v8/accounts/resolve-douyin-videos",
+                json={"video_ids": ["fixture-content"]},
+            )
+            self.assertEqual(resolved.status_code, 200)
+            self.assertEqual(resolved.json()["status"], "matched")
             blocked = replica_client.post("/api/v8/tasks", json={})
             self.assertEqual(blocked.status_code, 403)
             self.assertEqual(
@@ -2629,6 +2635,201 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         exported = self.client.get("/api/v8/accounts/export")
         self.assertEqual(exported.status_code, 200)
         self.assertIn("+86 138-0013-8000", exported.content.decode("utf-8-sig"))
+
+    def test_resolve_douyin_videos_returns_matched_unmatched_and_ambiguous(
+        self,
+    ) -> None:
+        created_at = now_utc()
+        with connect(self.db) as connection:
+            account = connection.execute(
+                """
+                INSERT INTO accounts(
+                    phone,phone_normalized,operator_name,account_type,
+                    content_direction,created_at,updated_at
+                ) VALUES ('13800138000','13800138000','resolver fixture','original',
+                          'media',?,?)
+                """,
+                (created_at, created_at),
+            )
+            first_account_id = int(account.lastrowid)
+            connection.execute(
+                """
+                INSERT INTO account_platform_identities(
+                    account_id,platform,uid,nickname,created_at,updated_at
+                ) VALUES (?,'douyin','fixture-uid','fixture account',?,?)
+                """,
+                (first_account_id, created_at, created_at),
+            )
+            connection.execute(
+                "UPDATE content_items SET account_id=? WHERE id=?",
+                (first_account_id, self.content_id),
+            )
+            connection.commit()
+
+        matched = self.client.post(
+            "/api/v8/accounts/resolve-douyin-videos",
+            json={
+                "video_ids": [
+                    "1",
+                    "missing-content",
+                    "1",
+                ]
+            },
+        )
+        self.assertEqual(matched.status_code, 200)
+        self.assertEqual(
+            matched.json(),
+            {
+                "status": "matched",
+                "matched_account": {
+                    "account_id": first_account_id,
+                    "platform_uid": "fixture-uid",
+                },
+                "candidate_accounts": [],
+                "unmatched_video_ids": ["missing-content"],
+                "matched_video_count": 1,
+            },
+        )
+
+        unmatched = self.client.post(
+            "/api/v8/accounts/resolve-douyin-videos",
+            json={"video_ids": ["missing-content"]},
+        )
+        self.assertEqual(unmatched.status_code, 200)
+        self.assertEqual(
+            unmatched.json(),
+            {
+                "status": "unmatched",
+                "matched_account": None,
+                "candidate_accounts": [],
+                "unmatched_video_ids": ["missing-content"],
+                "matched_video_count": 0,
+            },
+        )
+
+        with connect(self.db) as connection:
+            account = connection.execute(
+                """
+                INSERT INTO accounts(
+                    phone,phone_normalized,operator_name,account_type,
+                    content_direction,created_at,updated_at
+                ) VALUES ('13900139000','13900139000','resolver fixture','original',
+                          'media',?,?)
+                """,
+                (created_at, created_at),
+            )
+            second_account_id = int(account.lastrowid)
+            connection.execute(
+                """
+                INSERT INTO account_platform_identities(
+                    account_id,platform,uid,nickname,created_at,updated_at
+                ) VALUES (?,'douyin','resolver-uid','resolver account',?,?)
+                """,
+                (second_account_id, created_at, created_at),
+            )
+            connection.execute(
+                """
+                INSERT INTO content_items(
+                    link_id,platform,platform_content_id,canonical_url,account_id,
+                    raw_account_uid,raw_account_name,legacy_account_type,title,body,
+                    content_type,published_at,source_group,source_label,source_path,
+                    imported_at,created_at,updated_at
+                ) VALUES (
+                    'RSOLV2','douyin','resolver-content',
+                    'https://www.douyin.com/video/resolver-content',?,
+                    'resolver-uid','resolver account','original','','','video',?,
+                    'test','test','tests/test_v8_api.py',?,?,?
+                )
+                """,
+                (
+                    second_account_id,
+                    created_at,
+                    created_at,
+                    created_at,
+                    created_at,
+                ),
+            )
+            connection.commit()
+
+        ambiguous = self.client.post(
+            "/api/v8/accounts/resolve-douyin-videos",
+            json={"video_ids": ["resolver-content", "1"]},
+        )
+        self.assertEqual(ambiguous.status_code, 200)
+        self.assertEqual(ambiguous.json()["status"], "ambiguous")
+        self.assertIsNone(ambiguous.json()["matched_account"])
+        self.assertEqual(
+            ambiguous.json()["candidate_accounts"],
+            [
+                {
+                    "account_id": second_account_id,
+                    "platform_uid": "resolver-uid",
+                },
+                {"account_id": first_account_id, "platform_uid": "fixture-uid"},
+            ],
+        )
+        self.assertEqual(ambiguous.json()["unmatched_video_ids"], [])
+        self.assertEqual(ambiguous.json()["matched_video_count"], 2)
+
+    def test_resolve_douyin_videos_validates_request_boundaries(self) -> None:
+        invalid_payloads = [
+            {"video_ids": []},
+            {"video_ids": ["video"] * 21},
+            {"video_ids": [""]},
+            {"video_ids": ["v" * 129]},
+            {"video_ids": ["video"], "unexpected": True},
+        ]
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                response = self.client.post(
+                    "/api/v8/accounts/resolve-douyin-videos",
+                    json=payload,
+                )
+                self.assertEqual(response.status_code, 422)
+
+    def test_resolve_douyin_videos_excludes_disabled_accounts(self) -> None:
+        created_at = now_utc()
+        with connect(self.db) as connection:
+            account = connection.execute(
+                """
+                INSERT INTO accounts(
+                    phone,phone_normalized,operator_name,account_type,
+                    content_direction,enabled,created_at,updated_at
+                ) VALUES ('13800138000','13800138000','disabled resolver',
+                          'original','media',0,?,?)
+                """,
+                (created_at, created_at),
+            )
+            account_id = int(account.lastrowid)
+            connection.execute(
+                """
+                INSERT INTO account_platform_identities(
+                    account_id,platform,uid,nickname,created_at,updated_at
+                ) VALUES (?,'douyin','disabled-uid','disabled account',?,?)
+                """,
+                (account_id, created_at, created_at),
+            )
+            connection.execute(
+                "UPDATE content_items SET account_id=? WHERE id=?",
+                (account_id, self.content_id),
+            )
+            connection.commit()
+
+        response = self.client.post(
+            "/api/v8/accounts/resolve-douyin-videos",
+            json={"video_ids": ["1"]},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {
+                "status": "unmatched",
+                "matched_account": None,
+                "candidate_accounts": [],
+                "unmatched_video_ids": ["1"],
+                "matched_video_count": 0,
+            },
+        )
 
     def test_partial_content_patch_preserves_omitted_and_effective_fields(self) -> None:
         captured_at = now_utc()

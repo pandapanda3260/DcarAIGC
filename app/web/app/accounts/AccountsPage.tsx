@@ -1,6 +1,7 @@
 "use client";
 
 import Image from "next/image";
+import Link from "next/link";
 import { Fragment, useEffect, useState } from "react";
 import { BroadcastIcon, VideoCameraIcon } from "@phosphor-icons/react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -11,7 +12,7 @@ import { API_BASE, jsonRequest, parseCsv, readJson } from "../lib/api";
 import { label, platformKeys } from "../lib/format";
 import { publicAssetPath } from "../lib/paths";
 import { buildAccountSearchRequest, lastPageFor } from "../lib/queryContracts";
-import { accountSearchQueryOptions, queryKeys } from "../lib/queries";
+import { accountSearchQueryOptions, douyinAuthorizationStatusesQueryOptions, queryKeys } from "../lib/queries";
 import type { Account } from "../lib/types";
 type AccountForm = {
   id: number | null; phone: string; operatorName: string; accountType: string;
@@ -25,13 +26,14 @@ function formatIdentityCount(value: number | null | undefined, suffix = "") {
   return value == null ? "—" : `${integerFormat.format(value)}${suffix}`;
 }
 
-function AccountPlatformCells({ account }: { account: Account }) {
+function AccountPlatformCells({ account, douyinAuthorizationStatus }: { account: Account; douyinAuthorizationStatus: string }) {
   const identities = new Map(account.platforms.map((identity) => [identity.platform, identity]));
   return platformKeys.map((platformKey) => {
     const identity = identities.get(platformKey);
     return <Fragment key={platformKey}>
       <td className="account-platform-start">{identity?.uid || "—"}</td>
       <td>{identity ? label(identity.real_name_status) : "未绑定"}</td>
+      {platformKey === "douyin" && <td className="account-douyin-authorization-cell">{douyinAuthorizationStatus}</td>}
       <td>{identity?.nickname || "—"}</td>
       <td className="account-number-cell">{formatIdentityCount(identity?.follower_count)}</td>
       <td className="account-number-cell">{formatIdentityCount(identity ? identity.content_count : 0, " 条")}</td>
@@ -68,6 +70,7 @@ export default function AccountsPage() {
   const [message, setMessage] = useState("");
   const queryClient = useQueryClient();
   const accountsQuery = useQuery(accountSearchQueryOptions(appliedRequest));
+  const douyinAuthorizationStatusesQuery = useQuery(douyinAuthorizationStatusesQueryOptions());
   const result = accountsQuery.data;
   const items = result?.items ?? [];
   const pending = result?.pending_platform_identities ?? [];
@@ -75,6 +78,17 @@ export default function AccountsPage() {
   const unassociated = result?.legacy_unassociated_content_count ?? 0;
   const total = result?.total ?? 0;
   const accountsReadFailed = accountsQuery.isLoadingError || retrying;
+  const authorizedAccountIds = new Set(
+    (douyinAuthorizationStatusesQuery.data?.items ?? [])
+      .filter((item) => item.account_id != null && item.authorized)
+      .map((item) => item.account_id as number),
+  );
+
+  function douyinAuthorizationStatus(accountId: number) {
+    if (douyinAuthorizationStatusesQuery.isPending && !douyinAuthorizationStatusesQuery.data) return "查询中";
+    if (douyinAuthorizationStatusesQuery.isError) return "状态异常";
+    return authorizedAccountIds.has(accountId) ? "已授权" : "未授权";
+  }
 
   function retryAccountsRead() {
     if (retrying) return;
@@ -107,6 +121,34 @@ export default function AccountsPage() {
       return () => window.clearTimeout(timer);
     }
   }, [accountsQuery.isPlaceholderData, appliedRequest.page, appliedRequest.page_size, result]);
+
+  useEffect(() => {
+    const refreshAuthorizationStatuses = () => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.authorizationStatuses, exact: true });
+    };
+    const receivesAuthorizationUpdate = (data: unknown) => (
+      typeof data === "object"
+      && data !== null
+      && "type" in data
+      && data.type === "dcar-douyin-authorization-updated"
+    );
+    const handleWindowMessage = (event: MessageEvent) => {
+      if (event.origin !== window.location.origin || !receivesAuthorizationUpdate(event.data)) return;
+      refreshAuthorizationStatuses();
+    };
+    let channel: BroadcastChannel | null = null;
+    if ("BroadcastChannel" in window) {
+      channel = new BroadcastChannel("dcar-douyin-authorization");
+      channel.addEventListener("message", (event) => {
+        if (receivesAuthorizationUpdate(event.data)) refreshAuthorizationStatuses();
+      });
+    }
+    window.addEventListener("message", handleWindowMessage);
+    return () => {
+      channel?.close();
+      window.removeEventListener("message", handleWindowMessage);
+    };
+  }, [queryClient]);
 
   async function invalidateAccountData() {
     await Promise.all([
@@ -153,7 +195,7 @@ export default function AccountsPage() {
     <Feedback error={error} message={message} onClose={() => { setError(""); setMessage(""); }} />
     {accountsQuery.isError && <Notice tone="error">{accountsQuery.data ? `数据刷新失败，当前显示上次数据。${accountsQuery.error instanceof Error ? accountsQuery.error.message : ""}` : accountsQuery.error instanceof Error ? accountsQuery.error.message : "账号读取失败"}</Notice>}
     {accountsQuery.isPending && !accountsQuery.data && !accountsReadFailed ? <Loading label="正在读取账号库" /> : <section className="page-stack wide-stack">
-      <div className="detail-toolbar"><div><span className="eyebrow">手机号是唯一账号标识</span><h2>账号信息</h2><p>每个手机号对应一个账号；还没采集到粉丝量时显示“—”。</p></div><div className="placeholder-actions"><button className="primary small" onClick={() => edit()}>新增账号</button><a className="secondary button-link" href={`${API_BASE}/api/v8/accounts/export`}>下载账号表格</a><label className="secondary button-link">批量导入<input className="file-input" type="file" accept=".csv,text/csv" disabled={saving} onChange={(event) => { const file = event.target.files?.[0]; if (file) void importCsv(file); event.currentTarget.value = ""; }} /></label></div></div>
+      <div className="detail-toolbar"><div><span className="eyebrow">手机号是唯一账号标识</span><h2>账号信息</h2><p>每个手机号对应一个账号；还没采集到粉丝量时显示“—”。</p></div><div className="placeholder-actions"><button className="primary small" onClick={() => edit()}>新增账号</button><Link className="secondary button-link" href="/accounts/douyin-authorization">账号授权</Link><a className="secondary button-link" href={`${API_BASE}/api/v8/accounts/export`}>下载账号表格</a><label className="secondary button-link">批量导入<input className="file-input" type="file" accept=".csv,text/csv" disabled={saving} onChange={(event) => { const file = event.target.files?.[0]; if (file) void importCsv(file); event.currentTarget.value = ""; }} /></label></div></div>
       <div className="filter-bar"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="手机号、运营人员、平台账号编号、昵称" onKeyDown={(event) => { if (event.key === "Enter") applySearch({ page: 1 }); }} /><select value={accountType} onChange={(event) => { setAccountType(event.target.value); applySearch({ accountType: event.target.value, page: 1 }); }}><option value="">全部账号类型</option><option value="boutique_ip">精品 IP</option><option value="original">原创</option><option value="mixed_edit">混剪</option><option value="unknown">未知</option></select><select value={direction} onChange={(event) => { setDirection(event.target.value); applySearch({ direction: event.target.value, page: 1 }); }}><option value="">全部内容方向</option><option value="new_car">新车</option><option value="used_car">二手车</option><option value="media">媒体</option><option value="other">其他</option><option value="unknown">未知</option></select><select value={platform} onChange={(event) => { setPlatform(event.target.value); applySearch({ platform: event.target.value, page: 1 }); }}><option value="">全部平台</option>{platformKeys.map((key) => <option key={key} value={key}>{label(key)}</option>)}</select><button className="secondary" onClick={() => applySearch({ page: 1 })}>搜索</button><span>{accountsReadFailed ? "读取失败" : `${total} 个账号`}</span></div>
       <article className="panel table-panel account-master-panel">
         {!accountsReadFailed && accountsQuery.data && <Pagination page={appliedRequest.page} pageSize={appliedRequest.page_size} total={total} busy={accountsQuery.isFetching || saving} ariaLabel="账号分页" unitLabel="个账号" placement="top" onChange={(next) => applySearch({ page: next.page, pageSize: next.pageSize })} />}
@@ -163,7 +205,7 @@ export default function AccountsPage() {
           <col className="account-phone-col" /><col className="account-operator-col" /><col className="account-type-col" /><col className="account-direction-col" />
         </colgroup>
         {platformKeys.map((key) => <colgroup key={key} data-platform-columns={key}>
-          <col className="account-uid-col" /><col className="account-realname-col" /><col className="account-nickname-col" /><col className="account-followers-col" /><col className="account-content-count-col" />
+          <col className="account-uid-col" /><col className="account-realname-col" />{key === "douyin" && <col className="account-douyin-authorization-col" />}<col className="account-nickname-col" /><col className="account-followers-col" /><col className="account-content-count-col" />
         </colgroup>)}
         <colgroup>
           <col className="account-status-col" /><col className="account-action-col" />
@@ -171,15 +213,15 @@ export default function AccountsPage() {
         <thead>
           <tr className="account-group-row">
             <th className="account-base-group" colSpan={4} scope="colgroup">账号基础信息</th>
-            {platformKeys.map((key) => <th className="account-platform-group" data-platform={key} colSpan={5} scope="colgroup" key={key}><span className="account-platform-heading"><PlatformHeaderMark platformKey={key} />{label(key)}</span></th>)}
+            {platformKeys.map((key) => <th className="account-platform-group" data-platform={key} colSpan={key === "douyin" ? 6 : 5} scope="colgroup" key={key}><span className="account-platform-heading"><PlatformHeaderMark platformKey={key} />{label(key)}</span></th>)}
             <th className="account-management-group" colSpan={2} scope="colgroup">账号管理</th>
           </tr>
-          <tr className="account-column-row"><th className="account-sticky account-phone" scope="col">手机号</th><th className="account-sticky account-operator" scope="col">运营人员</th><th className="account-sticky account-type" scope="col">账号类型</th><th className="account-sticky account-direction" scope="col">内容方向</th>{platformKeys.map((key) => <Fragment key={key}><th className="account-platform-start" scope="col">平台账号编号</th><th scope="col">是否实名</th><th scope="col">昵称</th><th className="account-number-cell" scope="col">粉丝量</th><th className="account-number-cell" scope="col">关联内容量</th></Fragment>)}<th scope="col">状态</th><th scope="col">操作</th></tr>
+          <tr className="account-column-row"><th className="account-sticky account-phone" scope="col">手机号</th><th className="account-sticky account-operator" scope="col">运营人员</th><th className="account-sticky account-type" scope="col">账号类型</th><th className="account-sticky account-direction" scope="col">内容方向</th>{platformKeys.map((key) => <Fragment key={key}><th className="account-platform-start" scope="col">平台账号编号</th><th scope="col">是否实名</th>{key === "douyin" && <th scope="col">抖音开平授权</th>}<th scope="col">昵称</th><th className="account-number-cell" scope="col">粉丝量</th><th className="account-number-cell" scope="col">关联内容量</th></Fragment>)}<th scope="col">状态</th><th scope="col">操作</th></tr>
         </thead>
         <tbody>
-          {accountsReadFailed && <tr><td className="table-read-error" colSpan={26}><strong>账号读取失败</strong><span>请检查网络后重新加载。</span><button type="button" className="secondary read-error-retry" disabled={retrying} onClick={retryAccountsRead}>{retrying ? "正在重新加载…" : "重新加载"}</button></td></tr>}
-          {!accountsReadFailed && items.map((item) => <tr key={item.id}><th className="account-sticky account-phone" scope="row"><strong>{item.phone}</strong></th><td className="account-sticky account-operator">{item.operator_name || "未填写"}</td><td className="account-sticky account-type">{label(item.account_type)}</td><td className="account-sticky account-direction">{label(item.content_direction)}</td><AccountPlatformCells account={item} /><td>{item.enabled ? "运营中" : "停用"}</td><td><button className="text-button" onClick={() => edit(item)}>修改</button></td></tr>)}
-          {!accountsReadFailed && !items.length && <tr><td className="account-master-empty" colSpan={26}>暂无账号，请新增账号或批量导入</td></tr>}
+          {accountsReadFailed && <tr><td className="table-read-error" colSpan={27}><strong>账号读取失败</strong><span>请检查网络后重新加载。</span><button type="button" className="secondary read-error-retry" disabled={retrying} onClick={retryAccountsRead}>{retrying ? "正在重新加载…" : "重新加载"}</button></td></tr>}
+          {!accountsReadFailed && items.map((item) => <tr key={item.id}><th className="account-sticky account-phone" scope="row"><strong>{item.phone}</strong></th><td className="account-sticky account-operator">{item.operator_name || "未填写"}</td><td className="account-sticky account-type">{label(item.account_type)}</td><td className="account-sticky account-direction">{label(item.content_direction)}</td><AccountPlatformCells account={item} douyinAuthorizationStatus={douyinAuthorizationStatus(item.id)} /><td>{item.enabled ? "运营中" : "停用"}</td><td><button className="text-button" onClick={() => edit(item)}>修改</button></td></tr>)}
+          {!accountsReadFailed && !items.length && <tr><td className="account-master-empty" colSpan={27}>暂无账号，请新增账号或批量导入</td></tr>}
         </tbody>
       </table></div></article>
       {!accountsReadFailed && accountsQuery.data && <article className="panel pending-identity-panel">
