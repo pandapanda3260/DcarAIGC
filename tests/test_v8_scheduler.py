@@ -544,6 +544,87 @@ class V8SchedulerTest(unittest.TestCase):
         self.assertEqual(skipped["status"], "skipped")
         self.assertEqual(partial["status"], "partial")
 
+    def test_openapi_reconcile_missing_environment_defers_without_claim(self) -> None:
+        occurrence = datetime(2026, 8, 2, 2, 0, tzinfo=SHANGHAI)
+        missing_environment = self.root / "missing-douyin-sync.env"
+
+        with patch(
+            "v8.douyin_openapi_client.DEFAULT_ENV_PATH",
+            missing_environment,
+        ):
+            scheduled = execute_douyin_openapi_reconcile(
+                occurrence,
+                db_path=self.db,
+            )
+            guarded = douyin_openapi_reconcile_guard(
+                now=datetime(2026, 8, 2, 3, 0, tzinfo=SHANGHAI),
+                effective_from=date(2026, 8, 2),
+                db_path=self.db,
+            )
+
+        self.assertEqual(
+            scheduled,
+            {
+                "job_id": DOUYIN_OPENAPI_RECONCILE_JOB_ID,
+                "status": "deferred",
+                "reason": "douyin_sync_environment_not_installed",
+            },
+        )
+        self.assertEqual(guarded, scheduled)
+        with connect(self.db) as connection:
+            run_count = connection.execute(
+                "SELECT COUNT(*) FROM scheduler_runs WHERE job_id=?",
+                (DOUYIN_OPENAPI_RECONCILE_JOB_ID,),
+            ).fetchone()[0]
+            attempt_count = connection.execute(
+                """
+                SELECT COUNT(*) FROM scheduler_run_attempts a
+                JOIN scheduler_runs r ON r.id=a.scheduler_run_id
+                WHERE r.job_id=?
+                """,
+                (DOUYIN_OPENAPI_RECONCILE_JOB_ID,),
+            ).fetchone()[0]
+        self.assertEqual((run_count, attempt_count), (0, 0))
+
+        failed = execute_douyin_openapi_reconcile(
+            occurrence,
+            db_path=self.db,
+            runner=lambda **_kwargs: self._openapi_details(
+                [
+                    self._openapi_account_receipt(
+                        account_id=7,
+                        platform_uid="99887766",
+                        status="failed",
+                        complete=False,
+                        pages_fetched=0,
+                    )
+                ]
+            ),
+        )
+        self.assertEqual((failed["status"], failed["attempt_number"]), ("failed", 1))
+        with patch(
+            "v8.douyin_openapi_client.DEFAULT_ENV_PATH",
+            missing_environment,
+        ):
+            deferred_retry = douyin_openapi_reconcile_guard(
+                now=datetime(2026, 8, 2, 4, 0, tzinfo=SHANGHAI),
+                effective_from=date(2026, 8, 2),
+                db_path=self.db,
+            )
+        self.assertEqual(deferred_retry, scheduled)
+        with connect(self.db) as connection:
+            stored = connection.execute(
+                """
+                SELECT r.status,COUNT(a.id) AS attempt_count
+                FROM scheduler_runs r
+                JOIN scheduler_run_attempts a ON a.scheduler_run_id=r.id
+                WHERE r.job_id=?
+                GROUP BY r.id
+                """,
+                (DOUYIN_OPENAPI_RECONCILE_JOB_ID,),
+            ).fetchone()
+        self.assertEqual((stored["status"], stored["attempt_count"]), ("failed", 1))
+
     def test_openapi_reconcile_rejects_extra_fields_and_scrubs_exceptions(self) -> None:
         occurrence = datetime(2026, 8, 5, 2, 0, tzinfo=SHANGHAI)
         leaked = self._openapi_details(

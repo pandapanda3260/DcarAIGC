@@ -66,6 +66,24 @@ class DouyinSyncConfig:
     local_port: int = 14175
 
 
+def douyin_sync_environment_present(path: Path | None = None) -> bool:
+    """Return whether the operator has installed the dedicated sync env file.
+
+    Only a genuinely absent file disables reconciliation.  An existing but
+    unreadable, unsafe, or invalid file remains a fail-loud configuration
+    error in ``load_douyin_sync_config``.
+    """
+
+    resolved = DEFAULT_ENV_PATH if path is None else Path(path)
+    try:
+        resolved.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
 def _secure_regular_file(path: Path, label: str) -> None:
     if not path.is_absolute():
         raise ValueError(f"{label} path must be absolute")

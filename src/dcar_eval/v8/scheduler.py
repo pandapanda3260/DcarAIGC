@@ -895,6 +895,12 @@ def _default_douyin_openapi_runner(
     )
 
 
+def _default_douyin_openapi_environment_present() -> bool:
+    from .douyin_openapi_client import douyin_sync_environment_present
+
+    return douyin_sync_environment_present()
+
+
 def _validate_douyin_openapi_details(
     value: Mapping[str, Any],
 ) -> tuple[str, Dict[str, Any]]:
@@ -1019,6 +1025,12 @@ def execute_douyin_openapi_reconcile(
 ) -> Dict[str, Any]:
     """Execute the independent OpenAPI occurrence outside the fixed pipeline."""
 
+    if runner is None and not _default_douyin_openapi_environment_present():
+        return {
+            "job_id": DOUYIN_OPENAPI_RECONCILE_JOB_ID,
+            "status": "deferred",
+            "reason": "douyin_sync_environment_not_installed",
+        }
     claim = _claim_run(
         DOUYIN_OPENAPI_RECONCILE_JOB_ID,
         scheduled_for,
