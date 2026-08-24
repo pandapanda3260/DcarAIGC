@@ -40,8 +40,10 @@ npm --prefix app/web ci
 scripts/start_web_mvp.sh
 ```
 
-首次启动会在终端创建本地登录账号。打开 `http://127.0.0.1:4173` 后先登录；浏览器 API 也走同一个认证入口。内部端口为 Web 4174、API 8765，不应直接作为日常入口。
+首次启动会在终端创建本地登录账号。打开 `http://127.0.0.1:4173` 后先登录；浏览器 API 也走同一个认证入口。内部 Web 为 4174，正式 API 与唯一 scheduler 为 8766，不应绕过 4173 作为日常入口。
 
-8765 固定是无调度 UI/API：`scripts/start_web_mvp.sh` 对非零 `DCAR_SCHEDULER_ENABLED`、非零 `DCAR_STARTUP_CATCHUP_ENABLED` 或非空 `DCAR_DAILY_CAPTURE_RECONCILE_FROM` 直接拒绝启动。每日调度只能由 macOS 指定 writer 在 `127.0.0.1:8766` 运行，不得用 8765 临时打开第二个 scheduler。operator freeze lock 存在时，正式 API 也会失败式停止。
+`scripts/start_web_mvp.sh` 只启动 Web 与认证网关，不启动第二个 API。正常模式会先验证 8766 正连接 `app/data/dcar_insight.sqlite3`、持有 scheduler lock 且报告运行时就绪；任一条件不满足都失败式停止，不回退旧数据。8765 仅保留给 operator freeze 期间的只读快照 viewer。
+
+本地 4173 是可信操作台：页面上的显式新增、编辑、刷新和报告操作会写正式库；仅浏览或刷新卖点页不会触发供应商调用。每日调度仍只由 macOS 指定 writer 在 8766 运行。
 
 完整验证和备份流程见 `docs/v8/运行与备份手册.md`。

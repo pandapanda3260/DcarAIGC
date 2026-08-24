@@ -16,7 +16,7 @@ project_root="$(cd "$project_root" && pwd -P)"
 [[ "${DCAR_WORKER_HOST:-}" == "127.0.0.1" ]] || \
   fail "worker host must be 127.0.0.1"
 [[ "${DCAR_WORKER_PORT:-}" == "8766" ]] || \
-  fail "worker port must be 8766; port 8765 belongs to the UI/API process"
+  fail "worker port must be 8766; port 8765 is reserved for the freeze read-only viewer"
 [[ -z "${TIKHUB_API_KEY:-}" ]] || \
   fail "direct TIKHUB_API_KEY values are forbidden; use an external key file"
 

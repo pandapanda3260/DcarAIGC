@@ -255,9 +255,12 @@ class ApiConfigTest(unittest.TestCase):
         self.assertIn('if [[ "$scheduler_enabled" != "0" ]]', source)
         self.assertIn('if [[ "$startup_catchup_enabled" != "0" ]]', source)
         self.assertIn('if [[ -n "$daily_capture_reconcile_from" ]]', source)
-        self.assertIn("DCAR_SCHEDULER_ENABLED=0", source)
-        self.assertIn("DCAR_STARTUP_CATCHUP_ENABLED=0", source)
-        self.assertIn("DCar 自动调度：", source)
+        self.assertIn('api_upstream="http://127.0.0.1:8766"', source)
+        self.assertIn('api_upstream="http://127.0.0.1:8765"', source)
+        self.assertIn('health.get("mode") == "local_v8"', source)
+        self.assertIn('scheduler.get("enabled") is True', source)
+        self.assertIn('scheduler.get("writer_lock") or {}', source)
+        self.assertNotIn("--port 8765", source)
 
     def test_catchup_cannot_bypass_disabled_scheduler(self) -> None:
         config = api.ApiConfig(

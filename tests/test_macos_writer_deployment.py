@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import os
 import plistlib
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -15,6 +17,160 @@ RECONCILE_FROM = "2026-08-21"
 
 
 class MacOSWriterDeploymentTest(unittest.TestCase):
+    @staticmethod
+    def _writer_health() -> dict[str, object]:
+        return {
+            "status": "ok",
+            "mode": "local_v8",
+            "read_only": False,
+            "database": "dcar_insight.sqlite3",
+            "database_state": {"schema_compatibility": {"compatible": True}},
+        }
+
+    @staticmethod
+    def _scheduler_health() -> dict[str, object]:
+        return {
+            "read_only": False,
+            "requested": True,
+            "enabled": True,
+            "writer_lock": {"held": True},
+            "daily_capture_reconcile": {"enabled": True},
+            "report_runtime": {"ready": True},
+        }
+
+    def _run_ui_script(
+        self,
+        *,
+        writer_health: dict[str, object] | None = None,
+        scheduler_health: dict[str, object] | None = None,
+        writer_reachable: bool = True,
+        viewer_state: str = "absent",
+        freeze: bool = False,
+        reuse: bool = False,
+    ) -> tuple[subprocess.CompletedProcess[str], str]:
+        script = ROOT / "scripts" / "start_web_mvp.sh"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shim_root = root / "bin"
+            shim_root.mkdir()
+            log = root / "invocations.log"
+            freeze_lock = root / "operator-freeze.lock"
+            writer_health_file = root / "writer-health.json"
+            scheduler_health_file = root / "scheduler-health.json"
+            viewer_health_file = root / "viewer-health.json"
+            if freeze:
+                freeze_lock.write_text("freeze\n", encoding="utf-8")
+
+            writer_health_file.write_text(
+                json.dumps(writer_health or self._writer_health()), encoding="utf-8"
+            )
+            scheduler_health_file.write_text(
+                json.dumps(scheduler_health or self._scheduler_health()), encoding="utf-8"
+            )
+            viewer_health_file.write_text(
+                json.dumps(
+                    {
+                        "status": "ok",
+                        "mode": (
+                            "local_v8" if viewer_state == "writable" else "read_only_replica"
+                        ),
+                        "read_only": viewer_state != "writable",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            (shim_root / "lsof").write_text(
+                """#!/bin/bash
+case "$*" in
+  *-iTCP:8765*) [[ "${FAKE_VIEWER_STATE:-absent}" != "absent" ]] ;;
+  *) exit 1 ;;
+esac
+""",
+                encoding="utf-8",
+            )
+            (shim_root / "curl").write_text(
+                """#!/bin/bash
+printf 'curl %s\n' "$*" >> "$SHIM_LOG"
+url="${!#}"
+case " $* " in
+  *" -o /dev/null "*) exit 0 ;;
+esac
+case "$url" in
+  *127.0.0.1:8766/api/v8/health*)
+    [[ "$FAKE_WRITER_REACHABLE" == "1" ]] || exit 7
+    cat "$FAKE_WRITER_HEALTH_FILE"
+    ;;
+  *127.0.0.1:8766/api/v8/scheduler*)
+    [[ "$FAKE_WRITER_REACHABLE" == "1" ]] || exit 7
+    cat "$FAKE_SCHEDULER_HEALTH_FILE"
+    ;;
+  *127.0.0.1:8765/api/v8/health*)
+    [[ "$FAKE_VIEWER_STATE" != "unknown" ]] || exit 7
+    cat "$FAKE_VIEWER_HEALTH_FILE"
+    ;;
+  *127.0.0.1:4174/*) exit 0 ;;
+  *) exit 7 ;;
+esac
+""",
+                encoding="utf-8",
+            )
+            (shim_root / "npm").write_text(
+                """#!/bin/bash
+printf 'npm %s\n' "$*" >> "$SHIM_LOG"
+exit 0
+""",
+                encoding="utf-8",
+            )
+            (shim_root / "python3").write_text(
+                """#!/bin/bash
+if [[ "${1:-}" == "-" ]]; then
+  exec "$REAL_PYTHON" "$@"
+fi
+printf 'python3 %s\n' "$*" >> "$SHIM_LOG"
+printf 'DCAR_AUTH_API_UPSTREAM=%s\n' "${DCAR_AUTH_API_UPSTREAM:-}" >> "$SHIM_LOG"
+exit 0
+""",
+                encoding="utf-8",
+            )
+            for shim in shim_root.iterdir():
+                shim.chmod(0o755)
+
+            environment = os.environ.copy()
+            for variable in (
+                "DCAR_SCHEDULER_ENABLED",
+                "DCAR_STARTUP_CATCHUP_ENABLED",
+                "DCAR_DAILY_CAPTURE_RECONCILE_FROM",
+                "DCAR_REUSE_EXISTING_READ_ONLY_API",
+            ):
+                environment.pop(variable, None)
+            environment.update(
+                {
+                    "PATH": f"{shim_root}:{environment.get('PATH', '')}",
+                    "REAL_PYTHON": sys.executable,
+                    "SHIM_LOG": str(log),
+                    "FAKE_WRITER_REACHABLE": "1" if writer_reachable else "0",
+                    "FAKE_VIEWER_STATE": viewer_state,
+                    "FAKE_WRITER_HEALTH_FILE": str(writer_health_file),
+                    "FAKE_SCHEDULER_HEALTH_FILE": str(scheduler_health_file),
+                    "FAKE_VIEWER_HEALTH_FILE": str(viewer_health_file),
+                    "DCAR_OPERATOR_FREEZE_LOCK": str(freeze_lock),
+                    "DCAR_AUTH_BYPASS": "1",
+                }
+            )
+            if reuse:
+                environment["DCAR_REUSE_EXISTING_READ_ONLY_API"] = "1"
+            result = subprocess.run(
+                ["/bin/bash", str(script)],
+                cwd=ROOT,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            invocation_log = log.read_text(encoding="utf-8") if log.exists() else ""
+            return result, invocation_log
+
     def test_launch_agent_is_disabled_and_uses_separate_worker_port(self) -> None:
         template = (MACOS_DEPLOY / "cn.tj.dcar.writer-worker.plist.template").read_text(
             encoding="utf-8"
@@ -165,6 +321,120 @@ class MacOSWriterDeploymentTest(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 78)
                 self.assertIn(key, result.stderr)
+
+    def test_ui_normal_mode_routes_to_the_healthy_writer(self) -> None:
+        result, invocations = self._run_ui_script()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("本地操作台已连接正式数据库", result.stdout)
+        self.assertIn("DCAR_AUTH_API_UPSTREAM=http://127.0.0.1:8766", invocations)
+        self.assertIn(
+            "curl -fsS -o /dev/null http://127.0.0.1:8766/api/v8/health",
+            invocations,
+        )
+        self.assertNotIn("uvicorn v8.api:app", invocations)
+
+        source = (ROOT / "scripts" / "start_web_mvp.sh").read_text(encoding="utf-8")
+        cleanup = source.split("cleanup() {", maxsplit=1)[1].split("}", maxsplit=1)[0]
+        self.assertIn("web_pid", cleanup)
+        self.assertNotIn("api_pid", cleanup)
+        self.assertNotIn("8766", cleanup)
+
+    def test_ui_normal_mode_tolerates_only_a_verified_read_only_8765(self) -> None:
+        accepted, invocations = self._run_ui_script(viewer_state="read_only")
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertIn("残留的 8765 只读副本", accepted.stderr)
+        self.assertIn("DCAR_AUTH_API_UPSTREAM=http://127.0.0.1:8766", invocations)
+
+        for viewer_state in ("writable", "unknown"):
+            with self.subTest(viewer_state=viewer_state):
+                rejected, _ = self._run_ui_script(viewer_state=viewer_state)
+                self.assertEqual(rejected.returncode, 78)
+                self.assertIn("8765", rejected.stderr)
+
+    def test_ui_normal_mode_fails_closed_when_writer_is_unreachable(self) -> None:
+        result, invocations = self._run_ui_script(writer_reachable=False)
+
+        self.assertEqual(result.returncode, 78)
+        self.assertIn("正式 API 127.0.0.1:8766 不可用", result.stderr)
+        self.assertNotIn("dcar_auth.gateway", invocations)
+
+    def test_ui_writer_contract_accepts_the_real_scheduler_payload_scale(self) -> None:
+        scheduler = self._scheduler_health()
+        scheduler["jobs"] = [{"details_json": "x" * 400_000}]
+
+        result, invocations = self._run_ui_script(scheduler_health=scheduler)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("DCAR_AUTH_API_UPSTREAM=http://127.0.0.1:8766", invocations)
+
+    def test_ui_normal_mode_fails_closed_when_writer_contract_is_unhealthy(self) -> None:
+        cases: list[tuple[str, dict[str, object], dict[str, object]]] = []
+
+        read_only = self._writer_health()
+        read_only["read_only"] = True
+        cases.append(("read_only", read_only, self._scheduler_health()))
+
+        incompatible = self._writer_health()
+        incompatible["database_state"] = {
+            "schema_compatibility": {"compatible": False}
+        }
+        cases.append(("schema", incompatible, self._scheduler_health()))
+
+        for key in ("requested", "enabled"):
+            scheduler = self._scheduler_health()
+            scheduler[key] = False
+            cases.append((key, self._writer_health(), scheduler))
+
+        writer_lock = self._scheduler_health()
+        writer_lock["writer_lock"] = {"held": False}
+        cases.append(("writer_lock", self._writer_health(), writer_lock))
+
+        reconcile = self._scheduler_health()
+        reconcile["daily_capture_reconcile"] = {"enabled": False}
+        cases.append(("reconcile", self._writer_health(), reconcile))
+
+        report_runtime = self._scheduler_health()
+        report_runtime["report_runtime"] = {"ready": False}
+        cases.append(("report_runtime", self._writer_health(), report_runtime))
+
+        for name, writer, scheduler in cases:
+            with self.subTest(case=name):
+                result, invocations = self._run_ui_script(
+                    writer_health=writer,
+                    scheduler_health=scheduler,
+                )
+                self.assertEqual(result.returncode, 78)
+                self.assertIn("8766 未满足", result.stderr)
+                self.assertNotIn("dcar_auth.gateway", invocations)
+
+    def test_ui_freeze_mode_requires_lock_and_verified_viewer(self) -> None:
+        no_lock, _ = self._run_ui_script(reuse=True)
+        self.assertEqual(no_lock.returncode, 78)
+        self.assertIn("operator freeze", no_lock.stderr)
+
+        lock_without_reuse, _ = self._run_ui_script(freeze=True)
+        self.assertEqual(lock_without_reuse.returncode, 75)
+
+        accepted, invocations = self._run_ui_script(
+            freeze=True,
+            reuse=True,
+            viewer_state="read_only",
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertIn("DCAR_AUTH_API_UPSTREAM=http://127.0.0.1:8765", invocations)
+        self.assertIn(
+            "curl -fsS -o /dev/null http://127.0.0.1:8765/api/v8/health",
+            invocations,
+        )
+
+        rejected, _ = self._run_ui_script(
+            freeze=True,
+            reuse=True,
+            viewer_state="writable",
+        )
+        self.assertEqual(rejected.returncode, 78)
+        self.assertIn("不是只读副本", rejected.stderr)
 
     def test_writer_wrapper_validates_inherited_reconcile_date_before_env_file(
         self,

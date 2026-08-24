@@ -1,12 +1,12 @@
 # macOS 指定 writer 与 snapshot publisher
 
-该目录定义 DcarAIGC 正式拓扑中唯一允许运行调度的 macOS writer。writer 监听 `127.0.0.1:8766`，负责供应商抓取、媒体处理、增量评估和报告任务。日常 UI/API 继续使用 4173/8765，且 8765 固定不启用 scheduler。
+该目录定义 DcarAIGC 正式拓扑中唯一允许运行调度的 macOS writer。writer 监听 `127.0.0.1:8766`，同时承担本地正式 API、供应商抓取、媒体处理、增量评估和报告任务。日常 4173 网关经 4174 Web 连接 8766；8765 只保留给 operator freeze 下的只读快照。
 
 writer renderer 只生成 disabled-by-default plist，永不调用 `launchctl`；writer 仍按生效日人工启用。snapshot publisher plist 是已授权的无人值守任务，但它的 renderer 同样只渲染，必须经过一次本机门禁后由部署流程显式 bootstrap。
 
 ## 安全合同
 
-- 同一时刻只能有一个 scheduled writer。Ubuntu 副本和 8765 均必须保持 `DCAR_SCHEDULER_ENABLED=0` 和 `DCAR_STARTUP_CATCHUP_ENABLED=0`。
+- 同一时刻只能有一个 scheduled writer。Ubuntu 副本和 freeze 8765 均必须保持 `DCAR_SCHEDULER_ENABLED=0` 和 `DCAR_STARTUP_CATCHUP_ENABLED=0`。
 - writer 使用 `DCAR_SCHEDULER_ENABLED=1` 和 `DCAR_STARTUP_CATCHUP_ENABLED=1`，但 startup catch-up 严格为 `report_only`：只可创建/重试 `daily_report` 和 `weekly_report`，不运行 capture、media 或 cutoff，不产生供应商费用。
 - 每日 capture 的 task 总额硬顶为 USD 20。只有运营者明确批准循环成本并在 `writer.env` 写入固定 acknowledgement 后才能启用。
 - TikHub API key 不得进入 plist 或 `writer.env`。`writer.env` 只允许 `TIKHUB_API_KEY_FILE`、`DCAR_DAILY_COST_AUTHORIZATION`、空行和注释；其他条目都会 exit 78。
@@ -15,6 +15,8 @@ writer renderer 只生成 disabled-by-default plist，永不调用 `launchctl`�
 - `runtime/operator-freeze.lock` 存在时不得启动 writer。正式库只能在停服、freeze、已验证备份下走 v15→v16 离线 candidate 流程，运行时不自动迁移。
 - wrapper 使用 `caffeinate -s`，只能在接交流电时防止系统空闲睡眠。合盖、断电、人工睡眠或重启仍可以跳过 Cron。
 - 这是 per-user LaunchAgent，Mac 重启后指定账号必须登录 GUI session。
+
+本地 UI 不另设 LaunchAgent。登录后用唯一的 `dcar-live-ui` SCREEN 运行 `scripts/start_web_mvp.sh`，日志写到 `$HOME/Library/Logs/DcarAIGC/local-ui.log`；旧 `dcar-view-ui`/`dcar-read-api` 必须停用。该脚本只启动 4173/4174，并在启动前验证 8766 正式 writer 合同，不会启动、停止或重启 8766。
 
 ## 1. 准备项目外 writer 配置
 
