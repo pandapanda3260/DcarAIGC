@@ -5,7 +5,7 @@ import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import AppShell from "../components/AppShell";
 import DateRangePicker, { shiftDays, todayInShanghai } from "../components/DateRangePicker";
-import { Loading, Notice } from "../components/Feedback";
+import { Loading, Notice, showToast } from "../components/Feedback";
 import { jsonRequest, readJson } from "../lib/api";
 import { formatDate, humanizeTaskMessage, humanizeTaskStatus, label, taskWasSuperseded } from "../lib/format";
 import { isGeneratingTaskStatus } from "../lib/queryContracts";
@@ -52,7 +52,6 @@ function TaskCard({ task }: { task: Task }) {
 export default function TasksPage() {
   const [saving, setSaving] = useState(false);
   const [modal, setModal] = useState(false);
-  const [createError, setCreateError] = useState("");
   const [retrying, setRetrying] = useState(false);
   const [form, setForm] = useState({ periodStart: yesterday(), periodEnd: yesterday(), name: "" });
   const queryClient = useQueryClient();
@@ -67,12 +66,12 @@ export default function TasksPage() {
     void tasksQuery.refetch().finally(() => setRetrying(false));
   }
 
-  function openModal() { setCreateError(""); setModal(true); }
-  function closeModal() { if (!saving) { setCreateError(""); setModal(false); } }
+  function openModal() { setModal(true); }
+  function closeModal() { if (!saving) setModal(false); }
 
   async function createTask() {
     if (saving) return;
-    setSaving(true); setCreateError("");
+    setSaving(true);
     try {
       const task = await readJson<TaskDetail>("/api/v8/tasks", jsonRequest({ period_start: form.periodStart, period_end: form.periodEnd, name: form.name || null }));
       queryClient.setQueryData<{ items: Task[] }>(queryKeys.tasksList, (current) => ({
@@ -80,7 +79,7 @@ export default function TasksPage() {
       }));
       await queryClient.invalidateQueries({ queryKey: queryKeys.tasksList, exact: true });
       setModal(false);
-    } catch (reason) { setCreateError(reason instanceof Error ? reason.message : "报告创建失败，请检查日期后重试。"); }
+    } catch (reason) { showToast("error", reason instanceof Error ? reason.message : "报告创建失败，请检查日期后重试。"); }
     finally { setSaving(false); }
   }
 
@@ -100,7 +99,6 @@ export default function TasksPage() {
         </div>
         <label className="span-two">任务名称（可不填）<input value={form.name} disabled={saving} placeholder={`例如：${form.periodStart.slice(0, 7).replace("-", "年")}月报`} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} /></label>
       </div>
-      {createError && <div className="modal-error" role="alert"><span>!</span>{createError}</div>}
       <div className="modal-actions">
         <span className="modal-progress">{saving ? <><span className="drp-spinner" aria-hidden="true" />正在创建任务</> : "任务创建后在列表卡片上显示生成进度，可以关掉弹窗做别的事"}</span>
         <button className="secondary" onClick={closeModal} disabled={saving}>取消</button>

@@ -52,7 +52,6 @@ button:disabled { cursor: not-allowed; opacity: .55; transform: none !important;
 .sidebar-logout:hover { background: #173b45; color: #fff; }
 .sidebar-logout:focus-visible { outline: 2px solid var(--dcd-brand); outline-offset: 1px; }
 .sidebar-logout svg { width: 17px; height: 17px; display: block; }
-.sidebar-logout-error { position: absolute; right: 0; bottom: 48px; width: 190px; padding: 8px 10px; border: 1px solid rgba(255,173,173,.3); border-radius: 8px; background: #173b45; color: #ffd0d0; box-shadow: 0 8px 20px rgba(0, 0, 0, .22); font-size: 10px; line-height: 1.5; }
 
 .main-area { min-width: 0; padding: 0 34px 56px; }
 .topbar { min-height: 86px; display: flex; align-items: center; justify-content: space-between; gap: 24px; border-bottom: 1px solid var(--line); }
@@ -66,12 +65,20 @@ button:disabled { cursor: not-allowed; opacity: .55; transform: none !important;
 .primary.small { min-height: 36px; padding: 0 14px; }
 .secondary { border: 1px solid #cbd6d9; background: #fff; color: var(--ink); }
 .danger-button { border-color: #e5b9b9; color: #a74343; }
-.notice { position: relative; margin: 18px auto -3px; max-width: 1240px; padding: 11px 42px 11px 14px; border: 1px solid #bfded7; border-radius: 10px; background: #edf8f5; color: #176e63; font-size: 12px; display: flex; align-items: center; gap: 9px; }
-.notice > span { width: 19px; height: 19px; border-radius: 50%; background: var(--teal); color: #fff; display: grid; place-items: center; font-weight: 800; }
-.notice button { position: absolute; right: 10px; border: 0; background: transparent; color: #548178; font-size: 17px; }
-.feedback-notice { z-index: 20; margin-bottom: 14px; box-shadow: 0 10px 28px rgba(22, 45, 52, .1); line-height: 1.5; }
-/* Hero 页的首卡用负 margin 悬浮；出现反馈时先恢复普通流，避免首卡向上遮住提示。 */
-.feedback-notice + .page-stack { margin-top: 0; }
+/* ---- 全局浮动提示（toast）：悬浮在内容区顶部，不占版面、不推挤页面 ---- */
+/* 相同文案去重（重复触发重放入场动画）、到时自动消失、每条可手动关闭、悬停暂停计时；由 components/Feedback.tsx 派发，AppShell 挂载 .toast-viewport。 */
+.toast-viewport { position: fixed; top: 18px; left: calc(50% + 118px); transform: translateX(-50%); z-index: 90; width: min(560px, calc(100vw - 286px)); display: flex; flex-direction: column; align-items: center; gap: 9px; pointer-events: none; }
+.toast { pointer-events: auto; max-width: 100%; padding: 10px 12px 10px 14px; border: 1px solid #cbe2db; border-radius: 12px; background: #fff; color: var(--ink); box-shadow: 0 16px 38px rgba(22, 45, 52, .16), 0 3px 9px rgba(22, 45, 52, .08); font-size: 12px; line-height: 1.55; display: flex; align-items: center; gap: 10px; animation: toast-in .22s ease; transition: opacity .18s ease, transform .18s ease; }
+.toast-error { border-color: #eccfcf; }
+.toast-icon { flex: 0 0 19px; width: 19px; height: 19px; border-radius: 50%; background: var(--teal); color: #fff; display: grid; place-items: center; font-size: 11px; font-weight: 800; }
+.toast-error .toast-icon { background: var(--red); }
+.toast-text { min-width: 0; overflow-wrap: anywhere; }
+.toast-close { flex: 0 0 24px; width: 24px; height: 24px; margin-left: 2px; padding: 0; border: 0; border-radius: 7px; background: transparent; color: #8b9aa0; font-size: 16px; line-height: 1; display: grid; place-items: center; }
+.toast-close:hover { background: #eef3f3; color: var(--ink); }
+.toast-leaving { opacity: 0; transform: translateY(-8px); }
+@keyframes toast-in { from { opacity: 0; transform: translateY(-10px); } }
+@media (max-width: 1050px) { .toast-viewport { left: calc(50% + 39px); width: min(560px, calc(100vw - 128px)); } }
+@media (max-width: 720px) { .toast-viewport { top: 12px; left: 50%; width: calc(100vw - 26px); } }
 
 .page-stack { max-width: 1240px; margin: 0 auto; padding-top: 24px; display: grid; gap: 22px; }
 .page-stack > * { min-width: 0; }
@@ -268,9 +275,6 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
 
 .insight-shell .page-stack { max-width: 1360px; }
 .wide-stack { max-width: 1600px !important; }
-.error-notice { border-color: #efc6c6; background: var(--red-soft); color: #9d3939; }
-.success-notice { border-color: #b9dfd7; background: var(--teal-soft); color: #23796e; }
-.inline-notice { margin: 0; max-width: none; }
 .main-area[data-section="overview"] { padding-inline: 24px; background: #f7f9fa; container-type: inline-size; }
 .topbar[data-section="overview"] { min-height: 120px; padding: 20px 0 12px; align-items: flex-start; background-color: #fffefd; background-image: url("/overview-automotive-lines.webp"); background-position: right center; background-repeat: no-repeat; background-size: auto clamp(118px, 10vw, 148px); }
 .topbar[data-section="overview"] .topbar-copy, .topbar[data-section="overview"] .topbar-actions { position: relative; z-index: 1; }

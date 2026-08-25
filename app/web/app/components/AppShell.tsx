@@ -3,6 +3,7 @@ import Image from "next/image";
 import type { ReactNode } from "react";
 import type { Section } from "../lib/types";
 import { publicAssetPath } from "../lib/paths";
+import { ToastViewport } from "./Feedback";
 import LogoutButton from "./LogoutButton";
 
 const navItems: Array<{ id: Section; label: string; href: string }> = [
@@ -51,7 +52,7 @@ export default function AppShell({ active, actions, children }: { active: Sectio
       <aside className="sidebar">
         <div className="brand"><Image className="brand-mark" src={publicAssetPath("/dongchedi-app-icon.svg")} alt="懂车帝 App" width={38} height={38} unoptimized /><div><strong>Dcar Sentinel</strong><span>内容运营工作台 · V1.0</span></div></div>
         <nav aria-label="主导航">
-          <p>数据统计</p>
+          <p>AIGC数据统计</p>
           {navItems.map((item) => (
             <Link key={item.id} href={item.href} className={active === item.id ? "active" : ""} aria-current={active === item.id ? "page" : undefined}>
               <NavIcon section={item.id} />{item.label}
@@ -67,6 +68,7 @@ export default function AppShell({ active, actions, children }: { active: Sectio
         </header>}
         {children}
       </main>
+      <ToastViewport />
     </div>
   );
 }
