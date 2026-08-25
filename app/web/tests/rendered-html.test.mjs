@@ -145,6 +145,14 @@ test("douyin authorization management uses the official scan flow and fixed trus
 
   assert.match(source, /<AppShell active="accounts">/);
   assert.match(source, /href="\/accounts">返回账号页<\/Link>/);
+  assert.match(source, /readJson<\{ authenticated: true; username: string \}>\("\/auth\/session"\)/);
+  assert.match(source, /sessionQuery\.data\?\.username === "temporary-bypass"/);
+  assert.match(source, /enabled: canUseCurrentAuthorizationControl/);
+  assert.match(source, /PRODUCTION_AUTHORIZATION_URL = "https:\/\/origin\.tj\.cn\/dcar\/accounts\/douyin-authorization"/);
+  assert.match(source, /isBypassMode \? <article[\s\S]*请在正式 HTTPS 工作台完成扫码[\s\S]*href=\{PRODUCTION_AUTHORIZATION_URL\}/);
+  assert.match(source, /authorizationDataReady && <>[\s\S]*aria-label="抖音授权统计"/);
+  assert.match(source, /const authorizationReadPending = !queryError && \([\s\S]*authorizationsQuery\.isPending \|\| statusesQuery\.isPending/);
+  assert.match(source, /disabled=\{Boolean\(busyAction\) \|\| !authorizationActionsAvailable\}/);
   assert.match(source, /className="primary"[\s\S]*开始扫码授权/);
   assert.match(source, /markedJsonRequest\(\{\}, "douyin-oauth-start"\)/);
   assert.match(source, /window\.location\.assign\(result\.authorize_url\)/);
@@ -161,7 +169,7 @@ test("douyin authorization management uses the official scan flow and fixed trus
   assert.doesNotMatch(source, /postMessage\([^\n]+,\s*["']\*["']/);
   assert.match(source, /const noticeCopy: Record/);
   assert.match(source, /const callbackNotice = noticeCopy\[notice\] \?\? null/);
-  assert.match(source, /const queryError = authorizationsQuery\.isError[\s\S]*statusesQuery\.isError/);
+  assert.match(source, /const queryError = sessionQuery\.isError[\s\S]*authorizationsQuery\.isError[\s\S]*statusesQuery\.isError/);
   assert.match(source, /\{queryError && <Notice tone="error">\{queryError\}<\/Notice>\}/);
   assert.doesNotMatch(source, /authorizationsQuery\.isError && <Notice|statusesQuery\.isError && <Notice/);
   assert.doesNotMatch(source, /avatar|<img|<Image/);

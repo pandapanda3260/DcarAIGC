@@ -20,6 +20,7 @@ import type {
 
 const CALLBACK_CHANNEL = "dcar-douyin-authorization";
 const CALLBACK_MESSAGE = { type: "dcar-douyin-authorization-updated" } as const;
+const PRODUCTION_AUTHORIZATION_URL = "https://origin.tj.cn/dcar/accounts/douyin-authorization";
 const noticeCopy: Record<string, { tone: "error" | "success"; text: string }> = {
   "oauth-completed": { tone: "success", text: "抖音账号授权已完成，授权状态已更新。" },
   "oauth-disabled": { tone: "error", text: "抖音授权功能尚未启用。" },
@@ -60,18 +61,48 @@ function readLocationNotice() {
 
 export default function DouyinAuthorizationPage() {
   const queryClient = useQueryClient();
-  const authorizationsQuery = useQuery(douyinAuthorizationsQueryOptions());
-  const statusesQuery = useQuery(douyinAuthorizationStatusesQueryOptions());
+  const sessionQuery = useQuery({
+    queryKey: ["auth", "session"],
+    queryFn: () => readJson<{ authenticated: true; username: string }>("/auth/session"),
+    staleTime: 60_000,
+  });
+  const isBypassMode = sessionQuery.data?.username === "temporary-bypass";
+  const canUseCurrentAuthorizationControl = sessionQuery.isSuccess && !isBypassMode;
+  const authorizationsQuery = useQuery({
+    ...douyinAuthorizationsQueryOptions(),
+    enabled: canUseCurrentAuthorizationControl,
+  });
+  const statusesQuery = useQuery({
+    ...douyinAuthorizationStatusesQueryOptions(),
+    enabled: canUseCurrentAuthorizationControl,
+  });
   const authorizations = authorizationsQuery.data?.items ?? [];
-  const queryError = authorizationsQuery.isError
+  const queryError = sessionQuery.isError
+    ? sessionQuery.error instanceof Error
+      ? sessionQuery.error.message
+      : "登录状态读取失败"
+    : authorizationsQuery.isError
     ? authorizationsQuery.error instanceof Error
       ? authorizationsQuery.error.message
       : "授权记录读取失败"
     : statusesQuery.isError
       ? statusesQuery.error instanceof Error
-        ? statusesQuery.error.message
-        : "授权状态读取失败"
+      ? statusesQuery.error.message
+      : "授权状态读取失败"
       : "";
+  const authorizationDataReady = Boolean(authorizationsQuery.data && statusesQuery.data);
+  const authorizationReadPending = !queryError && (
+    sessionQuery.isPending || (
+      canUseCurrentAuthorizationControl
+      && !authorizationDataReady
+      && (authorizationsQuery.isPending || statusesQuery.isPending)
+    )
+  );
+  const authorizationActionsAvailable = (
+    canUseCurrentAuthorizationControl
+    && authorizationDataReady
+    && !queryError
+  );
   const notice = useSyncExternalStore(subscribeToLocation, readLocationNotice, () => "");
   const callbackNotice = noticeCopy[notice] ?? null;
   const [error, setError] = useState("");
@@ -205,36 +236,43 @@ export default function DouyinAuthorizationPage() {
   return <AppShell active="accounts">
     <Feedback error={error} message={message} onClose={() => { setError(""); setMessage(""); }} />
     {callbackNotice && <Notice tone={callbackNotice.tone}>{callbackNotice.text}</Notice>}
-    {queryError && <Notice tone="error">{queryError}</Notice>}
     <section className="page-stack wide-stack douyin-authorization-page">
       <div className="detail-toolbar"><div><span className="eyebrow">账号管理 · 抖音开放平台</span><h2>抖音开放平台授权</h2><p>达人在抖音官方页面扫码确认后，系统会自动匹配已有业务账号；扫码前不需要选择账号。</p></div><div><Link className="secondary button-link" href="/accounts">返回账号页</Link></div></div>
 
-      <article className="panel douyin-authorization-start">
-        <div><span className="eyebrow">统一授权入口</span><h3>打开抖音APP扫码授权</h3><p>点击后将进入抖音官方授权页。授权成功会自动返回本页，并立即刷新授权状态。</p></div>
-        <button className="primary" type="button" disabled={Boolean(busyAction)} onClick={() => void startAuthorization()}>{busyAction === "start" ? "正在打开…" : "开始扫码授权"}</button>
-      </article>
+      {authorizationReadPending ? <Loading label="正在确认抖音授权入口" /> : isBypassMode ? <article className="panel douyin-authorization-start">
+        <div><span className="eyebrow">正式授权入口</span><h3>请在正式 HTTPS 工作台完成扫码</h3><p>当前本地工作台处于免登录模式。为保证授权与真实登录用户、浏览器会话正确绑定，本地入口不会发起或管理抖音授权。</p></div>
+        <a className="primary button-link" href={PRODUCTION_AUTHORIZATION_URL}>打开正式授权入口</a>
+      </article> : <>
+        {queryError && <Notice tone="error">{queryError}</Notice>}
+        {authorizationDataReady && <>
+          <article className="panel douyin-authorization-start">
+            <div><span className="eyebrow">统一授权入口</span><h3>打开抖音APP扫码授权</h3><p>点击后将进入抖音官方授权页。授权成功会自动返回本页，并立即刷新授权状态。</p></div>
+            <button className="primary" type="button" disabled={Boolean(busyAction) || !authorizationActionsAvailable} onClick={() => void startAuthorization()}>{busyAction === "start" ? "正在打开…" : "开始扫码授权"}</button>
+          </article>
 
-      <article className="panel douyin-authorization-summary" aria-label="抖音授权统计">
-        <div><span>有效授权</span><strong>{counts.authorized}</strong></div>
-        <div><span>已绑定</span><strong>{counts.active}</strong></div>
-        <div><span>等待匹配</span><strong>{counts.pending}</strong></div>
-        <div><span>已解绑</span><strong>{counts.unbound}</strong></div>
-      </article>
+          <article className="panel douyin-authorization-summary" aria-label="抖音授权统计">
+            <div><span>有效授权</span><strong>{counts.authorized}</strong></div>
+            <div><span>已绑定</span><strong>{counts.active}</strong></div>
+            <div><span>等待匹配</span><strong>{counts.pending}</strong></div>
+            <div><span>已解绑</span><strong>{counts.unbound}</strong></div>
+          </article>
 
-      {authorizationsQuery.isPending && !authorizationsQuery.data ? <Loading label="正在读取抖音授权记录" /> : <article className="panel">
-        <div className="panel-head"><div><span className="eyebrow">授权记录</span><h3>已扫码的抖音账号</h3><p>只有等待匹配的授权需要人工选择业务账号。</p></div><span className="rule-chip">共 {authorizations.length} 条</span></div>
-        {!authorizations.length ? <div className="empty-state"><strong>还没有抖音开放平台授权</strong><span>点击“开始扫码授权”后，由达人在抖音官方页面完成扫码。</span></div> : <div className="douyin-authorization-list">
-          {authorizations.map((item) => <section className="douyin-authorization-card" key={item.id} data-status={item.status}>
-            <div className="douyin-authorization-card-head"><div><span className={`douyin-authorization-status ${item.status}`}>{statusCopy[item.status]}</span><strong>{item.platform_uid ? `抖音账号 ${item.platform_uid}` : "待识别的抖音账号"}</strong><p>{item.match_reason ? matchReasonCopy[item.match_reason] ?? "等待人工处理" : item.needs_reauthorization ? "授权即将失效，需要重新授权" : "授权状态正常"}</p></div><small>更新于 {formatTime(item.updated_at)}</small></div>
-            <dl className="douyin-authorization-details"><div><dt>业务账号编号</dt><dd>{item.account_id ?? "—"}</dd></div><div><dt>Refresh Token 到期</dt><dd>{formatTime(item.refresh_expires_at)}</dd></div><div><dt>授权范围</dt><dd>{item.scopes.join("、") || "—"}</dd></div><div><dt>发起人</dt><dd>{item.bound_username || "—"}</dd></div></dl>
-            {item.status !== "pending_match" && <div className="douyin-authorization-actions"><button className="secondary" type="button" disabled={Boolean(busyAction)} onClick={() => void reauthorize(item)}>重新授权</button>{item.status === "active" && <button className="secondary danger-button" type="button" disabled={Boolean(busyAction)} onClick={() => void unbind(item)}>解绑</button>}</div>}
-            {item.status === "pending_match" && <div className="douyin-manual-match">
-              <button className="secondary" type="button" disabled={Boolean(busyAction)} onClick={() => { setManualAuthorizationId((current) => current === item.id ? null : item.id); setAccountQuery(""); setAccountResults([]); }}>人工匹配业务账号</button>
-              {manualAuthorizationId === item.id && <form onSubmit={(event) => void searchAccounts(event)}><label htmlFor={`douyin-account-search-${item.id}`}>搜索已有抖音业务账号</label><div><input id={`douyin-account-search-${item.id}`} maxLength={100} value={accountQuery} onChange={(event) => setAccountQuery(event.target.value)} placeholder="运营人员、抖音账号编号或昵称" /><button className="secondary" type="submit" disabled={Boolean(busyAction)}>搜索</button></div>{accountResults.length > 0 && <ul>{accountResults.map((account) => <li key={`${account.account_id}:${account.uid}`}><div><strong>{account.nickname || account.uid}</strong><span>抖音账号 {account.uid} · {account.operator_name || "未填写运营人员"}{account.enabled ? "" : " · 已停用"}</span></div><button className="secondary" type="button" disabled={Boolean(busyAction) || !account.enabled} onClick={() => void matchAccount(item, account)}>选择并匹配</button></li>)}</ul>}{accountResults.length === 0 && accountResultTotal === 0 && <p className="douyin-search-hint">输入条件后搜索；全新或尚未采集过内容的账号可能需要人工确认。</p>}</form>}
+          <article className="panel">
+            <div className="panel-head"><div><span className="eyebrow">授权记录</span><h3>已扫码的抖音账号</h3><p>只有等待匹配的授权需要人工选择业务账号。</p></div><span className="rule-chip">共 {authorizations.length} 条</span></div>
+            {!authorizations.length ? <div className="empty-state"><strong>还没有抖音开放平台授权</strong><span>点击“开始扫码授权”后，由达人在抖音官方页面完成扫码。</span></div> : <div className="douyin-authorization-list">
+              {authorizations.map((item) => <section className="douyin-authorization-card" key={item.id} data-status={item.status}>
+                <div className="douyin-authorization-card-head"><div><span className={`douyin-authorization-status ${item.status}`}>{statusCopy[item.status]}</span><strong>{item.platform_uid ? `抖音账号 ${item.platform_uid}` : "待识别的抖音账号"}</strong><p>{item.match_reason ? matchReasonCopy[item.match_reason] ?? "等待人工处理" : item.needs_reauthorization ? "授权即将失效，需要重新授权" : "授权状态正常"}</p></div><small>更新于 {formatTime(item.updated_at)}</small></div>
+                <dl className="douyin-authorization-details"><div><dt>业务账号编号</dt><dd>{item.account_id ?? "—"}</dd></div><div><dt>Refresh Token 到期</dt><dd>{formatTime(item.refresh_expires_at)}</dd></div><div><dt>授权范围</dt><dd>{item.scopes.join("、") || "—"}</dd></div><div><dt>发起人</dt><dd>{item.bound_username || "—"}</dd></div></dl>
+                {item.status !== "pending_match" && <div className="douyin-authorization-actions"><button className="secondary" type="button" disabled={Boolean(busyAction) || !authorizationActionsAvailable} onClick={() => void reauthorize(item)}>重新授权</button>{item.status === "active" && <button className="secondary danger-button" type="button" disabled={Boolean(busyAction) || !authorizationActionsAvailable} onClick={() => void unbind(item)}>解绑</button>}</div>}
+                {item.status === "pending_match" && <div className="douyin-manual-match">
+                  <button className="secondary" type="button" disabled={Boolean(busyAction) || !authorizationActionsAvailable} onClick={() => { setManualAuthorizationId((current) => current === item.id ? null : item.id); setAccountQuery(""); setAccountResults([]); }}>人工匹配业务账号</button>
+                  {manualAuthorizationId === item.id && <form onSubmit={(event) => void searchAccounts(event)}><label htmlFor={`douyin-account-search-${item.id}`}>搜索已有抖音业务账号</label><div><input id={`douyin-account-search-${item.id}`} maxLength={100} value={accountQuery} onChange={(event) => setAccountQuery(event.target.value)} placeholder="运营人员、抖音账号编号或昵称" /><button className="secondary" type="submit" disabled={Boolean(busyAction) || !authorizationActionsAvailable}>搜索</button></div>{accountResults.length > 0 && <ul>{accountResults.map((account) => <li key={`${account.account_id}:${account.uid}`}><div><strong>{account.nickname || account.uid}</strong><span>抖音账号 {account.uid} · {account.operator_name || "未填写运营人员"}{account.enabled ? "" : " · 已停用"}</span></div><button className="secondary" type="button" disabled={Boolean(busyAction) || !authorizationActionsAvailable || !account.enabled} onClick={() => void matchAccount(item, account)}>选择并匹配</button></li>)}</ul>}{accountResults.length === 0 && accountResultTotal === 0 && <p className="douyin-search-hint">输入条件后搜索；全新或尚未采集过内容的账号可能需要人工确认。</p>}</form>}
+                </div>}
+              </section>)}
             </div>}
-          </section>)}
-        </div>}
-      </article>}
+          </article>
+        </>}
+      </>}
     </section>
   </AppShell>;
 }

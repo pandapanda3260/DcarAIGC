@@ -450,8 +450,12 @@ class VaultStore:
         authorization_columns = connection.execute(
             "PRAGMA table_info(douyin_authorizations)"
         ).fetchall()
-        if [str(row[1]) for row in authorization_columns] != expected_authorization_columns:
-            raise RuntimeError("Douyin Vault schema v3 authorization columns are invalid")
+        if [
+            str(row[1]) for row in authorization_columns
+        ] != expected_authorization_columns:
+            raise RuntimeError(
+                "Douyin Vault schema v3 authorization columns are invalid"
+            )
         nullability = {str(row[1]): int(row[3]) for row in authorization_columns}
         if nullability.get("account_id") != 0 or nullability.get("platform_uid") != 0:
             raise RuntimeError("Douyin Vault schema v3 targets must be nullable")
@@ -459,7 +463,9 @@ class VaultStore:
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='douyin_authorizations'"
         ).fetchone()
         authorization_sql = (
-            "" if authorization_sql_row is None else "".join(str(authorization_sql_row[0]).lower().split())
+            ""
+            if authorization_sql_row is None
+            else "".join(str(authorization_sql_row[0]).lower().split())
         )
         if "'active','unbound','pending_match'" not in authorization_sql:
             raise RuntimeError("Douyin Vault schema v3 authorization status is invalid")
@@ -481,7 +487,9 @@ class VaultStore:
                 fingerprint_unique = True
                 break
         if not fingerprint_unique:
-            raise RuntimeError("Douyin Vault schema v3 fingerprint uniqueness is missing")
+            raise RuntimeError(
+                "Douyin Vault schema v3 fingerprint uniqueness is missing"
+            )
         invalid_rows = int(
             connection.execute(
                 """
@@ -506,8 +514,7 @@ class VaultStore:
             raise RuntimeError("Douyin Vault schema v3 active UID index is missing")
         normalized = "".join(str(index[0]).lower().split())
         if (
-            "on douyin_authorizations(platform_uid)".replace(" ", "")
-            not in normalized
+            "on douyin_authorizations(platform_uid)".replace(" ", "") not in normalized
             or "wherestatus='active'" not in normalized
         ):
             raise RuntimeError("Douyin Vault schema v3 active UID index is invalid")
@@ -542,8 +549,15 @@ class VaultStore:
         oauth_sql_row = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='oauth_states'"
         ).fetchone()
-        oauth_sql = "" if oauth_sql_row is None else "".join(str(oauth_sql_row[0]).lower().split())
-        if "'created','exchanging','matching','completed','failed','expired'" not in oauth_sql:
+        oauth_sql = (
+            ""
+            if oauth_sql_row is None
+            else "".join(str(oauth_sql_row[0]).lower().split())
+        )
+        if (
+            "'created','exchanging','matching','completed','failed','expired'"
+            not in oauth_sql
+        ):
             raise RuntimeError("Douyin Vault schema v3 OAuth state status is invalid")
         invalid_oauth_targets = int(
             connection.execute(
@@ -563,7 +577,9 @@ class VaultStore:
             "target_authorization_version>=1)"
         )
         if target_constraint not in oauth_sql:
-            raise RuntimeError("Douyin Vault schema v3 OAuth target constraint is invalid")
+            raise RuntimeError(
+                "Douyin Vault schema v3 OAuth target constraint is invalid"
+            )
         live_index = connection.execute(
             """
             SELECT sql FROM sqlite_master
@@ -571,7 +587,8 @@ class VaultStore:
             """
         ).fetchone()
         live_index_sql = (
-            "" if live_index is None or live_index[0] is None
+            ""
+            if live_index is None or live_index[0] is None
             else "".join(str(live_index[0]).lower().split())
         )
         if (
@@ -588,9 +605,7 @@ class VaultStore:
                 connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
             ).lower()
             if mode != "delete":
-                raise RuntimeError(
-                    "Douyin Vault must use SQLite journal_mode=DELETE"
-                )
+                raise RuntimeError("Douyin Vault must use SQLite journal_mode=DELETE")
         finally:
             connection.close()
 
@@ -729,6 +744,17 @@ class VaultStore:
         timestamp = int(time.time()) if now is None else now
         with self.write_connection() as connection:
             self._expire_states(connection, timestamp)
+            active = connection.execute(
+                """
+                SELECT status FROM oauth_states
+                WHERE bound_username=? AND session_binding=?
+                  AND status IN ('created','exchanging','matching')
+                LIMIT 1
+                """,
+                (bound_username, session_binding),
+            ).fetchone()
+            if active is not None and active["status"] != "created":
+                raise StateTransitionError("oauth_state_in_progress")
             connection.execute(
                 """
                 UPDATE oauth_states
@@ -736,7 +762,7 @@ class VaultStore:
                     candidate_open_id_fingerprint=NULL,
                     failure_reason='superseded',updated_at=?
                 WHERE bound_username=? AND session_binding=?
-                  AND status IN ('created','exchanging','matching')
+                  AND status='created'
                 """,
                 (timestamp, bound_username, session_binding),
             )
@@ -784,6 +810,7 @@ class VaultStore:
         now: Optional[int] = None,
     ) -> dict[str, Any]:
         timestamp = int(time.time()) if now is None else now
+        identity_mismatch = False
         with self.write_connection() as connection:
             self._expire_states(connection, timestamp)
             cursor = connection.execute(
@@ -801,23 +828,47 @@ class VaultStore:
                 ),
             )
             if cursor.rowcount != 1:
-                raise StateTransitionError("oauth_state_unavailable")
-            row = connection.execute(
-                "SELECT * FROM oauth_states WHERE state_digest=?",
-                (state_digest,),
-            ).fetchone()
-            self._audit(
-                connection,
-                actor=bound_username,
-                action="oauth_callback",
-                result="exchanging",
-                reason_code="ok",
-                subject_fingerprint=state_digest,
-                request_id=request_id,
-                now=timestamp,
-            )
-            assert row is not None
-            return dict(row)
+                existing = connection.execute(
+                    """
+                    SELECT bound_username,session_binding
+                    FROM oauth_states WHERE state_digest=?
+                    """,
+                    (state_digest,),
+                ).fetchone()
+                identity_mismatch = existing is not None and (
+                    existing["bound_username"] != bound_username
+                    or existing["session_binding"] != session_binding
+                )
+            else:
+                row = connection.execute(
+                    "SELECT * FROM oauth_states WHERE state_digest=?",
+                    (state_digest,),
+                ).fetchone()
+                self._audit(
+                    connection,
+                    actor=bound_username,
+                    action="oauth_callback",
+                    result="exchanging",
+                    reason_code="ok",
+                    subject_fingerprint=state_digest,
+                    request_id=request_id,
+                    now=timestamp,
+                )
+                assert row is not None
+                return dict(row)
+        if identity_mismatch:
+            with self.write_connection() as connection:
+                self._audit(
+                    connection,
+                    actor=bound_username,
+                    action="oauth_callback",
+                    result="security_rejected",
+                    reason_code="identity_mismatch",
+                    subject_fingerprint=state_digest,
+                    request_id=request_id,
+                    now=timestamp,
+                )
+        raise StateTransitionError("oauth_state_unavailable")
 
     def store_candidate(
         self,
@@ -1168,9 +1219,8 @@ class VaultStore:
                 raise StateTransitionError("oauth_candidate_identity_changed")
             requested_scopes = json.loads(str(state["requested_scopes_json"]))
             candidate_scopes = candidate.get("scopes")
-            if (
-                not isinstance(requested_scopes, list)
-                or any(not isinstance(scope, str) for scope in requested_scopes)
+            if not isinstance(requested_scopes, list) or any(
+                not isinstance(scope, str) for scope in requested_scopes
             ):
                 raise RuntimeError("oauth state requested scopes are invalid")
             granted_scopes = (
@@ -1346,7 +1396,9 @@ class VaultStore:
                     "id": authorization_id,
                     "status": status,
                     "version": version,
-                    "account_id": existing["account_id"] if status == "active" else None,
+                    "account_id": existing["account_id"]
+                    if status == "active"
+                    else None,
                     "platform_uid": (
                         existing["platform_uid"] if status == "active" else None
                     ),
@@ -2131,13 +2183,13 @@ class VaultStore:
             for row in rows:
                 item = dict(row)
                 item["scopes"] = json.loads(str(item.pop("scopes_json")))
-                item["needs_reauthorization"] = bool(
-                    item["needs_reauthorization"]
-                )
+                item["needs_reauthorization"] = bool(item["needs_reauthorization"])
                 items.append(item)
             return items
 
-    def authorization_statuses(self, *, now: Optional[int] = None) -> list[dict[str, Any]]:
+    def authorization_statuses(
+        self, *, now: Optional[int] = None
+    ) -> list[dict[str, Any]]:
         timestamp = int(time.time()) if now is None else now
         with self.read_connection() as connection:
             rows = connection.execute(
@@ -2240,8 +2292,6 @@ class VaultStore:
 
     def healthcheck(self) -> dict[str, Any]:
         with self.read_connection() as connection:
-            quick_check = str(
-                connection.execute("PRAGMA quick_check").fetchone()[0]
-            )
+            quick_check = str(connection.execute("PRAGMA quick_check").fetchone()[0])
             mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0])
             return {"quick_check": quick_check, "journal_mode": mode.lower()}

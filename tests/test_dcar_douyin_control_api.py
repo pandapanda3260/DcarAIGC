@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import hashlib
 import json
 import os
 import sys
@@ -415,6 +416,46 @@ class DouyinControlApiTestCase(unittest.TestCase):
                     403,
                 )
 
+                non_ascii_headers = [
+                    (
+                        "machine",
+                        "/internal/v1/health",
+                        "GET",
+                        [(b"x-dcar-machine-key", b"\xff")],
+                    ),
+                    (
+                        "edge",
+                        "/api/douyin/authorizations",
+                        "GET",
+                        [
+                            (b"x-dcar-edge-key", b"\xff"),
+                            (b"x-dcar-authenticated-user", USERNAME.encode()),
+                            (b"x-dcar-session-binding", SESSION_BINDING.encode()),
+                        ],
+                    ),
+                    (
+                        "action",
+                        "/api/douyin/oauth/start",
+                        "POST",
+                        [
+                            (b"x-dcar-edge-key", EDGE_KEY.encode()),
+                            (b"x-dcar-authenticated-user", USERNAME.encode()),
+                            (b"x-dcar-session-binding", SESSION_BINDING.encode()),
+                            (b"x-dcar-verified-action", b"\xff"),
+                        ],
+                    ),
+                ]
+                for name, path, method, headers in non_ascii_headers:
+                    with self.subTest(base_path=base_path, non_ascii_header=name):
+                        response = control.request(
+                            method,
+                            path,
+                            headers=headers,
+                            json={} if method == "POST" else None,
+                        )
+                        self.assertEqual(response.status_code, 403, response.text)
+                        self.assertEqual(response.headers["cache-control"], "no-store")
+
                 old_routes = [
                     ("GET", "/douyin/confirm", None),
                     ("POST", "/api/douyin/oauth/confirm", "douyin-oauth-confirm"),
@@ -761,6 +802,49 @@ class DouyinControlApiTestCase(unittest.TestCase):
             self.assertIn("authorize_url", started.json())
             self.assertEqual(state.token_calls, 0)
             self.assertEqual(state.userinfo_calls, 0)
+
+    def test_oauth_start_returns_conflict_while_callback_is_exchanging(self) -> None:
+        with self._clients("", vault_namespace="start-in-progress") as (
+            control,
+            _provider,
+            _accounts,
+            state,
+        ):
+            started = control.post(
+                "/api/douyin/oauth/start",
+                headers=self._headers("douyin-oauth-start"),
+                json={},
+            )
+            self.assertEqual(started.status_code, 200, started.text)
+            raw_state = parse_qs(urlsplit(started.json()["authorize_url"]).query)[
+                "state"
+            ][0]
+            state_digest = hashlib.sha256(raw_state.encode("utf-8")).hexdigest()
+            store = cast(FastAPI, control.app).state.store
+            store.begin_exchange(
+                state_digest,
+                USERNAME,
+                SESSION_BINDING,
+                request_id="callback-in-progress",
+                now=NOW,
+            )
+
+            blocked = control.post(
+                "/api/douyin/oauth/start",
+                headers=self._headers("douyin-oauth-start"),
+                json={},
+            )
+            self.assertEqual(blocked.status_code, 409, blocked.text)
+            self.assertEqual(blocked.json()["detail"], "已有抖音授权流程正在处理中")
+            with store.read_connection() as connection:
+                rows = connection.execute(
+                    "SELECT state_digest,status FROM oauth_states"
+                ).fetchall()
+            self.assertEqual(
+                [(row["state_digest"], row["status"]) for row in rows],
+                [(state_digest, "exchanging")],
+            )
+            self.assertEqual(state.token_calls, 0)
 
     def test_mock_oauth_auto_matches_replays_safely_and_unbinds(self) -> None:
         for base_path in ("", "/dcar"):

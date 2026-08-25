@@ -102,14 +102,18 @@ def _identity(request: Request) -> tuple[str, str]:
     return str(request.state.username), str(request.state.session_binding)
 
 
+def _trusted_header_matches(supplied: str, expected: str) -> bool:
+    if not supplied.isascii() or not expected.isascii():
+        return False
+    return hmac.compare_digest(supplied, expected)
+
+
 class AccountDirectory:
     def __init__(self, client: httpx.AsyncClient, api_upstream: str) -> None:
         self.client = client
         self.api_upstream = api_upstream
 
-    async def search(
-        self, *, query: str, page: int, page_size: int
-    ) -> dict[str, Any]:
+    async def search(self, *, query: str, page: int, page_size: int) -> dict[str, Any]:
         try:
             response = await self.client.post(
                 f"{self.api_upstream}/api/v8/accounts/search",
@@ -247,9 +251,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         edge_key = read_shared_key(resolved.edge_key_path, "Douyin Edge Key")
-        machine_key = read_shared_key(
-            resolved.machine_key_path, "Douyin Machine Key"
-        )
+        machine_key = read_shared_key(resolved.machine_key_path, "Douyin Machine Key")
         cipher = TokenCipher(
             resolved.fernet_keyring_path, resolved.open_id_hmac_key_path
         )
@@ -275,9 +277,7 @@ def create_app(
                 provider = MockOAuthClient(resolved, oauth_client, clock=clock)
             else:
                 provider = DouyinOAuthClient(resolved, clock=clock)
-                token_manager = DouyinTokenManager(
-                    store, cipher, provider, clock=clock
-                )
+                token_manager = DouyinTokenManager(store, cipher, provider, clock=clock)
 
         async def cleanup_expired_states() -> None:
             while True:
@@ -323,7 +323,7 @@ def create_app(
                 request.headers.get("x-dcar-edge-key")
                 or request.headers.get("x-dcar-authenticated-user")
                 or request.headers.get("x-dcar-session-binding")
-                or not hmac.compare_digest(supplied, request.app.state.machine_key)
+                or not _trusted_header_matches(supplied, request.app.state.machine_key)
             ):
                 return _no_store(Response(status_code=403))
         else:
@@ -332,7 +332,7 @@ def create_app(
             binding = request.headers.get("x-dcar-session-binding", "")
             if (
                 request.headers.get("x-dcar-machine-key")
-                or not hmac.compare_digest(supplied, request.app.state.edge_key)
+                or not _trusted_header_matches(supplied, request.app.state.edge_key)
                 or not username
                 or len(username) > 128
                 or username == "temporary-bypass"
@@ -344,7 +344,7 @@ def create_app(
             request.state.session_binding = binding
             if request.method == "POST":
                 expected_action = POST_ACTIONS.get(path)
-                if expected_action is None or not hmac.compare_digest(
+                if expected_action is None or not _trusted_header_matches(
                     request.headers.get("x-dcar-verified-action", ""),
                     expected_action,
                 ):
@@ -443,32 +443,33 @@ def create_app(
         target_authorization_version: int | None = None,
     ) -> Response:
         if not resolved.authorization_enabled:
-            return JSONResponse(
-                {"detail": "抖音授权功能尚未启用"}, status_code=409
-            )
+            return JSONResponse({"detail": "抖音授权功能尚未启用"}, status_code=409)
         username, session_binding = _identity(request)
         state = secrets.token_urlsafe(32)
         state_digest = hashlib.sha256(state.encode("utf-8")).hexdigest()
         now = int(clock())
-        await asyncio.to_thread(
-            request.app.state.store.create_state,
-            state_digest=state_digest,
-            bound_username=username,
-            session_binding=session_binding,
-            scopes=REQUESTED_SCOPES,
-            expires_at=now + resolved.state_ttl_seconds,
-            request_id=_request_id(request),
-            target_authorization_id=target_authorization_id,
-            target_authorization_version=target_authorization_version,
-            now=now,
-        )
+        try:
+            await asyncio.to_thread(
+                request.app.state.store.create_state,
+                state_digest=state_digest,
+                bound_username=username,
+                session_binding=session_binding,
+                scopes=REQUESTED_SCOPES,
+                expires_at=now + resolved.state_ttl_seconds,
+                request_id=_request_id(request),
+                target_authorization_id=target_authorization_id,
+                target_authorization_version=target_authorization_version,
+                now=now,
+            )
+        except StateTransitionError:
+            return JSONResponse(
+                {"detail": "已有抖音授权流程正在处理中"}, status_code=409
+            )
         provider: Optional[MockOAuthClient | DouyinOAuthClient] = (
             request.app.state.provider
         )
         if provider is None:
-            return JSONResponse(
-                {"detail": "抖音授权功能尚未启用"}, status_code=409
-            )
+            return JSONResponse({"detail": "抖音授权功能尚未启用"}, status_code=409)
         return JSONResponse(
             {"authorize_url": provider.authorization_url(state, REQUESTED_SCOPES)}
         )
@@ -604,9 +605,7 @@ def create_app(
                         outcome = str(resolved_match["status"])
                         if outcome == "matched":
                             matched_account_id = int(resolved_match["account_id"])
-                            matched_platform_uid = str(
-                                resolved_match["platform_uid"]
-                            )
+                            matched_platform_uid = str(resolved_match["platform_uid"])
                     else:
                         outcome = "unmatched"
                 except (DouyinProviderError, RuntimeError, TypeError, ValueError):
@@ -650,9 +649,7 @@ def create_app(
                 authorization_page("oauth-failed"),
                 status_code=303,
             )
-        return RedirectResponse(
-            authorization_page("oauth-completed"), status_code=303
-        )
+        return RedirectResponse(authorization_page("oauth-completed"), status_code=303)
 
     @application.get("/api/douyin/authorizations")
     async def authorizations(request: Request) -> dict[str, Any]:

@@ -162,9 +162,7 @@ class DouyinControlStoreTestCase(unittest.TestCase):
                 for row in connection.execute("PRAGMA table_info(oauth_states)")
             }
         self.assertTrue(
-            {"oauth_states", "douyin_authorizations", "audit_events"}.issubset(
-                tables
-            )
+            {"oauth_states", "douyin_authorizations", "audit_events"}.issubset(tables)
         )
         self.assertIn("match_reason", authorization_columns)
         self.assertEqual(authorization_columns["account_id"], 0)
@@ -176,8 +174,12 @@ class DouyinControlStoreTestCase(unittest.TestCase):
                 self.assertEqual(
                     connection.execute("PRAGMA journal_mode").fetchone()[0], "delete"
                 )
-                self.assertEqual(connection.execute("PRAGMA synchronous").fetchone()[0], 3)
-                self.assertEqual(connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+                self.assertEqual(
+                    connection.execute("PRAGMA synchronous").fetchone()[0], 3
+                )
+                self.assertEqual(
+                    connection.execute("PRAGMA foreign_keys").fetchone()[0], 1
+                )
                 self.assertEqual(
                     connection.execute("PRAGMA busy_timeout").fetchone()[0], 10000
                 )
@@ -189,9 +191,7 @@ class DouyinControlStoreTestCase(unittest.TestCase):
 
     def _downgrade_index_contract_to_v1(self) -> None:
         with sqlite3.connect(self.vault_path) as connection:
-            connection.execute(
-                "DROP INDEX douyin_authorizations_active_target"
-            )
+            connection.execute("DROP INDEX douyin_authorizations_active_target")
             connection.execute(
                 """
                 CREATE UNIQUE INDEX douyin_authorizations_active_target
@@ -223,7 +223,9 @@ class DouyinControlStoreTestCase(unittest.TestCase):
                 (authorization_id, fingerprint, account_id, platform_uid),
             )
 
-    def test_schema_v1_migrates_index_in_place_and_initialize_is_idempotent(self) -> None:
+    def test_schema_v1_migrates_index_in_place_and_initialize_is_idempotent(
+        self,
+    ) -> None:
         self._downgrade_index_contract_to_v1()
         observed_versions: list[int] = []
 
@@ -537,14 +539,18 @@ class DouyinControlStoreTestCase(unittest.TestCase):
         other_path = self.root / "old-wal.sqlite3"
         connection = sqlite3.connect(other_path)
         try:
-            self.assertEqual(connection.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
+            self.assertEqual(
+                connection.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal"
+            )
             connection.execute("CREATE TABLE legacy(value TEXT)")
             connection.commit()
         finally:
             connection.close()
         VaultStore(other_path).initialize()
         with sqlite3.connect(other_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0], "delete")
+            self.assertEqual(
+                connection.execute("PRAGMA journal_mode").fetchone()[0], "delete"
+            )
 
         held_path = self.root / "held-wal.sqlite3"
         holder = sqlite3.connect(held_path, isolation_level=None)
@@ -557,11 +563,15 @@ class DouyinControlStoreTestCase(unittest.TestCase):
             VaultStore(held_path).initialize()
         tables = {
             row[0]
-            for row in holder.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            for row in holder.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
         }
         self.assertNotIn("oauth_states", tables)
 
-    def test_state_is_single_use_bound_and_terminal_states_erase_candidate(self) -> None:
+    def test_state_is_single_use_bound_and_terminal_states_erase_candidate(
+        self,
+    ) -> None:
         candidate, _fingerprint = self._pending(digest="1" * 64)
         with self.assertRaises(StateTransitionError):
             self.store.begin_exchange(
@@ -597,6 +607,142 @@ class DouyinControlStoreTestCase(unittest.TestCase):
         database_bytes = self.vault_path.read_bytes()
         self.assertNotIn(str(candidate["access_token"]).encode(), database_bytes)
         self.assertNotIn(str(candidate["refresh_token"]).encode(), database_bytes)
+
+    def test_new_start_only_supersedes_unclaimed_state(self) -> None:
+        now = 1_900_000_100
+        binding = "b" * 64
+        first_digest = "2" * 64
+        second_digest = "3" * 64
+        third_digest = "5" * 64
+        self.store.create_state(
+            state_digest=first_digest,
+            bound_username="operator",
+            session_binding=binding,
+            scopes=["user_info", "video.list"],
+            expires_at=now + 600,
+            request_id="first-start",
+            now=now,
+        )
+        self.store.create_state(
+            state_digest=second_digest,
+            bound_username="operator",
+            session_binding=binding,
+            scopes=["user_info", "video.list"],
+            expires_at=now + 601,
+            request_id="second-start",
+            now=now + 1,
+        )
+        with self.store.read_connection() as connection:
+            first = connection.execute(
+                "SELECT status,failure_reason FROM oauth_states WHERE state_digest=?",
+                (first_digest,),
+            ).fetchone()
+        self.assertEqual(tuple(first), ("expired", "superseded"))
+
+        self.store.begin_exchange(
+            second_digest,
+            "operator",
+            binding,
+            request_id="second-callback",
+            now=now + 2,
+        )
+
+        with self.assertRaisesRegex(StateTransitionError, "oauth_state_in_progress"):
+            self.store.create_state(
+                state_digest=third_digest,
+                bound_username="operator",
+                session_binding=binding,
+                scopes=["user_info", "video.list"],
+                expires_at=now + 602,
+                request_id="third-start",
+                now=now + 3,
+            )
+
+        self.store.store_candidate(
+            state_digest=second_digest,
+            ciphertext=b"encrypted-candidate",
+            open_id_fingerprint="f" * 64,
+            confirmation_expires_at=now + 900,
+            request_id="candidate",
+            now=now + 4,
+        )
+        with self.assertRaisesRegex(StateTransitionError, "oauth_state_in_progress"):
+            self.store.create_state(
+                state_digest="6" * 64,
+                bound_username="operator",
+                session_binding=binding,
+                scopes=["user_info", "video.list"],
+                expires_at=now + 604,
+                request_id="fourth-start",
+                now=now + 5,
+            )
+
+        with self.store.read_connection() as connection:
+            second = connection.execute(
+                "SELECT status,failure_reason FROM oauth_states WHERE state_digest=?",
+                (second_digest,),
+            ).fetchone()
+            third = connection.execute(
+                "SELECT status FROM oauth_states WHERE state_digest=?",
+                (third_digest,),
+            ).fetchone()
+        self.assertEqual(tuple(second), ("matching", None))
+        self.assertIsNone(third)
+
+    def test_wrong_callback_identity_leaves_security_audit(self) -> None:
+        now = 1_900_000_200
+        digest = "4" * 64
+        binding = "c" * 64
+        self.store.create_state(
+            state_digest=digest,
+            bound_username="operator",
+            session_binding=binding,
+            scopes=["user_info", "video.list"],
+            expires_at=now + 600,
+            request_id="start",
+            now=now,
+        )
+
+        with self.assertRaisesRegex(StateTransitionError, "oauth_state_unavailable"):
+            self.store.begin_exchange(
+                digest,
+                "wrong-operator",
+                "d" * 64,
+                request_id="wrong-callback",
+                now=now + 1,
+            )
+
+        with self.store.read_connection() as connection:
+            state = connection.execute(
+                "SELECT status FROM oauth_states WHERE state_digest=?",
+                (digest,),
+            ).fetchone()
+            audit = connection.execute(
+                """
+                SELECT actor,action,result,reason_code,subject_fingerprint,request_id
+                FROM audit_events WHERE request_id='wrong-callback'
+                """
+            ).fetchone()
+        self.assertEqual(state["status"], "created")
+        self.assertEqual(
+            tuple(audit),
+            (
+                "wrong-operator",
+                "oauth_callback",
+                "security_rejected",
+                "identity_mismatch",
+                digest,
+                "wrong-callback",
+            ),
+        )
+        claimed = self.store.begin_exchange(
+            digest,
+            "operator",
+            binding,
+            request_id="correct-callback",
+            now=now + 2,
+        )
+        self.assertEqual(claimed["status"], "exchanging")
 
     def test_concurrent_callback_claims_exactly_once(self) -> None:
         now = int(time.time())
@@ -790,7 +936,9 @@ class DouyinControlStoreTestCase(unittest.TestCase):
         self.assertNotIn("scopes_json", listed[0])
         self.assertNotIn("key_version", listed[0])
 
-    def test_machine_authorization_projection_excludes_identity_and_tokens(self) -> None:
+    def test_machine_authorization_projection_excludes_identity_and_tokens(
+        self,
+    ) -> None:
         candidate, fingerprint = self._pending(digest="8" * 64)
         created = self.store.confirm_authorization(
             state_digest="8" * 64,
@@ -820,7 +968,9 @@ class DouyinControlStoreTestCase(unittest.TestCase):
             },
         )
 
-    def test_automatic_match_stages_then_activates_and_reauthorizes_in_place(self) -> None:
+    def test_automatic_match_stages_then_activates_and_reauthorizes_in_place(
+        self,
+    ) -> None:
         _candidate, fingerprint, staged = self._stage(
             digest="b" * 64, open_id="automatic-open-id"
         )
@@ -893,7 +1043,9 @@ class DouyinControlStoreTestCase(unittest.TestCase):
         )
         self.assertEqual(access["token"], "access-by-second-operator")
 
-    def test_new_authorization_missing_requested_scope_fails_without_insert(self) -> None:
+    def test_new_authorization_missing_requested_scope_fails_without_insert(
+        self,
+    ) -> None:
         digest = "b" * 64
         binding = "c" * 64
         now = 1_900_010_000
@@ -955,7 +1107,9 @@ class DouyinControlStoreTestCase(unittest.TestCase):
             ),
         )
 
-    def test_active_reauthorization_missing_scope_preserves_existing_token(self) -> None:
+    def test_active_reauthorization_missing_scope_preserves_existing_token(
+        self,
+    ) -> None:
         _candidate, fingerprint, staged = self._stage(
             digest="c" * 64,
             open_id="missing-scope-active-open-id",
@@ -1170,7 +1324,9 @@ class DouyinControlStoreTestCase(unittest.TestCase):
                 "SELECT status,failure_reason FROM oauth_states WHERE state_digest=?",
                 ("7" * 64,),
             ).fetchone()
-        self.assertEqual(tuple(old_state), ("failed", "reauthorization_version_conflict"))
+        self.assertEqual(
+            tuple(old_state), ("failed", "reauthorization_version_conflict")
+        )
 
     def test_pending_rescan_reuses_id_and_stale_finalize_cannot_overwrite(self) -> None:
         _candidate, _fingerprint, first = self._stage(
@@ -1311,7 +1467,9 @@ class DouyinControlStoreTestCase(unittest.TestCase):
         self.assertIsNone(restaged["account_id"])
         self.assertIsNone(restaged["platform_uid"])
 
-    def test_auto_match_outcomes_status_projection_and_wrong_target_rejected(self) -> None:
+    def test_auto_match_outcomes_status_projection_and_wrong_target_rejected(
+        self,
+    ) -> None:
         staged_items: list[tuple[str, str, int]] = []
         for index, outcome in enumerate(("unmatched", "ambiguous", "unavailable")):
             digest = str(index + 1) * 64
@@ -1341,7 +1499,9 @@ class DouyinControlStoreTestCase(unittest.TestCase):
         listed = self.store.list_authorizations("unrelated-operator")
         self.assertEqual(len(listed), 3)
         self.assertTrue(all(item["status"] == "pending_match" for item in listed))
-        self.assertTrue(all(not item["authorized"] for item in self.store.authorization_statuses()))
+        self.assertTrue(
+            all(not item["authorized"] for item in self.store.authorization_statuses())
+        )
 
         target_id = staged_items[0][0]
         activated = self.store.manual_match(
@@ -1395,7 +1555,9 @@ class DouyinControlStoreTestCase(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(wrong_rows, 0)
 
-    def test_token_lifecycle_lease_updates_limit_and_reauthorization_audit(self) -> None:
+    def test_token_lifecycle_lease_updates_limit_and_reauthorization_audit(
+        self,
+    ) -> None:
         candidate, fingerprint = self._pending(digest="9" * 64)
         created = self.store.confirm_authorization(
             state_digest="9" * 64,
@@ -1622,7 +1784,9 @@ class DouyinControlStoreTestCase(unittest.TestCase):
         )
         active_after_rotation = self.store.get_active_authorization(authorization_id)
         assert active_after_rotation is not None
-        self.assertEqual(active_after_rotation["access_expires_at"], bundle_access_expiry)
+        self.assertEqual(
+            active_after_rotation["access_expires_at"], bundle_access_expiry
+        )
         self.assertGreaterEqual(
             int(active_after_rotation["refresh_expires_at"]), bundle_refresh_expiry
         )
