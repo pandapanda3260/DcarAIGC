@@ -686,7 +686,7 @@ test("spu audience page keeps rule assets, association and 3D stats together", a
 });
 
 test("routes preserve operations and expose read-only evidence workbench", async () => {
-  const [shell, accounts, pagination, contents, evidence, tasks, taskDetail, sellingPoints, apiSource, formatSource, layout, packageJson, queries, queryContracts] = await Promise.all([
+  const [shell, accounts, pagination, contents, evidence, tasks, taskDetail, sellingPoints, apiSource, operationsSource, formatSource, layout, packageJson, queries, queryContracts] = await Promise.all([
     readFile(new URL("../app/components/AppShell.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/accounts/AccountsPage.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/components/Pagination.tsx", import.meta.url), "utf8"),
@@ -696,6 +696,7 @@ test("routes preserve operations and expose read-only evidence workbench", async
     readFile(new URL("../app/tasks/[id]/TaskDetailPage.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/selling-points/SellingPointsPage.tsx", import.meta.url), "utf8"),
     readFile(new URL("../../../src/dcar_eval/v8/api.py", import.meta.url), "utf8"),
+    readFile(new URL("../../../src/dcar_eval/v8/operations.py", import.meta.url), "utf8"),
     readFile(new URL("../app/lib/format.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
@@ -724,7 +725,7 @@ test("routes preserve operations and expose read-only evidence workbench", async
   assert.match(contents, /if \(!contentsQuery\.data \|\| contentsQuery\.isPlaceholderData\) return;[\s\S]*lastPageFor\(contentsQuery\.data\.total, appliedRequest\.page_size\)[\s\S]*\{ \.\.\.current, page: lastPage \}/);
   assert.doesNotMatch(contents, /function pageWindow/);
   assert.match(accounts, /以手机号为唯一标识的账号列表/);
-  assert.match(accounts, /新增账号<\/button><Link className="secondary button-link" href="\/accounts\/douyin-authorization">抖音授权管理<\/Link><a className="secondary button-link"[^>]+>下载账号表格<\/a><label className="secondary button-link">批量导入/);
+  assert.match(accounts, /新增账号<\/button><Link className="secondary button-link" href="\/accounts\/douyin-authorization">抖音授权管理<\/Link><button className="secondary button-link" disabled=\{exporting\} onClick=\{\(\) => void exportWorkbook\(\)\}>\{exporting \? "正在导出…" : "下载账号表格"\}<\/button><label className="secondary button-link">批量导入/);
   assert.match(accounts, /useQuery\(douyinAuthorizationStatusesQueryOptions\(\)\)/);
   assert.match(accounts, /authorizationStatuses\.find\(\(item\) => item\.account_id === account\.id && item\.platform_uid === identity\.uid && item\.status === "active"\)/);
   assert.match(accounts, /authorizationStatusesPending[\s\S]*\? "查询中"[\s\S]*authorizationStatusesFailed[\s\S]*\? "状态异常"[\s\S]*needsAuthorization[\s\S]*\? "需重新授权"[\s\S]*authorization\?\.authorized[\s\S]*\? "已授权"[\s\S]*: "未授权"/);
@@ -749,10 +750,16 @@ test("routes preserve operations and expose read-only evidence workbench", async
   assert.match(accounts, /event\.origin !== window\.location\.origin \|\| !receivesAuthorizationUpdate\(event\.data\)/);
   assert.match(accounts, /data\.type === "dcar-douyin-authorization-updated"/);
   assert.match(accounts, /channel\?\.close\(\)[\s\S]*window\.removeEventListener\("message", handleWindowMessage\)/);
+  assert.match(accounts, /douyin_authorization_targets: authorizationTargets/);
+  assert.match(accounts, /item\.status === "active" && item\.account_id != null && item\.platform_uid != null/);
+  assert.match(accounts, /state: item\.authorized \? "authorized" as const : "needs_reauthorization" as const/);
+  assert.match(accounts, /response\.blob\(\)[\s\S]*URL\.createObjectURL\(blob\)[\s\S]*workbookFilename\(response\.headers\.get\("Content-Disposition"\)\)/);
+  assert.doesNotMatch(accounts, /douyin_authorized_account_ids/);
   assert.match(accounts, /className="table-read-error" colSpan=\{27\}/);
   assert.match(accounts, /className="account-master-empty" colSpan=\{27\}/);
-  assert.match(apiSource, /NULL follower_count/);
-  assert.match(apiSource, /COUNT\(c\.id\) content_count/);
+  assert.match(apiSource, /ACCOUNT_IDENTITY_STATS_SQL/);
+  assert.match(operationsSource, /NULL follower_count/);
+  assert.match(operationsSource, /COUNT\(c\.id\) content_count/);
   assert.match(accounts, /\/api\/v8\/accounts\/import/);
   assert.match(accounts, /\/api\/v8\/accounts\/export/);
   assert.match(contents, /\/api\/v8\/contents\/validate/);

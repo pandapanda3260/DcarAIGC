@@ -3,6 +3,9 @@
 The report revision CSV files are immutable snapshots.  This module turns those
 snapshots into a presentation-friendly workbook at download time without
 changing the task, revision, or registered report files.
+
+账号页的「下载账号表格」导出（build_accounts_workbook）也复用这里的
+XLSX 渲染，保持全站导出零第三方依赖。
 """
 
 from __future__ import annotations
@@ -110,6 +113,18 @@ _CONTENT_DIRECTION_LABELS = {
     "other": "其他",
     "unknown": "未知",
 }
+_ACCOUNT_REAL_NAME_LABELS = {"yes": "是", "no": "否", "unknown": "未知"}
+# 账号表格导出的平台列顺序 = 账号页表格的平台列顺序（format.ts platformKeys）。
+_ACCOUNT_EXPORT_PLATFORMS = ("douyin", "xiaohongshu", "wechat_channels", "kuaishou")
+# 分组表头样式索引（_styles_xml cellXfs 13-18），配色取自账号页表格分组行。
+_ACCOUNT_GROUP_BASE_STYLE = 13
+_ACCOUNT_GROUP_PLATFORM_STYLES = {
+    "douyin": 14,
+    "xiaohongshu": 15,
+    "wechat_channels": 16,
+    "kuaishou": 17,
+}
+_ACCOUNT_GROUP_MANAGEMENT_STYLE = 18
 
 _CHANNEL_HEADERS = {
     "platform": "平台内部标识",
@@ -244,6 +259,7 @@ class _Worksheet:
     merge_cells: Sequence[str] = ()
     auto_filter: str | None = None
     frozen_rows: int = 0
+    frozen_columns: int = 0
     row_heights: Mapping[int, float] | None = None
     hidden_columns: Sequence[int] = ()
 
@@ -751,6 +767,151 @@ def report_bundle_filename(*, task_name: str, task_id: str) -> str:
     return f"{_safe_filename_stem(task_name, fallback=task_id)}.zip"
 
 
+def accounts_workbook_filename(exported_at: datetime) -> str:
+    """账号表格下载文件名：内容 + 北京时间导出时刻，多次导出可区分版本。"""
+
+    return f"账号表格_{exported_at:%Y%m%d_%H%M}.xlsx"
+
+
+def _enum_or_dash(labels: Mapping[str, str], value: Any) -> str:
+    """与前端 label() 同口径：空值显示「—」，词典没有的枚举原样展示。"""
+
+    text = _clean_text(value or "").strip()
+    if not text:
+        return "—"
+    return labels.get(text, text)
+
+
+def build_accounts_workbook(
+    accounts: Sequence[Mapping[str, Any]],
+    *,
+    douyin_authorization_targets: Mapping[tuple[int, str], str] | None,
+    exported_at: str,
+) -> bytes:
+    """账号表格（xlsx）：列结构、中文表头与取值口径都对齐账号页表格。
+
+    - 表头两行：第一行是「账号基础信息 / 各平台 / 账号管理」分组（沿用页面
+      分组配色），第二行是与页面一致的中文列名；冻结前 4 列与表头，列名行
+      带筛选。
+    - 手机号、平台账号编号写成文本单元格，避免 Excel 把长编号变成科学计数法
+      （这是旧 CSV 导出的主要痛点）。
+    - 「抖音开平授权」状态在抖音控制面，不在账号主数据库；由前端随下载请求
+      带来精确 (account_id, platform_uid) 目标及状态。None 表示状态不可用，
+      空集或未精确命中显示「未授权」；命中后显示「已授权」或「需重新授权」。
+    - 粉丝量暂未采集（接口恒为 null），与页面一样显示「—」；关联内容量未绑定
+      平台时与页面一样按 0 条展示。
+    """
+
+    group_row: list[Any] = ["账号基础信息", None, None, None]
+    group_styles: list[int] = [_ACCOUNT_GROUP_BASE_STYLE] * 4
+    headers: list[Any] = ["手机号", "运营人员", "账号类型", "内容方向"]
+    widths: list[float] = [15, 12, 11, 11]
+    merges: list[str] = ["A1:D1"]
+    column = 5
+    for platform in _ACCOUNT_EXPORT_PLATFORMS:
+        span = 6 if platform == "douyin" else 5
+        group_row.extend([_PLATFORM_LABELS[platform], *([None] * (span - 1))])
+        group_styles.extend([_ACCOUNT_GROUP_PLATFORM_STYLES[platform]] * span)
+        headers.append("平台账号编号")
+        widths.append(26)
+        headers.append("是否实名")
+        widths.append(10)
+        if platform == "douyin":
+            headers.append("抖音开平授权")
+            widths.append(14)
+        headers.append("昵称")
+        widths.append(20)
+        headers.append("粉丝量")
+        widths.append(11)
+        headers.append("关联内容量")
+        widths.append(12)
+        merges.append(f"{_column_name(column)}1:{_column_name(column + span - 1)}1")
+        column += span
+    group_row.append("账号管理")
+    group_styles.append(_ACCOUNT_GROUP_MANAGEMENT_STYLE)
+    headers.append("状态")
+    widths.append(9)
+
+    rows: list[list[Any]] = [group_row, headers]
+    styles: list[list[int]] = [group_styles, [1] * len(headers)]
+    for account in accounts:
+        identities = {
+            str(identity.get("platform") or ""): identity
+            for identity in account.get("platforms", ())
+        }
+        row: list[Any] = []
+        row_styles: list[int] = []
+
+        def put(value: Any, style: int) -> None:
+            row.append(value)
+            row_styles.append(style)
+
+        put(_clean_text(account.get("phone") or ""), 12)
+        put(_clean_text(account.get("operator_name") or "").strip() or "未填写", 10)
+        put(_enum_or_dash(_ACCOUNT_TYPE_LABELS, account.get("account_type")), 10)
+        put(
+            _enum_or_dash(_CONTENT_DIRECTION_LABELS, account.get("content_direction")),
+            10,
+        )
+        for platform in _ACCOUNT_EXPORT_PLATFORMS:
+            identity = identities.get(platform)
+            uid = _clean_text((identity or {}).get("uid") or "").strip()
+            if uid:
+                put(uid, 12)
+            else:
+                put("—", 10)
+            if identity is None:
+                put("未绑定", 10)
+            else:
+                put(
+                    _enum_or_dash(
+                        _ACCOUNT_REAL_NAME_LABELS, identity.get("real_name_status")
+                    ),
+                    10,
+                )
+            if platform == "douyin":
+                if douyin_authorization_targets is None:
+                    put("状态异常", 10)
+                else:
+                    authorization_state = douyin_authorization_targets.get(
+                        (int(account.get("id") or 0), uid)
+                    )
+                    put(
+                        "已授权"
+                        if authorization_state == "authorized"
+                        else "需重新授权"
+                        if authorization_state == "needs_reauthorization"
+                        else "未授权",
+                        10,
+                    )
+            nickname = _clean_text((identity or {}).get("nickname") or "").strip()
+            put(nickname or "—", 10)
+            follower_count = (identity or {}).get("follower_count")
+            if follower_count is None:
+                put("—", 9)
+            else:
+                put(int(follower_count), 5)
+            content_count = int((identity or {}).get("content_count") or 0)
+            put(content_count, 19)
+        put("运营中" if account.get("enabled") else "停用", 10)
+        rows.append(row)
+        styles.append(row_styles)
+
+    last_column = _column_name(len(headers))
+    sheet = _Worksheet(
+        name="账号信息",
+        rows=rows,
+        styles=styles,
+        widths=widths,
+        merge_cells=tuple(merges),
+        auto_filter=f"A2:{last_column}{len(rows)}",
+        frozen_rows=2,
+        frozen_columns=4,
+        row_heights={1: 24, 2: 28},
+    )
+    return _xlsx_bytes([sheet], title="DCar 账号表格", created_at=exported_at)
+
+
 def build_report_download_bundle(
     *, image_extension: str, image_bytes: bytes, workbook_bytes: bytes
 ) -> bytes:
@@ -808,12 +969,21 @@ def _sheet_xml(sheet: _Worksheet) -> str:
     row_count = max(len(sheet.rows), 1)
     dimension = f"A1:{_column_name(column_count)}{row_count}"
     pane = ""
-    if sheet.frozen_rows:
-        top_left = f"A{sheet.frozen_rows + 1}"
+    if sheet.frozen_rows or sheet.frozen_columns:
+        top_left = f"{_column_name(sheet.frozen_columns + 1)}{sheet.frozen_rows + 1}"
+        if sheet.frozen_rows and sheet.frozen_columns:
+            active_pane = "bottomRight"
+        elif sheet.frozen_rows:
+            active_pane = "bottomLeft"
+        else:
+            active_pane = "topRight"
+        splits = (
+            f' xSplit="{sheet.frozen_columns}"' if sheet.frozen_columns else ""
+        ) + (f' ySplit="{sheet.frozen_rows}"' if sheet.frozen_rows else "")
         pane = (
-            f'<pane ySplit="{sheet.frozen_rows}" topLeftCell="{top_left}" '
-            'activePane="bottomLeft" state="frozen"/>'
-            f'<selection pane="bottomLeft" activeCell="{top_left}" sqref="{top_left}"/>'
+            f'<pane{splits} topLeftCell="{top_left}" '
+            f'activePane="{active_pane}" state="frozen"/>'
+            f'<selection pane="{active_pane}" activeCell="{top_left}" sqref="{top_left}"/>'
         )
     hidden_columns = set(sheet.hidden_columns)
     columns = "".join(
@@ -858,23 +1028,35 @@ def _sheet_xml(sheet: _Worksheet) -> str:
 def _styles_xml() -> str:
     return '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-<numFmts count="1"><numFmt numFmtId="164" formatCode="yyyy-mm-dd hh:mm:ss"/></numFmts>
-<fonts count="5">
+<numFmts count="2"><numFmt numFmtId="164" formatCode="yyyy-mm-dd hh:mm:ss"/><numFmt numFmtId="165" formatCode="#,##0&quot; 条&quot;"/></numFmts>
+<fonts count="11">
 <font><sz val="10"/><name val="Arial"/><family val="2"/></font>
 <font><b/><color rgb="FFFFFFFF"/><sz val="10"/><name val="Arial"/><family val="2"/></font>
 <font><b/><color rgb="FF1F2129"/><sz val="18"/><name val="Arial"/><family val="2"/></font>
 <font><b/><color rgb="FF13262D"/><sz val="10"/><name val="Arial"/><family val="2"/></font>
 <font><color rgb="FF0D6F65"/><u/><sz val="10"/><name val="Arial"/><family val="2"/></font>
+<font><b/><color rgb="FF102C35"/><sz val="10"/><name val="Arial"/><family val="2"/></font>
+<font><b/><color rgb="FFCF5336"/><sz val="10"/><name val="Arial"/><family val="2"/></font>
+<font><b/><color rgb="FFC93453"/><sz val="10"/><name val="Arial"/><family val="2"/></font>
+<font><b/><color rgb="FF247862"/><sz val="10"/><name val="Arial"/><family val="2"/></font>
+<font><b/><color rgb="FFBD5630"/><sz val="10"/><name val="Arial"/><family val="2"/></font>
+<font><b/><color rgb="FF536970"/><sz val="10"/><name val="Arial"/><family val="2"/></font>
 </fonts>
-<fills count="5">
+<fills count="11">
 <fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill>
 <fill><patternFill patternType="solid"><fgColor rgb="FF102C35"/><bgColor indexed="64"/></patternFill></fill>
 <fill><patternFill patternType="solid"><fgColor rgb="FFFFCD32"/><bgColor indexed="64"/></patternFill></fill>
 <fill><patternFill patternType="solid"><fgColor rgb="FFF2F6F6"/><bgColor indexed="64"/></patternFill></fill>
+<fill><patternFill patternType="solid"><fgColor rgb="FFEEF3F4"/><bgColor indexed="64"/></patternFill></fill>
+<fill><patternFill patternType="solid"><fgColor rgb="FFFEF4EE"/><bgColor indexed="64"/></patternFill></fill>
+<fill><patternFill patternType="solid"><fgColor rgb="FFFFF1F5"/><bgColor indexed="64"/></patternFill></fill>
+<fill><patternFill patternType="solid"><fgColor rgb="FFEEF8F3"/><bgColor indexed="64"/></patternFill></fill>
+<fill><patternFill patternType="solid"><fgColor rgb="FFFFF3ED"/><bgColor indexed="64"/></patternFill></fill>
+<fill><patternFill patternType="solid"><fgColor rgb="FFF3F6F7"/><bgColor indexed="64"/></patternFill></fill>
 </fills>
 <borders count="2"><border><left/><right/><top/><bottom/><diagonal/></border><border><left/><right/><top/><bottom style="thin"><color rgb="FFE4E9EA"/></bottom><diagonal/></border></borders>
 <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
-<cellXfs count="13">
+<cellXfs count="20">
 <xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
 <xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf>
 <xf numFmtId="0" fontId="2" fillId="3" borderId="0" xfId="0" applyAlignment="1"><alignment horizontal="left" vertical="center"/></xf>
@@ -888,6 +1070,13 @@ def _styles_xml() -> str:
 <xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyAlignment="1"><alignment horizontal="left" vertical="center"/></xf>
 <xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyAlignment="1"><alignment horizontal="left" vertical="center" wrapText="1"/></xf>
 <xf numFmtId="49" fontId="0" fillId="0" borderId="1" xfId="0" quotePrefix="1" applyNumberFormat="1" applyAlignment="1"><alignment horizontal="left" vertical="center"/></xf>
+<xf numFmtId="0" fontId="5" fillId="5" borderId="1" xfId="0" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>
+<xf numFmtId="0" fontId="6" fillId="6" borderId="1" xfId="0" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>
+<xf numFmtId="0" fontId="7" fillId="7" borderId="1" xfId="0" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>
+<xf numFmtId="0" fontId="8" fillId="8" borderId="1" xfId="0" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>
+<xf numFmtId="0" fontId="9" fillId="9" borderId="1" xfId="0" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>
+<xf numFmtId="0" fontId="10" fillId="10" borderId="1" xfId="0" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>
+<xf numFmtId="165" fontId="0" fillId="0" borderId="1" xfId="0" applyNumberFormat="1" applyAlignment="1"><alignment horizontal="right" vertical="center"/></xf>
 </cellXfs>
 <cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
 <dxfs count="0"/><tableStyles count="0" defaultTableStyle="TableStyleMedium2" defaultPivotStyle="PivotStyleLight16"/>

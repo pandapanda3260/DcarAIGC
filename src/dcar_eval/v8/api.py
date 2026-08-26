@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Literal, Mapping, Optional
 from urllib.parse import quote, unquote
 from zoneinfo import ZoneInfo
 
@@ -75,9 +75,10 @@ from .media import (
     recover_stale_media_processing_slots,
 )
 from .operations import (
+    ACCOUNT_IDENTITY_STATS_SQL,
     OperationError,
     content_identity,
-    export_accounts_csv,
+    export_accounts_xlsx,
     export_contents_csv,
     import_accounts,
     import_contents,
@@ -92,6 +93,7 @@ from .providers import (
     update_content_data,
 )
 from .report_export import (
+    accounts_workbook_filename,
     build_report_detail_workbook,
     build_report_download_bundle,
     platform_content_id_from_url,
@@ -274,6 +276,24 @@ class AccountSearchRequest(BaseModel):
     platform: Optional[str] = Field(default=None, max_length=32)
     page: int = Field(default=1, ge=1)
     page_size: int = Field(default=50, ge=1, le=100)
+
+
+class DouyinAuthorizationTarget(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    account_id: int = Field(ge=1)
+    platform_uid: str = Field(min_length=6, max_length=24, pattern=r"^\d{6,24}$")
+    state: Literal["authorized", "needs_reauthorization"]
+
+
+class AccountExportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # None means the control-plane status request failed.  An empty list means
+    # it succeeded and no exact account/UID pair currently has an active grant.
+    douyin_authorization_targets: Optional[List[DouyinAuthorizationTarget]] = Field(
+        default=None, max_length=100_000
+    )
 
 
 SELLING_POINT_NONE = "__none__"
@@ -1133,19 +1153,7 @@ def _account_search(
         items: List[Dict[str, Any]] = []
         for row in account_rows:
             identities = connection.execute(
-                """
-                SELECT api.platform, api.uid, api.nickname, api.real_name_status,
-                       NULL follower_count,
-                       COUNT(c.id) content_count
-                FROM account_platform_identities api
-                LEFT JOIN content_items c
-                  ON c.account_id=api.account_id AND c.platform=api.platform
-                WHERE api.account_id=?
-                GROUP BY api.id, api.platform, api.uid, api.nickname,
-                         api.real_name_status
-                ORDER BY api.platform
-                """,
-                (row["id"],),
+                ACCOUNT_IDENTITY_STATS_SQL, (row["id"],)
             ).fetchall()
             items.append(
                 {
@@ -2117,6 +2125,7 @@ router = APIRouter()
 
 READ_ONLY_POST_PATHS = frozenset(
     {
+        "/api/v8/accounts/export",
         "/api/v8/accounts/search",
         "/api/v8/contents/search",
         "/api/v8/contents/validate",
@@ -2156,6 +2165,7 @@ def create_app(config: Optional[ApiConfig] = None) -> FastAPI:
         allow_credentials=False,
         allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Content-Type"],
+        expose_headers=["Content-Disposition"],
     )
     application.middleware("http")(privacy_safe_request_log)
     application.middleware("http")(read_only_replica_guard)
@@ -2806,12 +2816,34 @@ def import_v8_accounts(request: Request, payload: BulkImportRequest) -> Dict[str
     )
 
 
-@router.get("/api/v8/accounts/export")
-def export_v8_accounts(request: Request) -> Response:
+@router.post("/api/v8/accounts/export")
+def export_v8_accounts(request: Request, payload: AccountExportRequest) -> Response:
+    workbook = export_accounts_xlsx(
+        douyin_authorization_targets=(
+            None
+            if payload.douyin_authorization_targets is None
+            else [
+                (target.account_id, target.platform_uid, target.state)
+                for target in payload.douyin_authorization_targets
+            ]
+        ),
+        db_path=_request_config(request).db_path,
+    )
+    filename = accounts_workbook_filename(datetime.now(SHANGHAI))
+    encoded_filename = quote(filename, safe="")
     return Response(
-        export_accounts_csv(db_path=_request_config(request).db_path),
-        media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": 'attachment; filename="dcar-accounts.csv"'},
+        content=workbook,
+        media_type=(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ),
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="dcar-accounts.xlsx"; '
+                f"filename*=UTF-8''{encoded_filename}"
+            ),
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 

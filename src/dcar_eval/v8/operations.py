@@ -20,7 +20,7 @@ from .evaluation_selectors import (
     effective_direction_sql,
 )
 from .migration import generate_link_id, normalize_timestamp
-from .report_export import formula_safe_csv_value
+from .report_export import build_accounts_workbook, formula_safe_csv_value
 from .storage import DEFAULT_DB, connect, now_utc, transaction
 
 
@@ -28,6 +28,21 @@ PLATFORMS = {"douyin", "xiaohongshu", "wechat_channels", "kuaishou"}
 ACCOUNT_TYPES = {"boutique_ip", "original", "mixed_edit", "unknown"}
 DIRECTIONS = {"new_car", "used_car", "media", "other", "unknown"}
 REAL_NAME_STATUSES = {"yes", "no", "unknown"}
+# 账号平台身份 + 关联内容量：账号页表格（api._account_search）与账号表格导出
+# （export_accounts_xlsx）共用的取数口径，改一处两边同时生效。
+# follower_count 暂未采集，恒为 NULL（页面与导出都显示「—」）。
+ACCOUNT_IDENTITY_STATS_SQL = """
+    SELECT api.platform, api.uid, api.nickname, api.real_name_status,
+           NULL follower_count,
+           COUNT(c.id) content_count
+    FROM account_platform_identities api
+    LEFT JOIN content_items c
+      ON c.account_id=api.account_id AND c.platform=api.platform
+    WHERE api.account_id=?
+    GROUP BY api.id, api.platform, api.uid, api.nickname,
+             api.real_name_status
+    ORDER BY api.platform
+"""
 CONTENT_PATCH_FIELDS = frozenset(
     {
         "platform",
@@ -1535,53 +1550,59 @@ def import_contents(
     return {"batch_id": batch_id, **counts.as_dict()}
 
 
-def export_accounts_csv(*, db_path: Path = DEFAULT_DB) -> bytes:
-    output = io.StringIO()
-    fields = [
-        "phone",
-        "operator_name",
-        "account_type",
-        "content_direction",
-        "enabled",
-        "douyin_uid",
-        "douyin_nickname",
-        "douyin_real_name_status",
-        "xiaohongshu_uid",
-        "xiaohongshu_nickname",
-        "xiaohongshu_real_name_status",
-        "wechat_channels_uid",
-        "wechat_channels_nickname",
-        "wechat_channels_real_name_status",
-        "kuaishou_uid",
-        "kuaishou_nickname",
-        "kuaishou_real_name_status",
-    ]
-    writer = csv.DictWriter(output, fieldnames=fields)
-    writer.writeheader()
+def export_accounts_xlsx(
+    *,
+    douyin_authorization_targets: Optional[Sequence[tuple[int, str, str]]] = None,
+    db_path: Path = DEFAULT_DB,
+) -> bytes:
+    """\u5bfc\u51fa\u8d26\u53f7\u8868\u683c\uff08xlsx\uff09\uff0c\u6392\u5e8f\u4e0e\u8d26\u53f7\u9875\u4e00\u81f4\uff08\u6700\u8fd1\u66f4\u65b0\u5728\u524d\uff09\u3002
+
+    douyin_authorization_targets \u662f\u524d\u7aef\u968f\u4e0b\u8f7d\u8bf7\u6c42\u5e26\u6765\u7684
+    (account_id, platform_uid, state) \u7cbe\u786e\u76ee\u6807\uff0cstate \u4ec5\u5141\u8bb8
+    authorized/needs_reauthorization\uff1bNone \u8868\u793a\u72b6\u6001\u4e0d\u53ef\u7528\uff0c\u7a7a\u96c6\u8868\u793a
+    \u72b6\u6001\u53ef\u7528\u4f46\u6ca1\u6709\u6388\u6743\u76ee\u6807\u3002\u91cd\u590d\u76ee\u6807\u4ee5 needs_reauthorization \u4f18\u5148\u3002
+    """
+
+    authorization_targets: Optional[Dict[tuple[int, str], str]]
+    if douyin_authorization_targets is None:
+        authorization_targets = None
+    else:
+        authorization_targets = {}
+        for account_id, platform_uid, state in douyin_authorization_targets:
+            normalized_state = str(state)
+            if normalized_state not in {"authorized", "needs_reauthorization"}:
+                raise ValueError("unsupported Douyin authorization export state")
+            target = (int(account_id), str(platform_uid))
+            if (
+                normalized_state == "needs_reauthorization"
+                or target not in authorization_targets
+            ):
+                authorization_targets[target] = normalized_state
+    accounts: List[Dict[str, Any]] = []
     with connect(db_path) as connection:
-        accounts = connection.execute("SELECT * FROM accounts ORDER BY id").fetchall()
-        for account in accounts:
-            row: Dict[str, Any] = {field: "" for field in fields}
-            row.update(
+        account_rows = connection.execute(
+            "SELECT * FROM accounts ORDER BY updated_at DESC, id DESC"
+        ).fetchall()
+        for account in account_rows:
+            identities = connection.execute(
+                ACCOUNT_IDENTITY_STATS_SQL, (account["id"],)
+            ).fetchall()
+            accounts.append(
                 {
+                    "id": account["id"],
                     "phone": account["phone"],
                     "operator_name": account["operator_name"],
                     "account_type": account["account_type"],
                     "content_direction": account["content_direction"],
-                    "enabled": account["enabled"],
+                    "enabled": bool(account["enabled"]),
+                    "platforms": [dict(identity) for identity in identities],
                 }
             )
-            identities = connection.execute(
-                "SELECT * FROM account_platform_identities WHERE account_id=?",
-                (account["id"],),
-            ).fetchall()
-            for identity in identities:
-                prefix = str(identity["platform"])
-                row[f"{prefix}_uid"] = identity["uid"]
-                row[f"{prefix}_nickname"] = identity["nickname"]
-                row[f"{prefix}_real_name_status"] = identity["real_name_status"]
-            writer.writerow(row)
-    return ("\ufeff" + output.getvalue()).encode("utf-8")
+    return build_accounts_workbook(
+        accounts,
+        douyin_authorization_targets=authorization_targets,
+        exported_at=now_utc(),
+    )
 
 
 def export_contents_csv(*, db_path: Path = DEFAULT_DB) -> bytes:

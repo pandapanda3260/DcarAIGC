@@ -959,6 +959,15 @@ class V8ApiTest(unittest.TestCase):
                 replica_client.post("/api/v8/accounts/search", json={}).status_code,
                 200,
             )
+            exported = replica_client.post(
+                "/api/v8/accounts/export",
+                json={"douyin_authorization_targets": []},
+            )
+            self.assertEqual(exported.status_code, 200)
+            self.assertEqual(
+                exported.headers["content-type"],
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
             blocked = replica_client.post("/api/v8/tasks", json={})
             self.assertEqual(blocked.status_code, 403)
             self.assertEqual(
@@ -2626,9 +2635,117 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         identity = searched.json()["items"][0]["platforms"][0]
         self.assertIsNone(identity["follower_count"])
         self.assertEqual(identity["content_count"], 1)
-        exported = self.client.get("/api/v8/accounts/export")
+        exported = self.client.post(
+            "/api/v8/accounts/export",
+            json={
+                "douyin_authorization_targets": [
+                    {
+                        "account_id": account_id,
+                        "platform_uid": "123456789",
+                        "state": "authorized",
+                    }
+                ]
+            },
+            headers={"Origin": "http://127.0.0.1:4174"},
+        )
         self.assertEqual(exported.status_code, 200)
-        self.assertIn("+86 138-0013-8000", exported.content.decode("utf-8-sig"))
+        self.assertEqual(
+            exported.headers["content-type"],
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        self.assertEqual(exported.headers["cache-control"], "private, no-store")
+        self.assertEqual(exported.headers["x-content-type-options"], "nosniff")
+        self.assertEqual(
+            exported.headers["access-control-expose-headers"], "Content-Disposition"
+        )
+        disposition = exported.headers["content-disposition"]
+        self.assertIn('filename="dcar-accounts.xlsx"', disposition)
+        self.assertRegex(
+            disposition,
+            r"filename\*=UTF-8''%E8%B4%A6%E5%8F%B7%E8%A1%A8%E6%A0%BC_\d{8}_\d{4}\.xlsx",
+        )
+        with zipfile.ZipFile(io.BytesIO(exported.content)) as archive:
+            sheet = archive.read("xl/worksheets/sheet1.xml")
+        values = _xlsx_sheet_values(sheet)
+        flattened = [value for row in values for value in row]
+        self.assertIn("手机号", flattened)
+        self.assertIn("抖音开平授权", flattened)
+        self.assertIn("+86 138-0013-8000", flattened)
+        self.assertIn("已授权", flattened)
+
+        needs_reauthorization = self.client.post(
+            "/api/v8/accounts/export",
+            json={
+                "douyin_authorization_targets": [
+                    {
+                        "account_id": account_id,
+                        "platform_uid": "123456789",
+                        "state": "needs_reauthorization",
+                    }
+                ]
+            },
+        )
+        self.assertEqual(needs_reauthorization.status_code, 200)
+        with zipfile.ZipFile(io.BytesIO(needs_reauthorization.content)) as archive:
+            needs_values = _xlsx_sheet_values(
+                archive.read("xl/worksheets/sheet1.xml")
+            )
+        self.assertIn(
+            "需重新授权", [value for row in needs_values for value in row]
+        )
+
+        degraded = self.client.post("/api/v8/accounts/export", json={})
+        self.assertEqual(degraded.status_code, 200)
+        with zipfile.ZipFile(io.BytesIO(degraded.content)) as archive:
+            degraded_values = _xlsx_sheet_values(
+                archive.read("xl/worksheets/sheet1.xml")
+            )
+        self.assertIn(
+            "状态异常", [value for row in degraded_values for value in row]
+        )
+
+        legacy = self.client.post(
+            "/api/v8/accounts/export",
+            json={"douyin_authorized_account_ids": [account_id]},
+        )
+        self.assertEqual(legacy.status_code, 422)
+
+        invalid_targets = [
+            {
+                "account_id": 0,
+                "platform_uid": "123456789",
+                "state": "authorized",
+            },
+            {
+                "account_id": account_id,
+                "platform_uid": "12345",
+                "state": "authorized",
+            },
+            {
+                "account_id": account_id,
+                "platform_uid": "12345x",
+                "state": "authorized",
+            },
+            {
+                "account_id": account_id,
+                "platform_uid": "123456789",
+                "state": "expired",
+            },
+            {"account_id": account_id, "platform_uid": "123456789"},
+            {
+                "account_id": account_id,
+                "platform_uid": "123456789",
+                "state": "authorized",
+                "unexpected": True,
+            },
+        ]
+        for target in invalid_targets:
+            with self.subTest(target=target):
+                response = self.client.post(
+                    "/api/v8/accounts/export",
+                    json={"douyin_authorization_targets": [target]},
+                )
+                self.assertEqual(response.status_code, 422)
 
     def test_partial_content_patch_preserves_omitted_and_effective_fields(self) -> None:
         captured_at = now_utc()

@@ -8,7 +8,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import AppShell from "../components/AppShell";
 import { Feedback, Loading, Notice } from "../components/Feedback";
 import { Pagination } from "../components/Pagination";
-import { API_BASE, jsonRequest, parseCsv, readJson } from "../lib/api";
+import { apiErrorMessage, apiUrl, jsonRequest, parseCsv, readJson } from "../lib/api";
 import { label, platformKeys } from "../lib/format";
 import { publicAssetPath } from "../lib/paths";
 import { buildAccountSearchRequest, lastPageFor } from "../lib/queryContracts";
@@ -24,6 +24,14 @@ const integerFormat = new Intl.NumberFormat("zh-CN");
 
 function formatIdentityCount(value: number | null | undefined, suffix = "") {
   return value == null ? "—" : `${integerFormat.format(value)}${suffix}`;
+}
+
+function workbookFilename(disposition: string | null) {
+  const encoded = disposition?.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+  if (encoded) {
+    try { return decodeURIComponent(encoded); } catch { /* Fall through to the safe filename. */ }
+  }
+  return "账号表格.xlsx";
 }
 
 function AccountPlatformCells({
@@ -94,6 +102,7 @@ export default function AccountsPage() {
   }, 1, 50));
   const [form, setForm] = useState<AccountForm | null>(null);
   const [saving, setSaving] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [retrying, setRetrying] = useState(false);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
@@ -210,11 +219,53 @@ export default function AccountsPage() {
     finally { setSaving(false); }
   }
 
+  async function exportWorkbook() {
+    setExporting(true); setError(""); setMessage("");
+    try {
+      let authorizationTargets: Array<{ account_id: number; platform_uid: string; state: "authorized" | "needs_reauthorization" }> | null = null;
+      try {
+        const statuses = await queryClient.fetchQuery(douyinAuthorizationStatusesQueryOptions());
+        authorizationTargets = statuses.items
+          .filter((item) => item.status === "active" && item.account_id != null && item.platform_uid != null)
+          .map((item) => ({
+            account_id: item.account_id as number,
+            platform_uid: item.platform_uid as string,
+            state: item.authorized ? "authorized" as const : "needs_reauthorization" as const,
+          }));
+      } catch {
+        authorizationTargets = null;
+      }
+      let response: Response;
+      try {
+        response = await fetch(apiUrl("/api/v8/accounts/export"), jsonRequest({ douyin_authorization_targets: authorizationTargets }));
+      } catch {
+        throw new Error("无法连接数据服务，请检查网络或稍后重试。");
+      }
+      if (!response.ok) {
+        const body = (await response.json().catch(() => null)) as { detail?: unknown } | null;
+        throw new Error(apiErrorMessage(body?.detail, response.status));
+      }
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = workbookFilename(response.headers.get("Content-Disposition"));
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "账号表格导出失败，请稍后重试。");
+    } finally {
+      setExporting(false);
+    }
+  }
+
   return <AppShell active="accounts">
     <Feedback error={error} message={message} onClose={() => { setError(""); setMessage(""); }} />
     {accountsQuery.isError && <Notice tone="error">{accountsQuery.data ? `数据刷新失败，当前显示上次数据。${accountsQuery.error instanceof Error ? accountsQuery.error.message : ""}` : accountsQuery.error instanceof Error ? accountsQuery.error.message : "账号读取失败"}</Notice>}
     {accountsQuery.isPending && !accountsQuery.data && !accountsReadFailed ? <Loading label="正在读取账号库" /> : <section className="page-stack wide-stack">
-      <div className="detail-toolbar"><div><span className="eyebrow">手机号是唯一账号标识</span><h2>账号信息</h2><p>每个手机号对应一个账号；还没采集到粉丝量时显示“—”。</p></div><div className="placeholder-actions"><button className="primary small" onClick={() => edit()}>新增账号</button><Link className="secondary button-link" href="/accounts/douyin-authorization">抖音授权管理</Link><a className="secondary button-link" href={`${API_BASE}/api/v8/accounts/export`}>下载账号表格</a><label className="secondary button-link">批量导入<input className="file-input" type="file" accept=".csv,text/csv" disabled={saving} onChange={(event) => { const file = event.target.files?.[0]; if (file) void importCsv(file); event.currentTarget.value = ""; }} /></label></div></div>
+      <div className="detail-toolbar"><div><span className="eyebrow">手机号是唯一账号标识</span><h2>账号信息</h2><p>每个手机号对应一个账号；还没采集到粉丝量时显示“—”。</p></div><div className="placeholder-actions"><button className="primary small" onClick={() => edit()}>新增账号</button><Link className="secondary button-link" href="/accounts/douyin-authorization">抖音授权管理</Link><button className="secondary button-link" disabled={exporting} onClick={() => void exportWorkbook()}>{exporting ? "正在导出…" : "下载账号表格"}</button><label className="secondary button-link">批量导入<input className="file-input" type="file" accept=".csv,text/csv" disabled={saving} onChange={(event) => { const file = event.target.files?.[0]; if (file) void importCsv(file); event.currentTarget.value = ""; }} /></label></div></div>
       <div className="filter-bar"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="手机号、运营人员、平台账号编号、昵称" onKeyDown={(event) => { if (event.key === "Enter") applySearch({ page: 1 }); }} /><select value={accountType} onChange={(event) => { setAccountType(event.target.value); applySearch({ accountType: event.target.value, page: 1 }); }}><option value="">全部账号类型</option><option value="boutique_ip">精品 IP</option><option value="original">原创</option><option value="mixed_edit">混剪</option><option value="unknown">未知</option></select><select value={direction} onChange={(event) => { setDirection(event.target.value); applySearch({ direction: event.target.value, page: 1 }); }}><option value="">全部内容方向</option><option value="new_car">新车</option><option value="used_car">二手车</option><option value="media">媒体</option><option value="other">其他</option><option value="unknown">未知</option></select><select value={platform} onChange={(event) => { setPlatform(event.target.value); applySearch({ platform: event.target.value, page: 1 }); }}><option value="">全部平台</option>{platformKeys.map((key) => <option key={key} value={key}>{label(key)}</option>)}</select><button className="secondary" onClick={() => applySearch({ page: 1 })}>搜索</button><span>{accountsReadFailed ? "读取失败" : `${total} 个账号`}</span></div>
       <article className="panel table-panel account-master-panel">
         {!accountsReadFailed && accountsQuery.data && <Pagination page={appliedRequest.page} pageSize={appliedRequest.page_size} total={total} busy={accountsQuery.isFetching || saving} ariaLabel="账号分页" unitLabel="个账号" placement="top" onChange={(next) => applySearch({ page: next.page, pageSize: next.pageSize })} />}

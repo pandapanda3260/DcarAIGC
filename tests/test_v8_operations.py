@@ -4,12 +4,14 @@ import csv
 import io
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 from v8.operations import (
     CONTENT_CHILD_MERGE_POLICIES,
     IdentityConflictError,
     OperationError,
+    export_accounts_xlsx,
     export_contents_csv,
     import_accounts,
     import_contents,
@@ -358,6 +360,145 @@ class V8OperationsTest(unittest.TestCase):
         self.assertEqual(account["enabled"], 1)
         self.assertEqual(identity["platform"], "xiaohongshu")
         self.assertEqual(identity["uid"], "5c668b3e0000000012021605")
+
+    def test_account_workbook_exports_frontend_labels_and_text_ids(self) -> None:
+        import_accounts(
+            [
+                {
+                    "phone": "13900139000",
+                    "operator_name": "运营乙",
+                    "account_type": "mixed_edit",
+                    "content_direction": "used_car",
+                    "enabled": "1",
+                    "douyin_uid": "7626610000000000000",
+                    "douyin_nickname": "车圈大土豆",
+                    "douyin_real_name_status": "unknown",
+                },
+                {
+                    "phone": "13800138000",
+                    "operator_name": "",
+                    "account_type": "boutique_ip",
+                    "content_direction": "new_car",
+                    "enabled": "停用",
+                    "xiaohongshu_uid": "5c668b3e0000000012021605",
+                    "xiaohongshu_nickname": "二手车号",
+                    "xiaohongshu_real_name_status": "yes",
+                },
+            ],
+            source_name="workbook-fixture.csv",
+            db_path=self.db,
+        )
+        with connect(self.db) as connection:
+            douyin_account_id = int(
+                connection.execute(
+                    "SELECT id FROM accounts WHERE phone='13900139000'"
+                ).fetchone()["id"]
+            )
+        workbook = export_accounts_xlsx(
+            douyin_authorization_targets=[
+                (douyin_account_id, "7626610000000000000", "authorized")
+            ],
+            db_path=self.db,
+        )
+        with zipfile.ZipFile(io.BytesIO(workbook)) as archive:
+            sheet = archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
+            workbook_xml = archive.read("xl/workbook.xml").decode("utf-8")
+        self.assertIn('name="账号信息"', workbook_xml)
+        # 两行表头：分组行（页面同款分组）+ 与页面表格一致的中文列名。
+        for header in (
+            "账号基础信息",
+            "抖音",
+            "小红书",
+            "视频号",
+            "快手",
+            "账号管理",
+            "手机号",
+            "运营人员",
+            "账号类型",
+            "内容方向",
+            "平台账号编号",
+            "是否实名",
+            "抖音开平授权",
+            "昵称",
+            "粉丝量",
+            "关联内容量",
+            "状态",
+        ):
+            self.assertIn(f">{header}</t>", sheet)
+        # 单元格取值与页面展示口径一致：中文枚举、未填写/未绑定/「—」兜底。
+        self.assertIn(">混剪</t>", sheet)
+        self.assertIn(">二手车</t>", sheet)
+        self.assertIn(">精品 IP</t>", sheet)
+        self.assertIn(">已授权</t>", sheet)
+        self.assertIn(">未授权</t>", sheet)
+        self.assertIn(">未绑定</t>", sheet)
+        self.assertIn(">未填写</t>", sheet)
+        self.assertIn(">运营中</t>", sheet)
+        self.assertIn(">停用</t>", sheet)
+        self.assertIn(">—</t>", sheet)
+        self.assertNotIn("mixed_edit", sheet)
+        self.assertNotIn("unknown", sheet)
+        # 长编号写成文本单元格（quotePrefix 文本样式），Excel 打开不会变科学计数法。
+        self.assertIn('s="12" t="inlineStr"', sheet)
+        self.assertIn(">7626610000000000000</t>", sheet)
+        # 分组行做了合并单元格；前 4 列 + 两行表头冻结。
+        self.assertIn('<mergeCell ref="A1:D1"/>', sheet)
+        self.assertIn('xSplit="4" ySplit="2"', sheet)
+        self.assertIn('s="14"', sheet)
+
+        wrong_uid = export_accounts_xlsx(
+            douyin_authorization_targets=[
+                (douyin_account_id, "7626610000000000001", "authorized")
+            ],
+            db_path=self.db,
+        )
+        with zipfile.ZipFile(io.BytesIO(wrong_uid)) as archive:
+            wrong_uid_sheet = archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        self.assertNotIn("已授权", wrong_uid_sheet)
+        self.assertIn("未授权", wrong_uid_sheet)
+
+        unavailable = export_accounts_xlsx(
+            douyin_authorization_targets=None, db_path=self.db
+        )
+        with zipfile.ZipFile(io.BytesIO(unavailable)) as archive:
+            unavailable_sheet = archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        self.assertIn("状态异常", unavailable_sheet)
+        self.assertNotIn("已授权", unavailable_sheet)
+
+        known_empty = export_accounts_xlsx(
+            douyin_authorization_targets=[], db_path=self.db
+        )
+        with zipfile.ZipFile(io.BytesIO(known_empty)) as archive:
+            known_empty_sheet = archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        self.assertNotIn("状态异常", known_empty_sheet)
+        self.assertNotIn("已授权", known_empty_sheet)
+        self.assertIn("未授权", known_empty_sheet)
+
+        reauthorization = export_accounts_xlsx(
+            douyin_authorization_targets=[
+                (douyin_account_id, "7626610000000000000", "authorized"),
+                (
+                    douyin_account_id,
+                    "7626610000000000000",
+                    "needs_reauthorization",
+                ),
+            ],
+            db_path=self.db,
+        )
+        with zipfile.ZipFile(io.BytesIO(reauthorization)) as archive:
+            reauthorization_sheet = archive.read(
+                "xl/worksheets/sheet1.xml"
+            ).decode("utf-8")
+        self.assertIn("需重新授权", reauthorization_sheet)
+        self.assertNotIn(">已授权</t>", reauthorization_sheet)
+
+        with self.assertRaisesRegex(ValueError, "unsupported Douyin"):
+            export_accounts_xlsx(
+                douyin_authorization_targets=[
+                    (douyin_account_id, "7626610000000000000", "unknown")
+                ],
+                db_path=self.db,
+            )
 
     def test_douyin_and_xhs_require_platform_ids_but_other_platforms_allow_url_fallback(
         self,
