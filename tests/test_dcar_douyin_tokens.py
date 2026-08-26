@@ -224,25 +224,15 @@ class DouyinTokenManagerTest(unittest.IsolatedAsyncioTestCase):
             now=NOW + 1,
         )
         fingerprint = self.cipher.open_id_fingerprint("open-id")
-        store.store_candidate(
-            state_digest=state_digest,
-            ciphertext=self.cipher.encrypt(
-                state_digest, "oauth_candidate", candidate
-            ),
-            open_id_fingerprint=fingerprint,
-            confirmation_expires_at=NOW + 300,
-            request_id="callback",
-            now=NOW + 2,
-        )
-        created = store.confirm_authorization(
+        created = store.complete_targeted_authorization(
             state_digest=state_digest,
             bound_username="operator",
             session_binding="a" * 64,
             open_id_fingerprint=fingerprint,
             candidate=candidate,
             cipher=self.cipher,
-            request_id="confirm",
-            now=NOW + 3,
+            request_id="targeted-complete",
+            now=NOW + 2,
         )
         manager = DouyinTokenManager(
             store, self.cipher, FakeProvider(), clock=lambda: NOW + 4  # type: ignore[arg-type]

@@ -1184,6 +1184,233 @@ class VaultStore:
             raise RuntimeError("authorization confirmation produced no result")
         return result
 
+    def complete_targeted_authorization(
+        self,
+        *,
+        state_digest: str,
+        bound_username: str,
+        session_binding: str,
+        open_id_fingerprint: str,
+        candidate: Mapping[str, Any],
+        cipher: "TokenCipher",
+        request_id: str,
+        now: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Complete an OAuth exchange against the account locked into its state."""
+        timestamp = int(time.time()) if now is None else now
+        conflict_reason: Optional[str] = None
+        result: Optional[dict[str, Any]] = None
+        with self.write_connection() as connection:
+            self._expire_states(connection, timestamp)
+            state = connection.execute(
+                """
+                SELECT * FROM oauth_states
+                WHERE state_digest=? AND bound_username=? AND session_binding=?
+                  AND status='exchanging' AND expires_at>?
+                """,
+                (state_digest, bound_username, session_binding, timestamp),
+            ).fetchone()
+            if state is None:
+                raise StateTransitionError("oauth_exchange_unavailable")
+            if state["account_id"] is None or state["platform_uid"] is None:
+                raise StateTransitionError("oauth_target_missing")
+
+            account_id = int(state["account_id"])
+            platform_uid = str(state["platform_uid"])
+            open_id = str(candidate["open_id"])
+            if not hmac.compare_digest(
+                cipher.open_id_fingerprint(open_id), open_id_fingerprint
+            ):
+                raise StateTransitionError("oauth_candidate_identity_changed")
+
+            requested_scopes = json.loads(str(state["requested_scopes_json"]))
+            candidate_scopes = candidate.get("scopes")
+            if not isinstance(requested_scopes, list) or any(
+                not isinstance(scope, str) for scope in requested_scopes
+            ):
+                raise RuntimeError("oauth state requested scopes are invalid")
+            granted_scopes = (
+                {str(scope) for scope in candidate_scopes}
+                if isinstance(candidate_scopes, list)
+                else set()
+            )
+            if not set(requested_scopes).issubset(granted_scopes):
+                conflict_reason = "oauth_scope_incomplete"
+
+            existing = connection.execute(
+                "SELECT * FROM douyin_authorizations WHERE open_id_fingerprint=?",
+                (open_id_fingerprint,),
+            ).fetchone()
+            target_authorization_id = state["target_authorization_id"]
+            target_authorization_version = state["target_authorization_version"]
+
+            if conflict_reason is None and target_authorization_id is not None:
+                if (
+                    existing is None
+                    or not hmac.compare_digest(
+                        str(existing["id"]), str(target_authorization_id)
+                    )
+                    or str(existing["status"]) != "active"
+                ):
+                    conflict_reason = "reauthorization_target_mismatch"
+                elif int(existing["version"]) != int(target_authorization_version):
+                    conflict_reason = "reauthorization_version_conflict"
+                elif str(existing["platform_uid"]) != platform_uid:
+                    conflict_reason = "open_id_rebind_conflict"
+                elif int(existing["account_id"]) != account_id:
+                    conflict_reason = "target_changed"
+            elif conflict_reason is None and existing is not None:
+                if str(existing["status"]) == "active":
+                    if str(existing["platform_uid"]) != platform_uid:
+                        conflict_reason = "open_id_rebind_conflict"
+                    elif int(existing["account_id"]) != account_id:
+                        conflict_reason = "target_changed"
+
+            if conflict_reason is None:
+                occupied = connection.execute(
+                    """
+                    SELECT id FROM douyin_authorizations
+                    WHERE platform_uid=?
+                      AND status IN ('active','pending_match')
+                      AND open_id_fingerprint<>?
+                    LIMIT 1
+                    """,
+                    (platform_uid, open_id_fingerprint),
+                ).fetchone()
+                if occupied is not None:
+                    conflict_reason = "account_binding_conflict"
+
+            if conflict_reason is not None:
+                connection.execute(
+                    """
+                    UPDATE oauth_states
+                    SET status='failed',failure_reason=?,candidate_ciphertext=NULL,
+                        candidate_open_id_fingerprint=NULL,updated_at=?
+                    WHERE state_digest=?
+                    """,
+                    (conflict_reason, timestamp, state_digest),
+                )
+                self._audit(
+                    connection,
+                    actor=bound_username,
+                    action="authorization_targeted_complete",
+                    result="failed",
+                    reason_code=conflict_reason,
+                    subject_fingerprint=open_id_fingerprint,
+                    request_id=request_id,
+                    now=timestamp,
+                )
+            else:
+                authorization_id = (
+                    uuid.uuid4().hex if existing is None else str(existing["id"])
+                )
+                access_token_ciphertext = cipher.encrypt(
+                    authorization_id,
+                    "access",
+                    {"open_id": open_id, "token": str(candidate["access_token"])},
+                )
+                refresh_token_ciphertext = cipher.encrypt(
+                    authorization_id,
+                    "refresh",
+                    {"open_id": open_id, "token": str(candidate["refresh_token"])},
+                )
+                scopes_json = json.dumps(
+                    [str(scope) for scope in candidate["scopes"]],
+                    separators=(",", ":"),
+                )
+                values = (
+                    access_token_ciphertext,
+                    refresh_token_ciphertext,
+                    int(candidate["access_expires_at"]),
+                    int(candidate["refresh_expires_at"]),
+                    scopes_json,
+                    cipher.key_version,
+                )
+                if existing is None:
+                    version = 1
+                    connection.execute(
+                        """
+                        INSERT INTO douyin_authorizations(
+                            id,open_id_fingerprint,bound_username,account_id,
+                            platform_uid,access_token_ciphertext,
+                            refresh_token_ciphertext,access_expires_at,
+                            refresh_expires_at,renew_count,scopes_json,key_version,
+                            version,refresh_lease_owner,refresh_lease_expires_at,
+                            needs_reauthorization,status,match_reason,created_at,
+                            updated_at,last_authorized_at,unbound_at
+                        ) VALUES(?,?,?,?,?,?,?,?,?,0,?,?,1,NULL,NULL,0,
+                                 'active',NULL,?,?,?,NULL)
+                        """,
+                        (
+                            authorization_id,
+                            open_id_fingerprint,
+                            bound_username,
+                            account_id,
+                            platform_uid,
+                            *values,
+                            timestamp,
+                            timestamp,
+                            timestamp,
+                        ),
+                    )
+                else:
+                    version = int(existing["version"]) + 1
+                    connection.execute(
+                        """
+                        UPDATE douyin_authorizations
+                        SET bound_username=?,account_id=?,platform_uid=?,
+                            access_token_ciphertext=?,refresh_token_ciphertext=?,
+                            access_expires_at=?,refresh_expires_at=?,renew_count=0,
+                            scopes_json=?,key_version=?,version=?,
+                            refresh_lease_owner=NULL,refresh_lease_expires_at=NULL,
+                            needs_reauthorization=0,status='active',match_reason=NULL,
+                            updated_at=?,last_authorized_at=?,unbound_at=NULL
+                        WHERE id=?
+                        """,
+                        (
+                            bound_username,
+                            account_id,
+                            platform_uid,
+                            *values,
+                            version,
+                            timestamp,
+                            timestamp,
+                            authorization_id,
+                        ),
+                    )
+                connection.execute(
+                    """
+                    UPDATE oauth_states
+                    SET status='completed',candidate_ciphertext=NULL,
+                        candidate_open_id_fingerprint=NULL,failure_reason=NULL,
+                        updated_at=?
+                    WHERE state_digest=?
+                    """,
+                    (timestamp, state_digest),
+                )
+                self._audit(
+                    connection,
+                    actor=bound_username,
+                    action="authorization_targeted_complete",
+                    result="completed",
+                    reason_code="ok",
+                    subject_fingerprint=open_id_fingerprint,
+                    request_id=request_id,
+                    now=timestamp,
+                )
+                result = {
+                    "id": authorization_id,
+                    "status": "active",
+                    "account_id": account_id,
+                    "platform_uid": platform_uid,
+                    "version": version,
+                }
+        if conflict_reason is not None:
+            raise AuthorizationConflict(conflict_reason)
+        if result is None:
+            raise RuntimeError("targeted authorization produced no result")
+        return result
+
     def stage_authorization_candidate(
         self,
         *,
@@ -2258,8 +2485,9 @@ class VaultStore:
         with self.write_connection() as connection:
             row = connection.execute(
                 """
-                SELECT id,open_id_fingerprint,version FROM douyin_authorizations
-                WHERE id=? AND status='active'
+                SELECT id,open_id_fingerprint,version,status
+                FROM douyin_authorizations
+                WHERE id=? AND status IN ('active','pending_match')
                 """,
                 (authorization_id,),
             ).fetchone()
@@ -2283,7 +2511,11 @@ class VaultStore:
                 actor=actor,
                 action="authorization_unbind",
                 result="unbound",
-                reason_code="operator_unbound",
+                reason_code=(
+                    "operator_invalidated_pending_match"
+                    if str(row["status"]) == "pending_match"
+                    else "operator_unbound"
+                ),
                 subject_fingerprint=str(row["open_id_fingerprint"]),
                 request_id=request_id,
                 now=timestamp,
