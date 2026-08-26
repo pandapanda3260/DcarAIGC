@@ -183,6 +183,8 @@ test("douyin authorization management locks every scan to the selected business 
   assert.match(source, /window\.opener\.postMessage\(CALLBACK_MESSAGE, window\.location\.origin\)/);
   assert.doesNotMatch(source, /postMessage\([^\n]+,\s*["']\*["']/);
   assert.match(source, /const noticeCopy: Record/);
+  assert.match(source, /"oauth-target-unavailable"[\s\S]*当前业务账号已停用、抖音账号编号已变化或账号目录暂时不可用/);
+  assert.match(source, /"oauth-conflict"[\s\S]*扫码账号与当前业务账号原有授权不一致/);
   assert.match(source, /const callbackNotice = noticeCopy\[notice\] \?\? null/);
   assert.match(source, /const queryError = sessionQuery\.isError[\s\S]*authorizationsQuery\.isError[\s\S]*statusesQuery\.isError/);
   assert.match(source, /\{queryError && <Notice tone="error">\{queryError\}<\/Notice>\}/);

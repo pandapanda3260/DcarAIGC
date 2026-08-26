@@ -509,7 +509,7 @@ def create_app(
                     now=int(clock()),
                 )
             return RedirectResponse(
-                authorization_page("oauth-conflict"), status_code=303
+                authorization_page("oauth-target-unavailable"), status_code=303
             )
 
         def targeted_page(notice: str) -> str:
@@ -535,7 +535,7 @@ def create_app(
                     now=int(clock()),
                 )
             return RedirectResponse(
-                targeted_page("oauth-conflict"), status_code=303
+                targeted_page("oauth-target-unavailable"), status_code=303
             )
         try:
             provider = request.app.state.provider

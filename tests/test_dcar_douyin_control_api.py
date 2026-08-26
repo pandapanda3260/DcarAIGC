@@ -820,6 +820,45 @@ class DouyinControlApiTestCase(unittest.TestCase):
             )
             self.assertEqual(state.token_calls, 0)
 
+    def test_callback_target_revalidation_failure_has_distinct_notice(self) -> None:
+        with self._clients("", vault_namespace="target-unavailable") as (
+            control,
+            provider,
+            accounts,
+            state,
+        ):
+            start = control.post(
+                "/api/douyin/oauth/start",
+                headers=self._headers("douyin-oauth-start"),
+                json={"account_id": 7, "platform_uid": PLATFORM_UID},
+            )
+            self.assertEqual(start.status_code, 200, start.text)
+            authorized = provider.get(start.json()["authorize_url"])
+            callback_target = self._upstream_target(
+                authorized.headers["location"], ""
+            )
+            accounts.account_enabled = False
+
+            callback = control.get(
+                callback_target,
+                headers=self._headers(),
+                follow_redirects=False,
+            )
+
+            self.assertEqual(callback.status_code, 303)
+            self._assert_authorization_location(
+                callback.headers["location"], "", "oauth-target-unavailable"
+            )
+            self.assertEqual(state.token_calls, 0)
+            self.assertEqual(state.userinfo_calls, 0)
+            store = cast(FastAPI, control.app).state.store
+            with store.read_connection() as connection:
+                failed = connection.execute(
+                    "SELECT status,failure_reason FROM oauth_states"
+                ).fetchone()
+            self.assertEqual(failed["status"], "failed")
+            self.assertEqual(failed["failure_reason"], "oauth_target_unavailable")
+
     def test_mock_oauth_activates_locked_target_replays_safely_and_unbinds(
         self,
     ) -> None:

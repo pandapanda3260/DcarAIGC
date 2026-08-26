@@ -18,6 +18,7 @@ const noticeCopy: Record<string, { tone: "error" | "success"; text: string }> = 
   "oauth-disabled": { tone: "error", text: "抖音授权功能尚未启用。" },
   "oauth-invalid-response": { tone: "error", text: "抖音没有返回完整的授权结果，请重新扫码。" },
   "oauth-state-invalid": { tone: "error", text: "本次授权已失效，请重新扫码。" },
+  "oauth-target-unavailable": { tone: "error", text: "当前业务账号已停用、抖音账号编号已变化或账号目录暂时不可用，请返回账号页确认后重新发起授权。" },
   "oauth-conflict": { tone: "error", text: "扫码账号与当前业务账号原有授权不一致，原授权未被覆盖。" },
   "oauth-failed": { tone: "error", text: "抖音授权没有完成，请稍后重试。" },
 };

@@ -246,6 +246,8 @@ state 原文和 code 永不入库、日志或审计。过期 pending 由定时�
   Token/到期/scopes，`version += 1`，`renew_count = 0`。
 - 相同 open_id + 不同目标：返回换绑冲突，旧 active 不变。
 - 不同 open_id + 已占用目标：返回占用冲突，旧 active 不变。
+- callback 换 Token 前必须重新验证目标账号；账号停用、uid 变化或账号目录不可用时返回
+  `oauth-target-unavailable`，不得复用账号占用类 `oauth-conflict`，也不得调用 Token 接口。
 - 只有显式 unbind 成功后，才允许绑定到新目标。
 - reauthorize 必须把 authorization id 与 expected version 一并写入 state；callback 只允许
   更新同一 active row、相同 account id/uid 和相同版本，不能借重新授权换绑。

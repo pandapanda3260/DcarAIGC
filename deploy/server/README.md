@@ -119,10 +119,10 @@ The control unit uses the explicit
 `DCAR_DOUYIN_PROXY_URL=http://127.0.0.1:4176` contract. Provider code must use
 that value explicitly with ambient proxy discovery disabled; it must never
 fall back to a direct connection when the proxy is unavailable. The base unit
-loads the optional root-owned `/etc/dcar-aigc/douyin-stage1.env`; it does not
-duplicate either gate with `Environment=` because systemd's directly configured
-values would override the environment file. With the file absent, application
-defaults remain `DOUYIN_AUTHORIZATION_ENABLED=0` and
+loads the optional root-owned `/etc/dcar-aigc/douyin-stage1.env`. Each gate is
+defined in only one place so the file is the single operational source of truth;
+do not duplicate the same variables with `Environment=` in the unit. With the
+file absent, application defaults remain `DOUYIN_AUTHORIZATION_ENABLED=0` and
 `DCAR_DOUYIN_PROVIDER=disabled`, so installing the proxy alone cannot enable a
 real authorization or provider call.
 
@@ -417,6 +417,15 @@ logging, raises error logging to `crit`, rate-limits GET, and never bypasses the
 gateway. The existing htpasswd file remains the account source, but browser HTTP
 Basic authentication is no longer used. See `AUTH.md` for the complete login,
 logout and acceptance contract.
+
+## Douyin authorization operations
+
+Each new scan must start from the exact business-account row. If the callback
+reports an authorization conflict, first open the Douyin authorization
+management page and check for a historical `pending_match` record occupying the
+same Douyin uid. Invalidate that historical record, return to the intended
+account row, and start a fresh scan. Never bypass the conflict or reassign the
+record directly in SQLite.
 
 ## Douyin Vault backup
 
