@@ -7,6 +7,7 @@ import secrets
 import time
 from contextlib import asynccontextmanager, suppress
 from typing import Any, Callable, Optional
+from urllib.parse import urlencode
 
 import httpx
 from fastapi import FastAPI, Request
@@ -32,33 +33,17 @@ from .tokens import (
 
 REQUESTED_SCOPES = ["user_info", "video.list"]
 POST_ACTIONS = {
-    "/api/douyin/accounts/search": "douyin-accounts-search",
     "/api/douyin/oauth/start": "douyin-oauth-start",
-    "/api/douyin/authorizations/match": "douyin-authorization-match",
     "/api/douyin/authorizations/reauthorize": "douyin-authorization-reauthorize",
     "/api/douyin/authorizations/unbind": "douyin-authorization-unbind",
 }
 
 
-class AccountSearchPayload(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    query: str = Field(default="", max_length=100)
-    page: int = Field(default=1, ge=1)
-    page_size: int = Field(default=50, ge=1, le=50)
-
-
 class OAuthStartPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-
-class AuthorizationMatchPayload(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    authorization_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     account_id: int = Field(ge=1)
     platform_uid: str = Field(pattern=r"^\d{6,24}$")
-    expected_version: int = Field(ge=1)
 
 
 class ReauthorizePayload(BaseModel):
@@ -198,45 +183,6 @@ class AccountDirectory:
             if page > 1000:
                 raise RuntimeError("account_directory_invalid")
         raise RuntimeError("account_identity_unavailable")
-
-    async def resolve_douyin_videos(self, video_ids: list[str]) -> dict[str, Any]:
-        try:
-            response = await self.client.post(
-                f"{self.api_upstream}/api/v8/accounts/resolve-douyin-videos",
-                json={"video_ids": video_ids},
-            )
-            response.raise_for_status()
-            payload = response.json()
-        except (httpx.HTTPError, ValueError) as exc:
-            raise RuntimeError("account_resolver_unavailable") from exc
-        if not isinstance(payload, dict) or payload.get("status") not in {
-            "matched",
-            "unmatched",
-            "ambiguous",
-        }:
-            raise RuntimeError("account_resolver_invalid")
-        if payload["status"] == "matched":
-            matched = payload.get("matched_account")
-            if not isinstance(matched, dict):
-                raise RuntimeError("account_resolver_invalid")
-            try:
-                account_id = int(matched["account_id"])
-                platform_uid = str(matched["platform_uid"])
-            except (KeyError, TypeError, ValueError) as exc:
-                raise RuntimeError("account_resolver_invalid") from exc
-            if account_id < 1 or not (
-                6 <= len(platform_uid) <= 24
-                and platform_uid.isascii()
-                and platform_uid.isdigit()
-            ):
-                raise RuntimeError("account_resolver_invalid")
-            return {
-                "status": "matched",
-                "account_id": account_id,
-                "platform_uid": platform_uid,
-            }
-        return {"status": str(payload["status"])}
-
 
 def create_app(
     config: Optional[DouyinControlConfig] = None,
@@ -430,20 +376,43 @@ def create_app(
             )
         return JSONResponse(page.as_dict())
 
-    def authorization_page(notice: str = "") -> str:
+    def authorization_page(
+        notice: str = "",
+        *,
+        account_id: int | None = None,
+        platform_uid: str | None = None,
+    ) -> str:
         target = resolved.public_route("/accounts/douyin-authorization")
+        query: dict[str, str] = {}
+        if account_id is not None and platform_uid is not None:
+            query["account_id"] = str(account_id)
+            query["platform_uid"] = platform_uid
         if notice:
-            return f"{target}?notice={notice}"
-        return target
+            query["notice"] = notice
+        return f"{target}?{urlencode(query)}" if query else target
 
     async def start_authorization(
         request: Request,
         *,
+        account_id: int,
+        platform_uid: str,
         target_authorization_id: str | None = None,
         target_authorization_version: int | None = None,
     ) -> Response:
         if not resolved.authorization_enabled:
             return JSONResponse({"detail": "抖音授权功能尚未启用"}, status_code=409)
+        provider: Optional[MockOAuthClient | DouyinOAuthClient] = (
+            request.app.state.provider
+        )
+        if provider is None:
+            return JSONResponse({"detail": "抖音授权功能尚未启用"}, status_code=409)
+        try:
+            await request.app.state.accounts.require_account(
+                account_id=account_id,
+                platform_uid=platform_uid,
+            )
+        except RuntimeError:
+            return JSONResponse({"detail": "目标抖音账号已失效"}, status_code=409)
         username, session_binding = _identity(request)
         state = secrets.token_urlsafe(32)
         state_digest = hashlib.sha256(state.encode("utf-8")).hexdigest()
@@ -454,6 +423,8 @@ def create_app(
                 state_digest=state_digest,
                 bound_username=username,
                 session_binding=session_binding,
+                account_id=account_id,
+                platform_uid=platform_uid,
                 scopes=REQUESTED_SCOPES,
                 expires_at=now + resolved.state_ttl_seconds,
                 request_id=_request_id(request),
@@ -465,11 +436,6 @@ def create_app(
             return JSONResponse(
                 {"detail": "已有抖音授权流程正在处理中"}, status_code=409
             )
-        provider: Optional[MockOAuthClient | DouyinOAuthClient] = (
-            request.app.state.provider
-        )
-        if provider is None:
-            return JSONResponse({"detail": "抖音授权功能尚未启用"}, status_code=409)
         return JSONResponse(
             {"authorize_url": provider.authorization_url(state, REQUESTED_SCOPES)}
         )
@@ -478,31 +444,13 @@ def create_app(
     async def index() -> RedirectResponse:
         return RedirectResponse(authorization_page(), status_code=303)
 
-    @application.post("/api/douyin/accounts/search")
-    async def account_search(
-        request: Request, payload: AccountSearchPayload
-    ) -> Response:
-        if request.url.query:
-            return JSONResponse(
-                {"detail": "账号搜索条件必须放在 JSON 请求体中"}, status_code=422
-            )
-        try:
-            return JSONResponse(
-                await request.app.state.accounts.search(
-                    query=payload.query,
-                    page=payload.page,
-                    page_size=payload.page_size,
-                )
-            )
-        except RuntimeError:
-            return JSONResponse(
-                {"detail": "账号目录暂时不可用，请稍后重试"}, status_code=502
-            )
-
     @application.post("/api/douyin/oauth/start")
     async def oauth_start(request: Request, payload: OAuthStartPayload) -> Response:
-        del payload
-        return await start_authorization(request)
+        return await start_authorization(
+            request,
+            account_id=payload.account_id,
+            platform_uid=payload.platform_uid,
+        )
 
     @application.get("/oauth/douyin/callback")
     async def oauth_callback(
@@ -529,7 +477,7 @@ def create_app(
         request_id = _request_id(request)
         state_digest = hashlib.sha256(state.encode("utf-8")).hexdigest()
         try:
-            await asyncio.to_thread(
+            exchange_state = await asyncio.to_thread(
                 request.app.state.store.begin_exchange,
                 state_digest,
                 username,
@@ -546,6 +494,48 @@ def create_app(
             return RedirectResponse(
                 authorization_page("oauth-failed"),
                 status_code=303,
+            )
+        try:
+            account_id = int(exchange_state["account_id"])
+            platform_uid = str(exchange_state["platform_uid"])
+        except (KeyError, TypeError, ValueError):
+            with suppress(Exception):
+                await asyncio.to_thread(
+                    request.app.state.store.fail_state,
+                    state_digest,
+                    "oauth_target_unavailable",
+                    request_id=request_id,
+                    actor=username,
+                    now=int(clock()),
+                )
+            return RedirectResponse(
+                authorization_page("oauth-conflict"), status_code=303
+            )
+
+        def targeted_page(notice: str) -> str:
+            return authorization_page(
+                notice,
+                account_id=account_id,
+                platform_uid=platform_uid,
+            )
+
+        try:
+            await request.app.state.accounts.require_account(
+                account_id=account_id,
+                platform_uid=platform_uid,
+            )
+        except (KeyError, TypeError, ValueError, RuntimeError):
+            with suppress(Exception):
+                await asyncio.to_thread(
+                    request.app.state.store.fail_state,
+                    state_digest,
+                    "oauth_target_unavailable",
+                    request_id=request_id,
+                    actor=username,
+                    now=int(clock()),
+                )
+            return RedirectResponse(
+                targeted_page("oauth-conflict"), status_code=303
             )
         try:
             provider = request.app.state.provider
@@ -569,8 +559,8 @@ def create_app(
                 "nickname": str(profile.get("nickname") or ""),
                 "avatar": str(profile.get("avatar") or ""),
             }
-            staged = await asyncio.to_thread(
-                request.app.state.store.stage_authorization_candidate,
+            await asyncio.to_thread(
+                request.app.state.store.complete_targeted_authorization,
                 state_digest=state_digest,
                 bound_username=username,
                 session_binding=session_binding,
@@ -580,60 +570,9 @@ def create_app(
                 request_id=request_id,
                 now=int(clock()),
             )
-            if not bool(staged["already_active"]):
-                outcome = "unavailable"
-                matched_account_id: int | None = None
-                matched_platform_uid: str | None = None
-                try:
-                    page = await provider.video_list_page(
-                        access_token=bundle.access_token,
-                        open_id=bundle.open_id,
-                        cursor=0,
-                        count=20,
-                    )
-                    video_ids = [
-                        str(item["video_id"])
-                        for item in page.items
-                        if isinstance(item, dict) and item.get("video_id")
-                    ]
-                    if video_ids:
-                        resolved_match = (
-                            await request.app.state.accounts.resolve_douyin_videos(
-                                video_ids
-                            )
-                        )
-                        outcome = str(resolved_match["status"])
-                        if outcome == "matched":
-                            matched_account_id = int(resolved_match["account_id"])
-                            matched_platform_uid = str(resolved_match["platform_uid"])
-                    else:
-                        outcome = "unmatched"
-                except (DouyinProviderError, RuntimeError, TypeError, ValueError):
-                    outcome = "unavailable"
-                await asyncio.to_thread(
-                    request.app.state.store.finalize_auto_match,
-                    state_digest=state_digest,
-                    authorization_id=str(staged["id"]),
-                    expected_version=int(staged["version"]),
-                    outcome=outcome,
-                    actor=username,
-                    request_id=request_id,
-                    account_id=matched_account_id,
-                    platform_uid=matched_platform_uid,
-                    now=int(clock()),
-                )
-        except AuthorizationConflict as exc:
-            with suppress(Exception):
-                await asyncio.to_thread(
-                    request.app.state.store.fail_state,
-                    state_digest,
-                    exc.reason_code,
-                    request_id=request_id,
-                    actor=username,
-                    now=int(clock()),
-                )
+        except AuthorizationConflict:
             return RedirectResponse(
-                authorization_page("oauth-conflict"), status_code=303
+                targeted_page("oauth-conflict"), status_code=303
             )
         except Exception:
             with suppress(Exception):
@@ -646,10 +585,10 @@ def create_app(
                     now=int(clock()),
                 )
             return RedirectResponse(
-                authorization_page("oauth-failed"),
+                targeted_page("oauth-failed"),
                 status_code=303,
             )
-        return RedirectResponse(authorization_page("oauth-completed"), status_code=303)
+        return RedirectResponse(targeted_page("oauth-completed"), status_code=303)
 
     @application.get("/api/douyin/authorizations")
     async def authorizations(request: Request) -> dict[str, Any]:
@@ -664,37 +603,6 @@ def create_app(
         )
         return {"items": items}
 
-    @application.post("/api/douyin/authorizations/match")
-    async def authorization_match(
-        request: Request, payload: AuthorizationMatchPayload
-    ) -> Response:
-        username, _binding = _identity(request)
-        try:
-            await request.app.state.accounts.require_account(
-                account_id=payload.account_id,
-                platform_uid=payload.platform_uid,
-            )
-            result = await asyncio.to_thread(
-                request.app.state.store.manual_match,
-                authorization_id=payload.authorization_id,
-                account_id=payload.account_id,
-                platform_uid=payload.platform_uid,
-                expected_version=payload.expected_version,
-                actor=username,
-                request_id=_request_id(request),
-                now=int(clock()),
-            )
-        except AuthorizationConflict as exc:
-            return JSONResponse(
-                {"detail": "授权状态已变化，请刷新后重试", "reason": exc.reason_code},
-                status_code=409,
-            )
-        except RuntimeError:
-            return JSONResponse(
-                {"detail": "所选抖音账号已失效，请重新选择"}, status_code=409
-            )
-        return JSONResponse({"authorization": result})
-
     @application.post("/api/douyin/authorizations/reauthorize")
     async def authorization_reauthorize(
         request: Request, payload: ReauthorizePayload
@@ -705,12 +613,20 @@ def create_app(
         )
         if authorization is None:
             return JSONResponse({"detail": "未找到授权"}, status_code=404)
+        if (
+            authorization["status"] != "active"
+            or authorization["account_id"] is None
+            or authorization["platform_uid"] is None
+        ):
+            return JSONResponse({"detail": "未找到有效授权"}, status_code=409)
         if int(authorization["version"]) != payload.expected_version:
             return JSONResponse(
                 {"detail": "授权状态已变化，请刷新后重试"}, status_code=409
             )
         return await start_authorization(
             request,
+            account_id=int(authorization["account_id"]),
+            platform_uid=str(authorization["platform_uid"]),
             target_authorization_id=payload.authorization_id,
             target_authorization_version=payload.expected_version,
         )

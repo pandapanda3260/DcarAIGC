@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import secrets
@@ -36,7 +37,6 @@ PLATFORM_UID = "123456789"
 CLIENT_KEY = "stage0-mock-client-key"
 CLIENT_SECRET = "stage0-mock-client-secret-32-bytes-minimum"
 OPEN_ID = "stage0-mock-open-id"
-QUERY_CANARY = "阶段0真实TCP搜索"
 
 
 sys.path.insert(0, str(ROOT))
@@ -49,7 +49,6 @@ from tests.fixtures.mock_douyin_oauth import (  # noqa: E402
 
 
 ACCOUNT_CALLS: list[dict[str, Any]] = []
-RESOLVER_CALLS: list[list[str]] = []
 accounts_app = FastAPI(redirect_slashes=False)
 
 
@@ -60,7 +59,7 @@ async def accounts_health() -> dict[str, str]:
 
 @accounts_app.get("/__e2e__/calls")
 async def accounts_calls() -> dict[str, Any]:
-    return {"calls": ACCOUNT_CALLS, "resolver_calls": RESOLVER_CALLS}
+    return {"calls": ACCOUNT_CALLS}
 
 
 @accounts_app.post("/api/v8/accounts/search")
@@ -95,43 +94,6 @@ async def accounts_search(request: Request) -> JSONResponse:
             "pending_platform_identities": [
                 {"platform": "douyin", "uid": "pending-e2e-secret"}
             ],
-        }
-    )
-
-
-@accounts_app.post("/api/v8/accounts/resolve-douyin-videos")
-async def resolve_douyin_videos(request: Request) -> JSONResponse:
-    payload = await request.json()
-    video_ids = [str(value) for value in payload.get("video_ids", [])]
-    RESOLVER_CALLS.append(video_ids)
-    if video_ids == ["mock-video-id"]:
-        return JSONResponse(
-            {
-                "status": "matched",
-                "requested_video_ids": video_ids,
-                "matched_video_ids": video_ids,
-                "unmatched_video_ids": [],
-                "matched_account": {
-                    "account_id": 7,
-                    "platform_uid": PLATFORM_UID,
-                },
-                "candidates": [
-                    {
-                        "account_id": 7,
-                        "platform_uid": PLATFORM_UID,
-                        "matched_video_ids": video_ids,
-                    }
-                ],
-            }
-        )
-    return JSONResponse(
-        {
-            "status": "unmatched",
-            "requested_video_ids": video_ids,
-            "matched_video_ids": [],
-            "unmatched_video_ids": video_ids,
-            "matched_account": None,
-            "candidates": [],
         }
     )
 
@@ -485,32 +447,6 @@ def run() -> dict[str, Any]:
             )
             assert_equal(page.headers["cache-control"], "no-store", "entry cache")
 
-            browser_headers = {
-                "Origin": GATEWAY_URL,
-                "Content-Type": "application/json",
-                "X-Dcar-Request": "douyin-accounts-search",
-            }
-            search = gateway.post(
-                "/dcar/api/douyin/accounts/search",
-                headers=browser_headers,
-                json={"query": QUERY_CANARY, "page": 1, "page_size": 50},
-            )
-            assert_equal(search.status_code, 200, "account search")
-            projected = search.json()["items"][0]
-            assert_equal(
-                set(projected),
-                {"account_id", "operator_name", "enabled", "uid", "nickname"},
-                "account projection",
-            )
-            assert_absent(
-                json.dumps(search.json(), ensure_ascii=False),
-                ["13800138000", "xhs-e2e-secret", "pending-e2e-secret"],
-                "account projection",
-            )
-            calls = accounts.get("/__e2e__/calls").json()["calls"]
-            assert_equal(calls[-1]["query"], QUERY_CANARY, "query forwarding")
-            assert_equal(calls[-1]["platform"], "douyin", "platform enforcement")
-
             start = gateway.post(
                 "/dcar/api/douyin/oauth/start",
                 headers={
@@ -518,11 +454,23 @@ def run() -> dict[str, Any]:
                     "Content-Type": "application/json",
                     "X-Dcar-Request": "douyin-oauth-start",
                 },
-                json={},
+                json={"account_id": 7, "platform_uid": PLATFORM_UID},
             )
             assert_equal(start.status_code, 200, "oauth start")
             authorize_url = start.json()["authorize_url"]
             captured_state = parse_qs(urlsplit(authorize_url).query)["state"][0]
+            state_digest = hashlib.sha256(captured_state.encode("utf-8")).hexdigest()
+            with sqlite3.connect(vault_path) as connection:
+                targeted_state = connection.execute(
+                    "SELECT account_id,platform_uid FROM oauth_states "
+                    "WHERE state_digest=?",
+                    (state_digest,),
+                ).fetchone()
+            assert_equal(
+                targeted_state,
+                (7, PLATFORM_UID),
+                "oauth state target",
+            )
             authorized = oauth.get(authorize_url)
             assert_equal(authorized.status_code, 303, "mock authorize")
             callback_url = authorized.headers["location"]
@@ -537,10 +485,20 @@ def run() -> dict[str, Any]:
                 },
             )
             assert_equal(callback.status_code, 303, "oauth callback")
+            callback_location = urlsplit(callback.headers["location"])
             assert_equal(
-                callback.headers["location"],
-                "/dcar/accounts/douyin-authorization?notice=oauth-completed",
+                callback_location.path,
+                "/dcar/accounts/douyin-authorization",
                 "callback target",
+            )
+            assert_equal(
+                parse_qs(callback_location.query),
+                {
+                    "account_id": ["7"],
+                    "platform_uid": [PLATFORM_UID],
+                    "notice": ["oauth-completed"],
+                },
+                "callback target query",
             )
             assert_equal(callback.headers["cache-control"], "no-store", "callback cache")
             assert_equal(
@@ -555,19 +513,18 @@ def run() -> dict[str, Any]:
             provider_state = oauth.get("/__e2e__/state").json()
             assert_equal(provider_state["token_calls"], 1, "token exchange count")
             assert_equal(provider_state["userinfo_calls"], 1, "userinfo count")
-            resolver_calls = accounts.get("/__e2e__/calls").json()["resolver_calls"]
-            assert_equal(
-                resolver_calls,
-                [["mock-video-id"]],
-                "first-page video auto-match",
-            )
+            calls = accounts.get("/__e2e__/calls").json()["calls"]
+            assert_equal(len(calls), 2, "target validation count")
+            for call in calls:
+                assert_equal(call["query"], PLATFORM_UID, "target query forwarding")
+                assert_equal(call["platform"], "douyin", "platform enforcement")
 
             listed = gateway.get("/dcar/api/douyin/authorizations")
             assert_equal(listed.status_code, 200, "authorization list")
             assert_equal(len(listed.json()["items"]), 1, "authorization count")
             authorization = listed.json()["items"][0]
-            assert_equal(authorization["status"], "active", "auto-match state")
-            assert_equal(authorization["account_id"], 7, "auto-match account")
+            assert_equal(authorization["status"], "active", "targeted binding state")
+            assert_equal(authorization["account_id"], 7, "targeted binding account")
             assert_equal(
                 authorization["platform_uid"],
                 PLATFORM_UID,
@@ -591,6 +548,22 @@ def run() -> dict[str, Any]:
                 json.dumps(statuses.json()),
                 [OPEN_ID, "access-", "refresh-", CLIENT_SECRET],
                 "authorization statuses",
+            )
+
+            video_page = control.post(
+                "/internal/v1/video-list/page",
+                headers={"X-Dcar-Machine-Key": machine_key},
+                json={
+                    "authorization_id": authorization["id"],
+                    "cursor": 0,
+                    "count": 20,
+                },
+            )
+            assert_equal(video_page.status_code, 503, "separate video-list route")
+            assert_equal(
+                video_page.json()["detail"],
+                "douyin_provider_unavailable",
+                "mock mode video-list boundary",
             )
 
             old_confirm_page = gateway.get("/dcar/douyin/confirm")
@@ -702,7 +675,6 @@ def run() -> dict[str, Any]:
                 "access-",
                 "refresh-",
                 CLIENT_SECRET,
-                QUERY_CANARY,
             ]
             for log_path in state_root.glob("*.log"):
                 log_text = log_path.read_text(encoding="utf-8", errors="replace")

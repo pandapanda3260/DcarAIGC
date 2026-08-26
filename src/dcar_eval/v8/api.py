@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated, Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional
 from urllib.parse import quote, unquote
 from zoneinfo import ZoneInfo
 
@@ -274,15 +274,6 @@ class AccountSearchRequest(BaseModel):
     platform: Optional[str] = Field(default=None, max_length=32)
     page: int = Field(default=1, ge=1)
     page_size: int = Field(default=50, ge=1, le=100)
-
-
-DouyinVideoId = Annotated[str, Field(min_length=1, max_length=128)]
-
-
-class ResolveDouyinVideosRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    video_ids: List[DouyinVideoId] = Field(min_length=1, max_length=20)
 
 
 SELLING_POINT_NONE = "__none__"
@@ -1195,79 +1186,6 @@ def _account_search(
         "legacy_unassociated_content_count": legacy_unassociated,
         "pending_platform_identity_count": pending_identity_count,
         "pending_platform_identities": [dict(row) for row in pending_identities],
-    }
-
-
-def _resolve_douyin_videos(
-    payload: ResolveDouyinVideosRequest,
-    *,
-    db_path: Path,
-    read_only: bool = False,
-) -> Dict[str, Any]:
-    video_ids = list(dict.fromkeys(payload.video_ids))
-    placeholders = ",".join("?" for _ in video_ids)
-    with connect(db_path, read_only=read_only) as connection:
-        rows = connection.execute(
-            f"""
-            SELECT c.platform_content_id AS video_id,
-                   c.account_id,
-                   identity.uid AS platform_uid
-            FROM content_items c
-            JOIN accounts account
-              ON account.id=c.account_id
-             AND account.enabled=1
-            JOIN account_platform_identities identity
-              ON identity.account_id=c.account_id
-             AND identity.platform='douyin'
-            WHERE c.platform='douyin'
-              AND c.platform_content_id IN ({placeholders})
-            """,
-            video_ids,
-        ).fetchall()
-
-    resolved_by_video: Dict[str, Dict[str, Any]] = {
-        str(row["video_id"]): {
-            "account_id": int(row["account_id"]),
-            "platform_uid": str(row["platform_uid"]),
-        }
-        for row in rows
-    }
-    matched_video_ids = [
-        video_id for video_id in video_ids if video_id in resolved_by_video
-    ]
-    unmatched_video_ids = [
-        video_id for video_id in video_ids if video_id not in resolved_by_video
-    ]
-    candidate_accounts: List[Dict[str, Any]] = []
-    seen_candidates: set[tuple[int, str]] = set()
-    for video_id in matched_video_ids:
-        candidate = resolved_by_video[video_id]
-        candidate_key = (
-            int(candidate["account_id"]),
-            str(candidate["platform_uid"]),
-        )
-        if candidate_key not in seen_candidates:
-            seen_candidates.add(candidate_key)
-            candidate_accounts.append(candidate)
-
-    if len(candidate_accounts) == 1:
-        status = "matched"
-        matched_account: Dict[str, Any] | None = candidate_accounts[0]
-        ambiguous_candidates: List[Dict[str, Any]] = []
-    elif candidate_accounts:
-        status = "ambiguous"
-        matched_account = None
-        ambiguous_candidates = candidate_accounts
-    else:
-        status = "unmatched"
-        matched_account = None
-        ambiguous_candidates = []
-    return {
-        "status": status,
-        "matched_account": matched_account,
-        "candidate_accounts": ambiguous_candidates,
-        "unmatched_video_ids": unmatched_video_ids,
-        "matched_video_count": len(matched_video_ids),
     }
 
 
@@ -2200,7 +2118,6 @@ router = APIRouter()
 READ_ONLY_POST_PATHS = frozenset(
     {
         "/api/v8/accounts/search",
-        "/api/v8/accounts/resolve-douyin-videos",
         "/api/v8/contents/search",
         "/api/v8/contents/validate",
         "/api/v8/media-processing/search",
@@ -2840,18 +2757,6 @@ def search_v8_accounts(
 ) -> Dict[str, Any]:
     config = _request_config(request)
     return _account_search(
-        payload,
-        db_path=config.db_path,
-        read_only=config.read_only,
-    )
-
-
-@router.post("/api/v8/accounts/resolve-douyin-videos")
-def resolve_v8_douyin_videos(
-    request: Request, payload: ResolveDouyinVideosRequest
-) -> Dict[str, Any]:
-    config = _request_config(request)
-    return _resolve_douyin_videos(
         payload,
         db_path=config.db_path,
         read_only=config.read_only,

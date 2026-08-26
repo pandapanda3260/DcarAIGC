@@ -34,9 +34,7 @@ MAX_DOUYIN_BODY_BYTES = 64 * 1024
 PROXY_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 DOUYIN_CALLBACK_PATH = "/oauth/douyin/callback"
 DOUYIN_POST_ACTIONS = {
-    "/api/douyin/accounts/search": "douyin-accounts-search",
     "/api/douyin/oauth/start": "douyin-oauth-start",
-    "/api/douyin/authorizations/match": "douyin-authorization-match",
     "/api/douyin/authorizations/reauthorize": "douyin-authorization-reauthorize",
     "/api/douyin/authorizations/unbind": "douyin-authorization-unbind",
 }

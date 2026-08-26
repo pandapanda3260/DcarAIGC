@@ -482,13 +482,14 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
                 base_path, douyin_enabled=True
             ) as (client, _config):
                 self.assertEqual(self._login(client, base_path).status_code, 200)
+                start_body = '{"account_id":7,"platform_uid":"123456789"}'
                 response = client.post(
-                    _route(base_path, "/api/douyin/accounts/search"),
-                    content='{"query":"中文 %_"}',
+                    _route(base_path, "/api/douyin/oauth/start"),
+                    content=start_body,
                     headers={
                         "Content-Type": "application/json",
                         "Origin": ORIGIN,
-                        "X-Dcar-Request": "douyin-accounts-search",
+                        "X-Dcar-Request": "douyin-oauth-start",
                         "X-Dcar-Authenticated-User": "attacker",
                         "X-Dcar-Session-Binding": "attacker-binding",
                         "X-Dcar-Edge-Key": "attacker-edge-key",
@@ -499,25 +500,19 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
                 self.assertEqual(response.status_code, 200)
                 payload = response.json()
                 self.assertEqual(payload["upstream"], "douyin")
-                self.assertEqual(payload["path"], "/api/douyin/accounts/search")
-                self.assertEqual(payload["body"], '{"query":"中文 %_"}')
+                self.assertEqual(payload["path"], "/api/douyin/oauth/start")
+                self.assertEqual(payload["body"], start_body)
                 self.assertEqual(payload["authenticated_user"], USERNAME)
                 self.assertRegex(payload["session_binding"], r"^[0-9a-f]{64}$")
                 self.assertEqual(payload["edge_key"], EDGE_KEY)
                 self.assertEqual(
-                    payload["verified_action"], "douyin-accounts-search"
+                    payload["verified_action"], "douyin-oauth-start"
                 )
                 self.assertIsNone(payload["forged_custom"])
                 self.assertIsNone(payload["dcar_request"])
                 self.assertIsNone(payload["cookie"])
 
                 actions = {
-                    "/api/douyin/oauth/start": ("douyin-oauth-start", "{}"),
-                    "/api/douyin/authorizations/match": (
-                        "douyin-authorization-match",
-                        '{"authorization_id":"auth-1","account_id":7,'
-                        '"platform_uid":"uid-7","expected_version":3}',
-                    ),
                     "/api/douyin/authorizations/reauthorize": (
                         "douyin-authorization-reauthorize",
                         '{"authorization_id":"auth-1","expected_version":3}',
@@ -542,6 +537,14 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
                     self.assertEqual(routed.json()["verified_action"], action)
 
                 for path, action in (
+                    (
+                        "/api/douyin/accounts/search",
+                        "douyin-accounts-search",
+                    ),
+                    (
+                        "/api/douyin/authorizations/match",
+                        "douyin-authorization-match",
+                    ),
                     ("/api/douyin/oauth/confirm", "douyin-oauth-confirm"),
                     ("/api/douyin/oauth/reject", "douyin-oauth-reject"),
                 ):
@@ -558,17 +561,17 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
                 for headers in (
                     {
                         "Origin": "https://evil.example",
-                        "X-Dcar-Request": "douyin-accounts-search",
+                        "X-Dcar-Request": "douyin-oauth-start",
                     },
                     {"Origin": ORIGIN},
                     {
                         "Origin": ORIGIN,
-                        "X-Dcar-Request": "douyin-oauth-start",
+                        "X-Dcar-Request": "douyin-authorization-unbind",
                     },
                 ):
                     rejected = client.post(
-                        _route(base_path, "/api/douyin/accounts/search"),
-                        content="{}",
+                        _route(base_path, "/api/douyin/oauth/start"),
+                        content=start_body,
                         headers=headers,
                     )
                     self.assertEqual(rejected.status_code, 403)
