@@ -58,89 +58,64 @@ class DouyinControlStoreTestCase(unittest.TestCase):
             "avatar": "",
         }
 
-    def _pending(
-        self,
-        *,
-        digest: str,
-        username: str = "operator",
-        binding: str = "a" * 64,
-        account_id: int = 1,
-        platform_uid: str = "123456789",
-        candidate: dict[str, object] | None = None,
-        now: int = 1_900_000_000,
-    ) -> tuple[dict[str, object], str]:
-        value = candidate or self._candidate()
-        fingerprint = self.cipher.open_id_fingerprint(str(value["open_id"]))
-        self.store.create_state(
-            state_digest=digest,
-            bound_username=username,
-            session_binding=binding,
-            account_id=account_id,
-            platform_uid=platform_uid,
-            scopes=["user_info", "video.list"],
-            expires_at=now + 600,
-            request_id="request-start",
-            now=now,
-        )
-        self.store.begin_exchange(
-            digest,
-            username,
-            binding,
-            request_id="request-callback",
-            now=now + 1,
-        )
-        self.store.store_candidate(
-            state_digest=digest,
-            ciphertext=self.cipher.encrypt(digest, "oauth_candidate", value),
-            open_id_fingerprint=fingerprint,
-            confirmation_expires_at=now + 900,
-            request_id="request-callback",
-            now=now + 2,
-        )
-        return value, fingerprint
-
-    def _stage(
+    def _insert_legacy_pending(
         self,
         *,
         digest: str,
         open_id: str,
         username: str = "operator",
-        binding: str = "a" * 64,
-        target_authorization_id: str | None = None,
-        target_authorization_version: int | None = None,
+        account_id: int | None = None,
+        platform_uid: str | None = None,
+        reason: str = "matching",
         now: int = 1_900_000_000,
     ) -> tuple[dict[str, object], str, dict[str, object]]:
         candidate = self._candidate(open_id)
         fingerprint = self.cipher.open_id_fingerprint(open_id)
-        self.store.create_state(
-            state_digest=digest,
-            bound_username=username,
-            session_binding=binding,
-            target_authorization_id=target_authorization_id,
-            target_authorization_version=target_authorization_version,
-            scopes=["user_info", "video.list"],
-            expires_at=now + 600,
-            request_id="automatic-start",
-            now=now,
+        authorization_id = digest[:32]
+        access = self.cipher.encrypt(
+            authorization_id,
+            "access",
+            {"open_id": open_id, "token": str(candidate["access_token"])},
         )
-        self.store.begin_exchange(
-            digest,
-            username,
-            binding,
-            request_id="automatic-callback",
-            now=now + 1,
+        refresh = self.cipher.encrypt(
+            authorization_id,
+            "refresh",
+            {"open_id": open_id, "token": str(candidate["refresh_token"])},
         )
-        staged = self.store.stage_authorization_candidate(
-            state_digest=digest,
-            bound_username=username,
-            session_binding=binding,
-            open_id_fingerprint=fingerprint,
-            candidate=candidate,
-            cipher=self.cipher,
-            request_id="automatic-stage",
-            now=now + 2,
-        )
-        return candidate, fingerprint, staged
+        with self.store.write_connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO douyin_authorizations(
+                    id,open_id_fingerprint,bound_username,account_id,platform_uid,
+                    access_token_ciphertext,refresh_token_ciphertext,
+                    access_expires_at,refresh_expires_at,renew_count,scopes_json,
+                    key_version,version,refresh_lease_owner,
+                    refresh_lease_expires_at,needs_reauthorization,status,
+                    match_reason,created_at,updated_at,last_authorized_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,0,?,1,1,NULL,NULL,0,'pending_match',?,?,?,?)
+                """,
+                (
+                    authorization_id,
+                    fingerprint,
+                    username,
+                    account_id,
+                    platform_uid,
+                    access,
+                    refresh,
+                    int(candidate["access_expires_at"]),
+                    int(candidate["refresh_expires_at"]),
+                    '["user_info","video.list"]',
+                    reason,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+        return candidate, fingerprint, {
+            "id": authorization_id,
+            "status": "pending_match",
+            "version": 1,
+        }
 
     def _complete_targeted(
         self,
@@ -620,7 +595,27 @@ class DouyinControlStoreTestCase(unittest.TestCase):
     def test_state_is_single_use_bound_and_terminal_states_erase_candidate(
         self,
     ) -> None:
-        candidate, _fingerprint = self._pending(digest="1" * 64)
+        candidate = self._candidate()
+        self.store.create_state(
+            state_digest="1" * 64,
+            bound_username="operator",
+            session_binding="a" * 64,
+            scopes=["user_info", "video.list"],
+            expires_at=1_900_000_600,
+            request_id="start",
+            now=1_900_000_000,
+        )
+        self.store.begin_exchange(
+            "1" * 64, "operator", "a" * 64, request_id="callback", now=1_900_000_001
+        )
+        with self.store.write_connection() as connection:
+            connection.execute(
+                """
+                UPDATE oauth_states SET status='matching',candidate_ciphertext=?,
+                    candidate_open_id_fingerprint=? WHERE state_digest=?
+                """,
+                (b"encrypted-candidate", "f" * 64, "1" * 64),
+            )
         with self.assertRaises(StateTransitionError):
             self.store.begin_exchange(
                 "1" * 64,
@@ -637,13 +632,12 @@ class DouyinControlStoreTestCase(unittest.TestCase):
                 request_id="wrong-user",
                 now=1_900_000_003,
             )
-        self.assertTrue(
-            self.store.reject_current(
-                "operator",
-                "a" * 64,
-                request_id="reject",
-                now=1_900_000_004,
-            )
+        self.store.fail_state(
+            "1" * 64,
+            "operator_rejected",
+            request_id="reject",
+            actor="operator",
+            now=1_900_000_004,
         )
         with self.store.read_connection() as connection:
             row = connection.execute(
@@ -706,14 +700,15 @@ class DouyinControlStoreTestCase(unittest.TestCase):
                 now=now + 3,
             )
 
-        self.store.store_candidate(
-            state_digest=second_digest,
-            ciphertext=b"encrypted-candidate",
-            open_id_fingerprint="f" * 64,
-            confirmation_expires_at=now + 900,
-            request_id="candidate",
-            now=now + 4,
-        )
+        with self.store.write_connection() as connection:
+            connection.execute(
+                """
+                UPDATE oauth_states SET status='matching',candidate_ciphertext=?,
+                    candidate_open_id_fingerprint=?,updated_at=?
+                WHERE state_digest=? AND status='exchanging'
+                """,
+                (b"encrypted-candidate", "f" * 64, now + 4, second_digest),
+            )
         with self.assertRaisesRegex(StateTransitionError, "oauth_state_in_progress"):
             self.store.create_state(
                 state_digest="6" * 64,
@@ -1071,10 +1066,9 @@ class DouyinControlStoreTestCase(unittest.TestCase):
                 0,
             )
 
-        _old_candidate, _old_fingerprint, pending = self._stage(
+        _old_candidate, _old_fingerprint, pending = self._insert_legacy_pending(
             digest="4" * 64,
             open_id="legacy-pending-open-id",
-            binding="4" * 64,
             now=1_900_005_000,
         )
         pending_id = str(pending["id"])
@@ -1110,172 +1104,242 @@ class DouyinControlStoreTestCase(unittest.TestCase):
         self.assertEqual(tuple(row), (None, None, None, None))
         self.assertEqual(audit["reason_code"], "operator_invalidated_pending_match")
 
-    def test_confirmation_reauthorization_conflicts_and_versioned_unbind(self) -> None:
-        candidate, fingerprint = self._pending(digest="3" * 64)
-        created = self.store.confirm_authorization(
-            state_digest="3" * 64,
-            bound_username="operator",
-            session_binding="a" * 64,
-            open_id_fingerprint=fingerprint,
-            candidate=candidate,
-            cipher=self.cipher,
-            request_id="confirm-1",
-            now=1_900_000_010,
+    def test_targeted_unbind_requires_current_version_and_erases_tokens(self) -> None:
+        _candidate, _fingerprint, created = self._complete_targeted(
+            digest="7" * 64, open_id="unbind-open-id"
         )
-        self.assertEqual(created["version"], 1)
         authorization_id = str(created["id"])
-        with self.store.read_connection() as connection:
-            row = connection.execute(
-                "SELECT * FROM douyin_authorizations WHERE id=?", (authorization_id,)
-            ).fetchone()
-        access = self.cipher.decrypt(
-            authorization_id, "access", bytes(row["access_token_ciphertext"])
-        )
-        refresh = self.cipher.decrypt(
-            authorization_id, "refresh", bytes(row["refresh_token_ciphertext"])
-        )
-        self.assertEqual(access["token"], "access-canary")
-        self.assertEqual(refresh["token"], "refresh-canary")
-        with self.assertRaises(RuntimeError):
-            self.cipher.decrypt(
-                authorization_id, "refresh", bytes(row["access_token_ciphertext"])
-            )
-
-        candidate2, fingerprint2 = self._pending(
-            digest="4" * 64,
-            candidate=self._candidate("open-id-a"),
-            now=1_900_001_000,
-        )
-        updated = self.store.confirm_authorization(
-            state_digest="4" * 64,
-            bound_username="operator",
-            session_binding="a" * 64,
-            open_id_fingerprint=fingerprint2,
-            candidate=candidate2,
-            cipher=self.cipher,
-            request_id="confirm-2",
-            now=1_900_001_010,
-        )
-        self.assertEqual(updated["id"], authorization_id)
-        self.assertEqual(updated["version"], 2)
-
-        conflict_candidate, conflict_fingerprint = self._pending(
-            digest="5" * 64,
-            account_id=2,
-            platform_uid="987654321",
-            candidate=self._candidate("open-id-a"),
-            now=1_900_002_000,
-        )
-        with self.assertRaisesRegex(AuthorizationConflict, "open_id_rebind_conflict"):
-            self.store.confirm_authorization(
-                state_digest="5" * 64,
-                bound_username="operator",
-                session_binding="a" * 64,
-                open_id_fingerprint=conflict_fingerprint,
-                candidate=conflict_candidate,
-                cipher=self.cipher,
-                request_id="conflict",
-                now=1_900_002_010,
-            )
-        with self.store.read_connection() as connection:
-            failed = connection.execute(
-                "SELECT status,candidate_ciphertext FROM oauth_states WHERE state_digest=?",
-                ("5" * 64,),
-            ).fetchone()
-        self.assertEqual(failed["status"], "failed")
-        self.assertIsNone(failed["candidate_ciphertext"])
-
-        changed_candidate, changed_fingerprint = self._pending(
-            digest="8" * 64,
-            account_id=2,
-            platform_uid="123456789",
-            candidate=self._candidate("open-id-a"),
-            now=1_900_002_100,
-        )
-        with self.assertRaisesRegex(AuthorizationConflict, "target_changed"):
-            self.store.confirm_authorization(
-                state_digest="8" * 64,
-                bound_username="operator",
-                session_binding="a" * 64,
-                open_id_fingerprint=changed_fingerprint,
-                candidate=changed_candidate,
-                cipher=self.cipher,
-                request_id="target-changed",
-                now=1_900_002_110,
-            )
-
-        owner_candidate, owner_fingerprint = self._pending(
-            digest="6" * 64,
-            username="other-operator",
-            binding="b" * 64,
-            candidate=self._candidate("open-id-a"),
-            now=1_900_003_000,
-        )
-        with self.assertRaisesRegex(AuthorizationConflict, "owner_conflict"):
-            self.store.confirm_authorization(
-                state_digest="6" * 64,
-                bound_username="other-operator",
-                session_binding="b" * 64,
-                open_id_fingerprint=owner_fingerprint,
-                candidate=owner_candidate,
-                cipher=self.cipher,
-                request_id="owner-conflict",
-                now=1_900_003_010,
-            )
-
-        target_candidate, target_fingerprint = self._pending(
-            digest="7" * 64,
-            candidate=self._candidate("open-id-b"),
-            now=1_900_004_000,
-        )
-        with self.assertRaisesRegex(AuthorizationConflict, "account_binding_conflict"):
-            self.store.confirm_authorization(
-                state_digest="7" * 64,
-                bound_username="operator",
-                session_binding="a" * 64,
-                open_id_fingerprint=target_fingerprint,
-                candidate=target_candidate,
-                cipher=self.cipher,
-                request_id="target-conflict",
-                now=1_900_004_010,
-            )
-
         with self.assertRaisesRegex(
             AuthorizationConflict, "authorization_version_conflict"
         ):
             self.store.unbind(
-                actor="operator",
+                actor="admin",
                 authorization_id=authorization_id,
-                expected_version=1,
+                expected_version=2,
                 request_id="stale-unbind",
             )
         self.assertTrue(
             self.store.unbind(
-                actor="operator",
+                actor="admin",
                 authorization_id=authorization_id,
-                expected_version=2,
-                request_id="unbind",
+                expected_version=1,
+                request_id="current-unbind",
             )
         )
-        listed = self.store.list_authorizations("operator")
-        self.assertEqual(listed[0]["status"], "unbound")
-        self.assertEqual(listed[0]["version"], 3)
-        self.assertNotIn("scopes_json", listed[0])
-        self.assertNotIn("key_version", listed[0])
+        with self.store.read_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT status,version,access_token_ciphertext,
+                       refresh_token_ciphertext,refresh_lease_owner
+                FROM douyin_authorizations WHERE id=?
+                """,
+                (authorization_id,),
+            ).fetchone()
+        self.assertEqual(tuple(row), ("unbound", 2, None, None, None))
+
+    def test_targeted_completion_requires_account_locked_in_state(self) -> None:
+        digest = "8" * 64
+        self.store.create_state(
+            state_digest=digest,
+            bound_username="operator",
+            session_binding="8" * 64,
+            scopes=["user_info", "video.list"],
+            expires_at=1_900_000_600,
+            request_id="missing-target-start",
+            now=1_900_000_000,
+        )
+        self.store.begin_exchange(
+            digest,
+            "operator",
+            "8" * 64,
+            request_id="missing-target-callback",
+            now=1_900_000_001,
+        )
+        candidate = self._candidate("missing-target-open-id")
+        with self.assertRaisesRegex(StateTransitionError, "oauth_target_missing"):
+            self.store.complete_targeted_authorization(
+                state_digest=digest,
+                bound_username="operator",
+                session_binding="8" * 64,
+                open_id_fingerprint=self.cipher.open_id_fingerprint(
+                    "missing-target-open-id"
+                ),
+                candidate=candidate,
+                cipher=self.cipher,
+                request_id="missing-target-complete",
+                now=1_900_000_002,
+            )
+        self.assertEqual(self.store.list_authorizations(), [])
+
+    def test_legacy_pending_blocks_targeted_binding_until_invalidated(self) -> None:
+        _candidate, _fingerprint, pending = self._insert_legacy_pending(
+            digest="9" * 64,
+            open_id="legacy-owner-open-id",
+            account_id=9,
+            platform_uid="999999999",
+        )
+        with self.assertRaisesRegex(AuthorizationConflict, "account_binding_conflict"):
+            self._complete_targeted(
+                digest="a" * 64,
+                open_id="new-open-id",
+                account_id=9,
+                platform_uid="999999999",
+                binding="a" * 64,
+                now=1_900_001_000,
+            )
+        self.assertTrue(
+            self.store.unbind(
+                actor="admin",
+                authorization_id=str(pending["id"]),
+                expected_version=1,
+                request_id="invalidate-legacy",
+            )
+        )
+        _value, _fingerprint2, active = self._complete_targeted(
+            digest="b" * 64,
+            open_id="new-open-id",
+            account_id=9,
+            platform_uid="999999999",
+            binding="b" * 64,
+            now=1_900_002_000,
+        )
+        self.assertEqual(active["status"], "active")
+
+    def test_legacy_pending_invalidation_is_audited_and_fail_closed(self) -> None:
+        _candidate, _fingerprint, pending = self._insert_legacy_pending(
+            digest="c" * 64, open_id="legacy-audit-open-id"
+        )
+        self.store.unbind(
+            actor="replacement-operator",
+            authorization_id=str(pending["id"]),
+            expected_version=1,
+            request_id="legacy-audit-unbind",
+        )
+        with self.store.read_connection() as connection:
+            audit = connection.execute(
+                """
+                SELECT actor,result,reason_code FROM audit_events
+                WHERE request_id='legacy-audit-unbind'
+                """
+            ).fetchone()
+        self.assertEqual(
+            tuple(audit),
+            ("replacement-operator", "unbound", "operator_invalidated_pending_match"),
+        )
+
+    def test_targeted_status_projection_tracks_active_and_unbound(self) -> None:
+        _candidate, _fingerprint, created = self._complete_targeted(
+            digest="d" * 64, open_id="status-open-id"
+        )
+        before = self.store.authorization_statuses(now=1_900_000_100)
+        self.assertEqual(len(before), 1)
+        self.assertTrue(before[0]["authorized"])
+        self.store.unbind(
+            actor="admin",
+            authorization_id=str(created["id"]),
+            expected_version=1,
+            request_id="status-unbind",
+            now=1_900_000_200,
+        )
+        after = self.store.authorization_statuses(now=1_900_000_201)
+        self.assertEqual(len(after), 1)
+        self.assertFalse(after[0]["authorized"])
+        self.assertEqual(after[0]["status"], "unbound")
+
+    def test_targeted_reauthorization_stale_callback_preserves_new_token(self) -> None:
+        _candidate, _fingerprint, created = self._complete_targeted(
+            digest="e" * 64, open_id="race-open-id"
+        )
+        authorization_id = str(created["id"])
+        fresh = self._candidate("race-open-id")
+        fresh["access_token"] = "fresh-access"
+        self._complete_targeted(
+            digest="f" * 64,
+            open_id="race-open-id",
+            candidate=fresh,
+            binding="f" * 64,
+            target_authorization_id=authorization_id,
+            target_authorization_version=1,
+            now=1_900_001_000,
+        )
+        stale = self._candidate("race-open-id")
+        stale["access_token"] = "stale-access"
+        with self.assertRaisesRegex(
+            AuthorizationConflict, "reauthorization_version_conflict"
+        ):
+            self._complete_targeted(
+                digest="0" * 64,
+                open_id="race-open-id",
+                candidate=stale,
+                binding="0" * 64,
+                target_authorization_id=authorization_id,
+                target_authorization_version=1,
+                now=1_900_002_000,
+            )
+        active = self.store.get_active_authorization(authorization_id)
+        assert active is not None
+        payload = self.cipher.decrypt(
+            authorization_id, "access", bytes(active["access_token_ciphertext"])
+        )
+        self.assertEqual(payload["token"], "fresh-access")
+
+    def test_targeted_reauthorization_scope_failure_preserves_active_token(self) -> None:
+        _candidate, _fingerprint, created = self._complete_targeted(
+            digest="1" * 64, open_id="scope-preserve-open-id"
+        )
+        authorization_id = str(created["id"])
+        incomplete = self._candidate("scope-preserve-open-id")
+        incomplete["scopes"] = ["user_info"]
+        with self.assertRaisesRegex(AuthorizationConflict, "oauth_scope_incomplete"):
+            self._complete_targeted(
+                digest="2" * 64,
+                open_id="scope-preserve-open-id",
+                candidate=incomplete,
+                binding="2" * 64,
+                target_authorization_id=authorization_id,
+                target_authorization_version=1,
+                now=1_900_001_000,
+            )
+        active = self.store.get_active_authorization(authorization_id)
+        assert active is not None
+        self.assertEqual(active["version"], 1)
+        payload = self.cipher.decrypt(
+            authorization_id, "access", bytes(active["access_token_ciphertext"])
+        )
+        self.assertEqual(payload["token"], "access-canary")
+
+    def test_any_authenticated_operator_can_manage_targeted_authorization(self) -> None:
+        _candidate, _fingerprint, created = self._complete_targeted(
+            digest="3" * 64, open_id="operator-handoff-open-id", username="creator"
+        )
+        self.assertTrue(
+            self.store.unbind(
+                actor="different-operator",
+                authorization_id=str(created["id"]),
+                expected_version=1,
+                request_id="operator-handoff",
+            )
+        )
+        item = self.store.get_authorization(str(created["id"]))
+        assert item is not None
+        self.assertEqual(item["status"], "unbound")
+
+    def test_targeted_public_projection_never_exposes_identity_or_ciphertext(self) -> None:
+        self._complete_targeted(
+            digest="4" * 64, open_id="projection-open-id"
+        )
+        item = self.store.list_authorizations()[0]
+        self.assertNotIn("open_id_fingerprint", item)
+        self.assertNotIn("access_token_ciphertext", item)
+        self.assertNotIn("refresh_token_ciphertext", item)
+        self.assertNotIn("key_version", item)
 
     def test_machine_authorization_projection_excludes_identity_and_tokens(
         self,
     ) -> None:
-        candidate, fingerprint = self._pending(digest="8" * 64)
-        created = self.store.confirm_authorization(
-            state_digest="8" * 64,
-            bound_username="operator",
-            session_binding="a" * 64,
-            open_id_fingerprint=fingerprint,
-            candidate=candidate,
-            cipher=self.cipher,
-            request_id="confirm-machine-list",
-            now=1_900_000_010,
+        _candidate, _fingerprint, created = self._complete_targeted(
+            digest="8" * 64,
+            open_id="machine-list-open-id",
         )
         items = self.store.list_active_authorizations()
         self.assertEqual(len(items), 1)
@@ -1295,606 +1359,12 @@ class DouyinControlStoreTestCase(unittest.TestCase):
             },
         )
 
-    def test_automatic_match_stages_then_activates_and_reauthorizes_in_place(
-        self,
-    ) -> None:
-        _candidate, fingerprint, staged = self._stage(
-            digest="b" * 64, open_id="automatic-open-id"
-        )
-        authorization_id = str(staged["id"])
-        self.assertEqual(staged["status"], "pending_match")
-        self.assertEqual(staged["version"], 1)
-        pending = self.store.get_authorization(authorization_id)
-        assert pending is not None
-        self.assertEqual(pending["match_reason"], "matching")
-        self.assertNotIn("open_id_fingerprint", pending)
-        self.assertNotIn("access_token_ciphertext", pending)
-
-        activated = self.store.finalize_auto_match(
-            state_digest="b" * 64,
-            authorization_id=authorization_id,
-            expected_version=1,
-            outcome="matched",
-            account_id=7,
-            platform_uid="123456789",
-            actor="operator",
-            request_id="automatic-finalize",
-            now=1_900_000_003,
-        )
-        self.assertEqual(activated["status"], "active")
-        self.assertEqual(activated["version"], 2)
-        statuses = self.store.authorization_statuses(now=1_900_000_004)
-        self.assertEqual(len(statuses), 1)
-        self.assertTrue(statuses[0]["authorized"])
-
-        candidate2 = self._candidate("automatic-open-id")
-        candidate2["access_token"] = "access-by-second-operator"
-        self.store.create_state(
-            state_digest="c" * 64,
-            bound_username="other-operator",
-            session_binding="b" * 64,
-            target_authorization_id=authorization_id,
-            target_authorization_version=2,
-            scopes=["user_info", "video.list"],
-            expires_at=1_900_001_600,
-            request_id="reauthorize-start",
-            now=1_900_001_000,
-        )
-        self.store.begin_exchange(
-            "c" * 64,
-            "other-operator",
-            "b" * 64,
-            request_id="reauthorize-callback",
-            now=1_900_001_001,
-        )
-        updated = self.store.stage_authorization_candidate(
-            state_digest="c" * 64,
-            bound_username="other-operator",
-            session_binding="b" * 64,
-            open_id_fingerprint=fingerprint,
-            candidate=candidate2,
-            cipher=self.cipher,
-            request_id="reauthorize-stage",
-            now=1_900_001_002,
-        )
-        self.assertEqual(updated["id"], authorization_id)
-        self.assertEqual(updated["status"], "active")
-        self.assertEqual(updated["account_id"], 7)
-        self.assertEqual(updated["platform_uid"], "123456789")
-        self.assertEqual(updated["version"], 3)
-        active = self.store.get_active_authorization(authorization_id)
-        assert active is not None
-        self.assertEqual(active["bound_username"], "other-operator")
-        access = self.cipher.decrypt(
-            authorization_id, "access", bytes(active["access_token_ciphertext"])
-        )
-        self.assertEqual(access["token"], "access-by-second-operator")
-
-    def test_new_authorization_missing_requested_scope_fails_without_insert(
-        self,
-    ) -> None:
-        digest = "b" * 64
-        binding = "c" * 64
-        now = 1_900_010_000
-        candidate = self._candidate("missing-scope-new-open-id")
-        candidate["scopes"] = ["user_info"]
-        fingerprint = self.cipher.open_id_fingerprint(str(candidate["open_id"]))
-        self.store.create_state(
-            state_digest=digest,
-            bound_username="scope-operator",
-            session_binding=binding,
-            scopes=["user_info", "video.list"],
-            expires_at=now + 600,
-            request_id="scope-start",
-            now=now,
-        )
-        self.store.begin_exchange(
-            digest,
-            "scope-operator",
-            binding,
-            request_id="scope-callback",
-            now=now + 1,
-        )
-        with self.assertRaisesRegex(AuthorizationConflict, "oauth_scope_incomplete"):
-            self.store.stage_authorization_candidate(
-                state_digest=digest,
-                bound_username="scope-operator",
-                session_binding=binding,
-                open_id_fingerprint=fingerprint,
-                candidate=candidate,
-                cipher=self.cipher,
-                request_id="scope-stage",
-                now=now + 2,
-            )
-        with self.store.read_connection() as connection:
-            state = connection.execute(
-                "SELECT status,failure_reason FROM oauth_states WHERE state_digest=?",
-                (digest,),
-            ).fetchone()
-            authorization_count = connection.execute(
-                "SELECT COUNT(*) FROM douyin_authorizations"
-            ).fetchone()[0]
-            audit = connection.execute(
-                """
-                SELECT actor,action,result,reason_code
-                FROM audit_events
-                WHERE action='authorization_stage'
-                ORDER BY id DESC LIMIT 1
-                """
-            ).fetchone()
-        self.assertEqual(tuple(state), ("failed", "oauth_scope_incomplete"))
-        self.assertEqual(authorization_count, 0)
-        self.assertEqual(
-            tuple(audit),
-            (
-                "scope-operator",
-                "authorization_stage",
-                "failed",
-                "oauth_scope_incomplete",
-            ),
-        )
-
-    def test_active_reauthorization_missing_scope_preserves_existing_token(
-        self,
-    ) -> None:
-        _candidate, fingerprint, staged = self._stage(
-            digest="c" * 64,
-            open_id="missing-scope-active-open-id",
-            now=1_900_020_000,
-        )
-        authorization_id = str(staged["id"])
-        active = self.store.finalize_auto_match(
-            state_digest="c" * 64,
-            authorization_id=authorization_id,
-            expected_version=1,
-            outcome="matched",
-            account_id=70,
-            platform_uid="823456789",
-            actor="operator",
-            request_id="scope-activate",
-            now=1_900_020_003,
-        )
-        self.store.create_state(
-            state_digest="d" * 64,
-            bound_username="replacement-operator",
-            session_binding="d" * 64,
-            target_authorization_id=authorization_id,
-            target_authorization_version=int(active["version"]),
-            scopes=["user_info", "video.list"],
-            expires_at=1_900_021_600,
-            request_id="scope-reauthorize-start",
-            now=1_900_021_000,
-        )
-        self.store.begin_exchange(
-            "d" * 64,
-            "replacement-operator",
-            "d" * 64,
-            request_id="scope-reauthorize-callback",
-            now=1_900_021_001,
-        )
-        replacement = self._candidate("missing-scope-active-open-id")
-        replacement["access_token"] = "must-not-replace-active-token"
-        replacement["scopes"] = ["user_info"]
-        with self.assertRaisesRegex(AuthorizationConflict, "oauth_scope_incomplete"):
-            self.store.stage_authorization_candidate(
-                state_digest="d" * 64,
-                bound_username="replacement-operator",
-                session_binding="d" * 64,
-                open_id_fingerprint=fingerprint,
-                candidate=replacement,
-                cipher=self.cipher,
-                request_id="scope-reauthorize-stage",
-                now=1_900_021_002,
-            )
-        preserved = self.store.get_active_authorization(authorization_id)
-        assert preserved is not None
-        access = self.cipher.decrypt(
-            authorization_id, "access", bytes(preserved["access_token_ciphertext"])
-        )
-        self.assertEqual(access["token"], "access-canary")
-        self.assertEqual(preserved["version"], active["version"])
-        self.assertEqual(preserved["bound_username"], "operator")
-        with self.store.read_connection() as connection:
-            state = connection.execute(
-                "SELECT status,failure_reason FROM oauth_states WHERE state_digest=?",
-                ("d" * 64,),
-            ).fetchone()
-        self.assertEqual(tuple(state), ("failed", "oauth_scope_incomplete"))
-
-    def test_authorization_statuses_prefer_rebound_active_target(self) -> None:
-        _candidate, _fingerprint, first = self._stage(
-            digest="4" * 64,
-            open_id="status-old-open-id",
-            now=1_900_030_000,
-        )
-        first_id = str(first["id"])
-        first_active = self.store.finalize_auto_match(
-            state_digest="4" * 64,
-            authorization_id=first_id,
-            expected_version=1,
-            outcome="matched",
-            account_id=80,
-            platform_uid="923456789",
-            actor="operator",
-            request_id="status-first-active",
-            now=1_900_030_003,
-        )
-        self.assertTrue(
-            self.store.unbind(
-                actor="operator",
-                authorization_id=first_id,
-                expected_version=int(first_active["version"]),
-                request_id="status-unbind",
-                now=1_900_030_004,
-            )
-        )
-        _candidate2, _fingerprint2, second = self._stage(
-            digest="5" * 64,
-            open_id="status-new-open-id",
-            binding="5" * 64,
-            now=1_900_030_100,
-        )
-        second_id = str(second["id"])
-        self.store.finalize_auto_match(
-            state_digest="5" * 64,
-            authorization_id=second_id,
-            expected_version=1,
-            outcome="matched",
-            account_id=80,
-            platform_uid="923456789",
-            actor="replacement-operator",
-            request_id="status-second-active",
-            now=1_900_030_103,
-        )
-        statuses = [
-            item
-            for item in self.store.authorization_statuses(now=1_900_030_104)
-            if item["account_id"] == 80 and item["platform_uid"] == "923456789"
-        ]
-        self.assertEqual(len(statuses), 1)
-        self.assertEqual(statuses[0]["id"], second_id)
-        self.assertEqual(statuses[0]["status"], "active")
-        self.assertTrue(statuses[0]["authorized"])
-
-    def test_old_reauthorization_callback_cannot_overwrite_newer_token(self) -> None:
-        _candidate, fingerprint, staged = self._stage(
-            digest="6" * 64, open_id="reauthorization-race-open-id"
-        )
-        authorization_id = str(staged["id"])
-        self.store.finalize_auto_match(
-            state_digest="6" * 64,
-            authorization_id=authorization_id,
-            expected_version=1,
-            outcome="matched",
-            account_id=30,
-            platform_uid="723456789",
-            actor="operator",
-            request_id="race-activate",
-            now=1_900_000_003,
-        )
-
-        self.store.create_state(
-            state_digest="7" * 64,
-            bound_username="old-operator",
-            session_binding="7" * 64,
-            target_authorization_id=authorization_id,
-            target_authorization_version=2,
-            scopes=["user_info", "video.list"],
-            expires_at=1_900_001_600,
-            request_id="old-reauthorization-start",
-            now=1_900_001_000,
-        )
-        self.store.begin_exchange(
-            "7" * 64,
-            "old-operator",
-            "7" * 64,
-            request_id="old-reauthorization-callback",
-            now=1_900_001_001,
-        )
-
-        newer = self._candidate("reauthorization-race-open-id")
-        newer["access_token"] = "newer-access-token"
-        self.store.create_state(
-            state_digest="8" * 64,
-            bound_username="new-operator",
-            session_binding="8" * 64,
-            target_authorization_id=authorization_id,
-            target_authorization_version=2,
-            scopes=["user_info", "video.list"],
-            expires_at=1_900_001_700,
-            request_id="new-reauthorization-start",
-            now=1_900_001_100,
-        )
-        self.store.begin_exchange(
-            "8" * 64,
-            "new-operator",
-            "8" * 64,
-            request_id="new-reauthorization-callback",
-            now=1_900_001_101,
-        )
-        current = self.store.stage_authorization_candidate(
-            state_digest="8" * 64,
-            bound_username="new-operator",
-            session_binding="8" * 64,
-            open_id_fingerprint=fingerprint,
-            candidate=newer,
-            cipher=self.cipher,
-            request_id="new-reauthorization-stage",
-            now=1_900_001_102,
-        )
-        self.assertEqual(current["version"], 3)
-
-        older = self._candidate("reauthorization-race-open-id")
-        older["access_token"] = "stale-access-token"
-        with self.assertRaisesRegex(
-            AuthorizationConflict, "reauthorization_version_conflict"
-        ):
-            self.store.stage_authorization_candidate(
-                state_digest="7" * 64,
-                bound_username="old-operator",
-                session_binding="7" * 64,
-                open_id_fingerprint=fingerprint,
-                candidate=older,
-                cipher=self.cipher,
-                request_id="old-reauthorization-stage",
-                now=1_900_001_103,
-            )
-        active = self.store.get_active_authorization(authorization_id)
-        assert active is not None
-        self.assertEqual(active["version"], 3)
-        access = self.cipher.decrypt(
-            authorization_id, "access", bytes(active["access_token_ciphertext"])
-        )
-        self.assertEqual(access["token"], "newer-access-token")
-        with self.store.read_connection() as connection:
-            old_state = connection.execute(
-                "SELECT status,failure_reason FROM oauth_states WHERE state_digest=?",
-                ("7" * 64,),
-            ).fetchone()
-        self.assertEqual(
-            tuple(old_state), ("failed", "reauthorization_version_conflict")
-        )
-
-    def test_pending_rescan_reuses_id_and_stale_finalize_cannot_overwrite(self) -> None:
-        _candidate, _fingerprint, first = self._stage(
-            digest="d" * 64,
-            open_id="pending-rescan-open-id",
-            username="operator-a",
-            binding="c" * 64,
-        )
-        authorization_id = str(first["id"])
-        _candidate2, _fingerprint2, second = self._stage(
-            digest="e" * 64,
-            open_id="pending-rescan-open-id",
-            username="operator-b",
-            binding="d" * 64,
-            now=1_900_000_100,
-        )
-        self.assertEqual(second["id"], authorization_id)
-        self.assertEqual(second["version"], 2)
-        with self.store.read_connection() as connection:
-            count = connection.execute(
-                "SELECT COUNT(*) FROM douyin_authorizations WHERE open_id_fingerprint=?",
-                (self.cipher.open_id_fingerprint("pending-rescan-open-id"),),
-            ).fetchone()[0]
-        self.assertEqual(count, 1)
-        stale = self.store.finalize_auto_match(
-            state_digest="d" * 64,
-            authorization_id=authorization_id,
-            expected_version=1,
-            outcome="matched",
-            account_id=8,
-            platform_uid="223456789",
-            actor="operator-a",
-            request_id="stale-finalize",
-            now=1_900_000_103,
-        )
-        self.assertEqual(stale["status"], "stale")
-        row = self.store.get_authorization(authorization_id)
-        assert row is not None
-        self.assertEqual(row["version"], 2)
-        self.assertEqual(row["status"], "pending_match")
-        self.assertIsNone(row["account_id"])
-        self.assertEqual(row["match_reason"], "matching")
-
-    def test_occupied_uid_stays_pending_and_manual_match_rechecks_target(self) -> None:
-        _candidate, _fingerprint, first = self._stage(
-            digest="f" * 64, open_id="occupied-open-id-a"
-        )
-        first_id = str(first["id"])
-        self.store.finalize_auto_match(
-            state_digest="f" * 64,
-            authorization_id=first_id,
-            expected_version=1,
-            outcome="matched",
-            account_id=10,
-            platform_uid="323456789",
-            actor="operator",
-            request_id="first-active",
-            now=1_900_000_003,
-        )
-        _candidate2, _fingerprint2, second = self._stage(
-            digest="0" * 64,
-            open_id="occupied-open-id-b",
-            now=1_900_000_100,
-        )
-        second_id = str(second["id"])
-        conflict = self.store.finalize_auto_match(
-            state_digest="0" * 64,
-            authorization_id=second_id,
-            expected_version=1,
-            outcome="matched",
-            account_id=10,
-            platform_uid="323456789",
-            actor="operator",
-            request_id="occupied-finalize",
-            now=1_900_000_103,
-        )
-        self.assertEqual(conflict["status"], "pending_match")
-        self.assertEqual(conflict["match_reason"], "account_binding_conflict")
-        occupied_statuses = [
-            item
-            for item in self.store.authorization_statuses(now=1_900_000_103)
-            if item["account_id"] == 10 and item["platform_uid"] == "323456789"
-        ]
-        self.assertEqual(len(occupied_statuses), 1)
-        self.assertEqual(occupied_statuses[0]["id"], first_id)
-        self.assertTrue(occupied_statuses[0]["authorized"])
-        with self.assertRaisesRegex(AuthorizationConflict, "account_binding_conflict"):
-            self.store.manual_match(
-                authorization_id=second_id,
-                account_id=10,
-                platform_uid="323456789",
-                expected_version=2,
-                actor="other-operator",
-                request_id="manual-conflict",
-                now=1_900_000_104,
-            )
-        activated = self.store.manual_match(
-            authorization_id=second_id,
-            account_id=11,
-            platform_uid="423456789",
-            expected_version=3,
-            actor="other-operator",
-            request_id="manual-success",
-            now=1_900_000_105,
-        )
-        self.assertEqual(activated["status"], "active")
-        self.assertEqual(activated["version"], 4)
-        with self.assertRaisesRegex(AuthorizationConflict, "authorization_not_pending"):
-            self.store.manual_match(
-                authorization_id=second_id,
-                account_id=12,
-                platform_uid="523456789",
-                expected_version=4,
-                actor="third-operator",
-                request_id="active-cannot-rebind",
-                now=1_900_000_106,
-            )
-        self.assertTrue(
-            self.store.unbind(
-                actor="third-operator",
-                authorization_id=second_id,
-                expected_version=4,
-                request_id="any-operator-unbind",
-                now=1_900_000_107,
-            )
-        )
-        _candidate3, _fingerprint3, restaged = self._stage(
-            digest="a" * 64,
-            open_id="occupied-open-id-b",
-            username="fourth-operator",
-            binding="e" * 64,
-            target_authorization_id=second_id,
-            target_authorization_version=5,
-            now=1_900_000_200,
-        )
-        self.assertEqual(restaged["id"], second_id)
-        self.assertEqual(restaged["status"], "pending_match")
-        self.assertIsNone(restaged["account_id"])
-        self.assertIsNone(restaged["platform_uid"])
-
-    def test_auto_match_outcomes_status_projection_and_wrong_target_rejected(
-        self,
-    ) -> None:
-        staged_items: list[tuple[str, str, int]] = []
-        for index, outcome in enumerate(("unmatched", "ambiguous", "unavailable")):
-            digest = str(index + 1) * 64
-            _candidate, _fingerprint, staged = self._stage(
-                digest=digest,
-                open_id=f"outcome-open-id-{index}",
-                username=f"operator-{index}",
-                binding=str(index + 5) * 64,
-                now=1_900_002_000 + index * 100,
-            )
-            result = self.store.finalize_auto_match(
-                state_digest=digest,
-                authorization_id=str(staged["id"]),
-                expected_version=1,
-                outcome=outcome,
-                actor=f"operator-{index}",
-                request_id=f"outcome-{outcome}",
-                now=1_900_002_003 + index * 100,
-            )
-            staged_items.append(
-                (str(staged["id"]), str(result["match_reason"]), int(result["version"]))
-            )
-        self.assertEqual(
-            [reason for _id, reason, _version in staged_items],
-            ["no_match", "ambiguous_match", "auto_match_unavailable"],
-        )
-        listed = self.store.list_authorizations("unrelated-operator")
-        self.assertEqual(len(listed), 3)
-        self.assertTrue(all(item["status"] == "pending_match" for item in listed))
-        self.assertTrue(
-            all(not item["authorized"] for item in self.store.authorization_statuses())
-        )
-
-        target_id = staged_items[0][0]
-        activated = self.store.manual_match(
-            authorization_id=target_id,
-            account_id=20,
-            platform_uid="623456789",
-            expected_version=2,
-            actor="operator-admin",
-            request_id="activate-before-wrong-target",
-            now=1_900_002_500,
-        )
-        self.assertEqual(activated["status"], "active")
-        self.store.create_state(
-            state_digest="9" * 64,
-            bound_username="operator-x",
-            session_binding="9" * 64,
-            target_authorization_id=target_id,
-            target_authorization_version=3,
-            scopes=["user_info", "video.list"],
-            expires_at=1_900_003_600,
-            request_id="wrong-target-start",
-            now=1_900_003_000,
-        )
-        self.store.begin_exchange(
-            "9" * 64,
-            "operator-x",
-            "9" * 64,
-            request_id="wrong-target-callback",
-            now=1_900_003_001,
-        )
-        wrong_candidate = self._candidate("different-open-id")
-        with self.assertRaisesRegex(
-            AuthorizationConflict, "reauthorization_target_mismatch"
-        ):
-            self.store.stage_authorization_candidate(
-                state_digest="9" * 64,
-                bound_username="operator-x",
-                session_binding="9" * 64,
-                open_id_fingerprint=self.cipher.open_id_fingerprint(
-                    "different-open-id"
-                ),
-                candidate=wrong_candidate,
-                cipher=self.cipher,
-                request_id="wrong-target-stage",
-                now=1_900_003_002,
-            )
-        with self.store.read_connection() as connection:
-            wrong_rows = connection.execute(
-                "SELECT COUNT(*) FROM douyin_authorizations WHERE open_id_fingerprint=?",
-                (self.cipher.open_id_fingerprint("different-open-id"),),
-            ).fetchone()[0]
-        self.assertEqual(wrong_rows, 0)
-
     def test_token_lifecycle_lease_updates_limit_and_reauthorization_audit(
         self,
     ) -> None:
-        candidate, fingerprint = self._pending(digest="9" * 64)
-        created = self.store.confirm_authorization(
-            state_digest="9" * 64,
-            bound_username="operator",
-            session_binding="a" * 64,
-            open_id_fingerprint=fingerprint,
-            candidate=candidate,
-            cipher=self.cipher,
-            request_id="confirm-token-lifecycle",
-            now=1_900_000_010,
+        _candidate, _fingerprint, created = self._complete_targeted(
+            digest="9" * 64,
+            open_id="token-lifecycle-open-id",
         )
         authorization_id = str(created["id"])
         self.assertRegex(authorization_id, r"\A[0-9a-f]{32}\Z")
@@ -2189,16 +1659,9 @@ class DouyinControlStoreTestCase(unittest.TestCase):
         )
 
     def test_refresh_lease_concurrent_acquire_has_one_owner(self) -> None:
-        candidate, fingerprint = self._pending(digest="a" * 64)
-        created = self.store.confirm_authorization(
-            state_digest="a" * 64,
-            bound_username="operator",
-            session_binding="a" * 64,
-            open_id_fingerprint=fingerprint,
-            candidate=candidate,
-            cipher=self.cipher,
-            request_id="confirm-concurrent-lease",
-            now=1_900_000_010,
+        _candidate, _fingerprint, created = self._complete_targeted(
+            digest="a" * 64,
+            open_id="concurrent-lease-open-id",
         )
         authorization_id = str(created["id"])
         barrier = threading.Barrier(3)

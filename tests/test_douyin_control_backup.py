@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import importlib.util
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -11,6 +13,8 @@ import threading
 import time
 import unittest
 from pathlib import Path
+
+from cryptography.fernet import Fernet
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -23,6 +27,7 @@ HELPER_PATH = (
     / "dcar-douyin-vault-backup.py"
 )
 
+from dcar_douyin_control.crypto import TokenCipher  # noqa: E402
 from dcar_douyin_control.store import VaultStore  # noqa: E402
 
 
@@ -48,6 +53,16 @@ class DouyinControlBackupTestCase(unittest.TestCase):
         self.backup_dir.mkdir(mode=0o700)
         self.store = VaultStore(self.source)
         self.store.initialize()
+        keyring = self.root / "fernet.keys"
+        fingerprint_key = self.root / "open-id-hmac.key"
+        keyring.write_text(
+            f"1:{Fernet.generate_key().decode('ascii')}\n", encoding="utf-8"
+        )
+        fingerprint_key.write_text(
+            base64.urlsafe_b64encode(os.urandom(32)).decode("ascii"),
+            encoding="utf-8",
+        )
+        cipher = TokenCipher(keyring, fingerprint_key)
         now = int(time.time())
         self.store.create_state(
             state_digest="d" * 64,
@@ -67,11 +82,22 @@ class DouyinControlBackupTestCase(unittest.TestCase):
             request_id="backup-canary",
             now=now + 1,
         )
-        self.store.store_candidate(
+        self.store.complete_targeted_authorization(
             state_digest="d" * 64,
-            ciphertext=b"encrypted-candidate-canary",
-            open_id_fingerprint="f" * 64,
-            confirmation_expires_at=now + 900,
+            bound_username="operator",
+            session_binding="e" * 64,
+            open_id_fingerprint=cipher.open_id_fingerprint("backup-open-id"),
+            candidate={
+                "open_id": "backup-open-id",
+                "access_token": "backup-access",
+                "refresh_token": "backup-refresh",
+                "access_expires_at": now + 900,
+                "refresh_expires_at": now + 1_800,
+                "scopes": ["user_info", "video.list"],
+                "nickname": "备份测试账号",
+                "avatar": "",
+            },
+            cipher=cipher,
             request_id="backup-canary",
             now=now + 2,
         )
@@ -97,15 +123,19 @@ class DouyinControlBackupTestCase(unittest.TestCase):
         with sqlite3.connect(target) as connection:
             self.assertEqual(connection.execute("PRAGMA quick_check").fetchone()[0], "ok")
             self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 3)
-            ciphertext = connection.execute(
-                "SELECT candidate_ciphertext FROM oauth_states WHERE state_digest=?",
-                ("d" * 64,),
-            ).fetchone()[0]
-        self.assertEqual(ciphertext, b"encrypted-candidate-canary")
+            row = connection.execute(
+                """
+                SELECT status,access_token_ciphertext,refresh_token_ciphertext
+                FROM douyin_authorizations
+                """
+            ).fetchone()
+        self.assertEqual(row[0], "active")
+        self.assertIsNotNone(row[1])
+        self.assertIsNotNone(row[2])
         manifest_payload = json.loads(manifest.read_text(encoding="utf-8"))
         self.assertEqual(manifest_payload["schema"], "dcar-douyin-vault-backup-v3")
         self.assertEqual(manifest_payload["sha256"], result["sha256"])
-        self.assertEqual(manifest_payload["counts"]["ciphertext_records"], 1)
+        self.assertEqual(manifest_payload["counts"]["ciphertext_records"], 2)
         self.assertEqual(list(self.backup_dir.glob("*.partial")), [])
         self.assertFalse(Path(f"{target}-wal").exists())
         self.assertFalse(Path(f"{target}-shm").exists())

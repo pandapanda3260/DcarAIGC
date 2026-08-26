@@ -12,7 +12,7 @@
 开放平台准备以下底座：
 
 1. 认证网关后的抖音控制路由；
-2. 账号最小投影与授权确认页面；
+2. 从账号列表逐行锁定 `(account_id, platform_uid)` 的授权入口与二级管理页；
 3. 单次消费、绑定浏览器会话的 OAuth 状态机；
 4. 独立加密 Token Vault；
 5. 可在控制服务停机时执行的 SQLite 在线备份；
@@ -60,8 +60,8 @@
 
 - 4173：抖音路由、认证、同源 POST、可信头、callback 清洁失败路径、短超时上游、
   base path Location 修复和 bypass 拒绝。
-- 4175：自渲染页面、账号搜索、Mock OAuth、状态机、授权确认、Token Vault、审计和
-  内部 health。
+- 4175：目标账号复核、Mock OAuth、直接完成目标绑定的状态机、Token Vault、审计和
+  内部 health；React 二级管理页由现有 Web 服务承载。
 - Vault：MultiFernet 密文、open_id HMAC 指纹、SQLite DELETE journal、每连接安全
   PRAGMA、显式关闭、单 writer。
 - 运维：停机也可用的 root 备份 helper、systemd timer、Nginx、Compose、凭据、受限
@@ -72,8 +72,9 @@
 
 - 不连接 `open.douyin.com`，不执行真实 OAuth 或 Token 刷新。
 - 不调用 `video.list`、Webhook、作品统计、媒体下载或删除。
-- 不修改 `v8/storage.py`、`v8/api.py`、`v8/providers.py`、`v8/capture.py`、
-  `v8/scheduler.py`、writer 或 React Web 页面。
+- 阶段 0 初始交付不修改 `v8/storage.py`、`v8/providers.py`、`v8/capture.py`、
+  `v8/scheduler.py` 或 writer；后续 targeted-authorization 修订只修改账号查询/导出 API
+  与账号 React 页面，不改变正式库 schema 和 writer 边界。
 - 不改正式库 schema；4175 不 import `dcar_eval.v8.*`，也不获得正式库写权限。
 - 不把 OpenAPI 临时塞入现有 `call_override`。阶段 1 先参数化 provider、
   adapter version、price 与账号解析，再建立 `AccountDiscoveryAdapter`。
@@ -91,7 +92,7 @@ Nginx -> dcar-auth 4173
              |-- 4174 Web
              |-- 8765 只读 API
              `-- 4175 dcar-douyin-control
-                       |-- 只读调用 8765 /api/v8/accounts/search
+                       |-- start/callback 时只读调用 8765 /api/v8/accounts/search 复核目标
                        `-- /var/lib/dcar-aigc/douyin-control/vault.sqlite3
 
 Mac writer -- 受限 SSH tunnel --> 127.0.0.1:4175/internal/v1/*
@@ -149,10 +150,8 @@ Python 网关清理。
 
 | 路径 | `X-Dcar-Request` |
 | --- | --- |
-| `/api/douyin/accounts/search` | `douyin-accounts-search` |
 | `/api/douyin/oauth/start` | `douyin-oauth-start` |
-| `/api/douyin/oauth/confirm` | `douyin-oauth-confirm` |
-| `/api/douyin/oauth/reject` | `douyin-oauth-reject` |
+| `/api/douyin/authorizations/reauthorize` | `douyin-authorization-reauthorize` |
 | `/api/douyin/authorizations/unbind` | `douyin-authorization-unbind` |
 
 4173 自己复用现有 `_same_origin_post` 语义校验 Origin/可信代理信息，验证后才生成
@@ -191,14 +190,13 @@ Python 网关清理。
 
 | 公开路径 | 方法 | 4175 上游路径 | 固定结果 |
 | --- | --- | --- | --- |
-| `/dcar/douyin` | GET | `/douyin` | 账号选择/授权状态页 |
-| `/dcar/api/douyin/accounts/search` | POST | `/api/douyin/accounts/search` | 最小账号投影 |
-| `/dcar/api/douyin/oauth/start` | POST | `/api/douyin/oauth/start` | `{ "authorize_url": "..." }` |
-| `/dcar/oauth/douyin/callback` | GET | `/oauth/douyin/callback` | 校验、换 Mock Token、303 |
-| `/dcar/douyin/confirm` | GET | `/douyin/confirm` | 当前 pending 授权确认页 |
-| `/dcar/api/douyin/oauth/confirm` | POST | `/api/douyin/oauth/confirm` | 事务确认 |
-| `/dcar/api/douyin/oauth/reject` | POST | `/api/douyin/oauth/reject` | 擦除候选 |
-| `/dcar/api/douyin/authorizations` | GET | `/api/douyin/authorizations` | 当前用户最小状态 |
+| `/dcar/accounts/douyin-authorization` | GET | 4174 Web | 按目标授权或查看授权记录 |
+| `/dcar/douyin` | GET | `/douyin` | 兼容入口，303 到 Web 管理页 |
+| `/dcar/api/douyin/oauth/start` | POST | `/api/douyin/oauth/start` | 锁定 `account_id + platform_uid` 并返回 `{ "authorize_url": "..." }` |
+| `/dcar/oauth/douyin/callback` | GET | `/oauth/douyin/callback` | 复核锁定目标、换 Token、事务绑定、303 |
+| `/dcar/api/douyin/authorizations` | GET | `/api/douyin/authorizations` | 授权记录与历史兼容状态 |
+| `/dcar/api/douyin/authorization-statuses` | GET | `/api/douyin/authorization-statuses` | 账号页精确状态投影 |
+| `/dcar/api/douyin/authorizations/reauthorize` | POST | `/api/douyin/authorizations/reauthorize` | 按 authorization id/version 锁定原目标后重新授权 |
 | `/dcar/api/douyin/authorizations/unbind` | POST | `/api/douyin/authorizations/unbind` | `authorization_id + expected_version` 乐观解绑 |
 
 内部仅暴露 `GET /internal/v1/health`，只接受 Machine Key。阶段 0 不实现同步写入接口。
@@ -207,26 +205,20 @@ Mock OAuth 提供方是独立的 loopback 测试服务，只由测试 fixture �
 4175 产品路由中不得出现 `/mock/*`。生产固定 `provider_mode=disabled`、
 `DOUYIN_AUTHORIZATION_ENABLED=0`，不读取 Client Secret，也不创建 OAuth HTTP client。
 
-## 7. 账号搜索合同
+## 7. 目标账号锁定与复核合同
 
-浏览器请求 JSON 只允许：
-
-- `query`：用户原始输入，0 到 100 字符；不 trim、不写日志；
-- `page`：整数且至少 1；
-- `page_size`：整数且最多 50。
-
-4175 服务端调用只读 `POST /api/v8/accounts/search`，原样透传 `query`，固定强制
-`platform=douyin`。列表需要翻页，不能假定少于 100 个账号。
-
-8765 的真实响应字段为 `platforms`，顶层还可能带 `phone` 和
-`pending_platform_identities`。4175 只允许返回：
-
-- `account_id`、`operator_name`、`enabled`；
-- 已正式建档的 Douyin `uid` 与 `nickname`。
-
-必须删除 phone、pending identity 和其他平台身份。接口不暴露 identity id，Vault
-有意只保存 `(account_id, platform_uid)`。start 与 confirm 都必须重新查询并验证账号仍
-存在、enabled、平台为 Douyin 且 uid 匹配，不信任页面旧快照。
+- 新授权只能从账号列表某一行的“抖音开平授权”入口进入；链接同时携带
+  `account_id` 与该行当前 Douyin `platform_uid`。通用管理页只展示记录，不提供统一扫码。
+- 二级页解析并校验两个参数，通过标准只读 `POST /api/v8/accounts/search` 精确读取目标；
+  必须同时匹配 account id、Douyin uid 和 enabled，不能只按 account id 判断。
+- `POST /api/douyin/oauth/start` 的 JSON 只允许 `account_id + platform_uid`。4175 在创建
+  state 前重新查询 8765，确认账号仍存在、enabled、平台为 Douyin 且 uid 未变化。
+- state 从创建起即保存这组目标；callback 换得 Token 后再次复核相同目标，再在单个事务
+  中完成授权。浏览器选择、open_id、作品 ID 或昵称均不得改变目标。
+- 8765 返回中的 phone、pending identity 和其他平台身份不得进入 Vault、日志或审计。
+  Vault 有意只保存 `(account_id, platform_uid)`，不保存 identity id。
+- 停用账号或缺少 Douyin uid 的账号不能新授权或重新授权；停用账号已有 active 授权仍
+  显示真实状态并允许进入管理页解绑。
 
 ## 8. OAuth 状态机
 
@@ -236,14 +228,16 @@ Mock OAuth 提供方是独立的 loopback 测试服务，只由测试 fixture �
    account_id、platform_uid、requested scopes 和过期时间。
 2. `exchanging`：callback 使用条件更新单次消费；要求 username/session binding 均与
    start 一致。并发回调只有一个能进入。
-3. `pending_confirmation`：code 立即换 Mock Token，候选 Token 立即加密；userinfo
-   失败只降低昵称/头像展示，不销毁已换得 Token。
-4. `confirmed`：confirm 在单个 `BEGIN IMMEDIATE` 事务中 upsert active authorization，
-   清除候选密文。
-5. `failed`、`rejected`、`expired`：终态；立即擦除候选密文，不可继续消费。
+3. callback 立即换 Mock/真实 Token；userinfo 失败不销毁已换得 Token。随后再次只读复核
+   state 中锁定的 account id/uid，并调用 `complete_targeted_authorization` 在单个
+   `BEGIN IMMEDIATE` 事务中 upsert active authorization、清除候选密文并把 state 置为
+   `completed`，不再经过人工确认页。
+4. `failed`、`expired`：终态；立即擦除候选密文，不可继续消费。用户拒绝由 provider
+   callback 错误进入 failed，不提供独立 confirm/reject API。
 
 state 原文和 code 永不入库、日志或审计。过期 pending 由定时清理归入 `expired` 并擦除
 密文。start 返回 JSON，由页面执行 `window.location`；不得让 fetch 跟随跨域 303。
+历史 `pending_match` authorization 不参与新流程，只能由管理页执行乐观版本作废。
 
 ### 8.2 授权唯一性与重新授权
 
@@ -253,11 +247,13 @@ state 原文和 code 永不入库、日志或审计。过期 pending 由定时�
 - 相同 open_id + 不同目标：返回换绑冲突，旧 active 不变。
 - 不同 open_id + 已占用目标：返回占用冲突，旧 active 不变。
 - 只有显式 unbind 成功后，才允许绑定到新目标。
+- reauthorize 必须把 authorization id 与 expected version 一并写入 state；callback 只允许
+  更新同一 active row、相同 account id/uid 和相同版本，不能借重新授权换绑。
 授权记录包含：access/refresh 到期时间、renew_count、scopes、key_version、version、刷新
-租约和 `needs_reauthorization`。阶段 0 只建立这些字段和加密存储，没有实现刷新、
-`renew_refresh_token`、租约竞争、到期调度或自动重新授权逻辑。官方 Token 生命周期限制
-及“同一 open_id 只刷新一次”的执行逻辑属于阶段 1：access 15 天、refresh 30 天、
-refresh 最多续 5 次、最长 195 天后必须重新授权。
+租约和 `needs_reauthorization`。阶段 0 最初只建立字段和加密存储；后续 Token 生命周期
+修订已实现按 open_id 串行的刷新租约、access 刷新、`renew_refresh_token` 最多 5 次、
+到期后 `needs_reauthorization` 以及密钥懒轮换。官方限制仍固定为 access 15 天、refresh
+30 天、最长 195 天后必须重新授权。
 
 ## 9. Vault 模型与加密合同
 
@@ -266,8 +262,9 @@ Vault 只含三张业务表：
 ### 9.1 `oauth_states`
 
 至少包含：`state_digest` 主键、`bound_username`、`session_binding`、`account_id`、
-`platform_uid`、`requested_scopes_json`、`status`、`expires_at`、候选 token 密文、
-候选 open_id 指纹、候选公开资料、失败 reason code、创建/更新时间。
+`platform_uid`、`target_authorization_id`、`target_authorization_version`、
+`requested_scopes_json`、`status`、`expires_at`、候选 token 密文、候选 open_id 指纹、
+候选公开资料、失败 reason code、创建/更新时间。
 
 候选 Token 明文 envelope 必须包含 `record_id=state_digest`；解密后用常量时间比较，防止
 不同记录间替换密文。
@@ -279,8 +276,9 @@ Vault 只含三张业务表：
 `renew_count`、`scopes_json`、`key_version`、`version`、刷新租约、
 `needs_reauthorization`、状态和时间戳。
 
-另加 `(account_id, platform_uid)` 的 active 唯一约束，数据库约束和事务内显式冲突检查
-共同保证不隐式换绑。
+另加 active 目标唯一约束，数据库约束和事务内显式冲突检查共同保证不隐式换绑。
+`pending_match` 仅用于兼容旧 Vault 记录，允许 account id/uid 为空且只能作废；新 OAuth
+流程不得创建 pending_match，也不得自动或人工匹配。
 
 ### 9.3 `audit_events`
 
@@ -290,9 +288,8 @@ Machine Key 或用户手机号。
 
 ### 9.4 密钥
 
-- Token 使用 `MultiFernet` 认证加密；阶段 0 已验证多 key 解密和显式 `rotate()` 原语，
-  但 Vault 尚未实现“旧 key 解密后用 primary key 懒重加密”的读写路径，该逻辑属于
-  阶段 1。
+- Token 使用 `MultiFernet` 认证加密；Token manager 在持有刷新租约时检测旧 key version，
+  使用 primary key 旋转 access/refresh 两条密文并以版本化条件更新写回。
 - Fernet keyring 每行固定为 `<正整数版本>:<Fernet key>`，首行是当前写 key，版本不得
   重复；候选密文绑定 `record_id=state_digest, kind=oauth_candidate`，正式 access/refresh
   密文分别绑定 `record_id=authorization_id, kind=access|refresh`。
@@ -437,7 +434,8 @@ session RW 路径。`ConditionPathIsDirectory` 只负责早失败；验收仍检
 3. 持锁复核 schema16、active snapshot、业务 DB SHA；安装目录、credential、unit。
 4. 依次停止 Auth、Control、Web、API，原子切换 `current`，依次启动 API、Control、Web、
    Auth。
-5. 服务健康后执行 `nginx -t` 并 reload；验证公网 health、页面、账号搜索和 start=409。
+5. 服务健康后执行 `nginx -t` 并 reload；验证公网 health、目标授权页、精确目标复核和
+   start=409。
 6. 复核业务 DB SHA、active snapshot 和 8765 只读状态未变，记录 receipt 后释放锁。
 
 snapshot installer 使用阻塞 `flock(LOCK_EX)`；若自动 publisher 在发布持锁期间触发，
@@ -453,7 +451,7 @@ API、Web、Auth 原合同完成 smoke。不得只回滚 4175 或只回滚按钮
 未登录 HTTPS smoke 已验证：页面返回 302、API 返回 401，callback 返回 303
 到不含 code/state 的固定 notice，响应具有 `no-store` 和 `no-referrer`。另使用
 服务器端创建并随即撤销的短期生产 Session 完成真实 HTTPS smoke：
-`/auth/session`、Douyin 页面和账号搜索均成功，带跨站导航 Fetch Metadata 的
+`/auth/session`、目标授权页和精确账号目标复核均成功，带跨站导航 Fetch Metadata 的
 callback 抵达 4175，并因 provider flag=0 按预期跳转到 `oauth-disabled`。
 
 当前 Chrome 没有可复用的 Dcar 登录态，验收过程也没有代用户输入密码，因此
@@ -489,13 +487,15 @@ provider flag 仍为 0，以上 smoke 不证明有效 state 消费或真实抖�
 
 1. 更新并锁定 `cryptography` 依赖；
 2. 实现 ready 前 DELETE preflight 和每连接 PRAGMA；
-3. 实现三表 DAO、加密和状态机；
-4. 实现页面、账号投影、loopback Mock OAuth client 与 test-only provider fixture；
+3. 实现三表 DAO、加密和锁定目标的状态机；
+4. 实现按账号行进入的二级管理页、目标复核、loopback Mock OAuth client 与 test-only
+   provider fixture；
 5. 实现单次 backup helper；
 6. 运行单元、集成、并发和停机备份测试。
 
-放行：真实抖音零连接；state 重放/错会话/冲突、密文替换、旧 WAL 纠偏、每连接
-sync=3、显式 close、短锁、持续锁、4175 停机备份全部通过；生产 flag=0。
+放行：真实抖音零连接；state 重放/错会话/目标变化/占用冲突、通用页禁止扫码、历史
+pending 只作废、密文替换、旧 WAL 纠偏、每连接 sync=3、显式 close、短锁、持续锁、
+4175 停机备份全部通过；生产 flag=0。
 
 ### 0D：部署、发布与文档
 
@@ -511,9 +511,10 @@ sync=3、显式 close、短锁、持续锁、4175 停机备份全部通过；生
 - Gateway：路径边界、bypass、认证顺序、GET/POST 方法白名单、marker/Origin、清头/注头、
   丢弃 4175 的全部 Set-Cookie、callback、Location、上游短超时。
 - Body：缺 Content-Length=411、超过 64KiB=413、上限内 bytes 不变。
-- Account search：空/中文/空格/%/_/100 字符原样传递；101=422 且 8765 零调用；最小投影。
-- OAuth：单次 state、并发 callback、错用户/会话、过期/reject、userinfo 降级、重新授权和
-  唯一性冲突。
+- Target：账号行链接和 start body 必须包含相同 account id/uid；缺参数、uid 变化、账号
+  停用均 fail closed；start 与 callback 都重新查询；通用管理页不得发起扫码。
+- OAuth：单次 state、并发 callback、错用户/会话、过期/provider 拒绝、userinfo 降级、
+  callback 直接完成目标绑定、重新授权版本锁和唯一性冲突；历史 pending 只能作废。
 - Vault：新库、持久 WAL 转 DELETE、占用 WAL 拒绝、每连接 sync=3、显式 close、
   `BEGIN IMMEDIATE`、密文跨记录替换失败。
 - Backup：运行中、clean stop、短锁、60 秒持续锁、hot journal fail closed、manifest、
@@ -537,24 +538,23 @@ sync=3、显式 close、短锁、持续锁、4175 停机备份全部通过；生
 5. 阶段 1 首版不显示真实头像，只使用本地占位图并把 CSP 收紧为
    `img-src 'self' data:`；不保存或渲染 provider avatar URL。若未来确需头像代理，必须
    另立 ADR 处理 SSRF、域名白名单、大小/类型限制和缓存，不能恢复浏览器直连外域；
-6. 实现 access/refresh 到期调度、open_id 刷新租约、`renew_refresh_token` 次数与 195 天
-   上限、`needs_reauthorization` 状态，以及旧 key 解密后的 primary-key 懒重加密；
-7. 增加 root-only 运维 CLI，用于离职操作员场景下审计式解绑：参数必须包含
-   `authorization_id`、`expected_version`、`actor` 和 `reason`，原子擦除 Token、置为
-   `unbound`、版本加一并记录 `authorization_admin_unbind`。CLI 不直接转移所有者；新
-   操作员必须重新完成 OAuth，不允许任意已登录浏览器操作员接管他人授权；
-8. 以 Vault schema v2 把 active 授权唯一约束迁移为仅
-   `platform_uid WHERE status='active'`，并补全冲突矩阵：owner 不同为
-   `owner_conflict`；同 open_id/同 UID 但 account_id 漂移为 `target_changed`；同 open_id
-   但 UID 改变为 `open_id_rebind_conflict`；不同 open_id 占用相同 active UID 为
-   `account_binding_conflict`；只有 unbound 记录才能由新操作员重新 OAuth 认领；
+6. Token manager 的 access/refresh 到期、刷新租约、续期次数、195 天上限、
+   `needs_reauthorization` 和 primary-key 懒轮换合同保持全绿；
+7. 内部工具采用“任何已登录操作员均可管理”的产品权限，`bound_username` 仅记录最近授权
+   发起人；解绑必须带 `authorization_id + expected_version`，原子擦除 Token、版本加一并
+   在 `audit_events.actor` 记录实际操作人，不允许直接换绑；
+8. Vault schema v3 的 active `platform_uid` 唯一约束和目标冲突矩阵保持全绿：同 open_id
+   改目标为 `open_id_rebind_conflict/target_changed`，不同 open_id 占用同一目标为
+   `account_binding_conflict`；只有先显式 unbind 后才能绑定新目标；
 9. callback 用户名/Session 不匹配必须在事务外留下不含敏感值的 `security_rejected`
    审计；新 start 遇到 `exchanging` 流程必须返回 409，不得直接 supersede；
 10. trust boundary 对非 ASCII credential/action 头稳定返回 403，不得让
     `compare_digest` 的 `TypeError` 变成 500；
-11. 单个自有白名单账号完成授权、刷新、重新授权、账号匹配、撤销 canary；
+11. 单个自有白名单账号从对应账号行完成目标锁定、授权、刷新、重新授权、撤销 canary，
+    并验证 Mac writer 消费该 active 授权；
 12. 先完成 `AccountDiscoveryAdapter` 前置参数化，`call_override` 仍只用于 fixture；
-13. 明确 open_id 到 `(account_id, platform_uid)` 的绑定及 DiscoveryItem 映射；
+13. 保持 open_id 到 state 锁定 `(account_id, platform_uid)` 的绑定；DiscoveryItem 映射不得
+    反向参与或改变账号绑定；
 14. Mac writer 继续是正式业务库唯一 writer。
 
 ### 16.2 阶段 1 运维与测试债

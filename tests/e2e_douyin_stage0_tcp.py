@@ -528,7 +528,7 @@ def run() -> dict[str, Any]:
             assert_equal(
                 authorization["platform_uid"],
                 PLATFORM_UID,
-                "auto-match platform uid",
+                "targeted binding platform uid",
             )
             assert_absent(
                 json.dumps(listed.json()),

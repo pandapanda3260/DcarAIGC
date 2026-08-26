@@ -537,10 +537,12 @@ Post-install acceptance must cover:
 - one report download passes its registered hash; omitted large evidence returns
   a clear unavailable response instead of a server error;
 - write endpoints are rejected by read-replica mode;
-- `GET /dcar/douyin` renders through the authenticated gateway and account
-  search returns only the documented Douyin projection;
-- `POST /dcar/api/douyin/oauth/start` returns 409 in production stage 0 and no
-  request reaches `open.douyin.com`;
+- `GET /dcar/accounts/douyin-authorization` renders through the authenticated
+  gateway; a new authorization is entered from one account row and its POST body
+  locks the exact account id plus Douyin uid, while the general management page
+  exposes no unified scan action;
+- a targeted `POST /dcar/api/douyin/oauth/start` returns 409 while the production
+  stage-0 flag is disabled and no request reaches `open.douyin.com`;
 - Squid listens only on `127.0.0.1:4176`, permits only
   `CONNECT open.douyin.com:443`, and denies subdomains, IP literals, other
   domains, methods, and ports;

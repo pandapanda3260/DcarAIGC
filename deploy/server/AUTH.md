@@ -127,10 +127,12 @@ DCAR_AUTH_SESSION_ROOT=/var/lib/dcar-aigc/auth-compose-sessions \
 - 点击退出后 URL 为 `/dcar/login`；
 - 浏览器后退或手工重放退出前 Cookie，受保护页面仍要求登录；
 - 连续失败达到限制后返回 429；
-- 已登录访问 `/dcar/douyin` 可看到控制页，账号搜索只返回正式 Douyin 身份投影；
+- 已登录访问 `/dcar/accounts/douyin-authorization` 可看到授权管理页；新授权只能从账号
+  列表具体行进入，链接与 start body 同时锁定 account id 和 Douyin uid，通用管理页不
+  提供统一扫码；
 - Douyin 路由的 HEAD/PUT/PATCH/DELETE/OPTIONS 返回 405，4175 返回的任意
   `Set-Cookie` 都不会到达浏览器或覆盖当前 Session；
-- 阶段 0 发起授权固定返回 409，真实抖音网络零请求；
+- 阶段 0 flag 关闭时，带完整目标的发起授权固定返回 409，真实抖音网络零请求；
 - `dcar-douyin-egress` 只监听 `127.0.0.1:4176`，只允许
   `CONNECT open.douyin.com:443`；example.com、IP literal、非 CONNECT 和其他端口
   都返回拒绝；
