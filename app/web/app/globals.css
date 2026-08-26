@@ -410,16 +410,10 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
 .douyin-authorization-details dt { color: #89969a; font-size: 9px; }
 .douyin-authorization-details dd { margin: 4px 0 0; overflow: hidden; color: #53666d; font-size: 10px; font-weight: 750; text-overflow: ellipsis; white-space: nowrap; }
 .douyin-authorization-actions { margin-top: 15px; display: flex; justify-content: flex-end; gap: 8px; }
-.douyin-manual-match { margin-top: 15px; padding-top: 15px; border-top: 1px solid var(--line); }
-.douyin-manual-match form { margin-top: 13px; }
-.douyin-manual-match form > label { display: block; margin-bottom: 7px; color: #53666d; font-size: 10px; font-weight: 800; }
-.douyin-manual-match form > div { display: flex; gap: 8px; }
-.douyin-manual-match input { min-width: 260px; height: 36px; padding: 0 11px; border: 1px solid #d6dfe1; border-radius: 7px; background: #fff; color: #46585e; font-size: 10px; }
-.douyin-manual-match ul { margin: 10px 0 0; padding: 0; list-style: none; border-top: 1px solid #e7ecee; }
-.douyin-manual-match li { padding: 10px 0; display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid #e7ecee; }
-.douyin-manual-match li strong, .douyin-manual-match li span { display: block; }
-.douyin-manual-match li strong { color: var(--ink); font-size: 10px; }
-.douyin-manual-match li span, .douyin-search-hint { margin: 4px 0 0; color: var(--muted); font-size: 9px; }
+.douyin-authorization-target { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+.douyin-authorization-target h3 { margin: 4px 0 0; color: var(--ink); font-size: 17px; }
+.douyin-authorization-target p { margin: 7px 0 0; color: var(--muted); font-size: 11px; }
+.douyin-authorization-target-actions { display: flex; align-items: center; gap: 8px; }
 .file-input { position: absolute; width: 1px; height: 1px; overflow: hidden; opacity: 0; pointer-events: none; }
 .filter-bar { padding: 13px; border: 1px solid var(--line); border-radius: 11px; background: #fff; display: flex; flex-wrap: wrap; align-items: center; gap: 9px; }
 .filter-bar input, .filter-bar select { height: 36px; padding: 0 11px; border: 1px solid #d6dfe1; border-radius: 7px; background: #fafbfb; color: #6d7c81; font-size: 10px; outline: 0; }
@@ -480,6 +474,10 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
 .account-master-table .account-platform-start { border-left: 2px solid #dce4e6; }
 .account-master-table .account-number-cell { text-align: right; font-variant-numeric: tabular-nums; }
 .account-master-table .account-douyin-authorization-cell { color: #536970; font-weight: 750; }
+.account-master-table .account-douyin-authorization-cell span, .account-master-table .account-douyin-authorization-cell a, .account-master-table .account-douyin-authorization-cell small { display: block; }
+.account-master-table .account-douyin-authorization-cell a { margin-top: 3px; color: var(--teal); font-size: 9px; font-weight: 800; text-decoration: none; }
+.account-master-table .account-douyin-authorization-cell a:hover { text-decoration: underline; }
+.account-master-table .account-douyin-authorization-cell small { margin-top: 3px; color: var(--muted); font-size: 9px; }
 .account-master-table .account-sticky { position: sticky; z-index: 2; background: #fff; }
 .account-master-table thead .account-sticky { z-index: 4; background: #f8fafb; }
 .account-master-table .account-phone { left: 0; }
@@ -847,8 +845,7 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
   .douyin-authorization-summary div:nth-child(2n) { border-right: 0; }
   .douyin-authorization-summary div:nth-last-child(-n+2) { border-bottom: 0; }
   .douyin-authorization-details { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .douyin-manual-match form > div, .douyin-manual-match li { align-items: stretch; flex-direction: column; }
-  .douyin-manual-match input { width: 100%; min-width: 0; }
+  .douyin-authorization-target, .douyin-authorization-target-actions { align-items: stretch; flex-direction: column; }
   .task-card { grid-template-columns: 1fr; align-items: stretch; gap: 14px; }
   .task-card > .button-link { justify-self: stretch; }
   .quality-check-list li { flex-direction: column; gap: 8px; }

@@ -136,7 +136,7 @@ test("server-renders every real v8 product route", async () => {
   }
 });
 
-test("douyin authorization management uses the official scan flow and fixed trusted markers", async () => {
+test("douyin authorization management locks every scan to the selected business account", async () => {
   const [source, queries, api] = await Promise.all([
     readFile(new URL("../app/accounts/douyin-authorization/DouyinAuthorizationPage.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/lib/queries.ts", import.meta.url), "utf8"),
@@ -147,23 +147,38 @@ test("douyin authorization management uses the official scan flow and fixed trus
   assert.match(source, /href="\/accounts">返回账号页<\/Link>/);
   assert.match(source, /readJson<\{ authenticated: true; username: string \}>\("\/auth\/session"\)/);
   assert.match(source, /sessionQuery\.data\?\.username === "temporary-bypass"/);
-  assert.match(source, /enabled: canUseCurrentAuthorizationControl/);
+  assert.match(source, /enabled: canUseControl/);
   assert.match(source, /PRODUCTION_AUTHORIZATION_URL = "https:\/\/origin\.tj\.cn\/dcar\/accounts\/douyin-authorization"/);
-  assert.match(source, /isBypassMode \? <article[\s\S]*请在正式 HTTPS 工作台完成扫码[\s\S]*href=\{PRODUCTION_AUTHORIZATION_URL\}/);
-  assert.match(source, /authorizationDataReady && <>[\s\S]*aria-label="抖音授权统计"/);
-  assert.match(source, /const authorizationReadPending = !queryError && \([\s\S]*authorizationsQuery\.isPending \|\| statusesQuery\.isPending/);
-  assert.match(source, /disabled=\{Boolean\(busyAction\) \|\| !authorizationActionsAvailable\}/);
-  assert.match(source, /className="primary"[\s\S]*开始扫码授权/);
-  assert.match(source, /markedJsonRequest\(\{\}, "douyin-oauth-start"\)/);
+  assert.match(source, /isBypassMode \? <article[\s\S]*请在正式 HTTPS 工作台完成扫码[\s\S]*href=\{productionUrl\}/);
+  assert.match(source, /authorizationDataReady && !targetWasRequested && <>[\s\S]*aria-label="抖音授权统计"/);
+  assert.match(source, /const authorizationReadPending = !queryError && \(sessionQuery\.isPending \|\| \(canUseControl && !authorizationDataReady\)/);
+  assert.match(source, /const rawAccountId = params\.get\("account_id"\) \?\? ""/);
+  assert.match(source, /const platformUid = params\.get\("platform_uid"\) \?\? ""/);
+  assert.match(source, /const targetIsValid = Number\.isSafeInteger\(accountId\) && accountId > 0 && \/\^\\d\{6,24\}\$\/\.test\(platformUid\)/);
+  assert.match(source, /buildAccountSearchRequest\(\{ query: platformUid, accountType: "", direction: "", platform: "douyin" \}, 1, 100\)/);
+  assert.match(source, /accountSearchQueryOptions\(targetRequest\), enabled: canUseControl && targetIsValid/);
+  assert.match(source, /targetAccountQuery\.data\?\.items\.find\(\(item\) => item\.id === accountId\)/);
+  assert.match(source, /identity\.platform === "douyin" && identity\.uid === uid/);
+  assert.match(queries, /accountSearchQueryOptions[\s\S]*readJson<AccountSearchResult>\("\/api\/v8\/accounts\/search"/);
+  assert.match(source, /targetWasRequested && !targetIsValid[\s\S]*授权目标参数无效/);
+  assert.match(source, /targetIsValid && targetAccountQuery\.isSuccess && !targetMatches[\s\S]*目标账号不存在或抖音账号编号已变化/);
+  assert.match(source, /targetMatches && !targetAccount\?\.enabled[\s\S]*已有授权仍可解绑/);
+  assert.match(source, /authorizationDataReady && targetIsValid && targetMatches && <article className="panel douyin-authorization-target">/);
+  assert.match(source, /disabled=\{Boolean\(busyAction\) \|\| !actionsAvailable \|\| !targetCanAuthorize\}/);
+  assert.match(source, /markedJsonRequest\(\{ account_id: accountId, platform_uid: platformUid \}, "douyin-oauth-start"\)/);
   assert.match(source, /window\.location\.assign\(result\.authorize_url\)/);
-  assert.doesNotMatch(source, /account_id[^\n]*douyin-oauth-start|选择业务账号[^\n]*开始扫码授权/);
-  assert.match(source, /"\/api\/douyin\/accounts\/search"[\s\S]*"douyin-accounts-search"/);
-  assert.match(source, /"\/api\/douyin\/authorizations\/match"[\s\S]*"douyin-authorization-match"/);
+  assert.match(source, /authorizationDataReady && !targetWasRequested && <>[\s\S]*本页不提供统一扫码入口[\s\S]*返回账号列表/);
+  assert.doesNotMatch(source, /markedJsonRequest\(\{\}, "douyin-oauth-start"\)|选择业务账号[^\n]*开始扫码授权/);
+  assert.doesNotMatch(source, /\/api\/douyin\/accounts\/search|douyin-accounts-search/);
+  assert.doesNotMatch(source, /\/api\/douyin\/authorizations\/match|douyin-authorization-match|人工匹配业务账号/);
   assert.match(source, /"\/api\/douyin\/authorizations\/reauthorize"[\s\S]*"douyin-authorization-reauthorize"/);
   assert.match(source, /"\/api\/douyin\/authorizations\/unbind"[\s\S]*"douyin-authorization-unbind"/);
-  assert.match(source, /item\.status !== "pending_match"[\s\S]*重新授权/);
-  assert.match(source, /item\.status === "active"[\s\S]*解绑/);
-  assert.match(source, /item\.status === "pending_match"[\s\S]*人工匹配业务账号/);
+  assert.match(source, /activeTargetAuthorization\.needs_reauthorization \? "需重新授权" : "已授权"/);
+  assert.match(source, /onClick=\{\(\) => void reauthorize\(activeTargetAuthorization\)\}[\s\S]*重新扫码授权/);
+  assert.match(source, /onClick=\{\(\) => void unbind\(activeTargetAuthorization\)\}>解绑/);
+  assert.match(source, /item\.status === "pending_match" && <button[\s\S]*onClick=\{\(\) => void unbind\(item\)\}>作废<\/button>/);
+  assert.match(source, /item\.status === "pending_match" \? "历史待处理授权已作废。" : "抖音开放平台授权已解绑。"/);
+  assert.match(source, /旧版遗留的待匹配记录只允许作废，不再人工匹配/);
   assert.match(source, /new BroadcastChannel\(CALLBACK_CHANNEL\)/);
   assert.match(source, /window\.opener\.postMessage\(CALLBACK_MESSAGE, window\.location\.origin\)/);
   assert.doesNotMatch(source, /postMessage\([^\n]+,\s*["']\*["']/);
@@ -709,12 +724,15 @@ test("routes preserve operations and expose read-only evidence workbench", async
   assert.match(contents, /if \(!contentsQuery\.data \|\| contentsQuery\.isPlaceholderData\) return;[\s\S]*lastPageFor\(contentsQuery\.data\.total, appliedRequest\.page_size\)[\s\S]*\{ \.\.\.current, page: lastPage \}/);
   assert.doesNotMatch(contents, /function pageWindow/);
   assert.match(accounts, /以手机号为唯一标识的账号列表/);
-  assert.match(accounts, /新增账号<\/button><Link className="secondary button-link" href="\/accounts\/douyin-authorization">账号授权<\/Link><a className="secondary button-link"[^>]+>下载账号表格<\/a><label className="secondary button-link">批量导入/);
+  assert.match(accounts, /新增账号<\/button><Link className="secondary button-link" href="\/accounts\/douyin-authorization">抖音授权管理<\/Link><a className="secondary button-link"[^>]+>下载账号表格<\/a><label className="secondary button-link">批量导入/);
   assert.match(accounts, /useQuery\(douyinAuthorizationStatusesQueryOptions\(\)\)/);
-  assert.match(accounts, /filter\(\(item\) => item\.account_id != null && item\.authorized\)/);
-  assert.match(accounts, /isPending && !douyinAuthorizationStatusesQuery\.data\) return "查询中"/);
-  assert.match(accounts, /douyinAuthorizationStatusesQuery\.isError\) return "状态异常"/);
-  assert.match(accounts, /authorizedAccountIds\.has\(accountId\) \? "已授权" : "未授权"/);
+  assert.match(accounts, /authorizationStatuses\.find\(\(item\) => item\.account_id === account\.id && item\.platform_uid === identity\.uid && item\.status === "active"\)/);
+  assert.match(accounts, /authorizationStatusesPending[\s\S]*\? "查询中"[\s\S]*authorizationStatusesFailed[\s\S]*\? "状态异常"[\s\S]*needsAuthorization[\s\S]*\? "需重新授权"[\s\S]*authorization\?\.authorized[\s\S]*\? "已授权"[\s\S]*: "未授权"/);
+  assert.match(accounts, /`\/accounts\/douyin-authorization\?account_id=\$\{encodeURIComponent\(String\(account\.id\)\)\}&platform_uid=\$\{encodeURIComponent\(douyinUid\)\}`/);
+  assert.match(accounts, /const hasDouyinUid = Boolean\(douyinUid\)/);
+  assert.match(accounts, /const canOpenAuthorization = hasDouyinUid && \(account\.enabled \|\| Boolean\(authorization\)\)/);
+  assert.match(accounts, /canOpenAuthorization \? <Link href=\{authorizationHref\}>\{account\.enabled && needsAuthorization \? "重新授权" : authorization \? "管理" : "去授权"\}<\/Link> : <small>账号已停用<\/small>/);
+  assert.match(accounts, /hasDouyinUid \? <>[\s\S]*<span>不可授权<\/span>/);
   assert.match(accounts, /className="account-base-group" colSpan=\{4\} scope="colgroup">账号基础信息/);
   assert.match(accounts, /platformKeys\.map\(\(key\) => <th className="account-platform-group"/);
   assert.match(accounts, /colSpan=\{key === "douyin" \? 6 : 5\}/);
@@ -724,9 +742,9 @@ test("routes preserve operations and expose read-only evidence workbench", async
   assert.match(accounts, /key === "douyin" && <col className="account-douyin-authorization-col" \/>/);
   assert.match(formatSource, /platformKeys = \["douyin", "xiaohongshu", "wechat_channels", "kuaishou"\]/);
   assert.match(accounts, /<th className="account-platform-start" scope="col">平台账号编号<\/th><th scope="col">是否实名<\/th>\{key === "douyin" && <th scope="col">抖音开平授权<\/th>\}<th scope="col">昵称<\/th><th className="account-number-cell" scope="col">粉丝量<\/th><th className="account-number-cell" scope="col">关联内容量<\/th>/);
-  assert.match(accounts, /platformKey === "douyin" && <td className="account-douyin-authorization-cell">\{douyinAuthorizationStatus\}<\/td>/);
+  assert.match(accounts, /platformKey === "douyin" && <td className="account-douyin-authorization-cell">\{hasDouyinUid \? <>/);
   assert.match(accounts, /<th className="account-sticky account-phone" scope="row"><strong>\{item\.phone\}<\/strong><\/th>/);
-  assert.match(accounts, /<AccountPlatformCells account=\{item\} douyinAuthorizationStatus=\{douyinAuthorizationStatus\(item\.id\)\} \/>/);
+  assert.match(accounts, /<AccountPlatformCells account=\{item\} authorizationStatuses=\{douyinAuthorizationStatuses\} authorizationStatusesPending=\{douyinAuthorizationStatusesQuery\.isPending && !douyinAuthorizationStatusesQuery\.data\} authorizationStatusesFailed=\{douyinAuthorizationStatusesQuery\.isError\} \/>/);
   assert.match(accounts, /new BroadcastChannel\("dcar-douyin-authorization"\)/);
   assert.match(accounts, /event\.origin !== window\.location\.origin \|\| !receivesAuthorizationUpdate\(event\.data\)/);
   assert.match(accounts, /data\.type === "dcar-douyin-authorization-updated"/);

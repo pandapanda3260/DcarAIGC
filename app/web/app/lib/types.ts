@@ -237,21 +237,6 @@ export type DouyinAuthorizationStatus = {
   scopes: string[];
 };
 
-export type DouyinAccountDirectoryItem = {
-  account_id: number;
-  operator_name: string;
-  enabled: boolean;
-  uid: string;
-  nickname: string;
-};
-
-export type DouyinAccountDirectoryResult = {
-  items: DouyinAccountDirectoryItem[];
-  total: number;
-  page: number;
-  page_size: number;
-};
-
 export type ContentTagSpu = {
   spu_id: string;
   series: string;
