@@ -64,7 +64,8 @@ Do not configure `TIKHUB_API_KEY` or `TIKHUB_API_KEY_FILE` on the read replica.
 If a future designated writer uses a credential file, keep it outside the
 repository with restrictive permissions and point `TIKHUB_API_KEY_FILE` to it.
 
-The Douyin control plane ships fail-closed in stage 0:
+The Douyin control plane ships fail-closed in stage 0. The application defaults
+to these values when `/etc/dcar-aigc/douyin-stage1.env` is absent or omits them:
 
 ```text
 DOUYIN_AUTHORIZATION_ENABLED=0
@@ -118,7 +119,10 @@ The control unit uses the explicit
 `DCAR_DOUYIN_PROXY_URL=http://127.0.0.1:4176` contract. Provider code must use
 that value explicitly with ambient proxy discovery disabled; it must never
 fall back to a direct connection when the proxy is unavailable. The base unit
-still fixes `DOUYIN_AUTHORIZATION_ENABLED=0` and
+loads the optional root-owned `/etc/dcar-aigc/douyin-stage1.env`; it does not
+duplicate either gate with `Environment=` because systemd's directly configured
+values would override the environment file. With the file absent, application
+defaults remain `DOUYIN_AUTHORIZATION_ENABLED=0` and
 `DCAR_DOUYIN_PROVIDER=disabled`, so installing the proxy alone cannot enable a
 real authorization or provider call.
 

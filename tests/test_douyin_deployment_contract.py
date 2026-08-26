@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class DouyinDeploymentContractTestCase(unittest.TestCase):
-    def test_control_unit_is_loopback_only_hardened_and_disabled(self) -> None:
+    def test_control_unit_is_loopback_only_hardened_and_fail_closed(self) -> None:
         unit = (
             ROOT / "deploy/server/systemd/dcar-douyin-control.service"
         ).read_text(encoding="utf-8")
@@ -29,8 +29,11 @@ class DouyinDeploymentContractTestCase(unittest.TestCase):
         self.assertIn("IPAddressAllow=localhost", unit)
         self.assertIn("ProtectSystem=strict", unit)
         self.assertIn("CapabilityBoundingSet=\n", unit)
-        self.assertIn("DOUYIN_AUTHORIZATION_ENABLED=0", unit)
-        self.assertIn("DCAR_DOUYIN_PROVIDER=disabled", unit)
+        self.assertIn(
+            "EnvironmentFile=-/etc/dcar-aigc/douyin-stage1.env", unit
+        )
+        self.assertNotIn("Environment=DOUYIN_AUTHORIZATION_ENABLED=", unit)
+        self.assertNotIn("Environment=DCAR_DOUYIN_PROVIDER=", unit)
         self.assertIn(
             "DCAR_DOUYIN_PROXY_URL=http://127.0.0.1:4176", unit
         )

@@ -13,10 +13,9 @@ Environment=PYTHONPATH=/var/www/dcar-aigc/current/src/dcar_eval
 Environment=DCAR_DOUYIN_PUBLIC_BASE_PATH=/dcar
 Environment=DCAR_DOUYIN_VAULT=/var/lib/dcar-aigc/douyin-control/vault.sqlite3
 Environment=DCAR_DOUYIN_API_UPSTREAM=http://127.0.0.1:8765
-Environment=DOUYIN_AUTHORIZATION_ENABLED=0
-Environment=DCAR_DOUYIN_PROVIDER=disabled
 Environment=DCAR_DOUYIN_PROXY_URL=http://127.0.0.1:4176
 Environment=DCAR_DOUYIN_CLIENT_SECRET_FILE=/run/credentials/dcar-douyin-control.service/douyin-client-secret
+EnvironmentFile=-/etc/dcar-aigc/douyin-stage1.env
 LoadCredential=douyin-edge-key:/etc/dcar-aigc/credentials/douyin-edge-key
 LoadCredential=douyin-machine-key:/etc/dcar-aigc/credentials/douyin-machine-key
 LoadCredential=douyin-fernet-keyring:/etc/dcar-aigc/credentials/douyin-fernet-keyring

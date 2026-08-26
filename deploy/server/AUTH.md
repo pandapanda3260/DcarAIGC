@@ -74,8 +74,9 @@ keyring、open-id HMAC 四个随机凭据，均为 root:root 0600。上线 Stage
 必须先在抖音控制台轮换截图中暴露过的值，并把唯一的新 Client Secret 安装为
 `/etc/dcar-aigc/credentials/douyin-client-secret`（root:root 0600）。4175 只通过
 systemd `LoadCredential` 读取它，Squid 的 `proxy` 用户不能读取凭据源。基础 unit
-仍固定关闭真实 OAuth（`DOUYIN_AUTHORIZATION_ENABLED=0`）和真实 provider
-（`DCAR_DOUYIN_PROVIDER=disabled`）。安装 `dcar-douyin-egress`、五个常驻 unit、
+只读取 root-owned 的 `/etc/dcar-aigc/douyin-stage1.env`，不再用 `Environment=`
+重复定义两个开关；文件缺失时应用默认仍为 `DOUYIN_AUTHORIZATION_ENABLED=0` 和
+`DCAR_DOUYIN_PROVIDER=disabled`。安装 `dcar-douyin-egress`、五个常驻 unit、
 备份 service/timer 和备份 helper 后，再加载 Nginx：
 
 ```sh
