@@ -141,8 +141,13 @@ class FullHistoryWrapperTest(unittest.TestCase):
                 return b'{"data":{"balance":12.34}}'
 
         with tempfile.TemporaryDirectory() as temporary:
-            key_file = Path(temporary) / "TikHub.env.local"
-            key_file.write_text("TIKHUB_API_KEY=test-secret\n", encoding="utf-8")
+            key_file = Path(temporary) / "dcar.env.local"
+            key_file.write_text(
+                "TIKHUB_API_BASE=https://api.tikhub.io\n"
+                "TIKHUB_API_KEY=test-secret\n",
+                encoding="utf-8",
+            )
+            key_file.chmod(0o600)
             with patch.object(runner, "TIKHUB_KEY_FILE", key_file), patch(
                 "urllib.request.urlopen", return_value=Response()
             ) as urlopen, patch.object(runner, "log") as log:
@@ -151,6 +156,10 @@ class FullHistoryWrapperTest(unittest.TestCase):
         request = urlopen.call_args.args[0]
         self.assertEqual(request.get_header("User-agent"), "DCar-Insight/1.0")
         self.assertEqual(request.get_header("Accept"), "application/json")
+        self.assertEqual(
+            request.full_url,
+            "https://api.tikhub.io/api/v1/tikhub/user/get_user_info",
+        )
         self.assertNotIn("12.34", " ".join(str(call) for call in log.call_args_list))
 
     def test_campaign_contract_loads_complete_active_release_row(self) -> None:

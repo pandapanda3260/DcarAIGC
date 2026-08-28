@@ -57,6 +57,65 @@ export async function readJson<T>(path: string, init?: RequestInit): Promise<T> 
   return (await response.json()) as T;
 }
 
+type DownloadFile = { blob: Blob; filename: string };
+
+function attachmentFilename(disposition: string | null, fallback: string) {
+  const encoded = disposition?.match(/filename\*\s*=\s*UTF-8''([^;]+)/i)?.[1];
+  let filename = "";
+  if (encoded) {
+    try { filename = decodeURIComponent(encoded.trim()); } catch { /* Use the plain filename or fallback. */ }
+  }
+  if (!filename) {
+    const plain = disposition?.match(/(?:^|;)\s*filename\s*=\s*(?:"([^"]+)"|([^;]+))/i);
+    filename = plain?.[1] || plain?.[2]?.trim() || fallback;
+  }
+  // A download name must stay a filename, even if a proxy returns a bad header.
+  return Array.from(filename, (character) => (
+    character === "/" || character === "\\" || character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127 ? "_" : character
+  )).join("").trim() || fallback;
+}
+
+export async function readDownload(
+  path: string,
+  options: { contentTypes: readonly string[]; fallbackFilename: string | ((contentType: string) => string) },
+): Promise<DownloadFile> {
+  let response: Response;
+  try {
+    response = await fetch(apiUrl(path));
+  } catch {
+    throw new Error("无法连接数据服务，请检查网络或稍后重试。");
+  }
+  if (!response.ok) {
+    const body = (await response.json().catch(() => null)) as { detail?: unknown } | null;
+    throw new Error(apiErrorMessage(body?.detail, response.status));
+  }
+  const contentType = (response.headers.get("Content-Type") ?? "").split(";")[0].trim().toLowerCase();
+  if (!options.contentTypes.includes(contentType)) {
+    throw new Error("下载服务返回的文件格式不正确，请刷新后重试。");
+  }
+  const blob = await response.blob();
+  if (blob.size === 0) throw new Error("下载文件为空，请稍后重试。");
+  const fallback = typeof options.fallbackFilename === "function" ? options.fallbackFilename(contentType) : options.fallbackFilename;
+  return {
+    blob,
+    filename: attachmentFilename(response.headers.get("Content-Disposition"), fallback),
+  };
+}
+
+export function saveDownload(file: DownloadFile) {
+  const url = URL.createObjectURL(file.blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = file.filename;
+  document.body.appendChild(anchor);
+  try { anchor.click(); }
+  finally {
+    anchor.remove();
+    // Let the browser consume both downloads before releasing their object URLs.
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  }
+}
+
 export function jsonRequest(body: unknown, method = "POST"): RequestInit {
   return {
     method,

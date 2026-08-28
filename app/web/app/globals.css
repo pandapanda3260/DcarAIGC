@@ -215,6 +215,12 @@ textarea:focus, input:focus { border-color: var(--teal); box-shadow: 0 0 0 3px r
 .detail-toolbar > div:last-child { flex: 0 0 auto; display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 10px; align-items: center; }
 .detail-toolbar > div:last-child > * { white-space: nowrap; }
 .detail-toolbar input:not(.file-input) { width: 280px; height: 38px; padding: 0 12px; border: 1px solid var(--line); border-radius: 8px; outline: none; color: var(--ink); background: #fff; font-size: 10px; }
+.task-detail-heading { display: flex; align-items: center; gap: 14px; }
+.task-detail-heading-copy { min-width: 0; overflow-wrap: anywhere; }
+.task-back-button { width: 40px; height: 40px; flex: 0 0 40px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid #cbd6d9; border-radius: 9px; background: #fff; color: var(--ink); text-decoration: none; transition: background .15s ease, border-color .15s ease; }
+.task-back-button:hover { background: var(--teal-soft); border-color: var(--teal); }
+.task-back-button:focus-visible { outline: 2px solid var(--teal); outline-offset: 3px; }
+.task-back-button svg { width: 20px; height: 20px; display: block; }
 .table-panel { padding: 0; overflow: hidden; }
 .table-scroll { overflow: auto; }
 table { width: 100%; border-collapse: collapse; min-width: 1100px; table-layout: fixed; }
@@ -478,6 +484,12 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
 .account-master-table .account-douyin-authorization-cell a { margin-top: 3px; color: var(--teal); font-size: 9px; font-weight: 800; text-decoration: none; }
 .account-master-table .account-douyin-authorization-cell a:hover { text-decoration: underline; }
 .account-master-table .account-douyin-authorization-cell small { margin-top: 3px; color: var(--muted); font-size: 9px; }
+.account-master-table .account-douyin-authorization-cell .account-authorization-state { display: inline-flex; padding: 3px 7px; border-radius: 999px; font-size: 9px; font-weight: 800; }
+.account-master-table .account-douyin-authorization-cell .account-authorization-state.authorized { background: var(--teal-soft); color: var(--teal); }
+.account-master-table .account-douyin-authorization-cell .account-authorization-state.needs_reauthorization { background: var(--orange-soft); color: #a95f31; }
+.account-master-table .account-douyin-authorization-cell .account-authorization-state.unauthorized { background: #edf1f2; color: #728187; }
+.account-master-table .account-douyin-authorization-cell .account-authorization-state.unbound { background: none; padding: 0; border-radius: 0; color: var(--muted); }
+.account-master-table .account-douyin-authorization-cell .account-authorization-placeholder { color: var(--muted); }
 .account-master-table .account-sticky { position: sticky; z-index: 2; background: #fff; }
 .account-master-table thead .account-sticky { z-index: 4; background: #f8fafb; }
 .account-master-table .account-phone { left: 0; }
@@ -485,14 +497,14 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
 .account-master-table .account-type { left: 200px; }
 .account-master-table .account-direction { left: 292px; border-right: 1px solid #d4dfe2; box-shadow: 8px 0 14px -12px rgba(16, 44, 53, .45); }
 .account-master-empty { height: 110px; color: #7b898e !important; text-align: center !important; }
-/* 列宽表：1:280 2-3:140 4-6:96 7:SPU 150 8:人群 96 9:场景 170 10:卖点 190 11:证据等级 96 12-17:96×6 → 合计 2126 */
+/* 列宽表：1:280 2:卖点 190 3-4:140 5-7:96 8:SPU 150 9:人群 96 10:场景 170 11:证据等级 96 12-17:96×6 → 合计 2126 */
 .content-table { min-width: 2126px !important; }
 .content-table th:first-child { width: 280px; }
-.content-table th:nth-child(2), .content-table th:nth-child(3) { width: 140px; }
-.content-table th:nth-child(n+4) { width: 96px; }
-.content-table th:nth-child(7) { width: 150px; }
-.content-table th:nth-child(9) { width: 170px; }
-.content-table th:nth-child(10) { width: 190px; }
+.content-table th:nth-child(2) { width: 190px; }
+.content-table th:nth-child(3), .content-table th:nth-child(4) { width: 140px; }
+.content-table th:nth-child(n+5) { width: 96px; }
+.content-table th:nth-child(8) { width: 150px; }
+.content-table th:nth-child(10) { width: 170px; }
 .content-table .content-scene-cell .scene-tag { margin: 0 4px 4px 0; font-size: 9px; }
 .content-table .spu-tag-subline { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 /* 卖点文案多行完整显示（2026-08-15 Mark 要求去掉单行省略号）；overflow-wrap 兜底超长连续字符 */

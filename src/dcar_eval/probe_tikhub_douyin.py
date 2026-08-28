@@ -18,10 +18,19 @@ from typing import Any
 import urllib.parse
 
 from project_paths import RAW_RESPONSE_CACHE_DIR
+from tikhub_config import (
+    DEFAULT_TIKHUB_API_BASE,
+    DEFAULT_TIKHUB_CONFIG_FILE,
+    TikHubConfigurationError,
+    load_tikhub_api_base,
+    load_tikhub_api_key,
+)
 
 
-KEY_FILE = Path("/Users/mark/Documents/key/DcarKey/TikHub.env.local")
-BASE_URL = "https://api.tikhub.dev"
+KEY_FILE = DEFAULT_TIKHUB_CONFIG_FILE
+# Shared scoring modules import this probe for pure helpers.  Configuration is
+# validated by load_key only when a caller actually requests provider access.
+BASE_URL = DEFAULT_TIKHUB_API_BASE
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -40,18 +49,11 @@ HTTP_MARKER = "\n__TIKHUB_HTTP_STATUS__="
 
 
 def load_key(path: Path) -> str:
-    if not path.exists():
-        raise RuntimeError(f"TikHub key file not found: {path}")
-    for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        name, value = line.split("=", 1)
-        if name.strip() == "TIKHUB_API_KEY":
-            key = value.strip().strip("\"'")
-            if key:
-                return key
-    raise RuntimeError("TIKHUB_API_KEY is missing or empty")
+    try:
+        load_tikhub_api_base(path, honor_environment=False)
+        return load_tikhub_api_key(path, honor_environment=False)
+    except TikHubConfigurationError as error:
+        raise RuntimeError(str(error)) from error
 
 
 def redact(value: Any, secret: str) -> Any:

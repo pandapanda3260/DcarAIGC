@@ -37,8 +37,7 @@ DB = FORMAL_DB
 STATE_DIR = REPO / "runtime" / "full_history_backfill"
 STATE_FILE = STATE_DIR / "state.json"
 OPERATOR_FREEZE_LOCK = REPO / "runtime" / "operator-freeze.lock"
-TIKHUB_KEY_FILE = Path("/Users/mark/Documents/key/DcarKey/TikHub.env.local")
-TIKHUB_USER_INFO = "https://api.tikhub.io/api/v1/tikhub/user/get_user_info"
+TIKHUB_KEY_FILE: Path | None = None
 
 METRICS_SAFETY, COMMENTS_SAFETY = 1.2, 1.3
 DOUYIN_UNIT_PRICE = 0.001
@@ -443,16 +442,19 @@ def phase_preflight() -> None:
     import urllib.error
     import urllib.request
 
-    if not TIKHUB_KEY_FILE.is_file():
-        raise AbortRun(f"TikHub 密钥文件不存在：{TIKHUB_KEY_FILE}")
-    key = ""
-    for line in TIKHUB_KEY_FILE.read_text(encoding="utf-8").splitlines():
-        if line.strip().startswith("TIKHUB_API_KEY="):
-            key = line.split("=", 1)[1].strip().strip('"').strip("'")
-    if not key:
-        raise AbortRun("密钥文件缺少 TIKHUB_API_KEY 变量")
+    source_root = str(REPO / "src" / "dcar_eval")
+    if source_root not in sys.path:
+        sys.path.insert(0, source_root)
+    from v8 import providers as providers_module
+
+    config_file = TIKHUB_KEY_FILE or providers_module.TIKHUB_KEY_FILE
+    try:
+        key = providers_module._load_key(config_file, "TIKHUB_API_KEY")
+        base = providers_module._load_tikhub_base(config_file)
+    except providers_module.ProviderConfigurationError as error:
+        raise AbortRun(str(error)) from error
     request = urllib.request.Request(
-        TIKHUB_USER_INFO,
+        f"{base}/api/v1/tikhub/user/get_user_info",
         headers={
             "Authorization": f"Bearer {key}",
             "Accept": "application/json",

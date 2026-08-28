@@ -66,6 +66,7 @@ export default function DouyinAuthorizationPage() {
   const queryError = sessionQuery.isError ? (sessionQuery.error instanceof Error ? sessionQuery.error.message : "登录状态读取失败")
     : authorizationsQuery.isError ? (authorizationsQuery.error instanceof Error ? authorizationsQuery.error.message : "授权记录读取失败")
     : statusesQuery.isError ? (statusesQuery.error instanceof Error ? statusesQuery.error.message : "授权状态读取失败")
+    : statusesQuery.data?.unavailable ? "抖音授权服务在当前环境未启用。"
     : targetIsValid && targetAccountQuery.isError ? (targetAccountQuery.error instanceof Error ? targetAccountQuery.error.message : "目标账号读取失败") : "";
   const authorizationDataReady = Boolean(authorizationsQuery.data && statusesQuery.data);
   const authorizationReadPending = !queryError && (sessionQuery.isPending || (canUseControl && !authorizationDataReady) || (canUseControl && targetIsValid && targetAccountQuery.isPending && !targetAccountQuery.data));

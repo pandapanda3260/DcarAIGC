@@ -11,6 +11,7 @@ XLSX 渲染，保持全站导出零第三方依赖。
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import math
 import re
@@ -749,6 +750,11 @@ def build_report_detail_workbook(
 def _safe_filename_stem(value: Any, *, fallback: str) -> str:
     stem = unicodedata.normalize("NFKC", _clean_text(value or ""))
     stem = _INVALID_FILENAME_CHARS.sub("-", stem)
+    stem = "".join(
+        character
+        for character in stem
+        if unicodedata.category(character) not in {"Cc", "Cf"}
+    )
     stem = re.sub(r"\s+", " ", stem).strip(" .")
     if stem.casefold().endswith(".zip"):
         stem = stem[:-4].rstrip(" .")
@@ -765,6 +771,29 @@ def report_bundle_filename(*, task_name: str, task_id: str) -> str:
     """Use the visible task name for the browser download filename."""
 
     return f"{_safe_filename_stem(task_name, fallback=task_id)}.zip"
+
+
+def report_file_filename(
+    *, task_name: str, task_id: str, revision: int, extension: str
+) -> str:
+    """Name a single report file without losing its task and revision identity."""
+
+    extension = extension.lower().lstrip(".")
+    if extension not in {"png", "svg", "xlsx"}:
+        raise ValueError("report file must be PNG, SVG, or XLSX")
+    label = "数据明细" if extension == "xlsx" else "图片报告"
+    identifier = _safe_filename_stem(task_id, fallback="report")
+    # Registered task IDs are short. Keep unusual historical IDs bounded without
+    # making two IDs that only differ after the truncation point collide.
+    if len(identifier.encode("utf-8")) > 96:
+        digest = hashlib.sha256(task_id.encode("utf-8")).hexdigest()[:12]
+        identifier = identifier.encode("utf-8")[:83].decode("utf-8", errors="ignore")
+        identifier = f"{identifier}-{digest}"
+    suffix = f"_{identifier}_v{revision}_{label}.{extension}"
+    name_budget = 255 - len(suffix.encode("utf-8"))
+    stem = _safe_filename_stem(task_name, fallback="DCar 报告")
+    stem = stem.encode("utf-8")[:name_budget].decode("utf-8", errors="ignore").rstrip(" .")
+    return f"{stem}{suffix}"
 
 
 def accounts_workbook_filename(exported_at: datetime) -> str:

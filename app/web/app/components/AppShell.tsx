@@ -50,7 +50,7 @@ export default function AppShell({ active, actions, children }: { active: Sectio
   return (
     <div className="app-shell insight-shell">
       <aside className="sidebar">
-        <div className="brand"><Image className="brand-mark" src={publicAssetPath("/dongchedi-app-icon.svg")} alt="懂车帝 App" width={38} height={38} unoptimized /><div><strong>Dcar Sentinel</strong><span>内容运营工作台 · V1.0</span></div></div>
+        <div className="brand"><Image className="brand-mark" src={publicAssetPath("/dongchedi-app-icon.svg")} alt="懂车帝 App" width={38} height={38} unoptimized /><div><strong>Dcar AIGC</strong><span>开心瓦瓦·运营工作台</span></div></div>
         <nav aria-label="主导航">
           <p>AIGC数据统计</p>
           {navItems.map((item) => (

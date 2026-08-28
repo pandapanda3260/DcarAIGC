@@ -1,0 +1,178 @@
+{
+  "version": "evidence-package-v2",
+  "normalization_version": "normalization-v2",
+  "source_matcher_bundle": "config/selling_point_matcher_v4.json",
+  "source_matcher_bundle_sha256": "1fe57bd24d6b19e876e93036f31ee2ce550846ecbf3c3c202e05b8e7f58842b6",
+  "source_ordered_replacements_sha256": "58e31df0f1789f2bad020d9a359c871bf7d38549efeab19f1ee9353d38101e1b",
+  "channel_limits": {
+    "title": 200,
+    "body": 1500,
+    "asr": 1800,
+    "ocr": 3000
+  },
+  "anchor_window_chars": 120,
+  "max_anchor_windows": 4,
+  "max_keyframes": 6,
+  "ocr_dedupe": {
+    "unicode_normalization": "NFKC",
+    "compare_adjacent_only": true,
+    "sequence_matcher_threshold": 0.9,
+    "keep": "longer",
+    "preserve_non_adjacent_repeats": true
+  },
+  "base_ordered_replacements": [
+    [
+      "总车帝",
+      "懂车帝"
+    ],
+    [
+      "董车帝",
+      "懂车帝"
+    ],
+    [
+      "懂车弟",
+      "懂车帝"
+    ],
+    [
+      "懂车地",
+      "懂车帝"
+    ],
+    [
+      "总车递",
+      "懂车帝"
+    ],
+    [
+      "总车第一",
+      "懂车帝"
+    ],
+    [
+      "懂车第一",
+      "懂车帝"
+    ],
+    [
+      "等车帝",
+      "懂车帝"
+    ],
+    [
+      "懂事得",
+      "懂车帝"
+    ],
+    [
+      "董车弟",
+      "懂车帝"
+    ],
+    [
+      "懂车递",
+      "懂车帝"
+    ],
+    [
+      "堵车币",
+      "懂车帝"
+    ],
+    [
+      "小东",
+      "小懂"
+    ],
+    [
+      "ai 小懂",
+      "AI小懂"
+    ],
+    [
+      "ai小懂",
+      "AI小懂"
+    ]
+  ],
+  "additional_replacements": [
+    {
+      "order": 16,
+      "source": "AI小董",
+      "target": "AI小懂",
+      "mode": "unconditional"
+    },
+    {
+      "order": 17,
+      "source": "懂车的",
+      "target": "懂车帝",
+      "mode": "context",
+      "context_window_chars": 12,
+      "context_terms": [
+        "APP",
+        "平台",
+        "搜索",
+        "车型库",
+        "二手车",
+        "打开",
+        "下载",
+        "查看",
+        "查询"
+      ]
+    },
+    {
+      "order": 18,
+      "source": "小董",
+      "target": "AI小懂",
+      "mode": "context",
+      "context_window_chars": 12,
+      "context_terms": [
+        "AI",
+        "助手",
+        "懂车帝",
+        "询问",
+        "语音"
+      ]
+    }
+  ],
+  "anchor_groups": [
+    {
+      "priority": 0,
+      "name": "ai_assistant",
+      "terms": [
+        "AI小懂"
+      ]
+    },
+    {
+      "priority": 1,
+      "name": "purchase_rights",
+      "terms": [
+        "政府补贴",
+        "补贴领取",
+        "购车补贴",
+        "搜索口令"
+      ]
+    },
+    {
+      "priority": 2,
+      "name": "explicit_cta",
+      "terms": [
+        "打开懂车帝",
+        "点击懂车帝",
+        "懂车帝链接",
+        "在懂车帝搜索"
+      ]
+    },
+    {
+      "priority": 3,
+      "name": "product",
+      "terms": [
+        "懂车帝二手车",
+        "懂车帝APP",
+        "懂车帝",
+        "车型库",
+        "车友圈"
+      ]
+    },
+    {
+      "priority": 4,
+      "name": "official_column",
+      "terms": [
+        "尖货星期天"
+      ]
+    }
+  ],
+  "channel_order": [
+    "title",
+    "body",
+    "asr",
+    "ocr"
+  ]
+}

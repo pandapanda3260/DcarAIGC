@@ -98,6 +98,7 @@ from .report_export import (
     build_report_download_bundle,
     platform_content_id_from_url,
     report_bundle_filename,
+    report_file_filename,
 )
 from .reports import (
     IMPLICIT_RUN_STATUSES,
@@ -2613,48 +2614,10 @@ def _report_export_context(
     return enrichment, selling_point_labels
 
 
-@router.get("/api/v8/tasks/{task_id}/revisions/{revision}/download")
-def download_v8_task_report(
-    request: Request, task_id: str, revision: int
-) -> Response:
-    """Download immutable revision data with the current image export template."""
-
-    with _connect_for_request(request) as connection:
-        task = connection.execute(
-            """
-            SELECT t.id,t.name,t.period_start,t.period_end,t.task_status,t.created_at,
-                   rr.created_at revision_created_at,rr.taxonomy_version
-            FROM report_revisions rr
-            JOIN report_tasks t ON t.id=rr.task_id
-            WHERE rr.task_id=? AND rr.revision=?
-            """,
-            (task_id, revision),
-        ).fetchone()
-        files = connection.execute(
-            """
-            SELECT file_kind,local_path,sha256,byte_size
-            FROM report_files
-            WHERE task_id=? AND revision=? AND status='available'
-              AND file_kind IN (
-                  'report-json','summary-svg','summary-png','content-csv','channel-csv'
-              )
-            """,
-            (task_id, revision),
-        ).fetchall()
-    if task is None:
-        raise HTTPException(status_code=404, detail="找不到这版报告。")
-
-    by_kind = {str(row["file_kind"]): row for row in files}
-    content_row = by_kind.get("content-csv")
-    if content_row is None:
-        raise HTTPException(
-            status_code=404, detail="这份报告的内容明细丢失了，请重新生成报告。"
-        )
-    _, content_csv = _verified_report_file(content_row)
-
-    channel_csv = None
-    if channel_row := by_kind.get("channel-csv"):
-        _, channel_csv = _verified_report_file(channel_row)
+def _report_download_image(
+    by_kind: Mapping[str, Mapping[str, Any]], *, task_id: str, revision: int
+) -> tuple[str, bytes]:
+    """Derive only the requested image, without touching revision CSV files."""
 
     image_extension: str
     image_bytes: bytes
@@ -2713,6 +2676,92 @@ def download_v8_task_report(
         raise HTTPException(
             status_code=404, detail="这份报告的图片丢失了，请重新生成报告。"
         )
+    return image_extension, image_bytes
+
+
+def _report_download_response(
+    payload: bytes, *, filename: str, media_type: str, extension: str
+) -> Response:
+    encoded_filename = quote(filename, safe="")
+    return Response(
+        content=payload,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="report.{extension}"; filename*=UTF-8\'\'{encoded_filename}'
+            ),
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@router.get("/api/v8/tasks/{task_id}/revisions/{revision}/download")
+def download_v8_task_report(
+    request: Request,
+    task_id: str,
+    revision: int,
+    format: Literal["zip", "image", "xlsx"] = "zip",
+) -> Response:
+    """Download one immutable revision artifact, or its legacy ZIP bundle."""
+
+    with _connect_for_request(request) as connection:
+        task = connection.execute(
+            """
+            SELECT t.id,t.name,t.period_start,t.period_end,t.task_status,t.created_at,
+                   rr.created_at revision_created_at,rr.taxonomy_version
+            FROM report_revisions rr
+            JOIN report_tasks t ON t.id=rr.task_id
+            WHERE rr.task_id=? AND rr.revision=?
+            """,
+            (task_id, revision),
+        ).fetchone()
+        files = connection.execute(
+            """
+            SELECT file_kind,local_path,sha256,byte_size
+            FROM report_files
+            WHERE task_id=? AND revision=? AND status='available'
+              AND file_kind IN (
+                  'report-json','summary-svg','summary-png','content-csv','channel-csv'
+              )
+            """,
+            (task_id, revision),
+        ).fetchall()
+    if task is None:
+        raise HTTPException(status_code=404, detail="找不到这版报告。")
+
+    by_kind = {str(row["file_kind"]): row for row in files}
+    if format == "image":
+        image_extension, image_bytes = _report_download_image(
+            by_kind, task_id=task_id, revision=revision
+        )
+        return _report_download_response(
+            image_bytes,
+            filename=report_file_filename(
+                task_name=str(task["name"]),
+                task_id=task_id,
+                revision=revision,
+                extension=image_extension,
+            ),
+            media_type="image/png" if image_extension == "png" else "image/svg+xml",
+            extension=image_extension,
+        )
+
+    content_row = by_kind.get("content-csv")
+    if content_row is None:
+        raise HTTPException(
+            status_code=404, detail="这份报告的内容明细丢失了，请重新生成报告。"
+        )
+    _, content_csv = _verified_report_file(content_row)
+
+    channel_csv = None
+    if channel_row := by_kind.get("channel-csv"):
+        _, channel_csv = _verified_report_file(channel_row)
+
+    if format == "zip":
+        image_extension, image_bytes = _report_download_image(
+            by_kind, task_id=task_id, revision=revision
+        )
 
     task_value = dict(task)
     content_enrichment, selling_point_labels = _report_export_context(
@@ -2730,11 +2779,12 @@ def download_v8_task_report(
             content_enrichment=content_enrichment,
             selling_point_labels=selling_point_labels,
         )
-        bundle = build_report_download_bundle(
-            image_extension=image_extension,
-            image_bytes=image_bytes,
-            workbook_bytes=workbook,
-        )
+        if format == "zip":
+            bundle = build_report_download_bundle(
+                image_extension=image_extension,
+                image_bytes=image_bytes,
+                workbook_bytes=workbook,
+            )
     except (UnicodeDecodeError, csv.Error, ValueError) as exc:
         LOGGER.exception(
             "report bundle generation failed: task=%s revision=%s", task_id, revision
@@ -2743,21 +2793,26 @@ def download_v8_task_report(
             status_code=500, detail="报告打包失败，请稍后重试。"
         ) from exc
 
-    filename = report_bundle_filename(
-        task_name=str(task["name"]),
-        task_id=task_id,
-    )
-    encoded_filename = quote(filename, safe="")
-    return Response(
-        content=bundle,
-        media_type="application/zip",
-        headers={
-            "Content-Disposition": (
-                f'attachment; filename="report.zip"; filename*=UTF-8\'\'{encoded_filename}'
+    if format == "xlsx":
+        return _report_download_response(
+            workbook,
+            filename=report_file_filename(
+                task_name=str(task["name"]),
+                task_id=task_id,
+                revision=revision,
+                extension="xlsx",
             ),
-            "Cache-Control": "private, no-store",
-            "X-Content-Type-Options": "nosniff",
-        },
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            extension="xlsx",
+        )
+    return _report_download_response(
+        bundle,
+        filename=report_bundle_filename(
+            task_name=str(task["name"]),
+            task_id=task_id,
+        ),
+        media_type="application/zip",
+        extension="zip",
     )
 
 

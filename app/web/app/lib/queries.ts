@@ -1,5 +1,5 @@
 import { keepPreviousData, queryOptions } from "@tanstack/react-query";
-import { jsonRequest, readJson } from "./api";
+import { ApiRequestError, jsonRequest, readJson } from "./api";
 import { isGeneratingTaskStatus } from "./queryContracts";
 import type { AccountSearchRequest, ContentSearchRequest } from "./queryContracts";
 import type {
@@ -26,10 +26,23 @@ export type AccountSearchResult = {
   pending_platform_identities: PendingPlatformIdentity[];
 };
 export type DouyinAuthorizationsResult = { items: DouyinAuthorization[] };
-export type DouyinAuthorizationStatusesResult = { items: DouyinAuthorizationStatus[] };
+export type DouyinAuthorizationStatusesResult = { items: DouyinAuthorizationStatus[]; unavailable?: boolean };
 
 function readDouyinAuthorizations() {
   return readJson<DouyinAuthorizationsResult>("/api/douyin/authorizations");
+}
+
+async function readDouyinAuthorizationStatuses(): Promise<DouyinAuthorizationStatusesResult> {
+  try {
+    return await readJson<DouyinAuthorizationStatusesResult>("/api/douyin/authorization-statuses");
+  } catch (reason) {
+    // 未部署抖音授权服务的环境（本地网关）对 /api/douyin/* 固定返回 403/404：
+    // 这不是运行故障，页面以"—"静默展示；真实故障（超时、5xx）继续抛出。
+    if (reason instanceof ApiRequestError && (reason.status === 403 || reason.status === 404)) {
+      return { items: [], unavailable: true };
+    }
+    throw reason;
+  }
 }
 
 export const queryKeys = {
@@ -88,7 +101,7 @@ export function douyinAuthorizationsQueryOptions() {
 export function douyinAuthorizationStatusesQueryOptions() {
   return queryOptions({
     queryKey: queryKeys.authorizationStatuses,
-    queryFn: () => readJson<DouyinAuthorizationStatusesResult>("/api/douyin/authorization-statuses"),
+    queryFn: readDouyinAuthorizationStatuses,
     staleTime: 0,
     refetchOnMount: "always",
     refetchOnWindowFocus: "always",

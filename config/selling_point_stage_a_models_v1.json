@@ -1,0 +1,49 @@
+{
+  "version": "selling-point-stage-a-models-v1",
+  "queried_at": "2026-08-23T17:10:43Z",
+  "currency": "CNY",
+  "unit": "per_million_tokens",
+  "budget_limit_cny": 500.0,
+  "cost_basis": "公开按量未缓存单价上界；不抵扣免费额度、缓存或优惠",
+  "api_models_snapshot": {
+    "source": "GET https://ark.cn-beijing.volces.com/api/v3/models",
+    "queried_at": "2026-08-23T17:10:43Z",
+    "shutdown_requested_models": [
+      "doubao-seed-1-6-flash-250715",
+      "deepseek-v3-1-250821",
+      "deepseek-v3-1-terminus"
+    ]
+  },
+  "models": [
+    {
+      "slot": "quality_default",
+      "requested_model": "doubao-seed-2-1-pro-260628",
+      "model": "doubao-seed-2-1-pro-260628",
+      "replacement_reason": null,
+      "input_cny_per_million_tokens": 6.0,
+      "output_cny_per_million_tokens": 30.0,
+      "supports_json_object": true,
+      "price_source_url": "https://www.volcengine.com/product/ark"
+    },
+    {
+      "slot": "speed_value",
+      "requested_model": "doubao-seed-1-6-flash-250715",
+      "model": "doubao-seed-2-1-turbo-260628",
+      "replacement_reason": "账号/models将原1.6 Flash标为Shutdown；替换为当前同厂低延迟批量部署型号2.1 Turbo。",
+      "input_cny_per_million_tokens": 3.0,
+      "output_cny_per_million_tokens": 15.0,
+      "supports_json_object": true,
+      "price_source_url": "https://www.volcengine.com/product/ark"
+    },
+    {
+      "slot": "independent_family",
+      "requested_model": "deepseek-v3-1-250821",
+      "model": "deepseek-v4-flash-ga-260731",
+      "replacement_reason": "账号/models将DeepSeek-V3.1标为Shutdown；替换为当前可用的DeepSeek-V4-Flash正式版。",
+      "input_cny_per_million_tokens": 1.0,
+      "output_cny_per_million_tokens": 2.0,
+      "supports_json_object": false,
+      "price_source_url": "https://developer.volcengine.com/articles/7670002625957838890"
+    }
+  ]
+}

@@ -2348,6 +2348,16 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
                     "SELECT COUNT(*) FROM report_files WHERE task_id=? AND revision=1",
                     (task_id,),
                 ).fetchone()[0],
+                "database": "\n".join(connection.iterdump()),
+                "file_hashes": {
+                    str(row["local_path"]): hashlib.sha256(
+                        (PROJECT_ROOT / str(row["local_path"])).read_bytes()
+                    ).hexdigest()
+                    for row in connection.execute(
+                        "SELECT local_path FROM report_files WHERE task_id=? AND revision=1 AND status='available'",
+                        (task_id,),
+                    ).fetchall()
+                },
             }
         with patch.object(api_module, "render_summary_png", return_value=False):
             derived = self.client.get(
@@ -2437,6 +2447,89 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         self.assertEqual(
             historical_row[14:16], ["卖点资料不足", "卖点资料不足"]
         )
+        with (
+            patch.object(api_module, "render_summary_png", return_value=False),
+            patch.object(
+                api_module,
+                "_report_export_context",
+                side_effect=AssertionError("image download must not read workbook context"),
+            ),
+            patch.object(
+                api_module,
+                "build_report_detail_workbook",
+                side_effect=AssertionError("image download must not generate a workbook"),
+            ),
+            patch.object(
+                api_module,
+                "build_report_download_bundle",
+                side_effect=AssertionError("single file download must not create a ZIP"),
+            ),
+        ):
+            single_image = self.client.get(
+                f"/api/v8/tasks/{task_id}/revisions/1/download?format=image"
+            )
+        self.assertEqual(single_image.status_code, 200)
+        self.assertEqual(single_image.headers["content-type"], "image/svg+xml")
+        self.assertEqual(single_image.content, derived_svg)
+        image_name = f'{value["name"]}_{task_id}_v1_图片报告.svg'
+        self.assertEqual(
+            single_image.headers["content-disposition"],
+            f'attachment; filename="report.svg"; filename*=UTF-8\'\'{quote(image_name, safe="")}',
+        )
+
+        with (
+            patch.object(
+                api_module,
+                "_report_download_image",
+                side_effect=AssertionError("workbook download must not render an image"),
+            ),
+            patch.object(
+                api_module,
+                "build_report_download_bundle",
+                side_effect=AssertionError("single file download must not create a ZIP"),
+            ),
+        ):
+            single_workbook = self.client.get(
+                f"/api/v8/tasks/{task_id}/revisions/1/download?format=xlsx"
+            )
+        self.assertEqual(single_workbook.status_code, 200)
+        self.assertEqual(
+            single_workbook.headers["content-type"],
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        self.assertEqual(single_workbook.content, workbook)
+        workbook_name = f'{value["name"]}_{task_id}_v1_数据明细.xlsx'
+        self.assertEqual(
+            single_workbook.headers["content-disposition"],
+            f'attachment; filename="report.xlsx"; filename*=UTF-8\'\'{quote(workbook_name, safe="")}',
+        )
+
+        # Both direct formats remain available on the read-only replica and do
+        # not write any derived file or new report revision back to its database.
+        with connect(self.db) as connection:
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        readonly_database_hash = hashlib.sha256(self.db.read_bytes()).hexdigest()
+        replica = api_module.create_app(replace(self.config, read_only=True))
+        with (
+            TestClient(replica) as replica_client,
+            patch.object(api_module, "render_summary_png", return_value=False),
+        ):
+            for export_format, expected in (
+                ("image", single_image),
+                ("xlsx", single_workbook),
+            ):
+                with self.subTest(readonly_format=export_format):
+                    response = replica_client.get(
+                        f"/api/v8/tasks/{task_id}/revisions/1/download?format={export_format}"
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.content, expected.content)
+                    self.assertEqual(response.headers["cache-control"], "private, no-store")
+                    self.assertEqual(response.headers["x-content-type-options"], "nosniff")
+        self.assertEqual(
+            hashlib.sha256(self.db.read_bytes()).hexdigest(), readonly_database_hash
+        )
+
         with connect(self.db) as connection:
             after_download = {
                 "task": tuple(
@@ -2455,12 +2548,137 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
                     "SELECT COUNT(*) FROM report_files WHERE task_id=? AND revision=1",
                     (task_id,),
                 ).fetchone()[0],
+                "database": "\n".join(connection.iterdump()),
+                "file_hashes": {
+                    str(row["local_path"]): hashlib.sha256(
+                        (PROJECT_ROOT / str(row["local_path"])).read_bytes()
+                    ).hexdigest()
+                    for row in connection.execute(
+                        "SELECT local_path FROM report_files WHERE task_id=? AND revision=1 AND status='available'",
+                        (task_id,),
+                    ).fetchall()
+                },
             }
         self.assertEqual(after_download, before_download)
-        missing_bundle = self.client.get(
-            f"/api/v8/tasks/{task_id}/revisions/999/download"
+        for export_format in ("zip", "image", "xlsx"):
+            with self.subTest(missing_format=export_format):
+                missing = self.client.get(
+                    f"/api/v8/tasks/{task_id}/revisions/999/download?format={export_format}"
+                )
+                self.assertEqual(missing.status_code, 404)
+        unsupported = self.client.get(
+            f"/api/v8/tasks/{task_id}/revisions/1/download?format=pdf"
         )
-        self.assertEqual(missing_bundle.status_code, 404)
+        self.assertEqual(unsupported.status_code, 422)
+
+    def test_single_report_downloads_isolate_artifacts_and_preserve_integrity_checks(
+        self,
+    ) -> None:
+        self._activate_current_report_release()
+        tasks = []
+        for _ in range(2):
+            created = self.client.post(
+                "/api/v8/tasks",
+                json={"period_start": "2026-07-01", "period_end": "2026-07-01"},
+            )
+            self.assertEqual(created.status_code, 200)
+            tasks.append(created.json())
+        self.assertEqual(tasks[0]["name"], tasks[1]["name"])
+        self.assertNotEqual(tasks[0]["id"], tasks[1]["id"])
+        workbook_names = []
+        for task in tasks:
+            response = self.client.get(
+                f'/api/v8/tasks/{task["id"]}/revisions/1/download?format=xlsx'
+            )
+            self.assertEqual(response.status_code, 200)
+            filename = f'{task["name"]}_{task["id"]}_v1_数据明细.xlsx'
+            self.assertIn(
+                quote(filename, safe=""), response.headers["content-disposition"]
+            )
+            workbook_names.append(response.headers["content-disposition"])
+        self.assertNotEqual(workbook_names[0], workbook_names[1])
+
+        task_id = tasks[0]["id"]
+        download_url = f"/api/v8/tasks/{task_id}/revisions/1/download"
+        with connect(self.db) as connection:
+            paths = {
+                row["file_kind"]: PROJECT_ROOT / str(row["local_path"])
+                for row in connection.execute(
+                    "SELECT file_kind,local_path FROM report_files WHERE task_id=? AND revision=1 AND status='available'",
+                    (task_id,),
+                ).fetchall()
+            }
+
+        png_payload = bytes.fromhex(
+            "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+            "0000000b49444154789c636000020000050001a5f645400000000049454e44ae426082"
+        )
+
+        def render_png_fixture(_svg_path: Path, png_path: Path) -> bool:
+            png_path.write_bytes(png_payload)
+            return True
+
+        with patch.object(api_module, "render_summary_png", side_effect=render_png_fixture):
+            png_response = self.client.get(f"{download_url}?format=image")
+        self.assertEqual(png_response.status_code, 200)
+        self.assertEqual(png_response.headers["content-type"], "image/png")
+        self.assertEqual(png_response.content, png_payload)
+        self.assertIn(
+            quote(f"_{task_id}_v1_图片报告.png", safe=""),
+            png_response.headers["content-disposition"],
+        )
+
+        # Missing or damaged artifacts only block the format that consumes them.
+        # ZIP still requires both sides, retaining its original integrity rules.
+        for file_kind, dependent_format, independent_format in (
+            ("content-csv", "xlsx", "image"),
+            ("channel-csv", "xlsx", "image"),
+            ("report-json", "image", "xlsx"),
+        ):
+            path = paths[file_kind]
+            original = path.read_bytes()
+            try:
+                for state, expected_status in (("damaged", 409), ("missing", 410)):
+                    with self.subTest(file_kind=file_kind, state=state):
+                        if state == "damaged":
+                            path.write_bytes(bytes([original[0] ^ 1]) + original[1:])
+                        else:
+                            path.unlink()
+                        with patch.object(api_module, "render_summary_png", return_value=False):
+                            independent = self.client.get(
+                                f"{download_url}?format={independent_format}"
+                            )
+                        self.assertEqual(independent.status_code, 200)
+                        dependent = self.client.get(
+                            f"{download_url}?format={dependent_format}"
+                        )
+                        self.assertEqual(dependent.status_code, expected_status)
+                        bundle = self.client.get(download_url)
+                        self.assertEqual(bundle.status_code, expected_status)
+            finally:
+                path.write_bytes(original)
+
+        with (
+            patch.object(api_module, "render_summary_svg", side_effect=ValueError("legacy report")),
+            patch.object(api_module, "render_summary_png", return_value=False),
+        ):
+            archived = self.client.get(f"{download_url}?format=image")
+        self.assertEqual(archived.status_code, 200)
+        self.assertEqual(archived.headers["content-type"], "image/svg+xml")
+        self.assertEqual(archived.content, paths["summary-svg"].read_bytes())
+
+        with connect(self.db) as connection:
+            connection.execute(
+                "DELETE FROM report_files WHERE task_id=? AND revision=1 AND file_kind IN ('report-json','summary-svg','summary-png')",
+                (task_id,),
+            )
+            connection.commit()
+        self.assertEqual(
+            self.client.get(f"{download_url}?format=image").status_code, 404
+        )
+        self.assertEqual(
+            self.client.get(f"{download_url}?format=xlsx").status_code, 200
+        )
 
     def test_report_export_context_recovers_url_id_and_rejects_mismatch(
         self,

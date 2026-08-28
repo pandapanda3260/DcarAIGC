@@ -255,6 +255,8 @@ exit 0
 
         self.assertIn("I_ACKNOWLEDGE_DAILY_PROVIDER_LIMIT_USD_20", wrapper)
         self.assertIn("TIKHUB_API_KEY_FILE", wrapper)
+        self.assertIn("TIKHUB_API_BASE=https://api.tikhub.io", wrapper)
+        self.assertIn("dcar.env.local", example)
         self.assertIn("export DCAR_STARTUP_CATCHUP_ENABLED=1", wrapper)
         self.assertIn(
             'reconcile_from="${DCAR_DAILY_CAPTURE_RECONCILE_FROM:-}"', wrapper

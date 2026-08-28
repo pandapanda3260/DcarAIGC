@@ -14,6 +14,7 @@ import { Feedback, Loading, Notice } from "../components/Feedback";
 import { jsonRequest, readJson } from "../lib/api";
 import { label } from "../lib/format";
 import { activeSellingPointsQueryOptions, draftSellingPointsQueryOptions, queryKeys } from "../lib/queries";
+import sellingPointV53 from "../../../../config/business_selling_points_v5_3.json";
 import type {
   BusinessSceneKey,
   OverviewChannelKey,
@@ -47,6 +48,24 @@ const emptyPoint: PointForm = {
 };
 
 const emptySellingPoints: SellingPointResponse = { taxonomy: null, items: [] };
+
+const v53PreviewByCode = new Map(
+  sellingPointV53.labels.map((point) => [point.id, point] as const),
+);
+
+function withV53PreviewCopy(response: SellingPointResponse): SellingPointResponse {
+  return {
+    ...response,
+    items: response.items.map((point) => {
+      const preview = v53PreviewByCode.get(point.code);
+      return preview ? {
+        ...point,
+        label: preview.label,
+        definition: preview.definition,
+      } : point;
+    }),
+  };
+}
 
 const standardFamilies = [
   { code: "E", title: "二手车", description: "交易、车况、估值与保障标准", scene: "used_car" },
@@ -90,6 +109,7 @@ function FamilyIcon({ code, size = 22 }: { code: StandardFamilyCode; size?: numb
 export default function SellingPointsPage() {
   const [statWindow, setStatWindow] = useState<WindowKey>("last_week");
   const [draftMode, setDraftMode] = useState(false);
+  const [previewMode, setPreviewMode] = useState(true);
   const [form, setForm] = useState<PointForm | null>(null);
   const [editingCode, setEditingCode] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -99,23 +119,28 @@ export default function SellingPointsPage() {
   const activeQuery = useQuery({ ...activeSellingPointsQueryOptions(), enabled: !draftMode });
   const draftQuery = useQuery({ ...draftSellingPointsQueryOptions(), enabled: draftMode });
   const currentQuery = draftMode ? draftQuery : activeQuery;
-  const data = currentQuery.data ?? emptySellingPoints;
+  const currentData = currentQuery.data ?? emptySellingPoints;
+  const data = previewMode && !draftMode ? withV53PreviewCopy(currentData) : currentData;
 
-  async function ensureDraft() {
-    if (draftMode) return;
+  async function ensureDraft(): Promise<SellingPointResponse> {
+    if (draftMode) return queryClient.fetchQuery(draftSellingPointsQueryOptions());
     await readJson("/api/v8/selling-points/draft", { method: "POST" });
     await queryClient.invalidateQueries({ queryKey: queryKeys.draftSellingPoints, exact: true });
-    await queryClient.fetchQuery(draftSellingPointsQueryOptions());
+    const draft = await queryClient.fetchQuery(draftSellingPointsQueryOptions());
     setDraftMode(true);
+    setPreviewMode(false);
     setMessage("已进入草稿编辑。发布前不会影响当前的评估结果。");
+    return draft;
   }
 
   async function beginPoint(point?: SellingPoint) {
     setSaving(true);
     setError("");
     try {
-      await ensureDraft();
-      open(point);
+      const draft = await ensureDraft();
+      const draftPoint = point ? draft.items.find((item) => item.code === point.code) : undefined;
+      if (point && !draftPoint) throw new Error("这个卖点已不在草稿中，请刷新页面后重试。");
+      open(draftPoint);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "卖点草稿创建失败");
     } finally {
@@ -194,6 +219,23 @@ export default function SellingPointsPage() {
         <span className="selling-point-activation-note" role="status">
           草稿完成检查并发布后才会正式生效
         </span>
+      )}
+      {!draftMode && previewMode && (
+        <span className="selling-point-activation-note" role="status">
+          当前仅预览 v5.3 新文案，命中统计和后台评估仍使用 v5.2
+        </span>
+      )}
+      {!draftMode && (
+        <button
+          className="secondary selling-point-edit-standard"
+          disabled={currentQuery.isPending || saving}
+          onClick={() => {
+            setPreviewMode((value) => !value);
+            setMessage(previewMode ? "已切回当前正式生效版 v5.2" : "当前显示 v5.3 新文案预览");
+          }}
+        >
+          {previewMode ? "查看正式生效版" : "预览 v5.3 新文案"}
+        </button>
       )}
       <button className="secondary selling-point-edit-standard" disabled={currentQuery.isPending || saving} onClick={() => void beginPoint()}>
         <PlusIcon size={16} weight="bold" aria-hidden />

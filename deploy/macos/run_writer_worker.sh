@@ -84,8 +84,12 @@ case "$key_file_path" in
     fail "TikHub key file must stay outside the repository"
     ;;
 esac
-/usr/bin/grep -Eq '^[[:space:]]*TIKHUB_API_KEY=' "$key_file_path" || \
-  fail "TikHub key file does not contain TIKHUB_API_KEY"
+[[ "$(/usr/bin/grep -Ec '^[[:space:]]*TIKHUB_API_KEY=' "$key_file_path")" == "1" ]] || \
+  fail "TikHub config file must contain exactly one TIKHUB_API_KEY"
+[[ "$(/usr/bin/grep -Ec '^[[:space:]]*TIKHUB_API_BASE=' "$key_file_path")" == "1" ]] || \
+  fail "TikHub config file must contain exactly one TIKHUB_API_BASE"
+/usr/bin/grep -Fxq 'TIKHUB_API_BASE=https://api.tikhub.io' "$key_file_path" || \
+  fail "TIKHUB_API_BASE must be exactly https://api.tikhub.io"
 
 python_bin="$project_root/.venv/bin/python"
 [[ -x "$python_bin" ]] || fail "project virtualenv Python is missing"

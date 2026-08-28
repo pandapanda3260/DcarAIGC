@@ -179,7 +179,7 @@ test("provider is SSR-safe and cached read query functions do not consume AbortS
   assert.match(client, /retry:\s*shouldRetryQuery/);
 
   assert.doesNotMatch(queries, /\bAbortController\b|\bsignal\b|QueryFunctionContext/);
-  assert.equal((queries.match(/queryFn:\s*\(\)\s*=>/g) ?? []).length, 11);
+  assert.equal((queries.match(/queryFn:\s*\(\)\s*=>/g) ?? []).length, 10);
   assert.match(queries, /activeSellingPointsQueryOptions[\s\S]*?staleTime:\s*60_000,[\s\S]*?refetchOnWindowFocus:\s*true/);
   assert.match(queries, /taskReportQueryOptions[\s\S]*?enabled:\s*Boolean\(revision\),[\s\S]*?staleTime:\s*Infinity/);
   assert.equal(JSON.parse(packageJson).dependencies["@tanstack/react-query"], "5.101.4");

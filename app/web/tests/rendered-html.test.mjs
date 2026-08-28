@@ -8,7 +8,7 @@ import {
   fromShanghaiDateTimeLocal,
   toShanghaiDateTimeLocal,
 } from "../app/contents/contentForm.ts";
-import { apiErrorMessage, jsonRequest } from "../app/lib/api.ts";
+import { apiErrorMessage, jsonRequest, readDownload, saveDownload } from "../app/lib/api.ts";
 import {
   metricCompactValue,
   metricEvidence,
@@ -96,6 +96,135 @@ test("user-facing errors and historical task messages stay in plain Chinese", ()
   assert.equal(humanizeTaskStatus("failed", "已由发现补跑后的新任务替代；revision 1 仅供审计"), "已被替代");
 });
 
+test("report downloads preserve task-linked UTF-8 names and the original file bytes", async (t) => {
+  const task = "D8-D-20260826-20260826";
+  for (const [format, contentType, extension, label, bytes] of [
+    ["image", "image/png", "png", "图片报告", new Uint8Array([137, 80, 78, 71])],
+    ["image", "image/svg+xml; charset=utf-8", "svg", "图片报告", "<svg/>"],
+    ["xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xlsx", "数据明细", new Uint8Array([80, 75, 3, 4])],
+  ]) {
+    const path = `/api/v8/tasks/${task}/revisions/2/download?format=${format}`;
+    const filename = `2026-08-26 日报_${task}_v2_${label}.${extension}`;
+    const payload = new Blob([bytes]);
+    t.mock.method(globalThis, "fetch", async (url) => {
+      assert.equal(url, path);
+      return new Response(payload, { headers: {
+        "Content-Type": contentType,
+        "Content-Disposition": `attachment; filename="report.${extension}"; filename*=UTF-8''${encodeURIComponent(filename)}`,
+      } });
+    });
+    const file = await readDownload(path, {
+      contentTypes: [contentType.split(";")[0]],
+      fallbackFilename: `${task}_v2.${extension}`,
+    });
+    assert.equal(file.filename, filename);
+    assert.deepEqual(await file.blob.arrayBuffer(), await payload.arrayBuffer());
+  }
+});
+
+test("download errors, old ZIP responses and empty files never become local reports", async (t) => {
+  const options = { contentTypes: ["image/png"], fallbackFilename: "D8-TEST_v1_图片报告.png" };
+  for (const [response, message] of [
+    [Response.json({ detail: "找不到这版报告。" }, { status: 404 }), /找不到这版报告/],
+    [Response.json({ detail: "expired" }, { status: 401 }), /登录已过期/],
+    [new Response("old archive", { headers: { "Content-Type": "application/zip" } }), /文件格式不正确/],
+    [new Response("<html>login</html>", { headers: { "Content-Type": "text/html" } }), /文件格式不正确/],
+    [new Response("", { headers: { "Content-Type": "image/png" } }), /文件为空/],
+  ]) {
+    t.mock.method(globalThis, "fetch", async () => response);
+    await assert.rejects(readDownload("/report", options), message);
+  }
+  t.mock.method(globalThis, "fetch", async () => { throw new TypeError("network"); });
+  await assert.rejects(readDownload("/report", options), /无法连接数据服务/);
+});
+
+test("download names fall back safely if an attachment header is absent or malformed", async (t) => {
+  const options = { contentTypes: ["image/png"], fallbackFilename: "D8-TEST_v2_图片报告.png" };
+  for (const [disposition, expected] of [
+    [null, options.fallbackFilename],
+    ["attachment; filename*=UTF-8''%broken", options.fallbackFilename],
+    ['attachment; filename="D8-TEST_v2.png"; filename*=UTF-8\'\'%broken', "D8-TEST_v2.png"],
+    ["attachment; filename*=UTF-8''..%2Freport%5Cname%00.png", ".._report_name_.png"],
+  ]) {
+    t.mock.method(globalThis, "fetch", async () => new Response("png", { headers: {
+      "Content-Type": "image/png",
+      ...(disposition ? { "Content-Disposition": disposition } : {}),
+    } }));
+    assert.equal((await readDownload("/report", options)).filename, expected);
+  }
+  t.mock.method(globalThis, "fetch", async () => new Response("<svg/>", { headers: { "Content-Type": "image/svg+xml" } }));
+  const svg = await readDownload("/report", {
+    contentTypes: ["image/png", "image/svg+xml"],
+    fallbackFilename: (contentType) => `D8-TEST_v2_图片报告.${contentType === "image/svg+xml" ? "svg" : "png"}`,
+  });
+  assert.equal(svg.filename, "D8-TEST_v2_图片报告.svg");
+  assert.equal(svg.blob.type, "image/svg+xml");
+});
+
+test("saving two reports starts two named downloads and releases blobs after the browser consumes them", (t) => {
+  const originalDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
+  const clicks = [];
+  const removed = [];
+  const revoked = [];
+  const callbacks = [];
+  const attached = new Set();
+  let sequence = 0;
+  t.mock.method(URL, "createObjectURL", () => `blob:report-${++sequence}`);
+  t.mock.method(URL, "revokeObjectURL", (url) => revoked.push(url));
+  t.mock.method(globalThis, "setTimeout", (callback, delay) => {
+    assert.equal(delay, 60_000);
+    callbacks.push(callback);
+  });
+  Object.defineProperty(globalThis, "document", { configurable: true, value: {
+    createElement(tag) {
+      assert.equal(tag, "a");
+      return {
+        click() { assert.ok(attached.has(this)); clicks.push([this.href, this.download]); },
+        remove() { attached.delete(this); removed.push(this.href); },
+      };
+    },
+    body: { appendChild(anchor) { attached.add(anchor); } },
+  } });
+  try {
+    for (const filename of ["日报_D8-TEST_v1_图片报告.png", "日报_D8-TEST_v1_数据明细.xlsx"]) {
+      saveDownload({ blob: new Blob([filename]), filename });
+    }
+    assert.deepEqual(clicks, [
+      ["blob:report-1", "日报_D8-TEST_v1_图片报告.png"],
+      ["blob:report-2", "日报_D8-TEST_v1_数据明细.xlsx"],
+    ]);
+    assert.equal(attached.size, 0);
+    assert.deepEqual(removed, ["blob:report-1", "blob:report-2"]);
+    assert.deepEqual(revoked, []);
+    callbacks.forEach((callback) => callback());
+    assert.deepEqual(revoked, removed);
+  } finally {
+    if (originalDocument) Object.defineProperty(globalThis, "document", originalDocument);
+    else delete globalThis.document;
+  }
+});
+
+test("task detail has one download button that always downloads both displayed-revision files", async () => {
+  const source = await readFile(new URL("../app/tasks/[id]/TaskDetailPage.tsx", import.meta.url), "utf8");
+  assert.match(source, /encodeURIComponent\(detail\.id\)\}\/revisions\/\$\{displayRevision\}\/download/);
+  assert.match(source, /await Promise\.all\([\s\S]*readDownload\(`\$\{path\}\?format=\$\{kind\}`[\s\S]*files\.forEach\(saveDownload\)/);
+  assert.match(source, /async function downloadReport\(\)/);
+  assert.match(source, /const formats = \["image", "xlsx"\] as const/);
+  assert.equal((source.match(/className="primary report-download-button"/g) ?? []).length, 1);
+  assert.doesNotMatch(source, /report-download-options|report-download-menu|report-download-controls|单独下载|<details|<summary/);
+  assert.match(source, /disabled=\{downloading\}/);
+  assert.match(source, /允许浏览器下载多个文件/);
+  assert.doesNotMatch(source, /<a[^>]+report-download-button/);
+});
+
+test("task detail places a direct parent-page link beside the task title", async () => {
+  const source = await readFile(new URL("../app/tasks/[id]/TaskDetailPage.tsx", import.meta.url), "utf8");
+  const heading = source.match(/<div className="task-detail-heading">([\s\S]*?)<div className="task-detail-heading-copy">/)?.[1];
+  assert.ok(heading, "the back control belongs to the visible task heading");
+  assert.match(heading, /<Link href="\/tasks" className="task-back-button" aria-label="返回任务列表" title="返回任务列表">/);
+  assert.doesNotMatch(source, /<AppShell active="tasks" actions=|window\.history\.back|router\.back/);
+});
+
 async function render(path = "/overview") {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
   workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}-${path}`);
@@ -174,6 +303,7 @@ test("douyin authorization management locks every scan to the selected business 
   assert.match(source, /"\/api\/douyin\/authorizations\/reauthorize"[\s\S]*"douyin-authorization-reauthorize"/);
   assert.match(source, /"\/api\/douyin\/authorizations\/unbind"[\s\S]*"douyin-authorization-unbind"/);
   assert.match(source, /activeTargetAuthorization\.needs_reauthorization \? "需重新授权" : "已授权"/);
+  assert.match(source, /statusesQuery\.data\?\.unavailable \? "抖音授权服务在当前环境未启用。"/);
   assert.match(source, /onClick=\{\(\) => void reauthorize\(activeTargetAuthorization\)\}[\s\S]*重新扫码授权/);
   assert.match(source, /onClick=\{\(\) => void unbind\(activeTargetAuthorization\)\}>解绑/);
   assert.match(source, /item\.status === "pending_match" && <button[\s\S]*onClick=\{\(\) => void unbind\(item\)\}>作废<\/button>/);
@@ -191,7 +321,8 @@ test("douyin authorization management locks every scan to the selected business 
   assert.doesNotMatch(source, /authorizationsQuery\.isError && <Notice|statusesQuery\.isError && <Notice/);
   assert.doesNotMatch(source, /avatar|<img|<Image/);
   assert.match(queries, /douyinAuthorizationsQueryOptions[\s\S]*readDouyinAuthorizations/);
-  assert.match(queries, /douyinAuthorizationStatusesQueryOptions[\s\S]*queryFn: \(\) => readJson<DouyinAuthorizationStatusesResult>\("\/api\/douyin\/authorization-statuses"\)[\s\S]*staleTime: 0[\s\S]*refetchOnMount: "always"[\s\S]*refetchOnWindowFocus: "always"/);
+  assert.match(queries, /douyinAuthorizationStatusesQueryOptions[\s\S]*queryFn: readDouyinAuthorizationStatuses[\s\S]*staleTime: 0[\s\S]*refetchOnMount: "always"[\s\S]*refetchOnWindowFocus: "always"/);
+  assert.match(queries, /reason instanceof ApiRequestError && \(reason\.status === 403 \|\| reason\.status === 404\)[\s\S]*\{ items: \[\], unavailable: true \}/);
   assert.match(api, /"X-Dcar-Request": marker/);
 });
 
@@ -209,8 +340,9 @@ test("sidebar uses the bundled Dongchedi app mark and brand colors", async () =>
   ]);
   assert.match(shell, /src=\{publicAssetPath\("\/dongchedi-app-icon\.svg"\)\}/);
   assert.match(shell, /alt="懂车帝 App"/);
-  assert.match(shell, /<strong>Dcar Sentinel<\/strong>/);
-  assert.match(shell, /内容运营工作台 · V1\.0/);
+  assert.match(shell, /<strong>Dcar AIGC<\/strong>/);
+  assert.match(shell, /开心瓦瓦·运营工作台/);
+  assert.doesNotMatch(shell, /Dcar Sentinel|内容运营工作台 · V1\.0|开心瓦瓦·内容运营工作台/);
   assert.doesNotMatch(shell, /内容运营工作台 · v8/);
   assert.doesNotMatch(shell, /v8\.2 合同|本地优先|topbar-statuses|safe-chip/);
   assert.doesNotMatch(shell, /<strong>DCar Insight<\/strong>/);
@@ -383,6 +515,11 @@ test("selling point standards use E/X/M scenes, scene-local hits, and matcher-on
   assert.match(source, /pointsForFamily\(data\.items, family\.scene\)/);
   assert.match(source, /useQuery\(\{ \.\.\.activeSellingPointsQueryOptions\(\), enabled: !draftMode \}\)/);
   assert.match(source, /useQuery\(\{ \.\.\.draftSellingPointsQueryOptions\(\), enabled: draftMode \}\)/);
+  assert.match(source, /import sellingPointV53 from "\.\.\/\.\.\/\.\.\/\.\.\/config\/business_selling_points_v5_3\.json"/);
+  assert.match(source, /const \[previewMode, setPreviewMode\] = useState\(true\)/);
+  assert.match(source, /withV53PreviewCopy\(currentData\)/);
+  assert.match(source, /当前仅预览 v5\.3 新文案，命中统计和后台评估仍使用 v5\.2/);
+  assert.match(source, /previewMode \? "查看正式生效版" : "预览 v5\.3 新文案"/);
   assert.doesNotMatch(source, /point\.code\.startsWith/);
   assert.match(source, /className="selling-point-summary-grid"/);
   assert.match(source, /className="selling-point-table"/);
@@ -559,8 +696,12 @@ test("spu audience page keeps rule assets, association and 3D stats together", a
   assert.match(page, /row\.aliases\.filter\(\(item\) => !item\.ambiguous\)/);
   assert.match(page, /row\.aliases\.filter\(\(item\) => item\.ambiguous\)/);
   assert.match(page, /audience_secondary: form\.audienceSecondary \|\| null,\s*aliases,/);
-  // 内容列表新增 SPU/人群/场景 三列与筛选，且顺序在卖点列之前；证据等级从卖点列拆出为独立列
-  assert.match(contents, /<th>内容方向<\/th><th>车型<\/th><th>人群<\/th><th>场景<\/th><th>卖点<\/th><th>资料完整度<\/th><th>垂直度<\/th>/);
+  // 卖点紧跟标题、位于平台之前；表头与每行内容同步移动。
+  assert.match(contents, /<th>内容编号 \/ 平台作品编号 \/ 标题<\/th><th>卖点<\/th><th>平台 \/ 发布时间<\/th><th>账号<\/th>/);
+  assert.match(contents, /<ContentTitle text=\{item\.title \|\| "标题缺失"\} \/><\/td><td>\{item\.primary_selling_point_code/);
+  assert.match(contents, /结果需更新<\/span>\}<\/td><td>\{label\(item\.platform\)\}/);
+  // 车型、人群、场景顺序不变；资料完整度仍为独立列。
+  assert.match(contents, /<th>内容方向<\/th><th>车型<\/th><th>人群<\/th><th>场景<\/th><th>资料完整度<\/th><th>垂直度<\/th>/);
   // 界面不暴露独立的英文 "SPU" 文本节点（会被浏览器翻译插件误译成"空间物理单元"）
   assert.doesNotMatch(contents, /<th>SPU<\/th>/);
   assert.doesNotMatch(page, /<th>SPU<\/th>/);
@@ -596,8 +737,14 @@ test("spu audience page keeps rule assets, association and 3D stats together", a
   assert.match(types, /audience: ContentTagAudience \| null;/);
   assert.match(types, /scenes: ContentTagScene\[\];/);
   assert.match(formatSource, /content_explicit: "内容中直接提到", rule_prior: "系统按规则判断"/);
-  // 列宽口径：证据等级列拆出后内容表总宽 2126
+  // 列宽跟随列顺序移动，各列原有宽度与内容表总宽保持不变。
   assert.match(styles, /\.content-table \{ min-width: 2126px !important; \}/);
+  assert.match(styles, /\.content-table th:first-child \{ width: 280px; \}/);
+  assert.match(styles, /\.content-table th:nth-child\(2\) \{ width: 190px; \}/);
+  assert.match(styles, /\.content-table th:nth-child\(3\), \.content-table th:nth-child\(4\) \{ width: 140px; \}/);
+  assert.match(styles, /\.content-table th:nth-child\(n\+5\) \{ width: 96px; \}/);
+  assert.match(styles, /\.content-table th:nth-child\(8\) \{ width: 150px; \}/);
+  assert.match(styles, /\.content-table th:nth-child\(10\) \{ width: 170px; \}/);
   assert.match(styles, /\.main-area\[data-section="spu-audience"\]/);
   // 后端：v15 关联域（v14 + LLM 辅助）+ 端点 + 内容检索标签
   assert.match(storageSource, /SCHEMA_VERSION = 16/);
@@ -730,12 +877,14 @@ test("routes preserve operations and expose read-only evidence workbench", async
   assert.match(accounts, /新增账号<\/button><Link className="secondary button-link" href="\/accounts\/douyin-authorization">抖音授权管理<\/Link><button className="secondary button-link" disabled=\{exporting\} onClick=\{\(\) => void exportWorkbook\(\)\}>\{exporting \? "正在导出…" : "下载账号表格"\}<\/button><label className="secondary button-link">批量导入/);
   assert.match(accounts, /useQuery\(douyinAuthorizationStatusesQueryOptions\(\)\)/);
   assert.match(accounts, /authorizationStatuses\.find\(\(item\) => item\.account_id === account\.id && item\.platform_uid === identity\.uid && item\.status === "active"\)/);
-  assert.match(accounts, /authorizationStatusesPending[\s\S]*\? "查询中"[\s\S]*authorizationStatusesFailed[\s\S]*\? "状态异常"[\s\S]*needsAuthorization[\s\S]*\? "需重新授权"[\s\S]*authorization\?\.authorized[\s\S]*\? "已授权"[\s\S]*: "未授权"/);
+  assert.match(accounts, /const authorizationState = needsAuthorization \? "needs_reauthorization" : authorization\?\.authorized \? "authorized" : "unauthorized"/);
+  assert.match(accounts, /const authorizationLabel = needsAuthorization \? "需重新授权" : authorization\?\.authorized \? "已授权" : "未授权"/);
+  assert.doesNotMatch(accounts, /查询中|状态异常|不可授权/);
   assert.match(accounts, /`\/accounts\/douyin-authorization\?account_id=\$\{encodeURIComponent\(String\(account\.id\)\)\}&platform_uid=\$\{encodeURIComponent\(douyinUid\)\}`/);
   assert.match(accounts, /const hasDouyinUid = Boolean\(douyinUid\)/);
   assert.match(accounts, /const canOpenAuthorization = hasDouyinUid && \(account\.enabled \|\| Boolean\(authorization\)\)/);
   assert.match(accounts, /canOpenAuthorization \? <Link href=\{authorizationHref\}>\{account\.enabled && needsAuthorization \? "重新授权" : authorization \? "管理" : "去授权"\}<\/Link> : <small>账号已停用<\/small>/);
-  assert.match(accounts, /hasDouyinUid \? <>[\s\S]*<span>不可授权<\/span>/);
+  assert.match(accounts, /!hasDouyinUid \? <span className="account-authorization-state unbound">未绑定<\/span> : !authorizationStatusesReady \? <span className="account-authorization-placeholder">—<\/span> : <>/);
   assert.match(accounts, /className="account-base-group" colSpan=\{4\} scope="colgroup">账号基础信息/);
   assert.match(accounts, /platformKeys\.map\(\(key\) => <th className="account-platform-group"/);
   assert.match(accounts, /colSpan=\{key === "douyin" \? 6 : 5\}/);
@@ -745,9 +894,10 @@ test("routes preserve operations and expose read-only evidence workbench", async
   assert.match(accounts, /key === "douyin" && <col className="account-douyin-authorization-col" \/>/);
   assert.match(formatSource, /platformKeys = \["douyin", "xiaohongshu", "wechat_channels", "kuaishou"\]/);
   assert.match(accounts, /<th className="account-platform-start" scope="col">平台账号编号<\/th><th scope="col">是否实名<\/th>\{key === "douyin" && <th scope="col">抖音开平授权<\/th>\}<th scope="col">昵称<\/th><th className="account-number-cell" scope="col">粉丝量<\/th><th className="account-number-cell" scope="col">关联内容量<\/th>/);
-  assert.match(accounts, /platformKey === "douyin" && <td className="account-douyin-authorization-cell">\{hasDouyinUid \? <>/);
+  assert.match(accounts, /platformKey === "douyin" && <td className="account-douyin-authorization-cell">\{!hasDouyinUid \?/);
   assert.match(accounts, /<th className="account-sticky account-phone" scope="row"><strong>\{item\.phone\}<\/strong><\/th>/);
-  assert.match(accounts, /<AccountPlatformCells account=\{item\} authorizationStatuses=\{douyinAuthorizationStatuses\} authorizationStatusesPending=\{douyinAuthorizationStatusesQuery\.isPending && !douyinAuthorizationStatusesQuery\.data\} authorizationStatusesFailed=\{douyinAuthorizationStatusesQuery\.isError\} \/>/);
+  assert.match(accounts, /<AccountPlatformCells account=\{item\} authorizationStatuses=\{douyinAuthorizationStatuses\} authorizationStatusesReady=\{Boolean\(douyinAuthorizationStatusesQuery\.data && !douyinAuthorizationStatusesQuery\.data\.unavailable\)\} \/>/);
+  assert.match(accounts, /douyinAuthorizationStatusesQuery\.isError && <Notice tone="error">/);
   assert.match(accounts, /new BroadcastChannel\("dcar-douyin-authorization"\)/);
   assert.match(accounts, /event\.origin !== window\.location\.origin \|\| !receivesAuthorizationUpdate\(event\.data\)/);
   assert.match(accounts, /data\.type === "dcar-douyin-authorization-updated"/);

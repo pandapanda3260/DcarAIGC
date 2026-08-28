@@ -6,6 +6,8 @@ COPY app/web/package.json app/web/package-lock.json ./
 RUN npm ci
 
 COPY app/web/ ./
+# The preview imports this public taxonomy outside the flattened web root.
+COPY config/business_selling_points_v5_3.json /config/business_selling_points_v5_3.json
 
 ARG DCAR_WEB_BASE_PATH=""
 ARG NEXT_PUBLIC_DCAR_API_BASE=""

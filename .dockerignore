@@ -16,6 +16,7 @@
 !src/dcar_eval/project_paths.py
 !src/dcar_eval/rebuild_channel_evaluation_v4.py
 !src/dcar_eval/three_proposition_scoring.py
+!src/dcar_eval/tikhub_config.py
 !src/dcar_eval/v8/
 !src/dcar_eval/v8/**
 !src/dcar_eval/dcar_auth/

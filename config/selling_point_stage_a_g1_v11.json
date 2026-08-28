@@ -1,0 +1,24 @@
+{
+  "version": "selling-point-stage-a-models-v2",
+  "queried_at": "2026-08-24T08:52:56Z",
+  "currency": "CNY",
+  "unit": "per_million_tokens",
+  "budget_limit_cny": 200.0,
+  "cost_basis": "公开按量未缓存单价上界；不抵扣免费额度、缓存或优惠",
+  "api_models_snapshot": {
+    "source": "GET https://ark.cn-beijing.volces.com/api/v3/models",
+    "queried_at": "2026-08-24T08:52:56Z"
+  },
+  "models": [
+    {
+      "slot": "quality_default",
+      "requested_model": "doubao-seed-2-1-pro-260628",
+      "model": "doubao-seed-2-1-pro-260628",
+      "replacement_reason": null,
+      "input_cny_per_million_tokens": 6.0,
+      "output_cny_per_million_tokens": 30.0,
+      "supports_json_object": true,
+      "price_source_url": "https://www.volcengine.com/product/ark"
+    }
+  ]
+}

@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import unittest
 from pathlib import Path
+from posixpath import normpath
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -113,12 +114,43 @@ class AuthDeploymentContractTestCase(unittest.TestCase):
         self.assertIn("!src/dcar_eval/dcar_auth/**", dockerignore)
         self.assertIn("!src/dcar_eval/dcar_douyin_control/**", dockerignore)
         self.assertIn("deploy/server/nginx/login.html", api_image)
+        self.assertIn(
+            "src/dcar_eval/tikhub_config.py /app/src/dcar_eval/tikhub_config.py",
+            api_image,
+        )
+        self.assertIn("!src/dcar_eval/tikhub_config.py", dockerignore)
         self.assertIn("EXPOSE 4174", web_image)
         self.assertIn("dcar_auth.gateway:app", unit)
         self.assertIn("ReadWritePaths=/var/lib/dcar-aigc/auth", unit)
         self.assertIn("proxy_pass http://127.0.0.1:4173", nginx)
         self.assertNotIn("auth_basic", nginx)
         self.assertNotIn("auth_request", nginx)
+
+    def test_web_image_includes_the_selling_point_preview_build_input(self) -> None:
+        web_image = (ROOT / "deploy/server/Dockerfile.web").read_text(
+            encoding="utf-8"
+        )
+        page = (ROOT / "app/web/app/selling-points/SellingPointsPage.tsx").read_text(
+            encoding="utf-8"
+        )
+        preview_import = re.search(r'import sellingPointV53 from "([^"]+)";', page)
+        self.assertIsNotNone(preview_import)
+        relative_path = preview_import.group(1) if preview_import else ""
+        container_path = normpath(f"/app/app/selling-points/{relative_path}")
+        self.assertEqual(container_path, "/config/business_selling_points_v5_3.json")
+        copy_instruction = (
+            "COPY config/business_selling_points_v5_3.json "
+            f"{container_path}"
+        )
+        self.assertIn(copy_instruction, web_image)
+        self.assertLess(
+            web_image.index(copy_instruction),
+            web_image.index("RUN node ./node_modules/vinext/dist/cli.js build"),
+        )
+        self.assertTrue((ROOT / "config/business_selling_points_v5_3.json").is_file())
+        self.assertIn(
+            "!config/*.json", (ROOT / ".dockerignore").read_text(encoding="utf-8")
+        )
 
 
 if __name__ == "__main__":

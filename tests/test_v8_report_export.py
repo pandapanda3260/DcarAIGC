@@ -15,6 +15,7 @@ from v8.report_export import (
     build_report_detail_workbook,
     build_report_download_bundle,
     report_bundle_filename,
+    report_file_filename,
 )
 from v8.reports import render_summary_png, render_summary_svg
 
@@ -441,6 +442,68 @@ class ReportExportTest(unittest.TestCase):
             report_bundle_filename(task_name="...", task_id="D8-C-TEST"),
             "D8-C-TEST.zip",
         )
+
+    def test_single_file_names_preserve_task_revision_and_safe_chinese_title(self) -> None:
+        task_id = "D8-D-20260826-20260826"
+        self.assertEqual(
+            report_file_filename(
+                task_name="2026-08-26 日报",
+                task_id=task_id,
+                revision=2,
+                extension="png",
+            ),
+            f"2026-08-26 日报_{task_id}_v2_图片报告.png",
+        )
+        for extension, label in (("svg", "图片报告"), ("xlsx", "数据明细")):
+            with self.subTest(extension=extension):
+                filename = report_file_filename(
+                    task_name='  ../月报：A/B*测试?\x00\n\x85\u202e.zip  ',
+                    task_id=task_id,
+                    revision=7,
+                    extension=extension,
+                )
+                self.assertIn("月报", filename)
+                self.assertTrue(filename.endswith(f"_{task_id}_v7_{label}.{extension}"))
+                self.assertFalse(filename.startswith("."))
+                self.assertFalse(
+                    any(character in filename for character in '<>:"/\\|?*\x00\n\x85\u202e')
+                )
+
+        filenames = {
+            report_file_filename(
+                task_name="同名任务",
+                task_id=identifier,
+                revision=revision,
+                extension="xlsx",
+            )
+            for identifier, revision in (("D8-C-A", 1), ("D8-C-B", 1), ("D8-C-A", 2))
+        }
+        self.assertEqual(len(filenames), 3)
+
+        long_name = report_file_filename(
+            task_name="超长中文任务" * 100,
+            task_id=task_id,
+            revision=123,
+            extension="xlsx",
+        )
+        self.assertLessEqual(len(long_name.encode("utf-8")), 255)
+        self.assertTrue(long_name.endswith(f"_{task_id}_v123_数据明细.xlsx"))
+        unusual_ids = ["D8-C-" + "A" * 300 + ending for ending in ("1", "2")]
+        unusual_names = [
+            report_file_filename(
+                task_name="超长中文任务" * 100,
+                task_id=identifier,
+                revision=1,
+                extension="png",
+            )
+            for identifier in unusual_ids
+        ]
+        self.assertNotEqual(unusual_names[0], unusual_names[1])
+        self.assertTrue(all(len(name.encode("utf-8")) <= 255 for name in unusual_names))
+        with self.assertRaises(ValueError):
+            report_file_filename(
+                task_name="报告", task_id=task_id, revision=1, extension="pdf"
+            )
 
     def test_summary_png_renderer_uses_aspect_ratio_preserving_renderer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

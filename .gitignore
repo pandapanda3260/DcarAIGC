@@ -10,6 +10,9 @@ Rnote key.txt
 [Aa]pify*key*.txt
 [Tt]ik[Hh]ub*.env
 [Tt]ik[Hh]ub*key*.txt
+[Tt]ik[Hh]ub*.env.local
+dcar.env.local
+writer.env
 
 # Reusable Douyin API cache (kept locally, not committed)
 douyin_cache/

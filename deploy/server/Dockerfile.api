@@ -31,6 +31,7 @@ COPY --chown=dcar:dcar src/dcar_eval/probe_tikhub_douyin.py /app/src/dcar_eval/p
 COPY --chown=dcar:dcar src/dcar_eval/project_paths.py /app/src/dcar_eval/project_paths.py
 COPY --chown=dcar:dcar src/dcar_eval/rebuild_channel_evaluation_v4.py /app/src/dcar_eval/rebuild_channel_evaluation_v4.py
 COPY --chown=dcar:dcar src/dcar_eval/three_proposition_scoring.py /app/src/dcar_eval/three_proposition_scoring.py
+COPY --chown=dcar:dcar src/dcar_eval/tikhub_config.py /app/src/dcar_eval/tikhub_config.py
 COPY --chown=dcar:dcar src/dcar_eval/v8 /app/src/dcar_eval/v8
 COPY --chown=dcar:dcar src/dcar_eval/dcar_auth /app/src/dcar_eval/dcar_auth
 COPY --chown=dcar:dcar src/dcar_eval/dcar_douyin_control /app/src/dcar_eval/dcar_douyin_control

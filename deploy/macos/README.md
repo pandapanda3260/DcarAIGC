@@ -9,7 +9,7 @@ writer renderer 只生成 disabled-by-default plist，永不调用 `launchctl`�
 - 同一时刻只能有一个 scheduled writer。Ubuntu 副本和 freeze 8765 均必须保持 `DCAR_SCHEDULER_ENABLED=0` 和 `DCAR_STARTUP_CATCHUP_ENABLED=0`。
 - writer 使用 `DCAR_SCHEDULER_ENABLED=1` 和 `DCAR_STARTUP_CATCHUP_ENABLED=1`，但 startup catch-up 严格为 `report_only`：只可创建/重试 `daily_report` 和 `weekly_report`，不运行 capture、media 或 cutoff，不产生供应商费用。
 - 每日 capture 的 task 总额硬顶为 USD 20。只有运营者明确批准循环成本并在 `writer.env` 写入固定 acknowledgement 后才能启用。
-- TikHub API key 不得进入 plist 或 `writer.env`。`writer.env` 只允许 `TIKHUB_API_KEY_FILE`、`DCAR_DAILY_COST_AUTHORIZATION`、空行和注释；其他条目都会 exit 78。
+- TikHub API base/key 不得进入 plist 或 `writer.env`。`writer.env` 只允许 `TIKHUB_API_KEY_FILE`、`DCAR_DAILY_COST_AUTHORIZATION`、空行和注释；其他条目都会 exit 78。`TIKHUB_API_KEY_FILE` 指向外部 `dcar.env.local`，wrapper 只导出文件路径，不会把其中其他服务的凭据注入 writer 环境。
 - `DCAR_DAILY_CAPTURE_RECONCILE_FROM` 只能由 plist 继承，必须是真实且规范的 `YYYY-MM-DD`。不得将它写进 `writer.env`。
 - scheduler 锁在 `$HOME/Library/Application Support/DcarAIGC/runtime/writer-worker.lock`，不在 checkout 里。`writer_lock.held=true` 只证明唯一 scheduler 进程锁已持有，不证明数据库没有其他非调度写进者。
 - `runtime/operator-freeze.lock` 存在时不得启动 writer。正式库只能在停服、freeze、已验证备份下走 v15→v16 离线 candidate 流程，运行时不自动迁移。
@@ -28,10 +28,10 @@ install -d -m 0700 "$HOME/Library/Application Support/DcarAIGC/runtime"
 install -d -m 0700 "$HOME/Library/Logs/DcarAIGC"
 install -m 0600 deploy/macos/writer.env.example \
   "$HOME/Library/Application Support/DcarAIGC/writer.env"
-chmod 0600 /absolute/path/outside/the/repository/TikHub.env.local
+chmod 0600 /absolute/path/outside/the/repository/dcar.env.local
 ```
 
-key 文件必须是项目外的普通非 symlink 文件，mode 只能是 0400 或 0600，内含 `TIKHUB_API_KEY=...`。wrapper 会在导出任何付费环境前完成该校验和 reconcile 日期校验。
+TikHub 配置文件必须是项目外的普通非 symlink 文件，mode 只能是 0400 或 0600，并且精确包含一条 `TIKHUB_API_BASE=https://api.tikhub.io` 和一条 `TIKHUB_API_KEY=...`。wrapper 会在导出任何付费环境前完成该校验和 reconcile 日期校验。
 
 ## 2. 只渲染，不加载
 

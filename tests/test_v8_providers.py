@@ -26,6 +26,7 @@ from v8.operations import IdentityConflictError, upsert_account, upsert_content
 from v8.providers import (
     ProviderConfigurationError,
     _load_key,
+    _load_tikhub_base,
     _collect_media_urls,
     _douyin_discovery_call,
     _douyin_image_url_groups,
@@ -84,6 +85,70 @@ class ProviderCredentialLoadingTest(unittest.TestCase):
                     _load_key(Path(temp) / "missing-default.key", "TEST_PROVIDER_KEY"),
                     "file-value",
                 )
+
+    def test_tikhub_key_and_base_share_the_environment_file_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            configured = Path(temp) / "dcar.env.local"
+            configured.write_text(
+                "TIKHUB_API_BASE=https://api.tikhub.io\n"
+                "TIKHUB_API_KEY=test-secret\n",
+                encoding="utf-8",
+            )
+            configured.chmod(0o600)
+            with patch.dict(
+                os.environ,
+                {"TIKHUB_API_KEY_FILE": str(configured)},
+                clear=True,
+            ):
+                self.assertEqual(
+                    _load_key(Path(temp) / "unused.env", "TIKHUB_API_KEY"),
+                    "test-secret",
+                )
+                self.assertEqual(
+                    _load_tikhub_base(Path(temp) / "unused.env"),
+                    "https://api.tikhub.io",
+                )
+
+    def test_tikhub_base_rejects_noncanonical_host(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            configured = Path(temp) / "dcar.env.local"
+            configured.write_text(
+                "TIKHUB_API_BASE=https://example.invalid\n",
+                encoding="utf-8",
+            )
+            configured.chmod(0o600)
+            with patch.dict(os.environ, {}, clear=True), self.assertRaisesRegex(
+                ProviderConfigurationError, "https://api.tikhub.io"
+            ):
+                _load_tikhub_base(configured)
+
+    def test_tikhub_key_access_validates_base_before_loading_the_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            configured = Path(temp) / "dcar.env.local"
+            configured.write_text(
+                "TIKHUB_API_BASE=https://example.invalid\n"
+                "TIKHUB_API_KEY=test-secret\n",
+                encoding="utf-8",
+            )
+            configured.chmod(0o600)
+            with patch.dict(os.environ, {}, clear=True), patch(
+                "v8.providers.load_tikhub_api_key"
+            ) as load_key, self.assertRaisesRegex(
+                ProviderConfigurationError, "https://api.tikhub.io"
+            ):
+                _load_key(configured, "TIKHUB_API_KEY")
+            load_key.assert_not_called()
+
+    def test_tikhub_direct_key_cannot_bypass_base_validation(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "TIKHUB_API_KEY": "test-secret",
+                "TIKHUB_API_BASE": "https://example.invalid",
+            },
+            clear=True,
+        ), self.assertRaisesRegex(ProviderConfigurationError, "https://api.tikhub.io"):
+            _load_key(Path("/unused-test-provider-config"), "TIKHUB_API_KEY")
 
 
 class V8ProviderUpdateTest(unittest.TestCase):

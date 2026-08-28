@@ -1,0 +1,30 @@
+{
+  "version": "selling-point-gold-overrides-v5.3",
+  "source_gold_sha256": "b34b5f7b550b948ec5f704620653e6e57662814d22d105f15631cc79588d8eec",
+  "expected_change_count": 18,
+  "expected_scene_counts": {
+    "X": 112,
+    "E": 93,
+    "M": 23
+  },
+  "decisions": [
+    {"excel_row": 45, "from_code": "X1", "to_code": "X9", "decision_id": "D1", "reason": "与第168条为同一内容，主任务是360度3D看车和车型细节"},
+    {"excel_row": 58, "from_code": "X5", "to_code": "M2", "decision_id": "P0", "reason": "出现AI小懂且无单一更具体任务，媒体类优先"},
+    {"excel_row": 67, "from_code": "X5", "to_code": "M2", "decision_id": "P0", "reason": "出现AI小懂且无单一更具体任务，媒体类优先"},
+    {"excel_row": 120, "from_code": "X11", "to_code": "X2", "decision_id": "D2", "reason": "真实车主用车体验用于购车决策"},
+    {"excel_row": 121, "from_code": "X11", "to_code": "X2", "decision_id": "D2", "reason": "真实车主长期用车体验用于购车决策"},
+    {"excel_row": 122, "from_code": "X11", "to_code": "X2", "decision_id": "D2", "reason": "真实车主长期用车体验用于购车决策"},
+    {"excel_row": 123, "from_code": "X11", "to_code": "X2", "decision_id": "D2", "reason": "真实车主长期用车体验用于购车决策"},
+    {"excel_row": 124, "from_code": "X11", "to_code": "M8", "decision_id": "D2", "reason": "车友圈发帖、提问和互动是主要任务"},
+    {"excel_row": 125, "from_code": "X11", "to_code": "M8", "decision_id": "D2", "reason": "车友圈交流、互动和玩车内容是主要任务"},
+    {"excel_row": 126, "from_code": "X11", "to_code": "X2", "decision_id": "D2", "reason": "真实车主用车体验用于购车决策"},
+    {"excel_row": 127, "from_code": "X11", "to_code": "X2", "decision_id": "D2", "reason": "真实车主用车体验用于购车决策"},
+    {"excel_row": 128, "from_code": "X11", "to_code": "X2", "decision_id": "D2", "reason": "真实车主用车体验用于购车决策"},
+    {"excel_row": 150, "from_code": "E3", "to_code": "X8", "decision_id": "P1", "reason": "懂车帝承接国补平台任务和购车权益"},
+    {"excel_row": 153, "from_code": "E3", "to_code": "E2", "decision_id": "P2", "reason": "平台活动、328项检测、7天可退构成主要购车保障承诺"},
+    {"excel_row": 198, "from_code": "E7", "to_code": "E2", "decision_id": "P2", "reason": "透明标准、7天可退、60天质保和官方兜底构成主要购车保障承诺"},
+    {"excel_row": 227, "from_code": "E10", "to_code": "X8", "decision_id": "P1", "reason": "主任务是以旧换新补贴政策、资格和兑付"},
+    {"excel_row": 228, "from_code": "E10", "to_code": "E6", "decision_id": "P4", "reason": "主任务是保值率和市场行情数据"},
+    {"excel_row": 229, "from_code": "E10", "to_code": "E6", "decision_id": "P4", "reason": "主任务是保值率和市场行情数据"}
+  ]
+}

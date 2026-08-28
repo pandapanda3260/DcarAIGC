@@ -18,6 +18,13 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
 
+from tikhub_config import (
+    DEFAULT_TIKHUB_API_BASE,
+    DEFAULT_TIKHUB_CONFIG_FILE,
+    TikHubConfigurationError,
+    load_tikhub_api_base,
+    load_tikhub_api_key,
+)
 from workflow.privacy import CommentHasher  # type: ignore[import-not-found,import-untyped]
 
 from .capture import (
@@ -65,9 +72,8 @@ from .storage import DEFAULT_DB, connect, now_utc, transaction
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
-TIKHUB_KEY_FILE = Path("/Users/mark/Documents/key/DcarKey/TikHub.env.local")
+TIKHUB_KEY_FILE = DEFAULT_TIKHUB_CONFIG_FILE
 RNOTE_KEY_FILE = Path("/Users/mark/Documents/key/DcarKey/Rnote.env.local")
-TIKHUB_BASE = "https://api.tikhub.io"
 RNOTE_BASE = "https://rnote.dev/api/v2/crawler/note"
 TIKHUB_PRICE = 0.001
 TIKHUB_XHS_PRICE = 0.01
@@ -123,6 +129,12 @@ class ProviderConfigurationError(RuntimeError):
 
 
 def _load_key(path: Path, variable: str) -> str:
+    if variable == "TIKHUB_API_KEY":
+        try:
+            load_tikhub_api_base(path)
+            return load_tikhub_api_key(path)
+        except TikHubConfigurationError as error:
+            raise ProviderConfigurationError(str(error)) from error
     direct_value = os.environ.get(variable, "").strip()
     if direct_value:
         return direct_value
@@ -145,6 +157,18 @@ def _load_key(path: Path, variable: str) -> str:
         elif len(text.splitlines()) == 1:
             return line.strip("\"'")
     raise ProviderConfigurationError(f"{variable} 未配置")
+
+
+def _load_tikhub_base(path: Path | None = None) -> str:
+    try:
+        return load_tikhub_api_base(path or TIKHUB_KEY_FILE)
+    except TikHubConfigurationError as error:
+        raise ProviderConfigurationError(str(error)) from error
+
+
+# Keep API imports independent of credential availability.  _load_key validates
+# the configured base at the provider access boundary before returning a key.
+TIKHUB_BASE = DEFAULT_TIKHUB_API_BASE
 
 
 def ensure_operational_budget(

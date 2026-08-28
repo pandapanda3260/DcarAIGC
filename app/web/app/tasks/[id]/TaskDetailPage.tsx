@@ -5,7 +5,7 @@ import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import AppShell from "../../components/AppShell";
 import { Feedback, Loading, Notice } from "../../components/Feedback";
-import { API_BASE, readJson } from "../../lib/api";
+import { API_BASE, readDownload, readJson, saveDownload } from "../../lib/api";
 import {
   formatBytes,
   formatDate,
@@ -167,6 +167,7 @@ function MetricText({ metric, compact = false }: { metric?: Metric; compact?: bo
 export default function TaskDetailPage({ taskId }: { taskId: string }) {
   const [tab, setTab] = useState<(typeof tabs)[number][0]>("summary");
   const [saving, setSaving] = useState(false);
+  const [downloading, setDownloading] = useState(false);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const queryClient = useQueryClient();
@@ -175,6 +176,24 @@ export default function TaskDetailPage({ taskId }: { taskId: string }) {
   const displayRevision = detail?.display_effective_revision?.revision;
   const reportQuery = useQuery(taskReportQueryOptions(taskId, displayRevision));
   const report = reportQuery.data ?? null;
+
+  async function downloadReport() {
+    if (downloading || !detail || displayRevision == null) return;
+    setDownloading(true); setError(""); setMessage("");
+    try {
+      // Both files use the same displayed revision even if polling finds a newer one.
+      const path = `/api/v8/tasks/${encodeURIComponent(detail.id)}/revisions/${displayRevision}/download`;
+      const formats = ["image", "xlsx"] as const;
+      const files = await Promise.all(formats.map((kind) => readDownload(`${path}?format=${kind}`, {
+        contentTypes: kind === "image" ? ["image/png", "image/svg+xml"] : ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"],
+        fallbackFilename: (contentType) => `${detail.id}_v${displayRevision}_${kind === "image" ? `图片报告.${contentType === "image/svg+xml" ? "svg" : "png"}` : "数据明细.xlsx"}`,
+      })));
+      files.forEach(saveDownload);
+      setMessage("已发起图片和 Excel 两份文件下载。如浏览器提示，请允许浏览器下载多个文件。");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "报告下载失败，请稍后重试。");
+    } finally { setDownloading(false); }
+  }
 
   async function action(kind: "retry" | "cancel" | "resume") {
     setSaving(true); setError(""); setMessage("");
@@ -211,13 +230,18 @@ export default function TaskDetailPage({ taskId }: { taskId: string }) {
       .filter(([key]) => key !== "weekly_comment_coverage" || detail?.task_type === "weekly")
       .map(([key, value]) => genericQualityRow(key, value)),
   ] : [];
-  return <AppShell active="tasks" actions={<Link className="secondary button-link" href="/tasks">返回任务</Link>}>
+  return <AppShell active="tasks">
     <Feedback error={error} message={message} onClose={() => { setError(""); setMessage(""); }} />
     {detailQuery.isError && <Notice tone="error">{detail ? `数据刷新失败，当前显示上次数据。${detailQuery.error instanceof Error ? detailQuery.error.message : ""}` : detailQuery.error instanceof Error ? detailQuery.error.message : "任务详情读取失败"}</Notice>}
     {reportQuery.isError && <Notice tone="error">{reportQuery.error instanceof Error ? reportQuery.error.message : "报告读取失败"}</Notice>}
     {detailQuery.isPending && !detail ? <Loading label="正在读取任务详情" /> : !detail ? <section className="page-stack wide-stack"><article className="panel"><div className="empty-state"><strong>暂时无法读取任务详情</strong><span>请稍后重试。</span></div></article></section> : <section className="page-stack wide-stack">
-      <div className="detail-toolbar"><div><span className="eyebrow">任务编号：{detail.id}</span><h2>{detail.name}</h2><p>{formatDate(detail.period_start)} — {formatDate(detail.period_end)} · {humanizeTaskStatus(detail.task_status, detail.message)} · {humanizeTaskMessage(detail.message) || "无附加说明"}</p></div><div>
-        {detail.display_effective_revision && <a className="primary button-link report-download-button" href={`${API_BASE}/api/v8/tasks/${encodeURIComponent(detail.id)}/revisions/${detail.display_effective_revision.revision}/download`} download title={`下载当前展示的第 ${detail.display_effective_revision.revision} 版报告图片和 Excel 明细`}>下载报告</a>}
+      <div className="detail-toolbar"><div className="task-detail-heading">
+        <Link href="/tasks" className="task-back-button" aria-label="返回任务列表" title="返回任务列表">
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false"><path d="m12.5 4.5-5.5 5.5 5.5 5.5" /></svg>
+        </Link>
+        <div className="task-detail-heading-copy"><span className="eyebrow">任务编号：{detail.id}</span><h2>{detail.name}</h2><p>{formatDate(detail.period_start)} — {formatDate(detail.period_end)} · {humanizeTaskStatus(detail.task_status, detail.message)} · {humanizeTaskMessage(detail.message) || "无附加说明"}</p></div>
+      </div><div>
+        {detail.display_effective_revision && <button type="button" className="primary report-download-button" disabled={downloading} onClick={() => void downloadReport()} title={`直接下载当前展示的第 ${displayRevision} 版报告图片和 Excel 明细，不打包`}>{downloading ? "正在准备文件…" : "下载报告"}</button>}
         {retryable && <button className="secondary" disabled={saving} onClick={() => void action("retry")}>重新生成报告</button>}
         {cancellable && <button className="secondary danger-button" disabled={saving || detail.task_status === "cancel_requested"} onClick={() => void action("cancel")}>{detail.task_status === "cancel_requested" ? "取消中" : "取消任务"}</button>}
         {detail.task_status === "cancelled" && <button className="primary" disabled={saving} onClick={() => void action("resume")}>恢复任务</button>}
