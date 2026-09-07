@@ -10,6 +10,12 @@ export type ServiceHealth = {
     status: "current" | "stale" | "unknown";
     last_successful_capture_at?: string | null;
   };
+  snapshot_sync?: {
+    status: "current" | "delayed" | "unknown";
+    last_verified_install_at: string | null;
+    window_state: "active" | "inactive" | "unknown";
+    next_scheduled_at?: string | null;
+  } | null;
 };
 export type ServiceState = {
   // AppShell renders faults in red and other non-running conditions in amber.
@@ -30,6 +36,32 @@ function captureTime(health: ServiceHealth): string {
   return `最近成功采集：${formatted}（北京时间）。`;
 }
 
+function snapshotTime(value: string | null | undefined): string {
+  if (!value || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value)
+    || !validDay(value.slice(0, 10)) || !Number.isFinite(Date.parse(value))) return "";
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hour12: false,
+  }).format(new Date(value));
+}
+
+function snapshotStatus(health: ServiceHealth): ServiceState {
+  const sync = health.snapshot_sync;
+  const installed = snapshotTime(sync?.last_verified_install_at);
+  const lastSync = installed ? `最近同步：${installed}（北京时间）。` : "";
+  const next = snapshotTime(sync?.next_scheduled_at);
+  const schedule = sync?.window_state === "inactive"
+    ? `当前不在自动发布时段，00:00–09:00（北京时间）不累计同步延迟。${next ? `下次计划发布：${next}（北京时间）。` : ""}`
+    : "";
+  if (sync?.status === "current" && installed) {
+    return { kind: "online", label: "快照同步正常", description: `${lastSync}线上展示已发布的只读数据，同步成功不代表采集完整。${schedule}` };
+  }
+  if (sync?.status === "delayed" && installed) {
+    return { kind: "stale", label: "快照同步延迟", description: `${lastSync}已超过计划发布时段内的同步等待时间，请检查自动发布任务。${schedule}` };
+  }
+  return { kind: "unknown", label: "同步状态待确认", description: `${lastSync}暂时无法确认最近的快照同步状态。${schedule}` };
+}
+
 export function dataServiceStatus(health: ServiceHealth | undefined, failed: boolean): ServiceState {
   // A failed refresh must not keep claiming that stale cached health is good.
   if (failed || (health && (health.status !== "ok" || typeof health.read_only !== "boolean"))) {
@@ -39,7 +71,7 @@ export function dataServiceStatus(health: ServiceHealth | undefined, failed: boo
   const lastCapture = captureTime(health);
   const automation = health.automation;
   if (health.read_only || automation?.scheduler_state === "read_only") {
-    return { kind: "read-only", label: "只读数据快照", description: `当前展示已发布的数据，非实时采集；新数据发布后会自动刷新。${lastCapture}` };
+    return snapshotStatus(health);
   }
   // A read-only replica has no local capture duty. On the writer, a broken gate must not be
   // disguised as a planned scheduler pause or stop.

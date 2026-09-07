@@ -54,6 +54,7 @@ from v8.runtime_database import (  # noqa: E402
     resolve_installed_database_access,
 )
 from v8.storage import SCHEMA_VERSION, LATEST_SCHEMA_VERSION  # noqa: E402
+from v8.runtime_paths import source_root, verified_git  # noqa: E402
 
 
 RUNTIME_ROOT_CONTRACT = "runtime-root-binding-v1"
@@ -119,6 +120,9 @@ V20_CRITICAL_FILES = CRITICAL_FILES + (
 V20_LEGACY_CRITICAL_FILES = V20_CRITICAL_FILES
 V20_CRITICAL_FILES += (Path("src/dcar_eval/v8/capture_code_successor.py"),
                        Path("src/dcar_eval/v8/account_code_successor.py"))
+V20_ACCOUNT_CRITICAL_FILES = V20_CRITICAL_FILES
+V20_CRITICAL_FILES += (Path("src/dcar_eval/v8/runtime_source_successor.py"),
+                       Path("src/dcar_eval/v8/runtime_paths.py"))
 
 class R0ReceiptError(RuntimeError):
     """The R0 evidence cannot be sealed or no longer verifies."""
@@ -419,15 +423,9 @@ def _inventory(root: Path, *, recursive: bool = True) -> dict[str, object]:
 
 def _git(*arguments: str, project_root: Path) -> bytes:
     try:
-        result = subprocess.run(
-            ["git", "-C", str(project_root), *arguments],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        return verified_git(source_root(project_root), *arguments)
     except subprocess.CalledProcessError as error:
         raise R0ReceiptError("cannot inspect the sealed Git checkout") from error
-    return result.stdout
 
 
 def _working_tree_mode(git_record: Mapping[str, object]) -> bool:
@@ -445,6 +443,7 @@ def _source_patches(project_root: Path) -> dict[str, bytes]:
 
 
 def _untracked_source(project_root: Path, name: str) -> tuple[Path, os.stat_result]:
+    project_root = source_root(project_root)
     relative = Path(name)
     path = project_root / relative
     if (relative.is_absolute() or not name or any(part in {".", "..", ".git"} for part in relative.parts)
@@ -491,7 +490,7 @@ def _git_record(project_root: Path, *, allow_working_tree: bool = False) -> dict
     if not branch:
         raise R0ReceiptError("R0 seal requires a named Git branch")
     try:
-        code_identity = database_safety.code_identity(project_root)
+        code_identity = database_safety.code_identity(source_root(project_root))
     except database_safety.OfflineContractError as error:
         raise R0ReceiptError(str(error)) from error
     if code_identity.get("git_head") != head:
@@ -513,10 +512,11 @@ def _git_record(project_root: Path, *, allow_working_tree: bool = False) -> dict
 def _critical_files(project_root: Path, paths: Sequence[Path] = CRITICAL_FILES) -> dict[str, str]:
     result: dict[str, str] = {}
     if set(paths) not in (set(CRITICAL_FILES), set(PRE_ACCOUNT_STATUS_CRITICAL_FILES),
-                          set(LEGACY_CRITICAL_FILES), set(V20_CRITICAL_FILES)):
+                          set(LEGACY_CRITICAL_FILES), set(V20_LEGACY_CRITICAL_FILES),
+                          set(V20_ACCOUNT_CRITICAL_FILES), set(V20_CRITICAL_FILES)):
         raise R0ReceiptError("sealed critical file inventory is invalid")
     for relative in paths:
-        path = project_root / relative
+        path = source_root(project_root) / relative
         if path.is_symlink() or not path.is_file():
             raise R0ReceiptError(
                 f"critical build file is missing or unsafe: {relative}"
@@ -585,7 +585,7 @@ def _source_archive_record(path: Path, git_record: Mapping[str, object]) -> dict
 
 
 def _report_contract(project_root: Path) -> dict[str, object]:
-    path = project_root / "config/report_contract_v8_9.json"
+    path = source_root(project_root) / "config/report_contract_v8_9.json"
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
@@ -619,6 +619,8 @@ def _installed_record(contract: InstalledWriterContract) -> dict[str, object]:
             "DCAR_V8_REPORTS_ROOT",
         )
     }
+    if environment.get("DCAR_WRITER_SOURCE_ROOT"):
+        selected_environment["DCAR_WRITER_SOURCE_ROOT"] = environment["DCAR_WRITER_SOURCE_ROOT"]
     return {
         "label": contract.payload.get("Label"),
         "working_directory": str(contract.project_root),

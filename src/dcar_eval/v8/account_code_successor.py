@@ -127,6 +127,10 @@ SOURCE_TRANSITIONS: dict[str, tuple[str | None, str | None]] = {
 }
 MODULE = "src/dcar_eval/v8/account_code_successor.py"
 _LOADED_SOURCE = Path(__file__).read_bytes()
+# The already issued account generation must remain verifiable after this
+# verifier itself advances. This is the reviewed original module, not a hash
+# accepted from a plan, environment variable or caller.
+HISTORICAL_MODULE_SHA256 = "00c576dc7a82ca917794e90e4abfa8a70243cede36e7009569b35df49260ba76"
 REQUIRED_CHECKS = frozenset({"account_backend", "account_frontend", "account_lint",
     "account_typecheck", "account_ruff", "account_mypy", "account_successor", "account_roster"})
 
@@ -144,9 +148,10 @@ def _digest(value: Any) -> bool:
     return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
 
 
-def approved_changes() -> dict[str, dict[str, str | None]]:
+def approved_changes(*, historical: bool = False) -> dict[str, dict[str, str | None]]:
     require(_digest(PARENT_BUILD_SHA256) and bool(SOURCE_TRANSITIONS),
             "final installed runtime parent and exact source review are not frozen")
+    require(not historical or _digest(HISTORICAL_MODULE_SHA256), "historical account verifier is not frozen")
     require(MODULE not in SOURCE_TRANSITIONS, "self source must use the actually loaded bytes")
     result = {}
     for name, pair in SOURCE_TRANSITIONS.items():
@@ -158,29 +163,32 @@ def approved_changes() -> dict[str, dict[str, str | None]]:
         result[name] = {"before_sha256": pair[0], "after_sha256": pair[1]}
     # There is no fixed-point hash: this module is new in the reviewed parent;
     # its actual loaded bytes must be present in the tested live source archive.
-    result[MODULE] = {"before_sha256": None, "after_sha256": _sha(_LOADED_SOURCE)}
+    result[MODULE] = {"before_sha256": None,
+                      "after_sha256": HISTORICAL_MODULE_SHA256 if historical else _sha(_LOADED_SOURCE)}
     return dict(sorted(result.items()))
 
 
 def verify_delta(project: Path, parent: Mapping[str, Any], current: Mapping[str, Any], *,
-                 live: bool = True) -> dict[str, dict[str, str | None]]:
+                 live: bool = True, historical: bool = False) -> dict[str, dict[str, str | None]]:
     require(parent["git"]["head"] == current["git"]["head"], "source HEAD changed")
     left = forward_recovery._successor_archive(parent)
     right = forward_recovery._successor_archive(current, live=live)
     import subprocess
+    from .runtime_paths import source_root, verified_git
     changes = {}
     for name in sorted(set(left) | set(right)):
         original = None
         if name not in left or name not in right:
             # Match the existing source archive representation: absent entries
             # may be tracked and unchanged at HEAD, never assume they are empty.
-            result = subprocess.run(["git", "show", str(current["git"]["head"]) + ":" + name],
-                                    cwd=project, check=False, capture_output=True)
-            original = result.stdout if result.returncode == 0 else None
+            try:
+                original = verified_git(source_root(project), "show", str(current["git"]["head"]) + ":" + name)
+            except subprocess.CalledProcessError:
+                original = None
         old, new = left.get(name, original), right.get(name, original)
         if old != new:
             changes[name] = {"before_sha256": _sha(old), "after_sha256": _sha(new)}
-    require(changes == approved_changes(), "source differs from the exact reviewed account transition")
+    require(changes == approved_changes(historical=historical), "source differs from the exact reviewed account transition")
     old_modes = {row["path"]: row["mode"] for row in parent["git"]["working_tree"]["untracked_files"]}
     new_modes = {row["path"]: row["mode"] for row in current["git"]["working_tree"]["untracked_files"]}
     require(all(new_modes.get(name, 0o644) == old_modes.get(name, 0o644)
@@ -200,11 +208,12 @@ def verify_parent(reference: Mapping[str, Any], proof: Mapping[str, Any]) -> Non
             "parent proof digest or contract changed")
 
 
-def verify_plan_fields(plan: Mapping[str, Any], parent: Mapping[str, Any], *, project: Path) -> None:
+def verify_plan_fields(plan: Mapping[str, Any], parent: Mapping[str, Any], *, project: Path,
+                       historical: bool = False) -> None:
     require(plan.get("contract") == PLAN and plan.get("transition") == TRANSITION
             and plan.get("project_root") == str(project.resolve())
             and plan.get("required_checks") == sorted(REQUIRED_CHECKS)
-            and plan.get("changes") == approved_changes(), "account plan contract or fixed source scope changed")
+            and plan.get("changes") == approved_changes(historical=historical), "account plan contract or fixed source scope changed")
     verify_parent(plan["installed_parent"], parent)
     old = parent["plan_payload"]
     for key in ("previous_build", "source_deployment", "source_decision_sha256", "active", "release", "operations", "manifest"):
@@ -292,11 +301,12 @@ def _issued_decision(connection, *, plan, plan_ref, build_ref, runtime_ref, at):
 
 @contextmanager
 def runtime_context(connection, *, build, build_ref, at, require_decision=True):
+    from . import runtime_source_successor as source
     code = _code()
     sealer, contract = code._tools()
     reference = build.get("code_successor_plan")
     plan = sealer._read_private_json(Path(reference["path"])) if reference else {}
-    if plan.get("contract") != PLAN or not require_decision:
+    if plan.get("contract") not in {PLAN, source.PLAN} or not require_decision:
         yield
         return
     reference = contract.verified_reference(reference)
@@ -315,10 +325,9 @@ def using_plan(connection, reference, *, project_root: Path, at: str, historical
     code = _code()
     sealer, contract = code._tools()
     plan = sealer._read_private_json(Path(reference["path"]))
-    require(not historical, "this account transition cannot itself become another parent")
     require(plan.get("contract") == PLAN and plan.get("transition") == TRANSITION,
             "account plan contract differs")
-    require(plan["git"] == sealer._git_record(project_root, allow_working_tree=True), "live source changed after account plan")
+    require(historical or plan["git"] == sealer._git_record(project_root, allow_working_tree=True), "live source changed after account plan")
     from .source_routing import parse_time
     require(parse_time(plan["issued_at"]) <= parse_time(at), "account plan is future dated")
     active, release = code._current_control(connection, at)
@@ -327,15 +336,16 @@ def using_plan(connection, reference, *, project_root: Path, at: str, historical
     parent = code.current_proof(connection, project_root=project_root,
         build_path=Path(parent_ref["path"]), at=at, _historical=True)
     require(parent is not None, "installed runtime parent lacks its released proof")
-    verify_plan_fields(plan, parent, project=project_root)
+    verify_plan_fields(plan, parent, project=project_root, historical=historical)
     previous_ref = contract.verified_reference(plan["previous_build"], project_root=project_root)
     previous = sealer._read_receipt(Path(previous_ref["path"]), contract_version=sealer.SEALED_BUILD_CONTRACT)
     parent_build = sealer._read_receipt(Path(parent_ref["path"]), contract_version=sealer.SEALED_BUILD_CONTRACT)
     source = contract.verified_reference(plan["source_archive"], project_root=project_root)
-    require(verify_delta(project_root, parent_build, {"git": plan["git"], "source_archive": source}) == plan["changes"],
+    require(verify_delta(project_root, parent_build, {"git": plan["git"], "source_archive": source},
+                         live=not historical, historical=historical) == plan["changes"],
             "account source delta changed after review")
     checked = {"project_root": str(project_root.resolve()), "previous_build": previous, "plan": plan,
-        "reference": reference, "historical": False, "installed_parent_proof": parent}
+        "reference": reference, "historical": historical, "installed_parent_proof": parent}
     token = code._CHECKED.set(checked)
     try:
         tests_ref = contract.verified_reference(plan["full_checks"], project_root=project_root)
@@ -417,7 +427,7 @@ def validate_portable(connection, proof, *, deployment, at):
     plan = proof["plan_payload"]
     parent = proof.get("installed_parent_proof")
     require(isinstance(parent, dict), "portable account parent proof is missing")
-    verify_plan_fields(plan, parent, project=Path(plan["project_root"]))
+    verify_plan_fields(plan, parent, project=Path(plan["project_root"]), historical=True)
     raw = (json.dumps(plan, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode()
     require(_sha(raw) == proof["plan_reference"]["sha256"]
             and len(raw) == proof["plan_reference"]["byte_size"]

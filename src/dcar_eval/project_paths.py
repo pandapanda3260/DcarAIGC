@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from v8.runtime_paths import project_root as runtime_project_root
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-CONFIG_DIR = PROJECT_ROOT / "config"
+SOURCE_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = runtime_project_root(SOURCE_ROOT)
+CONFIG_DIR = SOURCE_ROOT / "config"
 CONFIG_ARCHIVE_DIR = CONFIG_DIR / "archive"
 
 DATA_DIR = PROJECT_ROOT / "data"

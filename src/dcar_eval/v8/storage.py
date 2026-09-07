@@ -24,7 +24,9 @@ from typing import Iterator, Literal
 from .schema_v19 import PROFILE_SCHEMA_SQL
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+from .runtime_paths import project_root as runtime_project_root
+
+PROJECT_ROOT = runtime_project_root(Path(__file__).resolve().parents[3])
 
 
 def installed_data_root() -> Path:

@@ -31,6 +31,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from .runtime_paths import source_root
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from .storage import (
@@ -47,7 +48,8 @@ INPUT_SCHEMA_VERSION = "dcar-dongchedi-spu-trims-normalized-v1"
 SOURCE_ARTIFACT_SCHEMA = "dcar-dongchedi-trim-catalog-v1"
 SOURCE_PROVIDER = "dongchedi"
 SOURCE_ENDPOINT = "https://www.dongchedi.com/motor/car_page/m/v1/series_all_json/"
-DEFAULT_MAPPING_PATH = PROJECT_ROOT / "config" / "dongchedi_spu_series_map_v1.json"
+
+DEFAULT_MAPPING_PATH = source_root(PROJECT_ROOT) / "config" / "dongchedi_spu_series_map_v1.json"
 PLAN_SCHEMA_VERSION = "dcar-dongchedi-spu-trim-import-plan-v1"
 RECEIPT_SCHEMA_VERSION = "dcar-dongchedi-spu-trim-import-receipt-v1"
 

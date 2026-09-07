@@ -187,7 +187,7 @@ export default function AppShell({ active, actions, header, children }: { active
             </Link>
           </>}
         </nav>
-        <div className="sidebar-foot"><i className={`live-dot${serviceState.kind === "online" ? " online" : ""}`} aria-hidden="true" /><div role="status" aria-live="polite"><strong className={serviceStyles.footerLabel}>{serviceState.label}</strong></div><LogoutButton /></div>
+        <div className="sidebar-foot"><i className={`live-dot${serviceState.kind === "online" ? " online" : ""}`} aria-hidden="true" /><div role="status" aria-live="polite" title={serviceState.description || undefined} aria-label={`${serviceState.label}。${serviceState.description}`}><strong className={serviceStyles.footerLabel}>{serviceState.label}</strong></div><LogoutButton /></div>
       </aside>
       <main className="main-area" data-section={active} id="main-content" tabIndex={-1}>
         {header ?? (["contents", "accounts", "tasks"].includes(active) ? <h1 className="visually-hidden">{copy.title}</h1> : <header className="page-header" data-section={active}>

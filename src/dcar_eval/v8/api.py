@@ -3142,6 +3142,7 @@ def _scheduler_execution_state(config: ApiConfig, scheduler: Any) -> str:
 def v8_health(request: Request) -> Dict[str, Any]:
     from .paid_drain import dispatch_state
     from .snapshot_contract import descriptor
+    from .snapshot_sync import snapshot_sync_status
     config = _request_config(request)
     with connect(config.db_path, read_only=config.read_only) as connection:
         database_state = _database_state(connection)
@@ -3188,6 +3189,7 @@ def v8_health(request: Request) -> Dict[str, Any]:
         ),
         "database_state": database_state,
         "data_freshness": data_freshness,
+        "snapshot_sync": snapshot_sync_status(read_only=config.read_only),
         "paid_dispatch_state": (
             "open"
             if drain.state == "open"

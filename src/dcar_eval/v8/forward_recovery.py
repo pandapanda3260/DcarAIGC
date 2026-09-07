@@ -37,6 +37,7 @@ from .raw_evidence import canonical_json_bytes
 from .runtime_database import require_current_process_writer_lock
 from .source_routing import parse_time
 from .storage import PROJECT_ROOT, connect, now_utc, transaction
+from .runtime_paths import source_root, verified_git
 
 CONTRACT_VERSION = "current_activation_forward_release_v1"
 PURPOSE = "forward_only_release"
@@ -47,7 +48,7 @@ _SUCCESSOR_SEND_FILES = tuple(f"src/dcar_eval/v8/{name}.py" for name in (
     "capture", "paid_dispatch", "paid_identity", "providers", "provider_transport",
     "raw_evidence",
 )) + ("src/dcar_eval/tikhub_config.py",)
-_SUCCESSOR_READER_SHA256 = "31acd2bb75ee381e6aec6f7d2ae9d2e6cebbe1918848058eb45f695a9c27e657"
+_SUCCESSOR_READER_SHA256 = "d9ea4d1dfe49a73e5c4a6185ba1c0b65674bdca19e62854a939b1a71407759ba"
 _SUCCESSOR_OVERVIEW_TRANSITIONS = {
     "src/dcar_eval/v8/api.py": (
         "19512d05ce58f94cfc442ffe3c98b7f57004d5ff3469ab403bcfe444d6b8f915",
@@ -219,8 +220,8 @@ def _runtime_identity(connection: sqlite3.Connection, binding: Mapping[str, Any]
     _require(isinstance(critical, dict) and bool(critical), "forward_build_invalid", "Build has no verified code inventory")
     assert isinstance(critical, dict)
     for relative, expected in critical.items():
-        path = PROJECT_ROOT / relative
-        _require(not path.is_symlink() and path.is_file() and path.resolve().is_relative_to(PROJECT_ROOT.resolve())
+        path = source_root(PROJECT_ROOT) / relative
+        _require(not path.is_symlink() and path.is_file() and path.resolve().is_relative_to(source_root(PROJECT_ROOT))
                  and hashlib.sha256(path.read_bytes()).hexdigest() == expected,
                  "forward_build_invalid", "Runtime code changed after the sealed build")
     database = Path(str(connection.execute("PRAGMA database_list").fetchone()[2])).resolve(strict=True)
@@ -236,8 +237,7 @@ def _runtime_identity(connection: sqlite3.Connection, binding: Mapping[str, Any]
 @lru_cache(maxsize=256)
 def _successor_git(project: str, *arguments: str) -> bytes:
     try:
-        return subprocess.run(["git", "-C", project, *arguments], check=True,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10).stdout
+        return verified_git(source_root(Path(project)), *arguments)
     except (OSError, subprocess.SubprocessError) as exc:
         raise ProfileControlError("forward_build_invalid", "Sealed successor source is unavailable") from exc
 
@@ -372,10 +372,10 @@ def _successor_archive(build: Mapping[str, Any], *, live: bool = False) -> dict[
                        if name.startswith("untracked/")})
         if live:
             for source_relative, source_body in result.items():
-                source = PROJECT_ROOT / source_relative
+                source = source_root(PROJECT_ROOT) / source_relative
                 _require((source_body is None and not source.exists()) or (source_body is not None
                          and not source.is_symlink() and source.is_file()
-                         and source.resolve().is_relative_to(PROJECT_ROOT.resolve()) and source.read_bytes() == source_body),
+                         and source.resolve().is_relative_to(source_root(PROJECT_ROOT)) and source.read_bytes() == source_body),
                          "forward_build_invalid", "Live working-tree source differs from its tested archive")
         return result
     except (OSError, ValueError, KeyError, TypeError, tarfile.TarError) as exc:
@@ -440,6 +440,7 @@ def _successor_reader_compatible(before: bytes, after: bytes) -> bool:
         added_names = {node.name for node in additions}
         previous_helpers = helpers - {"_successor_patch", "_successor_patch_sources", "_successor_archive"}
         if not ((added_names == helpers and fingerprint in {_SUCCESSOR_READER_SHA256,
+                    "31acd2bb75ee381e6aec6f7d2ae9d2e6cebbe1918848058eb45f695a9c27e657",
                     "0ed69304d32786c44c437db2f340e3273453bbbbab57c175040df6422eb9cc99",
                     "fd51095ef365cb0bfa1f7565d0747debefee65ed0caabba0a1aa973b90bf612d"})
                 or (added_names == previous_helpers
@@ -451,6 +452,16 @@ def _successor_reader_compatible(before: bytes, after: bytes) -> bool:
                     node.id = "_released_runtime_identity"
                 return node
         for module in (old, new):
+            # Only the two reviewed identity readers may differ: the original
+            # checkout reader and the sealed-source reader with identical guards.
+            identities = [node for node in module.body if isinstance(node, ast.FunctionDef)
+                          and node.name == "_runtime_identity"]
+            if len(identities) != 1 or hashlib.sha256(ast.dump(identities[0], include_attributes=False).encode()).hexdigest() not in {
+                "9d2122a460073f1000513bd3e255f17bcdbc744a8d6f86b162887dfe959348e4",
+                "d1cd8a2aec0e7d95548e770e35cca9861087857ee120b532757863caf8cc723e",
+            }:
+                return False
+            module.body[module.body.index(identities[0])] = ast.parse("def _runtime_identity(): pass").body[0]
             for node in module.body:
                 if isinstance(node, ast.FunctionDef) and node.name == "validate_forward_release":
                     Rewrite().visit(node)
@@ -459,6 +470,10 @@ def _successor_reader_compatible(before: bytes, after: bytes) -> bool:
                 and not (isinstance(node, ast.Import) and [part.name for part in node.names]
                          in (["ast"], ["subprocess"], ["io"], ["re"], ["shlex"], ["tarfile"]))
                 and not (isinstance(node, ast.ImportFrom) and node.module == "functools")
+                and not (isinstance(node, ast.ImportFrom) and node.level == 1
+                         and node.module == "runtime_paths"
+                         and [(part.name, part.asname) for part in node.names]
+                         == [("source_root", None), ("verified_git", None)])
                 and not (isinstance(node, ast.Assign) and any(isinstance(name, ast.Name)
                          and name.id in {"_SUCCESSOR_SEND_FILES", "_SUCCESSOR_READER_SHA256", "_SUCCESSOR_OVERVIEW_TRANSITIONS", "_SUCCESSOR_ACCOUNT_READ_TRANSITIONS", "_SUCCESSOR_METRIC_READ_TRANSITIONS",
                                          "_SUCCESSOR_ACCOUNT_STATUS_CRITICAL_ADDITIONS", "_SUCCESSOR_ACCOUNT_STATUS_NEW_MODULES"}
@@ -525,9 +540,9 @@ def _successor_source(previous: Mapping[str, Any], current: Mapping[str, Any], *
                      and _successor_reader_compatible(before, after)),
                  "forward_build_invalid", "Successor changed release, budget, capture or transport safety code")
         if live:
-            path = PROJECT_ROOT / relative
+            path = source_root(PROJECT_ROOT) / relative
             _require(not path.is_symlink() and path.is_file()
-                     and path.resolve().is_relative_to(PROJECT_ROOT.resolve()) and path.read_bytes() == after,
+                     and path.resolve().is_relative_to(source_root(PROJECT_ROOT)) and path.read_bytes() == after,
                      "forward_build_invalid", "Loaded safety code differs from the tested successor")
 
 

@@ -242,15 +242,23 @@ def load_installed_writer_contract(
     if project_root.is_symlink() or not project_root.is_dir():
         raise RuntimeDatabaseError("installed writer project root is unsafe")
     project_root = project_root.resolve(strict=True)
-    program_arguments = payload.get("ProgramArguments")
-    expected_program = project_root / "deploy/macos/run_writer_worker.sh"
-    if program_arguments != [str(expected_program)]:
-        raise RuntimeDatabaseError("installed writer program does not match its project root")
     environment = payload.get("EnvironmentVariables")
     if not isinstance(environment, dict):
         raise RuntimeDatabaseError("installed writer environment is invalid")
     if environment.get("DCAR_PROJECT_ROOT") != str(project_root):
         raise RuntimeDatabaseError("installed writer environment project root is invalid")
+    source_root = project_root
+    if environment.get("DCAR_WRITER_SOURCE_ROOT"):
+        source_root = _require_absolute_path(environment["DCAR_WRITER_SOURCE_ROOT"],
+                                             label="installed writer source root")
+        if (not source_root.is_dir() or _has_symlink_component(source_root)
+                or source_root == project_root or source_root.is_relative_to(project_root)
+                or project_root.is_relative_to(source_root)):
+            raise RuntimeDatabaseError("installed writer source root must be independent and safe")
+    program_arguments = payload.get("ProgramArguments")
+    expected_program = source_root / "deploy/macos/run_writer_worker.sh"
+    if program_arguments != [str(expected_program)]:
+        raise RuntimeDatabaseError("installed writer program does not match its source root")
     database = _require_absolute_path(
         environment.get("DCAR_V8_DB"), label="installed writer database"
     )

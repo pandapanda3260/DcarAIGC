@@ -4,6 +4,7 @@ import ast
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import tarfile
@@ -56,7 +57,7 @@ class ForwardBuildSuccessorTest(unittest.TestCase):
         self.historical_readers = {revision: subprocess.run(
             ["git", "-C", str(original_project), "show", revision + ":" + FORWARD_PATH],
             check=True, capture_output=True,
-        ).stdout for revision in ("9ee4eee", "23831115")}
+        ).stdout for revision in ("9ee4eee", "23831115", "100bcbb")}
         self.stream_source = recovery._successor_patch(
             self.overview_sources["src/dcar_eval/v8/source_routing.py"],
             (original_project / "tests/fixtures/metric_stream_release_compat.diff").read_bytes(),
@@ -171,6 +172,37 @@ class ForwardBuildSuccessorTest(unittest.TestCase):
         forged = self.successor("forged-payload", corrupt_payload=True)
         with self.assertRaises(ProfileControlError):
             self.read(forged)
+
+    def test_source_reader_normalization_rejects_other_root_import_and_guard_changes(self):
+        mutations = (
+            (b"path = source_root(PROJECT_ROOT) / relative", b"path = source_root(Path('/other')) / relative"),
+            (b"and hashlib.sha256(path.read_bytes()).hexdigest() == expected", b"and True"),
+            (b"from .runtime_paths import source_root, verified_git", b"from .runtime_paths import source_root, verified_git, unreviewed"),
+            (b"from .runtime_paths import source_root, verified_git", b"from .runtime_paths import source_root as PROJECT_ROOT, verified_git"),
+            (b"return verified_git(source_root(Path(project)), *arguments)", b"return verified_git(Path(project), *arguments)"),
+        )
+        for before, after in mutations:
+            with self.subTest(change=before):
+                self.assertIn(before, self.new_forward)
+                changed = self.new_forward.replace(before, after, 1)
+                self.assertFalse(recovery._successor_reader_compatible(self.original_forward, changed))
+
+    def test_frozen_source_retains_chain_when_data_checkout_git_and_bytes_change(self):
+        self.write(FORWARD_PATH, self.new_forward)
+        build = self.successor("source-root-reader")
+        source = self.root / "frozen-source"
+        shutil.copytree(self.project, source)
+        (self.project / ".git").rename(self.root / "old-data-git")
+        self.write("src/dcar_eval/v8/capture.py", b"UNREVIEWED_DEVELOPMENT_EDIT = True\n")
+        recovery._successor_git.cache_clear()
+        with mock.patch.dict(os.environ, {"DCAR_PROJECT_ROOT": str(self.project),
+                                         "DCAR_WRITER_SOURCE_ROOT": str(source)}):
+            self.assertEqual(self.read(build)["build_receipt_sha256"], self.base["sha256"])
+            self.assertEqual(list(self.connection.execute("SELECT * FROM sentinel")), self.before)
+            self.assertEqual(self.connection.total_changes, 1)
+            (source / "src/dcar_eval/v8/capture.py").write_bytes(b"UNSEALED_RUNTIME_EDIT = True\n")
+            with self.assertRaisesRegex(ProfileControlError, "Loaded safety code"):
+                self.read(build)
 
     def test_schema_database_lineage_and_failed_tests_reject_successor(self):
         for name, options in [

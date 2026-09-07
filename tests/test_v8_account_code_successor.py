@@ -143,6 +143,9 @@ class AccountSourceBoundaryTest(unittest.TestCase):
 
 class AccountPortableLedgerTest(unittest.TestCase):
     def setUp(self):
+        # This ledger fixture seals the current synthetic module; production
+        # historical proofs keep the separately frozen original module hash.
+        self.enterContext(patch.object(account, "HISTORICAL_MODULE_SHA256", sha(account._LOADED_SOURCE)))
         self.fixture = prior.PortableSuccessorTests(methodName="runTest")
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)

@@ -33,11 +33,12 @@ from huggingface_hub import snapshot_download
 from . import raw_evidence as raw_evidence_module
 from . import raw_archive
 from .storage import DEFAULT_DB, PROJECT_ROOT, connect, now_utc, transaction
+from .runtime_paths import source_root
 
 
-CONFIG_PATH = PROJECT_ROOT / "config" / "media_processor_v8.json"
+CONFIG_PATH = source_root(PROJECT_ROOT) / "config" / "media_processor_v8.json"
 MEDIA_ROOT = PROJECT_ROOT / "data" / "cache" / "v8" / "media"
-OCR_SOURCE = PROJECT_ROOT / "src" / "dcar_eval" / "vision_ocr.swift"
+OCR_SOURCE = source_root(PROJECT_ROOT) / "src" / "dcar_eval" / "vision_ocr.swift"
 MEDIA_SOURCE_VERSION = "provider-media-source-v8.1"
 VIDEO_DOWNLOAD_VERSION = "provider-media-download-v8.1"
 IMAGE_DOWNLOAD_VERSION = "provider-image-download-v8.3"

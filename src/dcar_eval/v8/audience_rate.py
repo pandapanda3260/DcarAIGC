@@ -41,6 +41,7 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
+from .runtime_paths import source_root
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from .audience_classifier import (
@@ -66,7 +67,8 @@ CLASSIFICATION_COVERAGE_GATE = 100.0
 COMMENT_CAP = 1000
 
 CALIBRATION_RECORD_VERSION = "audience-calibration-v1"
-CALIBRATION_RECORD_PATH = PROJECT_ROOT / "config" / "audience_calibration_v1.json"
+
+CALIBRATION_RECORD_PATH = source_root(PROJECT_ROOT) / "config" / "audience_calibration_v1.json"
 CALIBRATION_PLATFORMS = ("douyin", "xiaohongshu")
 MIN_CALIBRATION_SAMPLE = 500
 

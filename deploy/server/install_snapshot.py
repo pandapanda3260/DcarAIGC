@@ -1239,11 +1239,17 @@ def _private_deployment_reference_index(manifest: Mapping[str, Any]) -> dict[str
             expected.update({"decision." + key: decision["runtime_evidence"][key] for key in ("build", "runtime")})
         code_successor = manifest.get("code_successor")
         if code_successor is not None:
+            if not isinstance(code_successor, dict):
+                raise ValueError("private code successor is invalid")
             from v8.capture_code_successor import PRIVATE_ROLES
+            from v8 import runtime_source_successor
 
+            roles = (runtime_source_successor.PRIVATE_ROLES
+                     if code_successor.get("contract") == runtime_source_successor.PROOF
+                     else PRIVATE_ROLES)
             references = code_successor["private_references"]
-            if (not isinstance(references, list) or len(references) != len(PRIVATE_ROLES)
-                    or {reference["role"] for reference in references} != set(PRIVATE_ROLES)):
+            if (not isinstance(references, list) or len(references) != len(roles)
+                    or {reference["role"] for reference in references} != set(roles)):
                 raise ValueError("private code successor roles differ")
             expected.update({"code_successor." + reference["role"]: reference for reference in references})
         allowed = set(expected) | ({"decision.build.full_checks"} if decision is not None else set())

@@ -18,6 +18,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from .runtime_paths import project_root as runtime_project_root
 from typing import Any
 
 from .evaluation import (
@@ -64,7 +65,8 @@ EVIDENCE_COMPONENT_KEYS = frozenset(
     }
 )
 ENVELOPE_STATES = frozenset({"exact", "stale", "absent"})
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+PROJECT_ROOT = runtime_project_root(Path(__file__).resolve().parents[3])
 
 
 class ReleaseManagementError(RuntimeError):

@@ -14,7 +14,9 @@ TEMPLATE = HERE / "cn.tj.dcar.snapshot-publisher.plist.template"
 LABEL = "cn.tj.dcar.snapshot-publisher"
 
 
-def render_plist(project_root: Path, home: Path) -> bytes:
+def render_plist(
+    project_root: Path, home: Path, source_root: Path | None = None
+) -> bytes:
     project_root = project_root.expanduser().resolve()
     home = home.expanduser().resolve()
     text = TEMPLATE.read_text(encoding="utf-8")
@@ -24,6 +26,17 @@ def render_plist(project_root: Path, home: Path) -> bytes:
         raise ValueError("snapshot publisher template has unresolved placeholders")
     payload = text.encode("utf-8")
     value = plistlib.loads(payload)
+    if source_root is not None:
+        source_root = source_root.expanduser()
+        if not source_root.is_absolute() or source_root.is_symlink():
+            raise ValueError("writer source root must be an absolute, non-symlink directory")
+        source_root = source_root.resolve()
+        value["ProgramArguments"] = [
+            str(source_root / "deploy/macos/run_snapshot_publisher.sh")
+        ]
+        value["EnvironmentVariables"]["DCAR_WRITER_SOURCE_ROOT"] = str(source_root)
+        value["EnvironmentVariables"]["PYTHONDONTWRITEBYTECODE"] = "1"
+        payload = plistlib.dumps(value, sort_keys=False)
     environment = value.get("EnvironmentVariables", {})
     schedule = value.get("StartCalendarInterval")
     expected = {
@@ -59,6 +72,7 @@ def render_plist(project_root: Path, home: Path) -> bytes:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project-root", type=Path, required=True)
+    parser.add_argument("--source-root", type=Path)
     parser.add_argument("--home", type=Path, default=Path.home())
     destination = parser.add_mutually_exclusive_group(required=True)
     destination.add_argument("--check", action="store_true")
@@ -69,11 +83,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     arguments = parse_args()
     project_root = arguments.project_root.expanduser().resolve()
-    wrapper = project_root / "deploy/macos/run_snapshot_publisher.sh"
-    publisher = project_root / "deploy/macos/publish_snapshot.py"
+    source_root = arguments.source_root or project_root
+    wrapper = source_root / "deploy/macos/run_snapshot_publisher.sh"
+    publisher = source_root / "deploy/macos/publish_snapshot.py"
     if not wrapper.is_file() or not publisher.is_file():
         raise SystemExit("snapshot publisher wrapper or implementation is missing")
-    payload = render_plist(project_root, arguments.home)
+    payload = render_plist(project_root, arguments.home, arguments.source_root)
     if arguments.check:
         print(f"valid automatic LaunchAgent: {LABEL} from 09:00 with hourly reconcile")
         return 0

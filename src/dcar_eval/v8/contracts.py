@@ -9,6 +9,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
 from .storage import PROJECT_ROOT
+from .runtime_paths import source_root
+
+PROJECT_ROOT = source_root(PROJECT_ROOT)
 
 
 CONTRACT_PATH = PROJECT_ROOT / "config" / "report_contract_v8_9.json"

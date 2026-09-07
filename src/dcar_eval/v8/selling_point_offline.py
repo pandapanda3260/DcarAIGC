@@ -44,7 +44,7 @@ PROMPT_CONTRACT_VERSION = "selling-point-flat-28-v4"
 HARD_PRIORITY_VERSION = "selling-point-hard-priority-v2"
 GOLD_OVERRIDES_VERSION = "selling-point-gold-overrides-v5.3"
 DEFAULT_GOLD_OVERRIDES_PATH = (
-    PROJECT_ROOT / "config" / "selling_point_gold_overrides_v5_3.json"
+    Path(__file__).resolve().parents[3] / "config" / "selling_point_gold_overrides_v5_3.json"
 )
 EXPECTED_GOLD_HEADERS = (
     "序号",

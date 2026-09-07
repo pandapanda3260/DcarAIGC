@@ -24,10 +24,11 @@ def main() -> None:
     parser.add_argument("--test-result", action="append", default=[])
     parser.add_argument("--actor")
     parser.add_argument("--reason")
-    parser.add_argument("--transition", choices=("account-workbench-20260907-v1",))
+    parser.add_argument("--transition", choices=("account-workbench-20260907-v1", "writer-source-isolation-20260907-v1"))
     args = parser.parse_args()
     project = args.project_root.resolve(strict=True)
-    sys.path[:0] = [str(project / "scripts"), str(project / "src/dcar_eval")]
+    source = Path(__file__).resolve().parents[1]
+    sys.path[:0] = [str(source / "scripts"), str(source / "src/dcar_eval")]
     import seal_r0_receipts as sealer
     from v8 import capture_code_successor as successor
     from v8.runtime_database import (

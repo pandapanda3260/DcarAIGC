@@ -19,7 +19,9 @@ from typing import Any, Iterator
 
 from .snapshot_contract import ARTIFACT_POLICY, MANAGED_ORIGINALS_CONTRACT, validate_descriptor
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+from .runtime_paths import project_root as runtime_project_root
+
+PROJECT_ROOT = runtime_project_root(Path(__file__).resolve().parents[3])
 ACTIVE_SNAPSHOT = Path("/var/lib/dcar-aigc/runtime/active-snapshot.json")
 _READ_ROOT: ContextVar[Path | None] = ContextVar("dcar_read_artifact_root", default=None)
 _SHA = re.compile(r"[0-9a-f]{64}")

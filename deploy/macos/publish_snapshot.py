@@ -34,6 +34,7 @@ if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
 from v8 import pipeline_cutover, runtime_database, runtime_receipts  # noqa: E402
+from v8.runtime_paths import source_root  # noqa: E402
 from v8.snapshot_contract import (  # noqa: E402
     ARTIFACT_POLICY, MANAGED_ORIGINALS_CONTRACT, descriptor, validate_descriptor,
 )
@@ -1662,7 +1663,7 @@ def _observe_formal_read_source(
 
 
 def _load_builder(project_root: Path) -> ModuleType:
-    path = project_root / "scripts/build_server_snapshot.py"
+    path = source_root(project_root) / "scripts/build_server_snapshot.py"
     specification = importlib.util.spec_from_file_location(
         "dcar_snapshot_builder_for_publisher", path
     )

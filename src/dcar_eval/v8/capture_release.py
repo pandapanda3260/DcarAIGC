@@ -27,6 +27,7 @@ from .profile_activations import activation_at
 from .runtime_database import load_installed_writer_contract, require_current_process_writer_lock
 from .source_routing import parse_time
 from .storage import PROJECT_ROOT
+from .runtime_paths import source_root
 from .transport_receipts import append_transport_receipt, read_transport_receipt
 
 CONTINUITY_CONTRACT = "capture-transport-continuity-v1"
@@ -42,7 +43,7 @@ _PERMIT_KEYS = ("provider", "operation", "qualification_sha256", "build_sha256",
 def _transport_code() -> dict[str, str]:
     result = {}
     for relative in ("src/dcar_eval/v8/provider_transport.py", "src/dcar_eval/tikhub_config.py"):
-        path = PROJECT_ROOT / relative
+        path = source_root(PROJECT_ROOT) / relative
         _require(path.is_file() and not path.is_symlink(), "Transport implementation is unavailable")
         result[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
     return result
@@ -79,7 +80,7 @@ def _release_tools() -> Any:
     # Load only the installed, inventory-verified tool; never a caller path.
     name = "_dcar_capture_release_validator"
     if name not in sys.modules:
-        sealer_path = PROJECT_ROOT / "scripts/seal_r0_receipts.py"
+        sealer_path = source_root(PROJECT_ROOT) / "scripts/seal_r0_receipts.py"
         if "seal_r0_receipts" not in sys.modules:
             spec = importlib.util.spec_from_file_location("seal_r0_receipts", sealer_path)
             _require(spec is not None and spec.loader is not None, "Installed sealer is unavailable")
@@ -87,7 +88,7 @@ def _release_tools() -> Any:
             module = importlib.util.module_from_spec(spec)
             sys.modules[spec.name] = module
             spec.loader.exec_module(module)
-        spec = importlib.util.spec_from_file_location(name, PROJECT_ROOT / "scripts/v20_release_contract.py")
+        spec = importlib.util.spec_from_file_location(name, source_root(PROJECT_ROOT) / "scripts/v20_release_contract.py")
         _require(spec is not None and spec.loader is not None, "Installed release validator is unavailable")
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)

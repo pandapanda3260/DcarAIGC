@@ -27,10 +27,9 @@ from zoneinfo import ZoneInfo
 import zstandard
 
 from . import raw_evidence
-from .storage import write_lock
+from .storage import PROJECT_ROOT, write_lock
 
 ARCHIVE_ROOT = Path("/Volumes/DcarAIGC-RawArchive/provider-raw-v1")
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
 CODEC_VERSION = "zstd-3-v1"
 BEIJING = ZoneInfo("Asia/Shanghai")
 MIN_ARCHIVE_FREE_BYTES = 150 * 1024**3

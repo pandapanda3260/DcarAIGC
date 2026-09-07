@@ -199,6 +199,23 @@ mv "$plist" "$HOME/.Trash/DcarAIGC-launchagents/$label.plist"
 
 ## snapshot publisher：无人值守自动发布
 
+### 正式源码与开发目录隔离
+
+正式 Writer 和 Publisher 通过同一个 `DCAR_WRITER_SOURCE_ROOT` 运行已封存的独立源码目录。
+`DCAR_PROJECT_ROOT` 继续指向原来的数据和证据根；正式数据库、writer lock、缓存、媒体、
+报告及凭据路径不随源码发布移动。源码目录使用独立 Git 对象，不能指向开发 worktree 或它的子目录。
+
+每次启动先用标准库验证已安装 Writer 的 build → plan → source-tree 回执，再校验精确源码文件集、
+字节、权限和 Git 状态，完成后才导入业务模块。Publisher 漏配或错配源码根会拒绝启动。
+不得直接编辑已封存目录；代码升级应创建新目录、执行回归、生成新的 source-isolation successor
+证据，再在 Writer 停止且持有唯一维护锁时封存并追加发布决定。原始授权和历史回执保持不变。
+
+发布验收必须包括：Writer 的实际加载版本及数据库身份、Publisher 的实际启动环境、
+一次成功同步后的本机成功记录与服务器 active-snapshot 回执一致，以及再次运行自动发布时
+正确发布新增变化或返回无更新。只验证网页构建或 HTTP 200 不能证明自动同步恢复。
+线上 health 的 `snapshot_sync` 仅表示已验证快照的安装时间与同步延迟，不表示采集覆盖完整，
+也不开放副本业务写入。北京时间 00:00–09:00 不累积同步等待时间，既有延迟不会因此消失。
+
 publisher 在登录时启动一次、每天 09:00 启动一次，并每小时 reconcile。09:00 前的自动调用只返回 no-op；同一北京自然日会重新读取 Writer，只有报告、采集和调度观察与已发布证据完全相同时才 no-op，后续新内容、指标或任务状态会继续发布。项目外 `snapshot_root/automatic-publisher-state-v2.json` 保存原子成功状态，`publisher-status.json` 记录最近执行结果及真实拒因，后者不充当授权或成功证明。任务不是 `KeepAlive` 服务，不运行 scheduler、catch-up 或任何供应商调用，也不继承 TikHub key。
 
 09:00 只是当天首次检查，不是假定所有上游工作已完成。Writer 配置 `reconcile_from` 后，发布统一使用该业务日下界：首日没有到期日报、报告缺失或失败、采集不完整均记录为真实的 `observed/partial` 快照，用户可以看到新数据和失败状态；快照发布成功不代表日报完整。只选择下界后的日报及完整周期均在下界后的周报，不创建历史任务。未配置下界的旧安装保留原完整当日依赖合同。所有模式保留以下完整性门禁：

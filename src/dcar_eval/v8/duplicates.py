@@ -14,6 +14,7 @@ from collections import Counter
 from contextlib import ExitStack
 from importlib.metadata import version as package_version
 from pathlib import Path
+from .runtime_paths import source_root
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import imagehash  # type: ignore[import-untyped]
@@ -43,7 +44,8 @@ FINGERPRINT_VERSION = (
     "duplicate-fingerprint-v1|ImageHash==4.3.2|Pillow==12.3.0|phash64|simhash64"
 )
 RELATION_METHOD = "fingerprint_v1"
-CALIBRATION_PATH = PROJECT_ROOT / "config" / "duplicate_calibration_v1.json"
+
+CALIBRATION_PATH = source_root(PROJECT_ROOT) / "config" / "duplicate_calibration_v1.json"
 FINGERPRINT_ROOT = PROJECT_ROOT / "data" / "cache" / "v8" / "duplicates"
 THRESHOLDS: Dict[str, float] = {
     "phash_strong_distance": 3.0,

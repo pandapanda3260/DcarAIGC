@@ -75,7 +75,7 @@ def _deployment_issuer() -> Any:
     release._release_tools()
     name = "_dcar_capture_deployment_issuer"
     if name not in sys.modules:
-        path = release.PROJECT_ROOT / "scripts/issue_v20_deployment_receipt.py"
+        path = release.source_root(release.PROJECT_ROOT) / "scripts/issue_v20_deployment_receipt.py"
         spec = importlib.util.spec_from_file_location(name, path)
         if spec is None or spec.loader is None:
             raise ValueError("Installed deployment issuer is unavailable")

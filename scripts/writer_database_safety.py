@@ -127,15 +127,12 @@ def code_identity(project_root: Path) -> dict[str, str]:
     at deployment, not an invented Git identity here.
     """
     def git(*arguments: str) -> bytes:
-        result = subprocess.run(
-            ["git", "-C", str(project_root), *arguments], check=True,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
-        return result.stdout
+        from v8.runtime_paths import verified_git
+        return verified_git(project_root, *arguments)
 
     try:
         head = git("rev-parse", "HEAD").decode("ascii").strip()
-        patch = git("diff", "--binary", "HEAD", "--", ".")
+        patch = git("diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD", "--", ".")
         digest = hashlib.sha256(patch)
         for entry in sorted(git(
             "ls-files", "--others", "--exclude-standard", "-z", "--",

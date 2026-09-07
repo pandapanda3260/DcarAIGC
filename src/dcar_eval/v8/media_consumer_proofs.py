@@ -20,8 +20,9 @@ from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, build_opener
 
 from .snapshot_contract import descriptor, validate_descriptor
+from .runtime_paths import project_root as runtime_project_root, source_root
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+PROJECT_ROOT = runtime_project_root(Path(__file__).resolve().parents[3])
 RUNTIME_CONTRACT = "media-consumer-runtime-v1"
 PROOF_CONTRACT = "media-production-consumer-proof-v1"
 LEGACY_TRANSITION_CONTRACT = "dcar-schema17-to18-server-transition-v1"
@@ -38,7 +39,7 @@ _CODE_FILES = ("pyproject.toml", "uv.lock", "scripts/build_server_snapshot.py",
 
 def code_sha256(project_root: Path) -> str:
     """Same source closure on Mac and release/app; excludes outputs and secrets."""
-    root = project_root.resolve(strict=True)
+    root = source_root(project_root)
     paths = {root / name for name in _CODE_FILES}
     for name in _CODE_DIRS:
         directory = root / name
@@ -243,7 +244,7 @@ def capture(*, db_path: Path, publisher_env: Path, mac_health_url: str) -> dict[
     import importlib.util
     import sys
     name = "_dcar_media_proof_publisher"
-    spec = importlib.util.spec_from_file_location(name, PROJECT_ROOT / "deploy/macos/publish_snapshot.py")
+    spec = importlib.util.spec_from_file_location(name, source_root(PROJECT_ROOT) / "deploy/macos/publish_snapshot.py")
     if spec is None or spec.loader is None:
         raise ValueError("consumer_publisher_module_missing")
     publisher = importlib.util.module_from_spec(spec)

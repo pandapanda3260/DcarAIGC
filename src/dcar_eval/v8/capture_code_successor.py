@@ -18,6 +18,7 @@ from typing import Any, Iterator, Mapping
 from . import account_code_successor as account, capture_authorizations as auth, forward_recovery, paid_drain
 from .profile_activations import activation_at
 from .source_routing import parse_time
+from .runtime_paths import source_root, verified_git
 
 PLAN = "capture-planner-budget-successor-plan-v1"
 DECISION = "capture-planner-budget-successor-decision-v1"
@@ -81,8 +82,10 @@ def _source_changes(project: Path, before: Mapping[str, Any], after: Mapping[str
     changes: dict[str, Any] = {}
     for name in sorted(set(left) | set(right)):
         if name not in left or name not in right:
-            original = subprocess.run(["git", "show", str(after["git"]["head"]) + ":" + name], cwd=project,
-                check=False, capture_output=True).stdout or None
+            try:
+                original = verified_git(source_root(project), "show", str(after["git"]["head"]) + ":" + name) or None
+            except subprocess.CalledProcessError:
+                original = None
         else:
             original = None
         old, new = left.get(name, original), right.get(name, original)
@@ -135,6 +138,11 @@ def using_plan(connection: sqlite3.Connection, reference: Mapping[str, Any], *, 
     sealer, contract = _tools()
     reference = contract.verified_reference(dict(reference), project_root=project_root)
     plan = sealer._read_private_json(Path(reference["path"]))
+    from . import runtime_source_successor as source
+    if plan.get("contract") == source.PLAN:
+        with source.using_plan(connection, reference, project_root=project_root, at=at, historical=_historical) as checked:
+            yield checked
+        return
     if plan.get("contract") == account.PLAN:
         with account.using_plan(connection, reference, project_root=project_root, at=at, historical=_historical) as checked:
             yield checked
@@ -248,6 +256,10 @@ def prepare_plan(connection: sqlite3.Connection, *, project_root: Path, previous
                  evidence_dir: Path, tests: Mapping[str, Path], actor: str, reason: str, at: str,
                  transition: str | None = None) -> dict[str, Any]:
     if transition is not None:
+        from . import runtime_source_successor as source
+        if transition == source.TRANSITION:
+            return source.prepare_plan(connection, project_root=project_root, previous_build=previous_build,
+                evidence_dir=evidence_dir, tests=tests, actor=actor, reason=reason, at=at)
         _require(transition == account.TRANSITION, "unknown explicit source transition")
         return account.prepare_plan(connection, project_root=project_root, previous_build=previous_build,
             evidence_dir=evidence_dir, tests=tests, actor=actor, reason=reason, at=at)
@@ -304,14 +316,16 @@ def prepare_plan(connection: sqlite3.Connection, *, project_root: Path, previous
 
 
 def _decision_row(connection: sqlite3.Connection, build_sha: str) -> sqlite3.Row | None:
+    from . import runtime_source_successor as source
     rows = connection.execute("""SELECT * FROM scheduler_runs WHERE job_id='transport_receipt:campaign_terminal'
-        AND json_extract(details_json,'$.payload.contract') IN (?,?,?)
-        AND json_extract(details_json,'$.payload.build_sha256')=? ORDER BY id""", (DECISION, DECISION_V2, account.DECISION, build_sha)).fetchall()
+        AND json_extract(details_json,'$.payload.contract') IN (?,?,?,?)
+        AND json_extract(details_json,'$.payload.build_sha256')=? ORDER BY id""", (DECISION, DECISION_V2, account.DECISION, source.DECISION, build_sha)).fetchall()
     _require(len(rows) <= 1, "duplicate postseal decisions")
     return rows[0] if rows else None
 
 
 def _decision_payload(plan: Mapping[str, Any], *, plan_sha: str, build_sha: str, runtime_sha: str, at: str) -> dict[str, Any]:
+    from . import runtime_source_successor as source
     from .transport_receipts import _timestamp
     at = _timestamp(at)
     result = {"contract": account.DECISION if plan["contract"] == account.PLAN else (DECISION_V2 if plan["contract"] == PLAN_V2 else DECISION), "source_deployment": plan["source_deployment"],
@@ -327,6 +341,11 @@ def _decision_payload(plan: Mapping[str, Any], *, plan_sha: str, build_sha: str,
     if plan["contract"] == PLAN_V2:
         result.update(parent_build_sha256=plan["installed_parent"]["sha256"],
                       change_scope=plan["change_scope"], required_checks=plan["required_checks"])
+    if plan["contract"] == source.PLAN:
+        result.update(contract=source.DECISION, parent_build_sha256=plan["installed_parent"]["sha256"],
+                      transition=source.TRANSITION, changes_sha256=auth.digest(plan["changes"]),
+                      source_root=plan["source_root"], source_tree_sha256=plan["source_tree"]["sha256"],
+                      required_checks=sorted(source.REQUIRED_CHECKS))
     return result
 
 
@@ -377,14 +396,14 @@ def _current_proof(connection: sqlite3.Connection, *, project_root: Path, build_
         if _historical:
             archive = forward_recovery._successor_archive(build)
             critical = {}
-            _require(set(build["critical_files"]) == {p.as_posix() for p in sealer.V20_LEGACY_CRITICAL_FILES},
+            paths = sealer.V20_ACCOUNT_CRITICAL_FILES if plan["contract"] == account.PLAN else sealer.V20_LEGACY_CRITICAL_FILES
+            _require(set(build["critical_files"]) == {p.as_posix() for p in paths},
                      "historical runtime critical inventory changed")
-            for relative in sealer.V20_LEGACY_CRITICAL_FILES:
+            for relative in paths:
                 name = relative.as_posix()
                 body = archive.get(name)
                 if name not in archive:
-                    body = subprocess.run(["git", "show", str(build["git"]["head"]) + ":" + name],
-                        cwd=project_root, check=True, capture_output=True).stdout
+                    body = verified_git(source_root(project_root), "show", str(build["git"]["head"]) + ":" + name)
                 _require(isinstance(body, bytes), "historical critical source is absent")
                 assert isinstance(body, bytes)
                 critical[name] = hashlib.sha256(body).hexdigest()
@@ -432,6 +451,9 @@ def _current_proof(connection: sqlite3.Connection, *, project_root: Path, build_
                      "postseal decision scope, identity or time differs")
         references = {"plan": plan_ref, "previous_build": plan.get("installed_parent", plan["previous_build"]), "source_archive": plan["source_archive"],
             "full_checks": plan["full_checks"], "build": build_ref, "runtime": runtime_ref}
+        from . import runtime_source_successor as source
+        if plan["contract"] == source.PLAN:
+            references["source_tree"] = plan["source_tree"]
         private = [{"role": key, "path": value["path"], "sha256": value["sha256"], "byte_size": Path(value["path"]).stat().st_size}
                    for key, value in sorted(references.items())]
         proof = {"contract": account.PROOF if plan["contract"] == account.PLAN else (PROOF_V2 if plan["contract"] == PLAN_V2 else PROOF), "source_deployment_sha256": deployment["receipt_sha256"],
@@ -441,6 +463,8 @@ def _current_proof(connection: sqlite3.Connection, *, project_root: Path, build_
             "manifest": plan["manifest"], "plan_payload": plan, "plan_reference": plan_ref,
             "decision_receipt": decision, "build_reference": build_ref, "runtime_reference": runtime_ref,
             "private_references": private}
+        if plan["contract"] == source.PLAN:
+            proof["contract"] = source.PROOF
         if "account_control" in checked:
             proof["roster_successor_contract"] = "account-roster-code-plan-successor-v1"
             control = checked["account_control"]
@@ -479,6 +503,9 @@ def validate_portable(connection: sqlite3.Connection, proof: Mapping[str, Any], 
 
 
 def _validate_portable(connection: sqlite3.Connection, proof: Mapping[str, Any], *, deployment: Mapping[str, Any], at: str) -> dict[str, Any]:
+    from . import runtime_source_successor as source
+    if proof.get("contract") == source.PROOF:
+        return source.validate_portable(connection, proof, deployment=deployment, at=at)
     if proof.get("contract") == account.PROOF:
         return account.validate_portable(connection, proof, deployment=deployment, at=at)
     _require(proof.get("contract") in {PROOF, PROOF_V2} and proof.get("proof_sha256") == auth.digest({k: v for k, v in proof.items() if k != "proof_sha256"}),
