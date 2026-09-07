@@ -11,6 +11,7 @@ from v8.evaluation_selectors import (
     audit_evaluations,
     display_effective_evaluation,
     display_effective_evaluations,
+    display_effective_evaluations_cte_for,
     effective_direction,
     effective_direction_sql,
     formal_as_of_evaluations,
@@ -212,6 +213,15 @@ class EvaluationSelectorsTest(unittest.TestCase):
         self.assertEqual(
             [row["release_id"] for row in history], ["release-v8", "release-v6"]
         )
+
+    def test_display_cte_can_be_bounded_by_a_page_id_relation(self) -> None:
+        bounded = display_effective_evaluations_cte_for("page_ids")
+        self.assertIn(
+            "JOIN page_ids selected_content_ids ON selected_content_ids.id=ev.content_id",
+            bounded,
+        )
+        with self.assertRaisesRegex(ValueError, "simple SQL identifier"):
+            display_effective_evaluations_cte_for("page_ids; DROP TABLE content_items")
 
     def test_display_and_formal_fail_closed_when_no_active_release(self) -> None:
         with connect(self.db) as connection:

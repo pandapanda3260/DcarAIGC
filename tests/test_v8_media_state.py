@@ -331,9 +331,9 @@ class V8MediaTerminalStateTest(unittest.TestCase):
         connection,
         content_id: int,
         *,
-        media_sha256: str,
+        media_sha256: str | None,
         asr_sha256: str | None,
-        ocr_sha256: str,
+        ocr_sha256: str | None,
         evaluation_status: str,
         evidence_level: str,
         suffix: str = "current",
@@ -375,7 +375,7 @@ class V8MediaTerminalStateTest(unittest.TestCase):
                 taxonomy_version,matcher_rule_sha256,evidence_sha256,
                 evaluation_source,evaluation_status,evidence_level,
                 payload_json,evaluated_at
-            ) VALUES (?,?,?,'evaluation-test','selling-points-test',?,?,
+            ) VALUES (?,?,?,'evaluation-test','selling-points-test',?, ?,
                       ?,?,?,?,?)
             """,
             (
@@ -392,6 +392,119 @@ class V8MediaTerminalStateTest(unittest.TestCase):
             ),
         )
 
+    def _detail_slot(
+        self,
+        connection,
+        content_id: int,
+        *,
+        status: str,
+        error_code: str | None,
+        window_key: str = "lifetime",
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO fetch_slots(
+                content_id,stage,window_key,provider,adapter_version,status,
+                attempt_count,last_error_code,last_error_message,
+                created_at,updated_at
+            ) VALUES (?,'detail',?,'TikHub','fixture',?,1,?,?,?,?)
+            """,
+            (
+                content_id,
+                window_key,
+                status,
+                error_code,
+                "fixture provider result",
+                self._timestamp(1),
+                self._timestamp(1),
+            ),
+        )
+
+    def test_provider_confirmed_unavailable_with_weak_envelope_is_terminal_insufficient(
+        self,
+    ) -> None:
+        with connect(self.db) as connection:
+            ids: list[int] = []
+            for evidence_level, content_type in (
+                ("V0", "video"),
+                ("V1", "video"),
+                ("V1", "unknown"),
+            ):
+                content_id = self._content(
+                    connection, content_type=content_type
+                )
+                self._detail_slot(
+                    connection,
+                    content_id,
+                    status="terminal_failed",
+                    error_code="content_unavailable",
+                    window_key=(
+                        "xhs-type-probe-v1"
+                        if content_type == "unknown"
+                        else "lifetime"
+                    ),
+                )
+                self._evaluation(
+                    connection,
+                    content_id,
+                    media_sha256=None,
+                    asr_sha256=None,
+                    ocr_sha256=None,
+                    evaluation_status="insufficient_evidence",
+                    evidence_level=evidence_level,
+                )
+                ids.append(content_id)
+            connection.commit()
+            details = media_terminal_state_details(
+                connection, self.release_id, ids
+            )
+        self.assertEqual(
+            set(details.values()),
+            {
+                MediaTerminalDetail(
+                    "terminal_insufficient", "terminal_insufficient"
+                )
+            },
+        )
+
+    def test_weak_envelope_does_not_close_untrusted_provider_state(self) -> None:
+        cases = (
+            ("running", "content_unavailable", "automatic"),
+            ("retryable_failed", "content_unavailable", "automatic"),
+            ("terminal_failed", "provider_unavailable", "automatic"),
+            ("terminal_failed", "content_unavailable", "migrated_from_v5"),
+        )
+        with connect(self.db) as connection:
+            ids: list[int] = []
+            for status, error_code, evaluation_source in cases:
+                content_id = self._content(connection)
+                self._detail_slot(
+                    connection,
+                    content_id,
+                    status=status,
+                    error_code=error_code,
+                )
+                self._evaluation(
+                    connection,
+                    content_id,
+                    media_sha256=None,
+                    asr_sha256=None,
+                    ocr_sha256=None,
+                    evaluation_status="insufficient_evidence",
+                    evidence_level="V1",
+                    evaluation_source=evaluation_source,
+                )
+                ids.append(content_id)
+            connection.commit()
+            details = media_terminal_state_details(
+                connection, self.release_id, ids
+            )
+        self.assertTrue(
+            all(
+                detail == MediaTerminalDetail("pending", "source_missing")
+                for detail in details.values()
+            )
+        )
     def test_video_current_dag_and_v3_envelope_is_complete(self) -> None:
         with connect(self.db) as connection:
             content_id = self._content(connection)

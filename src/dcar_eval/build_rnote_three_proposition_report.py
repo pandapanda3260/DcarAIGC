@@ -55,7 +55,7 @@ def write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
     )
 
 
-def rounded_mean(rows: list[Mapping[str, Any]], field: str) -> int | None:
+def rounded_mean(rows: Iterable[Mapping[str, Any]], field: str) -> int | None:
     values = [int(row[field]) for row in rows if row.get(field) is not None]
     return round(mean(values)) if values else None
 
@@ -106,7 +106,7 @@ def build_final_results(
         )
         if audience is None:
             raise ValueError(f"{attempt_id}: audience unexpectedly unscorable")
-        action_counts = {str(key): int(value) for key, value in score["action_score_counts"].items()}
+        action_counts: dict[str | int, int] = {str(key): int(value) for key, value in score["action_score_counts"].items()}
         action = score_action(action_counts, valid_users)
         content, adjustment = content_auto_score(
             text_score=score["content_text_score"],

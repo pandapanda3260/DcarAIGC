@@ -58,7 +58,7 @@ def render_visual_svg(rows: list[dict[str, Any]], *, theme_aware: bool = False) 
         if theme_aware
         else ["#3478F6", "#16A085", "#F59E0B"]
     )
-    panels = [
+    panels: list[dict[str, Any]] = [
         {
             "x": 400,
             "title": "命题1：是否为汽车内容",

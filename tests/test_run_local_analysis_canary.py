@@ -24,8 +24,9 @@ from unittest.mock import patch
 
 from scripts import run_full_history_cache_batches as step3_controller
 from scripts import run_local_analysis_canary as canary
+from tests.schema_fixture import initialize_historical_schema
 from v8 import duplicates, evaluation, media, providers
-from v8.storage import connect, initialize_database, now_utc
+from v8.storage import connect, initialize_database, migrate_database, now_utc
 
 
 class _Response:
@@ -96,7 +97,11 @@ class LocalAnalysisCanaryControllerTest(unittest.TestCase):
         self.source_fixtures: dict[int, dict[str, object]] = {}
         captured_at = now_utc()
         with closing(connect(self.source_db)) as connection:
-            initialize_database(connection)
+            if getattr(self, "source_schema_version", None) == 18:
+                initialize_historical_schema(connection, target_version=17)
+                migrate_database(connection, from_version=17, to_version=18)
+            else:
+                initialize_database(connection)
             connection.execute(
                 """
                 INSERT INTO taxonomy_versions(

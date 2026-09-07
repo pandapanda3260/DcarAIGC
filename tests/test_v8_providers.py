@@ -1,40 +1,51 @@
 from __future__ import annotations
 
+import hashlib
 import json
-import http.client
 import os
+import sqlite3
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, datetime
+from email.message import Message
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, Mapping
 from urllib.error import HTTPError
 from unittest.mock import patch
 
+from tests.roster_fixture import accept_roster
 import v8.capture as capture_module
 import v8.media as media_module
+import v8.raw_evidence as raw_evidence_module
 from v8.capture import (
     CaptureError,
     ProviderResult,
     SlotUnavailable,
     execute_account_fetch,
 )
+from v8.provider_transport import JsonTransportResult, ProviderTransportError
 from v8.evaluation import evaluate_content
 from v8.matcher_dsl import POINT_IDS, POINT_SCENES
-from v8.operations import IdentityConflictError, upsert_account, upsert_content
+from v8.operations import IdentityConflictError, upsert_content
+from v8.operations import upsert_account as _upsert_account
 from v8.providers import (
     ProviderConfigurationError,
     _load_key,
     _load_tikhub_base,
     _collect_media_urls,
     _douyin_discovery_call,
+    _douyin_call,
     _douyin_image_url_groups,
+    _douyin_high_quality_video_call,
     _douyin_media_urls,
     _douyin_reference_call,
+    _douyin_web_detail_call,
     _parse_douyin_discovery_payload,
     _parse_douyin_stage_payload,
     _parse_xhs_discovery_payload,
+    _parse_xhs_stage_payload,
     _rnote_call,
     _rnote_discovery_call,
     _request_json,
@@ -52,6 +63,59 @@ from v8.taxonomy_rule_backfill import backfill_v5_1_matcher_rules
 
 
 VALID_SEC_UID = "MS4wLjAB" + "A" * 68
+
+
+def transport_result(status: int, payload: Any) -> JsonTransportResult:
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    return JsonTransportResult(
+        status=status,
+        payload=payload,
+        encoded_body=body,
+        entity_body=body,
+        receipt={
+            "contract_version": "provider-json-transport-v1",
+            "transport_route_id": "fixture-route-v1",
+            "route_generation": "route-config-sha256:fixture",
+            "http_stack": "fixture-stream-v1",
+            "request_host": "fixture.invalid",
+            "status": "succeeded",
+            "error_code": None,
+            "http_status": status,
+            "content_encoding": "identity",
+            "content_length": len(body),
+            "clean_eof": True,
+            "length_match": True,
+            "gzip_crc_ok": None,
+            "json_parse_ok": True,
+            "entity_bytes": len(body),
+            "entity_sha256": hashlib.sha256(body).hexdigest(),
+            "zero_body": not body,
+            "retry_after": None,
+        },
+    )
+
+
+def transport_failure(partial: bytes) -> ProviderTransportError:
+    return ProviderTransportError(
+        "transport_incomplete_read",
+        "fixture incomplete response",
+        partial_bytes=partial,
+        receipt={
+            "status": "failed",
+            "error_code": "transport_incomplete_read",
+            "partial_bytes": len(partial),
+            "partial_sha256": hashlib.sha256(partial).hexdigest() if partial else None,
+            "zero_body": not partial,
+        },
+    )
+
+
+def upsert_account(value, *, db_path):
+    """Real test accounts enter a complete accepted roster before paid work."""
+    account = _upsert_account(value, db_path=db_path)
+    with connect(db_path) as connection:
+        accept_roster(connection)
+    return account
 
 
 class ProviderCredentialLoadingTest(unittest.TestCase):
@@ -154,7 +218,7 @@ class ProviderCredentialLoadingTest(unittest.TestCase):
 class V8ProviderUpdateTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.db = self.root / "providers.sqlite3"
         self.raw_root_patch = patch.object(
             capture_module, "RAW_ROOT", self.root / "raw"
@@ -231,10 +295,15 @@ class V8ProviderUpdateTest(unittest.TestCase):
                 ),
             )
             connection.commit()
+        self.account = upsert_account(
+            {"phone": "", "platforms": [{"platform": "douyin", "uid": "99887766"}]},
+            db_path=self.db,
+        )
         content = upsert_content(
             {
                 "platform": "douyin",
                 "canonical_url": "https://www.douyin.com/video/123456789",
+                "account_uid": "99887766",
                 "title": "待补详情",
                 "content_type": "video",
             },
@@ -243,7 +312,53 @@ class V8ProviderUpdateTest(unittest.TestCase):
         self.content_id = content["id"]
 
     def tearDown(self) -> None:
-        self.temp.cleanup()
+        try:
+            with connect(self.db) as connection:
+                raws = connection.execute("SELECT local_path,sha256,byte_size FROM provider_raw_responses").fetchall()
+            for raw in raws:
+                body = Path(raw["local_path"]).read_bytes()
+                self.assertEqual(len(body), raw["byte_size"])
+                self.assertEqual(hashlib.sha256(body).hexdigest(), raw["sha256"])
+        finally:
+            self.temp.cleanup()
+
+    def _claim_content(self, content_id, *, platform, uid):
+        account = upsert_account(
+            {"phone": "", "platforms": [{"platform": platform, "uid": uid}]},
+            db_path=self.db,
+        )
+        with connect(self.db) as connection:
+            connection.execute(
+                "UPDATE content_items SET account_id=?,raw_account_uid=? WHERE id=?",
+                (account["id"], uid, content_id),
+            )
+        return account
+
+    def _audit_state(self):
+        """Exact all-table and raw-byte state around an audit-only replay."""
+        with connect(self.db) as connection:
+            tables = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+            ).fetchall()
+            projection = {}
+            for table in tables:
+                name = str(table["name"])
+                quoted_name = name.replace('"', '""')
+                projection[name] = sorted(
+                    (tuple(row) for row in connection.execute(
+                        f'SELECT * FROM "{quoted_name}"'
+                    )),
+                    key=repr,
+                )
+            raws = connection.execute(
+                "SELECT id,local_path,sha256 FROM provider_raw_responses ORDER BY id"
+            ).fetchall()
+        evidence = {}
+        for raw in raws:
+            payload = Path(raw["local_path"]).read_bytes()
+            self.assertEqual(hashlib.sha256(payload).hexdigest(), raw["sha256"])
+            evidence[int(raw["id"])] = (str(raw["local_path"]), raw["sha256"], payload)
+        return projection, evidence
 
     def test_retired_rnote_private_adapters_fail_before_request(self) -> None:
         with patch("v8.providers._request_json") as request_json:
@@ -282,7 +397,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
         )
 
     def test_douyin_image_urls_preserve_original_images_candidate_groups(self) -> None:
-        standard = {
+        standard: dict[str, Any] = {
             "download_url_list": [
                 "https://p3-sign.douyinpic.com/water/standard.webp",
                 "https://p3-sign.douyinpic.com/water/standard.jpeg",
@@ -407,12 +522,12 @@ class V8ProviderUpdateTest(unittest.TestCase):
 
     def test_http_auth_failures_are_terminal_but_balance_can_retry(self) -> None:
         for status, retryable in ((401, False), (402, True), (403, False)):
-            error = HTTPError(
-                "https://provider.example/api", status, "blocked", {}, BytesIO(b"{}")
-            )
             with (
                 self.subTest(status=status),
-                patch("v8.providers.urllib.request.urlopen", side_effect=error),
+                patch(
+                    "v8.providers.request_json_transport",
+                    return_value=transport_result(status, {}),
+                ),
                 self.assertRaises(CaptureError) as raised,
             ):
                 _request_json(
@@ -425,11 +540,20 @@ class V8ProviderUpdateTest(unittest.TestCase):
 
     def test_tikhub_explicit_unbilled_http_400_retry_stays_retryable(self) -> None:
         body = json.dumps(
-            {"detail": {"message": "Request failed. Please retry."}}
+            {
+                "detail": {
+                    "message": (
+                        "Request failed. Please retry. "
+                        "You won't be charged for this request."
+                    )
+                }
+            }
         ).encode()
-        error = HTTPError("https://api.tikhub.io/api", 400, "retry", {}, BytesIO(body))
         with (
-            patch("v8.providers.urllib.request.urlopen", side_effect=error),
+            patch(
+                "v8.providers.request_json_transport",
+                return_value=transport_result(400, json.loads(body)),
+            ),
             self.assertRaises(CaptureError) as raised,
         ):
             _request_json(
@@ -440,12 +564,38 @@ class V8ProviderUpdateTest(unittest.TestCase):
             )
         self.assertTrue(raised.exception.retryable)
         self.assertEqual(raised.exception.error_code, "provider_retry_requested")
-        self.assertFalse(raised.exception.billed)
+        self.assertIs(raised.exception.billed, False)
+
+    def test_route_generation_is_derived_from_the_frozen_api_base(self) -> None:
+        response = transport_result(200, {"ok": True})
+        with patch(
+            "v8.providers.request_json_transport", return_value=response
+        ) as transport:
+            _request_json(
+                "https://api.tikhub.dev/api",
+                headers={},
+                params={},
+                provider="TikHub",
+            )
+            dev_generation = transport.call_args.kwargs["route_generation"]
+            _request_json(
+                "https://api.tikhub.io/api",
+                headers={},
+                params={},
+                provider="TikHub",
+            )
+            io_generation = transport.call_args.kwargs["route_generation"]
+
+        self.assertTrue(dev_generation.startswith("route-config-sha256:"))
+        self.assertTrue(io_generation.startswith("route-config-sha256:"))
+        self.assertNotEqual(dev_generation, io_generation)
 
     def test_truncated_provider_response_is_retryable_transport_error(self) -> None:
-        error = http.client.IncompleteRead(b"partial", 100)
         with (
-            patch("v8.providers.urllib.request.urlopen", side_effect=error),
+            patch(
+                "v8.providers.request_json_transport",
+                side_effect=transport_failure(b"partial"),
+            ),
             self.assertRaises(CaptureError) as raised,
         ):
             _request_json(
@@ -456,48 +606,52 @@ class V8ProviderUpdateTest(unittest.TestCase):
             )
         self.assertTrue(raised.exception.retryable)
         self.assertEqual(raised.exception.error_code, "transport_error")
+        self.assertEqual(raised.exception.transport_partial, b"partial")
 
-    def test_complete_json_from_incomplete_read_is_recovered(self) -> None:
+    def test_complete_json_from_incomplete_read_is_strictly_rejected(self) -> None:
         payload = {"code": 200, "data": {"comments": [], "has_more": 0}}
         body = json.dumps(payload).encode()
-
-        class Response:
-            status = 200
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-            def read(self):
-                raise http.client.IncompleteRead(body, len(body) + 100)
-
-        with patch("v8.providers.urllib.request.urlopen", return_value=Response()):
-            status, value = _request_json(
+        with (
+            patch(
+                "v8.providers.request_json_transport",
+                side_effect=transport_failure(body),
+            ),
+            self.assertRaises(CaptureError) as raised,
+        ):
+            _request_json(
                 "https://api.tikhub.io/api",
                 headers={},
                 params={},
                 provider="TikHub",
             )
-        self.assertEqual(status, 200)
-        self.assertEqual(value, payload)
+        self.assertEqual(raised.exception.error_code, "transport_error")
+        self.assertEqual(raised.exception.transport_partial, body)
+        self.assertFalse(raised.exception.transport_receipt["zero_body"])
 
-    def test_invalid_partial_from_response_stays_retryable_transport_error(self) -> None:
-        class Response:
-            status = 200
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-            def read(self):
-                raise http.client.IncompleteRead(b'{"unterminated":', 20)
-
+    def test_http_error_with_json_null_retains_complete_transport_entity(self) -> None:
+        response = transport_result(500, None)
         with (
-            patch("v8.providers.urllib.request.urlopen", return_value=Response()),
+            patch("v8.providers.request_json_transport", return_value=response),
+            self.assertRaises(CaptureError) as raised,
+        ):
+            _request_json(
+                "https://api.tikhub.io/api",
+                headers={},
+                params={},
+                provider="TikHub",
+            )
+        self.assertIsNone(raised.exception.raw_response)
+        self.assertEqual(raised.exception.entity_bytes, b"null")
+        self.assertEqual(raised.exception.transport_receipt, response.receipt)
+
+    def test_invalid_partial_from_response_stays_retryable_transport_error(
+        self,
+    ) -> None:
+        with (
+            patch(
+                "v8.providers.request_json_transport",
+                side_effect=transport_failure(b'{"unterminated":'),
+            ),
             self.assertRaises(CaptureError) as raised,
         ):
             _request_json(
@@ -548,7 +702,8 @@ class V8ProviderUpdateTest(unittest.TestCase):
             parsed["items"][0]["media_urls"],
             ["https://cdn.example/xhs-image.jpg"],
         )
-        self.assertEqual(parsed["items"][0]["metrics"]["view_count"], 321)
+        self.assertIsNone(parsed["items"][0]["metrics"]["view_count"])
+        self.assertEqual(parsed["items"][0]["metrics"]["_field_status"]["view_count"]["status"], "not_applicable")
         self.assertEqual(parsed["items"][0]["metrics"]["comment_count"], 12)
         self.assertEqual(parsed["next_cursor"], "xhs-next-cursor")
         self.assertTrue(parsed["has_more"])
@@ -676,6 +831,34 @@ class V8ProviderUpdateTest(unittest.TestCase):
             )
         self.assertEqual(raised.exception.error_code, "invalid_response")
         self.assertTrue(raised.exception.retryable)
+
+    def test_douyin_comment_parser_failure_retains_transport_evidence(self) -> None:
+        payload = {
+            "code": 200,
+            "data": {
+                "comments": [
+                    {
+                        "cid": "comment-1",
+                        "text": "内容",
+                        "create_time": "not-a-timestamp",
+                        "user": {"uid": "raw-user"},
+                    }
+                ],
+                "has_more": 0,
+                "total": 1,
+            },
+        }
+        response = transport_result(200, payload)
+        with (
+            patch("v8.providers._request_json", return_value=response),
+            self.assertRaises(CaptureError) as raised,
+        ):
+            _douyin_call("comments", "123456789", "fixture-secret")
+        self.assertEqual(raised.exception.error_code, "invalid_response")
+        self.assertFalse(raised.exception.retryable)
+        self.assertEqual(raised.exception.raw_response, payload)
+        self.assertEqual(raised.exception.entity_bytes, response.entity_body)
+        self.assertIs(raised.exception.transport_receipt, response.receipt)
 
     def test_discovery_zero_views_does_not_close_real_statistics_slot(self) -> None:
         account = upsert_account(
@@ -865,22 +1048,27 @@ class V8ProviderUpdateTest(unittest.TestCase):
                 """,
                 (content["id"],),
             ).fetchone()
-            observation_count = connection.execute(
+            facts = connection.execute(
                 """
-                SELECT COUNT(*) FROM content_metric_observations
-                WHERE content_id=?
+                SELECT id,raw_response_id,captured_at
+                FROM content_metric_observations WHERE content_id=? ORDER BY id
                 """,
                 (content["id"],),
-            ).fetchone()[0]
+            ).fetchall()
         self.assertEqual(preserved["view_count"], 321)
-        self.assertEqual(preserved["comment_count"], 3)
-        self.assertEqual(preserved["like_count"], 20)
-        self.assertEqual(preserved["status"], "available")
-        self.assertEqual(
-            json.loads(preserved["metadata_json"])["exposure_observation"],
-            "observed",
-        )
-        self.assertEqual(observation_count, 3)
+        self.assertEqual(preserved["comment_count"], 4)
+        self.assertEqual(preserved["like_count"], 21)
+        self.assertEqual(preserved["status"], "stale")
+        fields = json.loads(preserved["metadata_json"])["fields"]
+        self.assertEqual(len(facts), 3)
+        for key, fact in (("view_count", facts[1]), ("comment_count", facts[2]), ("like_count", facts[2])):
+            self.assertEqual(fields[key]["observation_id"], fact["id"])
+            self.assertEqual(fields[key]["raw_response_id"], fact["raw_response_id"])
+            self.assertEqual(fields[key]["captured_at"], fact["captured_at"])
+        self.assertEqual(fields["view_count"]["freshness"], "stale")
+        self.assertEqual(fields["view_count"]["latest_provider_status"], "invalid")
+        self.assertEqual(fields["comment_count"]["freshness"], "fresh")
+        self.assertEqual(fields["like_count"]["freshness"], "fresh")
 
         def missing_statistics_call(stage, content_row):
             return ProviderResult(
@@ -976,76 +1164,32 @@ class V8ProviderUpdateTest(unittest.TestCase):
             ),
         )
 
-        result = materialize_account_discovery_page(
-            account_id=int(account["id"]),
-            platform="douyin",
-            account_uid="6677889901",
-            page=page,
-            source_raw_response_id=fetched.raw_response_id,
-            metrics_window_key="2026-08-23",
-            discovery_operation="douyin_openapi_video_list",
-            provider="DouyinOpenAPI",
-            derived_adapter_version="douyin-openapi-video-list-derived-v1",
-            derived_operations={
-                "detail": "douyin_openapi_video_list_detail_derived",
-                "metrics": "douyin_openapi_video_list_metrics_derived",
-            },
-            zero_view_is_authoritative=True,
-            db_path=self.db,
-            derived_raw_root=self.root / "openapi-derived-raw",
-        )
-
-        self.assertEqual(result["inserted"], 1)
-        self.assertEqual(result["derived_stages"]["created"], 1)
-        self.assertEqual(result["derived_stages"]["skipped"], 1)
-        with connect(self.db) as connection:
-            content = connection.execute(
-                "SELECT id FROM content_items WHERE platform_content_id='776655443322'"
-            ).fetchone()
-            slot = connection.execute(
-                """
-                SELECT provider,adapter_version,status
-                FROM fetch_slots
-                WHERE content_id=? AND stage='metrics'
-                """,
-                (content["id"],),
-            ).fetchone()
-            snapshot = connection.execute(
-                """
-                SELECT view_count,status,raw_response_id
-                FROM content_metric_snapshots
-                WHERE content_id=? AND window_key='2026-08-23'
-                """,
-                (content["id"],),
-            ).fetchone()
-            observation = connection.execute(
-                """
-                SELECT view_count,status FROM content_metric_observations
-                WHERE content_id=? ORDER BY id DESC LIMIT 1
-                """,
-                (content["id"],),
-            ).fetchone()
-            sources = connection.execute(
-                """
-                SELECT source FROM provider_raw_responses
-                WHERE id=? OR id=? ORDER BY id
-                """,
-                (fetched.raw_response_id, snapshot["raw_response_id"]),
-            ).fetchall()
-        self.assertEqual(
-            tuple(slot),
-            (
-                "DouyinOpenAPI",
-                "douyin-openapi-video-list-derived-v1",
-                "succeeded",
-            ),
-        )
-        self.assertEqual(tuple(snapshot)[:2], (0, "available"))
-        self.assertEqual(tuple(observation), (0, "available"))
-        self.assertEqual([row["source"] for row in sources], [
-            "live_applied",
-            "derived_applied",
-        ])
+        before = self._audit_state()
+        self.assertIn("provider_usage", before[0])
+        with self.assertRaisesRegex(
+            ProviderConfigurationError, "DouyinOpenAPI discovery is retired"
+        ):
+            materialize_account_discovery_page(
+                account_id=int(account["id"]),
+                platform="douyin",
+                account_uid="6677889901",
+                page=page,
+                source_raw_response_id=fetched.raw_response_id,
+                metrics_window_key="2026-08-23",
+                discovery_operation="douyin_openapi_video_list",
+                provider="DouyinOpenAPI",
+                derived_adapter_version="douyin-openapi-video-list-derived-v1",
+                derived_operations={
+                    "detail": "douyin_openapi_video_list_detail_derived",
+                    "metrics": "douyin_openapi_video_list_metrics_derived",
+                },
+                zero_view_is_authoritative=True,
+                db_path=self.db,
+                derived_raw_root=self.root / "openapi-derived-raw",
+            )
+        after = self._audit_state()
+        self.assertEqual(after, before)
+        self.assertFalse((self.root / "openapi-derived-raw").exists())
 
     def test_openapi_discovery_missing_view_does_not_create_successful_metrics_slot(
         self,
@@ -1088,55 +1232,32 @@ class V8ProviderUpdateTest(unittest.TestCase):
             call=lambda: ProviderResult(page, {"data": {"list": [{}]}}, 200, False),
         )
 
-        result = materialize_account_discovery_page(
-            account_id=int(account["id"]),
-            platform="douyin",
-            account_uid="6677889902",
-            page=page,
-            source_raw_response_id=fetched.raw_response_id,
-            metrics_window_key="2026-08-23",
-            discovery_operation="douyin_openapi_video_list",
-            provider="DouyinOpenAPI",
-            derived_adapter_version="douyin-openapi-video-list-derived-v1",
-            derived_operations={
-                "detail": "douyin_openapi_video_list_detail_derived",
-                "metrics": "douyin_openapi_video_list_metrics_derived",
-            },
-            zero_view_is_authoritative=True,
-            db_path=self.db,
-            derived_raw_root=self.root / "openapi-derived-raw",
-        )
-
-        self.assertEqual(result["derived_stages"]["created"], 0)
-        self.assertEqual(result["derived_stages"]["skipped"], 2)
-        with connect(self.db) as connection:
-            content = connection.execute(
-                "SELECT id FROM content_items WHERE platform_content_id='776655443323'"
-            ).fetchone()
-            metrics_slot = connection.execute(
-                """
-                SELECT id FROM fetch_slots
-                WHERE content_id=? AND stage='metrics'
-                """,
-                (content["id"],),
-            ).fetchone()
-            snapshot = connection.execute(
-                """
-                SELECT view_count,comment_count,like_count,status
-                FROM content_metric_snapshots WHERE content_id=?
-                """,
-                (content["id"],),
-            ).fetchone()
-            observation = connection.execute(
-                """
-                SELECT view_count,status FROM content_metric_observations
-                WHERE content_id=? ORDER BY id DESC LIMIT 1
-                """,
-                (content["id"],),
-            ).fetchone()
-        self.assertIsNone(metrics_slot)
-        self.assertEqual(tuple(snapshot), (None, 2, 9, "missing"))
-        self.assertEqual(tuple(observation), (None, "missing"))
+        before = self._audit_state()
+        self.assertIn("provider_usage", before[0])
+        with self.assertRaisesRegex(
+            ProviderConfigurationError, "DouyinOpenAPI discovery is retired"
+        ):
+            materialize_account_discovery_page(
+                account_id=int(account["id"]),
+                platform="douyin",
+                account_uid="6677889902",
+                page=page,
+                source_raw_response_id=fetched.raw_response_id,
+                metrics_window_key="2026-08-23",
+                discovery_operation="douyin_openapi_video_list",
+                provider="DouyinOpenAPI",
+                derived_adapter_version="douyin-openapi-video-list-derived-v1",
+                derived_operations={
+                    "detail": "douyin_openapi_video_list_detail_derived",
+                    "metrics": "douyin_openapi_video_list_metrics_derived",
+                },
+                zero_view_is_authoritative=True,
+                db_path=self.db,
+                derived_raw_root=self.root / "openapi-derived-raw",
+            )
+        after = self._audit_state()
+        self.assertEqual(after, before)
+        self.assertFalse((self.root / "openapi-derived-raw").exists())
 
     def test_douyin_numeric_uid_resolves_through_profile_endpoint(self) -> None:
         payload = {
@@ -1151,6 +1272,73 @@ class V8ProviderUpdateTest(unittest.TestCase):
             request.call_args.args[0].endswith("/fetch_user_profile_by_uid")
         )
         self.assertEqual(outcome.data["reference"], VALID_SEC_UID)
+
+    def test_douyin_web_detail_uses_official_endpoint_and_aweme_id(self) -> None:
+        content_id = "7500000000000000001"
+        payload = {
+            "code": 200,
+            "data": {
+                "aweme_detail": {
+                    "aweme_id": content_id,
+                    "desc": "Web detail video",
+                    "create_time": 1782105580,
+                    "author": {"uid": "author-1", "nickname": "author"},
+                    "statistics": {},
+                    "video": {
+                        "play_addr": {
+                            "url_list": ["https://cdn.example/web-video.mp4"]
+                        }
+                    },
+                }
+            },
+        }
+        with patch(
+            "v8.providers._request_json", return_value=(200, payload)
+        ) as request:
+            outcome = _douyin_web_detail_call(content_id, "secret")
+
+        self.assertTrue(
+            request.call_args.args[0].endswith(
+                "/api/v1/douyin/web/fetch_one_video"
+            )
+        )
+        self.assertEqual(request.call_args.kwargs["params"], {"aweme_id": content_id})
+        self.assertEqual(
+            outcome.data["media_urls"], ["https://cdn.example/web-video.mp4"]
+        )
+
+    def test_douyin_high_quality_video_uses_original_url_endpoint(self) -> None:
+        content_id = "7500000000000000001"
+        payload = {
+            "code": 200,
+            "data": {
+                "video_id": content_id,
+                "original_video_url": "https://cdn.example/original-video.mp4",
+                "video_data": {"duration": 12},
+            },
+        }
+        with patch(
+            "v8.providers._request_json", return_value=(200, payload)
+        ) as request:
+            outcome = _douyin_high_quality_video_call(content_id, "secret")
+
+        self.assertTrue(
+            request.call_args.args[0].endswith(
+                "/api/v1/douyin/app/v3/fetch_video_high_quality_play_url"
+            )
+        )
+        self.assertEqual(
+            request.call_args.kwargs["params"],
+            {
+                "aweme_id": content_id,
+                "share_url": f"https://www.douyin.com/video/{content_id}",
+                "region": "CN",
+            },
+        )
+        self.assertEqual(
+            outcome.data["media_urls"],
+            ["https://cdn.example/original-video.mp4"],
+        )
 
     def test_xhs_image_and_video_detail_use_app_v2_and_normalize_metrics(self) -> None:
         image_note = {
@@ -1179,7 +1367,8 @@ class V8ProviderUpdateTest(unittest.TestCase):
         self.assertEqual(
             image.data["media_urls"], ["https://cdn.example/xhs-image.webp"]
         )
-        self.assertEqual(image.data["metrics"]["view_count"], 100)
+        self.assertIsNone(image.data["metrics"]["view_count"])
+        self.assertEqual(image.data["metrics"]["_field_status"]["view_count"]["status"], "not_applicable")
         self.assertEqual(image.data["metrics"]["collect_count"], 5)
         with patch(
             "v8.providers._request_json", return_value=(200, image_payload)
@@ -1221,6 +1410,36 @@ class V8ProviderUpdateTest(unittest.TestCase):
             video.data["media_urls"], ["https://cdn.example/xhs-video.mp4"]
         )
         self.assertEqual(video.data["metrics"]["comment_count"], 40)
+
+    def test_xhs_unavailable_note_is_not_misclassified_as_unknown_type(self) -> None:
+        payload = {
+            "code": 200,
+            "data": {
+                "data": [
+                    {
+                        "note_list": [
+                            {
+                                "id": "xhs-unavailable",
+                                "model_type": "error",
+                                "text": "Note is not available",
+                                "user_id": "xhs-user",
+                            }
+                        ]
+                    }
+                ]
+            },
+        }
+        with self.assertRaises(CaptureError) as raised:
+            _parse_xhs_stage_payload(
+                "detail",
+                "xhs-unavailable",
+                "unknown",
+                payload,
+                status=200,
+            )
+        self.assertEqual(raised.exception.error_code, "content_unavailable")
+        self.assertFalse(raised.exception.retryable)
+        self.assertTrue(raised.exception.billed)
 
     def test_xhs_latest_comments_are_anonymized_before_raw_storage(self) -> None:
         payload = {
@@ -1280,6 +1499,61 @@ class V8ProviderUpdateTest(unittest.TestCase):
             {"cursor": "comment-next", "index": 1, "pageArea": "UNFOLDED"},
         )
         self.assertIn('"next_cursor_params"', raw_text)
+
+    def test_xhs_comment_projection_is_anonymous_but_transport_raw_is_exact(self) -> None:
+        payload = {
+            "code": 200,
+            "data": {
+                "success": True,
+                "code": 0,
+                "data": {
+                    "comment_count": 1,
+                    "has_more": False,
+                    "comments": [
+                        {
+                            "id": "comment-raw-1",
+                            "content": "真实评论",
+                            "time": 1782814412,
+                            "user": {
+                                "userid": "raw-user-secret",
+                                "nickname": "原始昵称",
+                            },
+                        }
+                    ],
+                },
+            },
+        }
+        response = transport_result(200, payload)
+        with patch("v8.providers._request_json", return_value=response):
+            provider_result = _xhs_call(
+                "comments", "xhs-note-1", "fixture-secret", "image"
+            )
+        outcome = capture_module.execute_content_fetch(
+            content_id=self.content_id,
+            stage="comments",
+            window_key="transport-exact",
+            provider="FixtureTransport",
+            adapter_version="fixture-transport-v1",
+            operation="xiaohongshu_note_comments",
+            call=lambda: provider_result,
+            db_path=self.db,
+            raw_root=self.root / "raw",
+        )
+        projected = json.dumps(outcome.data, ensure_ascii=False)
+        self.assertNotIn("raw-user-secret", projected)
+        self.assertNotIn("原始昵称", projected)
+        with connect(self.db) as connection:
+            row = connection.execute(
+                """SELECT local_path,sha256,byte_size
+                   FROM provider_raw_responses WHERE id=?""",
+                (outcome.raw_response_id,),
+            ).fetchone()
+        stored = raw_evidence_module.read_raw_json(
+            Path(str(row["local_path"])),
+            expected_stored_sha256=str(row["sha256"]),
+            expected_stored_size=int(row["byte_size"]),
+        )
+        self.assertEqual(stored, payload)
 
     def test_xhs_plain_cursor_without_continuation_context_is_rejected(self) -> None:
         payload = {
@@ -2673,7 +2947,11 @@ class V8ProviderUpdateTest(unittest.TestCase):
                 (discovered["id"],),
             ).fetchall()
             snapshot = connection.execute(
-                "SELECT view_count FROM content_metric_snapshots WHERE content_id=?",
+                "SELECT * FROM content_metric_snapshots WHERE content_id=? AND window_key='2026-08-02'",
+                (discovered["id"],),
+            ).fetchone()
+            derived_raw = connection.execute(
+                "SELECT * FROM provider_raw_responses WHERE content_id=? AND operation='xiaohongshu_note_statistics'",
                 (discovered["id"],),
             ).fetchone()
             usage = connection.execute(
@@ -2687,7 +2965,13 @@ class V8ProviderUpdateTest(unittest.TestCase):
             [(row["stage"], row["status"]) for row in content_slots],
             [("detail", "succeeded"), ("metrics", "succeeded")],
         )
-        self.assertEqual(snapshot["view_count"], 3000)
+        self.assertIsNone(snapshot["view_count"])
+        self.assertEqual(json.loads(snapshot["metadata_json"])["fields"]["view_count"]["status"], "not_applicable")
+        self.assertEqual(tuple(snapshot[key] for key in ("comment_count", "like_count", "share_count", "collect_count")), (40, 120, 15, 70))
+        raw_bytes = Path(derived_raw["local_path"]).read_bytes()
+        self.assertEqual(hashlib.sha256(raw_bytes).hexdigest(), derived_raw["sha256"])
+        _, raw_value = capture_module._read_verified_raw_response(derived_raw)
+        self.assertEqual(raw_value["data"]["view_count"], 3000)
         self.assertEqual(usage["count"], 1)
         self.assertAlmostEqual(float(usage["amount"]), 0.01)
 
@@ -2702,6 +2986,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
             },
             db_path=self.db,
         )
+        self._claim_content(content["id"], platform="xiaohongshu", uid="xhs-user")
         calls: list[str] = []
 
         def detail_call(stage, current):
@@ -2750,21 +3035,23 @@ class V8ProviderUpdateTest(unittest.TestCase):
         )
         with connect(self.db) as connection:
             snapshot = connection.execute(
-                "SELECT * FROM content_metric_snapshots WHERE content_id=?",
+                "SELECT * FROM content_metric_snapshots WHERE content_id=? AND window_key='2026-08-02'",
                 (content["id"],),
             ).fetchone()
             raws = connection.execute(
                 "SELECT * FROM provider_raw_responses WHERE content_id=? ORDER BY id",
                 (content["id"],),
             ).fetchall()
-            observation = connection.execute(
-                "SELECT * FROM content_metric_observations WHERE content_id=?",
+            observations = connection.execute(
+                "SELECT * FROM content_metric_observations WHERE content_id=? ORDER BY id",
                 (content["id"],),
-            ).fetchone()
+            ).fetchall()
             usage = connection.execute(
                 "SELECT SUM(amount) amount FROM provider_usage",
             ).fetchone()
-        self.assertEqual(snapshot["view_count"], 1200)
+        self.assertIsNone(snapshot["view_count"])
+        self.assertEqual(json.loads(snapshot["metadata_json"])["fields"]["view_count"]["status"], "not_applicable")
+        self.assertEqual(tuple(snapshot[key] for key in ("comment_count", "like_count", "share_count", "collect_count")), (30, 80, 12, 50))
         self.assertEqual(
             [row["operation"] for row in raws],
             [
@@ -2773,8 +3060,15 @@ class V8ProviderUpdateTest(unittest.TestCase):
             ],
         )
         self.assertEqual([row["provider"] for row in raws], ["TikHub", "TikHub"])
-        self.assertEqual(observation["raw_response_id"], raws[1]["id"])
-        self.assertEqual(observation["captured_at"], raws[0]["captured_at"])
+        self.assertEqual(len(observations), 2)
+        self.assertEqual([row["raw_response_id"] for row in observations], [row["id"] for row in raws])
+        self.assertEqual([row["captured_at"] for row in observations], [raws[0]["captured_at"]] * 2)
+        captured_day = datetime.fromisoformat(raws[0]["captured_at"].replace("Z", "+00:00")).astimezone(capture_module.SHANGHAI).date().isoformat()
+        self.assertEqual([row["window_key"] for row in observations], [captured_day, "2026-08-02"])
+        raw_bytes = Path(raws[0]["local_path"]).read_bytes()
+        self.assertEqual(hashlib.sha256(raw_bytes).hexdigest(), raws[0]["sha256"])
+        _, raw_value = capture_module._read_verified_raw_response(raws[0])
+        self.assertEqual(raw_value["data"]["data"]["metrics"]["view_count"], 1200)
         self.assertEqual(snapshot["captured_at"], raws[0]["captured_at"])
         self.assertAlmostEqual(float(usage["amount"]), 0.01)
 
@@ -2791,6 +3085,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
             },
             db_path=self.db,
         )
+        self._claim_content(content["id"], platform="xiaohongshu", uid="xhs-user")
         calls: list[str] = []
 
         def detail_call(stage, current):
@@ -2822,6 +3117,20 @@ class V8ProviderUpdateTest(unittest.TestCase):
         self.assertEqual(first["provider_cost"], 0.01)
         self.assertEqual(calls, ["detail"])
 
+        with connect(self.db) as connection:
+            first_facts = connection.execute(
+                "SELECT * FROM content_metric_observations WHERE content_id=? ORDER BY id",
+                (content["id"],),
+            ).fetchall()
+            premature_metrics_slots = connection.execute(
+                "SELECT COUNT(*) FROM fetch_slots WHERE content_id=? AND stage='metrics'",
+                (content["id"],),
+            ).fetchone()[0]
+        self.assertEqual(len(first_facts), 1)
+        self.assertEqual(first_facts[0]["comment_count"], 12)
+        self.assertEqual(first_facts[0]["like_count"], 45)
+        self.assertEqual(premature_metrics_slots, 0)
+
         def no_provider_call(stage, current):
             raise AssertionError(f"unexpected provider call: {stage}")
 
@@ -2842,15 +3151,15 @@ class V8ProviderUpdateTest(unittest.TestCase):
         with connect(self.db) as connection:
             snapshot = connection.execute(
                 """
-                SELECT view_count,captured_at,raw_response_id
-                FROM content_metric_snapshots WHERE content_id=?
+                SELECT * FROM content_metric_snapshots WHERE content_id=?
+                AND window_key='2026-08-02'
                 """,
                 (content["id"],),
             ).fetchone()
-            observation = connection.execute(
-                "SELECT * FROM content_metric_observations WHERE content_id=?",
+            observations = connection.execute(
+                "SELECT * FROM content_metric_observations WHERE content_id=? ORDER BY id",
                 (content["id"],),
-            ).fetchone()
+            ).fetchall()
             raws = connection.execute(
                 "SELECT * FROM provider_raw_responses WHERE content_id=? ORDER BY id",
                 (content["id"],),
@@ -2858,13 +3167,23 @@ class V8ProviderUpdateTest(unittest.TestCase):
             usage = connection.execute(
                 "SELECT COUNT(*) count,SUM(amount) amount FROM provider_usage"
             ).fetchone()
-        self.assertEqual(snapshot["view_count"], 321)
+        self.assertIsNone(snapshot["view_count"])
+        self.assertEqual(json.loads(snapshot["metadata_json"])["fields"]["view_count"]["status"], "not_applicable")
+        self.assertEqual(tuple(snapshot[key] for key in ("comment_count", "like_count", "share_count", "collect_count")), (12, 45, 6, 7))
         self.assertEqual(
             [row["operation"] for row in raws],
             ["xiaohongshu_note_detail", "xiaohongshu_note_statistics"],
         )
-        self.assertEqual(observation["raw_response_id"], raws[1]["id"])
-        self.assertEqual(observation["captured_at"], raws[0]["captured_at"])
+        self.assertEqual(len(observations), 2)
+        self.assertEqual(tuple(observations[0]), tuple(first_facts[0]))
+        self.assertEqual([row["raw_response_id"] for row in observations], [row["id"] for row in raws])
+        self.assertEqual([row["captured_at"] for row in observations], [raws[0]["captured_at"]] * 2)
+        captured_day = datetime.fromisoformat(raws[0]["captured_at"].replace("Z", "+00:00")).astimezone(capture_module.SHANGHAI).date().isoformat()
+        self.assertEqual([row["window_key"] for row in observations], [captured_day, "2026-08-02"])
+        raw_bytes = Path(raws[0]["local_path"]).read_bytes()
+        self.assertEqual(hashlib.sha256(raw_bytes).hexdigest(), raws[0]["sha256"])
+        _, raw_value = capture_module._read_verified_raw_response(raws[0])
+        self.assertEqual(raw_value["data"]["metrics"]["view_count"], 321)
         self.assertEqual(snapshot["captured_at"], raws[0]["captured_at"])
         self.assertEqual(snapshot["raw_response_id"], raws[1]["id"])
         self.assertEqual(usage["count"], 1)
@@ -2915,9 +3234,15 @@ class V8ProviderUpdateTest(unittest.TestCase):
             pending = connection.execute(
                 "SELECT * FROM pending_platform_identities WHERE uid='99887766'"
             ).fetchone()
+            content = connection.execute(
+                "SELECT account_id,raw_account_uid,raw_account_name FROM content_items WHERE id=?",
+                (self.content_id,),
+            ).fetchone()
         self.assertIsNotNone(source)
-        self.assertEqual(pending["content_count"], 1)
-        self.assertEqual(pending["nickname"], "汽车号")
+        self.assertIsNone(pending)
+        self.assertEqual(content["account_id"], self.account["id"])
+        self.assertEqual(content["raw_account_uid"], "99887766")
+        self.assertEqual(content["raw_account_name"], "汽车号")
         with connect(self.db) as connection:
             self.assertEqual(
                 connection.execute(
@@ -2941,6 +3266,13 @@ class V8ProviderUpdateTest(unittest.TestCase):
             },
             db_path=self.db,
         )
+        # Matrix identifies the managed account before paid detail resolves
+        # the content's still-missing author field.
+        with connect(self.db) as connection:
+            connection.execute(
+                "UPDATE content_items SET account_id=?,raw_account_uid=NULL WHERE id=?",
+                (account["id"], self.content_id),
+            )
 
         def detail_call(stage, content):
             self.assertEqual(stage, "detail")
@@ -2994,7 +3326,8 @@ class V8ProviderUpdateTest(unittest.TestCase):
             self.content_id,
             db_path=self.db,
         )
-        self.assertIsNotNone(state)
+        if state is None:
+            self.fail("stored media source must have a state")
         return state
 
     def _insert_download_slot(
@@ -3034,6 +3367,46 @@ class V8ProviderUpdateTest(unittest.TestCase):
         }
         return ProviderResult(data, {"data": data}, 200, True)
 
+    def test_managed_or_previously_managed_source_cannot_use_legacy_paid_refresh(self) -> None:
+        from tests.test_v8_managed_media import ManagedMediaTest
+        from v8.media_lifecycle import LifecycleError
+
+        fixture = ManagedMediaTest()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        fixture._source()
+        fixture._activate()
+        fixture._download()
+        download_calls = list(fixture.calls)
+        for current_source in (True, False):
+            with self.subTest(current_source=current_source):
+                if not current_source:
+                    fixture._source(suffix="-replacement")
+                with connect(fixture.db) as connection:
+                    self.assertEqual(
+                        media_module._managed_bundle(connection, 1) is not None,
+                        current_source,
+                    )
+                    self.assertTrue(media_module._has_managed_history(connection, 1))
+                    before = list(connection.iterdump())
+                with (
+                    patch("v8.providers.process_content_media") as process_media,
+                    patch("v8.providers._douyin_call") as provider_call,
+                    self.assertRaisesRegex(
+                        LifecycleError, "^explicit_reacquire_contract_not_bound$"
+                    ),
+                ):
+                    retry_content_media(1, allow_paid_refresh=True, db_path=fixture.db)
+                process_media.assert_not_called()
+                provider_call.assert_not_called()
+                self.assertEqual(fixture.calls, download_calls)
+                with connect(fixture.db) as connection:
+                    self.assertEqual(list(connection.iterdump()), before)
+                    self.assertEqual(
+                        connection.execute("SELECT COUNT(*) FROM provider_usage").fetchone()[0],
+                        0,
+                    )
+
     def test_paid_media_retry_recovers_real_expired_download_then_refreshes_once(
         self,
     ) -> None:
@@ -3051,7 +3424,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
             "https://cdn.example/expired.mp4",
             403,
             "expired",
-            {},
+            Message(),
             BytesIO(b"expired"),
         )
         with (
@@ -3136,12 +3509,15 @@ class V8ProviderUpdateTest(unittest.TestCase):
             "https://cdn.example/expired-no-budget.mp4",
             403,
             "expired",
-            {},
+            Message(),
             BytesIO(b"expired"),
         )
         with (
             patch("v8.media.urllib.request.urlopen", side_effect=expired),
-            self.assertRaisesRegex(ProviderConfigurationError, "付费刷新"),
+            self.assertRaisesRegex(
+                ProviderConfigurationError,
+                "^当前媒体源下载失败；本地重试没有获取新来源的授权，请联系管理员核查$",
+            ),
         ):
             retry_content_media(
                 self.content_id,
@@ -3343,8 +3719,72 @@ class V8ProviderUpdateTest(unittest.TestCase):
         self.assertIsNone(result["media_source_refresh"]["previous_source_sha256"])
         self.assertEqual(result["media_source_refresh"]["status"], "succeeded")
 
-    def test_paid_refresh_rejects_missing_or_invalid_refreshed_media_source(
-        self,
+    def test_retryable_media_refresh_never_rebuys_without_compensation(self) -> None:
+        provider_calls = 0
+
+        def transient_detail(stage, content):
+            nonlocal provider_calls
+            provider_calls += 1
+            raise CaptureError(
+                "fixture provider asked for retry",
+                retryable=True,
+                error_code="provider_retry_requested",
+                http_status=400,
+                billed=False,
+                raw_response={"detail": {"message": "Please retry"}},
+            )
+
+        with patch(
+            "v8.providers.process_content_media",
+            return_value={"content_id": self.content_id, "status": "no_source"},
+        ):
+            with self.assertRaises(CaptureError) as first:
+                retry_content_media(
+                    self.content_id,
+                    allow_paid_refresh=True,
+                    db_path=self.db,
+                    call_override=transient_detail,
+                )
+            self.assertEqual(first.exception.error_code, "provider_retry_requested")
+
+            with self.assertRaises(CaptureError) as held:
+                retry_content_media(
+                    self.content_id,
+                    allow_paid_refresh=True,
+                    db_path=self.db,
+                    call_override=transient_detail,
+                )
+            self.assertEqual(held.exception.error_code, "paid_identity_hold")
+
+            with self.assertRaises(SlotUnavailable):
+                retry_content_media(
+                    self.content_id,
+                    allow_paid_refresh=True,
+                    db_path=self.db,
+                    call_override=transient_detail,
+                )
+
+        self.assertEqual(provider_calls, 1)
+        with connect(self.db) as connection:
+            slot = connection.execute(
+                "SELECT id,status,last_error_code FROM fetch_slots WHERE stage='media_source_refresh'"
+            ).fetchone()
+            attempt_count = connection.execute(
+                "SELECT COUNT(*) FROM fetch_attempts WHERE slot_id=?",
+                (slot["id"],),
+            ).fetchone()[0]
+            usage_count = connection.execute(
+                "SELECT COUNT(*) FROM provider_usage WHERE operation='douyin_video_detail'"
+            ).fetchone()[0]
+        self.assertEqual(
+            (slot["status"], slot["last_error_code"]),
+            ("terminal_failed", "paid_identity_hold"),
+        )
+        self.assertEqual(attempt_count, 1)
+        self.assertEqual(usage_count, 2)
+
+    def _assert_paid_refresh_rejects_invalid_source(
+        self, media_urls: list[str]
     ) -> None:
         state = self._store_media_source("https://cdn.example/terminal.mp4")
         self._insert_download_slot(
@@ -3352,40 +3792,35 @@ class V8ProviderUpdateTest(unittest.TestCase):
             status="terminal_failed",
             attempt_count=3,
         )
-        for media_urls in ([], ["http://unsupported.example/new.mp4"]):
-            with (
-                self.subTest(media_urls=media_urls),
-                patch("v8.providers.process_content_media") as process_media,
-                self.assertRaisesRegex(
-                    ProviderConfigurationError,
-                    "媒体源",
-                ),
-            ):
-                retry_content_media(
-                    self.content_id,
-                    allow_paid_refresh=True,
-                    db_path=self.db,
-                    call_override=lambda stage,
-                    content,
-                    urls=media_urls: ProviderResult(
-                        {
-                            "content_type": "video",
-                            "media_urls": urls,
-                        },
-                        {"data": {"media_urls": urls}},
-                        200,
-                        True,
-                    ),
-                )
-            process_media.assert_not_called()
-            with connect(self.db) as connection:
-                connection.execute("DELETE FROM fetch_attempts")
-                connection.execute(
-                    "DELETE FROM fetch_slots WHERE stage='media_source_refresh'"
-                )
-                connection.execute("DELETE FROM provider_usage")
-                connection.execute("DELETE FROM provider_budget_batches")
-                connection.commit()
+        def invalid_detail(
+            stage: str, content: Mapping[str, Any]
+        ) -> ProviderResult:
+            return ProviderResult(
+                {"content_type": "video", "media_urls": media_urls},
+                {"data": {"media_urls": media_urls}},
+                200,
+                True,
+            )
+
+        with (
+            patch("v8.providers.process_content_media") as process_media,
+            self.assertRaisesRegex(ProviderConfigurationError, "媒体源"),
+        ):
+            retry_content_media(
+                self.content_id,
+                allow_paid_refresh=True,
+                db_path=self.db,
+                call_override=invalid_detail,
+            )
+        process_media.assert_not_called()
+
+    def test_paid_refresh_rejects_missing_refreshed_media_source(self) -> None:
+        self._assert_paid_refresh_rejects_invalid_source([])
+
+    def test_paid_refresh_rejects_unsupported_refreshed_media_source(self) -> None:
+        self._assert_paid_refresh_rejects_invalid_source(
+            ["http://unsupported.example/new.mp4"]
+        )
 
     def test_paid_refresh_rejects_same_terminal_source_sha_without_reusing_it(
         self,
@@ -3455,7 +3890,8 @@ class V8ProviderUpdateTest(unittest.TestCase):
             self.content_id,
             db_path=self.db,
         )
-        self.assertIsNotNone(refreshed_state)
+        if refreshed_state is None:
+            self.fail("paid refresh must retain its source state")
         self._insert_download_slot(
             str(refreshed_state["source_artifact_sha256"]),
             status="terminal_failed",
@@ -3480,6 +3916,100 @@ class V8ProviderUpdateTest(unittest.TestCase):
             ).fetchone()
         self.assertEqual(usage["count"], 1)
         self.assertAlmostEqual(float(usage["amount"]), 0.001)
+
+    def test_discovery_retries_only_local_materialization_after_database_lock(
+        self,
+    ) -> None:
+        account = upsert_account(
+            {
+                "phone": "13800138991",
+                "platforms": [
+                    {
+                        "platform": "xiaohongshu",
+                        "uid": "lock-retry-xhs-user",
+                        "nickname": "发现落库锁重试测试号",
+                    }
+                ],
+            },
+            db_path=self.db,
+        )
+        provider_calls: list[str] = []
+
+        def discovery_call(operation, _identity):
+            provider_calls.append(operation)
+            return ProviderResult(
+                {
+                    "items": [
+                        {
+                            "platform": "xiaohongshu",
+                            "platform_content_id": "6a123456000000001234abcd",
+                            "canonical_url": (
+                                "https://www.xiaohongshu.com/explore/"
+                                "6a123456000000001234abcd"
+                            ),
+                            "title": "发现页已付费、本地落库重试",
+                            "body": "发现页已付费、本地落库重试",
+                            "published_at": "2026-08-20T04:00:00Z",
+                            "content_type": "image",
+                            "media_urls": ["https://cdn.example/lock-retry.jpg"],
+                        }
+                    ],
+                    "next_cursor": "",
+                    "has_more": False,
+                },
+                {"fixture": "paid-page-raw"},
+                200,
+                True,
+            )
+
+        real_materialize = materialize_account_discovery_page
+        materialize_attempts = 0
+
+        def flaky_materialize(**kwargs):
+            nonlocal materialize_attempts
+            materialize_attempts += 1
+            if materialize_attempts < 3:
+                raise sqlite3.OperationalError("database is locked")
+            return real_materialize(**kwargs)
+
+        with patch(
+            "v8.providers.materialize_account_discovery_page",
+            side_effect=flaky_materialize,
+        ), patch("v8.providers.time.sleep") as pause:
+            result = discover_account_content(
+                int(account["id"]),
+                "xiaohongshu",
+                "lock-retry-xhs-user",
+                as_of=date(2026, 8, 29),
+                window_key="range-lock-retry",
+                db_path=self.db,
+                call_override=discovery_call,
+                materialize_discovery_detail=False,
+                materialize_existing_discovery_stages=False,
+            )
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["inserted"], 1)
+        self.assertEqual(materialize_attempts, 3)
+        self.assertEqual(provider_calls, ["discover_content"])
+        self.assertEqual(pause.call_count, 2)
+        with connect(self.db) as connection:
+            raw_count = connection.execute(
+                """
+                SELECT COUNT(*) FROM provider_raw_responses
+                WHERE account_id=? AND operation='xiaohongshu_user_posts'
+                """,
+                (account["id"],),
+            ).fetchone()[0]
+            usage = connection.execute(
+                """
+                SELECT COUNT(*) count,SUM(amount) amount FROM provider_usage
+                WHERE operation='xiaohongshu_user_posts'
+                """
+            ).fetchone()
+        self.assertEqual(raw_count, 1)
+        self.assertEqual(usage["count"], 1)
+        self.assertAlmostEqual(float(usage["amount"]), 0.01)
 
 
 if __name__ == "__main__":

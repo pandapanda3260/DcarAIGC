@@ -1,0 +1,16 @@
+.banner {
+  width: 100%;
+  max-width: 1600px;
+  margin: 0 auto 18px;
+  padding: 12px 16px;
+  border: 1px solid #dfca95;
+  border-radius: 10px;
+  background: #fff9eb;
+  color: #644c20;
+  font-size: 0.875rem;
+  line-height: 1.65;
+}
+
+.banner strong { display: block; margin-bottom: 2px; }
+.offline { border-color: #e4b6b6; background: #fff3f3; color: #8c3636; }
+.footerLabel { font-size: 0.875rem !important; }

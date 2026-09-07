@@ -2,7 +2,6 @@
 Description=DcarAIGC authentication gateway
 After=network-online.target dcar-api.service dcar-douyin-control.service dcar-web.service
 Wants=network-online.target dcar-api.service dcar-douyin-control.service dcar-web.service
-ConditionFileNotEmpty=/etc/nginx/.htpasswd-dcar
 ConditionPathIsDirectory=/var/lib/dcar-aigc/auth
 
 [Service]
@@ -15,11 +14,13 @@ Environment=DCAR_AUTH_BASE_PATH=/dcar
 Environment=DCAR_AUTH_WEB_UPSTREAM=http://127.0.0.1:4174
 Environment=DCAR_AUTH_API_UPSTREAM=http://127.0.0.1:8765
 Environment=DCAR_AUTH_DOUYIN_UPSTREAM=http://127.0.0.1:4175
-Environment=DCAR_AUTH_HTPASSWD=/etc/nginx/.htpasswd-dcar
 Environment=DCAR_AUTH_SESSION_DB=/var/lib/dcar-aigc/auth/sessions.sqlite3
 Environment=DCAR_AUTH_LOGIN_TEMPLATE=/var/www/dcar-aigc/current/deploy/server/nginx/login.html
 Environment=DCAR_AUTH_SECURE_COOKIE=1
+Environment=DCAR_AUTH_SMS_PROVIDER=tencent
 LoadCredential=douyin-edge-key:/etc/dcar-aigc/credentials/douyin-edge-key
+LoadCredential=sms-tencent:/etc/dcar-aigc/credentials/sms-tencent
+LoadCredential=auth-pepper:/etc/dcar-aigc/credentials/auth-pepper
 ExecStart=/var/www/dcar-aigc/current/.venv/bin/python -m uvicorn dcar_auth.gateway:app --app-dir /var/www/dcar-aigc/current/src/dcar_eval --host 127.0.0.1 --port 4173 --workers 1 --no-access-log
 Restart=on-failure
 RestartSec=5s
@@ -28,7 +29,6 @@ KillSignal=SIGTERM
 UMask=0077
 
 ReadWritePaths=/var/lib/dcar-aigc/auth
-ReadOnlyPaths=/etc/nginx/.htpasswd-dcar
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true

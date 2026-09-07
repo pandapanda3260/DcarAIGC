@@ -14,6 +14,11 @@ Environment=NEXT_TELEMETRY_DISABLED=1
 Environment=WRANGLER_WRITE_LOGS=false
 Environment=WRANGLER_LOG_PATH=/tmp/dcar-wrangler.log
 Environment=MINIFLARE_REGISTRY_PATH=/tmp/dcar-miniflare-registry
+Environment=DCAR_READ_ONLY=1
+Environment=DCAR_THUMBNAIL_PYTHON=/var/www/dcar-aigc/current/.venv/bin/python
+Environment=DCAR_THUMBNAIL_HELPER=/var/www/dcar-aigc/current/app/web/server/content_thumbnails.py
+Environment=DCAR_THUMBNAIL_DB=/var/lib/dcar-aigc/db/dcar_insight.sqlite3
+Environment=DCAR_THUMBNAIL_PROJECT_ROOT=/var/www/dcar-aigc/current
 ExecStart=/var/www/dcar-aigc/runtime/node-v22.13.1-linux-x64/bin/node ./node_modules/vinext/dist/cli.js start --hostname 127.0.0.1 --port 4174
 Restart=on-failure
 RestartSec=5s
@@ -21,6 +26,8 @@ TimeoutStopSec=30s
 KillSignal=SIGTERM
 UMask=0027
 
+BindReadOnlyPaths=/var/lib/dcar-aigc/cache:/var/www/dcar-aigc/current/data/cache
+ReadOnlyPaths=/var/lib/dcar-aigc/db /var/lib/dcar-aigc/cache
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true

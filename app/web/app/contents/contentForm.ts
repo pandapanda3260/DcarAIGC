@@ -1,5 +1,5 @@
 export type ContentForm = {
-  id: number | null;
+  id: number;
   platform: string;
   platformContentId: string;
   canonicalUrl: string;
@@ -11,21 +11,6 @@ export type ContentForm = {
   accountName: string;
   accountType: string;
   contentDirection: string;
-};
-
-export const emptyContentForm: ContentForm = {
-  id: null,
-  platform: "douyin",
-  platformContentId: "",
-  canonicalUrl: "",
-  publishedAt: "",
-  title: "",
-  body: "",
-  contentType: "unknown",
-  accountUid: "",
-  accountName: "",
-  accountType: "unknown",
-  contentDirection: "unknown",
 };
 
 const formFields = [
@@ -90,15 +75,6 @@ function serializeField(field: keyof ContentForm, value: ContentForm[keyof Conte
   return value;
 }
 
-export function buildContentRequest(form: ContentForm): Record<string, unknown> {
-  return Object.fromEntries(
-    formFields.map(([field, requestField]) => [
-      requestField,
-      serializeField(field, form[field]),
-    ]),
-  );
-}
-
 export function buildContentPatch(
   original: ContentForm,
   current: ContentForm,
@@ -118,18 +94,10 @@ export function buildContentSaveOperation(
   original: ContentForm | null,
 ): {
   path: string;
-  method: "POST" | "PATCH";
+  method: "PATCH";
   body: Record<string, unknown>;
   unchanged: boolean;
 } {
-  if (form.id === null) {
-    return {
-      path: "/api/v8/contents",
-      method: "POST",
-      body: buildContentRequest(form),
-      unchanged: false,
-    };
-  }
   if (original === null) {
     throw new Error("无法保存：没有找到修改前的数据，请刷新页面后重试。");
   }

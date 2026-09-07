@@ -1,0 +1,36 @@
+.backdrop { padding: 20px; }
+.backdrop .panel {
+  width: min(1040px, 100%);
+  height: min(820px, calc(100dvh - 40px));
+  max-height: calc(100dvh - 40px);
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-radius: 14px;
+}
+.header { flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 18px 24px; border-bottom: 1px solid var(--line); }
+.header h2 { margin: 0; color: var(--ink); font-size: 18px; line-height: 26px; font-weight: 600; }
+.heading { min-width: 0; }
+.subtitle { display: grid; gap: 4px; margin-top: 8px; color: var(--muted); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.subtitle strong { color: var(--ink); font-size: 14px; font-weight: 500; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
+.close { flex: 0 0 auto; display: grid; place-items: center; width: 34px; height: 34px; padding: 0; border: 0; border-radius: 7px; background: #f1f5f5; color: #51666d; }
+.heading:has(.subtitle) + .close { align-self: flex-start; }
+.body { flex: 1 1 auto; min-height: 0; min-width: 0; padding: 24px; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.body > :global(.modal-fields):first-child { margin-top: 0; }
+.body :global(.panel-head) { flex-wrap: wrap; }
+.body :global(.panel-head) > div { min-width: 0; }
+.body :global(.panel-head) h3 { overflow-wrap: anywhere; }
+.footer { flex: 0 0 auto; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 10px; padding: 16px 24px; border-top: 1px solid var(--line); background: #fafcfc; }
+.status { flex-basis: 100%; margin: 0; color: var(--teal); font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+.status[data-error="true"] { color: #b42318; }
+.panel button:focus-visible, .panel a:focus-visible { outline: 2px solid var(--teal); outline-offset: 3px; border-radius: 3px; }
+@media (max-width: 540px) {
+  .backdrop { padding: 10px; }
+  .backdrop .panel { height: calc(100dvh - 20px); max-height: calc(100dvh - 20px); }
+  .header, .footer { padding: 14px 18px; }
+  .body { padding: 18px; }
+  .footer button { flex: 1; padding-inline: 10px; }
+  .body > :global(.modal-fields) { grid-template-columns: 1fr; }
+  .body :global(.media-gallery), .body :global(.evidence-columns) { grid-template-columns: 1fr; }
+}

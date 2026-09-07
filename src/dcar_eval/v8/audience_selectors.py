@@ -69,7 +69,7 @@ def latest_comment_rows(
           AND julianday(c.published_at) < julianday(?)
         """
         parameters.extend((evidence_window_start, evidence_window_end))
-    rows = connection.execute(
+    cursor = connection.execute(
         f"""
         WITH ranked_comment_evidence AS (
             SELECT cev.*,
@@ -99,8 +99,11 @@ def latest_comment_rows(
         ORDER BY cev.content_id, c.id
         """,
         parameters,
-    ).fetchall()
-    return [dict(row) for row in rows]
+    )
+    # Use positional rows locally; avoid quadratic named lookups per result.
+    cursor.row_factory = None
+    columns = tuple(column[0] for column in cursor.description)
+    return [dict(zip(columns, row)) for row in cursor]
 
 
 def latest_user_classifications(
@@ -141,7 +144,7 @@ def latest_user_classifications(
               ) < 0.000001
         """
         parameters.append(evidence_window_end)
-    rows = connection.execute(
+    cursor = connection.execute(
         f"""
         SELECT * FROM (
             SELECT cls.*,
@@ -162,5 +165,8 @@ def latest_user_classifications(
         ORDER BY interaction_user_id
         """,
         parameters,
-    ).fetchall()
-    return {int(row["interaction_user_id"]): dict(row) for row in rows}
+    )
+    cursor.row_factory = None
+    columns = tuple(column[0] for column in cursor.description)
+    values = (dict(zip(columns, row)) for row in cursor)
+    return {int(row["interaction_user_id"]): row for row in values}

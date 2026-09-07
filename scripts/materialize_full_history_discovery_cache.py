@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 from unittest.mock import patch
 
-from v8 import providers
+from v8 import providers, raw_evidence
 from v8.media import is_supported_media_url
 from v8.storage import PROJECT_ROOT, is_formal_database_path
 
@@ -237,14 +237,12 @@ def _parse_raw_items(
         else:
             raise CacheReplayError(f"原始响应包含未知 operation：{operation}")
         path = _resolve_raw_path(str(row["local_path"]), contract.raw_root)
-        metadata = _require_private_regular_file(path, label="原始响应")
-        body = path.read_bytes()
-        if metadata.st_size != int(row["byte_size"]):
-            raise CacheReplayError(f"原始响应字节数漂移：{path}")
-        if _sha256_bytes(body) != str(row["sha256"]):
-            raise CacheReplayError(f"原始响应 SHA256 漂移：{path}")
         try:
-            payload = json.loads(body)
+            payload = raw_evidence.read_raw_json(
+                path,
+                expected_stored_sha256=str(row["sha256"]),
+                expected_stored_size=int(row["byte_size"]),
+            )
             if platform == "douyin":
                 page = providers._parse_douyin_discovery_payload(payload).data
             else:

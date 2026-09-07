@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
-"""One-shot paid Douyin detail refresh for an isolated Step4 source clone.
+"""Historical schema18 Douyin detail refresh for an isolated source clone.
 
-The default mode is a read-only plan.  ``--apply`` permits exactly one billed
-TikHub detail request for exactly one frozen Douyin video.  The request only
+The default mode is a read-only plan.  Real clone-paid requests are disabled:
+the clone's ledger is not the unique writer's global budget authority. Use the
+v8 writer capture path for live work. Injected offline transports exercise one
+budgeted sequence-1 detail compensation for one frozen Douyin video, using a
+pre-existing settled original request and authorization. The claim adds exactly
+one independently replay-verified consumption; no authorization is fabricated.
+The request only
 materializes a new raw response and media_source manifest in isolated roots;
 it never downloads media, evaluates content, fingerprints content, or edits
 the content row.  A durable opening event makes the paid request permanently
 one-shot: an interrupted request without a committed raw response is blocked
-instead of automatically retried.
+instead of automatically retried. Its former private live HTTP helper is
+retired and cannot bypass the v8 writer.
 """
 
 # ruff: noqa: E402 -- direct execution bootstraps repo imports after disabling pyc.
@@ -26,11 +32,9 @@ import sqlite3
 import ssl
 import sys
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from contextlib import ExitStack, closing, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from datetime import datetime, timezone
 from pathlib import Path
@@ -48,7 +52,10 @@ if __package__ in {None, ""}:
 from scripts import run_local_analysis_canary as local_controller
 from v8 import capture as capture_module
 from v8 import media as media_module
+from v8.paid_identity import build_paid_request_identity
+from v8 import provider_budget as provider_budget_module
 from v8 import providers as providers_module
+from v8 import raw_evidence as raw_evidence_module
 from v8 import storage as storage_module
 
 
@@ -66,16 +73,10 @@ MAX_JSON_RESPONSE_BYTES = 32 * 1024 * 1024
 MAX_PRICE_EVIDENCE_AGE_SECONDS = 15 * 60
 MAX_HANDOFF_AGE_SECONDS = 5 * 60
 TRANSPORT_PROFILE: Mapping[str, Any] = {
-    "client": "python-urllib",
-    "https_handler": "urllib.request.HTTPSHandler",
-    "proxy": "disabled",
-    "redirects": "disabled",
+    "client": "schema18-live-retired",
+    "execution": "injected-fixture-only",
+    "network_enabled": False,
     "retries": 0,
-    "timeout_seconds": 45,
-    "tls_check_hostname": True,
-    "tls_context": "ssl.create_default_context",
-    "tls_verify_mode": "CERT_REQUIRED",
-    "user_agent": "DCar-Insight-v8-paid-source-refresh/2.0",
 }
 BLOCKED_ERROR_CODES = frozenset(
     {
@@ -400,12 +401,113 @@ def _task_identity(
     }
     digest = _json_sha256(seed)
     task_id = f"paid-source-refresh-{digest[:24]}"
-    budget_digest = hashlib.sha256(task_id.encode("utf-8")).hexdigest()[:16]
     return {
         "task_id": task_id,
-        "budget_id": f"task-{budget_digest}-tikhub-{OPERATION}-v1",
+        "budget_id": provider_budget_module.task_budget_id(
+            task_id, "TikHub", OPERATION
+        ),
         "window_key": f"paid-source-refresh-v2-{digest[:16]}",
     }
+
+
+def _capture_paid_identity(contract: Mapping[str, Any]):
+    """Rebuild the exact TikHub detail request represented by this contract."""
+
+    target = contract["target"]
+    return build_paid_request_identity(
+        provider=PROVIDER,
+        operation=OPERATION,
+        platform=str(target["platform"]),
+        subject=str(target["platform_content_id"]),
+        request_parameters={"aweme_id": str(target["platform_content_id"])},
+        cursor=None,
+        due_bucket=str(contract["route"]["window_key"]),
+        sequence=1,
+    )
+
+
+def _compensation_source(connection, target: Mapping[str, Any]) -> dict[str, Any]:
+    """Freeze an existing authorization, never manufacture one in a clone.
+
+    The request window belongs to the original send. Deriving it from the
+    source DB hash would create a cycle once that DB contains its authorization.
+    Task/budget identities remain bound to the final source hashes separately.
+    """
+    matches = []
+    for row in connection.execute(
+        "SELECT id,details_json FROM scheduler_runs WHERE job_id=? AND status='succeeded'",
+        (provider_budget_module.COMPENSATION_AUTH_JOB,),
+    ):
+        proof = json.loads(row["details_json"])
+        original = connection.execute(
+            "SELECT details_json FROM provider_usage WHERE id=? AND operation=?",
+            (proof.get("original_usage_id"), OPERATION),
+        ).fetchone()
+        if original is None:
+            continue
+        details = json.loads(original["details_json"])
+        document = details.get("paid_identity") or {}
+        if document.get("subject") != target["platform_content_id"]:
+            continue
+        identity = build_paid_request_identity(
+            provider=PROVIDER, operation=OPERATION, platform=str(target["platform"]),
+            subject=str(target["platform_content_id"]),
+            request_parameters={"aweme_id": str(target["platform_content_id"])},
+            cursor=None, due_bucket=str(document.get("due_bucket") or ""),
+        )
+        if (document != identity.document
+                or details.get("paid_sequence") != 0
+                or details.get("paid_scope_identity") != identity.scope_identity
+                or proof.get("paid_scope_identity") != identity.scope_identity
+                or proof.get("operation") != OPERATION):
+            raise PaidSourceRefreshError("original compensation request identity drift")
+        matches.append({"authorization_id": row["id"], "authorization": proof,
+                        "original_identity": identity.document})
+    if len(matches) != 1:
+        raise PaidSourceRefreshError("offline historical refresh requires one existing compensation authorization")
+    return matches[0]
+
+
+@contextmanager
+def _replayed_authorization(paths: RefreshPaths, contract: Mapping[str, Any], at: str):
+    """Replay current v3 authorization in memory; the sealed parent is read-only."""
+    parent = Path(str(contract["base_source"]["database"]["path"]))
+    with (closing(local_controller._immutable_connection(parent)) as source,
+          closing(sqlite3.connect(":memory:")) as replay):
+        source.backup(replay)
+        replay.row_factory = sqlite3.Row
+        replay.execute("BEGIN")
+        identity = _capture_paid_identity(contract)
+        provider_budget_module.consume_compensation_authorization(
+            replay, authorization_id=contract["compensation"]["authorization_id"],
+            paid_scope_identity=identity.scope_identity, sequence=1, operation=OPERATION, at=at,
+        )
+        yield replay
+
+
+def _validate_consumption_delta(paths, contract, new_rows) -> None:
+    """Only the exact atomic consumption paired with the new usage may be added."""
+    usages = new_rows["provider_usage"]
+    consumed = new_rows["scheduler_runs"]
+    if not usages:
+        if consumed:
+            raise PaidSourceRefreshError("compensation consumed without its usage")
+        return
+    if len(consumed) != 1:
+        raise PaidSourceRefreshError("exactly one compensation consumption required")
+    details = json.loads(usages[0]["details_json"])
+    consumed_at = consumed[0]["started_at"]
+    if _aware_timestamp(consumed_at, label="consumed_at") > _aware_timestamp(
+        details["reserved_at"], label="reserved_at"
+    ):
+        raise PaidSourceRefreshError("compensation consumed after reservation")
+    with _replayed_authorization(paths, contract, consumed_at) as replay:
+        expected = replay.execute(
+            "SELECT * FROM scheduler_runs WHERE job_id=?",
+            (f"{provider_budget_module.COMPENSATION_USE_JOB}{contract['compensation']['authorization_id']}",),
+        ).fetchone()
+        if consumed != [dict(expected)]:
+            raise PaidSourceRefreshError("compensation consumption ledger drift")
 
 
 def _code_snapshot() -> list[Mapping[str, Any]]:
@@ -413,6 +515,7 @@ def _code_snapshot() -> list[Mapping[str, Any]]:
         Path(__file__).resolve(),
         Path(local_controller.__file__).resolve(),
         Path(capture_module.__file__).resolve(),
+        Path(provider_budget_module.__file__).resolve(),
         Path(media_module.__file__).resolve(),
         Path(providers_module.__file__).resolve(),
         Path(storage_module.__file__).resolve(),
@@ -623,6 +726,111 @@ def _new_rows(
     return [row for value, row in after_by_key.items() if value not in before_by_key]
 
 
+def _usage_policy_evidence(
+    paths: RefreshPaths,
+    contract: Mapping[str, Any],
+    usage: Mapping[str, Any],
+    details: Mapping[str, Any],
+    *,
+    slot_id: int,
+) -> dict[str, Any]:
+    """Reproduce the frozen dispatch proof without reserving or sending again.
+
+    Only the immutable, hash-bound parent ledger is consulted.  This is proof
+    validation for a disposable fixture, never a production budget authority.
+    """
+    reserved_at = details.get("reserved_at")
+    reserved = _aware_timestamp(reserved_at, label="usage reserved_at")
+    sent_at = details.get("sent_at")
+    if sent_at is not None and _aware_timestamp(
+        sent_at, label="usage sent_at"
+    ) < reserved:
+        raise PaidSourceRefreshError("usage发送时点早于预占")
+    if usage.get("recorded_at") != (sent_at or reserved_at):
+        raise PaidSourceRefreshError("usage归账时点未绑定发送/预占")
+    with closing(local_controller._immutable_connection(paths.database)) as current:
+        consumed = current.execute(
+            "SELECT started_at FROM scheduler_runs WHERE job_id=?",
+            (f"{provider_budget_module.COMPENSATION_USE_JOB}{contract['compensation']['authorization_id']}",),
+        ).fetchone()
+    if consumed is None:
+        raise PaidSourceRefreshError("usage lacks its compensation consumption")
+    with _replayed_authorization(paths, contract, consumed["started_at"]) as connection:
+        identity = _capture_paid_identity(contract)
+        scope = provider_budget_module.freeze_scope(
+            connection, content_id=int(contract["target"]["id"]),
+            account_id=None, stage=STAGE,
+            scope=provider_budget_module.PaidScope(
+                purpose="history", compensation_authorization_id=contract["compensation"]["authorization_id"],
+            ),
+        )
+        scope = replace(scope, paid_sequence=1, paid_scope_identity=identity.scope_identity)
+        expected = provider_budget_module.check_reservation(
+            connection, scope=scope, operation=OPERATION,
+            unit_price=UNIT_PRICE, currency="USD", at=str(reserved_at),
+        )
+        if sent_at is not None:
+            sent = provider_budget_module.check_reservation(
+                connection, scope=scope, operation=OPERATION,
+                unit_price=UNIT_PRICE, currency="USD", at=str(sent_at),
+            )
+            expected.update(
+                state="sent", sent_at=sent_at, budget_day=sent["budget_day"],
+                borrowed_from=sent["borrowed_from"],
+                borrowing_proofs=sent["borrowing_proofs"],
+                validated_work_fingerprint=sent["validated_work_fingerprint"],
+            )
+    identity = _capture_paid_identity(contract)
+    expected.update(
+        slot_id=slot_id,
+        attempt_number=1,
+        paid_scope_identity=identity.scope_identity,
+        paid_execution_identity=identity.execution_identity,
+        paid_sequence=identity.sequence,
+        paid_identity=identity.document,
+        paid_identity_evidence="provider_exact",
+    )
+    if sent_at is not None:
+        claim_path = (
+            paths.database.parent
+            / "paid_send_claims"
+            / identity.scope_identity[:2]
+            / f"{identity.scope_identity}.sequence-{identity.sequence:08d}.claim.json"
+        )
+        usage_id_value = usage.get("id")
+        if usage_id_value is None:
+            usage_id_value = usage.get("usage_id")
+        claim_body = raw_evidence_module.canonical_json_bytes(
+            {
+                "claim": {
+                    "created_at": sent_at,
+                    "operation": OPERATION,
+                    "paid_execution_identity": identity.execution_identity,
+                    "provider": PROVIDER.lower(),
+                    "provider_usage_id": _exact_integer(
+                        usage_id_value, label="provider usage id"
+                    ),
+                    "slot_id": slot_id,
+                },
+                "paid_scope_identity": identity.scope_identity,
+                "schema": raw_evidence_module.PAID_SEND_CLAIM_SCHEMA,
+                "sequence": identity.sequence,
+            }
+        )
+        claim_file = _file_evidence(claim_path, label="paid send claim")
+        if (
+            claim_file["sha256"] != hashlib.sha256(claim_body).hexdigest()
+            or claim_file["byte_size"] != len(claim_body)
+        ):
+            raise PaidSourceRefreshError("paid send claim正文漂移")
+        expected.update(
+            paid_send_claim_path=str(claim_path),
+            paid_send_claim_sha256=claim_file["sha256"],
+            paid_send_claim_bytes=claim_file["byte_size"],
+        )
+    return expected
+
+
 def _validate_database_prefix(
     paths: RefreshPaths, contract: Mapping[str, Any]
 ) -> Mapping[str, list[Mapping[str, Any]]]:
@@ -637,7 +845,7 @@ def _validate_database_prefix(
         ):
             raise PaidSourceRefreshError("paid refresh前向DB schema/pragma漂移")
         for table in _table_names(before):
-            if table not in ALLOWED_DELTA_TABLES and _rows(before, table) != _rows(
+            if table not in ALLOWED_DELTA_TABLES | {"scheduler_runs"} and _rows(before, table) != _rows(
                 after, table
             ):
                 raise PaidSourceRefreshError(
@@ -649,6 +857,8 @@ def _validate_database_prefix(
         }
         if any(len(rows) > 1 for rows in new_rows.values()):
             raise PaidSourceRefreshError("paid refresh前向DB新增行数量越界")
+        consumption_rows = _new_rows(before, after, "scheduler_runs", "id")
+        _validate_consumption_delta(paths, contract, {**new_rows, "scheduler_runs": consumption_rows})
         presence = tuple(bool(new_rows[table]) for table in (
             "provider_budget_batches",
             "provider_usage",
@@ -660,7 +870,7 @@ def _validate_database_prefix(
         if presence not in {
             (False, False, False, False, False, False),
             (True, False, False, False, False, False),
-            (True, False, True, True, False, False),
+            (True, True, True, False, False, False),
             (True, True, True, True, False, False),
             (True, True, True, True, True, False),
             (True, True, True, True, True, True),
@@ -685,7 +895,8 @@ def _validate_database_prefix(
         for name in set(before_sequences) | set(after_sequences):
             expected = before_sequences.get(name, 0) + (
                 1
-                if name in AUTOINCREMENT_DELTA_TABLES and new_rows[name]
+                if (name in AUTOINCREMENT_DELTA_TABLES and new_rows[name])
+                or (name == "scheduler_runs" and consumption_rows)
                 else 0
             )
             if after_sequences.get(name, 0) != expected:
@@ -700,6 +911,25 @@ def _validate_database_prefix(
     attempt_row = next(iter(new_rows["fetch_attempts"]), None)
     raw_row = next(iter(new_rows["provider_raw_responses"]), None)
     artifact_row = next(iter(new_rows["evidence_artifacts"]), None)
+    usage_details: Mapping[str, Any] = {}
+    usage_policy: Mapping[str, Any] = {}
+    if usage_row is not None:
+        if slot_row is None:
+            raise PaidSourceRefreshError("paid usage lacks its frozen slot")
+        try:
+            parsed_details = json.loads(str(usage_row["details_json"]))
+        except json.JSONDecodeError as exc:
+            raise PaidSourceRefreshError("paid refresh前向usage JSON漂移") from exc
+        if not isinstance(parsed_details, Mapping):
+            raise PaidSourceRefreshError("paid refresh前向usage JSON不是对象")
+        usage_details = parsed_details
+        usage_policy = _usage_policy_evidence(
+            paths, contract, usage_row, usage_details,
+            slot_id=_exact_integer(slot_row.get("id"), label="slot id"),
+        )
+        if (attempt_row is None) != (usage_policy["sent_at"] is None):
+            raise PaidSourceRefreshError("paid refresh发送时点和attempt不一致")
+    released = usage_details.get("state") == "not_sent"
     if budget_row is not None and (
         budget_row.get("id") != contract["budget"]["budget_id"]
         or budget_row.get("purpose") != contract["budget"]["purpose"]
@@ -730,11 +960,11 @@ def _validate_database_prefix(
         or _exact_integer(
             budget_row.get("consumed_requests"), label="budget consumed requests"
         )
-        != (1 if usage_row is not None else 0)
+        != (1 if usage_row is not None and not released else 0)
         or _exact_decimal(
             budget_row.get("consumed_amount"), label="budget consumed amount"
         )
-        != (Decimal(str(UNIT_PRICE)) if usage_row is not None else Decimal("0"))
+        != (Decimal(str(UNIT_PRICE)) if usage_row is not None and not released else Decimal("0"))
         or budget_row.get("status") != "approved"
     ):
         raise PaidSourceRefreshError("paid refresh前向budget行漂移")
@@ -746,12 +976,14 @@ def _validate_database_prefix(
         or slot_row.get("provider") != PROVIDER
         or slot_row.get("adapter_version") != ADAPTER_VERSION
         or _exact_integer(slot_row.get("attempt_count"), label="slot attempt count")
-        != 1
+        != (1 if attempt_row is not None else 0)
         or slot_row.get("status")
-        not in {"running", "succeeded", "terminal_failed"}
+        not in ({"pending", "terminal_failed"} if released else {"running", "succeeded", "terminal_failed"})
     ):
         raise PaidSourceRefreshError("paid refresh前向slot行漂移")
-    if attempt_row is not None and (
+    if attempt_row is not None and slot_row is None:
+        raise PaidSourceRefreshError("paid attempt lacks its frozen slot")
+    if attempt_row is not None and slot_row is not None and (
         _exact_integer(attempt_row.get("slot_id"), label="attempt slot id")
         != _exact_integer(slot_row.get("id"), label="slot id")
         or _exact_integer(
@@ -761,10 +993,8 @@ def _validate_database_prefix(
     ):
         raise PaidSourceRefreshError("paid refresh前向attempt行漂移")
     if usage_row is not None:
-        try:
-            usage_details = json.loads(str(usage_row["details_json"]))
-        except json.JSONDecodeError as exc:
-            raise PaidSourceRefreshError("paid refresh前向usage JSON漂移") from exc
+        if slot_row is None:
+            raise PaidSourceRefreshError("paid usage lacks its frozen slot")
         if (
             usage_row.get("task_id") != contract["budget"]["task_id"]
             or usage_row.get("budget_batch_id")
@@ -774,27 +1004,53 @@ def _validate_database_prefix(
             or _exact_integer(
                 usage_row.get("request_attempts"), label="usage request attempts"
             )
-            != 1
+            != (1 if attempt_row is not None else 0)
             or _exact_integer(
                 usage_row.get("billed_requests"), label="usage billed requests"
             )
-            != 1
+            != (0 if released else 1)
             or usage_row.get("currency") != "USD"
             or _exact_decimal(usage_row.get("amount"), label="usage amount")
-            != Decimal(str(UNIT_PRICE))
-            or usage_details.get("state") not in {"reserved", "completed"}
+            != (Decimal("0") if released else Decimal(str(UNIT_PRICE)))
+            or usage_details.get("state") not in {"reserved", "sent", "completed", "not_sent"}
         ):
             raise PaidSourceRefreshError("paid refresh前向usage行漂移")
         if raw_row is None:
-            if slot_row.get("status") == "running":
+            if released:
+                release_time = _aware_timestamp(
+                    usage_details.get("released_at"), label="usage released_at"
+                )
+                expected_released = {
+                    **usage_policy, "state": "not_sent",
+                    "error_code": slot_row.get("last_error_code"),
+                    "released_at": usage_details.get("released_at"),
+                }
+                if (
+                    attempt_row is not None
+                    or usage_policy.get("sent_at") is not None
+                    or not slot_row.get("last_error_code")
+                    or not slot_row.get("finished_at")
+                    or release_time < _aware_timestamp(
+                        usage_policy["reserved_at"], label="usage reserved_at"
+                    )
+                    or _canonical_bytes(usage_details) != _canonical_bytes(expected_released)
+                ):
+                    raise PaidSourceRefreshError("paid refresh未发送退款证明漂移")
+            elif slot_row.get("status") == "running":
+                expected_running = {
+                    **usage_policy, "state": "sent" if attempt_row is not None else "reserved",
+                }
                 if _canonical_bytes(usage_details) != _canonical_bytes(
-                    {"state": "reserved"}
+                    expected_running
                 ):
                     raise PaidSourceRefreshError(
                         "paid refresh running且未落raw的usage不是精确reservation"
                     )
             elif slot_row.get("status") == "terminal_failed":
+                if attempt_row is None:
+                    raise PaidSourceRefreshError("charged closure lacks its attempt")
                 expected_transport_details = {
+                    **usage_policy,
                     "billing_basis": "conservative_upper_bound",
                     "outcome": "transport_failed",
                     "slot_id": _exact_integer(slot_row.get("id"), label="slot id"),
@@ -822,6 +1078,8 @@ def _validate_database_prefix(
             else:
                 raise PaidSourceRefreshError("paid refresh无raw的slot状态漂移")
     if raw_row is not None:
+        if attempt_row is None or slot_row is None:
+            raise PaidSourceRefreshError("paid raw lacks its attempt/slot")
         if (
             _exact_integer(
                 raw_row.get("fetch_attempt_id"), label="raw fetch attempt id"
@@ -845,8 +1103,20 @@ def _validate_database_prefix(
             != _exact_integer(raw_row.get("byte_size"), label="raw byte size")
         ):
             raise PaidSourceRefreshError("paid refresh前向raw文件漂移")
+        try:
+            loaded_raw = raw_evidence_module.read_raw_evidence(
+                raw_path,
+                expected_stored_sha256=str(raw_row["sha256"]),
+                expected_stored_size=_exact_integer(
+                    raw_row["byte_size"], label="raw byte size"
+                ),
+            )
+        except raw_evidence_module.RawEvidenceError as exc:
+            raise PaidSourceRefreshError("paid refresh前向raw receipt漂移") from exc
+        expected_error: tuple[str | None, str | None]
         if slot_row.get("status") == "succeeded":
             expected_usage_details = {
+                **usage_policy,
                 "http_status": 200,
                 "slot_id": _exact_integer(slot_row.get("id"), label="slot id"),
                 "state": "completed",
@@ -854,6 +1124,7 @@ def _validate_database_prefix(
             expected_error = (None, None)
         elif slot_row.get("status") == "terminal_failed":
             expected_usage_details = {
+                **usage_policy,
                 "http_status": 200,
                 "outcome": "rejected_source",
                 "slot_id": _exact_integer(slot_row.get("id"), label="slot id"),
@@ -882,11 +1153,11 @@ def _validate_database_prefix(
         if (
             ledger["events"][1].get("outcome") != "response_received"
             or ledger["events"][1].get("response_json_sha256")
-            != raw_file["sha256"]
+            != loaded_raw.receipt.entity_sha256
         ):
             raise PaidSourceRefreshError("paid refresh前向raw未绑定HTTP响应")
     if artifact_row is not None:
-        if raw_row is None or slot_row.get("status") != "succeeded":
+        if raw_row is None or slot_row is None or slot_row.get("status") != "succeeded":
             raise PaidSourceRefreshError("paid refresh前向artifact缺少成功raw")
         committed = _committed_raw(paths, contract)
         if committed is None:
@@ -1041,11 +1312,6 @@ def _extract_endpoint_fields(
     }
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *_args: Any, **_kwargs: Any) -> None:
-        return None
-
-
 def _exact_json_request(
     url: str,
     *,
@@ -1054,79 +1320,10 @@ def _exact_json_request(
     authorization: str | None,
     maximum_bytes: int = MAX_JSON_RESPONSE_BYTES,
 ) -> tuple[Any, Mapping[str, Any]]:
-    parsed = urllib.parse.urlsplit(url)
-    if (
-        parsed.scheme != "https"
-        or (parsed.hostname or "").lower() != "api.tikhub.io"
-        or parsed.port not in (None, 443)
-        or parsed.path != expected_path
-        or dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
-        != dict(expected_query)
-        or parsed.fragment
-    ):
-        raise PaidSourceRefreshError("TikHub请求未命中冻结exact endpoint")
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": str(TRANSPORT_PROFILE["user_agent"]),
-    }
-    if authorization is not None:
-        headers["Authorization"] = f"Bearer {authorization}"
-    request = urllib.request.Request(url, headers=headers, method="GET")
-    tls_context = ssl.create_default_context()
-    if (
-        tls_context.check_hostname is not True
-        or tls_context.verify_mode != ssl.CERT_REQUIRED
-    ):
-        raise PaidSourceRefreshError("TikHub TLS default context验证策略漂移")
-    opener = urllib.request.build_opener(
-        urllib.request.ProxyHandler({}),
-        _NoRedirect(),
-        urllib.request.HTTPSHandler(context=tls_context),
+    del url, expected_path, expected_query, authorization, maximum_bytes
+    raise PaidSourceRefreshError(
+        "schema18 canary live transport is retired; use the v8 writer capture path"
     )
-    try:
-        response = opener.open(
-            request, timeout=_exact_integer(TRANSPORT_PROFILE["timeout_seconds"], label="transport timeout")
-        )
-    except urllib.error.HTTPError as exc:
-        raise PaidSourceRefreshError(f"TikHub HTTP {exc.code}") from exc
-    with response:
-        if response.geturl() != url or _exact_integer(
-            response.status, label="TikHub HTTP status"
-        ) != 200:
-            raise PaidSourceRefreshError("TikHub响应URL或status漂移")
-        mime = str(response.headers.get("Content-Type") or "").split(";", 1)[0]
-        if mime.lower() != "application/json":
-            raise PaidSourceRefreshError("TikHub响应不是application/json")
-        declared_text = response.headers.get("Content-Length")
-        declared: int | None = None
-        if declared_text is not None:
-            try:
-                declared = int(declared_text)
-            except ValueError as exc:
-                raise PaidSourceRefreshError("TikHub Content-Length无效") from exc
-            if declared < 0 or declared > maximum_bytes:
-                raise PaidSourceRefreshError("TikHub Content-Length越界")
-        body = bytearray()
-        while True:
-            block = response.read(min(65536, maximum_bytes - len(body) + 1))
-            if not block:
-                break
-            body.extend(block)
-            if len(body) > maximum_bytes:
-                raise PaidSourceRefreshError("TikHub响应超过最大字节数")
-        if declared is not None and len(body) != declared:
-            raise PaidSourceRefreshError("TikHub响应长度与Content-Length不一致")
-    try:
-        payload = json.loads(bytes(body).decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise PaidSourceRefreshError("TikHub响应不是合法UTF-8 JSON") from exc
-    return payload, {
-        "url_sha256": hashlib.sha256(url.encode()).hexdigest(),
-        "response_sha256": hashlib.sha256(body).hexdigest(),
-        "response_bytes": len(body),
-        "http_status": 200,
-        "mime_type": "application/json",
-    }
 
 
 def _default_endpoint_info() -> Mapping[str, Any]:
@@ -1178,7 +1375,7 @@ def _validate_price_evidence(value: Mapping[str, Any]) -> Mapping[str, Any]:
             or response.get("http_status") != 200
             or response.get("mime_type") != "application/json"
             or type(response.get("response_bytes")) is not int
-            or response.get("response_bytes") <= 0
+            or response["response_bytes"] <= 0
             or not isinstance(fields, Mapping)
             or set(fields)
             != {
@@ -1227,7 +1424,7 @@ def _metadata_identity(
 
 
 def _metadata_request_plan(identity: Mapping[str, Any]) -> list[Mapping[str, Any]]:
-    definitions = (
+    definitions: tuple[tuple[str, str, dict[str, str], str, float, int], ...] = (
         ("endpoint_info", ENDPOINT_INFO_PATH, {"endpoint": ENDPOINT_INFO_PATH}, "none", 0.0, MAX_JSON_RESPONSE_BYTES),
         ("endpoint_info", ENDPOINT_INFO_PATH, {"endpoint": USER_INFO_PATH}, "none", 0.0, MAX_JSON_RESPONSE_BYTES),
         ("endpoint_info", ENDPOINT_INFO_PATH, {"endpoint": DETAIL_PATH}, "none", UNIT_PRICE, MAX_JSON_RESPONSE_BYTES),
@@ -2131,8 +2328,14 @@ def _validate_refresh_materialization(
         ):
             raise PaidSourceRefreshError("paid refresh raw文件/DB/root绑定漂移")
         try:
-            raw_body = json.loads(raw_path.read_bytes())
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raw_body = raw_evidence_module.read_raw_json(
+                raw_path,
+                expected_stored_sha256=str(raw["sha256"]),
+                expected_stored_size=_exact_integer(
+                    raw["byte_size"], label="raw byte size"
+                ),
+            )
+        except raw_evidence_module.RawEvidenceError as exc:
             raise PaidSourceRefreshError("paid refresh raw不是合法JSON") from exc
         parsed = providers_module._parse_douyin_stage_payload(
             "detail", str(target["platform_content_id"]), raw_body, status=200
@@ -2233,6 +2436,12 @@ def _validate_refresh_materialization(
             usage_details = json.loads(str(usage["details_json"]))
         except json.JSONDecodeError as exc:
             raise PaidSourceRefreshError("paid refresh usage details无效") from exc
+        if not isinstance(usage_details, Mapping):
+            raise PaidSourceRefreshError("paid refresh usage details不是对象")
+        usage_policy = _usage_policy_evidence(
+            paths, contract, dict(usage), usage_details,
+            slot_id=_exact_integer(slot["id"], label="slot id"),
+        )
         if (
             str(budget["provider"]) != PROVIDER
             or str(budget["operation"]) != OPERATION
@@ -2279,6 +2488,7 @@ def _validate_refresh_materialization(
             or _canonical_bytes(usage_details)
             != _canonical_bytes(
                 {
+                    **usage_policy,
                     "http_status": 200,
                     "slot_id": _exact_integer(slot["id"], label="slot id"),
                     "state": "completed",
@@ -2326,6 +2536,11 @@ def _validate_database_delta(
                 continue
             before_rows = _rows(before, table)
             after_rows = _rows(after, table)
+            if table == "scheduler_runs":
+                # Existing rows stay byte-for-byte identical; only a fully
+                # replay-verified consumption may appear after this baseline.
+                consumption_rows = _new_rows(before, after, table, "id")
+                after_rows = [row for row in after_rows if row not in consumption_rows]
             if before_rows != after_rows:
                 raise PaidSourceRefreshError(f"paid refresh保护表发生变化：{table}")
             protected[table] = {
@@ -2343,6 +2558,7 @@ def _validate_database_delta(
         }
         if any(len(rows) != 1 for rows in new_rows.values()):
             raise PaidSourceRefreshError("paid refresh六张allowed表不是各新增一行")
+        _validate_consumption_delta(paths, contract, {**new_rows, "scheduler_runs": consumption_rows})
         expected_ids = {
             "provider_budget_batches": str(materialized["budget"]["id"]),
             "provider_usage": str(materialized["usage"]["id"]),
@@ -2370,7 +2586,7 @@ def _validate_database_delta(
         for name in names:
             before_value = before_sequences.get(name, 0)
             after_value = after_sequences.get(name, 0)
-            expected = before_value + (1 if name in AUTOINCREMENT_DELTA_TABLES else 0)
+            expected = before_value + (1 if name in AUTOINCREMENT_DELTA_TABLES | {"scheduler_runs"} else 0)
             if after_value != expected:
                 raise PaidSourceRefreshError(
                     f"paid refresh sqlite_sequence非精确增量：{name}"
@@ -2384,6 +2600,7 @@ def _validate_database_delta(
         "protected_sha256": _json_sha256(protected),
         "new_rows": new_rows,
         "new_rows_sha256": _json_sha256(new_rows),
+        "compensation_consumption": consumption_rows,
         "sqlite_sequence_before": before_sequences,
         "sqlite_sequence_after": after_sequences,
     }
@@ -2589,18 +2806,27 @@ def _validate_output_prefix(
 
     raw_tree = _physical_tree(paths.raw_root, label="paid refresh raw root")
     if raw_row is None:
-        expected_raw = {"files": [], "directories": []}
+        expected_raw: Mapping[str, list[str]] = {"files": [], "directories": []}
     else:
         raw_path = _raw_path(raw_row).resolve()
+        raw_files = [str(raw_path.relative_to(paths.raw_root))]
+        if raw_path.name.endswith(".json.zst"):
+            raw_files.append(
+                str(
+                    raw_evidence_module.sidecar_path_for(raw_path).relative_to(
+                        paths.raw_root
+                    )
+                )
+            )
         expected_raw = {
-            "files": [str(raw_path.relative_to(paths.raw_root))],
+            "files": sorted(raw_files),
             "directories": _expected_parent_directories(raw_path, paths.raw_root),
         }
     if raw_tree != expected_raw:
         raise PaidSourceRefreshError("paid refresh raw root物理prefix漂移")
 
     media_tree = _physical_tree(paths.media_root, label="paid refresh media root")
-    expected_media = {"files": [], "directories": []}
+    expected_media: Mapping[str, list[str]] = {"files": [], "directories": []}
     if artifact_row is not None:
         artifact_path_raw = Path(str(artifact_row["local_path"]))
         artifact_path = (
@@ -2872,6 +3098,7 @@ def _build_contract(
         raise PaidSourceRefreshError("paid refresh contract缺少metadata价格强闭包")
     baseline = _database_baseline(paths.database)
     with closing(local_controller._immutable_connection(paths.database)) as connection:
+        compensation = _compensation_source(connection, plan["target"])
         baseline_artifact_ids = [
             int(row[0])
             for row in connection.execute(
@@ -2907,6 +3134,7 @@ def _build_contract(
         },
         "target": plan["target"],
         "prior_source": plan["prior_source"],
+        "compensation": compensation,
         "route": {
             "provider": PROVIDER,
             "method": "GET",
@@ -2915,7 +3143,7 @@ def _build_contract(
             "operation": OPERATION,
             "adapter_version": ADAPTER_VERSION,
             "stage": STAGE,
-            "window_key": identity["window_key"],
+            "window_key": compensation["original_identity"]["due_bucket"],
         },
         "budget": {
             "task_id": identity["task_id"],
@@ -2958,6 +3186,7 @@ def _validate_contract(
         "metadata",
         "target",
         "prior_source",
+        "compensation",
         "route",
         "budget",
         "price_evidence",
@@ -3033,6 +3262,8 @@ def _validate_contract(
         raise PaidSourceRefreshError("paid refresh clone基线身份漂移")
     with closing(local_controller._immutable_connection(paths.database)) as connection:
         target = _validate_content_target(connection, content_id)
+        if contract.get("compensation") != _compensation_source(connection, target):
+            raise PaidSourceRefreshError("compensation source drift")
     if target != contract.get("target"):
         raise PaidSourceRefreshError("paid refresh target content发生变化")
     route = contract.get("route")
@@ -3047,6 +3278,7 @@ def _validate_contract(
         or route.get("adapter_version") != ADAPTER_VERSION
         or route.get("stage") != STAGE
         or not isinstance(route.get("window_key"), str)
+        or route.get("window_key") != contract["compensation"]["original_identity"]["due_bucket"]
         or not isinstance(budget, Mapping)
         or set(budget)
         != {
@@ -3190,8 +3422,14 @@ def _committed_raw(
     ):
         raise PaidSourceRefreshError("paid refresh committed raw文件漂移")
     try:
-        body = json.loads(raw_path.read_bytes())
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        body = raw_evidence_module.read_raw_json(
+            raw_path,
+            expected_stored_sha256=str(value["sha256"]),
+            expected_stored_size=_exact_integer(
+                value["byte_size"], label="committed raw byte size"
+            ),
+        )
+    except raw_evidence_module.RawEvidenceError as exc:
         raise PaidSourceRefreshError("paid refresh committed raw不是JSON") from exc
     parsed = providers_module._parse_douyin_stage_payload(
         "detail", str(contract["target"]["platform_content_id"]), body, status=200
@@ -3372,6 +3610,8 @@ def _commit_successful_capture(
         closing(storage_module.connect(paths.database)) as connection,
         storage_module.transaction(connection),
     ):
+        if not capture_module._paid_slot_owner(connection, claim):
+            raise PaidSourceRefreshError("paid refresh attempt owner lost before commit")
         raw_id = capture_module._store_raw_response(
             connection,
             claim=claim,
@@ -3428,6 +3668,8 @@ def _commit_rejected_capture(
         closing(storage_module.connect(paths.database)) as connection,
         storage_module.transaction(connection),
     ):
+        if not capture_module._paid_slot_owner(connection, claim):
+            raise PaidSourceRefreshError("paid refresh attempt owner lost before rejection")
         capture_module._store_raw_response(
             connection,
             claim=claim,
@@ -3467,6 +3709,38 @@ def _commit_rejected_capture(
         )
 
 
+def _release_unsent_prefix(
+    paths: RefreshPaths, prefix_rows: Mapping[str, list[Mapping[str, Any]]],
+) -> None:
+    """Refund only the exact proven pre-send prefix; the one-shot stays closed."""
+    usage = prefix_rows["provider_usage"][0]
+    slot = prefix_rows["fetch_slots"][0]
+    reason = "canary_interrupted_before_send"
+    with (
+        closing(storage_module.connect(paths.database)) as connection,
+        storage_module.transaction(connection),
+    ):
+        for table, before in (("provider_usage", usage), ("fetch_slots", slot)):
+            row = connection.execute(
+                f"SELECT * FROM {table} WHERE id=?", (before["id"],)
+            ).fetchone()
+            if row is None or _canonical_bytes(_row_values(row)) != _canonical_bytes(before):
+                raise PaidSourceRefreshError("unsent recovery prefix changed")
+        at = storage_module.now_utc()
+        if not capture_module._release_unsent_usage(
+            connection, usage_id=int(usage["id"]), reason=reason, at=at,
+        ):
+            raise PaidSourceRefreshError("unsent recovery lacks proof of non-dispatch")
+        cursor = connection.execute(
+            """UPDATE fetch_slots SET status='terminal_failed',finished_at=?,
+               updated_at=?,last_error_code=?,last_error_message=NULL
+               WHERE id=? AND status='running' AND attempt_count=0""",
+            (at, at, reason, slot["id"]),
+        )
+        if cursor.rowcount != 1:
+            raise PaidSourceRefreshError("unsent recovery slot ownership changed")
+
+
 def _commit_transport_failed_capture(
     paths: RefreshPaths,
     contract: Mapping[str, Any],
@@ -3490,6 +3764,7 @@ def _commit_transport_failed_capture(
             SELECT fs.id slot_id,fs.status slot_status,fs.last_error_code,
                    fa.id attempt_id,fa.http_status,fa.billed,fa.amount,
                    fa.currency,fa.error_code,pu.id usage_id,pu.details_json,
+                   pu.recorded_at,
                    pbb.consumed_requests,pbb.consumed_amount
             FROM fetch_slots fs
             JOIN fetch_attempts fa ON fa.slot_id=fs.id
@@ -3524,6 +3799,14 @@ def _commit_transport_failed_capture(
             usage_details = json.loads(str(row["details_json"]))
         except json.JSONDecodeError as exc:
             raise PaidSourceRefreshError("transport_failed usage JSON漂移") from exc
+        if not isinstance(usage_details, Mapping):
+            raise PaidSourceRefreshError("transport_failed usage JSON不是对象")
+        policy = _usage_policy_evidence(
+            paths, contract, dict(row), usage_details, slot_id=resolved_slot_id,
+        )
+        if policy["sent_at"] is None:
+            raise PaidSourceRefreshError("transport_failed没有已发送证明")
+        expected_closed = {**policy, **details}
         already_closed = (
             row["slot_status"] == "terminal_failed"
             and row["last_error_code"] == "transport_failed"
@@ -3533,7 +3816,7 @@ def _commit_transport_failed_capture(
             and _exact_decimal(row["amount"], label="transport amount")
             == Decimal(str(UNIT_PRICE))
             and row["currency"] == "USD"
-            and usage_details == details
+            and _canonical_bytes(usage_details) == _canonical_bytes(expected_closed)
             and _exact_integer(
                 row["consumed_requests"], label="transport consumed requests"
             )
@@ -3545,12 +3828,14 @@ def _commit_transport_failed_capture(
         )
         if already_closed:
             return resolved_slot_id, resolved_attempt_id, resolved_usage_id
+        if claim is not None and not capture_module._paid_slot_owner(connection, claim):
+            raise PaidSourceRefreshError("paid refresh attempt owner lost before closure")
         if (
             row["slot_status"] != "running"
             or row["last_error_code"] is not None
             or row["error_code"] is not None
             or row["http_status"] is not None
-            or usage_details != {"state": "reserved"}
+            or _canonical_bytes(usage_details) != _canonical_bytes(policy)
             or _exact_integer(
                 row["consumed_requests"], label="reserved consumed requests"
             )
@@ -3887,7 +4172,7 @@ def _validate_success_records(
     materialized = _validate_refresh_materialization(paths, contract)
     if (
         ledger["events"][1].get("response_json_sha256")
-        != materialized["raw_response_file"]["sha256"]
+        != materialized["raw_response_body_sha256"]
     ):
         raise PaidSourceRefreshError("paid HTTP JSON响应未语义绑定committed raw")
     delta = _validate_database_delta(paths, contract, materialized)
@@ -4091,6 +4376,7 @@ def plan_refresh(
         source_plan = _source_plan(
             connection, content_id=content_id, source_evidence=source_evidence
         )
+        compensation = _compensation_source(connection, source_plan["target"])
     identity = _task_identity(
         source_db_sha256=expected_source_db_sha256,
         source_completion_sha256=expected_source_completion_sha256,
@@ -4125,7 +4411,7 @@ def plan_refresh(
             "endpoint": DETAIL_PATH,
             "adapter_version": ADAPTER_VERSION,
             "stage": STAGE,
-            "window_key": identity["window_key"],
+            "window_key": compensation["original_identity"]["due_bucket"],
         },
         "budget": {
             "task_id": identity["task_id"],
@@ -4498,6 +4784,20 @@ def _read_only_generation_gate(
     )
 
 
+def _require_offline_transports(callbacks: Sequence[Any]) -> None:
+    """A disposable clone cannot authorize charges on the writer's behalf."""
+    defaults = (_default_endpoint_info, _default_balance_check, _default_detail_fetch, _load_key)
+    if os.environ.get("DCAR_TEST_DENY_FORMAL_DB") != "1" or any(
+        callback is None or callback is default or not callable(callback)
+        for callback, default in zip(callbacks, defaults, strict=True)
+    ):
+        raise PaidSourceRefreshError(
+            "real clone-paid refresh is disabled: the clone is not the unique writer "
+            "budget authority; use the v8 writer capture path. Only injected offline "
+            "test transports may create a new request; committed raw recovery is free."
+        )
+
+
 def run_refresh(
     *,
     source_db_path: Path,
@@ -4515,6 +4815,7 @@ def run_refresh(
     key_loader: Callable[[], str] | None = None,
     after_fetch_hook: Callable[[], None] | None = None,
 ) -> Mapping[str, Any]:
+    offline_transports = (endpoint_info_fetcher, balance_checker, detail_fetcher, key_loader)
     content_id = _ordered_one(content_ids)
     paths = _paths(
         source_db_path=source_db_path,
@@ -4623,16 +4924,17 @@ def run_refresh(
             raise
         contract_temporary = paths.contract.with_name(f".{paths.contract.name}.tmp")
         if not paths.contract.exists() and os.path.lexists(contract_temporary):
+            def validate_temporary_contract(value: Mapping[str, Any]) -> None:
+                _validate_contract(
+                    paths, value, content_id=content_id,
+                    expected_source_db_sha256=expected_source_db_sha256,
+                    expected_source_completion_sha256=expected_source_completion_sha256,
+                )
+
             local_controller._recover_immutable_json_temp(
                 paths.contract,
                 label="paid refresh contract",
-                validator=lambda value: _validate_contract(
-                    paths,
-                    value,
-                    content_id=content_id,
-                    expected_source_db_sha256=expected_source_db_sha256,
-                    expected_source_completion_sha256=expected_source_completion_sha256,
-                ),
+                validator=validate_temporary_contract,
             )
         elif paths.contract.exists():
             _cleanup_final_temp(paths.contract, label="paid refresh contract")
@@ -4678,6 +4980,7 @@ def run_refresh(
             }
         fresh_contract = not paths.contract.exists()
         if fresh_contract:
+            _require_offline_transports(offline_transports)
             with closing(local_controller._immutable_connection(paths.database)) as connection:
                 source_plan = _source_plan(
                     connection,
@@ -4839,6 +5142,25 @@ def run_refresh(
         committed = _committed_raw(paths, contract)
         activity = _provider_activity(paths, contract)
         detail_events = list(ledger["events"])
+        if (
+            committed is None and len(detail_events) == 1
+            and activity == {"slots": 1, "attempts": 0, "usage": 1}
+        ):
+            details = json.loads(str(prefix_rows["provider_usage"][0]["details_json"]))
+            if details["state"] == "reserved":
+                _release_unsent_prefix(paths, prefix_rows)
+                local_controller._finalize_database(paths.database)
+                prefix_rows = _validate_database_prefix(paths, contract)
+                _validate_output_prefix(paths, contract, prefix_rows)
+                _blocked_state(
+                    paths, contract_sha256=_sha256_file(paths.contract),
+                    intent_sha256=intent_sha256,
+                    error=PaidSourceRefreshError("interrupted before durable send"),
+                )
+            raise PaidSourceRefreshError(
+                "paid request opening is permanently closed; proven unsent reservation "
+                "is refunded without a new request"
+            )
         transport_terminal = (
             len(detail_events) == 2
             and detail_events[1].get("outcome") == "transport_failed"
@@ -4898,6 +5220,7 @@ def run_refresh(
         try:
             provider_calls = 0
             if committed is None:
+                _require_offline_transports(offline_transports)
                 _require_price_fresh(contract["price_evidence"])
                 key, balance, user_info_calls_current = _ensure_user_info(
                     paths,
@@ -4923,39 +5246,50 @@ def run_refresh(
                 )
                 _write_json(paths.ledger, ledger, immutable=False)
                 _create_budget(paths, contract)
-                claim = capture_module.claim_content_slot(
-                    db_path=paths.database,
-                    content_id=content_id,
-                    stage=STAGE,
-                    window_key=contract["route"]["window_key"],
-                    provider=PROVIDER,
-                    adapter_version=ADAPTER_VERSION,
-                )
-                with (
-                    closing(storage_module.connect(paths.database)) as connection,
-                    storage_module.transaction(connection),
+                with provider_budget_module.paid_scope(
+                    "history", compensation_authorization_id=contract["compensation"]["authorization_id"],
                 ):
-                    usage_id, unit_price, currency = capture_module._reserve_budget(
-                        connection,
-                        budget_id=contract["budget"]["budget_id"],
+                    claim = capture_module._claim_paid_tikhub(
+                        db_path=paths.database,
+                        content_id=content_id,
+                        account_id=None,
+                        stage=STAGE,
+                        window_key=contract["route"]["window_key"],
                         provider=PROVIDER,
+                        adapter_version=ADAPTER_VERSION,
+                        budget_id=contract["budget"]["budget_id"],
                         operation=OPERATION,
                         task_id=contract["budget"]["task_id"],
                         task_max_amount=UNIT_PRICE,
+                        allow_terminal_retry=False,
+                        paid_request_identity=_capture_paid_identity(contract),
                     )
+                usage_id = claim.reserved_usage_id
+                unit_price = claim.reserved_unit_price
+                currency = claim.reserved_currency
                 if (
-                    _exact_decimal(unit_price, label="reserved unit price")
+                    usage_id is None
+                    or _exact_decimal(unit_price, label="reserved unit price")
                     != Decimal(str(UNIT_PRICE))
                     or currency != "USD"
                 ):
                     raise PaidSourceRefreshError("paid refresh reserve价格/币种漂移")
                 fetcher = detail_fetcher or _default_detail_fetch
-                provider_calls = 1
                 try:
-                    payload, transcript = fetcher(
-                        str(contract["target"]["platform_content_id"]), key
-                    )
+                    with capture_module.TIKHUB_NETWORK_SLOTS:
+                        claim = capture_module._mark_paid_sent(
+                            claim, operation=OPERATION,
+                            budget_id=contract["budget"]["budget_id"], db_path=paths.database,
+                        )
+                        provider_calls = 1
+                        payload, transcript = fetcher(
+                            str(contract["target"]["platform_content_id"]), key
+                        )
                 except Exception as exc:
+                    if claim.attempt_id == 0:
+                        # The shared gate has refunded a provably unsent reserve.
+                        # It must not become a charged transport failure.
+                        raise
                     failed = {
                         "index": 1,
                         "phase": "terminal",
@@ -4997,7 +5331,7 @@ def run_refresh(
                     or transcript.get("http_status") != 200
                     or transcript.get("mime_type") != "application/json"
                     or type(transcript.get("response_bytes")) is not int
-                    or transcript.get("response_bytes") <= 0
+                    or transcript["response_bytes"] <= 0
                 ):
                     transcript_error = PaidSourceRefreshError(
                         "detail网络transcript漂移"
@@ -5195,8 +5529,18 @@ def _compatible_source_snapshot(
         raise PaidSourceRefreshError("paid source handoff行或文件漂移")
     try:
         manifest = json.loads(Path(str(artifact_file["path"])).read_bytes())
-        raw_body = json.loads(Path(str(raw_file["path"])).read_bytes())
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raw_body = raw_evidence_module.read_raw_json(
+            Path(str(raw_file["path"])),
+            expected_stored_sha256=str(raw_row["sha256"]),
+            expected_stored_size=_exact_integer(
+                raw_row["byte_size"], label="handoff raw byte size"
+            ),
+        )
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        raw_evidence_module.RawEvidenceError,
+    ) as exc:
         raise PaidSourceRefreshError("paid source handoff JSON漂移") from exc
     parsed = providers_module._parse_douyin_stage_payload(
         "detail", str(contract["target"]["platform_content_id"]), raw_body, status=200

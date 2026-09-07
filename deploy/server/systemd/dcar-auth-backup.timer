@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily DcarAIGC authentication store backup
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+Unit=dcar-auth-backup.service
+
+[Install]
+WantedBy=timers.target

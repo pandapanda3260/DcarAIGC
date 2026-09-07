@@ -8,173 +8,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 import v8.storage as storage
+from tests.schema_fixture import initialize_historical_schema
 
 
-V8_FIXTURE_SQL = """
-CREATE TABLE schema_migrations(
-    version INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, applied_at TEXT NOT NULL
-);
-INSERT INTO schema_migrations VALUES (8,'append-only-review-reopen-audit','2026-08-02T00:00:00Z');
-CREATE TABLE taxonomy_versions(
-    id TEXT PRIMARY KEY, version TEXT NOT NULL UNIQUE, status TEXT NOT NULL,
-    definition TEXT NOT NULL, source_path TEXT, source_sha256 TEXT,
-    created_at TEXT NOT NULL, published_at TEXT
-);
-CREATE TABLE selling_points(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    taxonomy_id TEXT NOT NULL REFERENCES taxonomy_versions(id) ON DELETE CASCADE,
-    code TEXT NOT NULL, tier TEXT NOT NULL, label TEXT NOT NULL,
-    definition TEXT NOT NULL DEFAULT '', positive_evidence_json TEXT NOT NULL DEFAULT '[]',
-    negative_evidence_json TEXT NOT NULL DEFAULT '[]',
-    boundary_rules_json TEXT NOT NULL DEFAULT '[]', enabled INTEGER NOT NULL DEFAULT 1,
-    UNIQUE(taxonomy_id,code)
-);
-CREATE TABLE content_items(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    link_id TEXT NOT NULL DEFAULT 'LEGACY'
-);
-CREATE TABLE content_identities(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
-    platform_identity_key TEXT NOT NULL,
-    is_primary INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE fetch_slots(id INTEGER PRIMARY KEY AUTOINCREMENT);
-CREATE TABLE provider_raw_responses(id INTEGER PRIMARY KEY AUTOINCREMENT);
-CREATE TABLE content_metric_snapshots(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
-    captured_at TEXT NOT NULL,
-    window_key TEXT NOT NULL,
-    view_count INTEGER,
-    comment_count INTEGER,
-    like_count INTEGER,
-    share_count INTEGER,
-    collect_count INTEGER,
-    status TEXT NOT NULL,
-    source TEXT NOT NULL,
-    raw_response_id INTEGER REFERENCES provider_raw_responses(id),
-    metadata_json TEXT NOT NULL DEFAULT '{}',
-    UNIQUE(content_id,window_key,source)
-);
-CREATE TABLE comment_evidence_versions(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
-    captured_at TEXT NOT NULL, iso_week TEXT NOT NULL, source TEXT NOT NULL,
-    local_path TEXT NOT NULL, sha256 TEXT NOT NULL, comment_count INTEGER,
-    status TEXT NOT NULL, created_at TEXT NOT NULL,
-    UNIQUE(content_id, iso_week, sha256)
-);
-CREATE TABLE comments(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    evidence_version_id INTEGER NOT NULL REFERENCES comment_evidence_versions(id) ON DELETE CASCADE,
-    platform_comment_id TEXT, anonymous_user_key TEXT, body TEXT NOT NULL,
-    published_at TEXT, like_count INTEGER, parent_comment_id TEXT,
-    raw_json TEXT NOT NULL DEFAULT '{}',
-    UNIQUE(evidence_version_id, platform_comment_id)
-);
-CREATE TABLE comment_user_scores(
-    content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
-    evidence_version_id INTEGER REFERENCES comment_evidence_versions(id) ON DELETE SET NULL,
-    anonymous_user_key TEXT NOT NULL,
-    audience_automotive_score INTEGER NOT NULL,
-    action_intent_score INTEGER NOT NULL,
-    evaluated_at TEXT NOT NULL,
-    PRIMARY KEY(content_id, anonymous_user_key)
-);
-CREATE TABLE evidence_envelopes(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE CASCADE
-);
-CREATE TABLE evaluation_versions(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
-    evidence_envelope_id INTEGER REFERENCES evidence_envelopes(id) ON DELETE RESTRICT,
-    rule_version TEXT NOT NULL, taxonomy_version TEXT NOT NULL,
-    evidence_sha256 TEXT NOT NULL,
-    evaluation_source TEXT NOT NULL,
-    evaluation_status TEXT NOT NULL, evidence_level TEXT NOT NULL,
-    primary_selling_point_code TEXT, selling_point_score INTEGER,
-    selling_point_included INTEGER NOT NULL DEFAULT 0,
-    content_direction TEXT NOT NULL DEFAULT 'unknown',
-    content_automotive_score INTEGER, audience_automotive_score INTEGER,
-    acquisition_potential_score INTEGER, pending_review INTEGER NOT NULL DEFAULT 0,
-    payload_json TEXT NOT NULL, evaluated_at TEXT NOT NULL,
-    invalidated_at TEXT, invalidation_reason TEXT,
-    UNIQUE(content_id,rule_version,taxonomy_version,evidence_sha256)
-);
-CREATE UNIQUE INDEX uq_evaluation_idempotency
-ON evaluation_versions(content_id,rule_version,taxonomy_version,evidence_sha256);
-CREATE TABLE evaluation_matches(
-    evaluation_id INTEGER NOT NULL REFERENCES evaluation_versions(id) ON DELETE CASCADE,
-    selling_point_code TEXT NOT NULL, match_role TEXT NOT NULL,
-    score INTEGER, evidence_json TEXT NOT NULL DEFAULT '{}',
-    PRIMARY KEY(evaluation_id,selling_point_code)
-);
-CREATE TABLE review_queue(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
-    evaluation_id INTEGER REFERENCES evaluation_versions(id) ON DELETE SET NULL,
-    reason_code TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 50,
-    status TEXT NOT NULL, assigned_to TEXT, created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL, resolved_at TEXT, UNIQUE(content_id,reason_code)
-);
-CREATE TABLE evaluation_reviews(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    queue_id INTEGER REFERENCES review_queue(id) ON DELETE SET NULL,
-    content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
-    previous_evaluation_id INTEGER REFERENCES evaluation_versions(id),
-    resulting_evaluation_id INTEGER REFERENCES evaluation_versions(id),
-    decision TEXT NOT NULL, reason TEXT NOT NULL, reviewer TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
-CREATE TABLE review_reopen_events(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    queue_id INTEGER NOT NULL REFERENCES review_queue(id) ON DELETE CASCADE,
-    content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
-    previous_review_id INTEGER REFERENCES evaluation_reviews(id) ON DELETE SET NULL,
-    base_evaluation_id INTEGER REFERENCES evaluation_versions(id) ON DELETE SET NULL,
-    reopened_by TEXT NOT NULL, reason TEXT NOT NULL, created_at TEXT NOT NULL
-);
-CREATE TABLE manual_evidence(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    review_id INTEGER NOT NULL REFERENCES evaluation_reviews(id) ON DELETE CASCADE,
-    content_id INTEGER NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
-    evidence_type TEXT NOT NULL, text_value TEXT, local_path TEXT,
-    sha256 TEXT NOT NULL, created_at TEXT NOT NULL
-);
-CREATE TABLE report_tasks(id TEXT PRIMARY KEY);
-CREATE TABLE report_revisions(
-    task_id TEXT NOT NULL REFERENCES report_tasks(id) ON DELETE CASCADE,
-    revision INTEGER NOT NULL, contract_version TEXT NOT NULL,
-    rule_version TEXT NOT NULL, taxonomy_version TEXT NOT NULL,
-    report_json_path TEXT NOT NULL, report_sha256 TEXT NOT NULL,
-    created_at TEXT NOT NULL, invalidated_at TEXT, invalidation_reason TEXT,
-    PRIMARY KEY(task_id,revision)
-);
-CREATE TABLE report_files(
-    id TEXT PRIMARY KEY, task_id TEXT NOT NULL, revision INTEGER NOT NULL,
-    file_kind TEXT NOT NULL, local_path TEXT NOT NULL, sha256 TEXT NOT NULL,
-    byte_size INTEGER NOT NULL, status TEXT NOT NULL, error_message TEXT,
-    created_at TEXT NOT NULL,
-    FOREIGN KEY(task_id,revision) REFERENCES report_revisions(task_id,revision) ON DELETE CASCADE,
-    UNIQUE(task_id,revision,file_kind)
-);
-CREATE TABLE scheduler_runs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id TEXT NOT NULL,
-    scheduled_for TEXT NOT NULL,
-    status TEXT NOT NULL CHECK(status IN ('running','succeeded','failed','skipped')),
-    started_at TEXT NOT NULL,
-    completed_at TEXT,
-    details_json TEXT NOT NULL DEFAULT '{}',
-    UNIQUE(job_id, scheduled_for)
-);
-"""
 
 
 def _seed_v8_fixture(connection: sqlite3.Connection) -> None:
-    connection.executescript(V8_FIXTURE_SQL)
+    initialize_historical_schema(connection, target_version=8)
     captured_at = "2026-08-02T00:00:00Z"
     connection.execute(
         """
@@ -189,9 +29,21 @@ def _seed_v8_fixture(connection: sqlite3.Connection) -> None:
         VALUES ('taxonomy','C1','core','fixture')
         """
     )
-    connection.executemany("INSERT INTO content_items(id) VALUES (?)", [(1,), (2,)])
     connection.executemany(
-        "INSERT INTO evidence_envelopes(id,content_id) VALUES (?,?)", [(1, 1), (2, 2)]
+        """INSERT INTO content_items(
+            id,link_id,platform,canonical_url,imported_at,created_at,updated_at
+        ) VALUES (?,?,'douyin',?,?,?,?)""",
+        [
+            (item, f"TEST0{item}", f"https://example.com/{item}",
+             captured_at, captured_at, captured_at)
+            for item in (1, 2)
+        ],
+    )
+    connection.executemany(
+        """INSERT INTO evidence_envelopes(
+            id,content_id,schema_version,text_sha256,evidence_sha256,components_json,created_at
+        ) VALUES (?,?,'evidence-envelope-v1',?,?,'{}',?)""",
+        [(item, item, "a" * 64, "b" * 64, captured_at) for item in (1, 2)],
     )
 
     rows = [
@@ -306,7 +158,12 @@ def _seed_v8_fixture(connection: sqlite3.Connection) -> None:
         """,
         ("e" * 64, captured_at),
     )
-    connection.execute("INSERT INTO report_tasks(id) VALUES ('task')")
+    connection.execute(
+        """INSERT INTO report_tasks(
+            id,task_type,name,period_start,period_end,creation_source,task_status,created_at,updated_at
+        ) VALUES ('task','daily','fixture','2026-08-01','2026-08-02','manual','queued',?,?)""",
+        (captured_at, captured_at),
+    )
     connection.executemany(
         """
         INSERT INTO report_revisions(

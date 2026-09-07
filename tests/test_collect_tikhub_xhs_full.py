@@ -5,10 +5,22 @@ import unittest
 from pathlib import Path
 
 from collect_rnote_pilot import CacheStore, CollectorError, FatalProviderError
-from collect_tikhub_xhs_full import IMAGE_ENDPOINT, VIDEO_ENDPOINT, collect_content, unwrap
+from collect_tikhub_xhs_full import (
+    IMAGE_ENDPOINT,
+    VIDEO_ENDPOINT,
+    TikHubClient,
+    collect_content,
+    unwrap,
+)
 
 
 class TikHubXhsFullTest(unittest.TestCase):
+    def test_historical_client_is_retired_before_any_request_attempt(self):
+        client = TikHubClient("fixture-key", delay=0)
+        with self.assertRaisesRegex(CollectorError, "v8 writer capture path"):
+            client.get(IMAGE_ENDPOINT, {"note_id": "fixture"})
+        self.assertEqual(client.request_attempts, 0)
+
     def test_nested_success_payload_is_unwrapped(self):
         self.assertEqual(
             unwrap({"code": 200, "data": {"code": 0, "success": True, "data": {"comments": []}}}),

@@ -17,10 +17,14 @@ import json
 import re
 from pathlib import Path
 import threading
-import time
 from typing import Any, Iterable
 
-from probe_tikhub_douyin import KEY_FILE, atomic_write_json, fetch, load_key
+from probe_tikhub_douyin import (
+    KEY_FILE,
+    LEGACY_NETWORK_DISABLED,
+    atomic_write_json,
+    load_key,
+)
 from project_paths import DOUYIN_PROCESSED_DIR, TIKHUB_CACHE_DIR
 from workflow.privacy import CommentHasher
 
@@ -48,18 +52,8 @@ def chunks(values: list[str], size: int) -> Iterable[list[str]]:
 
 
 def api_call(endpoint: str, params: dict[str, Any], key: str) -> tuple[int, dict[str, Any]]:
-    last: Exception | None = None
-    for attempt in range(2):
-        try:
-            status, payload = fetch(endpoint, params, key)
-            if status == 200 and isinstance(payload, dict) and payload.get("code") == 200:
-                return status, payload
-            raise RuntimeError(f"HTTP {status}, API code {payload.get('code') if isinstance(payload, dict) else None}")
-        except Exception as exc:  # bounded provider retry
-            last = exc
-            time.sleep(0.8 * (attempt + 1))
-    assert last is not None
-    raise last
+    del endpoint, params, key
+    raise RuntimeError(LEGACY_NETWORK_DISABLED)
 
 
 def anon_user_key(aweme_id: str, user: Any) -> str:

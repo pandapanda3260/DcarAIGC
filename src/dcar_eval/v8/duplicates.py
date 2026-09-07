@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import time
 from collections import Counter
+from contextlib import ExitStack
 from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
@@ -18,7 +19,16 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 import imagehash  # type: ignore[import-untyped]
 from PIL import Image
 
-from .media import _resolved, _run_processing_slot, file_sha256
+from .media import (
+    _atomic_json,
+    _resolved,
+    _run_processing_slot,
+    file_sha256,
+    managed_bound_artifact,
+    managed_evidence_metadata,
+    managed_evidence_path,
+    managed_slot_source,
+)
 from .storage import (
     DEFAULT_DB,
     PROJECT_ROOT,
@@ -131,6 +141,9 @@ def _simhash_similarity(left: Optional[str], right: Optional[str]) -> Optional[f
 def _latest_artifact(
     connection: sqlite3.Connection, content_id: int, artifact_types: Sequence[str]
 ) -> Optional[sqlite3.Row]:
+    bundle, artifact = managed_bound_artifact(connection, content_id, artifact_types)
+    if bundle is not None:
+        return artifact
     placeholders = ",".join("?" for _ in artifact_types)
     return connection.execute(
         f"""
@@ -270,7 +283,8 @@ def _source_inputs(connection: sqlite3.Connection, content_id: int) -> Dict[str,
     asr = _latest_artifact(connection, content_id, ("asr", "transcript", "media_transcript"))
     ocr = _latest_artifact(connection, content_id, ("ocr", "media_ocr"))
     text = f"{content['title']}\n{content['body']}"
-    return {
+    bundle, _ = managed_bound_artifact(connection, content_id, ("media", "media_manifest"))
+    inputs: Dict[str, Any] = {
         "content": dict(content),
         "text": text,
         "asr_text": _artifact_text(asr, ("text", "combined_text")),
@@ -284,6 +298,11 @@ def _source_inputs(connection: sqlite3.Connection, content_id: int) -> Dict[str,
             "ocr_artifact_sha256": str(ocr["sha256"]) if ocr is not None else None,
         },
     }
+    if bundle is not None:
+        inputs["source"]["bundle_id"] = bundle["manifest"]["bundle_id"]
+        inputs["source"]["media_source_sha256"] = bundle["manifest"]["source"]["sha256"]
+    inputs["bundle"] = bundle
+    return inputs
 
 
 def _current_source_state(
@@ -296,6 +315,13 @@ def _current_source_state(
 
 
 def fingerprint_content(content_id: int, *, db_path: Path = DEFAULT_DB) -> Dict[str, Any]:
+    with ExitStack() as leases:
+        return _fingerprint_content(content_id, db_path=db_path, leases=leases)
+
+
+def _fingerprint_content(
+    content_id: int, *, db_path: Path, leases: ExitStack,
+) -> Dict[str, Any]:
     if package_version("ImageHash") != "4.3.2" or package_version("Pillow") != "12.3.0":
         raise DuplicateDetectionError("duplicate processor dependency version mismatch")
     with connect(db_path) as connection:
@@ -303,9 +329,48 @@ def fingerprint_content(content_id: int, *, db_path: Path = DEFAULT_DB) -> Dict[
     content = inputs["content"]
     output_root = _fingerprint_root_for_database(db_path)
     target = output_root / f"{content['link_id']}.json"
+    bundle = inputs["bundle"]
+    metadata: Dict[str, Any] = {}
+    slot_source = source_sha256
+    if bundle is not None:
+        from .media_retention import media_read_lease
+
+        slot_source = managed_slot_source(bundle, source_sha256)
+        output_root = Path(bundle["instance_root"])
+        target = managed_evidence_path(
+            bundle, stage="fingerprint", source_sha256=source_sha256,
+            processor_version=FINGERPRINT_VERSION, filename="fingerprint.json",
+        )
+        metadata = managed_evidence_metadata(
+            bundle, source_sha256=source_sha256, processor_version=FINGERPRINT_VERSION
+        )
+        with connect(db_path) as connection:
+            cached = connection.execute(
+                """SELECT 1 FROM media_processing_slots WHERE content_id=?
+                   AND source_sha256=? AND processor_type='duplicate_fingerprint'
+                   AND processor_version=? AND status='succeeded'
+                   AND output_artifact_id IS NOT NULL""",
+                (content_id, slot_source, FINGERPRINT_VERSION),
+            ).fetchone()
+        if cached is None:
+            leases.enter_context(media_read_lease(
+                content_id, db_path=db_path, purpose="duplicate_fingerprint"
+            ))
+
+    def validate_source(connection: sqlite3.Connection) -> None:
+        if _current_source_state(connection, content_id)[1] != source_sha256:
+            raise DuplicateDetectionError("fingerprint source identity changed")
 
     def produce() -> Path:
+        if bundle is not None:
+            from .media_retention import media_read_lease
+
+            leases.enter_context(media_read_lease(
+                content_id, db_path=db_path, purpose="duplicate_fingerprint"
+            ))
         media_sha256, phashes = _media_fingerprints(inputs["media_path"])
+        if bundle is not None and not media_sha256:
+            raise DuplicateDetectionError("managed original yielded no media fingerprint")
         normalized_text = _normalize_text(inputs["text"])
         normalized_asr = _normalize_text(inputs["asr_text"])
         normalized_ocr = _normalize_text(inputs["ocr_text"])
@@ -328,6 +393,9 @@ def fingerprint_content(content_id: int, *, db_path: Path = DEFAULT_DB) -> Dict[
             "ocr_char_count": len(normalized_ocr),
             "created_at": now_utc(),
         }
+        if bundle is not None:
+            _atomic_json(target, payload)
+            return target
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = target.with_name(f".{target.name}.tmp")
         temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
@@ -337,16 +405,23 @@ def fingerprint_content(content_id: int, *, db_path: Path = DEFAULT_DB) -> Dict[
     artifact = _run_processing_slot(
         db_path=db_path,
         content_id=content_id,
-        source_sha256=source_sha256,
+        source_sha256=slot_source,
         processor_type="duplicate_fingerprint",
         processor_version=FINGERPRINT_VERSION,
         artifact_type="duplicate_fingerprint",
         produce=produce,
+        metadata=metadata,
+        claim_validator=validate_source if bundle is not None else None,
+        commit_validator=validate_source if bundle is not None else None,
+        expected_output_path=target if bundle is not None else None,
+        expected_output_root=output_root if bundle is not None else None,
     )
     payload = _read_json(_resolved(artifact.local_path))
     if payload.get("source_sha256") != source_sha256:
         raise DuplicateDetectionError("cached duplicate fingerprint has stale source")
     with connect(db_path) as connection, transaction(connection):
+        if bundle is not None:
+            validate_source(connection)
         connection.execute(
             """
             INSERT INTO duplicate_fingerprints(
@@ -960,26 +1035,43 @@ def _pending_content_ids(
             content_rows = connection.execute(
                 "SELECT id FROM content_items ORDER BY id"
             ).fetchall()
+            fingerprint_rows = connection.execute(
+                """
+                SELECT content_id,source_sha256 FROM duplicate_fingerprints
+                WHERE fingerprint_version=?
+                """,
+                (FINGERPRINT_VERSION,),
+            ).fetchall()
         else:
             scope = list(dict.fromkeys(int(value) for value in scope_content_ids))
+            chunks = [
+                scope[offset : offset + 500]
+                for offset in range(0, len(scope), 500)
+            ]
             existing = {
                 int(row["id"])
-                for offset in range(0, len(scope), 500)
+                for chunk in chunks
                 for row in connection.execute(
                     "SELECT id FROM content_items WHERE id IN ("
-                    + ",".join("?" for _ in scope[offset : offset + 500])
+                    + ",".join("?" for _ in chunk)
                     + ")",
-                    scope[offset : offset + 500],
+                    chunk,
                 ).fetchall()
             }
             content_rows = [{"id": value} for value in scope if value in existing]
-        fingerprint_rows = connection.execute(
-            """
-            SELECT content_id,source_sha256 FROM duplicate_fingerprints
-            WHERE fingerprint_version=?
-            """,
-            (FINGERPRINT_VERSION,),
-        ).fetchall()
+            fingerprint_rows = [
+                row
+                for chunk in chunks
+                for row in connection.execute(
+                    """
+                    SELECT content_id,source_sha256 FROM duplicate_fingerprints
+                    WHERE fingerprint_version=? AND content_id IN (
+                    """
+                    + ",".join("?" for _ in chunk)
+                    + ")",
+                    (FINGERPRINT_VERSION, *chunk),
+                ).fetchall()
+            ]
         completed = {
             (int(row["content_id"]), str(row["source_sha256"]))
             for row in fingerprint_rows
@@ -989,9 +1081,21 @@ def _pending_content_ids(
         pending: List[int] = []
         for row in content_rows:
             content_id = int(row["id"])
-            _, source_sha256 = _current_source_state(connection, content_id)
+            from .media_lifecycle import LifecycleError
+
+            try:
+                inputs, source_sha256 = _current_source_state(connection, content_id)
+            except LifecycleError as exc:
+                if exc.error_code == "managed_source_pending":
+                    continue
+                raise
             if (content_id, source_sha256) in completed:
                 continue
+            if inputs["bundle"] is not None:
+                from .media_retention import original_availability
+
+                if original_availability(connection, content_id)["reason"] != "original_available":
+                    continue
             pending.append(content_id)
             if limit is not None and limit > 0 and len(pending) >= limit:
                 break

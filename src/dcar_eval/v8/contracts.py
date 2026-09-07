@@ -11,8 +11,10 @@ from typing import Any, Dict, List, Mapping, Optional
 from .storage import PROJECT_ROOT
 
 
-CONTRACT_PATH = PROJECT_ROOT / "config" / "report_contract_v8_7.json"
+CONTRACT_PATH = PROJECT_ROOT / "config" / "report_contract_v8_9.json"
 LEGACY_CONTRACT_PATHS = {
+    "dcar-content-operations-report-v8.8": PROJECT_ROOT / "config" / "report_contract_v8_8.json",
+    "dcar-content-operations-report-v8.7": PROJECT_ROOT / "config" / "report_contract_v8_7.json",
     "dcar-content-operations-report-v8.2": (
         PROJECT_ROOT / "config" / "report_contract_v8_2.json"
     ),
@@ -34,10 +36,12 @@ LEGACY_CONTRACT_PATHS = {
         PROJECT_ROOT / "config" / "report_contract_v8_6.json"
     ),
 }
-CURRENT_REPORT_VERSION = "dcar-content-operations-report-v8.7"
+CURRENT_REPORT_VERSION = "dcar-content-operations-report-v8.9"
 CURRENT_REPORT_RULE_VERSION = "evaluation-v9"
 CURRENT_REPORT_EVIDENCE_VERSION = "evidence-v2"
 REPORT_RULE_VERSIONS = {
+    "dcar-content-operations-report-v8.7": "evaluation-v9",
+    "dcar-content-operations-report-v8.8": "evaluation-v9",
     CURRENT_REPORT_VERSION: CURRENT_REPORT_RULE_VERSION,
     "dcar-content-operations-report-v8.6": "evaluation-v9",
     "dcar-content-operations-report-v8.5": "evaluation-v8",
@@ -169,6 +173,9 @@ def quality_gate_failures(
 
     active_contract = contract or load_contract()
     failures: List[Dict[str, Any]] = []
+    for key, required in active_contract.get("always_required_boolean_quality_gates", {}).items():
+        if data_quality.get(key) is not required:
+            failures.append({"key": key, "kind": "boolean", "actual": data_quality.get(key), "required": required})
     if enforce_boolean_quality_gates:
         for key, required in active_contract.get(
             "required_boolean_quality_gates", {}
@@ -683,8 +690,38 @@ def _validate_discovery_coverage_detail(
     if missing:
         errors.append(f"{path} missing {missing}")
 
+    terminal_fields = {
+        "succeeded_identity_occurrence_count",
+        "blocked_identity_occurrence_count",
+        "not_applicable_identity_occurrence_count",
+        "accounted_identity_occurrence_count",
+        "required_identity_occurrence_count",
+        "accounted_percentage",
+        "complete",
+        "partial_publishable",
+    }
+    terminal_contract = bool(terminal_fields & set(detail))
+    if terminal_contract:
+        terminal_missing = sorted(terminal_fields - set(detail))
+        if terminal_missing:
+            errors.append(f"{path} missing {terminal_missing}")
+    elif specification.get("requires_terminal_contract"):
+        errors.append(f"{path} requires the complete terminal coverage contract")
+
+    expected_success_rule = specification.get("success_rule")
+    if (
+        expected_success_rule is not None
+        and detail.get("success_rule") != expected_success_rule
+    ):
+        errors.append(
+            f"{path}.success_rule must equal {expected_success_rule}"
+        )
+
     status = detail.get("status")
-    if status not in {"available", "below_threshold", "not_applicable"}:
+    allowed_statuses = {"available", "below_threshold", "not_applicable"}
+    if specification.get("allow_unknown"):
+        allowed_statuses.add("unknown")
+    if status not in allowed_statuses:
         errors.append(f"{path}.status is invalid")
 
     count_fields = (
@@ -731,16 +768,110 @@ def _validate_discovery_coverage_detail(
             "observed_occurrence_count is zero"
         )
 
-    if detail.get("eligible_basis") != specification.get("eligible_basis"):
+    terminal_counts: Dict[str, Optional[int]] = {}
+    if terminal_contract:
+        for field in (
+            "succeeded_identity_occurrence_count",
+            "blocked_identity_occurrence_count",
+            "not_applicable_identity_occurrence_count",
+            "accounted_identity_occurrence_count",
+            "required_identity_occurrence_count",
+        ):
+            value = detail.get(field)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                errors.append(f"{path}.{field} must be a non-negative integer")
+                terminal_counts[field] = None
+            else:
+                terminal_counts[field] = value
+        succeeded_count = terminal_counts["succeeded_identity_occurrence_count"]
+        blocked_count = terminal_counts["blocked_identity_occurrence_count"]
+        not_applicable_count = terminal_counts[
+            "not_applicable_identity_occurrence_count"
+        ]
+        accounted_count = terminal_counts["accounted_identity_occurrence_count"]
+        required_count = terminal_counts["required_identity_occurrence_count"]
+        if succeeded_count is not None and covered_count != succeeded_count:
+            errors.append(
+                f"{path}.covered_identity_occurrence_count must equal "
+                "succeeded_identity_occurrence_count"
+            )
+        if None not in (
+            succeeded_count,
+            blocked_count,
+            not_applicable_count,
+            accounted_count,
+            required_count,
+            eligible_count,
+        ):
+            assert succeeded_count is not None
+            assert blocked_count is not None
+            assert not_applicable_count is not None
+            assert accounted_count is not None
+            assert required_count is not None
+            assert eligible_count is not None
+            if accounted_count != succeeded_count + blocked_count + not_applicable_count:
+                errors.append(f"{path}.accounted occurrence counts are not conserved")
+            if required_count != eligible_count - not_applicable_count:
+                errors.append(f"{path}.required occurrence count is not conserved")
+            if succeeded_count + blocked_count > required_count:
+                errors.append(f"{path}.required terminal counts are not conserved")
+        accounted_percentage = detail.get("accounted_percentage")
+        if accounted_count is not None and eligible_count is not None:
+            expected_accounted = (
+                None
+                if status == "unknown"
+                else round(100 * accounted_count / eligible_count, 2)
+                if eligible_count
+                else 100.0
+            )
+            if (
+                accounted_percentage is not None
+                if expected_accounted is None
+                else isinstance(accounted_percentage, bool)
+                or not isinstance(accounted_percentage, (int, float))
+                or abs(float(accounted_percentage) - expected_accounted) > 1e-9
+            ):
+                errors.append(
+                    f"{path}.accounted_percentage must equal accounted / eligible"
+                )
+        for field in ("complete", "partial_publishable"):
+            if not isinstance(detail.get(field), bool):
+                errors.append(f"{path}.{field} must be a boolean")
+        if (
+            detail.get("complete") is True
+            and succeeded_count is not None
+            and required_count is not None
+            and succeeded_count != required_count
+        ):
+            errors.append(f"{path}.complete requires every required occurrence succeeded")
+        if (
+            detail.get("partial_publishable") is True
+            and accounted_count is not None
+            and eligible_count is not None
+            and accounted_count != eligible_count
+        ):
+            errors.append(f"{path}.partial_publishable requires every occurrence accounted")
+    else:
+        succeeded_count = covered_count
+        required_count = eligible_count
+
+    eligible_basis = detail.get("eligible_basis")
+    expected_eligible_basis = specification.get("eligible_basis")
+    if eligible_basis != expected_eligible_basis:
         errors.append(
             f"{path}.eligible_basis must equal "
-            f"{specification.get('eligible_basis')}"
+            f"{expected_eligible_basis}"
         )
     reason = detail.get("reason")
     if not isinstance(reason, str):
         errors.append(f"{path}.reason must be a string")
     percentage = detail.get("percentage")
     minimum = float(specification["minimum_percentage"])
+
+    if status == "unknown" and specification.get("allow_unknown"):
+        if percentage is not None or scalar is not None or not isinstance(reason, str) or not reason.strip():
+            errors.append(f"{path}.unknown requires null percentage and a reason")
+        return
 
     if status == "not_applicable":
         if not bool(specification.get("allow_not_applicable_when_empty")):
@@ -771,14 +902,25 @@ def _validate_discovery_coverage_detail(
     ):
         errors.append(f"{path}.percentage must be 0..100 when applicable")
         expected_percentage: Optional[float] = None
-    elif covered_count is not None and eligible_count is not None and eligible_count > 0:
-        expected_percentage = round(covered_count * 100 / eligible_count, 2)
+    elif (
+        succeeded_count is not None
+        and required_count is not None
+        and required_count > 0
+    ):
+        expected_percentage = round(succeeded_count * 100 / required_count, 2)
         if abs(float(percentage) - expected_percentage) > 1e-9:
             errors.append(
                 f"{path}.percentage must equal "
-                "covered_identity_occurrence_count / "
-                "eligible_identity_occurrence_count"
+                + (
+                    "succeeded_identity_occurrence_count / "
+                    "required_identity_occurrence_count"
+                    if terminal_contract
+                    else "covered_identity_occurrence_count / "
+                    "eligible_identity_occurrence_count"
+                )
             )
+    elif terminal_contract and required_count == 0 and percentage == 100.0:
+        expected_percentage = 100.0
     else:
         expected_percentage = None
     if (
@@ -822,7 +964,7 @@ def _validate_data_quality_details(
             errors.append(f"{path} must be an object")
         else:
             status = pipeline_observation.get("status")
-            if status not in {"complete", "incomplete"}:
+            if status not in {"complete", "partial_publishable", "incomplete"}:
                 errors.append(f"{path}.status is invalid")
             observation_start = pipeline_observation.get(
                 "capture_observation_start_date"
@@ -855,8 +997,19 @@ def _validate_data_quality_details(
                     errors.append(f"{path}.{key} must be sorted and unique")
                 if key in {"legacy_unobserved_dates", "pipeline_gap_dates"}:
                     gap_count += len(values)
-            expected_status = "incomplete" if gap_count else "complete"
-            if status in {"complete", "incomplete"} and status != expected_status:
+            discovery_detail = details.get("discovery_coverage")
+            expected_status = (
+                "complete"
+                if not gap_count
+                else "partial_publishable"
+                if isinstance(discovery_detail, Mapping)
+                and discovery_detail.get("partial_publishable") is True
+                else "incomplete"
+            )
+            if (
+                status in {"complete", "partial_publishable", "incomplete"}
+                and status != expected_status
+            ):
                 errors.append(f"{path}.status must be {expected_status}")
     if (
         isinstance(publication_value, bool)
@@ -1033,6 +1186,23 @@ def validate_report(
         expected = contract[key]
         if report.get(key) != expected:
             errors.append(f"$.{key} must equal {expected}")
+    if contract.get("input_contract_version"):
+        from .report_inputs import digest
+        frozen = report.get("frozen_inputs")
+        if not isinstance(frozen, Mapping) or frozen.get("contract_version") != contract["input_contract_version"] or type(frozen.get("event_id")) is not int or frozen["event_id"] <= 0:
+            errors.append("$.frozen_inputs must identify the immutable task event")
+        else:
+            body = json.loads(json.dumps(report))
+            body.pop("frozen_inputs", None)
+            body.pop("files", None)
+            if isinstance(body.get("metadata"), dict):
+                body["metadata"].pop("revision", None)
+                body["metadata"].pop("generated_at", None)
+            if frozen.get("sha256") != digest(body):
+                errors.append("$.frozen_inputs.sha256 differs from the frozen report inputs")
+        references = report.get("input_references")
+        if not isinstance(references, Mapping) or not isinstance(references.get("content_ids"), list) or not isinstance(references.get("scans"), Mapping):
+            errors.append("$.input_references must contain frozen contents and scan evidence")
     taxonomy_version = report.get("taxonomy_version")
     if (
         not isinstance(taxonomy_version, str)

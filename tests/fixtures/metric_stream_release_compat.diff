@@ -1,0 +1,30 @@
+--- a/src/dcar_eval/v8/source_routing.py
++++ b/src/dcar_eval/v8/source_routing.py
+@@ -583,7 +583,7 @@
+         if window_key is not None:
+             window_filter = "AND o.window_key=?"
+             params.append(window_key)
+-        rows = connection.execute(
++        cursor = connection.execute(
+             f"""
+             SELECT o.*,r.id raw_id,r.provider raw_provider,r.operation raw_operation,
+                    r.content_id raw_content_id,r.account_id raw_account_id,
+@@ -602,10 +602,15 @@
+               AND julianday(o.recorded_at)<=julianday(?) {window_filter}
+             ORDER BY o.content_id,o.captured_at DESC,o.id DESC
+             """, params,
+-        ).fetchall()
++        )
++        # Avoid sqlite3.Row's repeated linear column-name lookups when making
++        # a mutable fact, and do not retain a second full fetched row list.
++        cursor.row_factory = None
++        columns = tuple(column[0] for column in cursor.description)
+         grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
+-        for row in rows:
+-            grouped[int(row["content_id"])].append(dict(row))
++        for values in cursor:
++            fact = dict(zip(columns, values))
++            grouped[int(fact["content_id"])].append(fact)
+         if current_read:
+             missing = [value for value in batch if value not in grouped]
+             if missing:

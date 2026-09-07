@@ -1,0 +1,174 @@
+.pagination {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px 24px;
+  min-width: 0;
+  padding: 16px;
+  color: #718187;
+  font-size: 12px;
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+}
+
+.summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+}
+
+.summary > span {
+  white-space: nowrap;
+}
+
+.summary > span:first-child {
+  color: #53656d;
+  font-weight: 500;
+}
+
+.legend {
+  padding-left: 16px;
+  border-left: 1px solid #e6ebee;
+  color: #7c8a92;
+}
+
+.controls,
+.pages {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.controls {
+  min-width: 0;
+  max-width: 100%;
+  gap: 12px;
+  margin-left: auto;
+}
+
+.pages {
+  min-width: 0;
+  max-width: 100%;
+  gap: 6px;
+}
+
+.pageButton,
+.pageSize,
+.jump input {
+  height: 32px;
+  border: 1px solid #dce3e8;
+  border-radius: 6px;
+  background: #fff;
+  color: #34454f;
+  font-size: 12px;
+  box-shadow: none;
+}
+
+.pageButton {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  min-width: 32px;
+  padding: 0 8px;
+  font-weight: 500;
+  transition: border-color .15s ease, background-color .15s ease;
+}
+
+.pageButton:hover:not(:disabled):not(.current) {
+  border-color: #aabac1;
+  background: #f7f9fa;
+}
+
+.pageButton.current {
+  border-color: var(--dcd-brand);
+  background: var(--dcd-brand);
+  color: var(--dcd-on-brand);
+  font-weight: 700;
+  box-shadow: none;
+}
+
+.pageButton:disabled {
+  background: #f8fafb;
+  opacity: .45;
+}
+
+.pageButton:focus-visible,
+.pageSize:focus-visible,
+.jump input:focus-visible {
+  outline: 2px solid var(--teal);
+  outline-offset: 2px;
+}
+
+.pageSize {
+  width: 100px;
+  padding: 0 10px;
+  cursor: pointer;
+}
+
+.pageSize:disabled,
+.jump input:disabled {
+  cursor: not-allowed;
+  opacity: .55;
+}
+
+.ellipsis {
+  min-width: 20px;
+  text-align: center;
+}
+
+.jump {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.jump input {
+  width: 44px;
+  padding: 0 6px;
+  text-align: center;
+}
+
+@media (max-width: 900px) {
+  .controls {
+    flex: 1 1 100%;
+    margin-left: 0;
+  }
+}
+
+@media (max-width: 480px) {
+  .pagination {
+    padding: 14px 12px;
+  }
+
+  .summary {
+    gap: 8px 12px;
+  }
+
+  .legend {
+    padding-left: 12px;
+  }
+
+  .controls {
+    gap: 10px 12px;
+    justify-content: space-between;
+  }
+
+  .pages {
+    order: 1;
+    flex-basis: 100%;
+    flex-wrap: nowrap;
+    gap: 4px;
+    overflow-x: auto;
+    padding: 3px;
+  }
+
+  .pageButton {
+    flex: 1 0 28px;
+    min-width: 28px;
+    padding: 0 4px;
+  }
+}

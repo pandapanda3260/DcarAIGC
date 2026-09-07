@@ -11,6 +11,10 @@ most 25, the frozen 51,749 Step3 universe, 17,147 statically downloadable
 items, 34,602 statically deferred items, and an explicit disclosure of the 39
 history rows that Step3 could not materialise.  A completion from this script
 can therefore never claim that the full history is complete.
+
+The legacy batch executor is retired. Only the explicitly separate read-only
+``--verify-managed-contract`` entrypoint accepts new managed-v1 evidence; it
+does not reopen the old manual-review or batch execution chain.
 """
 
 # ruff: noqa: E402 -- direct execution bootstraps repository imports first.
@@ -4051,7 +4055,6 @@ def _validate_review_pending_evaluation(
         media_path=artifacts["media_path"],
         asr=asr,
         ocr=ocr,
-        manual_rows=manual_rows,
     )
     matcher_desc = "\n".join(
         value
@@ -4109,7 +4112,7 @@ def _validate_review_pending_evaluation(
         and isinstance(expected_matches[0], Mapping)
         else ""
     )
-    normalized_matches: list[Mapping[str, Any]] = []
+    normalized_matches: list[dict[str, Any]] = []
     if not isinstance(runtime.taxonomy, Mapping) or not isinstance(
         runtime.allowed_scenes, Mapping
     ):
@@ -4890,7 +4893,6 @@ def _validate_insufficient_evaluation(
         media_path=artifacts["media_path"],
         asr=asr,
         ocr=ocr,
-        manual_rows=manual_rows,
     )
     before_direction = intent["before"]["content_direction"]
     expected_direction = str(before_direction or "unknown")
@@ -4905,7 +4907,7 @@ def _validate_insufficient_evaluation(
     expected_pending_review = (
         release["rule_version"] == evaluation_module.V8_RULE_VERSION
     )
-    expected_payload = {
+    expected_payload: dict[str, Any] = {
         "evaluation_status": "insufficient_evidence",
         "evidence_level": expected_level,
         "evidence_summary": expected_summary,
@@ -5342,7 +5344,7 @@ def _validate_item_deferred_exact(
                 local._validate_generated_artifacts(
                     connection,
                     contract=mini_contract,
-                    paths=paths,
+                    paths=paths.local_paths,
                     content_ids=[content_id],
                 )
             )
@@ -5394,11 +5396,11 @@ def _validate_item_deferred_exact(
 
         slot_rows = deltas["media_processing_slots"]
         slot_by_type: dict[str, Mapping[str, Any]] = {}
-        for row in slot_rows:
-            processor = str(row.get("processor_type") or "")
+        for slot_row in slot_rows:
+            processor = str(slot_row.get("processor_type") or "")
             if processor in slot_by_type:
                 raise FullLocalAnalysisError("deferred slot processor重复")
-            slot_by_type[processor] = row
+            slot_by_type[processor] = slot_row
         slot_attempt_expectations = [
             {
                 "slot_id": int(row["id"]),
@@ -10627,7 +10629,18 @@ FULL_LOCAL_ANALYSIS_RETIRED_MESSAGE = (
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    effective_argv = list(sys.argv[1:] if argv is None else argv)
+    if local.managed_validation.is_managed_verification(effective_argv):
+        return local.managed_validation.managed_verification_main(effective_argv)
     raise SystemExit(FULL_LOCAL_ANALYSIS_RETIRED_MESSAGE)
+
+
+def validate_managed_v1(contract: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Read new stage evidence without reviving the retired legacy writer."""
+    try:
+        return local.managed_validation.validate_managed_contract(contract)
+    except local.managed_validation.ManagedAnalysisValidationError as error:
+        raise FullLocalAnalysisError(str(error)) from error
 
 
 def _retired_main(argv: Sequence[str] | None = None) -> int:

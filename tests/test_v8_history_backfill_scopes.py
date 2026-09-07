@@ -3,13 +3,17 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from contextlib import ExitStack, contextmanager
+from contextvars import Context
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+from tests.roster_fixture import accept_roster
 import v8.capture as capture_module
+import v8.range_backfill as range_module
 from v8.capture import ProviderResult
 from v8.evaluation import evaluate_content, incremental_candidates
 from v8.matcher_dsl import POINT_IDS, POINT_SCENES
@@ -115,12 +119,46 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
             },
             db_path=self.db,
         )
+        with connect(self.db) as connection:
+            accept_roster(connection, accepted_at="2026-07-01T00:00:00Z")
+            connection.commit()
         self.start = datetime(2010, 1, 1, 0, 0, tzinfo=SHANGHAI)
         self.end = datetime(2026, 8, 7, 0, 0, tzinfo=SHANGHAI)
         self.archive_before = datetime(2026, 2, 7, 0, 0, tzinfo=SHANGHAI)
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    @contextmanager
+    def _ordinary_processors(
+        self, *, discovery: bool = False, content: bool = False
+    ):
+        """Inject the real processor as ordinary, non-history fixture capture."""
+
+        with ExitStack() as stack:
+            if discovery:
+                original = range_module.discover_account_content
+                stack.enter_context(
+                    patch.object(
+                        range_module,
+                        "discover_account_content",
+                        side_effect=lambda *args, **kwargs: Context().run(
+                            original, *args, **kwargs
+                        ),
+                    )
+                )
+            if content:
+                original_update = range_module.update_content_data
+                stack.enter_context(
+                    patch.object(
+                        range_module,
+                        "update_content_data",
+                        side_effect=lambda *args, **kwargs: Context().run(
+                            original_update, *args, **kwargs
+                        ),
+                    )
+                )
+            yield
 
     def _insert_content(self, content_id: str, published_at: str) -> int:
         result = upsert_content(
@@ -281,15 +319,16 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
                 True,
             )
 
-        result = run_discovery_backfill(
-            start=self.start, end=self.end,
-            as_of=self.end,
-            task_id="full-history-test", max_amount=1.0,
-            db_path=self.db, platforms=["douyin"],
-            call_override=discovery_call, state_root=self.state,
-            archive_before=self.archive_before, workers=2, compact=True,
-            require_live_detail=True,
-        )
+        with self._ordinary_processors(discovery=True):
+            result = run_discovery_backfill(
+                start=self.start, end=self.end,
+                as_of=self.end,
+                task_id="full-history-test", max_amount=1.0,
+                db_path=self.db, platforms=["douyin"],
+                call_override=discovery_call, state_root=self.state,
+                archive_before=self.archive_before, workers=2, compact=True,
+                require_live_detail=True,
+            )
         self.assertEqual(result["status"], "succeeded")
         self.assertEqual(result["accounts_completed"], 1)
         self.assertEqual(result["inserted"], 2)
@@ -730,18 +769,19 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
                 True,
             )
 
-        limited = run_discovery_backfill(
-            start=self.start,
-            end=self.end,
-            as_of=self.end,
-            task_id="page-limit-test",
-            max_amount=1.0,
-            db_path=self.db,
-            platforms=["douyin"],
-            call_override=page_limit_call,
-            state_root=self.state,
-            max_pages_per_account=1,
-        )
+        with self._ordinary_processors(discovery=True):
+            limited = run_discovery_backfill(
+                start=self.start,
+                end=self.end,
+                as_of=self.end,
+                task_id="page-limit-test",
+                max_amount=1.0,
+                db_path=self.db,
+                platforms=["douyin"],
+                call_override=page_limit_call,
+                state_root=self.state,
+                max_pages_per_account=1,
+            )
         self.assertEqual(limited["status"], "partial")
         self.assertEqual(limited["accounts_completed"], 0)
         self.assertEqual(limited["stopped_reason"], "page_limit_reached")
@@ -754,18 +794,19 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
 
         missing_end = datetime(2026, 8, 6, 0, 0, tzinfo=SHANGHAI)
         missing_start = datetime(2010, 1, 2, 0, 0, tzinfo=SHANGHAI)
-        missing = run_discovery_backfill(
-            start=missing_start,
-            end=missing_end,
-            as_of=missing_end,
-            task_id="missing-cursor-test",
-            max_amount=1.0,
-            db_path=self.db,
-            platforms=["douyin"],
-            call_override=missing_cursor_call,
-            state_root=self.state,
-            max_pages_per_account=2,
-        )
+        with self._ordinary_processors(discovery=True):
+            missing = run_discovery_backfill(
+                start=missing_start,
+                end=missing_end,
+                as_of=missing_end,
+                task_id="missing-cursor-test",
+                max_amount=1.0,
+                db_path=self.db,
+                platforms=["douyin"],
+                call_override=missing_cursor_call,
+                state_root=self.state,
+                max_pages_per_account=2,
+            )
         self.assertEqual(missing["status"], "partial")
         self.assertEqual(missing["accounts_completed"], 0)
         self.assertEqual(missing["stopped_reason"], "missing_next_cursor")
@@ -778,18 +819,19 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
                 result.data["next_cursor"] = "same-cursor"
             return result
 
-        repeated = run_discovery_backfill(
-            start=datetime(2010, 1, 3, 0, 0, tzinfo=SHANGHAI),
-            end=repeated_end,
-            as_of=repeated_end,
-            task_id="repeated-cursor-test",
-            max_amount=1.0,
-            db_path=self.db,
-            platforms=["douyin"],
-            call_override=repeated_cursor_call,
-            state_root=self.state,
-            max_pages_per_account=4,
-        )
+        with self._ordinary_processors(discovery=True):
+            repeated = run_discovery_backfill(
+                start=datetime(2010, 1, 3, 0, 0, tzinfo=SHANGHAI),
+                end=repeated_end,
+                as_of=repeated_end,
+                task_id="repeated-cursor-test",
+                max_amount=1.0,
+                db_path=self.db,
+                platforms=["douyin"],
+                call_override=repeated_cursor_call,
+                state_root=self.state,
+                max_pages_per_account=4,
+            )
         self.assertEqual(repeated["status"], "partial")
         self.assertEqual(repeated["accounts_completed"], 0)
         self.assertEqual(repeated["stopped_reason"], "cursor_repeated")
@@ -824,18 +866,19 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
                 True,
             )
 
-        result = run_discovery_backfill(
-            start=self.start,
-            end=self.end,
-            as_of=self.end,
-            task_id="preserve-rich-content-test",
-            max_amount=1.0,
-            db_path=self.db,
-            platforms=["douyin"],
-            call_override=discovery_call,
-            state_root=self.state,
-            skip_existing_derived_stages=True,
-        )
+        with self._ordinary_processors(discovery=True):
+            result = run_discovery_backfill(
+                start=self.start,
+                end=self.end,
+                as_of=self.end,
+                task_id="preserve-rich-content-test",
+                max_amount=1.0,
+                db_path=self.db,
+                platforms=["douyin"],
+                call_override=discovery_call,
+                state_root=self.state,
+                skip_existing_derived_stages=True,
+            )
 
         self.assertEqual(result["status"], "succeeded")
         with connect(self.db) as connection:
@@ -878,17 +921,18 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
                 True,
             )
 
-        result = run_discovery_backfill(
-            start=datetime(2010, 1, 4, 0, 0, tzinfo=SHANGHAI),
-            end=datetime(2026, 8, 4, 0, 0, tzinfo=SHANGHAI),
-            as_of=datetime(2026, 8, 4, 0, 0, tzinfo=SHANGHAI),
-            task_id="missing-published-test",
-            max_amount=1.0,
-            db_path=self.db,
-            platforms=["douyin"],
-            call_override=discovery_call,
-            state_root=self.state,
-        )
+        with self._ordinary_processors(discovery=True):
+            result = run_discovery_backfill(
+                start=datetime(2010, 1, 4, 0, 0, tzinfo=SHANGHAI),
+                end=datetime(2026, 8, 4, 0, 0, tzinfo=SHANGHAI),
+                as_of=datetime(2026, 8, 4, 0, 0, tzinfo=SHANGHAI),
+                task_id="missing-published-test",
+                max_amount=1.0,
+                db_path=self.db,
+                platforms=["douyin"],
+                call_override=discovery_call,
+                state_root=self.state,
+            )
 
         self.assertEqual(result["status"], "partial")
         self.assertEqual(result["failed_pages"], 1)
@@ -937,12 +981,13 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
                 data = {"comment_count": 0, "comments": []}
             return ProviderResult(data, {"stage": stage, "data": data}, 200, True)
 
-        result = run_content_backfill(
-            start=self.start, end=self.end, task_id="content-workers-test",
-            as_of=self.end,
-            max_amount=1.0, db_path=self.db, call_override=content_call,
-            state_root=self.state, workers=2, compact=True,
-        )
+        with self._ordinary_processors(content=True):
+            result = run_content_backfill(
+                start=self.start, end=self.end, task_id="content-workers-test",
+                as_of=self.end,
+                max_amount=1.0, db_path=self.db, call_override=content_call,
+                state_root=self.state, workers=2, compact=True,
+            )
         self.assertEqual(result["status"], "succeeded")
         self.assertEqual(result["processed"], 2)
         self.assertEqual(result["results"]["status_counts"], {"succeeded": 2})
@@ -1022,13 +1067,15 @@ class V8HistoryBackfillScopeTest(unittest.TestCase):
         )
         self.assertEqual(result["candidates"], 1)
         self.assertTrue(result["history_only"])
-        self.assertEqual(calls, [tagged])
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["stopped_reason"], "repair_budget_exhausted")
+        self.assertEqual(calls, [])
 
         summary = summarize_range_status(
             start=self.start, end=self.end, db_path=self.db, history_only=True,
         )
         self.assertEqual(summary["pending"]["comments"]["douyin"], 1)
-        self.assertEqual(summary["pending"]["metrics"]["douyin"], 0)
+        self.assertEqual(summary["pending"]["metrics"]["douyin"], 1)
 
     def test_summarize_range_status_reports_pending_and_costs(self) -> None:
         content = self._insert_content("737373737", "2026-08-01T01:00:00Z")

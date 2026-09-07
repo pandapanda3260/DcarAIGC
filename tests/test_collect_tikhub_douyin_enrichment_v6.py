@@ -6,6 +6,10 @@ import collect_tikhub_douyin_enrichment_v6 as v6
 
 
 class TikHubDouyinEnrichmentV6Test(unittest.TestCase):
+    def test_historical_network_entry_is_retired(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "v8 writer capture path"):
+            v6.api_call(v6.STATS_ENDPOINT, {"aweme_ids": "1"}, "fixture-key")
+
     def test_sanitizer_retains_no_raw_identity(self) -> None:
         payload = {
             "data": {

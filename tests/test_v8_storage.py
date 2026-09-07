@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+import json
+import os
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 from pathlib import Path
 
 import v8.storage as storage_module
+from tests.schema_fixture import initialize_historical_schema
 from v8.storage import (
     DEFAULT_DB,
     LEGACY_MATCHER_RULE_SHA256,
@@ -16,13 +22,340 @@ from v8.storage import (
     connect,
     ensure_legacy_evaluation_release,
     initialize_database,
+    live_wal_read_only_connections,
     require_schema_compatibility,
     same_database_path,
     schema_compatibility_state,
+    transaction,
+    transaction_metrics_context,
 )
 
 
 class V8StorageTest(unittest.TestCase):
+    def test_write_transaction_metrics_are_external_private_and_context_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            metrics_root = root / "metrics"
+            metrics_root.mkdir(mode=0o700)
+            metrics = metrics_root / "sqlite.jsonl"
+            database = root / "instrumented.sqlite3"
+            with patch.dict(os.environ, {"DCAR_SQLITE_METRICS_FILE": str(metrics)}):
+                with connect(database) as connection:
+                    connection.execute("CREATE TABLE writes(value TEXT NOT NULL)")
+                    connection.commit()
+                    with transaction_metrics_context(
+                        job_id="fixture", scheduler_run_id=12, attempt_id=34
+                    ), transaction(connection):
+                        connection.execute("INSERT INTO writes VALUES ('ok')")
+
+            records = [json.loads(line) for line in metrics.read_text().splitlines()]
+            self.assertEqual(len(records), 2)
+            self.assertEqual([row["phase"] for row in records], ["begin", "finish"])
+            self.assertEqual(records[0]["transaction_id"], records[1]["transaction_id"])
+            self.assertEqual(
+                {
+                    key: records[1][key]
+                    for key in ("schema", "outcome", "job_id", "scheduler_run_id", "attempt_id")
+                },
+                {
+                    "schema": "sqlite-write-transaction-v1",
+                    "outcome": "committed",
+                    "job_id": "fixture",
+                    "scheduler_run_id": 12,
+                    "attempt_id": 34,
+                },
+            )
+            self.assertTrue(records[1]["wal"])
+            self.assertGreaterEqual(records[0]["queue_wait_ms"], 0)
+            self.assertGreaterEqual(records[1]["hold_ms"], 0)
+            self.assertEqual(metrics.stat().st_mode & 0o777, 0o600)
+
+    def test_write_transaction_metrics_classify_locked_rollback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            metrics_root = root / "metrics"
+            metrics_root.mkdir(mode=0o700)
+            metrics = metrics_root / "sqlite.jsonl"
+            database = root / "instrumented.sqlite3"
+            with patch.dict(os.environ, {"DCAR_SQLITE_METRICS_FILE": str(metrics)}):
+                with connect(database) as connection:
+                    connection.execute("CREATE TABLE writes(value TEXT NOT NULL)")
+                    connection.commit()
+                    with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                        with transaction(connection):
+                            connection.execute("INSERT INTO writes VALUES ('rollback')")
+                            raise sqlite3.OperationalError("database is locked")
+                    self.assertEqual(
+                        connection.execute("SELECT COUNT(*) FROM writes").fetchone()[0], 0
+                    )
+            records = [json.loads(line) for line in metrics.read_text().splitlines()]
+            self.assertEqual([row["phase"] for row in records], ["begin", "finish"])
+            record = records[-1]
+            self.assertEqual(record["outcome"], "locked")
+            self.assertEqual(record["error_type"], "OperationalError")
+
+    def test_configured_metrics_path_fails_closed_before_begin(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "instrumented.sqlite3"
+            with connect(database) as connection:
+                connection.execute("CREATE TABLE writes(value TEXT NOT NULL)")
+                connection.commit()
+                with patch.dict(
+                    os.environ, {"DCAR_SQLITE_METRICS_FILE": "relative.jsonl"}
+                ), self.assertRaisesRegex(
+                    storage_module.TransactionMetricsError, "must be absolute"
+                ):
+                    with transaction(connection):
+                        connection.execute("INSERT INTO writes VALUES ('forbidden')")
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM writes").fetchone()[0], 0
+                )
+
+    def test_finish_metric_failure_never_makes_committed_write_look_retryable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            metrics_root = root / "metrics"
+            metrics_root.mkdir(mode=0o700)
+            database = root / "instrumented.sqlite3"
+            with connect(database) as connection:
+                connection.execute("CREATE TABLE writes(value TEXT NOT NULL)")
+                connection.commit()
+                calls = 0
+
+                def emit(_payload):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        raise storage_module.TransactionMetricsError(
+                            "fixture finish metric failure"
+                        )
+
+                with patch.dict(
+                    os.environ,
+                    {"DCAR_SQLITE_METRICS_FILE": str(metrics_root / "sqlite.jsonl")},
+                ), patch.object(storage_module, "_emit_transaction_metric", side_effect=emit):
+                    with transaction(connection):
+                        connection.execute("INSERT INTO writes VALUES ('committed')")
+                self.assertEqual(calls, 2)
+                self.assertEqual(
+                    connection.execute("SELECT value FROM writes").fetchone()[0],
+                    "committed",
+                )
+
+    def test_read_only_connection_sees_uncheckpointed_wal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "wal-visible.sqlite3"
+            writer = sqlite3.connect(database)
+            try:
+                self.assertEqual(
+                    writer.execute("PRAGMA journal_mode=WAL").fetchone()[0],
+                    "wal",
+                )
+                writer.execute("CREATE TABLE visible(value TEXT NOT NULL)")
+                writer.commit()
+                writer.execute("INSERT INTO visible VALUES ('from-wal')")
+                writer.commit()
+                self.assertTrue(Path(f"{database}-wal").is_file())
+
+                with live_wal_read_only_connections():
+                    with connect(database, read_only=True) as reader:
+                        self.assertEqual(reader.execute("PRAGMA query_only").fetchone()[0], 1)
+                        self.assertEqual(
+                            reader.execute("SELECT value FROM visible").fetchone()[0],
+                            "from-wal",
+                        )
+                        with self.assertRaises(sqlite3.OperationalError):
+                            reader.execute("INSERT INTO visible VALUES ('forbidden')")
+            finally:
+                writer.close()
+
+    def test_configured_default_database_prefers_explicit_runtime_path(self) -> None:
+        external = Path(
+            "/Users/mark/Library/Application Support/"
+            "DcarAIGC/data/dcar_insight.sqlite3"
+        )
+        with patch.dict(os.environ, {"DCAR_V8_DB": str(external)}):
+            self.assertEqual(storage_module.configured_default_database(), external)
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                storage_module.configured_default_database(),
+                storage_module.INSTALLED_DEFAULT_DB,
+            )
+
+    def test_installed_data_root_does_not_trust_home_environment(self) -> None:
+        with patch.dict(os.environ, {"HOME": "/tmp/untrusted-dcar-home"}):
+            self.assertEqual(
+                storage_module.installed_data_root(),
+                Path(storage_module.pwd.getpwuid(os.getuid()).pw_dir)
+                / "Library"
+                / "Application Support"
+                / "DcarAIGC"
+                / "data",
+            )
+
+    def test_runtime_legacy_defaults_use_installed_data_root(self) -> None:
+        from v8 import api as api_module
+        from v8 import migration as migration_module
+
+        self.assertEqual(
+            storage_module.INSTALLED_LEGACY_DB,
+            storage_module.INSTALLED_DATA_ROOT / "web_mvp.sqlite3",
+        )
+        self.assertEqual(api_module.DEFAULT_LEGACY_DB, storage_module.INSTALLED_LEGACY_DB)
+        self.assertEqual(migration_module.LEGACY_DB, storage_module.INSTALLED_LEGACY_DB)
+
+    def test_write_transactions_wait_in_process_instead_of_raising_busy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "serialized.sqlite3"
+            with connect(database) as connection:
+                connection.execute("CREATE TABLE writes(value TEXT NOT NULL)")
+                connection.commit()
+
+            first_started = threading.Event()
+            second_attempted = threading.Event()
+            release_first = threading.Event()
+
+            def first_write() -> None:
+                with connect(database) as connection, transaction(connection):
+                    connection.execute("INSERT INTO writes VALUES ('first')")
+                    first_started.set()
+                    if not release_first.wait(5):
+                        raise AssertionError("first transaction was not released")
+
+            def second_write() -> None:
+                if not first_started.wait(5):
+                    raise AssertionError("first transaction did not start")
+                with connect(database) as connection:
+                    connection.execute("PRAGMA busy_timeout = 1")
+                    second_attempted.set()
+                    with transaction(connection):
+                        connection.execute("INSERT INTO writes VALUES ('second')")
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                first = pool.submit(first_write)
+                second = pool.submit(second_write)
+                self.assertTrue(second_attempted.wait(5))
+                time.sleep(0.05)
+                release_first.set()
+                first.result(timeout=5)
+                second.result(timeout=5)
+
+            with connect(database) as connection:
+                self.assertEqual(
+                    [row["value"] for row in connection.execute(
+                        "SELECT value FROM writes ORDER BY rowid"
+                    )],
+                    ["first", "second"],
+                )
+
+    def _make_v16_account_fixture(self, database: Path) -> None:
+        from v8.operations import upsert_account, upsert_content
+
+        with connect(database) as connection:
+            initialize_historical_schema(connection, target_version=16)
+        account = upsert_account(
+            {
+                "phone": "13800138000",
+                "operator_name": "原运营人员",
+                "platforms": [{"platform": "douyin", "uid": "v16-account"}],
+            },
+            db_path=database,
+        )
+        upsert_content(
+            {
+                "platform": "douyin",
+                "canonical_url": "https://www.douyin.com/video/778899",
+                "account_uid": "v16-account",
+            },
+            db_path=database,
+        )
+        with connect(database) as connection:
+            connection.execute(
+                "UPDATE sqlite_sequence SET seq=1000 WHERE name='accounts'"
+            )
+            identity = connection.execute(
+                "SELECT id FROM account_platform_identities WHERE account_id=?",
+                (account["id"],),
+            ).fetchone()
+            connection.execute(
+                """INSERT INTO account_provider_references(
+                    account_identity_id,provider,reference_kind,reference_value,created_at,updated_at
+                ) VALUES (?,'TikHub','sec_user_id','MS4w.cached','2026-08-28','2026-08-28')""",
+                (identity["id"],),
+            )
+            connection.commit()
+
+    @patch.object(storage_module, "SCHEMA_VERSION", 17)
+    def test_optional_phone_migration_preserves_accounts_children_and_sequence(self) -> None:
+        # Seal the historical v17 uniqueness contract; v18's intentional
+        # repeated-phone behavior has its own migration/constraint test.
+        from v8.operations import upsert_account
+
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "v16.sqlite3"
+            self._make_v16_account_fixture(database)
+            with connect(database) as connection:
+                before = {
+                    table: [tuple(row) for row in connection.execute("SELECT * FROM " + table)]
+                    for table in ("accounts", "account_platform_identities", "account_provider_references", "content_items")
+                }
+                initialize_database(connection)
+                for table, rows in before.items():
+                    self.assertEqual(
+                        [tuple(row) for row in connection.execute("SELECT * FROM " + table)], rows
+                    )
+                self.assertFalse(connection.execute("PRAGMA foreign_key_check").fetchall())
+                self.assertTrue(schema_compatibility_state(connection)["compatible"])
+                self.assertEqual(
+                    connection.execute("PRAGMA foreign_key_list(account_platform_identities)").fetchone()["table"],
+                    "accounts",
+                )
+                changes = connection.total_changes
+                initialize_database(connection)
+                self.assertEqual(connection.total_changes, changes)
+            for uid in ("blank-phone-one", "blank-phone-two"):
+                added = upsert_account(
+                    {"platforms": [{"platform": "douyin", "uid": uid}]}, db_path=database
+                )
+                self.assertGreater(added["id"], 1000)
+            with connect(database) as connection:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM accounts WHERE phone='' AND phone_normalized IS NULL"
+                    ).fetchone()[0], 2
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "UPDATE accounts SET phone_normalized='13800138000' WHERE id=?",
+                        (added["id"],),
+                    )
+
+    def test_optional_phone_migration_rolls_back_and_restores_foreign_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "v16.sqlite3"
+            self._make_v16_account_fixture(database)
+            with connect(database) as connection:
+                original_ddl = connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE name='accounts'"
+                ).fetchone()[0]
+                with patch.object(
+                    storage_module, "_migration_checkpoint", side_effect=RuntimeError("injected")
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "injected"):
+                        initialize_database(connection)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 16)
+                self.assertEqual(connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+                self.assertEqual(connection.execute("PRAGMA legacy_alter_table").fetchone()[0], 0)
+                self.assertEqual(
+                    connection.execute("SELECT sql FROM sqlite_master WHERE name='accounts'").fetchone()[0],
+                    original_ddl,
+                )
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM content_items").fetchone()[0], 1)
+                self.assertFalse(connection.execute("PRAGMA foreign_key_check").fetchall())
+                self.assertNotIn("accounts_v16_old", storage_module._table_names(connection))
+                initialize_database(connection)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
+
     def test_test_guard_rejects_formal_database(self) -> None:
         with patch.dict("os.environ", {"DCAR_TEST_DENY_FORMAL_DB": "1"}):
             with self.assertRaisesRegex(RuntimeError, "formal DCar database"):
@@ -43,6 +376,22 @@ class V8StorageTest(unittest.TestCase):
                 self.assertRaisesRegex(RuntimeError, "formal DCar database"),
             ):
                 connect(alias)
+
+    def test_test_guard_recognizes_installed_formal_path_without_env(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            installed = root / "Application Support" / "DcarAIGC" / "data" / "dcar_insight.sqlite3"
+            installed.parent.mkdir(parents=True)
+            installed.write_bytes(b"formal-sentinel")
+            retired_checkout = root / "checkout" / "app" / "data" / "dcar_insight.sqlite3"
+            with (
+                patch.object(storage_module, "DEFAULT_DB", retired_checkout),
+                patch.object(storage_module, "INSTALLED_DEFAULT_DB", installed),
+                patch.object(storage_module, "CHECKOUT_DEFAULT_DB", retired_checkout),
+                patch.dict("os.environ", {"DCAR_TEST_DENY_FORMAL_DB": "1"}),
+                self.assertRaisesRegex(RuntimeError, "formal DCar database"),
+            ):
+                connect(installed)
 
     def test_database_path_comparison_canonicalizes_missing_targets(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -229,6 +578,17 @@ class V8StorageTest(unittest.TestCase):
                     "scheduler_run_attempts",
                     "migration_audit",
                     "migration_row_audit",
+                    "account_roster_snapshots",
+                    "account_roster_members",
+                    "account_metric_observations",
+                    "acquisition_profile_activations",
+                    "activation_cancellations",
+                    "account_state_events",
+                    "scan_verification_receipts",
+                    "profile_day_coverage_receipts",
+                    "runtime_receipt_revocations",
+                    "pipeline_paid_drain_events",
+                    "paid_provider_dispatch_events",
                 }
                 self.assertEqual(required - tables, set())
                 self.assertEqual(

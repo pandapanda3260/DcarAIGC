@@ -17,9 +17,12 @@ from unittest.mock import patch
 
 from scripts import materialize_full_history_discovery_cache as replay
 from scripts import run_full_history_cache_batches as batches
+from tests.roster_fixture import accept_roster
 from v8.capture import ProviderResult, claim_content_slot, execute_account_fetch
 from v8.operations import upsert_account, upsert_content
-from v8.storage import connect, initialize_database
+from v8.paid_identity import build_paid_request_identity
+from v8.providers import ensure_operational_budget
+from v8.storage import connect, initialize_database, now_utc
 
 
 class FullHistoryCacheBatchControllerTest(unittest.TestCase):
@@ -48,6 +51,23 @@ class FullHistoryCacheBatchControllerTest(unittest.TestCase):
             db_path=self.db,
         )
         self.account_id = int(account["id"])
+        with closing(connect(self.db)) as connection:
+            accept_roster(connection, accepted_at="2026-05-01T00:00:00Z")
+            identity_id = int(
+                connection.execute(
+                    "SELECT id FROM account_platform_identities WHERE account_id=?",
+                    (self.account_id,),
+                ).fetchone()[0]
+            )
+            stamp = now_utc()
+            connection.execute(
+                """INSERT INTO account_provider_references(
+                       account_identity_id,provider,reference_kind,reference_value,
+                       created_at,updated_at
+                   ) VALUES (?,'TikHub','sec_user_id','batch-fixture-sec-user',?,?)""",
+                (identity_id, stamp, stamp),
+            )
+            connection.commit()
         self.items: list[dict[str, object]] = []
         self.content_ids: list[int] = []
         for index in range(5):
@@ -98,6 +118,24 @@ class FullHistoryCacheBatchControllerTest(unittest.TestCase):
             ),
             db_path=self.db,
             raw_root=self.raw_root,
+            budget_id=ensure_operational_budget(
+                provider="TikHub", operation="douyin_user_posts", price=0.001,
+                db_path=self.db,
+            ),
+            paid_request_identity=build_paid_request_identity(
+                provider="TikHub",
+                operation="douyin_user_posts",
+                platform="douyin",
+                subject="batch-fixture-sec-user",
+                request_parameters={
+                    "sec_user_id": "batch-fixture-sec-user",
+                    "max_cursor": 0,
+                    "count": 20,
+                    "sort_type": 0,
+                },
+                cursor=None,
+                due_bucket="range:batch:test:page-001",
+            ),
         )
         with closing(connect(self.db)) as connection:
             connection.execute(
@@ -174,7 +212,7 @@ class FullHistoryCacheBatchControllerTest(unittest.TestCase):
             f"file:{self.db}?mode=ro&immutable=1", uri=True
         )
         try:
-            return tuple(
+            slots, attempts, raw_responses, artifacts, metrics = (
                 int(row[0])
                 for row in connection.execute(
                     "SELECT COUNT(*) FROM fetch_slots "
@@ -184,6 +222,7 @@ class FullHistoryCacheBatchControllerTest(unittest.TestCase):
                     "UNION ALL SELECT COUNT(*) FROM content_metric_snapshots"
                 ).fetchall()
             )
+            return slots, attempts, raw_responses, artifacts, metrics
         finally:
             connection.close()
 
@@ -250,7 +289,9 @@ class FullHistoryCacheBatchControllerTest(unittest.TestCase):
         self.assertEqual(second["completed"], 5)
         self.assertEqual(second["remaining"], 0)
         self.assertEqual(second["receipts_total"], 3)
-        self.assertEqual(second["completion"]["missing_media_urls"], 0)
+        completion = second["completion"]
+        assert isinstance(completion, dict)
+        self.assertEqual(completion["missing_media_urls"], 0)
         self.assertEqual(self._counts(), (6, 6, 6, 5, 0))
         self.assertEqual(replay._usage_snapshot(self.db), before_usage)
         self.assertFalse(Path(f"{self.db}-wal").exists())
@@ -295,24 +336,22 @@ class FullHistoryCacheBatchControllerTest(unittest.TestCase):
         self.assertEqual(self._counts(), counts_after_crash)
 
     def test_orphan_output_cleanup_is_durable_across_second_crash(self) -> None:
-        orphan: Path | None = None
-        original_atomic_bytes = batches.capture_module._atomic_bytes
+        orphans: list[Path] = []
+        original_write_raw = batches.capture_module.write_zstd_raw_evidence
 
-        def commit_raw_then_crash(path: Path, value: bytes) -> None:
-            nonlocal orphan
-            original_atomic_bytes(path, value)
-            orphan = path
+        def commit_raw_then_crash(*args: object, **kwargs: object) -> object:
+            receipt = original_write_raw(*args, **kwargs)
+            orphans.extend([receipt.path, receipt.sidecar_path])
             raise RuntimeError("fixture orphan after file commit")
 
         with patch.object(
             batches.capture_module,
-            "_atomic_bytes",
+            "write_zstd_raw_evidence",
             side_effect=commit_raw_then_crash,
         ), self.assertRaisesRegex(replay.CacheReplayError, "缓存详情物化失败"):
             self._run(max_batches=1)
-        self.assertIsNotNone(orphan)
-        assert orphan is not None
-        self.assertTrue(orphan.is_file())
+        self.assertEqual(len(orphans), 2)
+        self.assertTrue(all(path.is_file() for path in orphans))
         original_atomic_json = batches._atomic_json
 
         def crash_before_cleanup_receipt(path: Path, value: object) -> str:
@@ -334,7 +373,7 @@ class FullHistoryCacheBatchControllerTest(unittest.TestCase):
         )
         self.assertTrue(cleanup_intent.is_file())
         self.assertFalse(cleanup_receipt.exists())
-        self.assertFalse(orphan.exists())
+        self.assertTrue(all(not path.exists() for path in orphans))
 
         resumed = self._run(max_batches=1)
         self.assertEqual(resumed["status"], "partial")
@@ -344,19 +383,21 @@ class FullHistoryCacheBatchControllerTest(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        self.assertEqual(receipt["output_cleanup"]["files"], 1)
+        self.assertEqual(receipt["output_cleanup"]["files"], 2)
 
     def test_repeated_raw_orphans_append_cleanup_rounds(self) -> None:
-        original_atomic_bytes = batches.capture_module._atomic_bytes
+        original_publish = batches.raw_evidence_module._publish_no_replace
 
-        def commit_raw_then_crash(path: Path, value: bytes) -> None:
-            original_atomic_bytes(path, value)
+        def commit_raw_then_crash(
+            path: Path, value: bytes, **kwargs: object
+        ) -> None:
+            original_publish(path, value, **kwargs)
             raise RuntimeError("fixture repeated raw orphan")
 
         for _attempt in range(2):
             with patch.object(
-                batches.capture_module,
-                "_atomic_bytes",
+                batches.raw_evidence_module,
+                "_publish_no_replace",
                 side_effect=commit_raw_then_crash,
             ), self.assertRaisesRegex(
                 replay.CacheReplayError, "缓存详情物化失败"
@@ -390,6 +431,23 @@ class FullHistoryCacheBatchControllerTest(unittest.TestCase):
         )
         completed = self._run()
         self.assertEqual(completed["status"], "succeeded")
+        completion = completed["completion"]
+        assert isinstance(completion, dict)
+        fault_evidence = completion["scheduler_fault_receipts"]
+        self.assertEqual(fault_evidence["new_rows"], 1)
+        contract = json.loads(
+            (self.run_root / "run-contract.json").read_text(encoding="utf-8")
+        )
+        baseline_scheduler = contract["baseline"]["scheduler_runs"]
+        baseline_sequence = int(baseline_scheduler["sequence"]["seq"] or 0)
+        self.assertEqual(
+            fault_evidence["sequence"],
+            {"present": True, "seq": baseline_sequence + 1},
+        )
+        self.assertEqual(
+            receipt["critical_unchanged"]["protected"]["scheduler_runs"],
+            baseline_scheduler,
+        )
         tampered = json.loads(first_receipt.read_text(encoding="utf-8"))
         tampered["status"] = "tampered"
         first_receipt.write_text(
@@ -398,6 +456,48 @@ class FullHistoryCacheBatchControllerTest(unittest.TestCase):
         )
         with self.assertRaises(batches.BatchReplayError):
             self._run()
+
+    def test_zero_byte_sidecar_reservation_is_durably_cleaned(self) -> None:
+        original_publish = batches.raw_evidence_module._publish_no_replace
+        reserved_sidecar: Path | None = None
+
+        def reserve_sidecar_then_crash(
+            path: Path, value: bytes, **kwargs: object
+        ) -> None:
+            nonlocal reserved_sidecar
+            if path.name.endswith(".metadata.json"):
+                descriptor = os.open(
+                    path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+                os.close(descriptor)
+                reserved_sidecar = path
+                raise RuntimeError("fixture sidecar reservation crash")
+            original_publish(path, value, **kwargs)
+
+        with patch.object(
+            batches.raw_evidence_module,
+            "_publish_no_replace",
+            side_effect=reserve_sidecar_then_crash,
+        ), self.assertRaisesRegex(replay.CacheReplayError, "缓存详情物化失败"):
+            self._run(max_batches=1)
+        self.assertIsNotNone(reserved_sidecar)
+        assert reserved_sidecar is not None
+        self.assertEqual(reserved_sidecar.stat().st_size, 0)
+        raw_path = Path(str(reserved_sidecar)[: -len(".metadata.json")])
+        self.assertTrue(raw_path.is_file())
+
+        resumed = self._run(max_batches=1)
+        self.assertEqual(resumed["status"], "partial")
+        self.assertFalse(raw_path.exists())
+        self.assertFalse(reserved_sidecar.exists())
+        receipt = json.loads(
+            (self.run_root / "batches/batch-000001.receipt.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(receipt["output_cleanup"]["files"], 2)
 
     def test_repeated_media_temp_and_final_orphans_append_cleanup_rounds(
         self,
@@ -557,20 +657,27 @@ class FullHistoryCacheBatchControllerTest(unittest.TestCase):
     def test_partial_atomic_raw_temp_is_cleaned_and_retried(self) -> None:
         before_usage = replay._usage_snapshot(self.db)
 
-        def partial_atomic_raw(path: Path, value: bytes) -> None:
+        def partial_atomic_raw(
+            path: Path, entity_bytes: bytes, **_kwargs: object
+        ) -> None:
             path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = path.with_name(f".{path.name}.tmp")
-            temporary.write_bytes(value[: max(1, len(value) // 2)])
+            temporary = path.with_name(f".{path.name}.{'a' * 24}.tmp")
+            stored = batches.raw_evidence_module.compress_entity_bytes(entity_bytes)
+            temporary.write_bytes(stored[: max(1, len(stored) // 2)])
             raise RuntimeError("fixture partial atomic raw")
 
         with patch.object(
             batches.capture_module,
-            "_atomic_bytes",
+            "write_zstd_raw_evidence",
             side_effect=partial_atomic_raw,
         ), self.assertRaisesRegex(replay.CacheReplayError, "缓存详情物化失败"):
             self._run(max_batches=1)
         leftovers = list(self.derived_root.rglob("*.tmp"))
         self.assertEqual(len(leftovers), 1)
+        self.assertRegex(
+            leftovers[0].name,
+            r"^\.scope-[0-9a-f]{64}-sequence-0001\.json\.zst\.[0-9a-f]{24}\.tmp$",
+        )
 
         resumed = self._run(max_batches=1)
         self.assertEqual(resumed["status"], "partial")
@@ -588,6 +695,7 @@ class FullHistoryCacheBatchControllerTest(unittest.TestCase):
 
         def claim_then_forge(_index: int, content_ids: object) -> None:
             nonlocal fake
+            assert isinstance(content_ids, (list, tuple))
             content_id = int(list(content_ids)[0])
             claim = claim_content_slot(
                 db_path=self.db,
@@ -632,15 +740,31 @@ class FullHistoryCacheBatchControllerTest(unittest.TestCase):
             with closing(
                 sqlite3.connect(f"file:{self.db}?mode=ro&immutable=1", uri=True)
             ) as connection:
-                stored_path, sha256 = connection.execute(
+                stored_path = connection.execute(
                     """
-                    SELECT local_path,sha256 FROM provider_raw_responses
+                    SELECT local_path FROM provider_raw_responses
                     WHERE source='derived_applied' ORDER BY id LIMIT 1
                     """
-                ).fetchone()
+                ).fetchone()[0]
             source = batches._resolve_stored_path(str(stored_path))
-            forged = source.with_name(f"attempt-999-{str(sha256)[:12]}.json")
-            shutil.copy2(source, forged)
+            forged = source.with_name(f"scope-{'a' * 64}-sequence-0999.json.zst")
+            entity = batches.raw_evidence_module.read_raw_evidence(source).entity_bytes
+            forged_receipt = batches.raw_evidence_module.write_zstd_raw_evidence(
+                forged,
+                entity,
+                provider="TikHub",
+                operation="douyin_video_detail",
+                response_identity=batches._raw_response_identity(
+                    provider="TikHub",
+                    operation="douyin_video_detail",
+                    scope_identity="a" * 64,
+                    sequence=999,
+                ),
+                paid_scope_identity="a" * 64,
+                sequence=999,
+                evidence_root=self.derived_root,
+            )
+            self.assertTrue(forged_receipt.sidecar_path.is_file())
             raise RuntimeError("fixture forged final raw")
 
         with self.assertRaisesRegex(RuntimeError, "forged final raw"):
@@ -651,6 +775,9 @@ class FullHistoryCacheBatchControllerTest(unittest.TestCase):
         ):
             self._run(max_batches=1)
         self.assertTrue(forged.is_file())
+        self.assertTrue(
+            batches.raw_evidence_module.sidecar_path_for(forged).is_file()
+        )
         self.assertFalse(
             (
                 self.run_root
@@ -660,6 +787,7 @@ class FullHistoryCacheBatchControllerTest(unittest.TestCase):
 
     def test_stale_attempt_raw_temp_is_preserved_and_blocks_resume(self) -> None:
         def claim_then_interrupt(_index: int, content_ids: object) -> None:
+            assert isinstance(content_ids, (list, tuple))
             claim_content_slot(
                 db_path=self.db,
                 content_id=int(list(content_ids)[0]),
@@ -721,6 +849,7 @@ class FullHistoryCacheBatchControllerTest(unittest.TestCase):
         candidate = initial_plan.candidates[0]
 
         def claim_then_interrupt(_index: int, content_ids: object) -> None:
+            assert isinstance(content_ids, (list, tuple))
             claim_content_slot(
                 db_path=self.db,
                 content_id=int(list(content_ids)[0]),
@@ -761,19 +890,49 @@ class FullHistoryCacheBatchControllerTest(unittest.TestCase):
             / "tikhub"
             / str(first)
             / "douyin_video_detail"
-            / (
-                "attempt-001-"
-                f"{str(evidence['expected_detail_raw_sha256'])[:12]}.json"
-            )
         )
-        stale.parent.mkdir(parents=True, exist_ok=True)
-        stale.write_bytes(body)
+        with closing(
+            sqlite3.connect(f"file:{self.db}?mode=ro&immutable=1", uri=True)
+        ) as connection:
+            slot_id = int(
+                connection.execute(
+                    """
+                    SELECT id FROM fetch_slots
+                    WHERE content_id=? AND stage='detail' AND window_key='lifetime'
+                    """,
+                    (first,),
+                ).fetchone()[0]
+            )
+        scope_identity = batches.capture_module.raw_scope_identity(
+            provider="TikHub",
+            slot_id=slot_id,
+            stage="detail",
+            window_key="lifetime",
+            attempt_number=1,
+        )
+        stale = stale / f"scope-{scope_identity}-sequence-0001.json.zst"
+        stale_receipt = batches.raw_evidence_module.write_zstd_raw_evidence(
+            stale,
+            body,
+            provider="TikHub",
+            operation="douyin_video_detail",
+            response_identity=batches._raw_response_identity(
+                provider="TikHub",
+                operation="douyin_video_detail",
+                scope_identity=scope_identity,
+                sequence=1,
+            ),
+            paid_scope_identity=scope_identity,
+            sequence=1,
+            evidence_root=self.derived_root,
+        )
 
         with self.assertRaisesRegex(
             batches.BatchReplayError, "未绑定 pending attempt"
         ):
             self._run(max_batches=1)
         self.assertTrue(stale.is_file())
+        self.assertTrue(stale_receipt.sidecar_path.is_file())
 
     def test_partial_atomic_media_temp_is_cleaned_and_replayed(self) -> None:
         before_usage = replay._usage_snapshot(self.db)
@@ -1074,6 +1233,7 @@ class FullHistoryCacheBatchControllerTest(unittest.TestCase):
 
     def test_running_detail_slot_is_recovered_before_plan_and_retried(self) -> None:
         def interrupt_after_claim(_index: int, content_ids: object) -> None:
+            assert isinstance(content_ids, (list, tuple))
             first = list(content_ids)[0]
             claim_content_slot(
                 db_path=self.db,
@@ -1213,6 +1373,71 @@ class FullHistoryCacheBatchControllerTest(unittest.TestCase):
             (self.run_root / "batches/batch-000001.receipt.json").exists()
         )
 
+    def test_scheduler_runs_historical_prefix_drift_is_blocked(self) -> None:
+        def tamper_scheduler_prefix(_index: int, _content_ids: object) -> None:
+            with closing(connect(self.db)) as connection:
+                connection.execute(
+                    "UPDATE scheduler_runs SET details_json=details_json || ' ' "
+                    "WHERE id=(SELECT MIN(id) FROM scheduler_runs)"
+                )
+                connection.commit()
+            replay._finalize_disposable_database(self.db)
+
+        with self.assertRaisesRegex(
+            batches.BatchReplayError, "scheduler_runs 历史前缀"
+        ):
+            self._run(max_batches=1, before_batch_apply=tamper_scheduler_prefix)
+
+    def test_unbound_storage_fault_receipt_is_blocked(self) -> None:
+        def append_unbound_fault(_index: int, _applied: object) -> None:
+            captured_at = now_utc()
+            with closing(connect(self.db)) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                batches.capture_module.record_fault_state(
+                    connection,
+                    scope_kind="storage_hard",
+                    fault_class="local_evidence_store",
+                    reason="storage_hard",
+                    usage_id=None,
+                    at=captured_at,
+                    state_evidence={
+                        "error_code": "storage_hard",
+                        "raw_root": str(self.derived_root.resolve()),
+                    },
+                )
+                connection.commit()
+            replay._finalize_disposable_database(self.db)
+
+        with self.assertRaisesRegex(
+            batches.BatchReplayError, "不是本批 storage_hard receipt"
+        ):
+            self._run(max_batches=1, after_batch_applied=append_unbound_fault)
+
+    def test_scheduler_runs_sequence_drift_is_blocked(self) -> None:
+        def partial_atomic_raw(
+            path: Path, entity_bytes: bytes, **_kwargs: object
+        ) -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            raise RuntimeError("fixture storage fault before sequence drift")
+
+        with patch.object(
+            batches.capture_module,
+            "write_zstd_raw_evidence",
+            side_effect=partial_atomic_raw,
+        ), self.assertRaisesRegex(replay.CacheReplayError, "缓存详情物化失败"):
+            self._run(max_batches=1)
+        with closing(connect(self.db)) as connection:
+            connection.execute(
+                "UPDATE sqlite_sequence SET seq=seq+1 WHERE name='scheduler_runs'"
+            )
+            connection.commit()
+        replay._finalize_disposable_database(self.db)
+
+        with self.assertRaisesRegex(
+            batches.BatchReplayError, "scheduler_runs sqlite_sequence"
+        ):
+            self._run(max_batches=1)
+
     def test_derived_detail_body_must_match_frozen_discovery_item(self) -> None:
         original = replay.apply_replay_plan
 
@@ -1230,7 +1455,9 @@ class FullHistoryCacheBatchControllerTest(unittest.TestCase):
             self.assertIsNotNone(row)
             raw_id, stored_path = int(row[0]), str(row[1])
             raw_path = batches._resolve_stored_path(stored_path)
-            value = json.loads(raw_path.read_text(encoding="utf-8"))
+            metadata_path = batches.raw_evidence_module.sidecar_path_for(raw_path)
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            value = batches.raw_evidence_module.read_raw_json(raw_path)
             value["data"]["title"] = "被篡改但重新计算哈希的标题"
             body = (
                 json.dumps(
@@ -1242,19 +1469,24 @@ class FullHistoryCacheBatchControllerTest(unittest.TestCase):
                 )
                 + "\n"
             ).encode("utf-8")
-            digest = replay._sha256_bytes(body)
-            target = raw_path.with_name(
-                f"{raw_path.stem.rsplit('-', 1)[0]}-{digest[:12]}.json"
-            )
-            target.write_bytes(body)
             raw_path.unlink()
+            metadata_path.unlink()
+            receipt = batches.raw_evidence_module.write_zstd_raw_evidence(
+                raw_path,
+                body,
+                provider=str(metadata["provider"]),
+                operation=str(metadata["operation"]),
+                response_identity=str(metadata["response_identity"]),
+                paid_scope_identity=str(metadata["paid_scope_identity"]),
+                sequence=int(metadata["sequence"]),
+                evidence_root=self.derived_root,
+            )
             with closing(connect(self.db)) as connection:
                 connection.execute(
                     """
-                    UPDATE provider_raw_responses
-                    SET local_path=?,sha256=?,byte_size=? WHERE id=?
+                    UPDATE provider_raw_responses SET sha256=?,byte_size=? WHERE id=?
                     """,
-                    (str(target), digest, len(body), raw_id),
+                    (receipt.stored_sha256, receipt.stored_size, raw_id),
                 )
                 connection.commit()
             replay._finalize_disposable_database(self.db)
@@ -1266,6 +1498,34 @@ class FullHistoryCacheBatchControllerTest(unittest.TestCase):
             batches.BatchReplayError, "批次证据文件哈希或字节数漂移"
         ):
             self._run(max_batches=1)
+
+    def test_registered_sidecar_tamper_is_rejected(self) -> None:
+        self._run(max_batches=1)
+        with closing(
+            sqlite3.connect(f"file:{self.db}?mode=ro&immutable=1", uri=True)
+        ) as connection:
+            stored_path = connection.execute(
+                """
+                SELECT local_path FROM provider_raw_responses
+                WHERE source='derived_applied' ORDER BY id LIMIT 1
+                """
+            ).fetchone()[0]
+        raw_path = batches._resolve_stored_path(str(stored_path))
+        sidecar_path = batches.raw_evidence_module.sidecar_path_for(raw_path)
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        sidecar["response_identity"] = "f" * 64
+        sidecar_path.write_bytes(
+            batches.raw_evidence_module.canonical_json_bytes(sidecar)
+        )
+        sidecar_path.chmod(0o600)
+
+        with self.assertRaisesRegex(
+            batches.BatchReplayError,
+            "派生 raw sidecar 未绑定详情尝试",
+        ):
+            self._run()
+        self.assertTrue(raw_path.is_file())
+        self.assertTrue(sidecar_path.is_file())
 
     def test_media_metadata_must_match_manifest_urls(self) -> None:
         original = replay.apply_replay_plan

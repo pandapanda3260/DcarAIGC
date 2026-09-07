@@ -25,6 +25,19 @@ freeze = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(freeze)
 
 
+def _mock_catchup_thread(catchup_thread):
+    real_thread = api.threading.Thread
+
+    def create_thread(*args, **kwargs):
+        if kwargs.get("name") == "dcar-startup-catchup":
+            return catchup_thread
+        # The writer command executor has its own real worker. It must not
+        # count as, or prevent execution of, the report catchup thread.
+        return real_thread(*args, **kwargs)
+
+    return patch.object(api.threading, "Thread", side_effect=create_thread)
+
+
 class PrepareV9FreezeTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -194,13 +207,16 @@ class ProductionFreezeLifespanTest(unittest.IsolatedAsyncioTestCase):
             lock = Path(temp) / "operator-freeze.lock"
             lock.touch()
             config = api.ApiConfig(
-                db_path=api.DEFAULT_DB,
+                db_path=root / "formal.sqlite3",
                 reports_root=root / "reports",
                 legacy_db_path=root / "legacy.sqlite3",
                 operator_freeze_lock=lock,
             )
             application = api.create_app(config)
-            with patch.object(api, "initialize_database") as initialize:
+            with (
+                patch.object(api, "_uses_formal_database", return_value=True),
+                patch.object(api, "initialize_database") as initialize,
+            ):
                 with self.assertRaisesRegex(RuntimeError, "operator freeze lock"):
                     async with api.lifespan(application):
                         pass
@@ -248,13 +264,9 @@ class ApiConfigTest(unittest.TestCase):
             'startup_catchup_enabled="${DCAR_STARTUP_CATCHUP_ENABLED:-0}"',
             source,
         )
-        self.assertIn(
-            'daily_capture_reconcile_from="${DCAR_DAILY_CAPTURE_RECONCILE_FROM:-}"',
-            source,
-        )
         self.assertIn('if [[ "$scheduler_enabled" != "0" ]]', source)
         self.assertIn('if [[ "$startup_catchup_enabled" != "0" ]]', source)
-        self.assertIn('if [[ -n "$daily_capture_reconcile_from" ]]', source)
+        self.assertIn("unset DCAR_DAILY_CAPTURE_RECONCILE_FROM", source)
         self.assertIn('api_upstream="http://127.0.0.1:8766"', source)
         self.assertIn('api_upstream="http://127.0.0.1:8765"', source)
         self.assertIn('health.get("mode") == "local_v8"', source)
@@ -344,7 +356,7 @@ class ApiLifespanSwitchTest(unittest.IsolatedAsyncioTestCase):
                 with (
                     patch.object(api, "BackgroundScheduler", return_value=scheduler),
                     patch.object(api, "install_jobs") as install_jobs,
-                    patch.object(api.threading, "Thread", return_value=catchup_thread),
+                    _mock_catchup_thread(catchup_thread),
                     patch.object(
                         api,
                         "recover_stale_fetch_slots",
@@ -438,7 +450,7 @@ class ApiLifespanSwitchTest(unittest.IsolatedAsyncioTestCase):
             with (
                 patch.object(api, "BackgroundScheduler", return_value=scheduler),
                 patch.object(api, "install_jobs") as install_jobs,
-                patch.object(api.threading, "Thread", return_value=catchup_thread),
+                _mock_catchup_thread(catchup_thread),
                 patch.object(
                     api,
                     "recover_stale_fetch_slots",
@@ -539,7 +551,7 @@ class ApiLifespanSwitchTest(unittest.IsolatedAsyncioTestCase):
             with (
                 patch.object(api, "BackgroundScheduler", return_value=scheduler),
                 patch.object(api, "install_jobs") as install_jobs,
-                patch.object(api.threading, "Thread", return_value=catchup_thread),
+                _mock_catchup_thread(catchup_thread),
                 patch.object(
                     api,
                     "recover_stale_fetch_slots",

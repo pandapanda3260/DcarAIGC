@@ -1,4 +1,12 @@
-export type Section = "overview" | "tasks" | "accounts" | "contents" | "selling-points" | "spu-audience";
+export type Section = "overview" | "tasks" | "accounts" | "contents" | "selling-points" | "spu-audience" | "users";
+export type UserRole = "superadmin" | "admin" | "operator" | "new_user";
+export type UserStatus = "active" | "disabled";
+export type AuthSession = { authenticated: true; username: string; role?: UserRole };
+export type ManagedUser = {
+  username: string; phone: string | null; role: UserRole; status: UserStatus;
+  created_at: string; password_updated_at: string;
+};
+export type ManagedUsersResult = { actor: { username: string; role: UserRole }; items: ManagedUser[] };
 export type WindowKey = "yesterday" | "this_week" | "last_week";
 export type OverviewChannelKey = "douyin" | "xiaohongshu";
 export type BusinessSceneKey = "used_car" | "new_car" | "media";
@@ -179,22 +187,25 @@ export type ReportView = {
 };
 
 export type PlatformIdentity = {
+  id: number;
   platform: string;
-  uid: string;
+  uid: string | null;
   nickname: string;
   real_name_status: string;
+  avatar_url: string | null;
+  unique_id: string | null;
+  matrix_account_id: string | null;
+  profile_ref: string | null;
+  monitoring_status: "monitored" | "not_monitored" | "unknown";
+  authorization_status: "authorized" | "unauthorized" | "unknown";
   follower_count: number | null;
+  platform_work_count: number | null;
   content_count: number;
+  data_date: string | null;
+  data_status: string;
 };
 
-export type PendingPlatformIdentity = {
-  platform: string;
-  uid: string;
-  nickname: string;
-  content_count: number;
-  first_published_at: string | null;
-  last_published_at: string | null;
-};
+export type AccountStatus = "daily" | "weekly" | "paused" | "unmarked";
 
 export type Account = {
   id: number;
@@ -202,8 +213,28 @@ export type Account = {
   operator_name: string;
   account_type: string;
   content_direction: string;
+  account_status: AccountStatus;
+  update_frequency: "daily" | "weekly" | null;
   enabled: boolean;
   platforms: PlatformIdentity[];
+};
+
+export type AccountRosterStatus = {
+  ready: boolean;
+  active_profile_id: "matrix_hybrid_v1" | "tikhub_managed_v1" | "integrated_route_v1" | null;
+  activation_id: number | null;
+  source_family: "matrix" | "system";
+  snapshot_id: number | null;
+  pending_snapshot_id: number | null;
+  source_type: string | null;
+  source_captured_at: string | null;
+  accepted_at: string | null;
+  current_count: number;
+  unresolved_count: number;
+  pending_removal_count: number;
+  sync_mode: string;
+  message: string;
+  diff?: Record<string, unknown>;
 };
 
 export type DouyinAuthorizationState = "active" | "unbound" | "pending_match";
@@ -278,6 +309,7 @@ export type ContentItem = {
   evaluation_is_stale: boolean;
   view_count: number | null;
   comment_count: number | null;
+  like_count: number | null;
   metrics_captured_at: string | null;
   duplicate_original_link_id: string | null;
   spu: ContentTagSpu | null;
@@ -285,6 +317,47 @@ export type ContentItem = {
   spu_gray_count: number;
   audience: ContentTagAudience | null;
   scenes: ContentTagScene[];
+  // 列表接口的非数据库字段：writer 按证据台账投影，只读副本仅投影有效保留预览；只决定媒体框样式与去向
+  local_media_available: boolean;
+};
+
+export type EvidenceMedia = {
+  artifact_id: number; index: number; kind: "video" | "image"; name: string; url: string;
+  bundle_id?: string; member_id?: string; original_index?: number;
+  sha256?: string; byte_size?: number; available?: boolean;
+};
+
+export type MediaLifecycle = {
+  bundle_id: string; state: string; operation_state: string;
+  reason: string; http_status: number; read_only: boolean;
+  can_restore: boolean; can_reprocess: boolean; can_reacquire: boolean;
+  archive_verified_at: string | null; delete_due_at: string | null; deleted_at: string | null;
+  registered_at: string; original_artifact_id: number; original_member_count: number; original_bytes: number;
+  evidence_cutoff: unknown; protections: Record<string, unknown>; last_error: string | null;
+  restore_request: { status: string; run_id?: number; requested_at?: string } | null;
+  completion_gate_aged: { reason: string; first_listed_at: string } | null;
+};
+
+export type MediaLifecycleSummary = {
+  read_only: boolean; snapshot_only: boolean; as_of: string;
+  snapshot_captured_at?: string | null; snapshot_lag_seconds?: number | null;
+  counts: Record<string, number>; totals: Record<string, number>;
+  manual_count: number | null; manual_bytes: number | null; manual_longest_age_seconds: number | null;
+  earliest_delete_due_at: string | null; archive_root_health: string;
+  latest_jobs: Array<{ id: number; job_id: string; status: string; completed_at: string | null; reason?: string | null }>;
+  manual_todos: Array<{ bundle_id: string; content_id: number; link_id: string;
+    registered_at?: string | null; registered_bytes: number | null; member_count: number | null;
+    age_seconds: number | null; protected: boolean; evidence_ready?: boolean;
+    account_id?: number | null; platform?: string | null; account_uid?: string | null; account_name?: string | null;
+    latest_processing?: { processor_type: string; status: string; attempt_count: number; updated_at: string } | null;
+    protections?: Record<string, unknown>;
+    first_listed_at: string; last_error: string | null; blockers: string[]; resolution: string | null }>;
+  blocker_groups?: Array<{ category: string; count: number; registered_bytes: number | null }>;
+  expiry_debt?: Array<{ bundle_id: string; content_id: number; link_id: string;
+    account_id?: number | null; platform?: string | null; registered_bytes: number | null;
+    delete_due_at: string; overdue_seconds: number | null; operation_state: string;
+    delay_reason: string; protected: boolean; last_error: string | null }>;
+  expiry_debt_bytes?: number | null; expiry_debt_longest_overdue_seconds?: number | null;
 };
 
 export type EvidenceBundle = {
@@ -293,8 +366,11 @@ export type EvidenceBundle = {
   evaluation_freshness: "current" | "stale" | "missing";
   evaluation_is_stale: boolean;
   evaluation: Record<string, unknown> | null;
-  media: Array<{ artifact_id: number; index: number; kind: "video" | "image"; name: string; url: string }>;
-  media_availability: { status: "available" | "omitted" | "missing"; reason: string };
+  media: EvidenceMedia[];
+  media_availability: { status: "available" | "omitted" | "missing" | "unavailable"; reason: string; code?: string };
+  previews?: EvidenceMedia[];
+  media_lifecycle?: MediaLifecycle | null;
+  read_only?: boolean;
   asr: { status: string; model: string | null; text: string };
   ocr: { status: string; observation_count: number; text: string };
   comments: {

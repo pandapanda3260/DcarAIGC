@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -19,6 +19,17 @@ from unittest.mock import patch
 
 import v8.storage as storage
 from tests.schema_fixture import initialize_historical_schema
+
+# ``unittest discover -s tests`` imports this file as a top-level module while
+# sibling tests import it through the ``tests`` package.  Alias both spellings
+# before loading the dynamic CLI fixtures so a discovery run cannot create two
+# installer modules with distinct exception and contract identities.
+_THIS_MODULE = sys.modules[__name__]
+for _MODULE_ALIAS in (
+    "test_install_writer_database_candidate",
+    "tests.test_install_writer_database_candidate",
+):
+    sys.modules.setdefault(_MODULE_ALIAS, _THIS_MODULE)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -49,6 +60,11 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+@contextmanager
+def _isolated_formal_mutation(database: Path):
+    yield database.resolve(strict=True)
 
 
 class WriterDatabaseCandidateInstallerTest(unittest.TestCase):
@@ -237,7 +253,6 @@ class WriterDatabaseCandidateInstallerTest(unittest.TestCase):
         with patch.multiple(
             migrator,
             PROJECT_ROOT=project,
-            FORMAL_DATABASE=formal,
             CANONICAL_OPERATOR_FREEZE_LOCK=freeze,
         ):
             migrator.prepare_verified_backup(
@@ -248,6 +263,7 @@ class WriterDatabaseCandidateInstallerTest(unittest.TestCase):
                 freeze_lock=freeze,
                 migration_lock=migration_lock,
                 receipt=backup_receipt,
+                isolated=True,
                 holder_checker=lambda _: [],
             )
             migrator.build_migration_candidate(
@@ -260,6 +276,7 @@ class WriterDatabaseCandidateInstallerTest(unittest.TestCase):
                 migration_lock=migration_lock,
                 backup_receipt=backup_receipt,
                 receipt=migration_receipt,
+                isolated=True,
                 holder_checker=lambda _: [],
             )
         return {
@@ -291,12 +308,13 @@ class WriterDatabaseCandidateInstallerTest(unittest.TestCase):
 
     def _constant_patches(self, layout: dict[str, Path]) -> tuple[Any, Any, Any]:
         return (
-            patch.object(installer, "FORMAL_DATABASE", layout["formal"]),
-            patch.object(installer, "FORMAL_BACKUP_ROOT", layout["backups"]),
+            nullcontext(),
+            nullcontext(),
             patch.multiple(
                 installer,
                 PROJECT_ROOT=layout["project"],
                 CANONICAL_OPERATOR_FREEZE_LOCK=layout["lock"],
+                _formal_mutation_lease=_isolated_formal_mutation,
             ),
         )
 
@@ -960,19 +978,20 @@ class WriterDatabaseCandidateInstallerTest(unittest.TestCase):
             with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
                 installer.main(arguments[:-2])
 
-    def test_test_guard_refuses_actual_default_before_database_open(self) -> None:
+    def test_runtime_authority_refuses_before_database_open(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fake_formal = Path(temporary) / "never-open.sqlite3"
             with (
-                patch.dict(os.environ, {"DCAR_TEST_DENY_FORMAL_DB": "1"}),
-                patch.multiple(
+                patch.object(
                     installer,
-                    DEFAULT_DB=fake_formal,
-                    FORMAL_DATABASE=fake_formal,
+                    "hold_formal_mutation",
+                    side_effect=installer.RuntimeDatabaseError(
+                        "formal database identity unresolved"
+                    ),
                 ),
                 self.assertRaisesRegex(
                     installer.CandidateInstallError,
-                    "test process attempted to open the formal",
+                    "formal database identity unresolved",
                 ),
             ):
                 installer.install_candidate(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import plistlib
@@ -14,6 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 MACOS_DEPLOY = ROOT / "deploy" / "macos"
 RECONCILE_FROM = "2026-08-21"
+LOADED_BUILD_RECEIPT = "/tmp/dcar-evidence/sealed-build.json"
 
 
 class MacOSWriterDeploymentTest(unittest.TestCase):
@@ -34,7 +36,13 @@ class MacOSWriterDeploymentTest(unittest.TestCase):
             "requested": True,
             "enabled": True,
             "writer_lock": {"held": True},
-            "daily_capture_reconcile": {"enabled": True},
+            "registered_job_ids": ["daily_report", "pipeline_reconcile"],
+            "pipeline_reconcile": {
+                "mode": "current_day_only",
+                "enabled": True,
+                "interval_seconds": 3600,
+                "paid_round_cutoff": "20:00",
+            },
             "report_runtime": {"ready": True},
         }
 
@@ -47,6 +55,7 @@ class MacOSWriterDeploymentTest(unittest.TestCase):
         viewer_state: str = "absent",
         freeze: bool = False,
         reuse: bool = False,
+        web_mode: str | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], str]:
         script = ROOT / "scripts" / "start_web_mvp.sh"
         with tempfile.TemporaryDirectory() as temporary:
@@ -65,14 +74,17 @@ class MacOSWriterDeploymentTest(unittest.TestCase):
                 json.dumps(writer_health or self._writer_health()), encoding="utf-8"
             )
             scheduler_health_file.write_text(
-                json.dumps(scheduler_health or self._scheduler_health()), encoding="utf-8"
+                json.dumps(scheduler_health or self._scheduler_health()),
+                encoding="utf-8",
             )
             viewer_health_file.write_text(
                 json.dumps(
                     {
                         "status": "ok",
                         "mode": (
-                            "local_v8" if viewer_state == "writable" else "read_only_replica"
+                            "local_v8"
+                            if viewer_state == "writable"
+                            else "read_only_replica"
                         ),
                         "read_only": viewer_state != "writable",
                     }
@@ -142,6 +154,7 @@ exit 0
                 "DCAR_STARTUP_CATCHUP_ENABLED",
                 "DCAR_DAILY_CAPTURE_RECONCILE_FROM",
                 "DCAR_REUSE_EXISTING_READ_ONLY_API",
+                "DCAR_WEB_MODE",
             ):
                 environment.pop(variable, None)
             environment.update(
@@ -160,6 +173,8 @@ exit 0
             )
             if reuse:
                 environment["DCAR_REUSE_EXISTING_READ_ONLY_API"] = "1"
+            if web_mode is not None:
+                environment["DCAR_WEB_MODE"] = web_mode
             result = subprocess.run(
                 ["/bin/bash", str(script)],
                 cwd=ROOT,
@@ -178,6 +193,9 @@ exit 0
         rendered = template.replace("__PROJECT_ROOT_XML__", "/tmp/DcarAIGC")
         rendered = rendered.replace("__HOME_XML__", "/tmp/dcar-home")
         rendered = rendered.replace("__RECONCILE_FROM_XML__", RECONCILE_FROM)
+        rendered = rendered.replace(
+            "__LOADED_BUILD_RECEIPT_XML__", LOADED_BUILD_RECEIPT
+        )
         value = plistlib.loads(rendered.encode("utf-8"))
         environment = value["EnvironmentVariables"]
 
@@ -185,6 +203,7 @@ exit 0
         self.assertTrue(value["Disabled"])
         self.assertTrue(value["RunAtLoad"])
         self.assertTrue(value["KeepAlive"])
+        self.assertEqual(value["ProcessType"], "Interactive")
         self.assertEqual(environment["DCAR_READ_ONLY"], "0")
         self.assertEqual(environment["DCAR_SCHEDULER_ENABLED"], "1")
         self.assertEqual(environment["DCAR_STARTUP_CATCHUP_ENABLED"], "1")
@@ -193,6 +212,17 @@ exit 0
         )
         self.assertEqual(environment["DCAR_WORKER_HOST"], "127.0.0.1")
         self.assertEqual(environment["DCAR_WORKER_PORT"], "8766")
+        self.assertEqual(environment["DCAR_LOADED_BUILD_RECEIPT"], LOADED_BUILD_RECEIPT)
+        self.assertNotIn("DCAR_LOADED_BUILD_ID", environment)
+        self.assertEqual(
+            environment["DCAR_V8_DB"],
+            "/tmp/dcar-home/Library/Application Support/DcarAIGC/data/"
+            "dcar_insight.sqlite3",
+        )
+        self.assertEqual(
+            environment["DCAR_LEGACY_DB"],
+            "/tmp/dcar-home/Library/Application Support/DcarAIGC/data/web_mvp.sqlite3",
+        )
         self.assertEqual(
             environment["DCAR_WRITER_LOCK"],
             "/tmp/dcar-home/Library/Application Support/DcarAIGC/runtime/"
@@ -215,6 +245,8 @@ exit 0
                 "/tmp/dcar-home",
                 "--reconcile-from",
                 RECONCILE_FROM,
+                "--loaded-build-receipt",
+                LOADED_BUILD_RECEIPT,
                 "--check",
             ],
             check=True,
@@ -238,6 +270,8 @@ exit 0
                         "/tmp/dcar-home",
                         "--reconcile-from",
                         value,
+                        "--loaded-build-receipt",
+                        LOADED_BUILD_RECEIPT,
                         "--check",
                     ],
                     check=False,
@@ -248,14 +282,47 @@ exit 0
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("reconcile-from", result.stderr)
 
+    def test_renderer_requires_external_loaded_build_receipt(self) -> None:
+        path = MACOS_DEPLOY / "render_launch_agent.py"
+        cases = (
+            ("relative/receipt.json", "must be absolute"),
+            (str(ROOT / "runtime" / "sealed-build.json"), "outside the repository"),
+        )
+        for receipt, expected in cases:
+            with self.subTest(receipt=receipt):
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(path),
+                        "--project-root",
+                        str(ROOT),
+                        "--home",
+                        "/tmp/dcar-home",
+                        "--reconcile-from",
+                        RECONCILE_FROM,
+                        "--loaded-build-receipt",
+                        receipt,
+                        "--check",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(expected, result.stderr)
+
     def test_wrapper_requires_external_key_file_and_cost_authorization(self) -> None:
         wrapper = (MACOS_DEPLOY / "run_writer_worker.sh").read_text(encoding="utf-8")
         example = (MACOS_DEPLOY / "writer.env.example").read_text(encoding="utf-8")
         readme = (MACOS_DEPLOY / "README.md").read_text(encoding="utf-8")
 
-        self.assertIn("I_ACKNOWLEDGE_DAILY_PROVIDER_LIMIT_USD_20", wrapper)
+        self.assertIn("I_ACKNOWLEDGE_DAILY_PROVIDER_LIMIT_USD_100", wrapper)
+        self.assertNotIn("I_ACKNOWLEDGE_DAILY_PROVIDER_LIMIT_USD_20", wrapper)
         self.assertIn("TIKHUB_API_KEY_FILE", wrapper)
+        self.assertIn("TIKHUB_API_BASE=https://api.tikhub.dev", wrapper)
         self.assertIn("TIKHUB_API_BASE=https://api.tikhub.io", wrapper)
+        self.assertIn("direct TIKHUB_API_BASE values are forbidden", wrapper)
         self.assertIn("dcar.env.local", example)
         self.assertIn("export DCAR_STARTUP_CATCHUP_ENABLED=1", wrapper)
         self.assertIn(
@@ -272,17 +339,36 @@ exit 0
         self.assertIn("--port 8766", wrapper)
         self.assertIn("ffmpeg ffprobe swiftc", wrapper)
         self.assertIn("import mlx_whisper", wrapper)
+        self.assertIn("writer database must stay outside the repository", wrapper)
+        self.assertIn("legacy database must stay outside the repository", wrapper)
+        self.assertIn('loaded_build_receipt="${DCAR_LOADED_BUILD_RECEIPT:-}"', wrapper)
+        self.assertIn("loaded build receipt must be a single-link file", wrapper)
+        self.assertIn("loaded build receipt must be owned by the current user", wrapper)
+        self.assertIn("loaded build receipt must have mode 0600", wrapper)
+        self.assertIn("loaded build receipt must stay outside the repository", wrapper)
+        self.assertIn('/usr/bin/shasum -a 256 "$loaded_build_receipt_path"', wrapper)
+        self.assertIn(
+            'export DCAR_LOADED_BUILD_ID="sha256:$loaded_build_sha256"', wrapper
+        )
+        self.assertIn(
+            "DCAR_LOADED_BUILD_ID must be derived from the loaded build receipt",
+            wrapper,
+        )
         self.assertNotRegex(example, re.compile(r"^TIKHUB_API_KEY\s*=", re.MULTILINE))
         self.assertRegex(
             example,
             re.compile(r"^DCAR_DAILY_COST_AUTHORIZATION=$", re.MULTILINE),
         )
+        self.assertNotIn("I_ACKNOWLEDGE_DAILY_PROVIDER_LIMIT_USD_100", example)
         self.assertNotIn("I_ACKNOWLEDGE_DAILY_PROVIDER_LIMIT_USD_20", example)
-        self.assertIn("USD 20", readme)
+        self.assertIn("USD 100", readme)
         self.assertIn("Mac 接交流电、网络正常，且计划窗口内不睡眠", readme)
-        self.assertIn("renderer 只生成 disabled-by-default plist，永不调用 `launchctl`", readme)
+        self.assertIn(
+            "renderer 只生成 disabled-by-default plist，永不调用 `launchctl`", readme
+        )
         self.assertIn("startup catch-up 严格为 `report_only`", readme)
         self.assertIn("不运行 capture、media 或 cutoff，不产生供应商费用", readme)
+        self.assertIn("不会在两个域名之间自动 fallback", readme)
         parser = wrapper[
             wrapper.index("while IFS= read -r raw_line") : wrapper.index(
                 'done < "$writer_env"'
@@ -290,18 +376,76 @@ exit 0
         ]
         self.assertNotIn("DCAR_DAILY_CAPTURE_RECONCILE_FROM", parser)
         self.assertGreater(
-            wrapper.index(
-                'export DCAR_DAILY_CAPTURE_RECONCILE_FROM="$reconcile_from"'
-            ),
+            wrapper.index('export DCAR_DAILY_CAPTURE_RECONCILE_FROM="$reconcile_from"'),
             wrapper.index('[[ "$cost_authorization" =='),
         )
+
+    def test_writer_wrapper_fails_closed_then_accepts_valid_loaded_build_receipt(
+        self,
+    ) -> None:
+        wrapper = MACOS_DEPLOY / "run_writer_worker.sh"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            external = root / "evidence"
+            project.mkdir()
+            external.mkdir()
+            writer_env = external / "writer.env"
+            writer_env.write_text("", encoding="utf-8")
+            writer_env.chmod(0o600)
+            receipt = external / "sealed-build.json"
+            receipt_payload = b'{"schema":"sealed-build-v1"}\n'
+            receipt.write_bytes(receipt_payload)
+            receipt.chmod(0o600)
+            project_receipt = project / "sealed-build.json"
+            project_receipt.write_bytes(receipt_payload)
+            project_receipt.chmod(0o600)
+
+            environment = {
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "DCAR_PROJECT_ROOT": str(project),
+                "DCAR_WORKER_HOST": "127.0.0.1",
+                "DCAR_WORKER_PORT": "8766",
+                "DCAR_DAILY_CAPTURE_RECONCILE_FROM": RECONCILE_FROM,
+                "DCAR_WRITER_ENV_FILE": str(writer_env),
+            }
+
+            def run(**values: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    ["/bin/bash", str(wrapper)],
+                    cwd=project,
+                    env={**environment, **values},
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+
+            missing = run()
+            self.assertEqual(missing.returncode, 78)
+            self.assertIn("DCAR_LOADED_BUILD_RECEIPT is missing", missing.stderr)
+
+            injected = run(
+                DCAR_LOADED_BUILD_RECEIPT=str(receipt),
+                DCAR_LOADED_BUILD_ID="sha256:"
+                + hashlib.sha256(receipt_payload).hexdigest(),
+            )
+            self.assertEqual(injected.returncode, 78)
+            self.assertIn("must be derived", injected.stderr)
+
+            inside = run(DCAR_LOADED_BUILD_RECEIPT=str(project_receipt))
+            self.assertEqual(inside.returncode, 78)
+            self.assertIn("must stay outside the repository", inside.stderr)
+
+            accepted = run(DCAR_LOADED_BUILD_RECEIPT=str(receipt))
+            self.assertEqual(accepted.returncode, 78)
+            self.assertNotIn("loaded build receipt", accepted.stderr)
+            self.assertIn("daily USD 100 provider budget", accepted.stderr)
 
     def test_ui_start_fails_loud_when_writer_only_flags_leak_in(self) -> None:
         script = ROOT / "scripts" / "start_web_mvp.sh"
         cases = (
             ("DCAR_SCHEDULER_ENABLED", "1"),
             ("DCAR_STARTUP_CATCHUP_ENABLED", "1"),
-            ("DCAR_DAILY_CAPTURE_RECONCILE_FROM", RECONCILE_FROM),
         )
         for key, value in cases:
             with self.subTest(variable=key):
@@ -324,6 +468,20 @@ exit 0
                 self.assertEqual(result.returncode, 78)
                 self.assertIn(key, result.stderr)
 
+    def test_ui_inherited_business_boundary_does_not_prevent_read_only_start_checks(self) -> None:
+        # Stop at a temporary freeze lock before probing or starting any service.
+        with tempfile.TemporaryDirectory() as temporary:
+            lock = Path(temporary) / "operator-freeze.lock"
+            lock.touch()
+            environment = {**os.environ, "DCAR_DAILY_CAPTURE_RECONCILE_FROM": RECONCILE_FROM,
+                "DCAR_SCHEDULER_ENABLED": "0", "DCAR_STARTUP_CATCHUP_ENABLED": "0",
+                "DCAR_OPERATOR_FREEZE_LOCK": str(lock), "DCAR_REUSE_EXISTING_READ_ONLY_API": "0"}
+            result = subprocess.run(["/bin/bash", str(ROOT / "scripts/start_web_mvp.sh")],
+                                    cwd=ROOT, env=environment, capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 75)
+            self.assertIn(str(lock), result.stderr)
+            self.assertNotIn("DCAR_DAILY_CAPTURE_RECONCILE_FROM", result.stderr)
+
     def test_ui_normal_mode_routes_to_the_healthy_writer(self) -> None:
         result, invocations = self._run_ui_script()
 
@@ -335,12 +493,24 @@ exit 0
             invocations,
         )
         self.assertNotIn("uvicorn v8.api:app", invocations)
+        self.assertIn("vinext/dist/cli.js build", invocations)
+        self.assertIn("vinext/dist/cli.js start --hostname 127.0.0.1 --port 4174", invocations)
+        self.assertNotIn("vinext/dist/cli.js dev", invocations)
 
         source = (ROOT / "scripts" / "start_web_mvp.sh").read_text(encoding="utf-8")
         cleanup = source.split("cleanup() {", maxsplit=1)[1].split("}", maxsplit=1)[0]
         self.assertIn("web_pid", cleanup)
         self.assertNotIn("api_pid", cleanup)
         self.assertNotIn("8766", cleanup)
+
+    def test_ui_dev_mode_is_explicit_and_skips_production_build(self) -> None:
+        result, invocations = self._run_ui_script(web_mode="dev")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Web 运行模式：dev", result.stdout)
+        self.assertNotIn("vinext/dist/cli.js build", invocations)
+        source = (ROOT / "scripts" / "start_web_mvp.sh").read_text(encoding="utf-8")
+        self.assertIn('web_subcommand="dev"', source)
 
     def test_ui_normal_mode_tolerates_only_a_verified_read_only_8765(self) -> None:
         accepted, invocations = self._run_ui_script(viewer_state="read_only")
@@ -370,7 +540,9 @@ exit 0
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("DCAR_AUTH_API_UPSTREAM=http://127.0.0.1:8766", invocations)
 
-    def test_ui_normal_mode_fails_closed_when_writer_contract_is_unhealthy(self) -> None:
+    def test_ui_normal_mode_fails_closed_when_writer_contract_is_unhealthy(
+        self,
+    ) -> None:
         cases: list[tuple[str, dict[str, object], dict[str, object]]] = []
 
         read_only = self._writer_health()
@@ -378,9 +550,7 @@ exit 0
         cases.append(("read_only", read_only, self._scheduler_health()))
 
         incompatible = self._writer_health()
-        incompatible["database_state"] = {
-            "schema_compatibility": {"compatible": False}
-        }
+        incompatible["database_state"] = {"schema_compatibility": {"compatible": False}}
         cases.append(("schema", incompatible, self._scheduler_health()))
 
         for key in ("requested", "enabled"):
@@ -393,8 +563,25 @@ exit 0
         cases.append(("writer_lock", self._writer_health(), writer_lock))
 
         reconcile = self._scheduler_health()
-        reconcile["daily_capture_reconcile"] = {"enabled": False}
+        reconcile["pipeline_reconcile"] = {
+            **reconcile["pipeline_reconcile"],
+            "enabled": False,
+        }
         cases.append(("reconcile", self._writer_health(), reconcile))
+
+        missing_registration = self._scheduler_health()
+        missing_registration["registered_job_ids"] = ["daily_report"]
+        cases.append(
+            ("missing_registration", self._writer_health(), missing_registration)
+        )
+
+        history_registered = self._scheduler_health()
+        history_registered["registered_job_ids"] = [
+            "daily_report",
+            "history_recovery",
+            "pipeline_reconcile",
+        ]
+        cases.append(("history_registered", self._writer_health(), history_registered))
 
         report_runtime = self._scheduler_health()
         report_runtime["report_runtime"] = {"ready": False}
@@ -478,14 +665,33 @@ exit 0
         self.assertEqual(accepted.returncode, 78)
         self.assertIn("DCAR_WRITER_ENV_FILE is missing", accepted.stderr)
 
+    def test_writer_wrapper_rejects_inherited_tikhub_route(self) -> None:
+        wrapper = MACOS_DEPLOY / "run_writer_worker.sh"
+        result = subprocess.run(
+            ["/bin/bash", str(wrapper)],
+            cwd=ROOT,
+            env={
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "DCAR_PROJECT_ROOT": str(ROOT),
+                "DCAR_WORKER_HOST": "127.0.0.1",
+                "DCAR_WORKER_PORT": "8766",
+                "TIKHUB_API_BASE": "https://api.tikhub.dev",
+            },
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 78)
+        self.assertIn("direct TIKHUB_API_BASE values are forbidden", result.stderr)
+
     def test_first_start_bootstraps_once_then_waits_for_run_at_load(self) -> None:
         readme = (MACOS_DEPLOY / "README.md").read_text(encoding="utf-8")
         first_start = readme.split("## 3. D 日启用时序", maxsplit=1)[1].split(
             "## 故意重启、更新、停用和卸载", maxsplit=1
         )[0]
-        deliberate_restart = readme.split(
-            "## 故意重启、更新、停用和卸载", maxsplit=1
-        )[1].split("## snapshot publisher", maxsplit=1)[0]
+        deliberate_restart = readme.split("## 故意重启、更新、停用和卸载", maxsplit=1)[
+            1
+        ].split("## snapshot publisher", maxsplit=1)[0]
 
         self.assertIn('launchctl enable "$domain/$label"', first_start)
         self.assertIn('launchctl bootstrap "$domain" "$plist"', first_start)

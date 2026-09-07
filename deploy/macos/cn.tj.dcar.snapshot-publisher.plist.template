@@ -42,9 +42,9 @@
     <key>DCAR_PUBLISHER_ENV_FILE</key>
     <string>__HOME_XML__/Library/Application Support/DcarAIGC/publisher.env</string>
     <key>DCAR_V8_DB</key>
-    <string>__PROJECT_ROOT_XML__/app/data/dcar_insight.sqlite3</string>
+    <string>__HOME_XML__/Library/Application Support/DcarAIGC/data/dcar_insight.sqlite3</string>
     <key>DCAR_LEGACY_DB</key>
-    <string>__PROJECT_ROOT_XML__/app/data/web_mvp.sqlite3</string>
+    <string>__HOME_XML__/Library/Application Support/DcarAIGC/data/web_mvp.sqlite3</string>
     <key>DCAR_READ_ONLY</key>
     <string>1</string>
     <key>DCAR_SCHEDULER_ENABLED</key>

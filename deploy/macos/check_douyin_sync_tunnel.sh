@@ -14,7 +14,7 @@ control_socket="$(dcar_sync_control_socket)"
   dcar_sync_fail "SSH tunnel process is not healthy"
 
 machine_key="$(/bin/cat "$DCAR_DOUYIN_MACHINE_KEY_FILE_VALUE")"
-[[ "$machine_key" =~ ^[A-Za-z0-9._~+/=-]{32,512}$ ]] || \
+dcar_sync_validate_machine_key_value "$machine_key" || \
   dcar_sync_fail "Machine credential format is invalid"
 
 {

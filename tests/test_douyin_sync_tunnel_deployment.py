@@ -140,6 +140,42 @@ class DouyinSyncTunnelDeploymentTest(unittest.TestCase):
             "/tmp/dcar-sync-home/.ssh/id_ed25519_dcar_douyin_sync",
         )
 
+    def test_machine_key_validation_is_compatible_with_macos_bash(self) -> None:
+        common = MACOS / "douyin_sync_common.sh"
+        valid = subprocess.run(
+            [
+                "/bin/bash",
+                "-c",
+                f'source "{common}"; '
+                'dcar_sync_validate_machine_key_value "$MACHINE_KEY"',
+            ],
+            check=False,
+            env={**os.environ, "MACHINE_KEY": "m" * 40},
+        )
+        too_short = subprocess.run(
+            [
+                "/bin/bash",
+                "-c",
+                f'source "{common}"; '
+                'dcar_sync_validate_machine_key_value "$MACHINE_KEY"',
+            ],
+            check=False,
+            env={**os.environ, "MACHINE_KEY": "m" * 31},
+        )
+        invalid_character = subprocess.run(
+            [
+                "/bin/bash",
+                "-c",
+                f'source "{common}"; '
+                'dcar_sync_validate_machine_key_value "$MACHINE_KEY"',
+            ],
+            check=False,
+            env={**os.environ, "MACHINE_KEY": "m" * 39 + "@"},
+        )
+        self.assertEqual(valid.returncode, 0)
+        self.assertNotEqual(too_short.returncode, 0)
+        self.assertNotEqual(invalid_character.returncode, 0)
+
     def test_health_does_not_expose_machine_key_in_argv_or_logs(self) -> None:
         health = (MACOS / "check_douyin_sync_tunnel.sh").read_text(
             encoding="utf-8"

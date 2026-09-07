@@ -1,4 +1,4 @@
-import type { SpuAssociationRun, SpuAudienceAssets } from "./types";
+import type { AccountStatus, SpuAssociationRun, SpuAudienceAssets } from "./types";
 
 export type ContentSearchFilters = {
   query: string;
@@ -29,6 +29,7 @@ export type AccountSearchFilters = {
   platform: string;
   accountType: string;
   direction: string;
+  accountStatus?: AccountStatus | "";
 };
 
 export type AccountSearchRequest = {
@@ -38,6 +39,7 @@ export type AccountSearchRequest = {
   platform: string | null;
   account_type: string | null;
   content_direction: string | null;
+  account_status: AccountStatus | null;
 };
 
 function positiveInteger(value: number) {
@@ -75,6 +77,7 @@ export function buildAccountSearchRequest(
     platform: filters.platform || null,
     account_type: filters.accountType || null,
     content_direction: filters.direction || null,
+    account_status: filters.accountStatus || null,
   };
 }
 

@@ -1,163 +1,71 @@
 "use client";
 
-import Image from "next/image";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import {
-  CarIcon,
-  ClockIcon,
-  EyeIcon,
-  RobotIcon,
-  ShieldCheckIcon,
-  SparkleIcon,
-  StackIcon,
-  StarIcon,
-  TagIcon,
-  TrendUpIcon,
-  UserFocusIcon,
-} from "@phosphor-icons/react";
+import { ClockIcon, ShieldCheckIcon } from "@phosphor-icons/react";
 import AppShell from "../components/AppShell";
-import { Loading, Notice } from "../components/Feedback";
-import {
-  formatDate,
-  metricEvidence,
-  metricPublishesValue,
-  metricStatus,
-  metricValue,
-} from "../lib/format";
-import { publicAssetPath } from "../lib/paths";
+import { Loading, ReadErrorState } from "../components/Feedback";
+import { formatDate, formatDateTime } from "../lib/format";
 import { overviewQueryOptions } from "../lib/queries";
-import type {
-  BusinessSceneKey,
-  ConclusionMetricKey,
-  Metric,
-  OverviewChannel,
-  OverviewChannelKey,
-  WindowKey,
-} from "../lib/types";
+import type { OverviewChannelKey, WindowKey } from "../lib/types";
+import { OverviewChannelReport } from "./OverviewReport";
+import styles from "./OverviewReport.module.css";
 
 const windowLabels: Record<WindowKey, string> = {
   yesterday: "昨天", this_week: "本周", last_week: "上周",
 };
 const channelOrder: OverviewChannelKey[] = ["douyin", "xiaohongshu"];
-const sceneOrder: BusinessSceneKey[] = ["used_car", "new_car", "media"];
-const conclusionMetrics: Array<[ConclusionMetricKey, string]> = [
-  ["selling_point_count_share", "卖点条数占比"],
-  ["core_selling_point_count_share", "核心卖点条数占比"],
-  ["selling_point_exposure_share", "卖点曝光占比"],
-  ["core_selling_point_exposure_share", "核心卖点曝光占比"],
-  ["content_verticality", "内容垂直度"],
-  ["automotive_user_rate", "互动用户汽车兴趣占比"],
-  ["acquisition_potential", "内容拉新效果预估"],
-];
-const channelBrandAssets: Record<OverviewChannelKey, { src: string; label: string }> = {
-  douyin: { src: publicAssetPath("/brand-douyin-tiktok.svg"), label: "抖音" },
-  xiaohongshu: { src: publicAssetPath("/brand-xiaohongshu.svg"), label: "小红书" },
-};
-const metricIcons = {
-  selling_point_count_share: TagIcon,
-  core_selling_point_count_share: StarIcon,
-  selling_point_exposure_share: EyeIcon,
-  core_selling_point_exposure_share: SparkleIcon,
-  content_verticality: StackIcon,
-  automotive_user_rate: UserFocusIcon,
-  acquisition_potential: TrendUpIcon,
-} satisfies Record<ConclusionMetricKey, typeof TagIcon>;
-const sceneIcons = {
-  used_car: CarIcon,
-  new_car: CarIcon,
-  media: RobotIcon,
-} satisfies Record<BusinessSceneKey, typeof CarIcon>;
-
-function MetricIcon({ metricKey }: { metricKey: ConclusionMetricKey }) {
-  const Icon = metricIcons[metricKey];
-  return <Icon className="conclusion-metric-icon" size={16} weight="regular" aria-hidden="true" />;
-}
-
-function SceneIcon({ sceneKey }: { sceneKey: BusinessSceneKey }) {
-  const Icon = sceneIcons[sceneKey];
-  return <Icon className="scene-title-icon" size={18} weight="regular" aria-hidden="true" />;
-}
-
-function SummaryMetric({ metricKey, metric, label, reasonId }: { metricKey: ConclusionMetricKey; metric: Metric; label: string; reasonId: string }) {
-  const evidence = metricEvidence(metric);
-  const publishesValue = metricPublishesValue(metric);
-  return <article className="conclusion-metric-card" aria-label={label} aria-describedby={publishesValue ? undefined : reasonId} title={evidence}>
-    <div><span className="conclusion-metric-label"><MetricIcon metricKey={metricKey} /><span>{label}</span></span><em className={`metric-status ${metric.status === "available" ? "available" : "limited"}`}>{metricStatus(metric)}</em></div>
-    <strong>{metricValue(metric)}</strong>
-    {publishesValue ? <p>{evidence}</p> : <span id={reasonId} className="visually-hidden">{evidence}</span>}
-  </article>;
-}
-
-function SceneConclusion({ channel, sceneKey }: { channel: OverviewChannel; sceneKey: BusinessSceneKey }) {
-  const scene = channel.scenes[sceneKey];
-  return <article className="scene-conclusion-card" data-scene={sceneKey}>
-    <header><SceneIcon sceneKey={sceneKey} /><h5>{scene.label}</h5><span className="visually-hidden">{scene.publication_count} 条发布</span></header>
-    <dl>
-      {conclusionMetrics.map(([key, label]) => {
-        const metric = scene.metrics[key];
-        const evidence = metricEvidence(metric);
-        const publishesValue = metricPublishesValue(metric);
-        const reasonId = `metric-reason-${channel.platform}-${sceneKey}-${key}`;
-        return <div className="scene-metric-row" key={key} aria-describedby={publishesValue ? undefined : reasonId} title={evidence}>
-          <dt><MetricIcon metricKey={key} /><span>{label}</span></dt>
-          <dd><strong>{metricValue(metric)}</strong><em className={`metric-status ${metric.status === "available" ? "available" : "limited"}`}>{metricStatus(metric)}</em>{!publishesValue && <span id={reasonId} className="visually-hidden">{evidence}</span>}</dd>
-        </div>;
-      })}
-    </dl>
-  </article>;
-}
-
-function ChannelConclusion({ channel, index }: { channel: OverviewChannel; index: number }) {
-  const channelNumber = String(index + 1).padStart(2, "0");
-  const brand = channelBrandAssets[channel.platform];
-  return <section className="panel channel-conclusion" data-channel={channel.platform}>
-    <div className="channel-conclusion-head">
-      <span className="channel-number" aria-hidden="true">{channelNumber}</span>
-      <div className="channel-heading-copy"><span className="eyebrow">渠道 {channelNumber}</span><div className="channel-title-row"><h3>{channel.label}渠道</h3><span className={`channel-platform-mark ${channel.platform}`} title={brand.label}><Image src={brand.src} alt="" width={17} height={17} unoptimized /></span></div><p>所选时间内发布 {channel.publication_count} 条 · 可评估内容 {channel.evidence_coverage_percentage ?? "—"}% · 有曝光数据 {channel.valid_exposure_items} 条 · 已完成曝光分类 {channel.exposure_coverage_percentage ?? "—"}%</p></div>
-    </div>
-    <div className="conclusion-subhead"><b>1</b><div><h4>汇总</h4><p>条数占比按所选时间内该平台的全部内容计算；曝光占比只统计曝光量大于 0 的内容。</p></div></div>
-    <div className="conclusion-summary-grid">
-      {conclusionMetrics.map(([key, label]) => <SummaryMetric key={key} metricKey={key} label={label} metric={channel.summary.metrics[key]} reasonId={`metric-reason-${channel.platform}-summary-${key}`} />)}
-    </div>
-    <div className="conclusion-subhead scene-subhead"><b>2</b><div><h4>三个业务场景</h4><p>依次展示二手车、新车和媒体-AI小懂；其他和未知内容只计入平台总数，不单独展示。</p></div></div>
-    <div className="scene-conclusion-grid">
-      {sceneOrder.map((sceneKey) => <SceneConclusion key={sceneKey} channel={channel} sceneKey={sceneKey} />)}
-    </div>
-  </section>;
-}
 
 export default function OverviewPage() {
   const [windowKey, setWindowKey] = useState<WindowKey>("last_week");
+  const [retrying, setRetrying] = useState(false);
+  const retryInFlight = useRef(false);
   const overviewQuery = useQuery(overviewQueryOptions());
   const overview = overviewQuery.data;
+  const readFailed = overviewQuery.isError || retrying;
+
+  function retryOverviewRead() {
+    if (retryInFlight.current || overviewQuery.isFetching) return;
+    retryInFlight.current = true;
+    setRetrying(true);
+    void overviewQuery.refetch({ cancelRefetch: false }).finally(() => {
+      retryInFlight.current = false;
+      setRetrying(false);
+    });
+  }
 
   const activeWindow = overview?.windows[windowKey];
-  const windowSwitch = <div className="channel-switch" role="group" aria-label="统计窗口">
+  const windowSwitch = <div className={`channel-switch ${styles.windowSwitch}`} role="group" aria-label="统计窗口">
     {(Object.keys(windowLabels) as WindowKey[]).map((key) => <button key={key} type="button" aria-pressed={windowKey === key} className={windowKey === key ? "active" : ""} onClick={() => setWindowKey(key)}>{windowLabels[key]}</button>)}
   </div>;
   return (
     <AppShell active="overview" actions={windowSwitch}>
-      {overviewQuery.isError && <Notice tone="error">{overview ? `数据刷新失败，当前显示上次数据。${overviewQuery.error instanceof Error ? overviewQuery.error.message : ""}` : overviewQuery.error instanceof Error ? overviewQuery.error.message : "概览读取失败"}</Notice>}
-      {overviewQuery.isPending && !overview ? <Loading label="正在加载运营数据" /> : (
+      {readFailed && <article className="panel"><ReadErrorState
+        title={overview ? "数据刷新失败，当前显示上次数据。" : "概览读取失败"}
+        description={overviewQuery.error instanceof Error ? overviewQuery.error.message : "请稍后重新加载。"}
+        retrying={retrying || overviewQuery.isFetching}
+        onRetry={retryOverviewRead}
+      /></article>}
+      {overviewQuery.isPending && !overview && !readFailed && <Loading label="正在加载运营数据" />}
+      {overview && (
         <section className="page-stack overview-dashboard">
           <h2 className="visually-hidden">渠道结论</h2>
           <p className="visually-hidden" aria-live="polite">已切换到{windowLabels[windowKey]}，数据已更新</p>
-          {activeWindow && channelOrder.map((key, index) => <ChannelConclusion key={key} channel={activeWindow.channels[key]} index={index} />)}
-          <div className="overview-support-grid">
-            <article className="panel overview-support-card boundary-card">
-              <div className="support-card-title"><ClockIcon size={19} weight="regular" aria-hidden="true" /><h3>{windowLabels[windowKey]}统计时间范围</h3></div>
-              <dl className="definition-list">
+          {activeWindow && channelOrder.map((key) => <OverviewChannelReport key={`${windowKey}-${key}`} channel={activeWindow.channels[key]} />)}
+          <div className={styles.support}>
+            <article className={styles.supportPanel}>
+              <div className={styles.supportTitle}><ClockIcon size={19} weight="regular" aria-hidden="true" /><h3>{windowLabels[windowKey]}统计时间范围</h3></div>
+              <dl className={styles.definition}>
                 <div><dt>开始</dt><dd>{activeWindow ? formatDate(activeWindow.period_start) : "—"}</dd></div>
-                <div><dt>统计到此日期前一天</dt><dd>{activeWindow ? formatDate(activeWindow.period_end) : "—"}</dd></div>
+                <div><dt>{windowKey === "this_week" ? "统计截止（北京时间）" : "统计到此日期前一天"}</dt><dd>{activeWindow ? (windowKey === "this_week" ? formatDateTime(activeWindow.period_end) : formatDate(activeWindow.period_end)) : "—"}</dd></div>
                 <div><dt>所选时间内发布</dt><dd>{activeWindow?.metrics.publication_count?.value ?? "—"} 条</dd></div>
                 <div><dt>可自动评估的内容</dt><dd>{activeWindow?.eligible_count ?? "—"} 条</dd></div>
                 <div><dt>未关联账号内容</dt><dd>{activeWindow?.unassociated_content_count ?? "—"} 条</dd></div>
               </dl>
             </article>
-            <article className="panel overview-support-card quality-card">
-              <div className="support-card-title"><ShieldCheckIcon size={19} weight="regular" aria-hidden="true" /><div><h3>数据质量状态</h3><p>缺日期内容不进入任何日期窗口，重复内容单独记录。</p></div></div>
-              <div className="quality-grid">
+            <article className={styles.supportPanel}>
+              <div className={styles.supportTitle}><ShieldCheckIcon size={19} weight="regular" aria-hidden="true" /><div><h3>数据质量状态</h3><p>缺日期内容不进入任何日期窗口，重复内容单独记录。</p></div></div>
+              <div className={styles.quality}>
                 <div><strong>{overview?.data_quality.missing_published_at ?? "—"}</strong><span>缺失发布日期</span></div>
                 <div><strong>{overview?.data_quality.duplicate_fingerprint_coverage ?? "—"}%</strong><span>重复内容识别完成率</span></div>
                 <div><strong>{overview?.data_quality.confirmed_duplicate_count ?? "—"}</strong><span>确认重复内容</span></div>

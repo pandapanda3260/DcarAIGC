@@ -44,10 +44,12 @@ from .duplicates import FINGERPRINT_VERSION, THRESHOLDS, duplicate_metric_decisi
 from .insights import CHANNELS, SCENES, build_channel_conclusions
 from .media_state import media_terminal_states
 from .report_export import formula_safe_csv_value
+from . import report_inputs, runtime_receipts
+from .scan_receipts import coverage as scan_coverage
+from .source_routing import METRIC_FIELDS, load_policy, select_content_metrics
 from .storage import (
     DEFAULT_DB,
     PROJECT_ROOT,
-    SCHEMA_VERSION,
     SchemaMigrationError,
     connect,
     now_utc,
@@ -62,6 +64,7 @@ TASK_TYPES = {"daily", "weekly", "custom"}
 RUNNABLE_STATUSES = {"queued", "partial", "failed", "interrupted"}
 IMPLICIT_RUN_STATUSES = {"queued", "failed", "interrupted"}
 _REPORT_ID_BATCH_SIZE = 500
+_REPORT_SCHEMA_VERSIONS = frozenset({19, 20})
 
 _QUALITY_GATE_LABELS = {
     "discovery_coverage": "账号采集完成率",
@@ -74,6 +77,9 @@ _QUALITY_GATE_LABELS = {
     "weekly_comment_coverage": "评论采集完成率",
     "duplicate_calibration_ready": "重复内容规则校验",
     "pipeline_observation": "每日抓取观测完整度",
+    "roster_evidence_valid": "冻结名册可核验性",
+    "scan_traceable": "来源分页及逐项处置完整性",
+    "scope_reconstructable": "截止时点内容及账号维度可还原性",
 }
 
 _TASK_STATUS_LABELS = {
@@ -163,7 +169,7 @@ def assert_report_runtime_ready(connection) -> Dict[str, Any]:
 
     try:
         require_schema_compatibility(
-            connection, supported_versions=frozenset({SCHEMA_VERSION})
+            connection, supported_versions=_REPORT_SCHEMA_VERSIONS
         )
     except SchemaMigrationError as error:
         raise ReportTaskError(str(error)) from error
@@ -307,6 +313,8 @@ def retry_task(task_id: str, *, db_path: Path = DEFAULT_DB) -> Dict[str, Any]:
         ).fetchone()
         if task is None:
             raise ReportTaskError(f"task does not exist: {task_id}")
+        if _legacy_report(connection, task_id) is not None:
+            raise ReportTaskError("published legacy reports are read-only; create a correction task")
         if "已由发现补跑后的新任务替代" in str(task["message"] or ""):
             raise ReportTaskError(f"superseded task cannot be retried: {task_id}")
         if task["task_status"] not in {"succeeded", "partial", "failed", "interrupted"}:
@@ -613,45 +621,36 @@ def get_task(task_id: str, *, db_path: Path = DEFAULT_DB) -> Dict[str, Any]:
 
 
 def _snapshot_task_contents(connection, task: Mapping[str, Any]) -> None:
-    existing = int(
-        connection.execute(
-            "SELECT COUNT(*) FROM task_contents WHERE task_id=?", (task["id"],)
-        ).fetchone()[0]
-    )
-    if existing and str(task["creation_source"]) != "automatic":
-        return
-    start_utc, end_utc = period_bounds(
-        str(task["period_start"]), str(task["period_end"])
-    )
-    included = connection.execute(
-        """
-        SELECT id FROM content_items
-        WHERE published_at>=? AND published_at<? ORDER BY published_at, id
-        """,
-        (start_utc, end_utc),
-    ).fetchall()
-    for row in included:
-        connection.execute(
-            """
-            INSERT INTO task_contents(task_id, content_id, inclusion_status, reason)
-            VALUES (?, ?, 'included', '发布日期位于任务自然日边界内')
-            ON CONFLICT(task_id,content_id) DO UPDATE SET
-                inclusion_status='included',reason=excluded.reason
-            """,
-            (task["id"], row["id"]),
-        )
-    missing = connection.execute(
-        "SELECT id FROM content_items WHERE published_at IS NULL ORDER BY id"
-    ).fetchall()
-    for row in missing:
-        connection.execute(
-            """
-            INSERT INTO task_contents(task_id, content_id, inclusion_status, reason)
-            VALUES (?, ?, 'excluded_missing_boundary', '发布日期缺失，不能归入报告区间')
-            ON CONFLICT(task_id,content_id) DO NOTHING
-            """,
-            (task["id"], row["id"]),
-        )
+    start_utc, end_utc = period_bounds(str(task["period_start"]), str(task["period_end"]))
+    report_inputs.freeze_scope(connection, dict(task), start_at=start_utc, end_at=end_utc,
+                               cutoff_at=_collection_cutoff_at(dict(task), generated_at=now_utc()))
+
+
+def _legacy_report(connection, task_id: str) -> Dict[str, Any] | None:
+    row = connection.execute("SELECT * FROM report_revisions WHERE task_id=? AND invalidated_at IS NULL "
+                             "ORDER BY revision DESC LIMIT 1", (task_id,)).fetchone()
+    if row is None or row["contract_version"] != "dcar-content-operations-report-v8.7":
+        return None
+    path = Path(row["report_json_path"])
+    path = path if path.is_absolute() else PROJECT_ROOT / path
+    if not path.is_file() or path.is_symlink() or _sha256(path) != row["report_sha256"]:
+        raise ReportTaskError("published legacy report is missing or corrupt")
+    report = json.loads(path.read_bytes())
+    validate_report(report)
+    return report
+
+
+def create_correction_task(original_task_id: str, *, reason: str, db_path: Path = DEFAULT_DB) -> Dict[str, Any]:
+    if not reason.strip():
+        raise ReportTaskError("a correction reason is required")
+    original = get_task(original_task_id, db_path=db_path)
+    task = create_task(task_type="custom", period_start=original["period_start"], period_end=original["period_end"],
+                       creation_source="manual", name=original["name"] + "（更正）", db_path=db_path)
+    with connect(db_path) as connection, transaction(connection):
+        connection.execute("INSERT INTO task_events(task_id,event_type,message,payload_json,created_at) VALUES (?,?,?,?,?)",
+                           (task["id"], "corrects_report", reason.strip(), json.dumps({"original_task_id": original_task_id,
+                            "original_revision": original.get("display_effective_revision", {}).get("revision") if original.get("display_effective_revision") else None}), now_utc()))
+    return get_task(task["id"], db_path=db_path)
 
 
 def _collection_cutoff_at(
@@ -687,27 +686,7 @@ def _collection_cutoff_at(
 def _latest_metric_observations_at(
     connection, ids: Sequence[int], *, cutoff_at: str
 ) -> Dict[int, Dict[str, Any]]:
-    if not ids:
-        return {}
-    output: Dict[int, Dict[str, Any]] = {}
-    for batch in _report_id_batches(
-        connection, ids, reserved_parameters=1
-    ):
-        placeholders = ",".join("?" for _ in batch)
-        rows = connection.execute(
-            f"""
-            SELECT * FROM content_metric_observations
-            WHERE content_id IN ({placeholders})
-              AND julianday(captured_at)<=julianday(?)
-            ORDER BY content_id,julianday(captured_at) DESC,id DESC
-            """,
-            [*batch, cutoff_at],
-        ).fetchall()
-        for row in rows:
-            content_id = int(row["content_id"])
-            if content_id not in output:
-                output[content_id] = dict(row)
-    return output
+    return select_content_metrics(connection, ids, cutoff_at=cutoff_at)
 
 
 def _metric_freshness_detail(
@@ -726,16 +705,19 @@ def _metric_freshness_detail(
     eligible_count = len(ids)
     cutoff = datetime.fromisoformat(cutoff_at.replace("Z", "+00:00"))
     freshness_start = cutoff - timedelta(hours=36)
-    fresh_count = sum(
-        1
-        for observation in latest.values()
-        if observation["status"] == "available"
-        and freshness_start
-        <= datetime.fromisoformat(
-            str(observation["captured_at"]).replace("Z", "+00:00")
+    def required_fields_fresh(observation: Mapping[str, Any]) -> bool:
+        fields = observation.get("fields", {})
+        required = [value for value in fields.values() if value.get("status") != "not_applicable"]
+        return bool(required) and all(
+            value.get("status") == "provided"
+            and value.get("is_latest_valid", value.get("freshness") == "fresh")
+            and value.get("effective_provider") in {"newrank_matrix", "tikhub"}
+            and value.get("captured_at") is not None
+            and freshness_start <= datetime.fromisoformat(str(value["captured_at"]).replace("Z", "+00:00")) <= cutoff
+            for value in required
         )
-        <= cutoff
-    )
+
+    fresh_count = sum(1 for observation in latest.values() if required_fields_fresh(observation))
     percentage = _percentage(fresh_count, eligible_count)
     if eligible_count == 0:
         status = "not_applicable"
@@ -1172,23 +1154,87 @@ def _build_report_data(
     generated_at: str,
     files: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
+    existing = report_inputs.frozen_report(connection, str(task["id"]))
+    if existing is not None:
+        if existing["payload"]["metadata"]["collection_cutoff_at"] != _collection_cutoff_at(task, generated_at=generated_at):
+            raise ReportTaskError("frozen report cutoff changed")
+        if str(existing["payload"]["input_references"]["release_id"]) != str(release["id"]):
+            raise ReportTaskError("frozen report release changed; create a correction task")
+        return report_inputs.render_frozen(existing, revision=revision, generated_at=generated_at, files=files)
+    return _assemble_report_data(
+        connection,
+        task,
+        release=release,
+        revision=revision,
+        generated_at=generated_at,
+        files=files,
+    )
+
+
+def _compact_profile_day_scan_inputs(
+    scans: Mapping[str, Any],
+    *,
+    period_start: str,
+    period_end: str,
+) -> Dict[str, Any]:
+    """Freeze only immutable receipt bindings, never expanded raw scan proofs."""
+    try:
+        return report_inputs.compact_profile_day_scan_inputs(
+            scans,
+            period_start=period_start,
+            period_end=period_end,
+        )
+    except report_inputs.FrozenInputError as error:
+        raise ReportTaskError(str(error)) from error
+
+
+def _report_scan_coverage(
+    connection: sqlite3.Connection,
+    *,
+    period_start: str,
+    period_end: str,
+    cutoff_at: str,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Select the version-paired coverage reader and its frozen reference."""
+
+    schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    if schema_version in _REPORT_SCHEMA_VERSIONS:
+        scans = runtime_receipts.period_coverage_from_receipts(
+            connection,
+            period_start=period_start,
+            period_end=period_end,
+            cutoff_at=cutoff_at,
+        )
+        if scans.get("cutoff_at") != cutoff_at:
+            raise ReportTaskError("profile-day period receipt cutoff changed")
+        return scans, _compact_profile_day_scan_inputs(
+            scans, period_start=period_start, period_end=period_end
+        )
+    if schema_version == 18:
+        scans = scan_coverage(
+            connection,
+            period_start=period_start,
+            period_end=period_end,
+            cutoff_at=cutoff_at,
+        )
+        return scans, scans
+    raise ReportTaskError(
+        f"report scan coverage does not support schema v{schema_version}"
+    )
+
+
+def _assemble_report_data(connection, task: Mapping[str, Any], *, release: Mapping[str, Any], revision: int,
+                          generated_at: str, files: List[Dict[str, Any]]) -> Dict[str, Any]:
     taxonomy = connection.execute(
         "SELECT * FROM taxonomy_versions WHERE version=? AND status='published'",
         (release["taxonomy_version"],),
     ).fetchone()
     if taxonomy is None:
         raise ReportTaskError("active release taxonomy must be published")
-    content_rows = connection.execute(
-        """
-        SELECT c.*, COALESCE(a.account_type, c.legacy_account_type, 'unknown') account_type,
-               a.content_direction account_content_direction
-        FROM task_contents tc JOIN content_items c ON c.id=tc.content_id
-        LEFT JOIN accounts a ON a.id=c.account_id
-        WHERE tc.task_id=? AND tc.inclusion_status='included'
-        ORDER BY c.published_at, c.id
-        """,
-        (task["id"],),
-    ).fetchall()
+    scope_event = report_inputs.load_event(connection, str(task["id"]), report_inputs.SCOPE_EVENT)
+    if scope_event is None:
+        raise ReportTaskError("report scope must be frozen before assembly")
+    content_rows = scope_event["payload"]["contents"]
     contents = [dict(row) for row in content_rows]
     ids = [int(row["id"]) for row in content_rows]
     collection_cutoff_at = _collection_cutoff_at(task, generated_at=generated_at)
@@ -1205,18 +1251,13 @@ def _build_report_data(
     view_minimum = float(metric_display_thresholds["view_count"])
     comment_minimum = float(metric_display_thresholds["comment_count"])
     freshness_contract = contract["required_quality_details"]["metrics_freshness"]
-    discovery_contract = contract["required_quality_details"]["discovery_coverage"]
-    discovery_detail = _discovery_coverage_detail(
+    scans, frozen_scan_inputs = _report_scan_coverage(
         connection,
-        task,
-        generated_at=generated_at,
-        minimum_percentage=float(discovery_contract["minimum_percentage"]),
+        period_start=str(task["period_start"]),
+        period_end=str(task["period_end"]),
+        cutoff_at=collection_cutoff_at,
     )
-    pipeline_observation = _pipeline_observation_detail(
-        connection,
-        task,
-        generated_at=generated_at,
-    )
+    discovery_detail, pipeline_observation = scans["discovery_coverage"], scans["pipeline_observation"]
     freshness_detail = _metric_freshness_detail(
         connection,
         ids,
@@ -1226,11 +1267,11 @@ def _build_report_data(
     )
     eligible_evaluations: Dict[int, Dict[str, Any]] = {}
     for batch in _report_id_batches(
-        connection, ids, reserved_parameters=1
+        connection, ids, reserved_parameters=4
     ):
         eligible_evaluations.update(
             formal_eligible_release_evaluations(
-                connection, str(release["id"]), batch
+                connection, str(release["id"]), batch, cutoff_at=collection_cutoff_at
             )
         )
     included_evaluations = {
@@ -1264,20 +1305,21 @@ def _build_report_data(
     fingerprint_ready = 0
     duplicate_calibration_ready = False
     if ids:
-        for batch in _report_id_batches(connection, ids):
+        for batch in _report_id_batches(connection, ids, reserved_parameters=2):
             placeholders = ",".join("?" for _ in batch)
             detail_ready += int(
                 connection.execute(
                     f"""
                     SELECT COUNT(DISTINCT content_id) FROM fetch_slots
                     WHERE content_id IN ({placeholders})
-                      AND stage='detail' AND status='succeeded'
+                      AND stage='detail' AND window_key='lifetime' AND status='succeeded'
+                      AND julianday(created_at)<=julianday(?) AND julianday(updated_at)<=julianday(?)
                     """,
-                    batch,
+                    [*batch, collection_cutoff_at, collection_cutoff_at],
                 ).fetchone()[0]
             )
         for batch in _report_id_batches(
-            connection, ids, reserved_parameters=1
+            connection, ids, reserved_parameters=2
         ):
             placeholders = ",".join("?" for _ in batch)
             fingerprint_ready += int(
@@ -1285,8 +1327,9 @@ def _build_report_data(
                     f"""
                     SELECT COUNT(DISTINCT content_id) FROM duplicate_fingerprints
                     WHERE content_id IN ({placeholders}) AND fingerprint_version=?
+                      AND julianday(created_at)<=julianday(?)
                     """,
-                    [*batch, FINGERPRINT_VERSION],
+                    [*batch, FINGERPRINT_VERSION, collection_cutoff_at],
                 ).fetchone()[0]
             )
         duplicate_calibration_ready = (
@@ -1294,6 +1337,7 @@ def _build_report_data(
                 """
             SELECT 1 FROM duplicate_calibration_runs
             WHERE fingerprint_version=? AND thresholds_json=? AND status='passed'
+              AND julianday(created_at)<=julianday(?)
             LIMIT 1
             """,
                 (
@@ -1304,6 +1348,7 @@ def _build_report_data(
                         sort_keys=True,
                         separators=(",", ":"),
                     ),
+                    collection_cutoff_at,
                 ),
             ).fetchone()
             is not None
@@ -1319,7 +1364,7 @@ def _build_report_data(
             .replace("+00:00", "Z")
         )
         for batch in _report_id_batches(
-            connection, ids, reserved_parameters=2
+            connection, ids, reserved_parameters=3
         ):
             placeholders = ",".join("?" for _ in batch)
             recent_comment_ids.update(
@@ -1329,8 +1374,9 @@ def _build_report_data(
                     SELECT DISTINCT content_id FROM comment_evidence_versions
                     WHERE content_id IN ({placeholders}) AND status='available'
                       AND captured_at>=? AND captured_at<=?
+                      AND julianday(created_at)<=julianday(?)
                     """,
-                    [*batch, comment_cutoff, collection_cutoff_at],
+                    [*batch, comment_cutoff, collection_cutoff_at, collection_cutoff_at],
                 ).fetchall()
             )
     media_content_ids = [
@@ -1342,6 +1388,7 @@ def _build_report_data(
         connection,
         str(release["id"]),
         media_content_ids,
+        cutoff_at=collection_cutoff_at,
     )
     media_terminal_ids = {
         content_id
@@ -1370,6 +1417,9 @@ def _build_report_data(
         round(eval_ready * 100 / total, 2) if total else 100.0
     )
     data_quality: Dict[str, Any] = {
+        "roster_evidence_valid": scans["roster_evidence_valid"],
+        "scan_traceable": scans["scan_traceable"],
+        "scope_reconstructable": not scope_event["payload"]["unknown_dimensions"],
         "discovery_coverage": discovery_detail["percentage"],
         "detail_coverage": _percentage(detail_ready, total) if total else 100.0,
         "metrics_freshness": freshness_detail["percentage"],
@@ -1401,20 +1451,22 @@ def _build_report_data(
         for value in snapshots.values()
         if value["comment_count"] is not None
     ]
-    view_metric_coverage = _percentage(len(view_values), total)
-    all_historical = bool(snapshots) and all(
-        str(value["source"]).startswith("migrated_") for value in snapshots.values()
+    view_eligible = sum(str(content["platform"]) == "douyin" for content in contents)
+    view_metric_coverage = _percentage(len(view_values), view_eligible)
+    all_historical = bool(view_values) and all(
+        value.get("fields", {}).get("view_count", {}).get("freshness") != "fresh"
+        for value in snapshots.values() if value.get("view_count") is not None
     )
     view_status = (
         "not_applicable"
-        if total == 0
+        if view_eligible == 0
         else "missing"
         if not view_values
+        else "below_threshold"
+        if (view_metric_coverage or 0) < view_minimum
         else "stale"
         if all_historical
         else "available"
-        if (view_metric_coverage or 0) >= view_minimum
-        else "below_threshold"
     )
     comment_status = (
         "not_applicable"
@@ -1440,7 +1492,7 @@ def _build_report_data(
     )
     view_reason = (
         "曝光量来自之前保存的数据，不能当作当前实时数据"
-        if all_historical
+        if view_status == "stale"
         else f"有曝光量的数据占 {view_metric_coverage:.2f}%，低于至少 "
         f"{view_minimum:g}% 的要求"
         if view_status == "below_threshold" and view_metric_coverage is not None
@@ -1471,14 +1523,16 @@ def _build_report_data(
             WHERE task_id=? AND inclusion_status='included'
         )
           AND d.status='confirmed'
+          AND julianday(d.created_at)<=julianday(?)
           AND d.id=(
               SELECT d2.id FROM duplicate_relations d2
               WHERE d2.duplicate_content_id=d.duplicate_content_id AND d2.status='confirmed'
+                AND julianday(d2.created_at)<=julianday(?)
               ORDER BY d2.confidence DESC,d2.id LIMIT 1
           )
         ORDER BY d.id
         """,
-        (task["id"],),
+        (task["id"], collection_cutoff_at, collection_cutoff_at),
     ).fetchall()
     duplicate_by_content = {
         int(row["duplicate_content_id"]): dict(row) for row in duplicate_rows
@@ -1489,9 +1543,10 @@ def _build_report_data(
         WHERE fs.content_id IN (
             SELECT content_id FROM task_contents
             WHERE task_id=? AND inclusion_status='included'
-        ) GROUP BY fs.stage, fs.status ORDER BY fs.stage, fs.status
+        ) AND julianday(fs.created_at)<=julianday(?) AND julianday(fs.updated_at)<=julianday(?)
+        GROUP BY fs.stage, fs.status ORDER BY fs.stage, fs.status
         """,
-        (task["id"],),
+        (task["id"], collection_cutoff_at, collection_cutoff_at),
     ).fetchall()
     start_utc, end_utc = period_bounds(
         str(task["period_start"]), str(task["period_end"])
@@ -1519,6 +1574,8 @@ def _build_report_data(
         conclusion_rows.append(
             {
                 "content_id": content_id,
+                **{field: snapshot.get(field) if snapshot else None for field in METRIC_FIELDS},
+                "metric_sources": snapshot.get("fields", {}) if snapshot else {},
                 "platform": str(content["platform"]),
                 "content_direction": content["resolved_direction"],
                 "evidence_level": evaluation["evidence_level"] if evaluation else None,
@@ -1561,6 +1618,8 @@ def _build_report_data(
         duplicate = duplicate_by_content.get(content_id)
         details.append(
             {
+                **{field: snapshot.get(field) if snapshot else None for field in METRIC_FIELDS},
+                "metric_sources": snapshot.get("fields", {}) if snapshot else {},
                 "content_id": content_id,
                 "platform_content_id": content["platform_content_id"],
                 "link_id": content["link_id"],
@@ -1627,6 +1686,7 @@ def _build_report_data(
             "discovery_coverage": discovery_detail,
             "metrics_freshness": freshness_detail,
             "pipeline_observation": pipeline_observation,
+            "unknown_dimensions": scope_event["payload"]["unknown_dimensions"],
         },
         "summary_metrics": {
             "publication_count": quantity_metric(
@@ -1710,9 +1770,38 @@ def _build_report_data(
         "duplicates": [dict(row) for row in duplicate_rows],
         "capture_summary": [dict(row) for row in capture_rows],
         "provider_costs": [dict(row) for row in cost_rows],
+        "input_references": {
+            "scope_event_id": scope_event["event_id"], "scope_sha256": scope_event["sha256"],
+            "source_policy": load_policy(), "source_policy_sha256": report_inputs.digest(load_policy()),
+            "release_id": release["id"], "matcher_rule_sha256": release["matcher_rule_sha256"],
+            "content_ids": ids, "metrics": snapshots, "evaluations": eligible_evaluations,
+            "media_states": media_states, "comment_content_ids": sorted(recent_comment_ids), "scans": frozen_scan_inputs,
+            "evidence_rows": _frozen_evidence_rows(connection, ids, cutoff_at=collection_cutoff_at),
+        },
         "content_details": details,
         "files": files,
     }
+
+
+def _frozen_evidence_rows(connection, ids: Sequence[int], *, cutoff_at: str) -> Dict[str, Any]:
+    """Exact referenced row sets; no mutable `latest` query on report replay."""
+    result: Dict[str, Any] = {key: [] for key in ("artifacts", "envelopes", "fingerprints", "comments", "detail_slots")}
+    specifications = (
+        ("artifacts", "evidence_artifacts", "id,content_id,artifact_type,local_path,sha256,byte_size,processor_version,captured_at,created_at", "created_at", "captured_at"),
+        ("envelopes", "evidence_envelopes", "*", "created_at", "created_at"),
+        ("fingerprints", "duplicate_fingerprints", "*", "created_at", "created_at"),
+        ("comments", "comment_evidence_versions", "*", "created_at", "captured_at"),
+        ("detail_slots", "fetch_slots", "*", "created_at", "updated_at"),
+    )
+    for key, table, columns, stored, observed in specifications:
+        for batch in _report_id_batches(connection, ids, reserved_parameters=2):
+            placeholders = ",".join("?" for _ in batch)
+            result[key].extend(dict(row) for row in connection.execute(
+                f"SELECT {columns} FROM {table} WHERE content_id IN ({placeholders}) "
+                f"AND julianday({stored})<=julianday(?) AND julianday({observed})<=julianday(?) ORDER BY id",
+                [*batch, cutoff_at, cutoff_at],
+            ))
+    return result
 
 
 _CONCLUSION_METRIC_LABELS = (
@@ -2397,6 +2486,10 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         "content_automotive_score",
         "view_count",
         "comment_count",
+        "like_count",
+        "share_count",
+        "collect_count",
+        "metric_sources",
         "duplicate_original_link_id",
         "duplicate_method",
         "duplicate_confidence",
@@ -2407,7 +2500,7 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         writer.writeheader()
         writer.writerows(
             {
-                field: formula_safe_csv_value(value)
+                field: formula_safe_csv_value(json.dumps(value, ensure_ascii=False, sort_keys=True) if isinstance(value, dict) else value)
                 for field, value in row.items()
             }
             for row in rows
@@ -2691,6 +2784,9 @@ def run_task(
         ).fetchone()
         if task is None:
             raise ReportTaskError(f"task does not exist: {task_id}")
+        legacy = _legacy_report(connection, task_id)
+        if legacy is not None:
+            return legacy
         if task["task_status"] not in RUNNABLE_STATUSES:
             raise ReportTaskError(
                 f"task {task_id} is not runnable from {task['task_status']}"
@@ -2774,14 +2870,72 @@ def run_task(
             db_path=db_path,
         )
         with connect(db_path) as connection:
-            report = _build_report_data(
-                connection,
-                task_value,
-                release=release_value,
-                revision=revision,
-                generated_at=generated_at,
-                files=planned_files,
-            )
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("BEGIN")
+            try:
+                report = _build_report_data(
+                    connection,
+                    task_value,
+                    release=release_value,
+                    revision=revision,
+                    generated_at=generated_at,
+                    files=planned_files,
+                )
+            finally:
+                connection.rollback()
+        if not report.get("frozen_inputs"):
+            with connect(db_path) as connection, transaction(connection):
+                _require_pinned_report_release(connection, release_value)
+                current_task = connection.execute(
+                    "SELECT task_status FROM report_tasks WHERE id=?",
+                    (task_id,),
+                ).fetchone()
+                if current_task is None:
+                    raise ReportTaskError(f"task does not exist: {task_id}")
+                if current_task["task_status"] == "cancel_requested":
+                    raise TaskCancelled("任务已在冻结报告输入前取消")
+                if current_task["task_status"] != "running":
+                    raise ReportTaskError(
+                        f"task {task_id} changed while report inputs were assembled"
+                    )
+                current_scope = report_inputs.load_event(
+                    connection,
+                    str(task_id),
+                    report_inputs.SCOPE_EVENT,
+                )
+                references = report.get("input_references") or {}
+                if (
+                    current_scope is None
+                    or references.get("scope_event_id") != current_scope["event_id"]
+                    or references.get("scope_sha256") != current_scope["sha256"]
+                ):
+                    raise ReportTaskError(
+                        "report scope changed while report inputs were assembled"
+                    )
+                existing = report_inputs.frozen_report(connection, str(task_id))
+                if existing is not None:
+                    if existing["payload"]["metadata"]["collection_cutoff_at"] != _collection_cutoff_at(
+                        task_value, generated_at=generated_at
+                    ):
+                        raise ReportTaskError("frozen report cutoff changed")
+                    if str(existing["payload"]["input_references"]["release_id"]) != str(
+                        release_value["id"]
+                    ):
+                        raise ReportTaskError(
+                            "frozen report release changed; create a correction task"
+                        )
+                    event = existing
+                else:
+                    event = report_inputs.store_report(connection, str(task_id), report)
+                report = report_inputs.render_frozen(
+                    event,
+                    revision=revision,
+                    generated_at=generated_at,
+                    files=planned_files,
+                )
+                from .contracts import validate_report as validate_input_contract
+
+                validate_input_contract(report)
         advance_task_progress(
             task_id,
             progress=65,

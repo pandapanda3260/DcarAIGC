@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import importlib.util
 import json
@@ -11,16 +12,26 @@ import sys
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType
 from unittest.mock import patch
+from uuid import uuid4
 
+from fastapi.testclient import TestClient
+
+from v8.api import ApiConfig, create_app
+from v8 import api as api_module, capture_code_successor, raw_evidence
 from v8.contracts import CURRENT_REPORT_RULE_VERSION, CURRENT_REPORT_VERSION
+from v8.operations import upsert_account
+from v8.paid_drain import issue_activation_permit_in_transaction
+from v8.profile_activations import TIKHUB_PROFILE, append_activation
 from v8.release_management_v9 import (
     TARGET_RELEASE_ID,
     TAXONOMY_VERSION,
 )
-from v8.storage import CURRENT_SCHEMA_MIGRATION_NAME, SCHEMA_VERSION
+from v8.snapshot_contract import descriptor
+from v8.storage import CURRENT_SCHEMA_MIGRATION_NAME, SCHEMA_VERSION, connect, initialize_database, transaction
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -84,71 +95,48 @@ def _create_main_database(path: Path, project_root: Path) -> None:
     )
     media_manifest.chmod(0o600)
 
-    connection = sqlite3.connect(path)
+    connection = connect(path)
     try:
+        initialize_database(connection)
         connection.executescript(
             """
-            PRAGMA user_version=16;
-            CREATE TABLE content_items(
-                id INTEGER PRIMARY KEY,
-                published_at TEXT,
-                imported_at TEXT
+            INSERT INTO content_items(
+                id,link_id,platform,canonical_url,published_at,imported_at,
+                created_at,updated_at
+            ) VALUES(
+                1,'ABC123','douyin','https://www.douyin.com/video/1',
+                '2026-08-10T01:00:00Z','2026-08-10T02:00:00Z',
+                '2026-08-10T02:00:00Z','2026-08-10T02:00:00Z'
             );
-            CREATE TABLE scheduler_runs(
-                job_id TEXT,
-                scheduled_for TEXT,
-                status TEXT,
-                completed_at TEXT
-            );
-            CREATE TABLE schema_migrations(version INTEGER, name TEXT);
-            CREATE TABLE taxonomy_versions(version TEXT, status TEXT);
-            CREATE TABLE evaluation_releases(
-                id TEXT,
-                rule_version TEXT,
-                taxonomy_version TEXT,
-                matcher_rule_sha256 TEXT,
-                status TEXT
-            );
-            CREATE TABLE evidence_artifacts(
-                local_path TEXT,
-                sha256 TEXT,
-                byte_size INTEGER,
-                status TEXT,
-                artifact_type TEXT
-            );
-            CREATE TABLE report_files(
-                local_path TEXT,
-                sha256 TEXT,
-                byte_size INTEGER,
-                status TEXT
-            );
-            CREATE TABLE report_revisions(
-                report_json_path TEXT,
-                report_sha256 TEXT
-            );
-            INSERT INTO content_items VALUES(
-                1,'2026-08-10T01:00:00Z','2026-08-10T02:00:00Z'
-            );
-            INSERT INTO scheduler_runs VALUES(
+            INSERT INTO scheduler_runs(job_id,scheduled_for,status,started_at,completed_at) VALUES(
                 'daily_capture','2026-08-10T18:00:00Z','succeeded',
-                '2026-08-10T18:10:00Z'
+                '2026-08-10T18:00:00Z','2026-08-10T18:10:00Z'
             );
-            INSERT INTO schema_migrations VALUES(
-                16,'remove-manual-review'
+            INSERT INTO taxonomy_versions(id,version,status,definition,created_at) VALUES(
+                'fixture-taxonomy','selling-points-v5.2','published','{}',
+                '2026-08-10T02:00:00Z'
             );
-            INSERT INTO taxonomy_versions VALUES(
-                'selling-points-v5.2','published'
-            );
-            INSERT INTO evaluation_releases VALUES(
+            INSERT INTO evaluation_releases(
+                id,rule_version,taxonomy_version,matcher_rule_sha256,status,
+                created_at,updated_at
+            ) VALUES(
                 'evaluation-v9__selling-points-v5.2','evaluation-v9',
                 'selling-points-v5.2',
                 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-                'active'
+                'active','2026-08-10T02:00:00Z','2026-08-10T02:00:00Z'
+            );
+            INSERT INTO report_tasks(
+                id,task_type,name,period_start,period_end,creation_source,
+                task_status,created_at,updated_at
+            ) VALUES(
+                'fixture-report','daily','fixture','2026-08-09','2026-08-10',
+                'manual','succeeded','2026-08-10T02:00:00Z','2026-08-10T02:00:00Z'
             );
             """
         )
         connection.execute(
-            "INSERT INTO evidence_artifacts VALUES(?,?,?,?,?)",
+            "INSERT INTO evidence_artifacts(content_id,local_path,sha256,byte_size,status,"
+            "artifact_type,created_at) VALUES(1,?,?,?,?,?,'2026-08-10T02:00:00Z')",
             (
                 "data/cache/v8/media/test/media.json",
                 _sha256(media_manifest),
@@ -158,7 +146,16 @@ def _create_main_database(path: Path, project_root: Path) -> None:
             ),
         )
         connection.execute(
-            "INSERT INTO report_files VALUES(?,?,?,?)",
+            "INSERT INTO report_revisions(task_id,revision,release_id,contract_version,"
+            "rule_version,taxonomy_version,report_json_path,report_sha256,created_at) "
+            "VALUES('fixture-report',1,?,?,?,?,?,?,'2026-08-10T02:00:00Z')",
+            (TARGET_RELEASE_ID, CURRENT_REPORT_VERSION, CURRENT_REPORT_RULE_VERSION,
+             TAXONOMY_VERSION, "reports/runs/v8/test/revision_001/report.json", _sha256(report)),
+        )
+        connection.execute(
+            "INSERT INTO report_files(id,task_id,revision,file_kind,local_path,sha256,byte_size,"
+            "status,created_at) VALUES('fixture-file','fixture-report',1,'json',?,?,?,?,"
+            "'2026-08-10T02:00:00Z')",
             (
                 "reports/runs/v8/test/revision_001/report.json",
                 _sha256(report),
@@ -166,10 +163,7 @@ def _create_main_database(path: Path, project_root: Path) -> None:
                 "available",
             ),
         )
-        connection.execute(
-            "INSERT INTO report_revisions VALUES(?,?)",
-            ("reports/runs/v8/test/revision_001/report.json", _sha256(report)),
-        )
+        assert not connection.execute("PRAGMA foreign_key_check").fetchall()
         connection.commit()
     finally:
         connection.close()
@@ -188,11 +182,25 @@ def _create_legacy_database(path: Path) -> None:
 
 
 def _create_old_active_database(path: Path) -> None:
-    connection = sqlite3.connect(path)
+    # Older *data* on the current server contract. Cross-schema changes must
+    # use schema-upgrade and are tested separately, never ordinary install.
+    connection = connect(path)
     try:
+        initialize_database(connection)
         connection.executescript(
-            "PRAGMA user_version=16; CREATE TABLE active_marker(value TEXT);"
-            "INSERT INTO active_marker VALUES('old');"
+            """
+            CREATE TABLE active_marker(value TEXT);
+            INSERT INTO active_marker VALUES('old');
+            INSERT INTO taxonomy_versions(id,version,status,definition,created_at)
+            VALUES('active-taxonomy','selling-points-v5.2','published','{}','2026-08-10T02:00:00Z');
+            INSERT INTO evaluation_releases(
+                id,rule_version,taxonomy_version,matcher_rule_sha256,status,created_at,updated_at
+            ) VALUES(
+                'evaluation-v9__selling-points-v5.2','evaluation-v9','selling-points-v5.2',
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                'active','2026-08-10T02:00:00Z','2026-08-10T02:00:00Z'
+            );
+            """
         )
         connection.commit()
     finally:
@@ -220,7 +228,7 @@ def _write_snapshot_directory(root: Path, snapshot_id: str, payload: bytes) -> N
 class ServerSnapshotDeploymentTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.project = self.root / "project"
         self.project.mkdir()
         self.database = self.project / "app/data/dcar_insight.sqlite3"
@@ -229,8 +237,15 @@ class ServerSnapshotDeploymentTest(unittest.TestCase):
         _create_main_database(self.database, self.project)
         _create_legacy_database(self.legacy_database)
         self.bundle = self.root / "bundle"
+        self.installed_build_patch = patch.object(
+            capture_code_successor, "_installed_build_path",
+            side_effect=lambda: Path(os.environ["DCAR_LOADED_BUILD_RECEIPT"])
+            if os.environ.get("DCAR_LOADED_BUILD_RECEIPT") else None,
+        )
+        self.installed_build_patch.start()
 
     def tearDown(self) -> None:
+        self.installed_build_patch.stop()
         self.temporary.cleanup()
 
     def build_bundle(self) -> dict[str, object]:
@@ -259,6 +274,117 @@ class ServerSnapshotDeploymentTest(unittest.TestCase):
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
 
+    def test_roster_api_sources_keep_external_database_publishable(self) -> None:
+        external_data = self.root / "formal-data"
+        external_data.mkdir()
+        self.database = self.database.rename(external_data / self.database.name)
+        config = ApiConfig(
+            db_path=self.database,
+            reports_root=self.project / "reports/runs/v8",
+            legacy_db_path=self.legacy_database,
+            operator_freeze_lock=self.project / "runtime/operator-freeze.lock",
+            project_root=self.project,
+        )
+        upsert_account(
+            {"platforms": [{"platform": "douyin", "uid": "123456789"}]},
+            db_path=self.database,
+        )
+        source = json.dumps({"members": [{
+            "platform": "douyin",
+            "matrix_account_id": "matrix-external-db",
+            "uid": "123456789",
+            "profile_ref": "https://www.douyin.com/user/MS4w.external",
+        }]}).encode()
+        with TestClient(create_app(config)) as client:
+            imported = client.post("/api/v8/account-roster/import", json={
+                "source_name": "matrix-full.json",
+                "content_base64": base64.b64encode(source).decode(),
+                "organization": "test",
+                "source_exported_at": (
+                    datetime.now(timezone.utc) - timedelta(hours=1)
+                ).isoformat(),
+                "source_instance_id": "external-db-export",
+                "declared_count": 1,
+                "evidence_note": "Complete organization and all-added-account export.",
+            })
+            self.assertEqual(imported.status_code, 200, imported.text)
+            bootstrapped = client.post("/api/v8/account-roster/system/bootstrap", json={
+                "reason": "prepare system roster with an external formal database",
+            })
+            self.assertEqual(bootstrapped.status_code, 200, bootstrapped.text)
+            with connect(self.database) as connection:
+                snapshot = connection.execute(
+                    "SELECT id,members_sha256 FROM account_roster_snapshots WHERE id=?",
+                    (bootstrapped.json()["snapshot_id"],),
+                ).fetchone()
+                assert snapshot is not None
+                activated_at = (
+                    datetime.now(timezone.utc) - timedelta(seconds=1)
+                ).isoformat(timespec="seconds")
+                activation = append_activation(
+                    connection,
+                    profile_id=TIKHUB_PROFILE,
+                    roster_snapshot_id=int(snapshot["id"]),
+                    roster_members_sha256=str(snapshot["members_sha256"]),
+                    effective_at=activated_at,
+                    build_receipt_sha256="b" * 64,
+                    actor="test",
+                    reason="test managed roster mutations",
+                    created_at=activated_at,
+                )
+                with transaction(connection):
+                    issue_activation_permit_in_transaction(
+                        connection, activation_id=activation["activation_id"],
+                        drain_id="external-database-fixture:initial",
+                        source_activation_id=activation["activation_id"],
+                        business_day=activated_at[:10], planned_effective_at=activated_at,
+                        build_receipt_sha256="b" * 64, runtime_root_receipt_sha256="c" * 64,
+                        now=activated_at,
+                    )
+            client.app.state.writer_lock_held = True
+            def add_profile(uid: str):
+                profile_url = f"https://www.douyin.com/user/{uid}"
+                with patch.object(api_module, "_resolve_account_creation_profile", return_value={
+                    "platform": "douyin", "uid": uid, "profile_ref": profile_url,
+                }):
+                    return client.post("/api/v8/accounts", json={
+                        "profile_url": profile_url, "account_status": "daily",
+                        "request_id": str(uuid4()),
+                    })
+
+            added = add_profile("234567890")
+            self.assertEqual(added.status_code, 200, added.text)
+            merged = add_profile("345678901")
+            self.assertEqual(merged.status_code, 200, merged.text)
+            paused = client.patch(f"/api/v8/accounts/{added.json()['account_id']}", json={
+                "account_status": "paused",
+            })
+            self.assertEqual(paused.status_code, 200, paused.text)
+            self.assertFalse(paused.json()["enabled"])
+
+        with connect(self.database, read_only=True) as connection:
+            sources = connection.execute(
+                "SELECT local_path,sha256 FROM provider_raw_responses ORDER BY id"
+            ).fetchall()
+            roster_sources = connection.execute(
+                "SELECT source_path,source_sha256 FROM account_roster_snapshots ORDER BY id"
+            ).fetchall()
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM provider_usage"
+            ).fetchone()[0], 0)
+        self.assertEqual(len(sources), 5)
+        self.assertEqual([tuple(row) for row in sources], [tuple(row) for row in roster_sources])
+        expected_root = self.project / "data/cache/v8/raw_responses/roster_sources"
+        for row in sources:
+            path = Path(row["local_path"])
+            self.assertTrue(path.is_relative_to(expected_root), str(path))
+            self.assertEqual(_sha256(path), row["sha256"])
+        self.assertFalse((external_data / "roster_sources").exists())
+        manifest = self.build_bundle()
+        included = {item["project_path"] for item in manifest["files"]}
+        for row in sources:
+            self.assertIn(Path(row["local_path"]).relative_to(self.project).as_posix(), included)
+
     def test_builder_creates_online_backups_and_hash_lists(self) -> None:
         manifest = self.build_bundle()
         self.assertEqual(manifest["schema"], builder.BUNDLE_SCHEMA)
@@ -277,7 +403,11 @@ class ServerSnapshotDeploymentTest(unittest.TestCase):
                 "matcher_rule_sha256": "a" * 64,
             },
         )
-        self.assertEqual(manifest["artifact_policy"]["name"], "thin-server-v1")
+        self.assertEqual(manifest["artifact_policy"]["name"], "thin-server-v2")
+        self.assertEqual(manifest["snapshot_contract"], descriptor())
+        self.assertEqual(manifest["writer_project_root"], str(self.project.resolve()))
+        self.assertEqual(manifest["managed_originals"],
+                         {"contract_version": "managed-originals-v1", "bundles": []})
         self.assertEqual(manifest["file_count"], 4)
         self.assertEqual(
             {item["project_path"] for item in manifest["files"]},
@@ -313,6 +443,50 @@ class ServerSnapshotDeploymentTest(unittest.TestCase):
         finally:
             snapshot.close()
 
+    def test_builder_includes_compressed_raw_metadata_sidecar(self) -> None:
+        raw_path = (
+            self.project
+            / "data/cache/v8/raw_responses/tikhub/fixture/response.json.zst"
+        )
+        receipt = raw_evidence.write_zstd_raw_evidence(
+            raw_path,
+            b'{"status":"ok"}\n',
+            provider="TikHub",
+            operation="douyin_user_posts",
+            response_identity="c" * 64,
+            paid_scope_identity="d" * 64,
+            sequence=1,
+        )
+        with connect(self.database) as connection:
+            connection.execute(
+                "INSERT INTO provider_raw_responses("
+                "provider,operation,local_path,sha256,byte_size,http_status,"
+                "captured_at,source) VALUES(?,?,?,?,?,200,?,'live_applied')",
+                (
+                    "TikHub",
+                    "douyin_user_posts",
+                    str(raw_path),
+                    receipt.stored_sha256,
+                    receipt.stored_size,
+                    "2026-08-10T02:00:00Z",
+                ),
+            )
+            connection.commit()
+
+        manifest = self.build_bundle()
+        files = {
+            str(item["project_path"]): item for item in manifest["files"]
+        }
+        raw_relative = raw_path.relative_to(self.project).as_posix()
+        sidecar_path = raw_evidence.sidecar_path_for(raw_path)
+        sidecar_relative = sidecar_path.relative_to(self.project).as_posix()
+        self.assertIn(raw_relative, files)
+        self.assertIn(sidecar_relative, files)
+        self.assertEqual(files[raw_relative]["sha256"], receipt.stored_sha256)
+        self.assertEqual(
+            files[sidecar_relative]["sha256"], _sha256(sidecar_path)
+        )
+
     def test_server_runbook_pins_current_schema(self) -> None:
         runbook = (REPOSITORY_ROOT / "deploy/server/README.md").read_text(
             encoding="utf-8"
@@ -339,17 +513,24 @@ class ServerSnapshotDeploymentTest(unittest.TestCase):
         for statement in (
             """
             UPDATE evaluation_releases
-            SET id='evaluation-v8__selling-points-v5.2',rule_version='evaluation-v8'
+            SET status='retired';
+            INSERT INTO evaluation_releases(
+                id,rule_version,taxonomy_version,matcher_rule_sha256,status,created_at,updated_at
+            ) VALUES(
+                'evaluation-v8__selling-points-v5.2','evaluation-v8','selling-points-v5.2',
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                'active','2026-08-10T02:00:00Z','2026-08-10T02:00:00Z'
+            );
             """,
             """
             UPDATE schema_migrations
-            SET name='interaction-user-v1-fallback-keys' WHERE version=16
+            SET name='fixture-invalid-migration' WHERE version=19
             """,
         ):
             candidate = self.root / f"candidate-{len(list(self.root.glob('candidate-*')))}.sqlite3"
             shutil.copy2(self.database, candidate)
             with sqlite3.connect(candidate) as connection:
-                connection.execute(statement)
+                connection.executescript(statement)
                 connection.commit()
             output = candidate.with_suffix(".bundle")
             with self.assertRaisesRegex(
@@ -368,12 +549,19 @@ class ServerSnapshotDeploymentTest(unittest.TestCase):
     ) -> None:
         self.build_bundle()
         config = self.server_config()
+        config.database_root.mkdir(parents=True)
+        _create_old_active_database(config.database_root / "dcar_insight.sqlite3")
         database_path = self.bundle / "databases/dcar_insight.sqlite3"
         with sqlite3.connect(database_path) as connection:
-            connection.execute(
+            connection.executescript(
                 """
-                UPDATE evaluation_releases
-                SET id='evaluation-v8__selling-points-v5.2',rule_version='evaluation-v8'
+                UPDATE evaluation_releases SET status='retired';
+                INSERT INTO evaluation_releases(
+                    id,rule_version,taxonomy_version,matcher_rule_sha256,status,created_at,updated_at
+                )
+                SELECT 'evaluation-v8__selling-points-v5.2','evaluation-v8',taxonomy_version,
+                       matcher_rule_sha256,'active',created_at,updated_at
+                FROM evaluation_releases WHERE id='evaluation-v9__selling-points-v5.2';
                 """
             )
             connection.commit()
@@ -406,6 +594,8 @@ class ServerSnapshotDeploymentTest(unittest.TestCase):
     def test_installer_rejects_legacy_bundle_without_runtime_identity(self) -> None:
         self.build_bundle()
         config = self.server_config()
+        config.database_root.mkdir(parents=True)
+        _create_old_active_database(config.database_root / "dcar_insight.sqlite3")
         manifest = json.loads(
             (self.bundle / "manifest.json").read_text(encoding="utf-8")
         )
@@ -428,11 +618,14 @@ class ServerSnapshotDeploymentTest(unittest.TestCase):
     ) -> None:
         self.build_bundle()
         config = self.server_config()
+        config.database_root.mkdir(parents=True)
+        _create_old_active_database(config.database_root / "dcar_insight.sqlite3")
         database_path = self.bundle / "databases/dcar_insight.sqlite3"
         with sqlite3.connect(database_path) as connection:
             connection.execute("DELETE FROM schema_migrations")
             connection.execute(
-                "INSERT INTO schema_migrations VALUES(12,'append-only-metric-observations')"
+                "INSERT INTO schema_migrations(version,name,applied_at) "
+                "VALUES(12,'append-only-metric-observations','2026-08-10T02:00:00Z')"
             )
             connection.execute("PRAGMA user_version=12")
             connection.commit()
@@ -469,6 +662,8 @@ class ServerSnapshotDeploymentTest(unittest.TestCase):
     ) -> None:
         self.build_bundle()
         config = self.server_config()
+        config.database_root.mkdir(parents=True)
+        _create_old_active_database(config.database_root / "dcar_insight.sqlite3")
         database_path = self.bundle / "databases/dcar_insight.sqlite3"
         with sqlite3.connect(database_path) as connection:
             connection.execute(
@@ -563,7 +758,8 @@ class ServerSnapshotDeploymentTest(unittest.TestCase):
         with sqlite3.connect(self.database) as connection:
             connection.execute("DELETE FROM evidence_artifacts")
             connection.execute(
-                "INSERT INTO evidence_artifacts VALUES(?,?,?,?,?)",
+                "INSERT INTO evidence_artifacts(content_id,local_path,sha256,byte_size,status,"
+                "artifact_type,created_at) VALUES(1,?,?,?,?,?,'2026-08-10T02:00:00Z')",
                 (
                     "data/cache/v8/media/test/video.mp4",
                     expected_sha,
@@ -662,6 +858,116 @@ class ServerSnapshotDeploymentTest(unittest.TestCase):
         finally:
             active.close()
 
+    def test_sparse_bundle_reuses_exact_single_link_active_artifact(self) -> None:
+        manifest = self.build_bundle()
+        config = self.server_config()
+        config.database_root.mkdir(parents=True)
+        _create_old_active_database(config.database_root / "dcar_insight.sqlite3")
+        self.stage_artifacts(manifest, config)
+        item = manifest["files"][0]
+        staged = self.bundle.parent / "artifacts" / item["root"] / item["path"]
+        active_root = config.cache_root if item["root"] == "cache" else config.reports_root
+        active = active_root / item["path"]
+        active.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(staged, active)
+        staged.unlink()
+        active_inode = active.stat().st_ino
+
+        installer.verify_bundle(self.bundle, config, verify_artifacts=True)
+        actions: list[str] = []
+        installer.install_bundle(
+            self.bundle,
+            config,
+            service_action=actions.append,
+            smoke_check=lambda: None,
+        )
+
+        self.assertEqual(actions, ["stop", "start"])
+        self.assertEqual(active.stat().st_ino, active_inode)
+        self.assertEqual(_sha256(active), item["sha256"])
+
+    def test_sparse_bundle_refuses_drifted_active_fallback(self) -> None:
+        manifest = self.build_bundle()
+        config = self.server_config()
+        self.stage_artifacts(manifest, config)
+        item = manifest["files"][0]
+        staged = self.bundle.parent / "artifacts" / item["root"] / item["path"]
+        active_root = config.cache_root if item["root"] == "cache" else config.reports_root
+        active = active_root / item["path"]
+        active.parent.mkdir(parents=True, exist_ok=True)
+        active.write_bytes(b"drifted")
+        staged.unlink()
+
+        with self.assertRaisesRegex(installer.SnapshotInstallError, "artifact drifted"):
+            installer.verify_bundle(self.bundle, config, verify_artifacts=True)
+
+    def test_sparse_bundle_never_falls_back_when_staged_artifact_drifted(self) -> None:
+        manifest = self.build_bundle()
+        config = self.server_config()
+        self.stage_artifacts(manifest, config)
+        item = manifest["files"][0]
+        staged = self.bundle.parent / "artifacts" / item["root"] / item["path"]
+        active_root = config.cache_root if item["root"] == "cache" else config.reports_root
+        active = active_root / item["path"]
+        active.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(staged, active)
+        staged.write_bytes(b"drifted-staging")
+
+        with self.assertRaisesRegex(installer.SnapshotInstallError, "artifact drifted"):
+            installer.verify_bundle(self.bundle, config, verify_artifacts=True)
+
+    def test_sparse_bundle_refuses_hard_linked_active_fallback(self) -> None:
+        manifest = self.build_bundle()
+        config = self.server_config()
+        self.stage_artifacts(manifest, config)
+        item = manifest["files"][0]
+        staged = self.bundle.parent / "artifacts" / item["root"] / item["path"]
+        active_root = config.cache_root if item["root"] == "cache" else config.reports_root
+        active = active_root / item["path"]
+        active.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(staged, active)
+        os.link(active, active.with_name(active.name + ".extra-link"))
+        staged.unlink()
+
+        with self.assertRaisesRegex(
+            installer.SnapshotInstallError, "artifact is missing or unsafe"
+        ):
+            installer.verify_bundle(self.bundle, config, verify_artifacts=True)
+
+    def test_sparse_bundle_refuses_staged_symlink(self) -> None:
+        manifest = self.build_bundle()
+        config = self.server_config()
+        self.stage_artifacts(manifest, config)
+        item = manifest["files"][0]
+        staged = self.bundle.parent / "artifacts" / item["root"] / item["path"]
+        real = staged.with_name(staged.name + ".real")
+        staged.rename(real)
+        staged.symlink_to(real.name)
+
+        with self.assertRaisesRegex(
+            installer.SnapshotInstallError, "staged artifact is unsafe"
+        ):
+            installer.verify_bundle(self.bundle, config, verify_artifacts=True)
+
+    def test_sparse_bundle_refuses_active_symlink_fallback(self) -> None:
+        manifest = self.build_bundle()
+        config = self.server_config()
+        self.stage_artifacts(manifest, config)
+        item = manifest["files"][0]
+        staged = self.bundle.parent / "artifacts" / item["root"] / item["path"]
+        active_root = config.cache_root if item["root"] == "cache" else config.reports_root
+        active = active_root / item["path"]
+        real = active.with_name(active.name + ".real")
+        real.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(staged, real)
+        active.symlink_to(real.name)
+        staged.unlink()
+
+        with self.assertRaisesRegex(
+            installer.SnapshotInstallError, "artifact is missing or unsafe"
+        ):
+            installer.verify_bundle(self.bundle, config, verify_artifacts=True)
+
     def test_installer_refuses_unknown_thin_policy_before_stopping_service(self) -> None:
         manifest = self.build_bundle()
         config = self.server_config()
@@ -710,9 +1016,17 @@ class ServerSnapshotDeploymentTest(unittest.TestCase):
 
     def test_failed_smoke_check_automatically_restores_previous_database(self) -> None:
         manifest = self.build_bundle()
-        config = self.server_config()
+        owner_gid = next(
+            (group_id for group_id in os.getgroups() if group_id != os.getgid()),
+            os.getgid(),
+        )
+        config = replace(self.server_config(), owner_gid=owner_gid)
         config.database_root.mkdir(parents=True)
         _create_old_active_database(config.database_root / "dcar_insight.sqlite3")
+        old_snapshot_id = _snapshot_id(9)
+        _write_active_snapshot(config, old_snapshot_id)
+        os.chown(config.active_manifest_path, config.owner_uid, config.owner_gid)
+        config.active_manifest_path.chmod(0o640)
         self.stage_artifacts(manifest, config)
         actions: list[str] = []
         smoke_calls = 0
@@ -721,6 +1035,14 @@ class ServerSnapshotDeploymentTest(unittest.TestCase):
             nonlocal smoke_calls
             smoke_calls += 1
             if smoke_calls == 1:
+                # Installer-private backups are created by the installing user.
+                # Their metadata must never become the active receipt's access.
+                backup = (
+                    config.history_root
+                    / str(manifest["snapshot_id"])
+                    / "previous-active-snapshot.json"
+                )
+                backup.chmod(0o600)
                 raise installer.SnapshotInstallError("new snapshot smoke failed")
 
         with self.assertRaises(installer.SnapshotInstallError):
@@ -740,6 +1062,25 @@ class ServerSnapshotDeploymentTest(unittest.TestCase):
             )
         finally:
             active.close()
+        restored_receipt = json.loads(
+            config.active_manifest_path.read_text(encoding="utf-8")
+        )
+        self.assertEqual(restored_receipt["snapshot_id"], old_snapshot_id)
+        self.assertEqual(
+            stat.S_IMODE(config.active_manifest_path.stat().st_mode),
+            0o640,
+        )
+        self.assertEqual(config.active_manifest_path.stat().st_gid, config.owner_gid)
+        new_receipt_path = (
+            config.history_root
+            / str(manifest["snapshot_id"])
+            / "install-receipt.json"
+        )
+        new_receipt = json.loads(new_receipt_path.read_text(encoding="utf-8"))
+        self.assertEqual(new_receipt["snapshot_id"], manifest["snapshot_id"])
+        self.assertEqual(new_receipt["activation_status"], "pending_smoke")
+        self.assertEqual(stat.S_IMODE(new_receipt_path.stat().st_mode), 0o640)
+        self.assertEqual(new_receipt_path.stat().st_gid, config.owner_gid)
 
     def test_runtime_identity_smoke_drift_automatically_restores_previous_snapshot(
         self,
@@ -761,7 +1102,7 @@ class ServerSnapshotDeploymentTest(unittest.TestCase):
                 )
 
         with self.assertRaisesRegex(
-            installer.SnapshotInstallError, "previous databases were restored"
+            installer.SnapshotInstallError, "previous database/artifact/receipt set was restored"
         ):
             installer.install_bundle(
                 self.bundle,
@@ -1047,10 +1388,15 @@ class ServerSnapshotDeploymentTest(unittest.TestCase):
             if item["name"] == "dcar_insight.sqlite3"
         )
         config = self.server_config()
+        self.assertEqual(config.request_timeout_seconds, 120.0)
+        self.assertEqual(config.start_wait_seconds, 180.0)
         responses = {
             config.health_url: {
                 "status": "ok",
                 "read_only": True,
+                "report_version": CURRENT_REPORT_VERSION,
+                "snapshot_contract": descriptor(),
+                "lifecycle_jobs_enabled": False,
                 "database_state": {
                     "sha256": main_database["sha256"],
                     "user_version": main_database["user_version"],
@@ -1071,7 +1417,7 @@ class ServerSnapshotDeploymentTest(unittest.TestCase):
                 "read_only": True,
                 "requested": False,
                 "enabled": False,
-                "startup_catchup": {"requested": False},
+                "startup_catchup": {"requested": False, "enabled": False},
             },
         }
         with patch.object(

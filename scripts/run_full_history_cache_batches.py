@@ -36,6 +36,7 @@ from v8 import capture as capture_module
 from v8 import identity as identity_module
 from v8 import media as media_module
 from v8 import operations as operations_module
+from v8 import raw_evidence as raw_evidence_module
 from v8 import storage as storage_module
 
 
@@ -46,11 +47,24 @@ ALLOWED_CHANGED_TABLES = {
     "fetch_slots",
     "provider_raw_responses",
 }
+SPECIAL_APPEND_TABLES = {"scheduler_runs"}
 APPEND_CHANGED_TABLES = (
     "evidence_artifacts",
     "fetch_attempts",
     "fetch_slots",
     "provider_raw_responses",
+)
+STORAGE_FAULT_SCOPE = {"scope_kind": "storage_hard", "provider": "all"}
+STORAGE_FAULT_CLASS = "local_evidence_store"
+STORAGE_FAULT_JOB_ID = (
+    "provider_fault_v2:all:storage_hard:"
+    + hashlib.sha256(
+        json.dumps(
+            STORAGE_FAULT_SCOPE, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()[:24]
+    + ":"
+    + hashlib.sha256(STORAGE_FAULT_CLASS.encode("utf-8")).hexdigest()[:16]
 )
 DEFAULT_CANARY_SIZE = 100
 DEFAULT_BATCH_SIZE = 500
@@ -604,6 +618,7 @@ def _build_target_contract(
                 source_captured_at=source_captured_at,
             )
         )
+        expected_stored_raw = raw_evidence_module.compress_entity_bytes(expected_raw)
         rows.append(
             [
                 candidate.content_id,
@@ -614,8 +629,8 @@ def _build_target_contract(
                 source_sha,
                 source_captured_at,
                 replay._object_sha256(expected_data),
-                hashlib.sha256(expected_raw).hexdigest(),
-                len(expected_raw),
+                hashlib.sha256(expected_stored_raw).hexdigest(),
+                len(expected_stored_raw),
             ]
         )
     return {
@@ -668,6 +683,43 @@ def _allowed_prefix_hashes(
     }
 
 
+def _sequence_snapshot(
+    connection: sqlite3.Connection, *, table: str
+) -> Mapping[str, Any]:
+    row = connection.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name=?", (table,)
+    ).fetchone()
+    return {
+        "present": row is not None,
+        "seq": int(row["seq"]) if row is not None else None,
+    }
+
+
+def _scheduler_runs_baseline(
+    connection: sqlite3.Connection,
+) -> Mapping[str, Any]:
+    count = int(
+        connection.execute("SELECT COUNT(*) FROM scheduler_runs").fetchone()[0]
+    )
+    max_id = int(
+        connection.execute("SELECT COALESCE(MAX(id),0) FROM scheduler_runs").fetchone()[
+            0
+        ]
+    )
+    return {
+        "count": count,
+        "max_id": max_id,
+        "prefix": list(
+            _rows_hash(
+                connection,
+                "SELECT * FROM scheduler_runs WHERE id<=? ORDER BY id",
+                (max_id,),
+            )
+        ),
+        "sequence": _sequence_snapshot(connection, table="scheduler_runs"),
+    }
+
+
 def _database_baseline(
     db_path: Path, *, target_ids: Sequence[int]
 ) -> Mapping[str, Any]:
@@ -699,7 +751,7 @@ def _database_baseline(
         protected = {
             table: list(_table_hash(connection, table))
             for table in tables
-            if table not in ALLOWED_CHANGED_TABLES
+            if table not in ALLOWED_CHANGED_TABLES | SPECIAL_APPEND_TABLES
         }
         info = connection.execute('PRAGMA table_info("content_items")').fetchall()
         stable_columns = [
@@ -729,7 +781,8 @@ def _database_baseline(
         sequences = {
             str(row["name"]): int(row["seq"])
             for row in connection.execute("SELECT name,seq FROM sqlite_sequence")
-            if str(row["name"]) not in ALLOWED_CHANGED_TABLES
+            if str(row["name"])
+            not in ALLOWED_CHANGED_TABLES | SPECIAL_APPEND_TABLES
         }
         allowed_counts = {
             table: int(
@@ -751,6 +804,7 @@ def _database_baseline(
         allowed_non_target = _allowed_non_target_hashes(
             connection, target_ids=target
         )
+        scheduler_runs = _scheduler_runs_baseline(connection)
     finally:
         connection.close()
     return {
@@ -766,6 +820,7 @@ def _database_baseline(
         "allowed_max_ids": allowed_max_ids,
         "allowed_prefix": allowed_prefix,
         "allowed_non_target": allowed_non_target,
+        "scheduler_runs": scheduler_runs,
     }
 
 
@@ -838,12 +893,13 @@ def _critical_snapshot(db_path: Path, *, target_ids: Sequence[int]) -> Mapping[s
         protected = {
             table: list(_table_hash(connection, table))
             for table in tables
-            if table not in ALLOWED_CHANGED_TABLES
+            if table not in ALLOWED_CHANGED_TABLES | SPECIAL_APPEND_TABLES
         }
         sequences = {
             str(row["name"]): int(row["seq"])
             for row in connection.execute("SELECT name,seq FROM sqlite_sequence")
-            if str(row["name"]) not in ALLOWED_CHANGED_TABLES
+            if str(row["name"])
+            not in ALLOWED_CHANGED_TABLES | SPECIAL_APPEND_TABLES
         }
         info = connection.execute('PRAGMA table_info("content_items")').fetchall()
         stable_columns = [
@@ -885,6 +941,245 @@ def _critical_snapshot(db_path: Path, *, target_ids: Sequence[int]) -> Mapping[s
             non_target_digest.hexdigest(),
         ],
         "allowed_non_target": allowed_non_target,
+    }
+
+
+def _validate_scheduler_storage_fault_append_scope(
+    contract: Mapping[str, Any],
+    *,
+    db_path: Path,
+    authorized_content_ids: set[int],
+) -> Mapping[str, Any]:
+    """Validate the one special append-only protected-table exception.
+
+    A derived detail capture may append the global ``storage_hard`` fault
+    receipt before this controller can durably reconcile its orphaned output.
+    The row has no content foreign key, so bind it back to this run by the
+    matching terminal fetch-attempt timestamp and the frozen content scope.
+    """
+
+    target = {int(value) for value in contract.get("target_ids", [])}
+    authorized = {int(value) for value in authorized_content_ids}
+    if not authorized.issubset(target):
+        raise BatchReplayError("scheduler fault receipt 授权内容超出冻结目标")
+    expected_evidence = {
+        "error_code": "storage_hard",
+        "raw_root": str(contract.get("derived_raw_root") or ""),
+    }
+    expected_state_fingerprint = hashlib.sha256(
+        json.dumps(
+            {
+                "contract_version": "provider-fault-v2",
+                "scope": STORAGE_FAULT_SCOPE,
+                "fault_class": STORAGE_FAULT_CLASS,
+                "state_evidence": expected_evidence,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    baseline = contract.get("baseline")
+    if not isinstance(baseline, Mapping):
+        raise BatchReplayError("批处理合同缺少 scheduler_runs 基线")
+    scheduler_baseline = baseline.get("scheduler_runs")
+    allowed_max_ids = baseline.get("allowed_max_ids")
+    if not isinstance(scheduler_baseline, Mapping) or not isinstance(
+        allowed_max_ids, Mapping
+    ):
+        raise BatchReplayError("批处理合同缺少 scheduler_runs 基线")
+    try:
+        baseline_fetch_attempt_id = allowed_max_ids["fetch_attempts"]
+        baseline_count = scheduler_baseline["count"]
+        baseline_max_id = scheduler_baseline["max_id"]
+        baseline_prefix = scheduler_baseline["prefix"]
+        baseline_sequence = scheduler_baseline["sequence"]
+        if not isinstance(baseline_sequence, Mapping):
+            raise TypeError
+        baseline_sequence_present = baseline_sequence["present"]
+        baseline_sequence_value = baseline_sequence["seq"]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise BatchReplayError("批处理 scheduler_runs 基线非法") from exc
+    if (
+        type(baseline_fetch_attempt_id) is not int
+        or baseline_fetch_attempt_id < 0
+        or type(baseline_count) is not int
+        or type(baseline_max_id) is not int
+        or not isinstance(baseline_prefix, list)
+        or len(baseline_prefix) != 2
+        or type(baseline_prefix[0]) is not int
+        or not isinstance(baseline_prefix[1], str)
+        or len(baseline_prefix[1]) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in baseline_prefix[1]
+        )
+        or type(baseline_sequence_present) is not bool
+        or baseline_count < 0
+        or baseline_max_id < 0
+        or baseline_prefix[0] != baseline_count
+        or (baseline_count == 0) != (baseline_max_id == 0)
+        or baseline_max_id < baseline_count
+        or (
+            baseline_sequence_present
+            and (
+                type(baseline_sequence_value) is not int
+                or baseline_sequence_value < baseline_max_id
+            )
+        )
+        or (
+            not baseline_sequence_present
+            and (
+                baseline_sequence_value is not None
+                or baseline_count
+                or baseline_max_id
+            )
+        )
+    ):
+        raise BatchReplayError("批处理 scheduler_runs 基线非法")
+    first_new_id = int(baseline_sequence_value or 0) + 1
+
+    connection = _immutable_connection(db_path)
+    try:
+        current_count = int(
+            connection.execute("SELECT COUNT(*) FROM scheduler_runs").fetchone()[0]
+        )
+        current_prefix = list(
+            _rows_hash(
+                connection,
+                "SELECT * FROM scheduler_runs WHERE id<=? ORDER BY id",
+                (baseline_max_id,),
+            )
+        )
+        current_sequence = _sequence_snapshot(connection, table="scheduler_runs")
+        new_rows = list(
+            connection.execute(
+                "SELECT * FROM scheduler_runs WHERE id>? ORDER BY id",
+                (baseline_max_id,),
+            )
+        )
+        storage_attempts: dict[str, set[int]] = {}
+        for row in connection.execute(
+            """
+            SELECT fs.content_id,fa.response_finished_at
+            FROM fetch_attempts fa
+            JOIN fetch_slots fs ON fs.id=fa.slot_id
+            WHERE fa.id>?
+              AND fa.error_code='storage_hard'
+              AND fa.http_status=200
+              AND fa.billed=0
+              AND fa.amount=0.0
+              AND fa.currency=''
+              AND fa.response_finished_at IS NOT NULL
+              AND fs.content_id IS NOT NULL
+              AND fs.stage='detail'
+              AND fs.window_key='lifetime'
+              AND fs.provider='TikHub'
+              AND fs.adapter_version='tikhub-discovery-derived-v8.1'
+            ORDER BY fa.id
+            """,
+            (baseline_fetch_attempt_id,),
+        ):
+            content_id = int(row["content_id"])
+            if content_id in target:
+                storage_attempts.setdefault(
+                    str(row["response_finished_at"]), set()
+                ).add(content_id)
+    finally:
+        connection.close()
+
+    if current_prefix != baseline_prefix:
+        raise BatchReplayError("批处理改变了 scheduler_runs 历史前缀")
+    if current_count != baseline_count + len(new_rows):
+        raise BatchReplayError("scheduler_runs 存在删除或越界插入")
+    if len(new_rows) > 1:
+        raise BatchReplayError("本批 storage_hard receipt 不是幂等单行")
+    expected_ids = list(range(first_new_id, first_new_id + len(new_rows)))
+    if [int(row["id"]) for row in new_rows] != expected_ids:
+        raise BatchReplayError("scheduler_runs append-only ID 链漂移")
+    expected_current_sequence = {
+        "present": baseline_sequence_present or bool(new_rows),
+        "seq": (
+            int(baseline_sequence_value or 0) + len(new_rows)
+            if baseline_sequence_present or new_rows
+            else None
+        ),
+    }
+    if current_sequence != expected_current_sequence:
+        raise BatchReplayError("scheduler_runs sqlite_sequence 漂移")
+
+    evidence_rows: list[list[Any]] = []
+    for row in new_rows:
+        started_at = str(row["started_at"] or "")
+        completed_at = str(row["completed_at"] or "")
+        scheduled_for = str(row["scheduled_for"] or "")
+        try:
+            details = json.loads(str(row["details_json"] or ""))
+        except (TypeError, ValueError) as exc:
+            raise BatchReplayError("scheduler storage fault receipt JSON 非法") from exc
+        generation = details.get("generation") if isinstance(details, dict) else None
+        expected_details = {
+            "contract_version": "provider-fault-v2",
+            **STORAGE_FAULT_SCOPE,
+            "open": True,
+            "opened_at": started_at,
+            "last_failure_at": started_at,
+            "generation": generation,
+            "state_fingerprint": expected_state_fingerprint,
+            "state_evidence": expected_evidence,
+            "fault_class": STORAGE_FAULT_CLASS,
+            "reason": "storage_hard",
+            "usage_id": None,
+            "probe_eligible": False,
+            "recovery_required": "domain_specific_evidence",
+        }
+        schedule_prefix = f"{started_at}:"
+        schedule_nonce = scheduled_for[len(schedule_prefix) :]
+        matching_content_ids = storage_attempts.get(started_at, set())
+        if (
+            row["job_id"] != STORAGE_FAULT_JOB_ID
+            or row["status"] != "partial"
+            or not started_at
+            or completed_at != started_at
+            or not scheduled_for.startswith(schedule_prefix)
+            or len(schedule_nonce) != 32
+            or any(
+                character not in "0123456789abcdef"
+                for character in schedule_nonce
+            )
+            or not isinstance(details, dict)
+            or not isinstance(generation, str)
+            or len(generation) != 32
+            or any(character not in "0123456789abcdef" for character in generation)
+            or details != expected_details
+            or str(row["details_json"])
+            != json.dumps(
+                expected_details,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            or not matching_content_ids
+        ):
+            raise BatchReplayError("新增 scheduler_runs 不是本批 storage_hard receipt")
+        if not matching_content_ids.intersection(authorized):
+            raise BatchReplayError("scheduler storage fault receipt 超出当前批次")
+        evidence_rows.append(
+            [
+                int(row["id"]),
+                str(row["job_id"]),
+                scheduled_for,
+                str(row["status"]),
+                started_at,
+                completed_at,
+                str(row["details_json"]),
+            ]
+        )
+
+    return {
+        "baseline_prefix": baseline_prefix,
+        "new_rows": len(evidence_rows),
+        "rows_sha256": replay._object_sha256(evidence_rows),
+        "sequence": current_sequence,
     }
 
 
@@ -1005,7 +1300,8 @@ def _validate_batch_artifacts(
         for content_id in sorted(int(value) for value in content_ids):
             detail = connection.execute(
                 """
-                SELECT fs.status,fa.billed,fa.amount,pr.id raw_id,pr.source,
+                SELECT fs.id slot_id,fs.status,fa.attempt_number,fa.billed,fa.amount,
+                       pr.id raw_id,pr.source,
                        pr.operation,pr.local_path raw_path,pr.sha256 raw_sha,
                        pr.byte_size raw_bytes
                 FROM fetch_slots fs
@@ -1067,21 +1363,61 @@ def _validate_batch_artifacts(
             ):
                 raise BatchReplayError(f"批次证据文件哈希或字节数漂移：{content_id}")
             raw_filename_suffix = f"-{str(detail['raw_sha'])[:12]}.json"
+            legacy_name = raw_path.name.startswith("attempt-") and raw_path.name.endswith(
+                raw_filename_suffix
+            )
+            expected_scope_identity = capture_module.raw_scope_identity(
+                provider="TikHub",
+                slot_id=int(detail["slot_id"]),
+                stage="detail",
+                window_key="lifetime",
+                attempt_number=int(detail["attempt_number"]),
+            )
+            compressed_name = raw_path.name == (
+                f"scope-{expected_scope_identity}-sequence-"
+                f"{int(detail['attempt_number']):04d}.json.zst"
+            )
             if (
                 str(detail["operation"]) != expected_operation
                 or raw_path.parent.name != expected_operation
                 or raw_path.parent.parent.name != str(content_id)
                 or raw_path.parent.parent.parent
                 != derived_raw_root.resolve() / "tikhub"
-                or not raw_path.name.startswith("attempt-")
-                or not raw_path.name.endswith(raw_filename_suffix)
+                or not (legacy_name or compressed_name)
             ):
                 raise BatchReplayError(f"派生 raw 路径形状或 operation 漂移：{content_id}")
             try:
-                raw_body = json.loads(raw_path.read_bytes())
+                loaded_raw = raw_evidence_module.read_raw_evidence(
+                    raw_path,
+                    expected_stored_sha256=str(detail["raw_sha"]),
+                    expected_stored_size=int(detail["raw_bytes"]),
+                )
+                raw_body = json.loads(loaded_raw.entity_bytes.decode("utf-8"))
                 artifact_body = json.loads(artifact_path.read_bytes())
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            except (
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                raw_evidence_module.RawEvidenceError,
+            ) as exc:
                 raise BatchReplayError(f"批次证据文件不是合法 JSON：{content_id}") from exc
+            if compressed_name:
+                expected_response_identity = _raw_response_identity(
+                    provider="TikHub",
+                    operation=expected_operation,
+                    scope_identity=expected_scope_identity,
+                    sequence=int(detail["attempt_number"]),
+                )
+                raw_receipt = loaded_raw.receipt
+                if (
+                    raw_receipt.provider != "TikHub"
+                    or raw_receipt.operation != expected_operation
+                    or raw_receipt.paid_scope_identity != expected_scope_identity
+                    or raw_receipt.sequence != int(detail["attempt_number"])
+                    or raw_receipt.response_identity != expected_response_identity
+                ):
+                    raise BatchReplayError(
+                        f"派生 raw sidecar 未绑定详情尝试：{content_id}"
+                    )
             if (
                 not isinstance(raw_body, Mapping)
                 or not isinstance(raw_body.get("data"), Mapping)
@@ -1324,8 +1660,19 @@ def _validate_allowed_append_scope(
                     not succeeded
                     and (
                         error_code
-                        not in {"batch_interrupted", "unhandled_adapter_error"}
-                        or row["http_status"] is not None
+                        not in {
+                            "batch_interrupted",
+                            "unhandled_adapter_error",
+                            "storage_hard",
+                        }
+                        or (
+                            error_code == "storage_hard"
+                            and int(row["http_status"] or 0) != 200
+                        )
+                        or (
+                            error_code != "storage_hard"
+                            and row["http_status"] is not None
+                        )
                         or not str(row["error_message"] or "")
                     )
                 )
@@ -1577,10 +1924,32 @@ def _expected_output_inventory(
         ):
             if content_ids is not None and int(row["content_id"] or 0) not in content_ids:
                 continue
-            expected_raw[_resolve_stored_path(str(row["local_path"]))] = [
+            raw_path = _resolve_stored_path(str(row["local_path"]))
+            expected_raw[raw_path] = [
                 int(row["byte_size"]),
                 str(row["sha256"]),
             ]
+            if raw_path.name.endswith(".json.zst"):
+                try:
+                    loaded = raw_evidence_module.read_raw_evidence(
+                        raw_path,
+                        expected_stored_sha256=str(row["sha256"]),
+                        expected_stored_size=int(row["byte_size"]),
+                    )
+                except raw_evidence_module.RawEvidenceError as exc:
+                    raise BatchReplayError(
+                        f"已登记派生 raw/sidecar 证据漂移：{raw_path}"
+                    ) from exc
+                sidecar_path = loaded.receipt.sidecar_path
+                if sidecar_path is None:
+                    raise BatchReplayError(f"已登记压缩 raw 缺少 sidecar：{raw_path}")
+                sidecar = _private_file(
+                    sidecar_path, label="派生 raw immutable sidecar"
+                )
+                expected_raw[sidecar_path.resolve()] = [
+                    sidecar.st_size,
+                    replay._file_sha256(sidecar_path),
+                ]
         for row in connection.execute(
             """
             SELECT content_id,local_path,byte_size,sha256
@@ -1719,6 +2088,33 @@ def _recover_interrupted_detail_slots(
                         "transition": "already_recovered",
                     }
                 )
+            elif (
+                status == "terminal_failed"
+                and str(row["provider"]) == "TikHub"
+                and str(row["adapter_version"])
+                == "tikhub-discovery-derived-v8.1"
+                and str(row["last_error_code"] or "") == "storage_hard"
+                and not bool(row["raw_exists"])
+                and row["response_finished_at"] is not None
+            ):
+                # This controller is zero-network and derived-only.  A local
+                # evidence publication failure is therefore safe to retry once
+                # the orphan cleanup protocol has durably reconciled its files.
+                connection.execute(
+                    """
+                    UPDATE fetch_slots SET status='retryable_failed',updated_at=?
+                    WHERE id=? AND status='terminal_failed'
+                    """,
+                    (captured_at, int(row["slot_id"])),
+                )
+                recovered.append(
+                    {
+                        "content_id": int(row["content_id"]),
+                        "slot_id": int(row["slot_id"]),
+                        "attempt_id": int(row["attempt_id"]),
+                        "transition": "derived_storage_hard_to_retryable_failed",
+                    }
+                )
         connection.commit()
     except BaseException:
         connection.rollback()
@@ -1851,6 +2247,84 @@ def _cleanup_record_state(
     return records
 
 
+def _parse_capture_raw_name(raw_name: str) -> tuple[int, int | None, str] | None:
+    if Path(raw_name).suffix != ".json":
+        return None
+    parts = Path(raw_name).stem.split("-")
+    if len(parts) == 3 and parts[0] == "attempt":
+        attempt, slot_id, digest = parts[1], None, parts[2]
+    elif len(parts) == 5 and parts[0] == "attempt" and parts[2] == "slot":
+        attempt, slot_id, digest = parts[1], parts[3], parts[4]
+        if not slot_id.isdigit() or int(slot_id) <= 0:
+            return None
+    else:
+        return None
+    if (
+        not attempt.isdigit()
+        or int(attempt) <= 0
+        or len(digest) != 12
+        or any(value not in "0123456789abcdef" for value in digest)
+    ):
+        return None
+    return int(attempt), int(slot_id) if slot_id is not None else None, digest
+
+
+def _parse_zstd_capture_raw_name(
+    raw_name: str,
+) -> tuple[str, int, str, bool] | None:
+    """Parse immutable raw, sidecar, or atomic temp names without resolving links."""
+
+    candidate = raw_name
+    temporary = candidate.startswith(".") and candidate.endswith(".tmp")
+    if temporary:
+        candidate = candidate[1:-4]
+        base, separator, token = candidate.rpartition(".")
+        if (
+            not separator
+            or len(token) != 24
+            or any(value not in "0123456789abcdef" for value in token)
+        ):
+            return None
+        candidate = base
+    if candidate.endswith(".json.zst.metadata.json"):
+        kind = "sidecar"
+        stem = candidate[: -len(".json.zst.metadata.json")]
+    elif candidate.endswith(".json.zst"):
+        kind = "raw"
+        stem = candidate[: -len(".json.zst")]
+    else:
+        return None
+    prefix = "scope-"
+    marker = "-sequence-"
+    if not stem.startswith(prefix) or marker not in stem:
+        return None
+    scope_identity, sequence = stem[len(prefix) :].rsplit(marker, 1)
+    if (
+        len(scope_identity) != 64
+        or any(value not in "0123456789abcdef" for value in scope_identity)
+        or len(sequence) != 4
+        or not sequence.isdigit()
+        or int(sequence) <= 0
+    ):
+        return None
+    return scope_identity, int(sequence), kind, temporary
+
+
+def _raw_response_identity(
+    *, provider: str, operation: str, scope_identity: str, sequence: int
+) -> str:
+    return hashlib.sha256(
+        capture_module.canonical_json_bytes(
+            {
+                "provider": provider.lower(),
+                "operation": operation,
+                "paid_scope_identity": scope_identity,
+                "sequence": sequence,
+            }
+        )
+    ).hexdigest()
+
+
 def _validate_owned_orphan_rows(
     rows: Sequence[Any],
     *,
@@ -1909,7 +2383,7 @@ def _validate_owned_orphan_rows(
                     or replay._file_sha256(path) != sha256
                 ):
                     raise BatchReplayError("待清理输出孤儿文件证据漂移")
-                if not is_atomic_temp:
+                if not is_atomic_temp and label != "derived_raw":
                     try:
                         value = json.loads(path.read_bytes())
                     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -1934,46 +2408,81 @@ def _validate_owned_orphan_rows(
                     raise BatchReplayError("待清理派生 raw 内容 ID 非法") from exc
                 evidence = target_evidence.get(content_id)
                 raw_name = relative.parts[3]
-                if is_atomic_temp:
+                zstd_name_parts = _parse_zstd_capture_raw_name(raw_name)
+                if is_atomic_temp and zstd_name_parts is None:
                     if not raw_name.startswith(".") or not raw_name.endswith(
                         ".json.tmp"
                     ):
                         raise BatchReplayError("待清理派生 raw 临时路径非法")
                     raw_name = raw_name[1:-4]
-                name_parts = Path(raw_name).stem.split("-")
+                legacy_name_parts = (
+                    _parse_capture_raw_name(raw_name)
+                    if zstd_name_parts is None
+                    else None
+                )
                 if (
                     content_id not in content_ids
                     or evidence is None
                     or relative.parts[2] != evidence["expected_detail_operation"]
-                    or Path(raw_name).suffix != ".json"
-                    or len(name_parts) != 3
-                    or name_parts[0] != "attempt"
-                    or not name_parts[1].isdigit()
-                    or int(name_parts[1]) <= 0
-                    or len(name_parts[2]) != 12
-                    or any(
-                        value not in "0123456789abcdef" for value in name_parts[2]
-                    )
-                    or name_parts[2]
-                    != str(evidence["expected_detail_raw_sha256"])[:12]
-                    or (
-                        not is_atomic_temp
-                        and (
-                            sha256 != evidence["expected_detail_raw_sha256"]
-                            or expected_bytes
-                            != int(evidence["expected_detail_raw_bytes"])
-                        )
-                    )
-                    or (
-                        is_atomic_temp
-                        and expected_bytes
-                        > int(evidence["expected_detail_raw_bytes"])
-                    )
+                    or (zstd_name_parts is None and legacy_name_parts is None)
                 ):
                     raise BatchReplayError("待清理派生 raw 不属于 pending 内容")
+                if zstd_name_parts is not None:
+                    scope_identity, attempt_number, raw_kind, zstd_temp = (
+                        zstd_name_parts
+                    )
+                    if zstd_temp != is_atomic_temp:
+                        raise BatchReplayError(
+                            "待清理派生 raw 临时文件身份漂移"
+                        )
+                    expected_raw_bytes = int(evidence["expected_detail_raw_bytes"])
+                    expected_raw_sha = str(evidence["expected_detail_raw_sha256"])
+                    if raw_kind == "raw":
+                        exact_raw = (
+                            expected_bytes == expected_raw_bytes
+                            and sha256 == expected_raw_sha
+                        )
+                        if (
+                            (is_atomic_temp and expected_bytes > expected_raw_bytes)
+                            or (
+                                not is_atomic_temp
+                                and not exact_raw
+                                and expected_bytes != 0
+                            )
+                        ):
+                            raise BatchReplayError(
+                                "待清理派生 raw 不属于 pending 内容"
+                            )
+                    elif expected_bytes > raw_evidence_module.MAX_SIDECAR_BYTES:
+                        raise BatchReplayError(
+                            "待清理派生 raw sidecar 超出安全上限"
+                        )
+                else:
+                    assert legacy_name_parts is not None
+                    attempt_number = legacy_name_parts[0]
+                    if (
+                        legacy_name_parts[2]
+                        != str(evidence["expected_detail_raw_sha256"])[:12]
+                        or (
+                            not is_atomic_temp
+                            and (
+                                sha256 != evidence["expected_detail_raw_sha256"]
+                                or expected_bytes
+                                != int(evidence["expected_detail_raw_bytes"])
+                            )
+                        )
+                        or (
+                            is_atomic_temp
+                            and expected_bytes
+                            > int(evidence["expected_detail_raw_bytes"])
+                        )
+                    ):
+                        raise BatchReplayError(
+                            "待清理派生 raw 不属于 pending 内容"
+                        )
                 attempt = connection.execute(
                     """
-                    SELECT fa.id,fa.attempt_number,fs.provider,
+                    SELECT fa.id,fa.attempt_number,fs.id slot_id,fs.provider,
                            fs.adapter_version,COUNT(pr.id) raw_rows,
                            (
                                SELECT MAX(fa2.attempt_number)
@@ -1987,13 +2496,18 @@ def _validate_owned_orphan_rows(
                     WHERE fs.content_id=? AND fs.stage='detail'
                       AND fs.window_key='lifetime'
                       AND fa.attempt_number=?
-                    GROUP BY fa.id,fa.attempt_number,fs.provider,
+                    GROUP BY fa.id,fa.attempt_number,fs.id,fs.provider,
                              fs.adapter_version
                     """,
-                    (content_id, int(name_parts[1])),
+                    (content_id, attempt_number),
                 ).fetchone()
                 if (
                     attempt is None
+                    or (
+                        legacy_name_parts is not None
+                        and legacy_name_parts[1] is not None
+                        and int(attempt["slot_id"]) != legacy_name_parts[1]
+                    )
                     or attempt["provider"] != "TikHub"
                     or attempt["adapter_version"]
                     != "tikhub-discovery-derived-v8.1"
@@ -2007,6 +2521,116 @@ def _validate_owned_orphan_rows(
                     raise BatchReplayError(
                         "待清理派生 raw 文件未绑定 pending attempt"
                     )
+                if zstd_name_parts is not None:
+                    expected_scope_identity = capture_module.raw_scope_identity(
+                        provider="TikHub",
+                        slot_id=int(attempt["slot_id"]),
+                        stage="detail",
+                        window_key="lifetime",
+                        attempt_number=int(attempt["attempt_number"]),
+                    )
+                    if scope_identity != expected_scope_identity:
+                        raise BatchReplayError(
+                            "待清理派生 raw 文件未绑定 pending attempt"
+                        )
+                    path_exists = os.path.lexists(path)
+                    if (
+                        not is_atomic_temp
+                        and path_exists
+                        and expected_bytes > 0
+                    ):
+                        pair_raw_path = (
+                            path
+                            if raw_kind == "raw"
+                            else path.with_name(path.name[: -len(".metadata.json")])
+                        )
+                        pair_sidecar_path = raw_evidence_module.sidecar_path_for(
+                            pair_raw_path
+                        )
+                        pair_complete = False
+                        if raw_kind == "raw":
+                            if os.path.lexists(pair_sidecar_path):
+                                sidecar_metadata = _private_file(
+                                    pair_sidecar_path,
+                                    label="待清理派生 raw sidecar",
+                                )
+                                if (
+                                    sidecar_metadata.st_size
+                                    > raw_evidence_module.MAX_SIDECAR_BYTES
+                                ):
+                                    raise BatchReplayError(
+                                        "待清理派生 raw sidecar 超出安全上限"
+                                    )
+                                pair_complete = sidecar_metadata.st_size > 0
+                        else:
+                            if not os.path.lexists(pair_raw_path):
+                                raise BatchReplayError(
+                                    "待清理派生 raw sidecar 缺少配对 raw"
+                                )
+                            raw_metadata = _private_file(
+                                pair_raw_path, label="待清理派生 raw"
+                            )
+                            if raw_metadata.st_size == 0:
+                                raise BatchReplayError(
+                                    "待清理派生 raw sidecar 配对 raw 不完整"
+                                )
+                            pair_complete = True
+                        if pair_complete:
+                            try:
+                                loaded = raw_evidence_module.read_raw_evidence(
+                                    pair_raw_path,
+                                    expected_stored_sha256=str(
+                                        evidence["expected_detail_raw_sha256"]
+                                    ),
+                                    expected_stored_size=int(
+                                        evidence["expected_detail_raw_bytes"]
+                                    ),
+                                )
+                                value = json.loads(
+                                    loaded.entity_bytes.decode("utf-8", "strict")
+                                )
+                            except (
+                                UnicodeDecodeError,
+                                json.JSONDecodeError,
+                                raw_evidence_module.RawEvidenceError,
+                            ) as exc:
+                                raise BatchReplayError(
+                                    "待清理派生 raw/sidecar 证据漂移"
+                                ) from exc
+                            receipt = loaded.receipt
+                            if (
+                                receipt.provider != "TikHub"
+                                or receipt.operation
+                                != evidence["expected_detail_operation"]
+                                or receipt.paid_scope_identity != scope_identity
+                                or receipt.sequence != attempt_number
+                                or receipt.response_identity
+                                != _raw_response_identity(
+                                    provider="TikHub",
+                                    operation=str(
+                                        evidence["expected_detail_operation"]
+                                    ),
+                                    scope_identity=scope_identity,
+                                    sequence=attempt_number,
+                                )
+                                or not isinstance(value, Mapping)
+                            ):
+                                raise BatchReplayError(
+                                    "待清理派生 raw sidecar 身份漂移"
+                                )
+                            body = value
+                elif not is_atomic_temp:
+                    try:
+                        value = json.loads(path.read_bytes())
+                    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                        raise BatchReplayError(
+                            "待清理输出孤儿文件不是合法 JSON"
+                        ) from exc
+                    if not isinstance(value, Mapping):
+                        raise BatchReplayError(
+                            "待清理输出孤儿文件不是 JSON object"
+                        )
+                    body = value
                 if body is not None and (
                     set(body)
                     != {
@@ -2087,8 +2711,12 @@ def _validate_owned_orphan_rows(
             ):
                 raise BatchReplayError("媒体孤儿来源 raw 文件漂移")
             try:
-                detail_body = json.loads(detail_path.read_bytes())
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                detail_body = raw_evidence_module.read_raw_json(
+                    detail_path,
+                    expected_stored_sha256=str(raw["sha256"]),
+                    expected_stored_size=int(raw["byte_size"]),
+                )
+            except raw_evidence_module.RawEvidenceError as exc:
                 raise BatchReplayError("媒体孤儿来源 raw 不是合法 JSON") from exc
             detail_data = detail_body.get("data") if isinstance(detail_body, Mapping) else None
             if (
@@ -2832,7 +3460,11 @@ def _validate_receipt_apply(
             or int(row.get("slot_id") or 0) <= 0
             or int(row.get("attempt_id") or 0) <= 0
             or row.get("transition")
-            not in {"running_to_retryable_failed", "already_recovered"}
+            not in {
+                "running_to_retryable_failed",
+                "already_recovered",
+                "derived_storage_hard_to_retryable_failed",
+            }
         ):
             raise BatchReplayError("批次 receipt 中断恢复行非法")
         recovery_content_ids.append(int(row.get("content_id") or 0))
@@ -3015,6 +3647,7 @@ def _initial_contract(
             "schema": baseline["schema"],
             "protected_tables": baseline["protected_tables"],
             "protected_sequences": baseline["protected_sequences"],
+            "scheduler_runs": baseline["scheduler_runs"],
             "content_stable": baseline["content_stable"],
             "non_target_content_full": baseline["non_target_content_full"],
             "allowed_non_target": baseline["allowed_non_target"],
@@ -3068,7 +3701,13 @@ def _verify_critical_unchanged(
     authorized_content_ids: set[int],
     allow_unapplied_raw_content_ids: set[int] | None = None,
 ) -> Mapping[str, Any]:
-    current = _critical_snapshot(db_path, target_ids=target_ids)
+    _validate_scheduler_storage_fault_append_scope(
+        contract,
+        db_path=db_path,
+        authorized_content_ids=authorized_content_ids,
+    )
+    current = dict(_critical_snapshot(db_path, target_ids=target_ids))
+    current["scheduler_runs"] = contract["baseline"]["scheduler_runs"]
     if current != contract.get("critical_baseline"):
         raise BatchReplayError("批处理改变了关键禁止变更数据")
     if replay._usage_snapshot(
@@ -3139,6 +3778,11 @@ def _verify_complete(
         media_root=media_root,
         require_complete=True,
     )
+    scheduler_fault_receipts = _validate_scheduler_storage_fault_append_scope(
+        contract,
+        db_path=db_path,
+        authorized_content_ids=set(target_ids),
+    )
     output_inventory = _validate_output_inventory(
         contract,
         db_path=db_path,
@@ -3157,6 +3801,7 @@ def _verify_complete(
         "target_text": target_text,
         "artifacts": artifacts,
         "allowed_append_scope": allowed_scope,
+        "scheduler_fault_receipts": scheduler_fault_receipts,
         "output_inventory": output_inventory,
         "allowed_table_counts_before": contract["baseline"][
             "allowed_table_counts"

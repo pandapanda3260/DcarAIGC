@@ -58,7 +58,9 @@ def pct(n: int | float, d: int | float) -> float:
     return round(float(n) * 100 / float(d), 2) if d else 0.0
 
 
-def score_display(score: int | float, suffix: str = "/100") -> str:
+def score_display(score: int | float | None, suffix: str = "/100") -> str:
+    if score is None:
+        raise TypeError("score must be numeric")
     shown = round(float(score), 1)
     number = str(int(shown)) if shown.is_integer() else str(shown)
     return f"{number}{suffix}"

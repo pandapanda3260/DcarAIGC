@@ -23,6 +23,8 @@ V8_3_CONTRACT_PATH = PROJECT_ROOT / "config" / "report_contract_v8_3.json"
 V8_4_CONTRACT_PATH = PROJECT_ROOT / "config" / "report_contract_v8_4.json"
 V8_5_CONTRACT_PATH = PROJECT_ROOT / "config" / "report_contract_v8_5.json"
 V8_6_CONTRACT_PATH = PROJECT_ROOT / "config" / "report_contract_v8_6.json"
+V8_7_CONTRACT_PATH = PROJECT_ROOT / "config" / "report_contract_v8_7.json"
+V8_8_CONTRACT_PATH = PROJECT_ROOT / "config" / "report_contract_v8_8.json"
 
 
 def _audience_quality() -> dict:
@@ -305,9 +307,9 @@ class V84ContractFreezeTest(unittest.TestCase):
             V8_6_CONTRACT_PATH,
         )
         self.assertIn("review_summary", v86["required_top_level_keys"])
-        v87 = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
-        self.assertEqual(CONTRACT_PATH.name, "report_contract_v8_7.json")
-        self.assertEqual(CURRENT_REPORT_VERSION, v87["report_version"])
+        v87 = json.loads(V8_7_CONTRACT_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(v87["report_version"], "dcar-content-operations-report-v8.7")
+        self.assertEqual(LEGACY_CONTRACT_PATHS[v87["report_version"]], V8_7_CONTRACT_PATH)
         self.assertNotIn("review_summary", v87["required_top_level_keys"])
         self.assertEqual(
             [key for key in v87["required_top_level_keys"]],
@@ -328,6 +330,32 @@ class V84ContractFreezeTest(unittest.TestCase):
         self.assertEqual(
             REPORT_RULE_VERSIONS[CURRENT_REPORT_VERSION], "evaluation-v9"
         )
+        v88 = json.loads(V8_8_CONTRACT_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(
+            LEGACY_CONTRACT_PATHS["dcar-content-operations-report-v8.8"],
+            V8_8_CONTRACT_PATH,
+        )
+        self.assertEqual(
+            v88["required_quality_details"]["discovery_coverage"][
+                "eligible_basis"
+            ],
+            "frozen_matrix_roster_identity_occurrences",
+        )
+        current = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(CONTRACT_PATH.name, "report_contract_v8_9.json")
+        self.assertEqual(CURRENT_REPORT_VERSION, "dcar-content-operations-report-v8.9")
+        self.assertEqual(current["report_version"], CURRENT_REPORT_VERSION)
+        self.assertEqual(current["required_top_level_keys"],
+            v88["required_top_level_keys"])
+        self.assertEqual(current["boolean_quality_fields"],
+            v88["boolean_quality_fields"])
+        self.assertEqual(current["required_quality_details"]["discovery_coverage"], {
+            "minimum_percentage": 90, "allow_not_applicable_when_empty": True,
+            "eligible_basis": "frozen_profile_roster_identity_occurrences",
+            "requires_terminal_contract": True,
+            "success_rule": "profile-day-coverage-v1",
+            "allow_unknown": True,
+        })
 
     def test_v8_4_accepts_a_complete_report(self) -> None:
         validate_report(_valid_v8_4_report(), contract_path=V8_4_CONTRACT_PATH)

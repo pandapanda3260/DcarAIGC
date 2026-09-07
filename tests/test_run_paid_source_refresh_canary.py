@@ -12,13 +12,28 @@ import unittest
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any, Mapping, TypedDict
 from unittest.mock import patch
 
 from scripts import run_local_analysis_canary as local_canary
 from scripts import run_paid_source_refresh_canary as paid
+from tests.paid_compensation_fixture import seed_offline_compensation
+from tests.roster_fixture import accept_roster
 from tests.test_run_local_analysis_canary import (
     LocalAnalysisCanaryControllerTest as _LocalAnalysisCanaryControllerTest,
 )
+
+
+class _RefreshArguments(TypedDict):
+    source_db_path: Path
+    source_completion_path: Path
+    expected_source_db_sha256: str
+    expected_source_completion_sha256: str
+    db_path: Path
+    raw_root: Path
+    media_root: Path
+    run_root: Path
+    content_ids: list[int]
 
 
 def _subprocess_paid_refresh_worker(config_path: str) -> None:
@@ -70,6 +85,15 @@ def _subprocess_paid_refresh_worker(config_path: str) -> None:
         "key_loader": lambda: "fixture-key",
     }
     mode = config["mode"]
+    if mode == "reserved":
+        def reserved_then_wait(*_args, **_kwargs):
+            stop_at_marker("reserved-not-sent")
+
+        with patch.object(
+            paid.capture_module, "_mark_paid_sent", side_effect=reserved_then_wait
+        ):
+            paid.run_refresh(**kwargs)
+        return
     if mode == "transport_db":
         original_transport_commit = paid._commit_transport_failed_capture
 
@@ -98,14 +122,16 @@ def _subprocess_paid_refresh_worker(config_path: str) -> None:
         return
 
     if mode == "raw_final":
-        original_atomic_bytes = paid.capture_module._atomic_bytes
+        original_raw_writer = paid.capture_module.write_zstd_raw_evidence
 
-        def raw_final_then_wait(path, body):
-            original_atomic_bytes(path, body)
+        def raw_final_then_wait(*args, **kwargs):
+            original_raw_writer(*args, **kwargs)
             stop_at_marker("raw-final")
 
         with patch.object(
-            paid.capture_module, "_atomic_bytes", side_effect=raw_final_then_wait
+            paid.capture_module,
+            "write_zstd_raw_evidence",
+            side_effect=raw_final_then_wait,
         ):
             paid.run_refresh(**kwargs)
         return
@@ -182,8 +208,27 @@ def _subprocess_paid_refresh_worker(config_path: str) -> None:
 class PaidSourceRefreshCanaryTest(unittest.TestCase):
     def setUp(self) -> None:
         self.fixture = _LocalAnalysisCanaryControllerTest(methodName="runTest")
+        # This frozen one-shot controller validates the schema-18 Step4
+        # handoff contract.  Current schema-19 paid calls use the unified
+        # pipeline and its activation-bound dispatch ledger instead.
+        self.fixture.source_schema_version = 18
         self.fixture.setUp()
         self.addCleanup(self.fixture.tearDown)
+        with (
+            closing(paid.storage_module.connect(self.fixture.source_db)) as connection,
+            paid.storage_module.transaction(connection),
+        ):
+            at = paid.storage_module.now_utc()
+            cursor = connection.execute(
+                "INSERT INTO account_platform_identities "
+                "(account_id,platform,uid,created_at,updated_at) VALUES (39,'douyin',?,?,?)",
+                ("fixture-uid", at, at),
+            )
+            self.identity_id = cursor.lastrowid
+            self.roster_snapshot = accept_roster(connection)
+        self.compensation = seed_offline_compensation(self.fixture.source_db)
+        self.refresh_slot_id = self.compensation["original_slot_id"] + 1
+        self.fixture._refresh_step3_proof()
         self.root = self.fixture.root / "paid"
         self.root.mkdir()
         self.db_parent = self.root / "db"
@@ -295,7 +340,7 @@ class PaidSourceRefreshCanaryTest(unittest.TestCase):
             "aweme_id": "canary-1",
         }
 
-    def _kwargs(self) -> dict[str, object]:
+    def _kwargs(self) -> _RefreshArguments:
         return {
             "source_db_path": self.fixture.source_db,
             "source_completion_path": self.fixture.source_completion,
@@ -318,6 +363,83 @@ class PaidSourceRefreshCanaryTest(unittest.TestCase):
             **overrides,
         }
         return paid.run_refresh(**values)
+
+    def _assert_usage_policy(self, details: dict, *, sent: bool = True) -> dict:
+        """Keep exact terminal assertions and also check every dispatch field."""
+        reserved_at = details["reserved_at"]
+        sent_at = details["sent_at"]
+        paid._aware_timestamp(reserved_at, label="test reserved_at")
+        if sent:
+            self.assertIsInstance(sent_at, str)
+            self.assertGreaterEqual(
+                paid._aware_timestamp(sent_at, label="test sent_at"),
+                paid._aware_timestamp(reserved_at, label="test reserved_at"),
+            )
+        else:
+            self.assertIsNone(sent_at)
+        expected = {
+            "policy_version": "tikhub-global-budget-v3",
+            "budget_day": paid.provider_budget_module.budget_day(sent_at or reserved_at),
+            "category": "history",
+            "budget_bucket": "metrics",
+            "reserved_microusd": 1000,
+            "price_version": "tikhub-verified-2026-08-28",
+            "reserved_at": reserved_at,
+            "sent_at": sent_at,
+            "borrowed_from": {},
+            "borrowing_proofs": {},
+            "validated_work_fingerprint": None,
+            "recovery_probe_id": None,
+            "attempt_number": 1,
+            "scope": {
+                "purpose": "history",
+                "roster_snapshot_id": self.roster_snapshot["id"],
+                "roster_snapshot_hash": self.roster_snapshot["members_sha256"],
+                "scheduler_run_id": None,
+                "scheduler_attempt_id": None,
+                "identity_id": self.identity_id,
+                "account_id": 39,
+                "content_id": 1,
+                "category": "history",
+                "uid": "fixture-uid",
+                "platform": "douyin",
+                "scheduler_owner_token": None,
+                "scheduler_scan_id": None,
+                "recovery_probe_id": None,
+                "incident_authorization_id": None,
+                "compensation_authorization_id": self.compensation["authorization"]["id"],
+                "paid_scope_identity": self.compensation["original_identity"].scope_identity,
+                "paid_sequence": 1,
+            },
+        }
+        contract = paid._read_json(
+            self.run_root / "refresh-contract.json", label="test contract"
+        )
+        identity = paid._capture_paid_identity(contract)
+        expected.update(
+            paid_scope_identity=identity.scope_identity,
+            paid_execution_identity=identity.execution_identity,
+            paid_sequence=identity.sequence,
+            paid_identity=identity.document,
+            paid_identity_evidence="provider_exact",
+        )
+        if sent:
+            claim_path = (
+                self.db.parent
+                / "paid_send_claims"
+                / identity.scope_identity[:2]
+                / f"{identity.scope_identity}.sequence-{identity.sequence:08d}.claim.json"
+            )
+            claim_file = paid._file_evidence(
+                claim_path, label="test paid send claim"
+            )
+            expected.update(
+                paid_send_claim_path=str(claim_path),
+                paid_send_claim_sha256=claim_file["sha256"],
+                paid_send_claim_bytes=claim_file["byte_size"],
+            )
+        self.assertEqual({key: details[key] for key in expected}, expected)
+        return {key: value for key, value in details.items() if key not in expected}
 
     def _new_case(self) -> "PaidSourceRefreshCanaryTest":
         value = PaidSourceRefreshCanaryTest(methodName="runTest")
@@ -446,11 +568,199 @@ class PaidSourceRefreshCanaryTest(unittest.TestCase):
         assert isinstance(baseline, dict)
         values = baseline["sqlite_sequence"]
         assert isinstance(values, dict)
+        if "provider_usage" in incremented:
+            # Claim atomically consumes exactly one prior authorization.
+            incremented = incremented | {"scheduler_runs"}
         names = set(values) | incremented
         return {
             str(name): int(values.get(name, 0)) + (1 if name in incremented else 0)
             for name in names
         }
+
+    def test_default_real_clone_paid_entry_rejects_before_http_or_key(self) -> None:
+        with (
+            patch.object(paid, "_default_endpoint_info") as price,
+            patch.object(paid, "_default_balance_check") as balance,
+            patch.object(paid, "_default_detail_fetch") as detail,
+            patch.object(paid, "_load_key") as key,
+            self.assertRaisesRegex(paid.PaidSourceRefreshError, "v8 writer capture path"),
+        ):
+            paid.run_refresh(**self._kwargs())
+        for callback in (price, balance, detail, key):
+            callback.assert_not_called()
+        with closing(local_canary._immutable_connection(self.db)) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM provider_usage WHERE task_id LIKE 'paid-source-refresh-%'"
+            ).fetchone()[0], 0)
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM fetch_slots WHERE stage=?", (paid.STAGE,)
+            ).fetchone()[0], 0)
+
+    def test_committed_raw_default_reentry_needs_no_injected_or_live_transport(self) -> None:
+        def interrupt() -> None:
+            raise OSError("fixture after durable raw commit")
+
+        with self.assertRaises(paid.PaidSourceRefreshError):
+            self._run(after_fetch_hook=interrupt)
+        self.assertEqual(self.calls["detail"], 1)
+        with (
+            patch.object(paid, "_default_endpoint_info") as price,
+            patch.object(paid, "_default_balance_check") as balance,
+            patch.object(paid, "_default_detail_fetch") as detail,
+            patch.object(paid, "_load_key") as key,
+        ):
+            result = paid.run_refresh(**self._kwargs())
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["total_provider_calls"], 0)
+        for callback in (price, balance, detail, key):
+            callback.assert_not_called()
+        self.assertEqual(self.calls["detail"], 1)
+
+    def test_compensation_preserves_original_rows_and_consumes_exactly_once(self) -> None:
+        self._run()
+        with (closing(local_canary._immutable_connection(self.fixture.source_db)) as before,
+              closing(local_canary._immutable_connection(self.db)) as after):
+            original = paid._rows(before, "scheduler_runs")
+            current = paid._rows(after, "scheduler_runs")
+            self.assertEqual(current[:len(original)], original)
+            self.assertEqual(len(current), len(original) + 1)
+            consumption = json.loads(current[-1]["details_json"])
+            self.assertEqual(consumption["authorization_id"], self.compensation["authorization"]["id"])
+            self.assertEqual(consumption["sequence"], 1)
+            new_usage = paid._new_rows(before, after, "provider_usage", "id")
+            self.assertEqual(len(new_usage), 1)
+            details = json.loads(new_usage[0]["details_json"])
+            self.assertEqual(details["paid_sequence"], 1)
+            self.assertEqual(details["paid_scope_identity"], self.compensation["original_identity"].scope_identity)
+            self.assertNotEqual(details["paid_execution_identity"], self.compensation["original_identity"].execution_identity)
+            self.assertEqual(new_usage[0]["amount"], paid.UNIT_PRICE)
+        self._run()
+        self.assertEqual(self.calls["detail"], 1)
+
+    def test_extra_scheduler_row_cannot_hide_as_compensation(self) -> None:
+        self._run()
+        with closing(paid.storage_module.connect(self.db)) as connection:
+            connection.execute(
+                "INSERT INTO scheduler_runs(job_id,scheduled_for,status,started_at,completed_at) "
+                "VALUES ('unexpected-fixture-job','1970-01-01T00:00:00Z','succeeded',"
+                "'1970-01-01T00:00:00Z','1970-01-01T00:00:00Z')"
+            )
+            connection.commit()
+        paid.local_controller._finalize_database(self.db)
+        calls = dict(self.calls)
+        with self.assertRaises(paid.PaidSourceRefreshError):
+            self._run()
+        self.assertEqual(self.calls, calls)
+
+    def test_consumed_authorization_cannot_fund_a_fresh_clone(self) -> None:
+        with (closing(paid.storage_module.connect(self.fixture.source_db)) as connection,
+              paid.storage_module.transaction(connection)):
+            paid.provider_budget_module.consume_compensation_authorization(
+                connection, authorization_id=self.compensation["authorization"]["id"],
+                paid_scope_identity=self.compensation["original_identity"].scope_identity,
+                sequence=1, operation=paid.OPERATION, at=paid.storage_module.now_utc(),
+            )
+        self.fixture._refresh_step3_proof()
+        self.source_db_sha = local_canary._sha256_file(self.fixture.source_db)
+        self.source_completion_sha = local_canary._sha256_file(self.fixture.source_completion)
+        with self.assertRaises(paid.PaidSourceRefreshError):
+            self._run()
+        self.assertEqual(self.calls["detail"], 0)
+        with (closing(local_canary._immutable_connection(self.fixture.source_db)) as before,
+              closing(local_canary._immutable_connection(self.db)) as after):
+            self.assertEqual(paid._rows(before, "provider_usage"), paid._rows(after, "provider_usage"))
+            self.assertEqual(paid._rows(before, "scheduler_runs"), paid._rows(after, "scheduler_runs"))
+
+    def test_shared_roster_and_global_budget_gates_block_offline_detail(self) -> None:
+        for reason in ("missing_roster", "global_ceiling"):
+            with self.subTest(reason=reason):
+                case = self._new_case()
+                with (
+                    closing(paid.storage_module.connect(case.fixture.source_db)) as connection,
+                    paid.storage_module.transaction(connection),
+                ):
+                    if reason == "missing_roster":
+                        accept_roster(connection, [])
+                    else:
+                        at = paid.storage_module.now_utc()
+                        connection.execute(
+                            """INSERT INTO provider_usage(
+                               provider,operation,request_attempts,billed_requests,
+                               currency,amount,recorded_at,details_json)
+                               VALUES ('TikHub','douyin_video_statistics',100000,100000,
+                                       'USD',100,?,'{}')""",
+                            (at,),
+                        )
+                case.fixture._refresh_step3_proof()
+                case.source_db_sha = local_canary._sha256_file(case.fixture.source_db)
+                case.source_completion_sha = local_canary._sha256_file(case.fixture.source_completion)
+                with self.assertRaises(paid.PaidSourceRefreshError):
+                    case._run()
+                self.assertEqual(case.calls["detail"], 0)
+                with closing(local_canary._immutable_connection(case.db)) as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT COUNT(*) FROM provider_usage WHERE task_id LIKE 'paid-source-refresh-%'"
+                    ).fetchone()[0], 0)
+                    self.assertEqual(connection.execute(
+                        "SELECT COUNT(*) FROM fetch_slots WHERE stage=?", (paid.STAGE,)
+                    ).fetchone()[0], 0)
+                    self.assertEqual(connection.execute(
+                        "SELECT consumed_requests,consumed_amount FROM provider_budget_batches "
+                        "WHERE purpose LIKE 'paid_source_refresh_%'"
+                    ).fetchone()[:], (0, 0.0))
+
+    def test_real_sigkill_before_send_refunds_once_and_never_reopens_request(self) -> None:
+        marker = self._kill_subprocess_at_marker(mode="reserved")
+        self.assertEqual(marker.read_text(encoding="utf-8"), "reserved-not-sent\n")
+        self.assertEqual(self._subprocess_detail_count(mode="reserved"), 0)
+        with closing(sqlite3.connect(self.db)) as connection:
+            usage = connection.execute(
+                "SELECT request_attempts,billed_requests,amount,details_json "
+                "FROM provider_usage WHERE task_id LIKE 'paid-source-refresh-%'"
+            ).fetchone()
+            self.assertEqual(usage[:3], (0, 1, paid.UNIT_PRICE))
+            self.assertEqual(
+                self._assert_usage_policy(json.loads(usage[3]), sent=False),
+                {"state": "reserved", "slot_id": self.refresh_slot_id},
+            )
+        sequences = self._sequence_snapshot(self.db)
+        for _ in range(2):
+            with (
+                patch.object(paid, "_default_endpoint_info") as price,
+                patch.object(paid, "_default_balance_check") as balance,
+                patch.object(paid, "_default_detail_fetch") as detail,
+                patch.object(paid, "_load_key") as key,
+                self.assertRaisesRegex(paid.PaidSourceRefreshError, "refunded"),
+            ):
+                paid.run_refresh(**self._kwargs())
+            for callback in (price, balance, detail, key):
+                callback.assert_not_called()
+            with closing(local_canary._immutable_connection(self.db)) as connection:
+                usage = connection.execute(
+                    "SELECT request_attempts,billed_requests,amount,details_json "
+                    "FROM provider_usage WHERE task_id LIKE 'paid-source-refresh-%'"
+                ).fetchone()
+                self.assertEqual(tuple(usage[:3]), (0, 0, 0.0))
+                details = json.loads(usage[3])
+                self.assertEqual(
+                    self._assert_usage_policy(details, sent=False),
+                    {"state": "not_sent", "slot_id": self.refresh_slot_id,
+                     "error_code": "canary_interrupted_before_send",
+                     "released_at": details["released_at"]},
+                )
+                self.assertEqual(connection.execute(
+                    "SELECT consumed_requests,consumed_amount FROM provider_budget_batches "
+                    "WHERE purpose LIKE 'paid_source_refresh_%'"
+                ).fetchone()[:], (0, 0.0))
+                self.assertEqual(connection.execute(
+                    "SELECT status,attempt_count,last_error_code FROM fetch_slots WHERE stage=?",
+                    (paid.STAGE,),
+                ).fetchone()[:], ("terminal_failed", 0, "canary_interrupted_before_send"))
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM fetch_attempts WHERE slot_id=?", (self.refresh_slot_id,)
+                ).fetchone()[0], 0)
+            self.assertEqual(self._sequence_snapshot(self.db), sequences)
+            self.assertEqual(self._subprocess_detail_count(mode="reserved"), 0)
 
     def test_default_plan_is_read_only_and_zero_network(self) -> None:
         before = self._tree(self.fixture.step3_root)
@@ -472,12 +782,11 @@ class PaidSourceRefreshCanaryTest(unittest.TestCase):
             source_completion_sha256="b" * 64,
             content_id=1,
         )
-        task_digest = hashlib.sha256(
-            identity["task_id"].encode("utf-8")
-        ).hexdigest()[:16]
         self.assertEqual(
             identity["budget_id"],
-            f"task-{task_digest}-tikhub-{paid.OPERATION}-v1",
+            paid.provider_budget_module.task_budget_id(
+                identity["task_id"], "TikHub", paid.OPERATION
+            ),
         )
 
     def test_success_binds_durable_metadata_ledger_and_frozen_transport(self) -> None:
@@ -523,7 +832,7 @@ class PaidSourceRefreshCanaryTest(unittest.TestCase):
         self.assertEqual(receipt["metadata_ledger_sha256"], metadata_sha)
 
     def test_metadata_contract_precedes_price_and_binds_code_and_runtime(self) -> None:
-        observed: dict[str, object] = {}
+        observed: dict[str, Any] = {}
 
         def price_after_contract():
             metadata_contract = paid._read_json(
@@ -774,10 +1083,17 @@ class PaidSourceRefreshCanaryTest(unittest.TestCase):
         with self.assertRaises(paid.PaidSourceRefreshError):
             self._run(detail_fetcher=transport_failure)
         with closing(sqlite3.connect(self.db)) as connection:
+            details = json.loads(connection.execute(
+                "SELECT details_json FROM provider_usage "
+                "WHERE task_id LIKE 'paid-source-refresh-%'"
+            ).fetchone()[0])
+            details.pop("billing_basis")
+            details.pop("outcome")
+            details["state"] = "sent"
             connection.execute(
                 "UPDATE provider_usage SET details_json=? "
                 "WHERE task_id LIKE 'paid-source-refresh-%'",
-                ('{"state":"reserved"}',),
+                (json.dumps(details),),
             )
             connection.execute(
                 "UPDATE fetch_attempts SET response_finished_at=NULL,http_status=NULL,"
@@ -837,7 +1153,10 @@ class PaidSourceRefreshCanaryTest(unittest.TestCase):
                 "SELECT details_json FROM provider_usage WHERE task_id LIKE 'paid-source-refresh-%'"
             ).fetchone()
         self.assertEqual(tuple(slot), ("running", None))
-        self.assertEqual(json.loads(usage[0]), {"state": "reserved"})
+        self.assertEqual(
+            self._assert_usage_policy(json.loads(usage[0])),
+            {"state": "sent", "slot_id": self.refresh_slot_id},
+        )
         calls = {"count": 0}
 
         def forbidden(*_args, **_kwargs):
@@ -922,11 +1241,11 @@ class PaidSourceRefreshCanaryTest(unittest.TestCase):
         self.assertEqual(tuple(attempt), (None, 1, paid.UNIT_PRICE, "USD", "transport_failed"))
         self.assertEqual(tuple(usage[:3]), (1, 1, paid.UNIT_PRICE))
         self.assertEqual(
-            json.loads(usage[3]),
+            self._assert_usage_policy(json.loads(usage[3])),
             {
                 "billing_basis": "conservative_upper_bound",
                 "outcome": "transport_failed",
-                "slot_id": 1,
+                "slot_id": self.refresh_slot_id,
                 "state": "completed",
             },
         )
@@ -1667,11 +1986,11 @@ class PaidSourceRefreshCanaryTest(unittest.TestCase):
             ).fetchone()
             self.assertEqual(tuple(usage[:3]), (1, 1, paid.UNIT_PRICE))
             self.assertEqual(
-                json.loads(usage[3]),
+                self._assert_usage_policy(json.loads(usage[3])),
                 {
                     "http_status": 200,
                     "outcome": "rejected_source",
-                    "slot_id": 1,
+                    "slot_id": self.refresh_slot_id,
                     "state": "completed",
                 },
             )
@@ -1777,7 +2096,7 @@ class PaidSourceRefreshCanaryTest(unittest.TestCase):
             )
 
     def test_exact_price_and_balance_shapes_reject_bool_or_stale_values(self) -> None:
-        valid_endpoint = {
+        valid_endpoint: dict[str, Any] = {
             "code": 200,
             "router": paid.ENDPOINT_INFO_PATH,
             "params": {"endpoint": paid.USER_INFO_PATH},
@@ -1943,101 +2262,25 @@ class PaidSourceRefreshCanaryTest(unittest.TestCase):
             accepted = paid._default_balance_check("fixture-key", "b" * 64)
         self.assertTrue(accepted["balance_sufficient"])
 
-    def test_exact_json_request_disables_proxy_redirect_and_streams_with_caps(self) -> None:
-        url = (
-            f"{paid.providers_module.TIKHUB_BASE}{paid.ENDPOINT_INFO_PATH}"
-            "?endpoint=%2Fapi%2Fv1%2Ftikhub%2Fuser%2Fget_user_info"
+    def test_schema18_live_transport_is_retired_before_network_open(self) -> None:
+        urls = (
+            "https://api.tikhub.dev/paid",
+            "https://api.tikhub.io/paid",
+            "https://attacker.example/paid",
         )
-
-        class Response:
-            def __init__(self, body: bytes, *, headers=None, response_url=url):
-                self.body = body
-                self.offset = 0
-                self.headers = headers or {"Content-Type": "application/json"}
-                self.status = 200
-                self.response_url = response_url
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
-            def geturl(self):
-                return self.response_url
-
-            def read(self, size: int):
-                block = self.body[self.offset : self.offset + size]
-                self.offset += len(block)
-                return block
-
-        class Opener:
-            def __init__(self, response):
-                self.response = response
-
-            def open(self, request, *, timeout):
-                self.request = request
-                self.timeout = timeout
-                return self.response
-
-        def run(response, *, maximum_bytes=16):
-            captured = {}
-            tls_context = paid.ssl.create_default_context()
-
-            def build(*handlers):
-                captured["handlers"] = handlers
-                captured["opener"] = Opener(response)
-                return captured["opener"]
-
-            with patch.object(
-                paid.ssl, "create_default_context", return_value=tls_context
-            ) as context_factory, patch.object(
-                paid.urllib.request, "build_opener", side_effect=build
-            ):
-                result = paid._exact_json_request(
-                    url,
-                    expected_path=paid.ENDPOINT_INFO_PATH,
-                    expected_query={"endpoint": paid.USER_INFO_PATH},
-                    authorization=None,
-                    maximum_bytes=maximum_bytes,
-                )
-            self.assertEqual(captured["handlers"][0].proxies, {})
-            self.assertIsInstance(captured["handlers"][1], paid._NoRedirect)
-            self.assertIsInstance(
-                captured["handlers"][2], paid.urllib.request.HTTPSHandler
-            )
-            self.assertIs(captured["handlers"][2]._context, tls_context)
-            context_factory.assert_called_once_with()
-            self.assertTrue(tls_context.check_hostname)
-            self.assertEqual(tls_context.verify_mode, paid.ssl.CERT_REQUIRED)
-            self.assertEqual(captured["opener"].request.get_method(), "GET")
-            self.assertEqual(
-                captured["opener"].request.get_header("User-agent"),
-                paid.TRANSPORT_PROFILE["user_agent"],
-            )
-            self.assertEqual(
-                captured["opener"].timeout,
-                paid.TRANSPORT_PROFILE["timeout_seconds"],
-            )
-            return result
-
-        payload, transcript = run(Response(b"{}"))
-        self.assertEqual(payload, {})
-        self.assertEqual(transcript["response_bytes"], 2)
-        with self.assertRaises(paid.PaidSourceRefreshError):
-            run(Response(b'{"long":true}'), maximum_bytes=4)
-        with self.assertRaises(paid.PaidSourceRefreshError):
-            run(
-                Response(
-                    b"{}",
-                    headers={
-                        "Content-Type": "application/json",
-                        "Content-Length": "10",
-                    },
-                )
-            )
-        with self.assertRaises(paid.PaidSourceRefreshError):
-            run(Response(b"{}", response_url=url + "&redirected=1"))
+        with patch.object(paid.providers_module, "_request_json") as transport:
+            for url in urls:
+                with self.subTest(url=url), self.assertRaisesRegex(
+                    paid.PaidSourceRefreshError, "v8 writer capture path"
+                ):
+                    paid._exact_json_request(
+                        url,
+                        expected_path="/paid",
+                        expected_query={},
+                        authorization=None,
+                        maximum_bytes=16,
+                    )
+        transport.assert_not_called()
 
     def test_db_commit_before_finalize_is_recovered_without_second_detail_call(
         self,
@@ -2250,8 +2493,8 @@ class PaidSourceRefreshCanaryTest(unittest.TestCase):
                     {str(path): path.read_bytes() for path in raw_files}, raw_bytes
                 )
                 if mode == "raw_final":
-                    self.assertEqual(len(raw_files), 1)
-                    self.assertTrue(raw_files[0].is_file())
+                    self.assertEqual(len(raw_files), 2)
+                    self.assertTrue(all(path.is_file() for path in raw_files))
 
     def test_real_sigkill_post_raw_windows_resume_zero_network_and_exact_sequences(self) -> None:
         modes = (
@@ -2345,7 +2588,8 @@ class PaidSourceRefreshCanaryTest(unittest.TestCase):
         ), self.assertRaises(paid.PaidSourceRefreshError):
             self._run()
         orphan_path = orphan["path"]
-        self.assertIsInstance(orphan_path, Path)
+        if not isinstance(orphan_path, Path):
+            self.fail("orphan path must be a Path")
         self.assertEqual(orphan_path.read_bytes(), orphan["body"])
         self.assertEqual(self.calls["detail"], 1)
 
@@ -3075,7 +3319,7 @@ class PaidSourceRefreshCanaryTest(unittest.TestCase):
         completion_path = self.run_root / "completion.json"
         database_sha256 = local_canary._sha256_file(self.db)
         original = paid._validate_parent_separation
-        seen: list[tuple[paid.RefreshPaths, object]] = []
+        seen: list[tuple[paid.RefreshPaths, Mapping[str, Any]]] = []
 
         def validating(paths, source_evidence):
             seen.append((paths, source_evidence))

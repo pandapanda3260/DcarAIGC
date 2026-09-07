@@ -46,6 +46,11 @@ def render_plist(project_root: Path, home: Path) -> bytes:
         for key, expected_value in expected.items()
     ):
         raise ValueError("snapshot publisher safety environment is invalid")
+    expected_data = home / "Library/Application Support/DcarAIGC/data"
+    if environment.get("DCAR_V8_DB") != str(expected_data / "dcar_insight.sqlite3"):
+        raise ValueError("snapshot publisher database must be outside the repository")
+    if environment.get("DCAR_LEGACY_DB") != str(expected_data / "web_mvp.sqlite3"):
+        raise ValueError("snapshot publisher legacy database must be outside the repository")
     if any("API_KEY" in str(key) or "PASSWORD" in str(key) for key in environment):
         raise ValueError("credentials must not be stored in the publisher plist")
     return payload

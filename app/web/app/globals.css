@@ -38,6 +38,7 @@ button:disabled { cursor: not-allowed; opacity: .55; transform: none !important;
 .brand strong { font-size: 15px; letter-spacing: .2px; }
 .brand span { margin-top: 3px; color: #91a9b0; font-size: 11px; }
 .sidebar nav p { margin: 0 12px 9px; color: #6f8c94; font-size: 10px; font-weight: 800; letter-spacing: 1.5px; }
+.sidebar nav a + p { margin-top: 24px; }
 .sidebar nav a { width: 100%; padding: 11px 13px; margin-bottom: 5px; border-radius: 10px; background: transparent; color: #a9bec4; display: flex; align-items: center; gap: 12px; text-align: left; text-decoration: none; font-size: 13px; font-weight: 650; transition: .18s ease; }
 .sidebar nav a .nav-icon { width: 20px; height: 20px; flex: 0 0 20px; display: block; }
 .sidebar nav a:hover { background: #173b45; color: #fff; }
@@ -54,10 +55,7 @@ button:disabled { cursor: not-allowed; opacity: .55; transform: none !important;
 .sidebar-logout svg { width: 17px; height: 17px; display: block; }
 
 .main-area { min-width: 0; padding: 0 34px 56px; }
-.topbar { min-height: 86px; display: flex; align-items: center; justify-content: space-between; gap: 24px; border-bottom: 1px solid var(--line); }
-.topbar h1 { margin: 4px 0 0; font-size: 20px; letter-spacing: -.4px; }
 .eyebrow { color: #7b8b90; font-size: 10px; font-weight: 850; letter-spacing: 1.25px; text-transform: uppercase; }
-.topbar-actions { display: flex; align-items: center; gap: 12px; }
 .rule-chip { padding: 7px 10px; border: 1px solid var(--line); border-radius: 999px; background: #fff; color: #596a70; font-size: 11px; font-weight: 700; }
 .primary, .secondary { min-height: 40px; padding: 0 17px; border-radius: 9px; font-weight: 750; font-size: 12px; transition: transform .15s ease, box-shadow .15s ease; }
 .primary { border: 1px solid var(--navy); background: var(--navy); color: #fff; box-shadow: 0 7px 18px rgba(16,44,53,.15); }
@@ -152,10 +150,11 @@ button:disabled { cursor: not-allowed; opacity: .55; transform: none !important;
 .empty-state strong, .empty-state span { display: block; }
 .empty-state strong { color: #52656b; font-size: 12px; }
 .empty-state span { margin-top: 6px; font-size: 10px; }
-.table-read-error { height: 150px; color: #849196 !important; text-align: center !important; }
-.table-read-error strong, .table-read-error span { display: block; }
-.table-read-error strong { color: #52656b; font-size: 12px; }
-.table-read-error span { margin-top: 6px; font-size: 10px; }
+.read-error-state { width: 100%; min-height: 150px; box-sizing: border-box; display: grid; place-content: center; justify-items: center; padding: 24px; color: #849196; text-align: center; }
+.read-error-state strong, .read-error-state span { display: block; }
+.read-error-state strong { color: #52656b; font-size: 12px; }
+.read-error-state span { margin-top: 6px; font-size: 10px; }
+.table-panel > .read-error-state { border-top: 1px solid #edf1f2; }
 .read-error-retry { min-height: 34px; margin-top: 12px; padding: 0 13px; justify-self: center; }
 
 .form-panel { padding: 28px; }
@@ -223,6 +222,7 @@ textarea:focus, input:focus { border-color: var(--teal); box-shadow: 0 0 0 3px r
 .task-back-button svg { width: 20px; height: 20px; display: block; }
 .table-panel { padding: 0; overflow: hidden; }
 .table-scroll { overflow: auto; }
+.table-panel.has-read-error .table-scroll { overflow-x: hidden; }
 table { width: 100%; border-collapse: collapse; min-width: 1100px; table-layout: fixed; }
 /* 宽表兜底：≥7 列的表给更大的最小宽度。卖点表与车型库按各自列宽之和计算，故排除在外，
    否则这条规则会静默盖掉组件里的 min-width 声明（那样组件声明就成了死代码）。 */
@@ -272,35 +272,53 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
 .guardrail h3 { margin: 0 0 5px; font-size: 12px; }
 .guardrail p { margin: 0; color: #7c6c63; font-size: 10px; line-height: 1.6; }
 /* 加载态居中于正在加载的内容区（main-area），而非整个视口：侧边栏是已就绪的导航，不参与居中参照。
-   加载期间 main-area 只有 topbar + loading-screen，flex 让 loading-screen 撑满剩余可视高度；
+   加载期间 main-area 只有 page-header + loading-screen，flex 让 loading-screen 撑满剩余可视高度；
    padding-bottom 6vh 做光学居中——人眼感知的中心比几何中心高约 3~5%。 */
 .main-area:has(> .loading-screen) { display: flex; flex-direction: column; min-height: 100vh; min-height: 100dvh; }
 .loading-screen { flex: 1; display: grid; place-content: center; justify-items: center; gap: 12px; padding-bottom: 6vh; text-align: center; color: #728187; }
-.loading-mark { width: 44px; height: 44px; border-radius: 13px; display: grid; place-items: center; background: var(--navy); color: #d9ff57; font-weight: 900; }
+/* 加载图标动效：外层 .loading-mark 是 68px 的舞台，::before 画一道弧线（与弹窗里的 .drp-spinner 同一语汇，
+   只是放大到 3px 线宽）绕中心匀速旋转；内层 span 是 44px 品牌 D 字标，做轻微呼吸。
+   几何校验：字标圆角 13px 时四角离中心约 25.7px，光环内沿半径 31px，留 5px 余量不相碰。
+   降级：文件末尾的 prefers-reduced-motion 规则会把两段动画压成静态一帧。 */
+.loading-mark { position: relative; width: 68px; height: 68px; display: grid; place-items: center; }
+.loading-mark::before { content: ""; position: absolute; inset: 0; border-radius: 50%; border: 3px solid rgba(16, 44, 53, .1); border-top-color: var(--navy); animation: loading-spin .9s linear infinite; }
+.loading-mark span { width: 44px; height: 44px; border-radius: 13px; display: grid; place-items: center; background: var(--navy); color: #d9ff57; font-weight: 900; animation: loading-breathe 1.8s ease-in-out infinite; }
 .loading-screen p { margin: 0; font-size: 12px; }
+@keyframes loading-spin { to { transform: rotate(360deg); } }
+@keyframes loading-breathe { 50% { transform: scale(.93); } }
 
 .insight-shell .page-stack { max-width: 1360px; }
 .wide-stack { max-width: 1600px !important; }
-.main-area[data-section="overview"] { padding-inline: 24px; background: #f7f9fa; container-type: inline-size; }
-.topbar[data-section="overview"] { min-height: 120px; padding: 20px 0 12px; align-items: flex-start; background-color: #fffefd; background-image: url("/overview-automotive-lines.webp"); background-position: right center; background-repeat: no-repeat; background-size: auto clamp(118px, 10vw, 148px); }
-.topbar[data-section="overview"] .topbar-copy, .topbar[data-section="overview"] .topbar-actions { position: relative; z-index: 1; }
-.topbar[data-section="overview"] .eyebrow { display: none; }
-.topbar[data-section="overview"] h1 { margin: 0; font-size: 28px; line-height: 36px; letter-spacing: -.65px; }
-.topbar[data-section="overview"] .topbar-copy p { margin: 5px 0 0; color: #687a82; font-size: 13px; line-height: 20px; }
-.topbar[data-section="overview"] .topbar-actions { display: flex; justify-content: flex-end; }
-.topbar[data-section="overview"] .channel-switch { border-color: #d8e0e2; border-radius: 10px; box-shadow: 0 4px 14px rgba(16, 44, 53, .035); }
-.topbar[data-section="overview"] .channel-switch button { min-width: 84px; min-height: 40px; padding: 8px 14px; color: #617278; font-size: 12px; transition: background-color .18s ease, color .18s ease; }
-.topbar[data-section="overview"] .channel-switch button:focus-visible { outline: 2px solid #ba4811; outline-offset: 2px; }
-.main-area[data-section="selling-points"] { padding: 0 28px 64px; background: #fefefe; container-type: inline-size; }
-.topbar[data-section="selling-points"] { min-height: 220px; margin-inline: -28px; padding: 28px 34px 64px; align-items: flex-start; border-bottom: 0; background-color: #f4f8fe; background-image: url("/selling-points-hero-bg.png"); background-position: center; background-repeat: no-repeat; background-size: cover; }
-.topbar[data-section="selling-points"] .topbar-copy { position: relative; z-index: 1; max-width: 500px; }
-.topbar[data-section="selling-points"] .eyebrow { color: #8190a3; font-size: 9px; letter-spacing: 1.7px; }
-.topbar[data-section="selling-points"] h1 { margin-top: 10px; color: #111f33; font-size: clamp(32px, 3vw, 38px); line-height: 1.1; letter-spacing: -1.2px; }
-.topbar[data-section="selling-points"] .topbar-copy p { max-width: 500px; margin: 13px 0 0; color: #65758b; font-size: 12px; line-height: 1.75; }
-.topbar[data-section="selling-points"] .topbar-actions { position: relative; z-index: 1; margin-top: 90px; align-self: flex-start; }
+/* 六个一级页面共享标题规范；不复用卡片/弹窗的 eyebrow、h2 或 detail-toolbar。 */
+.main-area:has(.page-header) { padding-inline: 32px; background: var(--canvas); container-type: inline-size; }
+.page-header { width: 100%; max-width: 1600px; min-height: 0; margin: 0 auto; padding: 28px 0 24px; display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 20px 24px; border: 0; background: var(--canvas); font-family: var(--font-geist-sans); }
+.detail-page-header { width: 100%; max-width: 1600px; margin: 0 auto; padding: 24px 0; }
+.detail-page-header + .page-stack { padding-top: 0; }
+.page-header-copy { min-width: 0; flex: 1 1 420px; }
+.page-header-eyebrow { display: block; margin: 0 0 8px; color: #60717a; font-size: 12px; font-weight: 500; line-height: 18px; letter-spacing: 0; }
+.page-header-title { margin: 0; color: var(--ink); font-size: 28px; font-weight: 600; line-height: 36px; letter-spacing: 0; overflow-wrap: anywhere; }
+.page-header-description { max-width: 72em; margin: 8px 0 0; color: #60717a; font-size: 14px; font-weight: 400; line-height: 24px; letter-spacing: 0; overflow-wrap: anywhere; }
+.page-header-actions { min-width: 0; max-width: 100%; margin: 0; flex: 0 1 auto; align-self: center; display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 10px; }
+.page-header-actions > * { max-width: 100%; }
+.page-header-actions > :is(button, a, label) { white-space: nowrap; }
+.page-stack:has(> .page-header) { padding-top: 0; row-gap: 24px; }
+.main-area > .page-header ~ .page-stack { margin-top: 0; padding-top: 24px; }
+.main-area[data-section="selling-points"], .main-area[data-section="spu-audience"] { padding-bottom: 64px; }
+.page-header[data-section="overview"] .channel-switch { border-color: #d8e0e2; border-radius: 10px; box-shadow: 0 4px 14px rgba(16, 44, 53, .035); }
+.page-header[data-section="overview"] .channel-switch button { min-width: 84px; min-height: 40px; padding: 8px 14px; color: #617278; font-size: 12px; transition: background-color .18s ease, color .18s ease; }
+.page-header[data-section="overview"] .channel-switch button:focus-visible { outline: 2px solid #ba4811; outline-offset: 2px; }
+@container (max-width: 719px) {
+  .page-header-actions { width: 100%; justify-content: flex-start; }
+  .page-header[data-section="overview"] .channel-switch { width: 100%; }
+  .page-header[data-section="overview"] .channel-switch button { min-width: 0; flex: 1; }
+}
+@media (max-width: 540px) {
+  .main-area:has(.page-header) { padding-inline: 20px; }
+  .page-header { padding-block: 24px; }
+  .page-header-title { font-size: 24px; line-height: 32px; }
+}
 .selling-point-edit-standard { min-height: 40px; padding-inline: 16px; display: inline-flex; align-items: center; gap: 8px; border-color: rgba(175, 189, 208, .7); color: #18273c; box-shadow: 0 8px 24px rgba(66, 84, 123, .1); }
 .selling-point-top-action { min-height: 40px; }
-.selling-point-activation-note { max-width: 300px; color: #53657a; font-size: 10px; line-height: 1.55; text-align: right; }
 .overview-dashboard { max-width: 1600px !important; padding-top: 16px; gap: 16px; font-family: var(--font-geist-sans), "PingFang SC", "Microsoft YaHei", sans-serif; }
 .definition-list { margin: 18px 0 0; display: grid; gap: 0; }
 .definition-list div { padding: 11px 0; border-bottom: 1px solid #edf1f2; display: flex; justify-content: space-between; gap: 24px; }
@@ -388,7 +406,7 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
 .overview-support-card .quality-grid strong { font-size: 24px; line-height: 30px; }
 .overview-support-card .quality-grid span { margin-top: 4px; font-size: 10px; }
 .placeholder-actions { display: flex; gap: 9px; align-items: center; }
-.button-link { min-height: 36px; padding: 0 14px; display: inline-flex; align-items: center; justify-content: center; text-decoration: none; cursor: pointer; }
+.button-link { min-height: 36px; padding: 0 14px; display: inline-flex; align-items: center; justify-content: center; text-decoration: none; white-space: nowrap; cursor: pointer; }
 .button-link.disabled { opacity: .5; pointer-events: none; }
 .douyin-authorization-page { max-width: 1060px; }
 .douyin-authorization-start { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
@@ -467,12 +485,9 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
 .account-master-table .account-platform-group[data-platform="wechat_channels"] { border-top-color: #25a06e; background: #eef8f3; color: #247862; }
 .account-master-table .account-platform-group[data-platform="kuaishou"] { border-top-color: #f06a37; background: #fff3ed; color: #bd5630; }
 .account-master-table .account-platform-heading { display: inline-flex; align-items: center; justify-content: center; gap: 7px; }
-.account-master-table .account-platform-icon { width: 16px; height: 16px; flex: 0 0 16px; border-radius: 50%; display: inline-grid; place-items: center; color: #fff; }
-.account-master-table .account-platform-icon[data-platform-mark="douyin"] { background: #fc7148; }
-.account-master-table .account-platform-icon[data-platform-mark="xiaohongshu"] { background: #f04464; }
-.account-master-table .account-platform-icon[data-platform-mark="wechat_channels"] { background: #25a06e; }
-.account-master-table .account-platform-icon[data-platform-mark="kuaishou"] { background: #f06a37; }
-.account-master-table .account-platform-icon img { width: 10px; height: 10px; filter: brightness(0) invert(1); }
+.account-master-table .account-platform-icon { width: 16px; height: 16px; flex: 0 0 16px; margin: 0; border-radius: 4px; display: inline-grid; place-items: center; overflow: hidden; background: transparent; color: #fff; }
+.account-master-table .account-platform-icon:not([data-official-logo="true"]) { background: #718188; }
+.account-master-table .account-platform-icon img { display: block; width: 16px; height: 16px; object-fit: contain; }
 .account-master-table .account-platform-icon svg { width: 10px; height: 10px; }
 .account-master-table .account-management-group { border-top-color: #9cabb0 !important; background: #f3f6f7; color: #536970; }
 .account-master-table .account-column-row th { height: 40px; border-bottom: 1px solid #dce4e6; background: #f8fafb; color: #435961; font-size: 10px; font-weight: 750; letter-spacing: .1px; text-align: left; }
@@ -497,23 +512,42 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
 .account-master-table .account-type { left: 200px; }
 .account-master-table .account-direction { left: 292px; border-right: 1px solid #d4dfe2; box-shadow: 8px 0 14px -12px rgba(16, 44, 53, .45); }
 .account-master-empty { height: 110px; color: #7b898e !important; text-align: center !important; }
-/* 列宽表：1:280 2:卖点 190 3-4:140 5-7:96 8:SPU 150 9:人群 96 10:场景 170 11:证据等级 96 12-17:96×6 → 合计 2126 */
-.content-table { min-width: 2126px !important; }
-.content-table th:first-child { width: 280px; }
+/* 列宽表：1:标题 380（88 媒体框 + 10 间距 + 正文）2:卖点 190 3:平台/时间 170 4:账号 140 5-7:96 8:SPU 150 9:人群 96 10:场景 170 11:证据等级 96 12-17:96×6 → 合计 2256 */
+.content-table { min-width: 2256px !important; }
+.content-table th:first-child { width: 380px; }
 .content-table th:nth-child(2) { width: 190px; }
-.content-table th:nth-child(3), .content-table th:nth-child(4) { width: 140px; }
+.content-table th:nth-child(3) { width: 170px; }
+.content-table th:nth-child(4) { width: 140px; }
 .content-table th:nth-child(n+5) { width: 96px; }
 .content-table th:nth-child(8) { width: 150px; }
 .content-table th:nth-child(10) { width: 170px; }
 .content-table .content-scene-cell .scene-tag { margin: 0 4px 4px 0; font-size: 9px; }
 .content-table .spu-tag-subline { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.content-table .content-platform-cell { white-space: nowrap; }
+.content-table .content-platform-id { font-size: inherit; font-weight: inherit; text-decoration: none; }
+.content-table .content-platform-id:hover { text-decoration: underline; }
 /* 卖点文案多行完整显示（2026-08-15 Mark 要求去掉单行省略号）；overflow-wrap 兜底超长连续字符 */
 .content-table .selling-point-name { display: block; white-space: normal; overflow-wrap: anywhere; }
 .content-table .evidence-level-tag { border-bottom: 1px dotted #b7c4c8; cursor: help; }
-/* 标题折叠：默认两行，末尾内联「展开」。首列是 sticky 且恒为 #fff（无 hover 变色），
-   所以按钮可以用白色渐变盖住第二行末尾的文字，做出"…展开"的收尾效果。 */
-.content-table .content-title { position: relative; display: block; }
-.content-table .content-title-text { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; margin: 0; color: inherit; }
+/* 标题格：左侧 88×50 静态媒体框 + 右侧标题正文，两列 grid 放在包裹 div 上（td 不能改 display，
+   会破坏 table-layout: fixed 与 sticky 首列）。标题默认两行，末尾内联「展开」。首列是 sticky 且恒为 #fff
+   （无 hover 变色），所以按钮可以用白色渐变盖住第二行末尾的文字，做出"…展开"的收尾效果。 */
+.content-table .content-title-cell { display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: 10px; align-items: start; }
+.content-table .content-title { position: relative; display: block; min-width: 0; margin-top: 0; color: var(--ink); }
+/* 媒体框：深底 + 左上平台 Logo + 中央图标与文字；第三级是 <a>，两个类的特异性压过 td:first-child a / span 的全局规则 */
+.content-table .content-media-box { position: relative; width: 88px; height: 50px; display: grid; place-content: center; justify-items: center; gap: 3px; padding: 0; margin: 0; border: 1px solid #22434c; border-radius: 8px; background: #0f2026; color: #fff; font-size: 9px; font-weight: 750; text-decoration: none; cursor: pointer; }
+.content-table .content-media-box span { display: block; margin: 0; color: inherit; }
+.content-table .content-media-box:hover { background: #163540; color: #fff; }
+.content-table .content-media-box:focus-visible { outline: 2px solid var(--teal); outline-offset: 2px; }
+.content-table .content-media-box .content-media-mark { position: absolute; top: 4px; left: 4px; width: 14px; height: 14px; display: inline-grid; place-items: center; overflow: hidden; border-radius: 3px; background: transparent; }
+.content-table .content-media-box .content-media-mark:not([data-official-logo="true"]) { background: #718188; }
+.content-table .content-media-box .content-media-mark img { display: block; width: 14px; height: 14px; object-fit: contain; }
+.content-table .content-media-box .content-media-mark svg { display: block; width: 10px; height: 10px; }
+.content-table .content-media-glyph svg { display: block; width: 16px; height: 16px; }
+.content-table .content-media-label { line-height: 1; }
+.content-table .content-media-box .content-media-badge { position: absolute; top: 4px; right: 4px; display: grid; place-items: center; width: 14px; height: 14px; }
+.content-table .content-media-box .content-media-badge svg { display: block; width: 12px; height: 12px; }
+.content-table .content-title-text { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; margin: 0; color: inherit; font-size: inherit; font-weight: 750; }
 .content-table .content-title[data-expanded="true"] .content-title-text { display: inline; overflow: visible; }
 .content-table .content-title-toggle { position: absolute; right: 0; bottom: 0; padding: 0 0 0 22px; border: 0; color: var(--teal); font-size: 9px; font-weight: 750; line-height: inherit; cursor: pointer; background: linear-gradient(90deg, rgba(255, 255, 255, 0) 0, #fff 40%); }
 .content-table .content-title[data-expanded="true"] .content-title-toggle { position: static; margin-left: 5px; padding-left: 0; background: transparent; }
@@ -523,7 +557,6 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
 .cell-subline { display: block; margin-top: 4px; color: #8b989c; }
 .content-table { border-collapse: separate; border-spacing: 0; }
 .content-table th:first-child, .content-table td:first-child { position: sticky; left: 0; z-index: 3; background: #fff; border-right: 1px solid #e6ecee; box-shadow: 8px 0 14px -12px rgba(16, 44, 53, .35); }
-.content-table td.table-read-error { position: static; border-right: 0; box-shadow: none; }
 .content-table thead th:first-child { z-index: 4; background: #edf2f3; }
 .row-actions { display: grid; justify-items: start; gap: 6px; }
 .muted-cell { color: #8b989c; }
@@ -550,7 +583,7 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
 .task-progress em { flex: 0 0 auto; color: var(--teal); font-style: normal; }
 .task-card .progress-track { height: 6px; }
 .task-card .progress-track i { background: var(--teal); transition: width .4s ease; }
-.selling-points-page { max-width: 1600px !important; margin-top: -33px; padding-top: 0; gap: 20px; position: relative; z-index: 2; font-family: var(--font-geist-sans), "PingFang SC", "Microsoft YaHei", sans-serif; }
+.selling-points-page { max-width: 1600px !important; margin-top: 0; padding-top: 0; gap: 20px; position: relative; z-index: 2; font-family: var(--font-geist-sans), "PingFang SC", "Microsoft YaHei", sans-serif; }
 .selling-point-summary { overflow: hidden; border: 1px solid rgba(220, 227, 237, .9); border-radius: 12px; background: rgba(255, 255, 255, .97); box-shadow: 0 18px 42px rgba(43, 59, 92, .09); }
 .selling-point-summary-head { min-height: 45px; padding: 14px 24px 10px; display: flex; align-items: center; justify-content: space-between; gap: 24px; }
 .selling-point-summary-head h2 { margin: 0; color: #18263a; font-size: 14px; line-height: 1.4; }
@@ -584,8 +617,8 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
 .selling-point-family-meta { flex: 0 0 auto; margin: 0 0 2px; display: flex; align-items: center; gap: 8px; color: #6f7d90; font-size: 10px; white-space: nowrap; }
 .selling-point-family-meta span { color: #b1bac6; }
 .selling-point-table-wrap { overflow-x: auto; }
-/* min-width = 各列定宽之和 96+400+190+88+100×4+88 = 1262px。 */
-.selling-point-table { width: 100%; min-width: 1262px; table-layout: fixed; border-collapse: collapse; }
+/* min-width = 各列定宽之和 96+400+190+88+100×4 = 1174px。 */
+.selling-point-table { width: 100%; min-width: 1174px; table-layout: fixed; border-collapse: collapse; }
 .selling-point-table col.selling-point-code-col { width: 96px; }
 /* 显式宽度而非 auto：最长文案“通过懂车帝查看检测报告、车辆档案或专业检测，识别问题二手车”
    29 全角字 × 12px = 348px，加单元格左右 padding 24px = 372px，取 400px 留余量。
@@ -598,7 +631,6 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
    加 thead 左右 padding 24px = 95.4px，取 100px 留余量。表格总宽不变（由上面的
    table:has(th:nth-child(7)) 锁定 1480px），多出的宽度由弹性的“卖点标准”列吸收，不新增横向滚动。 */
 .selling-point-table col.selling-point-share-col { width: 100px; }
-.selling-point-table col.selling-point-action-col { width: 88px; }
 .selling-point-table th,
 .selling-point-table td { width: auto; border-bottom: 1px solid #e9edf2; background: transparent; text-align: left; vertical-align: middle; }
 .selling-point-table thead th { padding: 10px 12px; color: #6f7d90; font-size: 10px; font-weight: 700; letter-spacing: .2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -722,6 +754,34 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
 .evidence-body { padding: 12px; border-radius: 8px; background: #fff; color: #576970; font-size: 10px; line-height: 1.7; white-space: pre-wrap; }
 .media-gallery { margin-top: 14px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
 .evidence-media { width: 100%; max-height: 420px; object-fit: contain; border: 1px solid var(--line); border-radius: 9px; background: #0f2026; }
+/* 内容媒体弹窗（只读）：尺寸跟内容走。--media-stage-h 是舞台高度；面板宽度由内容宽高比 --media-ratio 算出（本地媒体在 loadedmetadata/load 后实测写入，默认 9:16）。
+   抖音官方播放器固定竖版：宽 = (高 − 48px 底条) × 9/16，且不小于其最小布局 324px（播放器不随 iframe 缩放，更小会被裁）。
+   DOM 顺序 标题→舞台→（工具栏）→操作区，操作区用 grid 区域钉回右上角：跨源 iframe 之后必须有父文档可聚焦的出口（打开原帖、关闭）。 */
+.modal-backdrop.content-media-backdrop { padding: 16px; }
+.modal-panel.content-media-modal { --media-stage-h: clamp(360px, calc(100dvh - 164px), 768px); --media-ratio: 0.5625; --media-w: calc(var(--media-stage-h) * var(--media-ratio)); width: clamp(360px, calc(var(--media-w) + 36px), min(960px, 100vw - 32px)); max-height: calc(100dvh - 32px); padding: 14px 18px 18px; display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-rows: auto minmax(0, 1fr) auto; grid-template-areas: "head actions" "stage stage" "bar bar"; column-gap: 12px; overflow: hidden; transition: width .15s ease; }
+.modal-panel.content-media-modal:has(> .content-media-toolbar) { --media-stage-h: clamp(320px, calc(100dvh - 206px), 768px); }
+.modal-panel.content-media-modal[data-stage="player"] { --media-stage-h: clamp(240px, calc(100dvh - 228px), 704px); --media-w: clamp(324px, calc((var(--media-stage-h) - 48px) * 9 / 16), 480px); }
+.modal-panel.content-media-modal:not([data-stage="local"]):not([data-stage="player"]) { --media-stage-h: 240px; }
+.content-media-head { grid-area: head; min-width: 0; }
+.content-media-head h3 { margin: 4px 0 0; font-size: 15px; line-height: 1.4; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
+.content-media-head p { margin: 5px 0 0; color: var(--muted); font-size: 11px; }
+.content-media-player-help { grid-area: bar; margin: 10px 0 0; color: #52656d; font-size: 13px; line-height: 1.6; }
+.content-media-player-help a { color: #087e80; text-decoration: underline; }
+.content-media-actions { grid-area: actions; display: flex; align-items: center; gap: 8px; }
+.content-media-actions .button-link { min-height: 32px; padding: 0 12px; font-size: 11px; }
+.content-media-stage { grid-area: stage; margin-top: 12px; height: var(--media-stage-h); display: grid; grid-template-rows: 100%; place-items: center; overflow: hidden; border-radius: 10px; background: #0f2026; }
+.content-media-stage .content-media-video, .content-media-stage .content-media-image { display: block; width: 100%; height: 100%; object-fit: contain; }
+.content-media-stage .content-media-player { display: block; border: 0; width: var(--media-w); max-width: 100%; height: 100%; }
+.content-media-stage .empty-state, .content-media-stage .empty-state strong, .content-media-stage .empty-state span { color: #c7d3d7; }
+.content-media-stage .empty-state .read-error-retry { color: var(--ink); }
+.content-media-toolbar { grid-area: bar; margin-top: 10px; min-height: 32px; display: flex; align-items: center; justify-content: space-between; gap: 10px; color: #64747a; font-size: 10px; }
+.content-media-nav { display: flex; gap: 6px; }
+.content-media-nav button { min-height: 32px; padding: 0 10px; display: inline-flex; align-items: center; gap: 4px; }
+@media (max-width: 600px) {
+  .modal-backdrop.content-media-backdrop { padding: 8px; }
+  .modal-panel.content-media-modal { --media-stage-h: clamp(240px, calc(100dvh - 190px), 640px); width: 100%; padding: 12px 14px 14px; }
+  .content-media-toolbar { flex-direction: column; align-items: flex-start; }
+}
 .evidence-columns { align-items: stretch; }
 .evidence-text { max-height: 320px; overflow: auto; margin: 0; padding: 13px; border: 1px solid #e3e9ea; border-radius: 8px; background: #fff; color: #40545b; font: 10px/1.7 var(--font-geist-mono), monospace; white-space: pre-wrap; word-break: break-word; }
 .comment-list { max-height: 330px; overflow: auto; margin: 0; padding: 0; list-style: none; }
@@ -732,22 +792,6 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
 .slot-list strong { color: var(--ink); font-size: 10px; }
 .slot-list span, .slot-list small { color: #7b898e; font-size: 9px; line-height: 1.5; }
 .slot-list small { color: var(--red); }
-.pending-identity-panel { overflow: hidden; }
-.pending-identity-list { max-height: 430px; margin-top: 16px; overflow: auto; border: 1px solid #e2e8ea; border-radius: 10px; }
-.pending-identity-table { min-width: 660px !important; }
-.pending-identity-table th { padding: 11px 14px; background: #f3f6f7; color: #65767c; font-size: 9px; letter-spacing: .35px; }
-.pending-identity-table th:first-child { width: 96px; }
-.pending-identity-table th:nth-child(2) { width: auto; }
-.pending-identity-table th:nth-child(3) { width: 200px; }
-.pending-identity-table th:nth-child(4) { width: 100px; text-align: right; }
-.pending-identity-table td { padding: 12px 14px; color: #63747a; font-size: 10px; vertical-align: middle; }
-.pending-identity-table td:first-child { width: 96px; }
-.pending-identity-table td:nth-child(2) { color: var(--ink); font-variant-numeric: tabular-nums; }
-.pending-identity-table td:nth-child(4) { text-align: right; font-weight: 750; white-space: nowrap; }
-.pending-identity-table tbody tr { background: #fff; transition: background-color .15s ease; }
-.pending-identity-table tbody tr:hover { background: #f8fafb; }
-.pending-identity-table td:first-child .pending-platform-label { display: inline-flex; margin-top: 0; padding: 4px 8px; border-radius: 999px; background: #edf3f4; color: #536970; font-size: 9px; font-weight: 800; }
-.pending-identity-empty { height: 84px; color: #7b898e !important; text-align: center !important; font-weight: 500 !important; }
 .invalidated-revision { opacity: .6; }
 .task-tabs { margin-top: 20px; padding: 4px; border: 1px solid var(--line); border-radius: 10px; display: flex; gap: 3px; overflow-x: auto; }
 .task-tabs button { min-height: 36px; padding: 0 14px; border: 0; border-radius: 7px; background: transparent; color: #77858a; font-size: 10px; font-weight: 750; white-space: nowrap; }
@@ -794,12 +838,12 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
   .app-shell { display: block; }
   .sidebar { position: fixed; inset: auto 0 0; width: 100%; height: 64px; padding: 7px 10px; display: block; }
   .brand, .sidebar nav p, .sidebar-foot { display: none; }
-  .sidebar nav { display: grid; grid-template-columns: repeat(5, 1fr); }
-  .sidebar nav a { margin: 0; padding: 6px; display: grid; gap: 2px; justify-items: center; font-size: 8px !important; }
+  /* 底栏固定 64px 高：入口超过 5 个（管理员多一个"用户权限"）时单行横向滚动，不换行被裁掉。 */
+  .sidebar nav { display: flex; overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none; }
+  .sidebar nav::-webkit-scrollbar { display: none; }
+  .sidebar nav a { flex: 0 0 20%; margin: 0; padding: 6px; display: grid; gap: 2px; justify-items: center; font-size: 8px !important; }
   .sidebar nav a .nav-icon { width: 18px; height: 18px; }
   .main-area { padding: 0 15px 88px; }
-  .topbar { min-height: 70px; }
-  .topbar h1 { font-size: 17px; }
   .primary.small { display: none; }
   .page-stack { padding-top: 16px; gap: 15px; }
   .hero-panel { padding: 28px 23px; gap: 30px; }
@@ -820,14 +864,9 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
   .platform-editor { grid-template-columns: 1fr; }
   .modal-fields .span-two { grid-column: auto; }
   .insight-metrics, .quality-grid { grid-template-columns: 1fr; }
-  .main-area[data-section="selling-points"] { padding: 0 15px 92px; }
-  .topbar[data-section="selling-points"] { min-height: 254px; margin-inline: -15px; padding: 23px 18px 70px; display: grid; grid-template-columns: 1fr; align-content: start; gap: 18px; background-position: 58% center; }
-  .topbar[data-section="selling-points"] h1 { font-size: 30px; }
-  .topbar[data-section="selling-points"] .topbar-copy p { font-size: 10px; line-height: 1.7; }
-  .topbar[data-section="selling-points"] .topbar-actions { width: 100%; margin-top: 0; justify-content: flex-start; }
-  .selling-point-activation-note { max-width: 240px; text-align: left; }
+  .main-area[data-section="selling-points"] { padding-bottom: 92px; }
   .selling-point-edit-standard { min-height: 38px; }
-  .selling-points-page { margin-top: -42px; gap: 20px; }
+  .selling-points-page { gap: 20px; }
   .selling-point-summary-head { padding: 17px 18px 14px; }
   .selling-point-summary-head { align-items: flex-start; flex-direction: column; gap: 10px; }
   .selling-point-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -839,7 +878,6 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
   .selling-point-projection-preview > header { align-items: flex-start; flex-direction: column; gap: 4px; }
   .selling-point-projection-preview > header span { text-align: left; }
   .selling-point-projection-grid { grid-template-columns: 1fr; }
-  .main-area[data-section="overview"] { padding-inline: 15px; }
   .account-master-table .account-group-row .account-base-group { position: static; box-shadow: none; }
   .account-master-table .account-operator,
   .account-master-table .account-type,
@@ -882,24 +920,6 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
 }
 
 @container (max-width: 719px) {
-  .topbar[data-section="overview"] {
-    min-height: 138px;
-    padding-block: 14px;
-    display: grid;
-    grid-template-columns: 1fr;
-    gap: 10px;
-    background-image: none;
-  }
-  .topbar[data-section="overview"] h1 { font-size: 20px; }
-  .topbar[data-section="overview"] .topbar-copy p { font-size: 11px; }
-  .topbar[data-section="overview"] .topbar-actions {
-    width: 100%;
-    display: flex;
-    align-items: center;
-    justify-content: flex-end;
-  }
-  .topbar[data-section="overview"] .channel-switch { width: 100%; }
-  .topbar[data-section="overview"] .channel-switch button { min-width: 0; min-height: 40px; flex: 1; }
   .overview-dashboard { padding-top: 12px; gap: 13px; }
   .overview-dashboard .channel-conclusion { padding: 16px; }
   .overview-dashboard .channel-number { width: 46px; height: 46px; flex-basis: 46px; font-size: 22px; }
@@ -913,7 +933,6 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
 }
 
 @container (max-width: 420px) {
-  .topbar[data-section="overview"] { min-height: 158px; }
   .overview-dashboard .channel-conclusion-head { align-items: flex-start; }
   .overview-dashboard .scene-metric-row { grid-template-columns: 1fr; }
   .overview-dashboard .scene-metric-row dd { justify-content: start; text-align: left; }
@@ -984,10 +1003,8 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
 }
 
 /* ===== SPU人群页（spu-audience）===== */
-/* 版式对齐卖点页：渐变 hero + 悬浮总览卡 + 彩色区块头，不再用 panel/eyebrow 堆叠。 */
-.main-area[data-section="spu-audience"] { padding: 0 28px 64px; background: #fefefe; container-type: inline-size; }
-.topbar[data-section="spu-audience"] { min-height: 172px; margin-inline: -28px; padding: 26px 34px 56px; align-items: flex-start; border-bottom: 0; background: linear-gradient(128deg, #edf6f3 0%, #ecf3fd 50%, #f4effc 100%); }
-.spu-audience-page { max-width: 1600px !important; margin-top: -34px; padding-top: 0; gap: 20px; position: relative; z-index: 2; }
+/* 页头使用共享 page-header；下方总览卡和彩色业务区块保留原有样式。 */
+.spu-audience-page { max-width: 1600px !important; margin-top: 0; padding-top: 0; gap: 20px; position: relative; z-index: 2; }
 
 /* 色板：车型/人群/场景沿用卖点页的青·蓝·紫，映射与缺口用中性与警示色 */
 .spu-block, .spu-summary-item { --tone: #0fa886; --tone-soft: #e4f6f1; }
@@ -1123,6 +1140,4 @@ td:first-child span { margin-top: 5px; color: #8b989c; }
 @container (max-width: 719px) {
   .spu-catalog-search-wrap { align-items: center; }
   .spu-catalog-search { width: min(100%, 280px); }
-  .topbar[data-section="spu-audience"] { display: grid; grid-template-columns: 1fr; align-content: start; gap: 14px; }
-  .topbar[data-section="spu-audience"] .topbar-actions { width: 100%; justify-content: flex-start; flex-wrap: wrap; }
 }

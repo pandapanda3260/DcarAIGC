@@ -3,11 +3,45 @@
 import { useEffect, useId, useRef, useSyncExternalStore } from "react";
 import type { ReactNode } from "react";
 
+// 加载文案统一以中文省略号"……"收尾表示进行中；调用方只传动作短语（如"正在读取内容库"）。
+// 若调用方已自带省略号/句号，先去掉再补，避免出现"…………"。
+const TRAILING_ELLIPSIS = /[…⋯.。]+$/u;
+function loadingCopy(label: string): string { return `${label.replace(TRAILING_ELLIPSIS, "").trimEnd()}……`; }
+
 export function Loading({ label = "正在加载运营数据" }: { label?: string }) {
   // 行内渲染在 .main-area 内：加载指示器居中于"正在加载的内容区"，而不是整个视口
   //（侧边栏仍可用，不属于加载区域；参见 Carbon/Red Hat 设计系统的 loading 规范）。
   // 居中由 globals.css 的 .main-area:has(> .loading-screen) 布局完成，无需 portal/fixed。
-  return <div className="loading-screen" role="status" aria-live="polite"><div className="loading-mark">D</div><p>{label}</p></div>;
+  // 图标是纯 CSS 动效（外圈弧线绕品牌 D 字标旋转 + 字标呼吸），不用 GIF：无额外资源、任意缩放下清晰、
+  // 自动遵守 prefers-reduced-motion（globals.css 末尾的全局降级规则）。样式见 .loading-mark。
+  return (
+    <div className="loading-screen" role="status" aria-live="polite">
+      <div className="loading-mark" aria-hidden="true"><span>D</span></div>
+      <p>{loadingCopy(label)}</p>
+    </div>
+  );
+}
+
+export function ReadErrorState({
+  title,
+  retrying,
+  onRetry,
+  description = "请检查网络后重新加载。",
+}: {
+  title: string;
+  retrying: boolean;
+  onRetry: () => void;
+  description?: string;
+}) {
+  return (
+    <div className="read-error-state" role="region" aria-label={title} aria-busy={retrying}>
+      <strong>{title}</strong>
+      <span>{description}</span>
+      <button type="button" className="secondary read-error-retry" disabled={retrying} onClick={onRetry}>
+        {retrying ? "正在重新加载…" : "重新加载"}
+      </button>
+    </div>
+  );
 }
 
 // ---- 全局浮动提示（toast）----

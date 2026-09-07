@@ -4,6 +4,7 @@ import csv
 import json
 import sqlite3
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -36,6 +37,7 @@ from v8.storage import (
     transaction,
 )
 from tests.v9_report_fixture import activate_v9_report_fixture
+from tests.metric_fixture import provider_metric
 
 
 class V8ReportTaskTest(unittest.TestCase):
@@ -135,6 +137,7 @@ class V8ReportTaskTest(unittest.TestCase):
                 source="migrated_historical",
                 raw_response_id=None,
                 metadata_json="{}",
+                observation_origin="legacy_snapshot_baseline",
             )
             legacy_release = ensure_legacy_evaluation_release(
                 connection,
@@ -297,7 +300,7 @@ class V8ReportTaskTest(unittest.TestCase):
                     INSERT INTO content_items(
                         link_id,platform,platform_content_id,canonical_url,
                         published_at,title,content_type,imported_at,created_at,updated_at
-                    ) VALUES (?,'douyin',?,?, '2026-08-04T04:00:00Z',
+                    ) VALUES (?,'douyin',?,?, '2026-08-02T04:00:00Z',
                               'freshness fixture','video',?,?,?)
                     """,
                     (
@@ -321,38 +324,38 @@ class V8ReportTaskTest(unittest.TestCase):
                     (content_id, f"freshness-{index}", f"douyin:freshness-{index}"),
                 )
                 if index < len(captured_values):
-                    persist_metric_observation(
+                    provider_metric(
                         connection,
                         content_id=content_id,
                         captured_at=captured_values[index],
                         window_key="2026-08-04",
                         view_count=100 + index,
-                        comment_count=None,
-                        like_count=None,
-                        share_count=None,
-                        collect_count=None,
+                        comment_count=0,
+                        like_count=0,
+                        share_count=0,
+                        collect_count=0,
                         status="available",
                         source="douyin",
                         raw_response_id=None,
                         metadata_json="{}",
                     )
                 elif index == 5:
-                    persist_metric_observation(
+                    provider_metric(
                         connection,
                         content_id=content_id,
                         captured_at="2026-08-04T00:00:00Z",
                         window_key="old-available",
                         view_count=105,
-                        comment_count=None,
-                        like_count=None,
-                        share_count=None,
-                        collect_count=None,
+                        comment_count=0,
+                        like_count=0,
+                        share_count=0,
+                        collect_count=0,
                         status="available",
                         source="douyin",
                         raw_response_id=None,
                         metadata_json="{}",
                     )
-                    persist_metric_observation(
+                    provider_metric(
                         connection,
                         content_id=content_id,
                         captured_at="2026-08-04T23:00:00Z",
@@ -391,7 +394,7 @@ class V8ReportTaskTest(unittest.TestCase):
         )
 
         with connect(self.db) as connection, transaction(connection):
-            persist_metric_observation(
+            provider_metric(
                 connection,
                 content_id=content_ids[4],
                 captured_at="2026-08-05T00:00:00.500000Z",
@@ -419,8 +422,9 @@ class V8ReportTaskTest(unittest.TestCase):
         self.assertEqual(as_of[content_ids[0]]["captured_at"], cutoff)
         self.assertNotIn(content_ids[3], as_of)
         self.assertNotIn(content_ids[4], as_of)
-        self.assertEqual(as_of[content_ids[5]]["status"], "missing")
-        self.assertIsNone(as_of[content_ids[5]]["view_count"])
+        self.assertEqual(as_of[content_ids[5]]["status"], "stale")
+        self.assertEqual(as_of[content_ids[5]]["view_count"], 105)
+        self.assertEqual(as_of[content_ids[5]]["fields"]["view_count"]["freshness"], "stale")
 
     def test_empty_metric_freshness_is_not_applicable_not_one_hundred(self) -> None:
         with connect(self.db) as connection:
@@ -489,6 +493,78 @@ class V8ReportTaskTest(unittest.TestCase):
             {row["content_id"] for row in report["content_details"]},
             set(content_ids),
         )
+
+    def test_report_assembly_read_snapshot_does_not_hold_writer_lock(self) -> None:
+        task = create_task(
+            task_type="custom",
+            period_start="2026-07-01",
+            period_end="2026-07-01",
+            creation_source="manual",
+            db_path=self.db,
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        results = []
+        failures = []
+        read_contract = []
+        original = reports_module._assemble_report_data
+
+        def slow_assembly(*args, **kwargs):
+            connection = args[0]
+            read_contract.append(
+                (
+                    bool(connection.in_transaction),
+                    int(connection.execute("PRAGMA query_only").fetchone()[0]),
+                )
+            )
+            with self.assertRaises(sqlite3.OperationalError):
+                connection.execute(
+                    "UPDATE report_tasks SET message=message WHERE id=?",
+                    (task["id"],),
+                )
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("report assembly kept the fixture waiting")
+            return original(*args, **kwargs)
+
+        def worker():
+            try:
+                results.append(
+                    run_task(
+                        task["id"],
+                        db_path=self.db,
+                        reports_root=self.reports_root,
+                    )
+                )
+            except Exception as error:
+                failures.append(error)
+
+        with patch.object(reports_module, "_assemble_report_data", side_effect=slow_assembly):
+            thread = threading.Thread(target=worker)
+            thread.start()
+            self.assertTrue(entered.wait(2))
+            try:
+                with connect(self.db) as connection, transaction(connection):
+                    connection.execute(
+                        "UPDATE report_tasks SET message=message WHERE id=?",
+                        (task["id"],),
+                    )
+            finally:
+                release.set()
+            thread.join(timeout=10)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(read_contract, [(True, 1)])
+        with connect(self.db) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM task_events WHERE task_id=? AND event_type='report_inputs_v1'",
+                    (task["id"],),
+                ).fetchone()[0],
+                1,
+            )
 
     def test_automatic_custom_report_is_rejected(self) -> None:
         with self.assertRaisesRegex(
@@ -723,23 +799,25 @@ class V8ReportTaskTest(unittest.TestCase):
             "SELECT * FROM evaluation_releases WHERE id=?", (selected_release,)
         ).fetchone()
         assert release is not None
+        envelope_id, evidence_sha256, _ = build_evidence_envelope(connection, content_id, rule_version=release["rule_version"])
         cursor = connection.execute(
             """
             INSERT INTO evaluation_versions(
-                content_id,release_id,rule_version,taxonomy_version,
+                content_id,evidence_envelope_id,release_id,rule_version,taxonomy_version,
                 matcher_rule_sha256,evidence_sha256,evaluation_source,
                 evaluation_status,evidence_level,primary_selling_point_code,
                 selling_point_score,selling_point_included,content_direction,
                 content_automotive_score,payload_json,evaluated_at
-            ) VALUES (?,?,?,?,?,?,'automatic','evaluated',?,?,90,?,?,80,'{}',?)
+            ) VALUES (?,?,?,?,?,?,?,'automatic','evaluated',?,?,90,?,?,80,'{}',?)
             """,
             (
                 content_id,
+                envelope_id,
                 selected_release,
                 release["rule_version"],
                 release["taxonomy_version"],
                 release["matcher_rule_sha256"],
-                f"{content_id:064x}"[-64:],
+                evidence_sha256,
                 evidence_level,
                 code,
                 included,
@@ -929,7 +1007,7 @@ class V8ReportTaskTest(unittest.TestCase):
                 """,
                 (content_id, captured_at),
             )
-            persist_metric_observation(
+            provider_metric(
                 connection,
                 content_id=content_id,
                 captured_at=captured_at,
@@ -1275,7 +1353,7 @@ class V8ReportTaskTest(unittest.TestCase):
     ) -> None:
         with patch(
             "v8.reports.media_terminal_states",
-            side_effect=lambda _connection, _release_id, content_ids: {
+            side_effect=lambda _connection, _release_id, content_ids, *, cutoff_at: {
                 content_id: "complete" for content_id in content_ids
             },
         ):
@@ -1407,9 +1485,10 @@ class V8ReportTaskTest(unittest.TestCase):
                 """
             )
             connection.commit()
-        with self.assertRaisesRegex(ReportTaskError, "multiple active"):
+        with self.assertRaisesRegex(ReportTaskError, "incompatible or incomplete schema"):
             run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
         with connect(self.db) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM evaluation_releases WHERE status='active'").fetchone()[0], 2)
             self.assertEqual(
                 connection.execute("SELECT COUNT(*) FROM report_revisions").fetchone()[
                     0
@@ -1539,7 +1618,7 @@ class V8ReportTaskTest(unittest.TestCase):
         self.assertEqual(later_report["task"]["task_status"], "partial")
         self.assertEqual(later_report["data_quality"]["evaluation_coverage"], 0.0)
 
-    def test_discovery_coverage_uses_window_receipts_and_missing_occurrences(
+    def test_legacy_discovery_is_preserved_but_not_used_by_new_reports(
         self,
     ) -> None:
         captured_at = now_utc()
@@ -1629,15 +1708,18 @@ class V8ReportTaskTest(unittest.TestCase):
             db_path=self.db,
         )
         partial = run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
-        self.assertEqual(partial["data_quality"]["discovery_coverage"], 50.0)
+        with connect(self.db) as connection:
+            legacy_partial = reports_module._discovery_coverage_detail(connection, task, generated_at=task["created_at"], minimum_percentage=90)
+        self.assertEqual(legacy_partial["percentage"], 50.0)
+        self.assertIsNone(partial["data_quality"]["discovery_coverage"])
+        self.assertEqual(partial["data_quality_details"]["discovery_coverage"]["status"], "unknown")
+        self.assertFalse(partial["data_quality"]["roster_evidence_valid"])
         self.assertEqual(
-            partial["data_quality_details"]["discovery_coverage"]
-            ["covered_identity_occurrence_count"],
+            legacy_partial["covered_identity_occurrence_count"],
             1,
         )
         self.assertEqual(
-            partial["data_quality_details"]["discovery_coverage"]
-            ["eligible_identity_occurrence_count"],
+            legacy_partial["eligible_identity_occurrence_count"],
             2,
         )
         self.assertEqual(partial["task"]["task_status"], "partial")
@@ -1668,8 +1750,12 @@ class V8ReportTaskTest(unittest.TestCase):
             missing_task["id"], db_path=self.db, reports_root=self.reports_root
         )
         missing_discovery = missing["data_quality_details"]["discovery_coverage"]
-        self.assertEqual(missing["data_quality"]["discovery_coverage"], 0.0)
-        self.assertEqual(missing_discovery["eligible_identity_occurrence_count"], 2)
+        with connect(self.db) as connection:
+            legacy_missing = reports_module._discovery_coverage_detail(connection, missing_task, generated_at=missing_task["created_at"], minimum_percentage=90)
+        self.assertEqual(legacy_missing["percentage"], 0.0)
+        self.assertEqual(legacy_missing["eligible_identity_occurrence_count"], 2)
+        self.assertIsNone(missing["data_quality"]["discovery_coverage"])
+        self.assertEqual(missing_discovery["eligible_identity_occurrence_count"], 0)
         self.assertEqual(missing_discovery["observed_occurrence_count"], 0)
         self.assertEqual(missing_discovery["missing_occurrence_dates"], ["2026-07-04"])
 
@@ -1683,10 +1769,12 @@ class V8ReportTaskTest(unittest.TestCase):
         two_day = run_task(
             two_day_task["id"], db_path=self.db, reports_root=self.reports_root
         )
-        self.assertEqual(two_day["data_quality"]["discovery_coverage"], 25.0)
+        with connect(self.db) as connection:
+            legacy_two_day = reports_module._discovery_coverage_detail(connection, two_day_task, generated_at=two_day_task["created_at"], minimum_percentage=90)
+        self.assertEqual(legacy_two_day["percentage"], 25.0)
+        self.assertIsNone(two_day["data_quality"]["discovery_coverage"])
         self.assertEqual(
-            two_day["data_quality_details"]["discovery_coverage"]
-            ["eligible_identity_occurrence_count"],
+            legacy_two_day["eligible_identity_occurrence_count"],
             4,
         )
 

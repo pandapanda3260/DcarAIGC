@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import sqlite3
 import re
+import json
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from v8.metric_observations import MetricObservationError, persist_metric_observation
@@ -37,6 +39,40 @@ class MetricObservationsTest(unittest.TestCase):
                 """,
                 (CAPTURED_AT,),
             )
+            for captured in (CAPTURED_AT, "2026-08-11T02:00:00Z"):
+                slot = connection.execute(
+                    """
+                    INSERT INTO fetch_slots(
+                        content_id,stage,window_key,provider,adapter_version,
+                        status,attempt_count,created_at,updated_at
+                    ) VALUES (1,'metrics',?,'TikHub','fixture-v1',
+                              'succeeded',1,?,?)
+                    """,
+                    (f"fixture:{captured}", captured, captured),
+                )
+                attempt = connection.execute(
+                    """
+                    INSERT INTO fetch_attempts(
+                        slot_id,attempt_number,request_started_at,
+                        response_finished_at,http_status,billed
+                    ) VALUES (?,1,?,?,200,0)
+                    """,
+                    (int(slot.lastrowid), captured, captured),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO provider_raw_responses(
+                        fetch_attempt_id,content_id,provider,operation,local_path,
+                        sha256,byte_size,captured_at
+                    ) VALUES (?,1,'TikHub','douyin_video_statistics',?, ?,1,?)
+                    """,
+                    (
+                        int(attempt.lastrowid),
+                        f"/fixture/{captured}.json",
+                        "a" * 64,
+                        captured,
+                    ),
+                )
             connection.commit()
 
     def tearDown(self) -> None:
@@ -65,11 +101,16 @@ class MetricObservationsTest(unittest.TestCase):
             collect_count=3,
             status=status,
             source="douyin",
-            raw_response_id=None,
+            raw_response_id=int(connection.execute(
+                "SELECT id FROM provider_raw_responses WHERE captured_at=?", (captured_at,)
+            ).fetchone()[0]),
             metadata_json=metadata_json,
             snapshot_mode=snapshot_mode,  # type: ignore[arg-type]
             observation_origin=observation_origin,  # type: ignore[arg-type]
-            recorded_at="2026-08-11T01:00:00Z",
+            recorded_at=(
+                datetime.fromisoformat(captured_at.replace("Z", "+00:00"))
+                + timedelta(hours=1)
+            ).isoformat().replace("+00:00", "Z"),
         )
 
     def test_requires_an_existing_caller_transaction(self) -> None:
@@ -149,13 +190,21 @@ class MetricObservationsTest(unittest.TestCase):
     def test_system_correction_replaces_projection_and_preserves_both_facts(self) -> None:
         with connect(self.database) as connection:
             with transaction(connection):
-                self._persist(connection, view_count=0)
+                original = self._persist(connection, view_count=0)
             with transaction(connection):
                 self._persist(
                     connection,
                     view_count=None,
                     status="missing",
-                    metadata_json='{"repair_reason":"invalid_discovery_exposure"}',
+                    metadata_json=json.dumps({
+                        "repair_reason": "invalid_discovery_exposure",
+                        "correction": {
+                            "target_observation_id": original.observation_id,
+                            "rule_id": "invalid-discovery-exposure-v1",
+                            "action": "invalidate",
+                            "fields": ["view_count"],
+                        },
+                    }),
                     snapshot_mode="replace",
                     observation_origin="system_correction",
                 )

@@ -1,0 +1,36 @@
+--- 8ae11f9/_account_search
++++ current/_account_search
+@@ -58,33 +58,11 @@
+         items: List[Dict[str, Any]] = []
+         for row in account_rows:
+             items.append(account_read_model(connection, row, roster=roster))
+-        legacy_unassociated = int(
+-            connection.execute(
+-                "SELECT COUNT(*) FROM content_items WHERE account_id IS NULL"
+-            ).fetchone()[0]
+-        )
+-        pending_identities = connection.execute(
+-            """
+-            SELECT platform, uid, nickname, content_count,
+-                   first_published_at, last_published_at
+-            FROM pending_platform_identities
+-            ORDER BY content_count DESC, platform, uid
+-            LIMIT 100
+-            """
+-        ).fetchall()
+-        pending_identity_count = int(
+-            connection.execute(
+-                "SELECT COUNT(*) FROM pending_platform_identities"
+-            ).fetchone()[0]
+-        )
+     return {
+         "items": items,
+         "total": total,
+         "page": payload.page,
+         "page_size": payload.page_size,
+-        "legacy_unassociated_content_count": legacy_unassociated,
+-        "pending_platform_identity_count": pending_identity_count,
+-        "pending_platform_identities": [dict(row) for row in pending_identities],
+         "archive_total": archive_total,
+         "roster": roster,
+     }

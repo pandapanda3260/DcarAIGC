@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Atomically restore the receipt-bound v15 backup over a frozen v16 database.
+"""Atomically restore a receipt-bound backup under its original schema contract.
 
 This is the reverse cutover companion to ``migrate_v8_schema.py`` and
 ``install_writer_database_candidate.py``.  It never mutates the verified v15
-backup.  The current v16 database and its sidecars are moved into a dedicated
+backup. Schema 18 additionally requires proof it is unchanged since installation.
+The current database and its sidecars are moved into a dedicated
 rollback directory, and every failed durable transition restores those exact
-v16 files before the command returns an error.
+files before the command returns an error.
 """
 
 from __future__ import annotations
@@ -28,12 +29,12 @@ if str(SCRIPT_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPT_ROOT))
 
 import install_writer_database_candidate as safety  # noqa: E402
+import writer_database_safety as shared_safety  # noqa: E402
 
 
-FORMAL_DATABASE = safety.FORMAL_DATABASE
-FORMAL_BACKUP_ROOT = safety.FORMAL_BACKUP_ROOT
 CANONICAL_OPERATOR_FREEZE_LOCK = safety.CANONICAL_OPERATOR_FREEZE_LOCK
-RESTORE_RECEIPT_SCHEMA = "dcar-writer-database-v15-restore-v1"
+RESTORE_RECEIPT_SCHEMA = shared_safety.LEGACY_V15_V16.restore_receipt_schema
+_contract = shared_safety.current_contract
 RESTORE_CHECKPOINTS = (
     "after_preflight",
     "after_rollback_directory_created",
@@ -46,12 +47,20 @@ RESTORE_CHECKPOINTS = (
     "after_post_restore_verification",
     "after_restore_receipt_written",
 )
+MATRIX_RESTORE_CHECKPOINTS = tuple(
+    value.replace("v16", "v18").replace("v15", "v17")
+    for value in RESTORE_CHECKPOINTS
+)
 
 
 def _checkpoint(
     name: str,
     fault_injector: Callable[[str], None] | None,
 ) -> None:
+    if _contract() != shared_safety.LEGACY_V15_V16:
+        name = name.replace(
+            "v16", f"v{_contract().candidate.version}"
+        ).replace("v15", f"v{_contract().source.version}")
     if fault_injector is not None:
         fault_injector(name)
 
@@ -97,18 +106,18 @@ def _validate_v16(path: Path) -> dict[str, Any]:
         foreign_keys = list(connection.execute("PRAGMA foreign_key_check"))
         version = safety.require_schema_compatibility(
             connection,
-            supported_versions=frozenset({safety.EXPECTED_CANDIDATE_SCHEMA_VERSION}),
+            supported_versions=frozenset({_contract().candidate.version}),
         )
         migrations = safety._schema_migration_rows(connection)
         if (
             quick != ["ok"]
             or integrity != ["ok"]
             or foreign_keys
-            or version != safety.EXPECTED_CANDIDATE_SCHEMA_VERSION
+            or version != _contract().candidate.version
             or not migrations
             or migrations[-1][:2] != (
-                safety.EXPECTED_CANDIDATE_SCHEMA_VERSION,
-                safety.EXPECTED_CANDIDATE_MIGRATION,
+                _contract().candidate.version,
+                _contract().candidate.migration,
             )
         ):
             raise safety.CandidateInstallError(
@@ -119,7 +128,7 @@ def _validate_v16(path: Path) -> dict[str, Any]:
             "integrity_check": "ok",
             "foreign_key_violation_count": 0,
             "schema_version": version,
-            "schema_migration": safety.EXPECTED_CANDIDATE_MIGRATION,
+            "schema_migration": _contract().candidate.migration,
         }
     except (sqlite3.Error, RuntimeError) as error:
         if isinstance(error, safety.CandidateInstallError):
@@ -169,9 +178,16 @@ def _load_backup_contract(
             "migration_lock_file",
         }
     )
+    if _contract() != shared_safety.LEGACY_V15_V16:
+        fields |= {"code_identity"}
+        shared_safety.require_code_identity(value.get("code_identity"), safety.PROJECT_ROOT)
     safety._require_exact_keys(value, fields, label="backup receipt")
-    if value["schema_version"] != safety.BACKUP_RECEIPT_SCHEMA:
-        raise safety.CandidateInstallError("backup receipt schema is unsupported")
+    try:
+        contract = shared_safety.contract_for_receipt(
+            value["schema_version"], kind="backup",
+        )
+    except shared_safety.OfflineContractError as error:
+        raise safety.CandidateInstallError(str(error)) from error
     safety._require_same_resolved_path(
         value["source_path"],
         formal_database,
@@ -185,8 +201,8 @@ def _load_backup_contract(
         label="backup receipt source SHA-256",
     )
     expected_scalars = {
-        "source_schema_version": safety.EXPECTED_SOURCE_SCHEMA_VERSION,
-        "source_schema_migration": safety.EXPECTED_SOURCE_MIGRATION,
+        "source_schema_version": contract.source.version,
+        "source_schema_migration": contract.source.migration,
         "restore_verified": True,
         "quick_check": "ok",
         "integrity_check": "ok",
@@ -225,7 +241,7 @@ def _load_backup_contract(
         label="backup receipt migration lock file",
     )
     backup_validation = safety._validate_source_database(backup)
-    if backup_validation["schema_version"] != safety.EXPECTED_SOURCE_SCHEMA_VERSION:
+    if backup_validation["schema_version"] != _contract().source.version:
         raise safety.CandidateInstallError("verified backup is not exact v15")
     return value, backup.resolve(strict=True), migration_lock.resolve(strict=True)
 
@@ -337,6 +353,54 @@ def _assert_archived_v16_exact(
             )
 
 
+def _require_unwritten_install(
+    *,
+    install_receipt: Path | None,
+    expected_sha256: str | None,
+    formal_database: Path,
+    formal_sha256: str,
+    backup_value: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    if _contract() == shared_safety.LEGACY_V15_V16:
+        return None
+    if install_receipt is None or expected_sha256 is None:
+        raise safety.CandidateInstallError(
+            "v18 restore requires the exact successful install receipt and its SHA-256"
+        )
+    safety._require_sha256(expected_sha256, label="install receipt SHA-256")
+    safety._require_project_external(install_receipt, label="install receipt")
+    value = safety._read_json_object(
+        install_receipt, label="install receipt", maximum_bytes=8 * 1024 * 1024,
+    )
+    if safety._sha256_file(install_receipt) != expected_sha256:
+        raise safety.CandidateInstallError("install receipt SHA-256 differs")
+    if (
+        value.get("schema_version") != _contract().install_receipt_schema
+        or value.get("status") != "installed"
+    ):
+        raise safety.CandidateInstallError("restore requires a successful v18 install receipt")
+    safety._require_same_resolved_path(
+        value.get("formal_database"), formal_database, label="install receipt formal database",
+    )
+    installed = safety._require_mapping(value.get("installed"), label="installed")
+    installed_file = safety._require_mapping(installed.get("file"), label="installed.file")
+    original = safety._require_mapping(value.get("before"), label="before")
+    original_file = safety._require_mapping(original.get("database"), label="before.database")
+    migration = safety._require_mapping(value.get("migration_receipt"), label="migration_receipt")
+    if (
+        installed_file.get("sha256") != formal_sha256
+        or original_file.get("sha256") != backup_value["source_sha256"]
+        or migration.get("verified_backup_sha256") != backup_value["backup_sha256"]
+    ):
+        raise safety.CandidateInstallError(
+            "v18 database changed after install or backup differs; automatic v17 restore is forbidden"
+        )
+    shared_safety.require_code_identity(value.get("code_identity"), safety.PROJECT_ROOT)
+    return {"path": str(install_receipt), "sha256": expected_sha256}
+
+
+@safety.bind_formal_mutation
+@shared_safety.bind_operation_contract("restore", error_type=safety.CandidateInstallError)
 def restore_verified_backup(
     *,
     formal_database: Path,
@@ -346,6 +410,8 @@ def restore_verified_backup(
     rollback_directory: Path,
     receipt: Path,
     freeze_lock: Path,
+    install_receipt: Path | None = None,
+    expected_install_receipt_sha256: str | None = None,
     holder_checker: Callable[[Sequence[Path]], list[dict[str, Any]]] | None = None,
     fault_injector: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
@@ -364,23 +430,6 @@ def restore_verified_backup(
         expected_backup_receipt_sha256,
         label="expected backup receipt SHA-256",
     )
-    if (
-        os.environ.get("DCAR_TEST_DENY_FORMAL_DB") == "1"
-        and safety.is_formal_database_path(
-            formal_database,
-            formal_database=safety.DEFAULT_DB,
-        )
-    ):
-        raise safety.CandidateInstallError(
-            "test process attempted to open the formal DCar database"
-        )
-    if not safety.is_formal_database_path(
-        formal_database,
-        formal_database=FORMAL_DATABASE,
-    ):
-        raise safety.CandidateInstallError(
-            f"formal restore target must be exactly {FORMAL_DATABASE}"
-        )
     formal_identity = safety._require_regular_single_link(
         formal_database,
         label="formal v16 database",
@@ -407,13 +456,20 @@ def restore_verified_backup(
         expected_receipt_sha256=expected_backup_receipt_sha256,
         formal_database=formal_database,
     )
+    install_binding = _require_unwritten_install(
+        install_receipt=install_receipt,
+        expected_sha256=expected_install_receipt_sha256,
+        formal_database=formal_database,
+        formal_sha256=expected_formal_v16_sha256,
+        backup_value=backup_value,
+    )
     backup_identity = safety._stat_identity(backup)
     backup_sha256 = safety._sha256_file(backup)
     backup_receipt_identity = safety._stat_identity(backup_receipt)
     backup_receipt_sha256 = safety._sha256_file(backup_receipt)
 
     rollback_root = safety._require_directory(
-        FORMAL_BACKUP_ROOT,
+        formal_database.parent / "backups",
         label="formal rollback root",
     )
     if safety._path_exists(rollback_directory):
@@ -525,6 +581,13 @@ def restore_verified_backup(
                 raise safety.CandidateInstallError(
                     "database handles appeared before restore cutover"
                 )
+            _require_unwritten_install(
+                install_receipt=install_receipt,
+                expected_sha256=expected_install_receipt_sha256,
+                formal_database=formal_database,
+                formal_sha256=safety._sha256_file(formal_database),
+                backup_value=backup_value,
+            )
             rollback_directory.mkdir(mode=0o700)
             safety._fsync_directory(rollback_root)
             _checkpoint("after_rollback_directory_created", fault_injector)
@@ -606,8 +669,8 @@ def restore_verified_backup(
             _checkpoint("after_post_restore_verification", fault_injector)
 
             result: dict[str, Any] = {
-                "schema_version": RESTORE_RECEIPT_SCHEMA,
-                "status": "restored_v15",
+                "schema_version": _contract().restore_receipt_schema,
+                "status": f"restored_v{_contract().source.version}",
                 "completed_at": safety._utc_now(),
                 "before": {
                     "database": formal_fingerprint,
@@ -631,7 +694,7 @@ def restore_verified_backup(
                     "validation": restored_validation,
                     "lineage": restored_lineage,
                 },
-                "archived_v16": {
+                f"archived_v{_contract().candidate.version}": {
                     "path": str(archived_v16),
                     "file": safety._fingerprint(archived_v16),
                     "sidecars": {
@@ -653,6 +716,11 @@ def restore_verified_backup(
                 "rollback": "not_required",
                 "receipt": str(receipt),
             }
+
+            if _contract() != shared_safety.LEGACY_V15_V16:
+                shared_safety.require_code_identity(backup_value["code_identity"], safety.PROJECT_ROOT)
+                result["code_identity"] = backup_value["code_identity"]
+                result["unwritten_install_receipt"] = install_binding
 
             def receipt_created(identity: safety.FileIdentity) -> None:
                 nonlocal receipt_identity
@@ -814,18 +882,29 @@ def restore_verified_backup(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--formal-db", type=Path, required=True)
-    parser.add_argument("--expected-formal-v16-sha256", required=True)
+    parser.add_argument(
+        "--expected-formal-sha256", "--expected-formal-v16-sha256",
+        dest="expected_formal_v16_sha256", required=True,
+    )
     parser.add_argument("--backup-receipt", type=Path, required=True)
     parser.add_argument("--expected-backup-receipt-sha256", required=True)
     parser.add_argument("--rollback-dir", type=Path, required=True)
     parser.add_argument("--receipt", type=Path, required=True)
     parser.add_argument("--freeze-lock", type=Path, required=True)
+    parser.add_argument("--install-receipt", type=Path)
+    parser.add_argument("--expected-install-receipt-sha256")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
     try:
+        install_arguments: dict[str, Any] = {}
+        if arguments.install_receipt is not None or arguments.expected_install_receipt_sha256 is not None:
+            install_arguments = {
+                "install_receipt": arguments.install_receipt,
+                "expected_install_receipt_sha256": arguments.expected_install_receipt_sha256,
+            }
         result = restore_verified_backup(
             formal_database=arguments.formal_db,
             expected_formal_v16_sha256=arguments.expected_formal_v16_sha256,
@@ -836,9 +915,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             rollback_directory=arguments.rollback_dir,
             receipt=arguments.receipt,
             freeze_lock=arguments.freeze_lock,
+            **install_arguments,
         )
     except safety.CandidateInstallError as error:
-        print(f"writer v15 restore refused: {error}", file=sys.stderr)
+        print(f"writer database restore refused: {error}", file=sys.stderr)
         return 1
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0

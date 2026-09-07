@@ -257,7 +257,7 @@ def transcribe(note_id: str) -> dict[str, Any]:
     manifest = read_json(MEDIA_ROOT / note_id / "manifest.json", {}) or {}
     video = Path(str(manifest.get("video_path") or ""))
     if not valid_video(video):
-        result = {"note_id": note_id, "status": "not_video", "text": "", "segments": []}
+        result: dict[str, Any] = {"note_id": note_id, "status": "not_video", "text": "", "segments": []}
         atomic_json(target, result)
         return result
     import mlx_whisper  # type: ignore

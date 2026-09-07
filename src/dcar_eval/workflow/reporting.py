@@ -622,7 +622,7 @@ def build_report_revision(
         "douyin": _channel(rows, "douyin"),
         "xiaohongshu": _channel(rows, "xiaohongshu"),
     }
-    report = {
+    report: dict[str, Any] = {
         "report_version": CURRENT_REPORT_VERSION,
         "rule_version": CURRENT_RULE_VERSION,
         "metadata": {

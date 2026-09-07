@@ -4,10 +4,11 @@ import Link from "next/link";
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import AppShell from "../../components/AppShell";
+import AccountPageAccess from "../../components/AccountPageAccess";
 import { Feedback, Loading, Notice } from "../../components/Feedback";
 import { markedJsonRequest, readJson } from "../../lib/api";
 import { buildAccountSearchRequest } from "../../lib/queryContracts";
-import { accountSearchQueryOptions, douyinAuthorizationsQueryOptions, douyinAuthorizationStatusesQueryOptions, queryKeys } from "../../lib/queries";
+import { accountSearchQueryOptions, douyinAuthorizationsQueryOptions, douyinAuthorizationStatusesQueryOptions, queryKeys, sessionQueryOptions } from "../../lib/queries";
 import type { Account, DouyinAuthorization } from "../../lib/types";
 
 const CALLBACK_CHANNEL = "dcar-douyin-authorization";
@@ -35,6 +36,10 @@ function douyinIdentity(account: Account | undefined, uid: string) {
 }
 
 export default function DouyinAuthorizationPage() {
+  return <AccountPageAccess><DouyinAuthorizationWorkspace /></AccountPageAccess>;
+}
+
+function DouyinAuthorizationWorkspace() {
   const queryClient = useQueryClient();
   const locationSearch = useSyncExternalStore(subscribeToLocation, readLocationSearch, () => "");
   const params = new URLSearchParams(locationSearch);
@@ -46,7 +51,7 @@ export default function DouyinAuthorizationPage() {
   const targetIsValid = Number.isSafeInteger(accountId) && accountId > 0 && /^\d{6,24}$/.test(platformUid);
   const targetRequest = buildAccountSearchRequest({ query: platformUid, accountType: "", direction: "", platform: "douyin" }, 1, 100);
 
-  const sessionQuery = useQuery({ queryKey: ["auth", "session"], queryFn: () => readJson<{ authenticated: true; username: string }>("/auth/session"), staleTime: 60_000 });
+  const sessionQuery = useQuery(sessionQueryOptions());
   const isBypassMode = sessionQuery.data?.username === "temporary-bypass";
   const canUseControl = sessionQuery.isSuccess && !isBypassMode;
   const authorizationsQuery = useQuery({ ...douyinAuthorizationsQueryOptions(), enabled: canUseControl });
@@ -127,11 +132,13 @@ export default function DouyinAuthorizationPage() {
   }
   const productionUrl = targetIsValid ? `${PRODUCTION_AUTHORIZATION_URL}?account_id=${encodeURIComponent(String(accountId))}&platform_uid=${encodeURIComponent(platformUid)}` : PRODUCTION_AUTHORIZATION_URL;
 
-  return <AppShell active="accounts">
+  return <AppShell active="accounts" header={<header className="detail-page-header">
+    <h1 className="visually-hidden">抖音开放平台授权</h1>
+    <div className="detail-toolbar"><div><span className="eyebrow">账号管理 · 抖音开放平台</span><h2>抖音开放平台授权</h2><p>{targetIsValid ? "本次扫码只会绑定到当前锁定的业务账号。" : "查看已有授权；发起新授权请从账号列表对应行进入。"}</p></div><div><Link className="secondary button-link" href="/accounts">返回账号页</Link></div></div>
+  </header>}>
     <Feedback error={error} message={message} onClose={() => { setError(""); setMessage(""); }} />
     {callbackNotice && <Notice tone={callbackNotice.tone}>{callbackNotice.text}</Notice>}
     <section className="page-stack wide-stack douyin-authorization-page">
-      <div className="detail-toolbar"><div><span className="eyebrow">账号管理 · 抖音开放平台</span><h2>抖音开放平台授权</h2><p>{targetIsValid ? "本次扫码只会绑定到当前锁定的业务账号。" : "查看已有授权；发起新授权请从账号列表对应行进入。"}</p></div><div><Link className="secondary button-link" href="/accounts">返回账号页</Link></div></div>
       {authorizationReadPending ? <Loading label="正在确认抖音授权入口" /> : isBypassMode ? <article className="panel douyin-authorization-start"><div><span className="eyebrow">正式授权入口</span><h3>请在正式 HTTPS 工作台完成扫码</h3><p>当前本地工作台处于免登录模式，本地入口不会发起或管理抖音授权。</p></div><a className="primary button-link" href={productionUrl}>打开正式授权入口</a></article> : <>
         {queryError && <Notice tone="error">{queryError}</Notice>}
         {targetWasRequested && !targetIsValid && <Notice tone="error">授权目标参数无效，请返回账号页重新进入。</Notice>}

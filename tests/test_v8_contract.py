@@ -15,14 +15,26 @@ from v8.contracts import (
     LEGACY_CONTRACT_PATHS,
     REPORT_RULE_VERSIONS,
     V8ContractViolation,
-    expected_terminal_task_status,
+    expected_terminal_task_status as current_terminal_task_status,
     load_contract,
-    quality_gate_failures,
+    quality_gate_failures as current_quality_gate_failures,
     quantity_metric,
     ratio_metric,
     score_metric,
     validate_report,
 )
+
+
+# Keep every historical boundary assertion on its frozen v8.7 contract. The
+# Current v8.9 freeze/lineage gates are exercised in test_v8_report_inputs.
+def expected_terminal_task_status(*args, **kwargs):
+    kwargs.setdefault("contract", load_contract(report_version="dcar-content-operations-report-v8.7"))
+    return current_terminal_task_status(*args, **kwargs)
+
+
+def quality_gate_failures(*args, **kwargs):
+    kwargs.setdefault("contract", load_contract(report_version="dcar-content-operations-report-v8.7"))
+    return current_quality_gate_failures(*args, **kwargs)
 
 
 def _audience_quality() -> dict:
@@ -101,7 +113,7 @@ def _channel_conclusions() -> dict:
 def valid_report() -> dict:
     publications = 10
     return {
-        "report_version": CURRENT_REPORT_VERSION,
+        "report_version": "dcar-content-operations-report-v8.7",
         "rule_version": CURRENT_REPORT_RULE_VERSION,
         "taxonomy_version": "selling-points-v5.1",
         "evidence_version": CURRENT_REPORT_EVIDENCE_VERSION,
@@ -217,7 +229,7 @@ class V8ContractTest(unittest.TestCase):
         project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
         deployed_version = project["tool"]["dcar"]["report-version"]
         self.assertEqual(deployed_version, CURRENT_REPORT_VERSION)
-        self.assertEqual(CONTRACT_PATH.name, "report_contract_v8_7.json")
+        self.assertEqual(CONTRACT_PATH.name, "report_contract_v8_9.json")
         live_contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
         self.assertEqual(live_contract["report_version"], CURRENT_REPORT_VERSION)
         self.assertEqual(live_contract["rule_version"], CURRENT_REPORT_RULE_VERSION)
@@ -494,6 +506,55 @@ class V8ContractTest(unittest.TestCase):
             },
         )
         validate_report(valid_report())
+
+    def test_terminal_accounted_partial_publishable_report_is_valid_but_partial(self) -> None:
+        report = valid_report()
+        report["data_quality"]["discovery_coverage"] = 99.0
+        report["data_quality_details"]["discovery_coverage"] = {
+            "status": "available",
+            "covered_identity_occurrence_count": 99,
+            "eligible_identity_occurrence_count": 100,
+            "succeeded_identity_occurrence_count": 99,
+            "blocked_identity_occurrence_count": 1,
+            "not_applicable_identity_occurrence_count": 0,
+            "accounted_identity_occurrence_count": 100,
+            "required_identity_occurrence_count": 100,
+            "accounted_percentage": 100.0,
+            "observed_occurrence_count": 1,
+            "expected_occurrence_count": 1,
+            "percentage": 99.0,
+            "eligible_basis": "scheduled_daily_capture_identity_occurrences",
+            "complete": False,
+            "partial_publishable": True,
+            "reason": "全部义务已终态且满足部分发布门槛",
+        }
+        report["data_quality_details"]["pipeline_observation"] = {
+            "status": "partial_publishable",
+            "capture_observation_start_date": "2026-08-21",
+            "expected_dates": ["2026-08-21"],
+            "legacy_unobserved_dates": [],
+            "pipeline_gap_dates": ["2026-08-21"],
+            "zero_content_dates": [],
+        }
+        report["task"]["task_status"] = "partial"
+
+        validate_report(report)
+        self.assertEqual(
+            expected_terminal_task_status(
+                report["data_quality"],
+                data_quality_details=report["data_quality_details"],
+            ),
+            "partial",
+        )
+
+        forged = copy.deepcopy(report)
+        forged["data_quality_details"]["discovery_coverage"][
+            "accounted_identity_occurrence_count"
+        ] = 99
+        with self.assertRaisesRegex(
+            V8ContractViolation, "accounted occurrence counts are not conserved"
+        ):
+            validate_report(forged)
 
     def test_structured_discovery_controls_task_status_at_ninety_percent(self) -> None:
         report = valid_report()

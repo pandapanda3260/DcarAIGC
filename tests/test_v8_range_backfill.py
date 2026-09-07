@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+from tests.metric_fixture import provider_metric
+from tests.roster_fixture import accept_roster
+
 import contextlib
 import inspect
 import io
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
+from contextvars import Context
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -14,8 +19,10 @@ from zoneinfo import ZoneInfo
 
 import v8.capture as capture_module
 import v8.range_backfill as range_module
+import v8.storage as storage_module
 from v8.capture import CaptureError, ProviderResult
-from v8.operations import upsert_account, upsert_content
+from v8.operations import upsert_account as _upsert_account, upsert_content
+from v8.providers import _parse_xhs_discovery_payload
 from v8.range_backfill import (
     RangeBackfillError,
     _iso,
@@ -32,6 +39,16 @@ from v8.storage import connect, initialize_database
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def upsert_account(payload, *, db_path):
+    # Existing backfill tests exercise approved members, not unaccepted local
+    # accounts. Supply the real new prerequisite; budget tests cover rejection.
+    result = _upsert_account(payload, db_path=db_path)
+    with connect(db_path) as connection:
+        accept_roster(connection, accepted_at="2026-07-01T00:00:00Z")
+        connection.commit()
+    return result
 
 
 class V8RangeBackfillTest(unittest.TestCase):
@@ -53,6 +70,43 @@ class V8RangeBackfillTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    @contextlib.contextmanager
+    def _ordinary_processors(
+        self, *, discovery: bool = False, content: bool = False
+    ):
+        """Run the real processor as ordinary fixture capture, outside history.
+
+        Range orchestration still enters its production ``history`` scope.  The
+        injected processor gets a fresh Context so pagination/content tests can
+        exercise the real capture path without pretending that repair=0 permits
+        an unapproved historical purchase.
+        """
+
+        with contextlib.ExitStack() as stack:
+            if discovery:
+                original = range_module.discover_account_content
+                stack.enter_context(
+                    patch.object(
+                        range_module,
+                        "discover_account_content",
+                        side_effect=lambda *args, **kwargs: Context().run(
+                            original, *args, **kwargs
+                        ),
+                    )
+                )
+            if content:
+                original_update = range_module.update_content_data
+                stack.enter_context(
+                    patch.object(
+                        range_module,
+                        "update_content_data",
+                        side_effect=lambda *args, **kwargs: Context().run(
+                            original_update, *args, **kwargs
+                        ),
+                    )
+                )
+            yield
 
     def test_discovery_filters_range_pages_and_replays_without_new_cost(self) -> None:
         account = upsert_account(
@@ -110,11 +164,12 @@ class V8RangeBackfillTest(unittest.TestCase):
             }
             return ProviderResult(normalized, raw, 200, True)
 
-        first = run_discovery_backfill(
-            start=self.start, end=self.end, task_id=self.task_id,
-            max_amount=0.10, db_path=self.db, platforms=["xiaohongshu"],
-            call_override=discovery_call, state_root=self.state, as_of=self.end,
-        )
+        with self._ordinary_processors(discovery=True):
+            first = run_discovery_backfill(
+                start=self.start, end=self.end, task_id=self.task_id,
+                max_amount=0.10, db_path=self.db, platforms=["xiaohongshu"],
+                call_override=discovery_call, state_root=self.state, as_of=self.end,
+            )
         self.assertEqual(first["status"], "succeeded")
         self.assertEqual(first["pages_processed"], 2)
         self.assertEqual(first["inserted"], 2)
@@ -130,11 +185,12 @@ class V8RangeBackfillTest(unittest.TestCase):
         def no_provider_call(operation, identity):
             raise AssertionError(f"unexpected provider call: {operation}")
 
-        second = run_discovery_backfill(
-            start=self.start, end=self.end, task_id=self.task_id,
-            max_amount=0.10, db_path=self.db, platforms=["xiaohongshu"],
-            call_override=no_provider_call, state_root=self.state, as_of=self.end,
-        )
+        with self._ordinary_processors(discovery=True):
+            second = run_discovery_backfill(
+                start=self.start, end=self.end, task_id=self.task_id,
+                max_amount=0.10, db_path=self.db, platforms=["xiaohongshu"],
+                call_override=no_provider_call, state_root=self.state, as_of=self.end,
+            )
         self.assertEqual(second["status"], "succeeded")
         self.assertEqual(second["inserted"], 0)
         self.assertEqual(second["usage"]["amount"], 0.02)
@@ -143,6 +199,160 @@ class V8RangeBackfillTest(unittest.TestCase):
             for result in second["results"] for page_result in result["pages"]
         ))
         self.assertEqual(int(account["id"]), second["results"][0]["account_id"])
+
+    def _run_august_discovery_pages(
+        self, pages: list[list[dict]]
+    ) -> tuple[dict, list[str | None], set[str]]:
+        uid = "67f6657f000000000e02c214"
+        upsert_account(
+            {
+                "phone": "13800138014",
+                "platforms": [{
+                    "platform": "xiaohongshu", "uid": uid,
+                    "nickname": "分页边界测试号",
+                }],
+            },
+            db_path=self.db,
+        )
+        start = datetime(2026, 8, 17, tzinfo=SHANGHAI)
+        end = datetime(2026, 8, 27, 23, 59, 59, tzinfo=SHANGHAI)
+        calls: list[str | None] = []
+        pages_by_cursor = {
+            None if index == 0 else f"page-{index + 1}": (index, page)
+            for index, page in enumerate(pages)
+        }
+
+        def discovery_call(operation, identity):
+            self.assertEqual(operation, "discover_content")
+            cursor = identity.get("cursor")
+            calls.append(cursor)
+            self.assertIn(cursor, pages_by_cursor)
+            index, page = pages_by_cursor[cursor]
+            has_more = index + 1 < len(pages)
+            notes = [
+                {
+                    "title": f"边界笔记-{item['id']}",
+                    "desc": "分页边界测试内容",
+                    "type": "normal",
+                    "user": {"userid": uid},
+                    **item,
+                }
+                for item in page
+            ]
+            raw = {
+                "code": 200,
+                "data": {
+                    "success": True,
+                    "code": 0,
+                    "data": {
+                        "notes": notes,
+                        "cursor": f"page-{index + 2}" if has_more else "",
+                        "has_more": has_more,
+                    },
+                },
+            }
+            return ProviderResult(_parse_xhs_discovery_payload(raw), raw, 200, True)
+
+        with patch(
+            "v8.providers._request_json",
+            side_effect=AssertionError("boundary tests must not make network requests"),
+        ) as request_json:
+            with self._ordinary_processors(discovery=True):
+                result = run_discovery_backfill(
+                    start=start,
+                    end=end,
+                    as_of=datetime(2026, 8, 29, 10, tzinfo=SHANGHAI),
+                    task_id=task_id_for(start, end),
+                    max_amount=0.10,
+                    db_path=self.db,
+                    platforms=["xiaohongshu"],
+                    call_override=discovery_call,
+                    state_root=self.state,
+                )
+        request_json.assert_not_called()
+        with connect(self.db) as connection:
+            stored_ids = {
+                str(row["platform_content_id"])
+                for row in connection.execute(
+                    "SELECT platform_content_id FROM content_items"
+                )
+            }
+        return result, calls, stored_ids
+
+    def test_discovery_pinned_old_and_post_range_new_items_do_not_stop_early(self) -> None:
+        result, calls, stored_ids = self._run_august_discovery_pages([
+            [
+                {"id": "a" * 24, "time": "2026-08-16T23:59:59+08:00", "is_top": True},
+                {"id": "b" * 24, "time": "2026-08-29T00:00:00+08:00"},
+            ],
+            [{"id": "c" * 24, "time": "2026-08-27T20:00:00+08:00"}],
+        ])
+        self.assertEqual(calls, [None, "page-2"])
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["pages_processed"], 2)
+        self.assertEqual(result["inserted"], 1)
+        self.assertEqual(stored_ids, {"c" * 24})
+        account = result["results"][0]
+        self.assertEqual(account["pages"][0]["persisted_item_count"], 0)
+        self.assertEqual(account["completion_reason"], "provider_exhausted")
+
+    def test_discovery_stops_when_complete_page_is_strictly_before_start(self) -> None:
+        result, calls, stored_ids = self._run_august_discovery_pages([
+            [{"id": "a" * 24, "time": "2026-08-20T12:00:00+08:00"}],
+            [
+                {"id": "b" * 24, "time": "2026-08-16T23:59:59+08:00"},
+                {"id": "c" * 24, "time": "2026-08-15T12:00:00+08:00"},
+            ],
+            [{"id": "d" * 24, "time": "2026-08-14T12:00:00+08:00"}],
+        ])
+        self.assertEqual(calls, [None, "page-2"])
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["pages_processed"], 2)
+        self.assertEqual(stored_ids, {"a" * 24})
+        account = result["results"][0]
+        self.assertTrue(account["completed"])
+        self.assertEqual(account["completion_reason"], "range_start_reached")
+        self.assertTrue(account["pages"][-1]["has_more"])
+        self.assertEqual(account["pages"][-1]["page_item_count"], 2)
+
+    def test_discovery_start_boundary_items_continue_to_next_page(self) -> None:
+        result, calls, stored_ids = self._run_august_discovery_pages([
+            [{"id": "a" * 24, "time": "2026-08-17T00:00:00+08:00"}],
+            [{"id": "b" * 24, "time": "2026-08-17T00:00:00+08:00"}],
+            [{"id": "c" * 24, "time": "2026-08-16T23:59:59+08:00"}],
+            [{"id": "d" * 24, "time": "2026-08-15T12:00:00+08:00"}],
+        ])
+        self.assertEqual(calls, [None, "page-2", "page-3"])
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["inserted"], 2)
+        self.assertEqual(stored_ids, {"a" * 24, "b" * 24})
+        self.assertEqual(
+            result["results"][0]["completion_reason"], "range_start_reached"
+        )
+
+    def test_discovery_missing_publication_date_does_not_stop_early(self) -> None:
+        result, calls, stored_ids = self._run_august_discovery_pages([
+            [
+                {"id": "a" * 24, "time": "2026-08-16T23:59:59+08:00"},
+                {"id": "b" * 24},
+            ],
+            [{"id": "c" * 24, "time": "2026-08-18T12:00:00+08:00"}],
+        ])
+        self.assertEqual(calls, [None, "page-2"])
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["failed_pages"], 1)
+        self.assertEqual(result["inserted"], 1)
+        self.assertEqual(stored_ids, {"c" * 24})
+        account = result["results"][0]
+        self.assertEqual(account["completion_reason"], "provider_exhausted")
+        first_page = account["pages"][0]
+        self.assertEqual(first_page["page_item_count"], 2)
+        self.assertEqual(len(first_page["page_published_at"]), 1)
+        self.assertEqual(first_page["missing_published_at_count"], 1)
+        self.assertEqual(
+            first_page["derived_stages"]["failures"][0]["error_code"],
+            "missing_published_at",
+        )
 
     def test_discovery_reports_partial_when_an_account_page_fails(self) -> None:
         upsert_account(
@@ -165,20 +375,82 @@ class V8RangeBackfillTest(unittest.TestCase):
                 billed=False,
             )
 
-        result = run_discovery_backfill(
-            start=self.start,
-            end=self.end,
-            task_id=self.task_id,
-            max_amount=0.10,
-            db_path=self.db,
-            platforms=["xiaohongshu"],
-            call_override=failed_call,
-            state_root=self.state,
-            as_of=self.end,
-        )
+        with self._ordinary_processors(discovery=True):
+            result = run_discovery_backfill(
+                start=self.start,
+                end=self.end,
+                task_id=self.task_id,
+                max_amount=0.10,
+                db_path=self.db,
+                platforms=["xiaohongshu"],
+                call_override=failed_call,
+                state_root=self.state,
+                as_of=self.end,
+            )
         self.assertEqual(result["status"], "partial")
         self.assertEqual(result["failed_pages"], 1)
         self.assertEqual(result["results"][0]["pages"][0]["status"], "failed")
+
+    def test_discovery_resume_reuses_completed_and_holds_failed_paid_identity(self) -> None:
+        complete_uid = "67f6657f000000000e02c216"
+        retry_uid = "67f6657f000000000e02c217"
+        for uid, nickname in ((complete_uid, "完成账号"), (retry_uid, "重试账号")):
+            upsert_account(
+                {
+                    "phone": "",
+                    "platforms": [{
+                        "platform": "xiaohongshu", "uid": uid, "nickname": nickname,
+                    }],
+                },
+                db_path=self.db,
+            )
+        first_calls: list[str] = []
+
+        def first_call(operation, identity):
+            first_calls.append(str(identity["uid"]))
+            if identity["uid"] == retry_uid:
+                raise CaptureError(
+                    "retry fixture", retryable=True,
+                    error_code="provider_retry_requested", billed=False,
+                )
+            value = {"items": [], "next_cursor": "", "has_more": False}
+            return ProviderResult(value, {"data": value}, 200, True)
+
+        with self._ordinary_processors(discovery=True):
+            first = run_discovery_backfill(
+                start=self.start, end=self.end, task_id=self.task_id,
+                max_amount=0.10, db_path=self.db, platforms=["xiaohongshu"],
+                call_override=first_call, state_root=self.state, as_of=self.end,
+                resume_completed=True,
+            )
+        self.assertEqual(first["status"], "partial")
+        self.assertEqual(first["accounts_completed"], 1)
+        self.assertCountEqual(first_calls, [complete_uid, retry_uid])
+        second_calls: list[str] = []
+
+        def second_call(operation, identity):
+            second_calls.append(str(identity["uid"]))
+            value = {"items": [], "next_cursor": "", "has_more": False}
+            return ProviderResult(value, {"data": value}, 200, True)
+
+        with self._ordinary_processors(discovery=True):
+            second = run_discovery_backfill(
+                start=self.start, end=self.end, task_id=self.task_id,
+                max_amount=0.10, db_path=self.db, platforms=["xiaohongshu"],
+                call_override=second_call, state_root=self.state, as_of=self.end,
+                resume_completed=True,
+            )
+        self.assertEqual(second["status"], "blocked")
+        self.assertEqual(second["stopped_reason"], "paid_identity_hold")
+        self.assertEqual(second["accounts_reused"], 1)
+        self.assertEqual(second["accounts_processed"], 1)
+        self.assertEqual(second["accounts_completed"], 1)
+        self.assertEqual(second_calls, [])
+        self.assertEqual(
+            second["results"][1]["pages"][0]["error_code"],
+            "paid_identity_hold",
+        )
+        self.assertEqual(len(second["results"]), 2)
 
     def test_content_backfill_is_newest_first_idempotent_and_task_bounded(self) -> None:
         account = upsert_account(
@@ -232,11 +504,12 @@ class V8RangeBackfillTest(unittest.TestCase):
                 data = {"comment_count": 0, "comments": []}
             return ProviderResult(data, {"stage": stage, "data": data}, 200, True)
 
-        first = run_content_backfill(
-            start=self.start, end=self.end, task_id=self.task_id,
-            max_amount=0.10, db_path=self.db, call_override=content_call,
-            state_root=self.state, as_of=self.end,
-        )
+        with self._ordinary_processors(content=True):
+            first = run_content_backfill(
+                start=self.start, end=self.end, task_id=self.task_id,
+                max_amount=0.10, db_path=self.db, call_override=content_call,
+                state_root=self.state, as_of=self.end,
+            )
         self.assertEqual(first["status"], "succeeded")
         self.assertEqual(first["processed"], 2)
         self.assertEqual(first["usage"]["amount"], 0.006)
@@ -251,11 +524,12 @@ class V8RangeBackfillTest(unittest.TestCase):
         self.assertEqual(task_ids, {self.task_id})
         self.assertEqual(int(account["id"]), 1)
 
-        second = run_content_backfill(
-            start=self.start, end=self.end, task_id=self.task_id,
-            max_amount=0.10, db_path=self.db, call_override=content_call,
-            state_root=self.state, as_of=self.end,
-        )
+        with self._ordinary_processors(content=True):
+            second = run_content_backfill(
+                start=self.start, end=self.end, task_id=self.task_id,
+                max_amount=0.10, db_path=self.db, call_override=content_call,
+                state_root=self.state, as_of=self.end,
+            )
         self.assertEqual(second["candidates"], 0)
         self.assertEqual(second["usage"]["amount"], 0.006)
 
@@ -362,16 +636,10 @@ class V8RangeBackfillTest(unittest.TestCase):
                 """,
                 (content["id"],),
             )
-            connection.execute(
-                """
-                INSERT INTO content_metric_snapshots(
-                    content_id,captured_at,window_key,view_count,comment_count,
-                    like_count,status,source,metadata_json
-                ) VALUES (?, '2026-08-03T00:00:00Z','2026-08-03',0,3,20,
-                          'available','douyin','{}')
-                """,
-                (content["id"],),
-            )
+            provider_metric(connection, content_id=content["id"],
+                            captured_at="2026-08-03T00:00:00Z", window_key="2026-08-03",
+                            view_count=0, comment_count=3, like_count=20, share_count=None,
+                            collect_count=None, status="available", metadata_json="{}")
             connection.commit()
             slot_id = int(slot.lastrowid)
 
@@ -438,7 +706,8 @@ class V8RangeBackfillTest(unittest.TestCase):
         self.assertEqual(repaired_snapshot["status"], "missing")
         self.assertEqual(
             [tuple(row) for row in repaired_observations],
-            [("system_correction", "2026-08-03T00:00:00Z", None, "missing")],
+                [("provider_capture", "2026-08-03T00:00:00Z", 0, "available"),
+                 ("system_correction", "2026-08-03T00:00:00Z", None, "missing")],
         )
 
         calls: list[str] = []
@@ -457,18 +726,19 @@ class V8RangeBackfillTest(unittest.TestCase):
             )
 
         task_id = "placeholder-metrics-repair-test"
-        fetched = run_repaired_metrics_backfill(
-            start=self.start, end=self.end, as_of=self.end,
-            task_id=task_id, max_amount=0.01, db_path=self.db,
-            platforms=["douyin"], call_override=statistics_call,
-            state_root=self.state, history_only=True,
-        )
-        second_fetch = run_repaired_metrics_backfill(
-            start=self.start, end=self.end, as_of=self.end,
-            task_id=task_id, max_amount=0.01, db_path=self.db,
-            platforms=["douyin"], call_override=statistics_call,
-            state_root=self.state, history_only=True,
-        )
+        with self._ordinary_processors(content=True):
+            fetched = run_repaired_metrics_backfill(
+                start=self.start, end=self.end, as_of=self.end,
+                task_id=task_id, max_amount=0.01, db_path=self.db,
+                platforms=["douyin"], call_override=statistics_call,
+                state_root=self.state, history_only=True,
+            )
+            second_fetch = run_repaired_metrics_backfill(
+                start=self.start, end=self.end, as_of=self.end,
+                task_id=task_id, max_amount=0.01, db_path=self.db,
+                platforms=["douyin"], call_override=statistics_call,
+                state_root=self.state, history_only=True,
+            )
         self.assertEqual(calls, ["metrics"])
         self.assertEqual(fetched["usage"]["amount"], 0.001)
         self.assertEqual(second_fetch["candidates"], 0)
@@ -495,6 +765,7 @@ class V8RangeBackfillTest(unittest.TestCase):
         self.assertEqual(
             [tuple(row) for row in final_observations],
             [
+                ("provider_capture", 0, "available"),
                 ("system_correction", None, "missing"),
                 ("provider_capture", 4321, "available"),
             ],
@@ -543,6 +814,7 @@ class V8RangeBackfillTest(unittest.TestCase):
                             self.end.isoformat(),
                             "--db",
                             str(self.db),
+                            "--isolated-candidate",
                         ]
                     )
                 with self.assertRaises(SystemExit) as missing_as_of:
@@ -555,11 +827,52 @@ class V8RangeBackfillTest(unittest.TestCase):
                             self.end.isoformat(),
                             "--db",
                             str(self.db),
+                            "--isolated-candidate",
                         ]
                     )
         self.assertEqual(missing_start.exception.code, 2)
         self.assertEqual(missing_as_of.exception.code, 2)
         summarize.assert_not_called()
+
+    def test_formal_read_cli_forces_all_default_connections_read_only(self) -> None:
+        def downstream(_argv):
+            self.assertEqual(os.environ.get("DCAR_READ_ONLY"), "1")
+            with range_module.connect(self.db) as connection:
+                self.assertEqual(
+                    connection.execute("PRAGMA query_only").fetchone()[0],
+                    1,
+                )
+                with self.assertRaises(sqlite3.OperationalError):
+                    connection.execute(
+                        "UPDATE schema_migrations SET applied_at='forbidden'"
+                    )
+            return 0
+
+        with (
+            patch.object(
+                range_module,
+                "is_installed_formal_database",
+                return_value=True,
+            ),
+            patch.object(
+                range_module,
+                "resolve_installed_database_access",
+                return_value=object(),
+            ),
+            patch.object(range_module, "_main", side_effect=downstream),
+            patch.dict(os.environ, {"DCAR_READ_ONLY": "0"}),
+        ):
+            self.assertEqual(
+                main(
+                    [
+                        "status",
+                        "--db",
+                        str(self.db),
+                    ]
+                ),
+                0,
+            )
+            self.assertEqual(os.environ.get("DCAR_READ_ONLY"), "0")
 
     def test_campaign_contract_is_anchored_before_db_or_provider_work(self) -> None:
         upsert_account(
@@ -601,8 +914,9 @@ class V8RangeBackfillTest(unittest.TestCase):
             call_override=discovery_call,
             state_root=self.state,
         )
-        self.assertEqual(result["status"], "succeeded")
-        self.assertEqual(provider_calls, 1)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["stopped_reason"], "repair_budget_exhausted")
+        self.assertEqual(provider_calls, 0)
         state_path = self.state / f"{task_id}.json"
         state = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(
@@ -674,7 +988,7 @@ class V8RangeBackfillTest(unittest.TestCase):
                 self.assertRaisesRegex(RangeBackfillError, "完整合同"),
             ):
                 run_discovery_backfill(**arguments)
-        self.assertEqual(provider_calls, 1)
+        self.assertEqual(provider_calls, 0)
         with connect(self.db) as connection:
             after = tuple(
                 connection.execute(
@@ -741,6 +1055,25 @@ class V8RangeBackfillTest(unittest.TestCase):
         ):
             range_module._require_formal_mutation_freeze(db_path=alias)
 
+    def test_installed_formal_path_cannot_bypass_freeze_without_env(self) -> None:
+        installed = self.root / "Application Support" / "DcarAIGC" / "data" / "dcar_insight.sqlite3"
+        installed.parent.mkdir(parents=True)
+        installed.hardlink_to(self.db)
+        retired_checkout = self.root / "checkout" / "app" / "data" / "dcar_insight.sqlite3"
+        missing_freeze = self.root / "missing-installed-freeze.lock"
+        with (
+            patch.object(range_module, "DEFAULT_DB", retired_checkout),
+            patch.object(storage_module, "INSTALLED_DEFAULT_DB", installed),
+            patch.object(storage_module, "CHECKOUT_DEFAULT_DB", retired_checkout),
+            patch.dict(
+                os.environ,
+                {"DCAR_OPERATOR_FREEZE_LOCK": str(missing_freeze)},
+                clear=False,
+            ),
+            self.assertRaisesRegex(RangeBackfillError, "operator freeze lock"),
+        ):
+            range_module._require_formal_mutation_freeze(db_path=installed)
+
     def test_detail_only_backfill_does_not_create_metric_snapshots(self) -> None:
         upsert_account(
             {
@@ -783,18 +1116,19 @@ class V8RangeBackfillTest(unittest.TestCase):
                 True,
             )
 
-        result = run_content_backfill(
-            start=self.start,
-            end=self.end,
-            as_of=datetime.fromisoformat("2026-08-18T15:00:00+08:00"),
-            task_id="detail-only-test",
-            max_amount=0.10,
-            db_path=self.db,
-            platforms=["douyin"],
-            stages=["detail"],
-            call_override=detail_call,
-            state_root=self.state,
-        )
+        with self._ordinary_processors(content=True):
+            result = run_content_backfill(
+                start=self.start,
+                end=self.end,
+                as_of=datetime.fromisoformat("2026-08-18T15:00:00+08:00"),
+                task_id="detail-only-test",
+                max_amount=0.10,
+                db_path=self.db,
+                platforms=["douyin"],
+                stages=["detail"],
+                call_override=detail_call,
+                state_root=self.state,
+            )
         self.assertEqual(result["status"], "succeeded")
         with connect(self.db) as connection:
             self.assertEqual(

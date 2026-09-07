@@ -43,6 +43,8 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 from .storage import DEFAULT_DB, PROJECT_ROOT, connect, now_utc, transaction
+from .source_routing import select_content_metrics
+from .statistics_scope import content_statistics_scope_sql
 
 LOGGER = logging.getLogger(__name__)
 
@@ -1812,7 +1814,7 @@ def build_stats(
             return {"ready": False}
         assets = _load_assets(connection)
         bounds = _window_bounds(window)
-        where = ["c.published_at IS NOT NULL"]
+        where = ["c.published_at IS NOT NULL", content_statistics_scope_sql()]
         parameters: List[Any] = []
         if bounds is not None:
             where.append("c.published_at >= ? AND c.published_at < ?")
@@ -1822,17 +1824,16 @@ def build_stats(
             parameters.append(platform)
         contents = connection.execute(
             f"""
-            SELECT c.id, c.platform, ms.view_count
+            SELECT c.id, c.platform
             FROM content_items c
-            LEFT JOIN content_metric_snapshots ms ON ms.id=(
-                SELECT ms2.id FROM content_metric_snapshots ms2
-                WHERE ms2.content_id=c.id ORDER BY ms2.captured_at DESC, ms2.id DESC LIMIT 1
-            )
             WHERE {' AND '.join(where)}
             """,
             parameters,
         ).fetchall()
         content_ids = [int(row["id"]) for row in contents]
+        metrics = select_content_metrics(
+            connection, content_ids, metric_fields=("view_count",)
+        )
         labels = content_labels(connection, content_ids)
         catalog = assets["catalog"]
         audience_labels = {str(item["code"]): str(item["label"]) for item in assets["audiences"]}
@@ -1850,7 +1851,8 @@ def build_stats(
         overflow: Dict[Tuple[str, str], int] = {}
         for row in contents:
             content_id = int(row["id"])
-            view = int(row["view_count"]) if row["view_count"] is not None and int(row["view_count"]) > 0 else 0
+            value = metrics.get(content_id, {}).get("view_count")
+            view = int(value) if value is not None and int(value) > 0 else 0
             views_total_valid += view
             entry = labels.get(content_id) or {"spu": None, "audience": None, "scenes": []}
             spu = entry.get("spu")
@@ -1903,7 +1905,7 @@ def build_stats(
             round(classified_views * 100 / views_total_valid, 2) if views_total_valid else None
         )
         views_status = (
-            "not_applicable" if posts_total == 0
+            "not_applicable" if not any(row["platform"] == "douyin" for row in contents)
             else "missing" if views_total_valid == 0
             else "available" if exposure_share is not None and exposure_share >= EXPOSURE_COVERAGE_THRESHOLD
             else "below_threshold"
@@ -1945,7 +1947,8 @@ def build_stats(
         for row in contents:
             content_id = int(row["id"])
             content_platform = str(row["platform"])
-            view = int(row["view_count"]) if row["view_count"] is not None and int(row["view_count"]) > 0 else 0
+            value = metrics.get(content_id, {}).get("view_count")
+            view = int(value) if value is not None and int(value) > 0 else 0
             entry = labels.get(content_id) or {"spu": None, "audience": None, "scenes": []}
             spu_key = str(entry["spu"]["spu_id"]) if entry.get("spu") else NONE_KEY
             audience_key = str(entry["audience"]["code"]) if entry.get("audience") else NONE_KEY
@@ -1987,6 +1990,8 @@ def build_stats(
                     and share is not None
                     and share >= EXPOSURE_COVERAGE_THRESHOLD
                 ),
+                "exposure_status": "not_applicable" if p == "xiaohongshu" else
+                                   "available" if total["valid_views"] else "missing",
             }
 
         def _rollup_rows(source: Dict[str, Dict[str, Any]], kind: str) -> List[Dict[str, Any]]:
@@ -2089,7 +2094,7 @@ def build_stats(
             "gaps": {"missing": gaps_missing, "overflow": overflow_rows},
             "footnotes": [
                 "一条内容可以对应多个场景，所以各场景条数相加可能大于内容总数；每个场景内同一内容只计算一次。",
-                "曝光量使用每条内容最近保存的阅读或播放累计值，只统计曝光量大于 0 的内容；完成分类的曝光低于 90% 时不显示曝光占比。",
+                "曝光量按矩阵通优先、TikHub固定补位规则选择抖音播放量；小红书曝光不适用。只统计有效播放量大于0的内容，完成分类低于90%时不显示曝光占比。",
                 "一条内容只统计一个主要车型；对比多个车系时，其他车系仍会保留在识别明细中。",
                 "系统只自动处理资料较完整、可以评估的内容；资料不足或尚未评估的内容会显示为未归类。",
             ],

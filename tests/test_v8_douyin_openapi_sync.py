@@ -19,7 +19,6 @@ from v8.douyin_openapi_client import (
     load_douyin_sync_config,
 )
 from v8.douyin_openapi_sync import reconcile_with_client
-from v8.scheduler import _select_due_capture_contents, prepare_due_capture_slots
 from v8.storage import connect, initialize_database, now_utc
 
 
@@ -261,7 +260,19 @@ class DouyinOpenAPIReconcileTest(unittest.TestCase):
                 (captured_at, captured_at),
             )
 
-    def test_window_pagination_top_rule_raw_first_and_authoritative_zero(self) -> None:
+    def _assert_no_content_side_effects(self, client: FakeMachineClient) -> None:
+        self.assertEqual(client.requested_cursors, [])
+        self.assertFalse(self.raw.exists())
+        with connect(self.db) as connection:
+            for table in (
+                "content_items", "provider_raw_responses", "content_metric_observations",
+                "content_metric_snapshots", "fetch_slots", "fetch_attempts", "provider_usage",
+            ):
+                self.assertEqual(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0], 0, table)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM accounts").fetchone()[0], 1)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM account_platform_identities").fetchone()[0], 1)
+
+    def test_retired_window_pagination_and_authoritative_zero_cannot_write(self) -> None:
         coverage_start = int(
             datetime(2026, 8, 10, 0, 0, tzinfo=SHANGHAI).timestamp()
         )
@@ -298,75 +309,30 @@ class DouyinOpenAPIReconcileTest(unittest.TestCase):
             raw_root=self.raw,
         )
 
-        self.assertEqual(client.requested_cursors, [0, 20])
-        self.assertEqual(
-            result["window_start"], "2026-08-09T16:00:00Z"
-        )
+        self._assert_no_content_side_effects(client)
+        self.assertEqual(result["contract_version"], "authorization-status-v1")
+        self.assertEqual(result["authorization_state"], "available")
+        self.assertFalse(result["content_sync_enabled"])
+        self.assertNotIn("window_start", result)
         account = result["accounts"][0]
         self.assertEqual(
             account,
             {
+                "authorization_id": AUTHORIZATION_ID,
                 "account_id": 1,
                 "platform_uid": "123456789",
-                "status": "succeeded",
-                "coverage_start": "2026-08-09T16:00:00Z",
-                "coverage_end": "2026-08-22T18:00:00Z",
-                "coverage_complete": True,
-                "pagination_complete": True,
-                "materialization_complete": True,
-                "pages_fetched": 2,
-                "items_discovered": 2,
+                "status": "available",
+                "identity_matches": True,
+                "needs_reauthorization": False,
+                "access_expires_at": 1_800_000_000,
+                "refresh_expires_at": 1_800_086_400,
+                "reason": "",
             },
         )
         serialized = json.dumps(result)
-        self.assertNotIn(AUTHORIZATION_ID, serialized)
+        self.assertIn(AUTHORIZATION_ID, serialized)
         self.assertNotIn("open_id", serialized)
         self.assertNotIn("token", serialized)
-        daily_capture_at = datetime(2026, 8, 23, 2, 0, tzinfo=SHANGHAI)
-        prepare_due_capture_slots(daily_capture_at, db_path=self.db)
-        due_contents = _select_due_capture_contents(
-            daily_capture_at,
-            db_path=self.db,
-            content_limit=100,
-        )
-        self.assertEqual(len(due_contents), 2)
-        self.assertTrue(all(item["metrics_needed"] is False for item in due_contents))
-        with connect(self.db) as connection:
-            contents = connection.execute(
-                """
-                SELECT platform_content_id,canonical_url,content_type
-                FROM content_items ORDER BY platform_content_id
-                """
-            ).fetchall()
-            raw_rows = connection.execute(
-                "SELECT provider,operation,source FROM provider_raw_responses ORDER BY id"
-            ).fetchall()
-            metric = connection.execute(
-                """
-                SELECT c.platform_content_id,o.view_count,o.status
-                FROM content_metric_observations o
-                JOIN content_items c ON c.id=o.content_id
-                WHERE c.platform_content_id='900000000002'
-                """
-            ).fetchone()
-        self.assertEqual(
-            [tuple(row) for row in contents],
-            [
-                (
-                    "900000000002",
-                    "https://www.douyin.com/video/900000000002",
-                    "video",
-                ),
-                (
-                    "900000000003",
-                    "https://www.douyin.com/video/900000000003",
-                    "image",
-                ),
-            ],
-        )
-        self.assertGreaterEqual(len(raw_rows), 4)
-        self.assertTrue(all(row["provider"] == "DouyinOpenAPI" for row in raw_rows))
-        self.assertEqual(tuple(metric), ("900000000002", 0, "available"))
 
     def test_identity_mismatch_fails_without_calling_provider(self) -> None:
         client = FakeMachineClient(
@@ -379,14 +345,72 @@ class DouyinOpenAPIReconcileTest(unittest.TestCase):
             client=client,  # type: ignore[arg-type]
             raw_root=self.raw,
         )
-        self.assertEqual(client.requested_cursors, [])
-        self.assertEqual(result["accounts"][0]["status"], "failed")
+        self._assert_no_content_side_effects(client)
+        self.assertEqual(result["accounts"][0]["status"], "attention")
+        self.assertFalse(result["accounts"][0]["identity_matches"])
         self.assertEqual(
-            result["accounts"][0]["error_code"],
+            result["accounts"][0]["reason"],
             "authorization_identity_mismatch",
         )
 
-    def test_materialization_failure_keeps_raw_and_reopens_slot(self) -> None:
+    def test_actual_health_time_is_not_the_scheduled_time_or_video_scope(self) -> None:
+        current = {**authorization(), "scopes": ["user_info"]}
+        client = FakeMachineClient([current], {})
+        checked_at = "2026-08-29T01:00:00Z"
+        with patch("v8.douyin_openapi_sync.now_utc", return_value=checked_at) as clock:
+            result = reconcile_with_client(
+                scheduled_for=SCHEDULED_FOR, db_path=self.db,
+                client=client,  # type: ignore[arg-type]
+            )
+        clock.assert_called_once()
+        self.assertEqual(result["captured_at"], checked_at)
+        self.assertNotEqual(datetime.fromisoformat(checked_at.replace("Z", "+00:00")), SCHEDULED_FOR)
+        self.assertEqual(result["authorization_state"], "available")
+        self.assertEqual(result["accounts"][0]["status"], "available")
+        self._assert_no_content_side_effects(client)
+
+    def test_paused_account_keeps_its_authorization_identity(self) -> None:
+        with connect(self.db) as connection:
+            connection.execute("UPDATE accounts SET enabled=0 WHERE id=1")
+        client = FakeMachineClient([authorization()], {})
+        result = reconcile_with_client(
+            scheduled_for=SCHEDULED_FOR, db_path=self.db,
+            client=client,  # type: ignore[arg-type]
+        )
+        self.assertTrue(result["accounts"][0]["identity_matches"])
+        self.assertEqual(result["accounts"][0]["status"], "available")
+        self.assertEqual(result["accounts"][0]["reason"], "")
+        self._assert_no_content_side_effects(client)
+
+    def test_empty_authorization_directory_is_explicitly_not_all_healthy(self) -> None:
+        client = FakeMachineClient([], {})
+        result = reconcile_with_client(
+            scheduled_for=SCHEDULED_FOR, db_path=self.db,
+            client=client,  # type: ignore[arg-type]
+        )
+        self.assertEqual(result["authorization_state"], "no_authorization")
+        self.assertEqual(result["accounts"], [])
+        self.assertFalse(result["content_sync_enabled"])
+        self._assert_no_content_side_effects(client)
+
+    def test_expired_and_reauthorization_required_are_attention_only(self) -> None:
+        for changes, reason in (
+            ({"needs_reauthorization": True}, "reauthorization_required"),
+            ({"refresh_expires_at": 0}, "refresh_expired"),
+            ({"access_expires_at": 0}, "access_expired"),
+        ):
+            with self.subTest(reason=reason):
+                client = FakeMachineClient([{**authorization(), **changes}], {})
+                result = reconcile_with_client(
+                    scheduled_for=SCHEDULED_FOR, db_path=self.db,
+                    client=client,  # type: ignore[arg-type]
+                )
+                self.assertEqual(result["authorization_state"], "attention")
+                self.assertEqual(result["accounts"][0]["status"], "attention")
+                self.assertEqual(result["accounts"][0]["reason"], reason)
+                self._assert_no_content_side_effects(client)
+
+    def test_retired_materialization_is_never_called_or_reopens_slots(self) -> None:
         recent = int(datetime(2026, 8, 20, 12, tzinfo=SHANGHAI).timestamp())
         client = FakeMachineClient(
             [authorization()],
@@ -401,7 +425,7 @@ class DouyinOpenAPIReconcileTest(unittest.TestCase):
         )
 
         def fail_materialization(**_kwargs: object) -> Mapping[str, object]:
-            raise RuntimeError("canary materialization failure")
+            self.fail("retired OpenAPI must not materialize or retry content")
 
         result = reconcile_with_client(
             scheduled_for=SCHEDULED_FOR,
@@ -411,19 +435,10 @@ class DouyinOpenAPIReconcileTest(unittest.TestCase):
             materialize_page=fail_materialization,
         )
         account = result["accounts"][0]
-        self.assertEqual(account["status"], "failed")
-        self.assertEqual(account["error_code"], "derived_materialization_failed")
-        with connect(self.db) as connection:
-            slot = connection.execute(
-                "SELECT status,last_error_code FROM fetch_slots"
-            ).fetchone()
-            raw_count = connection.execute(
-                "SELECT COUNT(*) FROM provider_raw_responses"
-            ).fetchone()[0]
-        self.assertEqual(tuple(slot), ("retryable_failed", "derived_materialization_failed"))
-        self.assertEqual(raw_count, 1)
+        self.assertEqual(account["status"], "available")
+        self._assert_no_content_side_effects(client)
 
-    def test_cursor_loop_is_partial_after_first_materialized_page(self) -> None:
+    def test_retired_cursor_loop_cannot_claim_any_content_coverage(self) -> None:
         recent = int(datetime(2026, 8, 20, 12, tzinfo=SHANGHAI).timestamp())
         client = FakeMachineClient(
             [authorization()],
@@ -449,21 +464,10 @@ class DouyinOpenAPIReconcileTest(unittest.TestCase):
             raw_root=self.raw,
         )
         account = result["accounts"][0]
-        self.assertEqual(account["status"], "partial")
-        self.assertEqual(account["error_code"], "pagination_cursor_loop")
-        self.assertFalse(account["pagination_complete"])
-        with connect(self.db) as connection:
-            slots = connection.execute(
-                "SELECT status,last_error_code FROM fetch_slots ORDER BY id"
-            ).fetchall()
-        self.assertEqual(
-            [tuple(row) for row in slots],
-            [
-                ("succeeded", None),
-                ("succeeded", None),
-                ("retryable_failed", "pagination_cursor_loop"),
-            ],
-        )
+        self.assertEqual(account["status"], "available")
+        self.assertNotIn("pagination_complete", account)
+        self.assertNotIn("coverage_complete", account)
+        self._assert_no_content_side_effects(client)
 
 
 if __name__ == "__main__":

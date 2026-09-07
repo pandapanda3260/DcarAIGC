@@ -269,9 +269,29 @@ def run() -> dict[str, Any]:
         )
         htpasswd_path.chmod(0o600)
         session_db = state_root / "sessions.sqlite3"
+        pepper_path = state_root / "auth-pepper"
+        pepper_path.write_text(secrets.token_hex(32) + "\n", encoding="utf-8")
+        pepper_path.chmod(0o600)
         vault_path = vault_root / "vault.sqlite3"
 
         base_environment = common_environment()
+        # The gateway no longer reads htpasswd; the account is imported once
+        # through the offline CLI exactly like a server migration.
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "dcar_auth.admin",
+                "--db",
+                str(session_db),
+                "import-htpasswd",
+                "--source",
+                str(htpasswd_path),
+            ],
+            check=True,
+            env=base_environment,
+            stdout=subprocess.DEVNULL,
+        )
         fixture_environment = base_environment.copy()
         control_environment = base_environment | {
             "CREDENTIALS_DIRECTORY": str(credentials),
@@ -297,8 +317,9 @@ def run() -> dict[str, Any]:
             "DCAR_AUTH_WEB_UPSTREAM": API_URL,
             "DCAR_AUTH_API_UPSTREAM": API_URL,
             "DCAR_AUTH_DOUYIN_UPSTREAM": CONTROL_URL,
-            "DCAR_AUTH_HTPASSWD": str(htpasswd_path),
             "DCAR_AUTH_SESSION_DB": str(session_db),
+            "DCAR_AUTH_PEPPER_FILE": str(pepper_path),
+            "DCAR_AUTH_SMS_PROVIDER": "log",
             "DCAR_AUTH_LOGIN_TEMPLATE": str(
                 ROOT / "deploy" / "server" / "nginx" / "login.html"
             ),

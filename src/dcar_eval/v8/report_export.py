@@ -817,126 +817,67 @@ def build_accounts_workbook(
     douyin_authorization_targets: Mapping[tuple[int, str], str] | None,
     exported_at: str,
 ) -> bytes:
-    """账号表格（xlsx）：列结构、中文表头与取值口径都对齐账号页表格。
+    """One platform account per row; missing statistics are never local counts."""
 
-    - 表头两行：第一行是「账号基础信息 / 各平台 / 账号管理」分组（沿用页面
-      分组配色），第二行是与页面一致的中文列名；冻结前 4 列与表头，列名行
-      带筛选。
-    - 手机号、平台账号编号写成文本单元格，避免 Excel 把长编号变成科学计数法
-      （这是旧 CSV 导出的主要痛点）。
-    - 「抖音开平授权」状态在抖音控制面，不在账号主数据库；由前端随下载请求
-      带来精确 (account_id, platform_uid) 目标及状态。None 表示状态不可用，
-      空集或未精确命中显示「未授权」；命中后显示「已授权」或「需重新授权」。
-    - 粉丝量暂未采集（接口恒为 null），与页面一样显示「—」；关联内容量未绑定
-      平台时与页面一样按 0 条展示。
-    """
-
-    group_row: list[Any] = ["账号基础信息", None, None, None]
-    group_styles: list[int] = [_ACCOUNT_GROUP_BASE_STYLE] * 4
-    headers: list[Any] = ["手机号", "运营人员", "账号类型", "内容方向"]
-    widths: list[float] = [15, 12, 11, 11]
-    merges: list[str] = ["A1:D1"]
-    column = 5
-    for platform in _ACCOUNT_EXPORT_PLATFORMS:
-        span = 6 if platform == "douyin" else 5
-        group_row.extend([_PLATFORM_LABELS[platform], *([None] * (span - 1))])
-        group_styles.extend([_ACCOUNT_GROUP_PLATFORM_STYLES[platform]] * span)
-        headers.append("平台账号编号")
-        widths.append(26)
-        headers.append("是否实名")
-        widths.append(10)
-        if platform == "douyin":
-            headers.append("抖音开平授权")
-            widths.append(14)
-        headers.append("昵称")
-        widths.append(20)
-        headers.append("粉丝量")
-        widths.append(11)
-        headers.append("关联内容量")
-        widths.append(12)
-        merges.append(f"{_column_name(column)}1:{_column_name(column + span - 1)}1")
-        column += span
-    group_row.append("账号管理")
-    group_styles.append(_ACCOUNT_GROUP_MANAGEMENT_STYLE)
-    headers.append("状态")
-    widths.append(9)
-
-    rows: list[list[Any]] = [group_row, headers]
-    styles: list[list[int]] = [group_styles, [1] * len(headers)]
+    headers = [
+        "平台", "昵称", "头像", "平台 UID", "短号", "矩阵监测", "矩阵授权",
+        "总粉丝", "平台作品总量", "本地收录量", "手机号", "运营人员",
+        "账号类型", "内容方向", "数据日期", "账号状态", "抖音开平授权", "采集开关",
+    ]
+    rows: list[list[Any]] = [headers]
+    styles: list[list[int]] = [[1] * len(headers)]
+    status_labels = {
+        "monitored": "已监测", "not_monitored": "未监测", "unknown": "未知",
+        "authorized": "已授权", "unauthorized": "未授权",
+    }
+    operating_status_labels = {"daily": "日更", "weekly": "周更", "paused": "暂停", "unmarked": "待标记"}
     for account in accounts:
-        identities = {
-            str(identity.get("platform") or ""): identity
-            for identity in account.get("platforms", ())
-        }
-        row: list[Any] = []
-        row_styles: list[int] = []
-
-        def put(value: Any, style: int) -> None:
-            row.append(value)
-            row_styles.append(style)
-
-        put(_clean_text(account.get("phone") or ""), 12)
-        put(_clean_text(account.get("operator_name") or "").strip() or "未填写", 10)
-        put(_enum_or_dash(_ACCOUNT_TYPE_LABELS, account.get("account_type")), 10)
-        put(
+        identities = list(account.get("platforms") or ())
+        if len(identities) > 1:
+            raise ValueError("account export requires one platform identity per account")
+        identity = identities[0] if identities else {}
+        platform = str(identity.get("platform") or "")
+        uid = _clean_text(identity.get("uid") or "").strip()
+        if platform != "douyin" or not uid:
+            authorization = "—"
+        elif douyin_authorization_targets is None:
+            authorization = "状态异常"
+        else:
+            state = douyin_authorization_targets.get((int(account.get("id") or 0), uid))
+            authorization = {
+                "authorized": "已授权", "needs_reauthorization": "需重新授权",
+            }.get(str(state), "未授权")
+        rows.append([
+            _PLATFORM_LABELS.get(platform, "无平台档案"),
+            _clean_text(identity.get("nickname") or "—"),
+            _clean_text(identity.get("avatar_url") or "—"),
+            uid or "—",
+            _clean_text(identity.get("unique_id") or "—"),
+            status_labels.get(str(identity.get("monitoring_status") or "unknown"), "未知"),
+            status_labels.get(str(identity.get("authorization_status") or "unknown"), "未知"),
+            identity.get("follower_count") if identity.get("follower_count") is not None else "—",
+            identity.get("platform_work_count") if identity.get("platform_work_count") is not None else "—",
+            int(identity.get("content_count") or 0),
+            _clean_text(account.get("phone") or ""),
+            _clean_text(account.get("operator_name") or "").strip() or "未填写",
+            _enum_or_dash(_ACCOUNT_TYPE_LABELS, account.get("account_type")),
             _enum_or_dash(_CONTENT_DIRECTION_LABELS, account.get("content_direction")),
-            10,
-        )
-        for platform in _ACCOUNT_EXPORT_PLATFORMS:
-            identity = identities.get(platform)
-            uid = _clean_text((identity or {}).get("uid") or "").strip()
-            if uid:
-                put(uid, 12)
-            else:
-                put("—", 10)
-            if identity is None:
-                put("未绑定", 10)
-            else:
-                put(
-                    _enum_or_dash(
-                        _ACCOUNT_REAL_NAME_LABELS, identity.get("real_name_status")
-                    ),
-                    10,
-                )
-            if platform == "douyin":
-                if douyin_authorization_targets is None:
-                    put("状态异常", 10)
-                else:
-                    authorization_state = douyin_authorization_targets.get(
-                        (int(account.get("id") or 0), uid)
-                    )
-                    put(
-                        "已授权"
-                        if authorization_state == "authorized"
-                        else "需重新授权"
-                        if authorization_state == "needs_reauthorization"
-                        else "未授权",
-                        10,
-                    )
-            nickname = _clean_text((identity or {}).get("nickname") or "").strip()
-            put(nickname or "—", 10)
-            follower_count = (identity or {}).get("follower_count")
-            if follower_count is None:
-                put("—", 9)
-            else:
-                put(int(follower_count), 5)
-            content_count = int((identity or {}).get("content_count") or 0)
-            put(content_count, 19)
-        put("运营中" if account.get("enabled") else "停用", 10)
-        rows.append(row)
-        styles.append(row_styles)
-
-    last_column = _column_name(len(headers))
+            _clean_text(identity.get("data_date") or "—"),
+            operating_status_labels.get(str(account.get("account_status") or ""),
+                                        "待标记" if account.get("enabled") else "暂停"),
+            authorization,
+            "运营中" if account.get("enabled") else "停用",
+        ])
+        styles.append([10, 10, 12, 12, 12, 10, 10, 5, 5, 19, 12, 10, 10, 10, 12, 10, 10, 10])
     sheet = _Worksheet(
         name="账号信息",
         rows=rows,
         styles=styles,
-        widths=widths,
-        merge_cells=tuple(merges),
-        auto_filter=f"A2:{last_column}{len(rows)}",
-        frozen_rows=2,
-        frozen_columns=4,
-        row_heights={1: 24, 2: 28},
+        widths=[12, 22, 36, 28, 22, 12, 12, 14, 16, 16, 18, 16, 12, 12, 22, 16, 16, 12],
+        auto_filter=f"A1:R{len(rows)}",
+        frozen_rows=1,
+        frozen_columns=2,
+        row_heights={1: 28},
     )
     return _xlsx_bytes([sheet], title="DCar 账号表格", created_at=exported_at)
 

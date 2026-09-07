@@ -332,7 +332,8 @@ def run_command(
 def rb(phase: str, end: str, *extra: str) -> List[str]:
     return [
         *python_prefix(), "-m", "v8.range_backfill", phase,
-        "--full-history", "--end", end, *extra,
+        "--full-history", "--end", end, "--db", str(DB),
+        "--isolated-candidate", *extra,
     ]
 
 

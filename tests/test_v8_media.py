@@ -6,12 +6,14 @@ import io
 import os
 import subprocess
 import tempfile
+import threading
 import unittest
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
-from v8 import media
+from v8 import media, raw_evidence
 from v8.storage import connect, initialize_database, now_utc, transaction
 
 
@@ -78,6 +80,44 @@ class V8MediaTest(unittest.TestCase):
             media_root=self.root / "test-image-sources",
         )
 
+    def test_read_douyin_group_raw_supports_legacy_and_zstd_evidence(self) -> None:
+        body = json.dumps(
+            {"code": 200, "data": {"aweme_detail": {"aweme_id": "123"}}},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        legacy_path = self.root / "douyin-detail.json"
+        legacy_path.write_bytes(body)
+        legacy_path.chmod(0o600)
+        legacy_row = {
+            "provider": "TikHub",
+            "http_status": 200,
+            "byte_size": len(body),
+            "sha256": hashlib.sha256(body).hexdigest(),
+            "local_path": str(legacy_path),
+        }
+        zstd_path = self.root / "raw" / "douyin-detail.json.zst"
+        receipt = raw_evidence.write_zstd_raw_evidence(
+            zstd_path,
+            body,
+            provider="TikHub",
+            operation="douyin_video_detail",
+            response_identity="a" * 64,
+            paid_scope_identity="b" * 64,
+            sequence=1,
+            evidence_root=self.root / "raw",
+        )
+        zstd_row = {
+            "provider": "TikHub",
+            "http_status": 200,
+            "byte_size": receipt.stored_size,
+            "sha256": receipt.stored_sha256,
+            "local_path": str(zstd_path),
+        }
+
+        for label, row in (("legacy", legacy_row), ("zstd", zstd_row)):
+            with self.subTest(label=label):
+                self.assertEqual(media._read_douyin_group_raw(row), json.loads(body))
+
     def test_processor_version_pins_library_model_and_revision(self) -> None:
         config = media.load_media_config()
         version = media.processor_versions()["asr"]
@@ -114,6 +154,8 @@ class V8MediaTest(unittest.TestCase):
         self.assertTrue(
             media._valid_media(self.video, maximum_duration_seconds=2.0)
         )
+        with patch.object(media, "_has_decodable_video_frame", return_value=False):
+            self.assertFalse(media._valid_media(self.video))
 
     def test_frame_outputs_are_staged_until_manifest_is_durable(self) -> None:
         target_dir = self.root / "atomic-frames"
@@ -533,11 +575,81 @@ class V8MediaTest(unittest.TestCase):
             ),
             patch(
                 "mlx_whisper.transcribe",
-                side_effect=RuntimeError("Metal backend failed"),
-            ),
+                side_effect=[
+                    RuntimeError("Metal backend failed"),
+                    {"language": "zh", "text": "recovered", "segments": []},
+                ],
+            ) as transcribe,
         ):
             with self.assertRaisesRegex(RuntimeError, "Metal backend failed"):
                 media._run_asr(self.video, self.root / "unexpected-asr.json")
+            recovered = media._run_asr(
+                self.video, self.root / "recovered-asr.json"
+            )
+        self.assertEqual(transcribe.call_count, 2)
+        self.assertEqual(
+            json.loads(recovered.read_text(encoding="utf-8"))["text"],
+            "recovered",
+        )
+
+    def test_asr_serializes_mlx_inference_across_worker_threads(self) -> None:
+        start = threading.Barrier(3)
+        first_entered = threading.Event()
+        second_entered = threading.Event()
+        release_first = threading.Event()
+        guard = threading.Lock()
+        calls = 0
+        active = 0
+        peak = 0
+
+        def transcribe(*_args, **_kwargs):
+            nonlocal calls, active, peak
+            with guard:
+                calls += 1
+                call_number = calls
+                active += 1
+                peak = max(peak, active)
+                (first_entered if call_number == 1 else second_entered).set()
+            try:
+                if call_number == 1:
+                    self.assertTrue(release_first.wait(2))
+                return {"language": "zh", "text": str(call_number), "segments": []}
+            finally:
+                with guard:
+                    active -= 1
+
+        def run(target: Path) -> Path:
+            start.wait(timeout=2)
+            return media._run_asr(self.video, target)
+
+        with (
+            patch.object(
+                media,
+                "pinned_whisper_model_path",
+                return_value=self.root / "whisper-model",
+            ),
+            patch("mlx_whisper.transcribe", side_effect=transcribe),
+            ThreadPoolExecutor(max_workers=2) as pool,
+        ):
+            futures = [
+                pool.submit(run, self.root / f"thread-{index}.json")
+                for index in range(2)
+            ]
+            start.wait(timeout=2)
+            self.assertTrue(first_entered.wait(2))
+            try:
+                self.assertFalse(second_entered.wait(0.2))
+            finally:
+                release_first.set()
+            outputs = [future.result(timeout=2) for future in futures]
+
+        self.assertEqual(calls, 2)
+        self.assertEqual(peak, 1)
+        self.assertTrue(second_entered.is_set())
+        self.assertEqual(
+            {json.loads(path.read_text(encoding="utf-8"))["text"] for path in outputs},
+            {"1", "2"},
+        )
 
     def test_provider_media_download_has_its_own_idempotent_slot(self) -> None:
         calls = 0
@@ -690,6 +802,20 @@ class V8MediaTest(unittest.TestCase):
                     b"x" * 4096,
                     final_url="https://redirect.example/video.mp4",
                     length=4096,
+                ),
+                maximum_bytes=8192,
+                require_exact_response_url=True,
+            )
+        self.assertFalse(target.exists())
+
+        with self.assertRaisesRegex(media.MediaProcessingError, "download failed"):
+            media._download_video(
+                [source_url],
+                target,
+                urlopen_fn=lambda *_args, **_kwargs: Response(
+                    b"x" * 4096,
+                    final_url=source_url,
+                    length=8192,
                 ),
                 maximum_bytes=8192,
                 require_exact_response_url=True,

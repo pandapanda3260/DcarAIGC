@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from . import durable_runs
+
 import json
 import math
+import re
+import sqlite3
 import threading
-import time as time_module
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -15,11 +18,9 @@ from typing import Any, Callable, Dict, List, Mapping, Optional
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler  # type: ignore[import-untyped]
-from apscheduler.triggers.cron import CronTrigger  # type: ignore[import-untyped]
-from apscheduler.triggers.interval import (  # type: ignore[import-untyped]
-    IntervalTrigger,
-)
 
+from .account_roster import get_current_members
+from .automatic_scope import automatic_from_date, automatic_scope, within_automatic_scope
 from .capture import ProviderResult, ensure_content_slot
 from .contracts import load_contract
 from .duplicates import (
@@ -35,6 +36,7 @@ from .media import (
 )
 from .media_state import media_terminal_state_details
 from .providers import STAGE_CONFIG, discover_account_content, update_content_data
+from .provider_budget import DEFAULT_TASK_MAX_AMOUNT_USD
 from .reports import (
     REPORTS_ROOT,
     ReportTaskError,
@@ -55,15 +57,14 @@ from .storage import (
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+PIPELINE_REPORT_EXECUTION_LOCK = threading.RLock()
 #: Daily provider spend is a task-wide ceiling across every operation.  The
 #: amount is reserved under BEGIN IMMEDIATE in capture.py, so concurrent
 #: workers cannot split the allowance by provider operation.
-DAILY_CAPTURE_MAX_AMOUNT = 20.0
+DAILY_CAPTURE_MAX_AMOUNT = DEFAULT_TASK_MAX_AMOUNT_USD
 DAILY_CAPTURE_CONTENT_LIMIT = 3000
 DAILY_DISCOVERY_MAX_PAGES = 20
 DAILY_CAPTURE_WORKERS = 4
-DAILY_CAPTURE_MAX_ATTEMPTS = 2
-DAILY_CAPTURE_RETRY_DELAY_SECONDS = 1.0
 DAILY_CAPTURE_DISCOVERY_QUALITY_PERCENT = 90
 DAILY_CAPTURE_CONTENT_QUALITY_PERCENT = 60
 CAPTURE_PROVIDER_FATAL_CODES = frozenset(
@@ -234,7 +235,7 @@ def _weekly_daily_dependency(
             """
             SELECT status,completed_at FROM scheduler_runs
             WHERE job_id='daily_report' AND scheduled_for=?
-            """,
+            """ + durable_runs.root_run_predicate(connection),
             (_scheduled_iso(daily_occurrence),),
         ).fetchone()
         task = connection.execute(
@@ -323,7 +324,7 @@ def current_day_daily_capture_guard(
             """
             SELECT status FROM scheduler_runs
             WHERE job_id='daily_capture' AND scheduled_for=?
-            """,
+            """ + durable_runs.root_run_predicate(connection),
             (occurrence_key,),
         ).fetchone()
     if existing is not None:
@@ -352,7 +353,7 @@ def _current_day_run_state(
             """
             SELECT status,started_at,completed_at FROM scheduler_runs
             WHERE job_id=? AND scheduled_for=?
-            """,
+            """ + durable_runs.root_run_predicate(connection),
             (job_id, _scheduled_iso(occurrence)),
         ).fetchone()
     if row is None:
@@ -568,8 +569,9 @@ def _claim_run(
     allow_retry: bool,
     invocation_source: str,
     retry_terminal_if_completed_before: Optional[datetime] = None,
+    occurrence_key: Optional[str] = None,
 ) -> Optional[RunClaim]:
-    key = _scheduled_iso(scheduled_for)
+    key = occurrence_key or _scheduled_iso(scheduled_for)
     started_at = now_utc()
     claim_started_at = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
     retrying_terminal = False
@@ -583,7 +585,7 @@ def _claim_run(
             """
             SELECT id,status,started_at,completed_at,details_json FROM scheduler_runs
             WHERE job_id=? AND scheduled_for=?
-            """,
+            """ + durable_runs.root_run_predicate(connection),
             (job_id, key),
         ).fetchone()
         if existing is None:
@@ -776,6 +778,7 @@ def _finish_run(
     status: str,
     details: Dict[str, Any],
     db_path: Path,
+    transaction_effect: Optional[Callable[[sqlite3.Connection], None]] = None,
 ) -> None:
     if status not in ATTEMPT_TERMINAL_STATUSES:
         raise SchedulerJobError(f"unsupported scheduler terminal status: {status}")
@@ -816,6 +819,8 @@ def _finish_run(
             raise SchedulerJobError(
                 f"scheduler run is no longer active: {claim.scheduler_run_id}"
             )
+        if transaction_effect is not None:
+            transaction_effect(connection)
 
 
 def recover_interrupted_scheduler_runs(*, db_path: Path = DEFAULT_DB) -> int:
@@ -825,8 +830,9 @@ def recover_interrupted_scheduler_runs(*, db_path: Path = DEFAULT_DB) -> int:
     with connect(db_path) as connection, transaction(connection):
         attempts = connection.execute(
             """
-            SELECT id,scheduler_run_id,details_json FROM scheduler_run_attempts
-            WHERE status='running' ORDER BY id
+            SELECT a.id,a.scheduler_run_id,r.details_json
+            FROM scheduler_run_attempts a JOIN scheduler_runs r ON r.id=a.scheduler_run_id
+            WHERE a.status='running' ORDER BY a.id
             """
         ).fetchall()
         running_run_ids = {
@@ -904,116 +910,162 @@ def _default_douyin_openapi_environment_present() -> bool:
 def _validate_douyin_openapi_details(
     value: Mapping[str, Any],
 ) -> tuple[str, Dict[str, Any]]:
+    from .douyin_openapi_sync import AUTHORIZATION_CONTRACT_VERSION
+
     details = dict(value)
-    if set(details) != {"window_start", "coverage_end", "accounts"}:
-        raise SchedulerJobError("Douyin OpenAPI receipt fields are invalid")
-    window_start = details.get("window_start")
-    coverage_end = details.get("coverage_end")
-    accounts = details.get("accounts")
-    if not isinstance(window_start, str) or not window_start:
-        raise SchedulerJobError("Douyin OpenAPI receipt is missing window_start")
-    if not isinstance(coverage_end, str) or not coverage_end:
-        raise SchedulerJobError("Douyin OpenAPI receipt is missing coverage_end")
-    if not isinstance(accounts, list):
-        raise SchedulerJobError("Douyin OpenAPI receipt accounts must be a list")
+    if set(details) != {
+        "contract_version", "captured_at", "content_sync_enabled",
+        "authorization_state", "accounts",
+    } or details.get("contract_version") != AUTHORIZATION_CONTRACT_VERSION:
+        raise SchedulerJobError("Douyin authorization receipt fields are invalid")
+    captured_at = details["captured_at"]
+    try:
+        captured = datetime.fromisoformat(captured_at.replace("Z", "+00:00"))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise SchedulerJobError("Douyin authorization captured_at is invalid") from exc
+    if captured.tzinfo is None:
+        raise SchedulerJobError("Douyin authorization captured_at must include timezone")
+    if details["content_sync_enabled"] is not False or not isinstance(details["accounts"], list):
+        raise SchedulerJobError("Douyin authorization health cannot claim content coverage")
 
-    account_statuses: List[str] = []
-    seen_identities: set[tuple[int, str]] = set()
-    for account in accounts:
-        if not isinstance(account, Mapping):
-            raise SchedulerJobError("Douyin OpenAPI account receipt must be an object")
-        required_fields = {
-            "account_id",
-            "platform_uid",
-            "status",
-            "coverage_start",
-            "coverage_end",
-            "coverage_complete",
-            "pagination_complete",
-            "materialization_complete",
-            "pages_fetched",
-            "items_discovered",
-        }
-        account_fields = set(account)
-        if not required_fields <= account_fields or not account_fields <= (
-            required_fields | {"error_code"}
-        ):
-            raise SchedulerJobError("Douyin OpenAPI account receipt fields are invalid")
-        account_id = account.get("account_id")
-        platform_uid = account.get("platform_uid")
-        status = account.get("status")
+    seen: set[tuple[int, str]] = set()
+    seen_authorizations: set[str] = set()
+    statuses = []
+    fields = {
+        "authorization_id", "account_id", "platform_uid", "status", "identity_matches",
+        "needs_reauthorization", "access_expires_at", "refresh_expires_at", "reason",
+    }
+    for account in details["accounts"]:
+        if not isinstance(account, Mapping) or set(account) != fields:
+            raise SchedulerJobError("Douyin authorization account receipt fields are invalid")
+        authorization_id = account["authorization_id"]
+        account_id, uid = account["account_id"], account["platform_uid"]
         if (
-            isinstance(account_id, bool)
-            or not isinstance(account_id, int)
-            or account_id <= 0
-            or not isinstance(platform_uid, str)
-            or not 6 <= len(platform_uid) <= 24
-            or not platform_uid.isdigit()
+            not isinstance(authorization_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", authorization_id) is None
         ):
-            raise SchedulerJobError("Douyin OpenAPI account identity is invalid")
-        identity = (account_id, platform_uid)
-        if identity in seen_identities:
-            raise SchedulerJobError("Douyin OpenAPI account receipt is duplicated")
-        seen_identities.add(identity)
-        if status not in {"succeeded", "partial", "failed"}:
-            raise SchedulerJobError("Douyin OpenAPI account status is invalid")
-        error_code = account.get("error_code")
-        if (status == "succeeded" and "error_code" in account) or (
-            status != "succeeded"
-            and (
-                not isinstance(error_code, str)
-                or not error_code
-                or len(error_code) > 128
-                or any(
-                    character not in "abcdefghijklmnopqrstuvwxyz0123456789_"
-                    for character in error_code
-                )
-            )
-        ):
-            raise SchedulerJobError("Douyin OpenAPI account error_code is invalid")
-        if account.get("coverage_start") != window_start:
-            raise SchedulerJobError("Douyin OpenAPI account coverage_start drifted")
-        if account.get("coverage_end") != coverage_end:
-            raise SchedulerJobError("Douyin OpenAPI account coverage_end drifted")
-        for field in (
-            "coverage_complete",
-            "pagination_complete",
-            "materialization_complete",
-        ):
-            if not isinstance(account.get(field), bool):
-                raise SchedulerJobError(
-                    f"Douyin OpenAPI account {field} must be boolean"
-                )
-        for field in ("pages_fetched", "items_discovered"):
-            number = account.get(field)
-            if isinstance(number, bool) or not isinstance(number, int) or number < 0:
-                raise SchedulerJobError(
-                    f"Douyin OpenAPI account {field} must be non-negative"
-                )
-        if status == "succeeded" and (
-            account.get("coverage_complete") is not True
-            or account.get("pagination_complete") is not True
-            or account.get("materialization_complete") is not True
-            or account.get("pages_fetched", 0) < 1
-        ):
-            raise SchedulerJobError("Douyin OpenAPI succeeded receipt is incomplete")
-        account_statuses.append(str(status))
+            raise SchedulerJobError("Douyin authorization id is invalid")
+        if (isinstance(account_id, bool) or not isinstance(account_id, int) or account_id <= 0
+                or not isinstance(uid, str) or not uid.isdigit() or not 6 <= len(uid) <= 24):
+            raise SchedulerJobError("Douyin authorization account identity is invalid")
+        if (account_id, uid) in seen or authorization_id in seen_authorizations:
+            raise SchedulerJobError("Douyin authorization account receipt is duplicated")
+        seen.add((account_id, uid))
+        seen_authorizations.add(authorization_id)
+        if any(not isinstance(account[key], bool) for key in ("identity_matches", "needs_reauthorization")):
+            raise SchedulerJobError("Douyin authorization health flags must be boolean")
+        if any(isinstance(account[key], bool) or not isinstance(account[key], int) or account[key] < 0
+               for key in ("access_expires_at", "refresh_expires_at")):
+            raise SchedulerJobError("Douyin authorization expiry must be a non-negative integer")
+        if not account["identity_matches"]:
+            reason = "authorization_identity_mismatch"
+        elif account["needs_reauthorization"]:
+            reason = "reauthorization_required"
+        elif account["refresh_expires_at"] <= captured.timestamp():
+            reason = "refresh_expired"
+        elif account["access_expires_at"] <= captured.timestamp():
+            reason = "access_expired"
+        else:
+            reason = ""
+        expected_status = "attention" if reason else "available"
+        if account["status"] != expected_status or account["reason"] != reason:
+            raise SchedulerJobError("Douyin authorization account health is inconsistent")
+        statuses.append(expected_status)
+    state = (
+        "no_authorization" if not statuses
+        else "available" if all(status == "available" for status in statuses)
+        else "attention"
+    )
+    if details["authorization_state"] != state:
+        raise SchedulerJobError("Douyin authorization summary is inconsistent")
+    status = (
+        "skipped" if not statuses
+        else "succeeded" if state == "available"
+        else "failed" if all(status == "attention" for status in statuses)
+        else "partial"
+    )
+    details["status"] = status
+    details["reason"] = "no_authorization" if not statuses else "authorization_health_only"
+    return status, details
 
-    if not account_statuses:
-        run_status = "skipped"
-    elif all(status == "failed" for status in account_statuses):
-        run_status = "failed"
-    elif all(status == "succeeded" for status in account_statuses) and all(
-        account.get("coverage_complete") is True
-        and account.get("pagination_complete") is True
-        and account.get("materialization_complete") is True
-        for account in accounts
-    ):
-        run_status = "succeeded"
-    else:
-        run_status = "partial"
-    details["status"] = run_status
-    return run_status, details
+
+_DOUYIN_ACCOUNT_AUTHORIZATION_FAULT = "account_authorization"
+_DOUYIN_ACCOUNT_AUTHORIZATION_REASONS = frozenset(
+    {"reauthorization_required", "refresh_expired", "access_expired"}
+)
+_DOUYIN_AUTHORIZATION_STATE_FIELDS = (
+    "account_id",
+    "platform_uid",
+    "needs_reauthorization",
+    "access_expires_at",
+    "refresh_expires_at",
+    "reason",
+)
+
+
+def _synchronize_douyin_authorization_faults(
+    connection: sqlite3.Connection,
+    *,
+    claim: RunClaim,
+    details: Mapping[str, Any],
+) -> None:
+    """Project validated health into isolated, append-only authorization faults."""
+
+    from .provider_budget import fault_state, record_fault_state, resolve_fault_state
+
+    captured_at = str(details["captured_at"])
+    for account in details["accounts"]:
+        # A roster/authorization identity mismatch is a contract fault.  It must
+        # neither open nor close the token state for either identity.
+        if not account["identity_matches"]:
+            continue
+        authorization_id = str(account["authorization_id"])
+        current = fault_state(
+            connection,
+            scope_kind="authorization_hard",
+            provider="douyin_openapi",
+            authorization_id=authorization_id,
+            fault_class=_DOUYIN_ACCOUNT_AUTHORIZATION_FAULT,
+        )
+        reason = str(account["reason"])
+        if account["status"] == "available":
+            if current is not None and current.get("open") is True:
+                resolve_fault_state(
+                    connection,
+                    scope_kind="authorization_hard",
+                    provider="douyin_openapi",
+                    authorization_id=authorization_id,
+                    fault_class=_DOUYIN_ACCOUNT_AUTHORIZATION_FAULT,
+                    expected_generation=str(current["generation"]),
+                    expected_fingerprint=str(current["state_fingerprint"]),
+                    evidence_id=claim.scheduler_run_id,
+                    at=captured_at,
+                )
+            continue
+        if reason not in _DOUYIN_ACCOUNT_AUTHORIZATION_REASONS:
+            continue
+        state = {field: account[field] for field in _DOUYIN_AUTHORIZATION_STATE_FIELDS}
+        current_evidence = current.get("state_evidence") if current is not None else None
+        # Preserve one generation while the authorization state is unchanged.
+        # The run that first proved that state remains its source receipt.
+        if (
+            current is not None
+            and current.get("open") is True
+            and isinstance(current_evidence, Mapping)
+            and all(current_evidence.get(field) == value for field, value in state.items())
+        ):
+            continue
+        record_fault_state(
+            connection,
+            scope_kind="authorization_hard",
+            provider="douyin_openapi",
+            authorization_id=authorization_id,
+            fault_class=_DOUYIN_ACCOUNT_AUTHORIZATION_FAULT,
+            reason=reason,
+            usage_id=None,
+            at=captured_at,
+            state_evidence={**state, "scheduler_run_id": claim.scheduler_run_id},
+        )
 
 
 def execute_douyin_openapi_reconcile(
@@ -1023,7 +1075,9 @@ def execute_douyin_openapi_reconcile(
     runner: Optional[DouyinOpenApiRunner] = None,
     allow_retry: bool = False,
 ) -> Dict[str, Any]:
-    """Execute the independent OpenAPI occurrence outside the fixed pipeline."""
+    """Claim a versioned authorization check, never an old content receipt."""
+
+    from .douyin_openapi_sync import AUTHORIZATION_CONTRACT_VERSION
 
     if runner is None and not _default_douyin_openapi_environment_present():
         return {
@@ -1031,12 +1085,18 @@ def execute_douyin_openapi_reconcile(
             "status": "deferred",
             "reason": "douyin_sync_environment_not_installed",
         }
+    logical_occurrence = latest_occurrence(
+        JobDefinition(DOUYIN_OPENAPI_RECONCILE_JOB_ID, DOUYIN_OPENAPI_RECONCILE_HOUR, 0),
+        scheduled_for,
+    )
+    logical_key = _scheduled_iso(logical_occurrence)
     claim = _claim_run(
         DOUYIN_OPENAPI_RECONCILE_JOB_ID,
         scheduled_for,
         db_path=db_path,
         allow_retry=allow_retry,
         invocation_source="scheduled",
+        occurrence_key=f"{AUTHORIZATION_CONTRACT_VERSION}:{logical_key}",
     )
     if claim is None:
         return {
@@ -1049,15 +1109,30 @@ def execute_douyin_openapi_reconcile(
         if not isinstance(raw_details, Mapping):
             raise SchedulerJobError("Douyin OpenAPI runner must return an object")
         status, details = _validate_douyin_openapi_details(raw_details)
+        details["scheduled_for"] = _scheduled_iso(scheduled_for)
+        details["logical_scheduled_for"] = logical_key
     except Exception:
         _finish_run(
             claim,
             status="failed",
-            details={"error_code": "douyin_openapi_reconcile_failed"},
+            details={"contract_version": AUTHORIZATION_CONTRACT_VERSION,
+                     "scheduled_for": _scheduled_iso(scheduled_for),
+                     "logical_scheduled_for": logical_key,
+                     "error_code": "douyin_openapi_reconcile_failed"},
             db_path=db_path,
         )
         raise
-    _finish_run(claim, status=status, details=details, db_path=db_path)
+    _finish_run(
+        claim,
+        status=status,
+        details=details,
+        db_path=db_path,
+        transaction_effect=lambda connection: _synchronize_douyin_authorization_faults(
+            connection,
+            claim=claim,
+            details=details,
+        ),
+    )
     return {
         "job_id": DOUYIN_OPENAPI_RECONCILE_JOB_ID,
         "status": status,
@@ -1192,6 +1267,12 @@ def _select_due_capture_contents(
               ) last_capture_touched_at
             FROM content_items c JOIN accounts a ON a.id=c.account_id
             WHERE a.enabled=1 AND c.platform IN ('douyin','xiaohongshu')
+              AND EXISTS (
+                SELECT 1 FROM account_roster_members m
+                JOIN account_platform_identities i ON i.id=m.account_identity_id
+                WHERE m.snapshot_id=(SELECT MAX(id) FROM account_roster_snapshots)
+                  AND i.account_id=c.account_id AND i.platform=c.platform
+              )
             """
         ).fetchall()
         slots = connection.execute(
@@ -1349,7 +1430,7 @@ def _douyin_openapi_receipts_for_day(
             """
             SELECT status,details_json FROM scheduler_runs
             WHERE job_id=? AND scheduled_for=?
-            """,
+            """ + durable_runs.root_run_predicate(connection),
             (
                 DOUYIN_OPENAPI_RECONCILE_JOB_ID,
                 _scheduled_iso(occurrence),
@@ -1477,14 +1558,8 @@ def run_due_capture(
     local_day = scheduled_for.astimezone(SHANGHAI).date()
     task_id = f"daily-capture-{local_day.isoformat()}-bjt"
     with connect(db_path) as connection:
-        identities = connection.execute(
-            """
-            SELECT api.*, a.enabled FROM account_platform_identities api
-            JOIN accounts a ON a.id=api.account_id
-            WHERE a.enabled=1 AND api.platform IN ('douyin','xiaohongshu')
-            ORDER BY api.account_id, api.platform
-            """
-        ).fetchall()
+        identities = [member for member in get_current_members(connection, enabled_only=True)
+                      if member["platform"] in {"douyin", "xiaohongshu"}]
     if not identities:
         return {
             "status": "skipped",
@@ -1501,21 +1576,7 @@ def run_due_capture(
         local_day - timedelta(days=1), time.min, SHANGHAI
     ).astimezone(timezone.utc)
     discovery_end = scheduled_for.astimezone(timezone.utc)
-    openapi_receipts = _douyin_openapi_receipts_for_day(
-        local_day,
-        db_path=db_path,
-        required_start=discovery_start,
-        required_end=discovery_end,
-    )
     for identity in identities:
-        openapi_receipt = openapi_receipts.get(
-            (int(identity["account_id"]), str(identity["uid"]))
-        )
-        if str(identity["platform"]) == "douyin" and openapi_receipt is not None:
-            discovery.append(
-                _synthetic_openapi_discovery(identity, openapi_receipt)
-            )
-            continue
         if capture_circuit.is_set():
             discovery.append(
                 {
@@ -1544,34 +1605,23 @@ def run_due_capture(
             )
             page = None
             page_error: Optional[Exception] = None
-            for attempt_number in range(1, DAILY_CAPTURE_MAX_ATTEMPTS + 1):
-                try:
-                    page = discover_account_content(
-                        int(identity["account_id"]),
-                        str(identity["platform"]),
-                        str(identity["uid"]),
-                        as_of=local_day,
-                        cursor=cursor,
-                        window_key=window_key,
-                        published_start=discovery_start,
-                        published_end=discovery_end,
-                        db_path=db_path,
-                        call_override=call_override,
-                        task_id=task_id,
-                        task_max_amount=max_amount,
-                    )
-                    page_error = None
-                    break
-                except Exception as exc:
-                    page_error = exc
-                    should_retry = bool(getattr(exc, "retryable", False)) and (
-                        getattr(exc, "error_code", "")
-                        not in CAPTURE_CIRCUIT_BREAK_CODES
-                    )
-                    if not should_retry or attempt_number >= DAILY_CAPTURE_MAX_ATTEMPTS:
-                        break
-                    if call_override is None:
-                        time_module.sleep(DAILY_CAPTURE_RETRY_DELAY_SECONDS)
+            try:
+                page = discover_account_content(
+                    int(identity["account_id"]),
+                    str(identity["platform"]),
+                    str(identity["uid"]),
+                    as_of=local_day,
+                    cursor=cursor,
+                    window_key=window_key,
+                    published_start=discovery_start,
+                    published_end=discovery_end,
+                    db_path=db_path,
+                    call_override=call_override,
+                    task_id=task_id,
+                    task_max_amount=max_amount,
+                )
+            except Exception as exc:
+                page_error = exc
             if page_error is not None or page is None:
                 page_failure = page_error or SchedulerJobError("账号发现未返回结果")
                 error_code = getattr(
@@ -1639,6 +1689,12 @@ def run_due_capture(
                 SELECT COUNT(*)
                 FROM content_items c JOIN accounts a ON a.id=c.account_id
                 WHERE a.enabled=1 AND c.platform IN ('douyin','xiaohongshu')
+                  AND EXISTS (
+                    SELECT 1 FROM account_roster_members m
+                    JOIN account_platform_identities i ON i.id=m.account_identity_id
+                    WHERE m.snapshot_id=(SELECT MAX(id) FROM account_roster_snapshots)
+                      AND i.account_id=c.account_id AND i.platform=c.platform
+                  )
                 """
             ).fetchone()[0]
         )
@@ -1652,7 +1708,6 @@ def run_due_capture(
     metrics_targets = [dict(c) for c in contents if c["metrics_needed"]]
     metrics_refreshed: set[int] = set()
     metrics_attempted: set[int] = set()
-    metrics_retry_ids: set[int] = set()
     metrics_first_results: List[Dict[str, Any]] = []
     metrics_first_summary = {
         "attempted": len(metrics_targets),
@@ -1720,13 +1775,7 @@ def run_due_capture(
                 metrics_first_summary[error_code] += 1
             else:
                 metrics_first_summary["failed"] += 1
-            retryable = bool((metric_stage or {}).get("retryable"))
-            if (
-                (retryable or error_code == "budget_blocked")
-                and error_code not in CAPTURE_CIRCUIT_BREAK_CODES
-            ):
-                metrics_retry_ids.add(content_id)
-    # ---- 指标优先段结束；未刷成功的指标在主循环里按剩余总预算继续尝试 ----
+    # ---- 指标优先段结束；已发送失败只进入补偿授权，不在主循环重买 ----
 
     def update_one_content(content: Mapping[str, Any]) -> Dict[str, Any]:
         if capture_circuit.is_set():
@@ -1769,93 +1818,6 @@ def run_due_capture(
     ) as pool:
         content_updates = list(pool.map(update_one_content, map(dict, contents)))
 
-    retry_targets: List[tuple[int, Dict[str, Any], List[str]]] = []
-    for index, (content, result) in enumerate(zip(contents, content_updates)):
-        retry_stages = sorted(
-            {
-                str(stage["stage"])
-                for stage in result.get("stages", [])
-                if stage.get("status") == "failed"
-                and stage.get("retryable") is True
-                and stage.get("error_code") not in CAPTURE_CIRCUIT_BREAK_CODES
-                and stage.get("stage") in {"detail", "metrics", "comments"}
-            }
-        )
-        if int(content["id"]) in metrics_retry_ids and "metrics" not in retry_stages:
-            retry_stages = sorted({*retry_stages, "metrics"})
-        if retry_stages:
-            retry_targets.append((index, dict(content), retry_stages))
-
-    if retry_targets:
-        if call_override is None:
-            time_module.sleep(DAILY_CAPTURE_RETRY_DELAY_SECONDS)
-
-        def retry_content_stages(
-            target: tuple[int, Dict[str, Any], List[str]],
-        ) -> tuple[int, Dict[str, Any]]:
-            index, content, retry_stages = target
-            initial = content_updates[index]
-            try:
-                retry_result = update_content_data(
-                    int(content["id"]),
-                    as_of=local_day,
-                    db_path=db_path,
-                    call_override=call_override,
-                    stages=retry_stages,
-                    process_media=False,
-                    task_id=task_id,
-                    task_max_amount=max_amount,
-                )
-            except Exception as exc:
-                error_code = getattr(exc, "error_code", type(exc).__name__)
-                capture_circuit.record(error_code)
-                return index, {
-                    **initial,
-                    "retry_error_code": str(error_code),
-                    "retry_error_message": str(exc)[:500],
-                }
-            capture_circuit.record_result(retry_result)
-            retried_by_stage = {
-                str(stage["stage"]): stage for stage in retry_result.get("stages", [])
-            }
-            initial_stage_rows = initial.get("stages", []) or []
-            initial_stage_names = {
-                str(stage.get("stage")) for stage in initial_stage_rows
-            }
-            merged_stages = [
-                retried_by_stage.get(str(stage.get("stage")), stage)
-                for stage in initial_stage_rows
-            ] + [
-                row
-                for name, row in retried_by_stage.items()
-                if name not in initial_stage_names
-            ]
-            remaining_failed = any(
-                stage.get("status") == "failed" for stage in merged_stages
-            )
-            return index, {
-                **initial,
-                "status": "partial" if remaining_failed else "succeeded",
-                "stages": merged_stages,
-                "provider_cost": round(
-                    float(initial.get("provider_cost") or 0)
-                    + float(retry_result.get("provider_cost") or 0),
-                    6,
-                ),
-            }
-
-        retry_workers = min(DAILY_CAPTURE_WORKERS, len(retry_targets))
-        with ThreadPoolExecutor(
-            max_workers=retry_workers, thread_name_prefix="dcar-capture-retry"
-        ) as pool:
-            for index, retry_result in pool.map(retry_content_stages, retry_targets):
-                content_updates[index] = retry_result
-                if any(
-                    stage.get("stage") == "metrics"
-                    and stage.get("status") == "succeeded"
-                    for stage in retry_result.get("stages", [])
-                ):
-                    metrics_refreshed.add(int(contents[index]["id"]))
     unresolved_metrics = {
         int(content["id"]) for content in metrics_targets
     } - metrics_refreshed
@@ -2022,6 +1984,12 @@ def daily_capture_quality_gate(details: Mapping[str, Any]) -> Dict[str, Any]:
         )
         or 0
     )
+    metrics_first = details.get("metrics_first") or {}
+    metrics_unresolved = (
+        max(0, int(metrics_first.get("final_unresolved") or 0))
+        if isinstance(metrics_first, Mapping)
+        else 0
+    )
     ledger_exactly_matches_reported = abs(reported_cost - ledger_cost) <= 1e-6
     checks = {
         "accounts_complete": len(discovery) == monitored_accounts,
@@ -2042,6 +2010,7 @@ def daily_capture_quality_gate(details: Mapping[str, Any]) -> Dict[str, Any]:
         ),
         "budget_contract_unblocked": budget_fatal_count == 0,
         "successful_operations_present": successful_operations > 0,
+        "metrics_complete": metrics_unresolved == 0,
         "ledger_source_present": ledger_source_present,
         "budget_declaration_present": budget_declaration_present,
         # provider_usage is the authoritative billed ledger. Per-operation
@@ -2067,6 +2036,7 @@ def daily_capture_quality_gate(details: Mapping[str, Any]) -> Dict[str, Any]:
         "monitored_accounts": monitored_accounts,
         "content_succeeded": content_succeeded,
         "monitored_contents": monitored_contents,
+        "metrics_unresolved": metrics_unresolved,
         "discovery_threshold_percent": DAILY_CAPTURE_DISCOVERY_QUALITY_PERCENT,
         "content_threshold_percent": DAILY_CAPTURE_CONTENT_QUALITY_PERCENT,
         "declared_budget_max_amount": budget_max,
@@ -2213,6 +2183,11 @@ def _retry_terminal_report_task_if_stale(
     retry_started_at: Optional[datetime],
     db_path: Path,
 ) -> None:
+    with connect(db_path) as connection:
+        if connection.execute("SELECT 1 FROM task_events WHERE task_id=? AND event_type='report_inputs_v1'", (task["id"],)).fetchone() or connection.execute(
+            "SELECT 1 FROM report_revisions WHERE task_id=? AND contract_version='dcar-content-operations-report-v8.7' AND invalidated_at IS NULL", (task["id"],)
+        ).fetchone():
+            return  # Late evidence belongs in a new-cutoff correction task.
     if retry_started_at is None or str(task["task_status"]) not in {
         "succeeded",
         "partial",
@@ -2401,6 +2376,8 @@ def execute_job(
             raise SchedulerJobError(
                 "terminal downstream retry requires allow_retry=True"
             )
+    if job_id in REPORT_JOB_IDS and not within_automatic_scope(_report_period(job_id, scheduled_for)[0].isoformat()):
+        return {"job_id": job_id, "status": "skipped", "reason": "automatic_before_start"}
     if job_id == "weekly_report":
         dependency = _weekly_daily_dependency(scheduled_for, db_path=db_path)
         if not dependency["ready"]:
@@ -2534,6 +2511,16 @@ def _current_day_pipeline_guard_job(
     )
 
 
+def _has_authorization_health_run(*, db_path: Path) -> bool:
+    from .douyin_openapi_sync import AUTHORIZATION_CONTRACT_VERSION
+
+    with connect(db_path) as connection:
+        return connection.execute(
+            "SELECT 1 FROM scheduler_runs WHERE job_id=? AND scheduled_for LIKE ? LIMIT 1",
+            (DOUYIN_OPENAPI_RECONCILE_JOB_ID, AUTHORIZATION_CONTRACT_VERSION + ":%"),
+        ).fetchone() is not None
+
+
 def _douyin_openapi_live_job(
     *,
     db_path: Path,
@@ -2544,7 +2531,10 @@ def _douyin_openapi_live_job(
         DOUYIN_OPENAPI_RECONCILE_HOUR,
         0,
     )
-    occurrence = latest_occurrence(definition, datetime.now(SHANGHAI))
+    now = datetime.now(SHANGHAI)
+    if runner is None and not _default_douyin_openapi_environment_present():
+        return
+    occurrence = latest_occurrence(definition, now) if _has_authorization_health_run(db_path=db_path) else now
     execute_douyin_openapi_reconcile(
         occurrence,
         db_path=db_path,
@@ -2562,6 +2552,14 @@ def douyin_openapi_reconcile_guard(
     local_now = now.astimezone(SHANGHAI)
     if local_now.date() < effective_from:
         return {"status": "before_effective_date"}
+    if runner is None and not _default_douyin_openapi_environment_present():
+        return execute_douyin_openapi_reconcile(local_now, db_path=db_path)
+    if not _has_authorization_health_run(db_path=db_path):
+        # The immediate startup guard creates the first new-contract check at
+        # the actual cutover time, even when an old same-day receipt succeeded.
+        return execute_douyin_openapi_reconcile(
+            local_now, db_path=db_path, runner=runner, allow_retry=True,
+        )
     occurrence = datetime.combine(
         local_now.date(),
         time(DOUYIN_OPENAPI_RECONCILE_HOUR, 0),
@@ -2602,102 +2600,15 @@ def install_jobs(
     reconcile_effective_date: date,
     douyin_openapi_runner: Optional[DouyinOpenApiRunner] = None,
 ) -> None:
-    for job in JOBS:
-        callback: Callable[..., None]
-        if job.job_id == "daily_capture":
-            callback = _daily_capture_guard_job
-            kwargs = {
-                "effective_from": reconcile_effective_date,
-                "db_path": db_path,
-                "reports_root": reports_root,
-                "capture_call_override": capture_call_override,
-            }
-        else:
-            callback = _current_day_pipeline_guard_job
-            kwargs = {
-                "effective_from": reconcile_effective_date,
-                "db_path": db_path,
-                "reports_root": reports_root,
-                "capture_call_override": capture_call_override,
-            }
-        trigger_minute = (
-            DAILY_CAPTURE_START_DELAY_MINUTES
-            if job.job_id == "daily_capture"
-            else job.minute
-        )
-        scheduler.add_job(
-            callback,
-            CronTrigger(
-                hour=job.hour,
-                minute=trigger_minute,
-                day_of_week=job.day_of_week,
-                timezone=SHANGHAI,
-            ),
-            id=job.job_id,
-            replace_existing=True,
-            kwargs=kwargs,
-            coalesce=True,
-            max_instances=1,
-            misfire_grace_time=3600,
-        )
-    scheduler.add_job(
-        _douyin_openapi_live_job,
-        CronTrigger(
-            hour=DOUYIN_OPENAPI_RECONCILE_HOUR,
-            minute=0,
-            timezone=SHANGHAI,
-        ),
-        id=DOUYIN_OPENAPI_RECONCILE_JOB_ID,
-        replace_existing=True,
-        kwargs={
-            "db_path": db_path,
-            "runner": douyin_openapi_runner,
-        },
-        coalesce=True,
-        max_instances=1,
-        misfire_grace_time=3600,
-    )
-    scheduler.add_job(
-        _douyin_openapi_reconcile_guard_job,
-        IntervalTrigger(hours=1, timezone=SHANGHAI),
-        id=DOUYIN_OPENAPI_RECONCILE_GUARD_JOB_ID,
-        replace_existing=True,
-        kwargs={
-            "effective_from": reconcile_effective_date,
-            "db_path": db_path,
-            "runner": douyin_openapi_runner,
-        },
-        next_run_time=datetime.now(SHANGHAI),
-        coalesce=True,
-        max_instances=1,
-        misfire_grace_time=None,
-    )
-    scheduler.add_job(
-        _current_day_pipeline_guard_job,
-        IntervalTrigger(hours=1, timezone=SHANGHAI),
-        id="daily_capture_reconcile",
-        replace_existing=True,
-        kwargs={
-            "effective_from": reconcile_effective_date,
-            "db_path": db_path,
-            "reports_root": reports_root,
-            "capture_call_override": capture_call_override,
-        },
-        next_run_time=datetime.now(SHANGHAI),
-        coalesce=True,
-        max_instances=1,
-        misfire_grace_time=None,
-    )
-    scheduler.add_job(
-        _report_reconcile_job,
-        IntervalTrigger(hours=1, timezone=SHANGHAI),
-        id="report_reconcile",
-        replace_existing=True,
-        kwargs={"db_path": db_path, "reports_root": reports_root},
-        next_run_time=datetime.now(SHANGHAI),
-        coalesce=True,
-        max_instances=1,
-        misfire_grace_time=None,
+    # Keep the public construction contract while retiring all old acquisition
+    # registrations. Historical helpers remain available to read old receipts.
+    from .pipeline import install_pipeline_jobs
+
+    install_pipeline_jobs(
+        scheduler, db_path=db_path, reports_root=reports_root,
+        call_override=capture_call_override,
+        authorization_runner=douyin_openapi_runner,
+        authorization_effective_date=reconcile_effective_date,
     )
 
 
@@ -2740,18 +2651,24 @@ def _report_duplicate_input_retry_before(
             """
             SELECT status,completed_at FROM scheduler_runs
             WHERE job_id=? AND scheduled_for=?
-            """,
+            """ + durable_runs.root_run_predicate(connection),
             (job_id, _scheduled_iso(occurrence)),
         ).fetchone()
         task_type = "daily" if job_id == "daily_report" else "weekly"
         task = connection.execute(
             """
-            SELECT task_status,completed_at FROM report_tasks
+            SELECT id,task_status,completed_at FROM report_tasks
             WHERE task_type=? AND period_start=? AND period_end=?
               AND creation_source='automatic'
             """,
             (task_type, period_start.isoformat(), period_end.isoformat()),
         ).fetchone()
+        if task is not None and (connection.execute(
+            "SELECT 1 FROM task_events WHERE task_id=? AND event_type='report_inputs_v1'", (task["id"],)
+        ).fetchone() or connection.execute(
+            "SELECT 1 FROM report_revisions WHERE task_id=? AND contract_version='dcar-content-operations-report-v8.7' AND invalidated_at IS NULL", (task["id"],)
+        ).fetchone()):
+            return None
         watermark = connection.execute(
             """
             SELECT MAX(changed_at) FROM (
@@ -2806,11 +2723,14 @@ def _report_duplicate_input_retry_before(
 
 
 def _report_catchup_occurrences(
-    *, current: datetime, db_path: Path
+    *, current: datetime, db_path: Path, effective_from: date | None = None,
 ) -> List[tuple[str, datetime]]:
-    """Return due failed/interrupted and natural-day missing report slots."""
+    """Recover only reports whose entire data period belongs to automation."""
 
     current = current.astimezone(SHANGHAI)
+    effective_from = effective_from or automatic_from_date()
+    if effective_from is not None and current.date() < effective_from:
+        return []
     candidates: set[tuple[str, datetime]] = set()
     with connect(db_path) as connection:
         for row in connection.execute(
@@ -2854,6 +2774,10 @@ def _report_catchup_occurrences(
         )
         if daily_anchor is None:
             daily_anchor = latest_daily.date() - timedelta(days=1)
+        if effective_from is not None:
+            # Missing source data is itself reportable: enumerate every closed
+            # business day owned by this deployment, including empty days.
+            daily_anchor = effective_from
         existing = {
             (str(row["job_id"]), str(row["scheduled_for"]))
             for row in connection.execute(
@@ -2863,7 +2787,7 @@ def _report_catchup_occurrences(
                 """
             )
         }
-        if observation_anchor is not None:
+        if observation_anchor is not None or effective_from is not None:
             report_days: List[date] = []
             report_day = daily_anchor
             latest_report_day = latest_daily.date() - timedelta(days=1)
@@ -2895,7 +2819,7 @@ def _report_catchup_occurrences(
             ):
                 candidates.add(("daily_report", occurrence))
 
-        if observation_anchor is not None:
+        if observation_anchor is not None or effective_from is not None:
             week_starts = []
             week_start = daily_anchor - timedelta(days=daily_anchor.weekday())
             while _report_occurrence(
@@ -2940,7 +2864,9 @@ def _report_catchup_occurrences(
         occurrence = datetime.fromisoformat(
             scheduled_for.replace("Z", "+00:00")
         ).astimezone(SHANGHAI)
-        if occurrence > current:
+        if occurrence > current or (
+            effective_from is not None and _report_period(job_id, occurrence)[0] < effective_from
+        ):
             continue
         if _report_duplicate_input_retry_before(
             job_id, occurrence, db_path=db_path
@@ -2951,8 +2877,9 @@ def _report_catchup_occurrences(
         (
             (job_id, occurrence)
             for job_id, occurrence in candidates
-            if (job_id, _scheduled_iso(occurrence)) not in terminal
-            or (job_id, _scheduled_iso(occurrence)) in stale_terminal
+            if (effective_from is None or _report_period(job_id, occurrence)[0] >= effective_from)
+            and ((job_id, _scheduled_iso(occurrence)) not in terminal
+                 or (job_id, _scheduled_iso(occurrence)) in stale_terminal)
         ),
         key=lambda item: (item[1], item[0]),
     )
@@ -2963,29 +2890,31 @@ def startup_catchup(
     now: Optional[datetime] = None,
     db_path: Path = DEFAULT_DB,
     reports_root: Path = REPORTS_ROOT,
+    effective_from: date | None = None,
 ) -> List[Dict[str, Any]]:
     """Catch up report-only occurrences; this path never runs provider/media jobs."""
 
     current = (now or datetime.now(SHANGHAI)).astimezone(SHANGHAI)
     results: List[Dict[str, Any]] = []
     for job_id, occurrence in _report_catchup_occurrences(
-        current=current, db_path=db_path
+        current=current, db_path=db_path, effective_from=effective_from,
     ):
         try:
-            retry_terminal_if_completed_before = (
-                _report_duplicate_input_retry_before(
-                    job_id, occurrence, db_path=db_path
+            with automatic_scope(effective_from), PIPELINE_REPORT_EXECUTION_LOCK:
+                retry_terminal_if_completed_before = (
+                    _report_duplicate_input_retry_before(
+                        job_id, occurrence, db_path=db_path
+                    )
                 )
-            )
-            result = execute_job(
-                job_id,
-                occurrence,
-                db_path=db_path,
-                reports_root=reports_root,
-                allow_retry=True,
-                invocation_source="startup_report_catchup",
-                retry_terminal_if_completed_before=retry_terminal_if_completed_before,
-            )
+                result = execute_job(
+                    job_id,
+                    occurrence,
+                    db_path=db_path,
+                    reports_root=reports_root,
+                    allow_retry=True,
+                    invocation_source="startup_report_catchup",
+                    retry_terminal_if_completed_before=retry_terminal_if_completed_before,
+                )
             result["scheduled_for"] = _scheduled_iso(occurrence)
             results.append(result)
         except Exception as exc:
@@ -3000,9 +2929,12 @@ def startup_catchup(
     return results
 
 
-def _report_reconcile_job(*, db_path: Path, reports_root: Path) -> None:
+def _report_reconcile_job(
+    *, db_path: Path, reports_root: Path, effective_from: date | None = None,
+) -> None:
     startup_catchup(
         now=datetime.now(SHANGHAI),
         db_path=db_path,
         reports_root=reports_root,
+        effective_from=effective_from,
     )

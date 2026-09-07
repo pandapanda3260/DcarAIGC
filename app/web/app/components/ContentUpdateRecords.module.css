@@ -1,0 +1,34 @@
+.records { min-width: 0; border: 1px solid var(--line); border-radius: 8px; background: #fff; color: var(--ink); }
+.record { display: grid; grid-template-columns: minmax(0, 1fr) 112px 115px 112px; align-items: center; gap: 18px; padding: 16px 18px; border-bottom: 1px solid var(--line); }
+.record:last-child { border-bottom: 0; }
+.content { min-width: 0; }
+.content h3 { margin: 0; font-size: 13px; font-weight: 650; line-height: 1.6; overflow-wrap: anywhere; }
+.content p { margin: 5px 0 0; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.muted, .elapsed { color: var(--muted); }
+.warning { color: #986131; }
+.result { color: #43605e; }
+.status { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; min-width: 0; }
+.badge { display: inline-flex; align-items: center; gap: 5px; padding: 4px 7px; border-radius: 5px; background: #eaf5f3; color: #147b72; font-size: 11px; font-weight: 600; line-height: 1.5; }
+.badge[data-state="failed"], .badge[data-state="uncertain"], .badge[data-state="rejected"], .badge[data-state="partial"] { background: #fff1e4; color: #9c5a2d; }
+.badge[data-state="queued"]::before, .badge[data-state="running"]::before, .badge[data-state="submitting"]::before { content: ""; width: 6px; height: 6px; flex-shrink: 0; border-radius: 50%; background: currentColor; animation: pulse 1.6s ease-in-out infinite; }
+.stage { color: #54716e; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.elapsed { display: flex; flex-direction: column; gap: 6px; font-size: 11px; line-height: 1.5; }
+.elapsed small { font-size: 11px; }
+.actions { display: flex; justify-content: flex-end; }
+.actions a, .actions button { min-height: 32px; padding: 6px 10px; font-size: 12px; }
+.readError { margin: 14px 18px; padding: 10px 12px; border-radius: 6px; background: #fff6ed; color: #986131; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.empty { margin: 0; padding: 32px 18px; color: var(--muted); text-align: center; font-size: 13px; }
+@keyframes pulse { 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) { .badge::before { animation: none; } }
+@media (max-width: 1050px) {
+  .record { grid-template-columns: minmax(0, 1fr) 100px 100px; gap: 12px; }
+  .actions { grid-column: 2 / 4; }
+  .content { grid-row: 1 / 3; }
+}
+@media (max-width: 640px) {
+  .record { display: flex; flex-direction: column; align-items: stretch; gap: 10px; padding: 14px; }
+  .status { flex-direction: row; flex-wrap: wrap; align-items: center; }
+  .elapsed { flex-direction: row; flex-wrap: wrap; gap: 8px 16px; }
+  .actions { justify-content: flex-start; }
+  .readError { margin: 14px; }
+}

@@ -1,0 +1,11 @@
+{
+  "versions": [
+    16,
+    17
+  ],
+  "provenance": "Historic ALTER ADD columns, verified on P0 source v17 backup; neither table is rebuilt in 16-to-17.",
+  "tables": {
+    "provider_raw_responses": "CREATE TABLE provider_raw_responses (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    fetch_attempt_id INTEGER REFERENCES fetch_attempts(id) ON DELETE SET NULL,\n    content_id INTEGER REFERENCES content_items(id) ON DELETE CASCADE,\n    provider TEXT NOT NULL,\n    operation TEXT NOT NULL,\n    local_path TEXT NOT NULL,\n    sha256 TEXT NOT NULL,\n    byte_size INTEGER NOT NULL,\n    http_status INTEGER,\n    captured_at TEXT NOT NULL,\n    source TEXT NOT NULL DEFAULT 'live', account_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE,\n    UNIQUE(content_id, provider, operation, local_path, sha256)\n)",
+    "selling_points": "CREATE TABLE selling_points (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    taxonomy_id TEXT NOT NULL REFERENCES taxonomy_versions(id) ON DELETE CASCADE,\n    code TEXT NOT NULL,\n    tier TEXT NOT NULL CHECK(tier IN ('core','other')),\n    label TEXT NOT NULL,\n    definition TEXT NOT NULL DEFAULT '',\n    positive_evidence_json TEXT NOT NULL DEFAULT '[]',\n    negative_evidence_json TEXT NOT NULL DEFAULT '[]',\n    boundary_rules_json TEXT NOT NULL DEFAULT '[]',\n    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)), matcher_rule_json TEXT NOT NULL DEFAULT '{}',\n    UNIQUE(taxonomy_id, code)\n)"
+  }
+}

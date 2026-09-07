@@ -61,7 +61,7 @@ TERMINAL_STOP_REASONS = {
     "max_pages",
     "max_raw_comments",
 }
-SPAM_PATTERNS = (
+SPAM_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
         r"\b(?:vx|v信|v\+|wechat)\b",
@@ -71,7 +71,6 @@ SPAM_PATTERNS = (
         r"接推广|接广|商务合作|代理招募",
     )
 )
-SPAM_PATTERNS = tuple(SPAM_PATTERNS)
 
 
 class CollectorError(RuntimeError):
@@ -505,7 +504,8 @@ def normalize_content(
 ) -> dict[str, Any]:
     note_id = row["note_id"]
     note, container = find_note(payload, note_id)
-    user = note.get("user") if isinstance(note.get("user"), dict) else {}
+    user_value = note.get("user")
+    user = user_value if isinstance(user_value, dict) else {}
     if not user and isinstance(container.get("user"), dict):
         user = container["user"]
     author_id = first_value(user, ("userid", "id", "user_id", "userId"))
@@ -657,7 +657,8 @@ def normalize_comment(
     retrieval_order: int,
 ) -> dict[str, Any]:
     text = normalize_text(first_value(comment, ("content", "text", "comment")))
-    user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
+    user_value = comment.get("user")
+    user = user_value if isinstance(user_value, dict) else {}
     raw_user_id = first_value(user, ("userid", "id", "user_id", "userId"))
     user_hash = (
         store.digest(f"xiaohongshu:{note_id}:user", str(raw_user_id))
@@ -910,7 +911,8 @@ def collect_comments(
     comments_path = note_dir / "comments.jsonl"
     metadata_path = note_dir / "collection.json"
     metadata = read_json(metadata_path, {}) or {}
-    comments_meta = metadata.get("comments") if isinstance(metadata.get("comments"), dict) else {}
+    comments_meta_value = metadata.get("comments")
+    comments_meta = comments_meta_value if isinstance(comments_meta_value, dict) else {}
 
     if refresh:
         records: list[dict[str, Any]] = []
@@ -1030,7 +1032,8 @@ def collect_comments(
             write_jsonl(comments_path, records)
             write_json(metadata_path, metadata)
 
-            if stop_reason:
+            # A missing next cursor already sets stop_reason above.
+            if stop_reason or next_cursor is None:
                 break
             cursor = next_cursor
     except (RequestBudgetExceeded, FatalProviderError):
@@ -1071,8 +1074,10 @@ def collection_status(
     content: Mapping[str, Any] | None,
     metadata: Mapping[str, Any],
 ) -> dict[str, Any]:
-    comments = metadata.get("comments") if isinstance(metadata.get("comments"), dict) else {}
-    content_state = metadata.get("content") if isinstance(metadata.get("content"), dict) else {}
+    comments_value = metadata.get("comments")
+    comments = comments_value if isinstance(comments_value, dict) else {}
+    content_state_value = metadata.get("content")
+    content_state = content_state_value if isinstance(content_state_value, dict) else {}
     valid = safe_int(comments.get("valid_unique_commenters"))
     stop_reason = comments.get("stop_reason")
     status = comments.get("status")

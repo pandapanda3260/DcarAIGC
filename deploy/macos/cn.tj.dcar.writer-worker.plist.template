@@ -14,8 +14,9 @@
   <true/>
   <key>ThrottleInterval</key>
   <integer>300</integer>
+  <!-- This process also serves interactive workbench HTTP requests. -->
   <key>ProcessType</key>
-  <string>Background</string>
+  <string>Interactive</string>
 
   <key>WorkingDirectory</key>
   <string>__PROJECT_ROOT_XML__</string>
@@ -34,12 +35,14 @@
     <string>__PROJECT_ROOT_XML__/src/dcar_eval</string>
     <key>DCAR_PROJECT_ROOT</key>
     <string>__PROJECT_ROOT_XML__</string>
+    <key>DCAR_LOADED_BUILD_RECEIPT</key>
+    <string>__LOADED_BUILD_RECEIPT_XML__</string>
     <key>DCAR_WRITER_ENV_FILE</key>
     <string>__HOME_XML__/Library/Application Support/DcarAIGC/writer.env</string>
     <key>DCAR_V8_DB</key>
-    <string>__PROJECT_ROOT_XML__/app/data/dcar_insight.sqlite3</string>
+    <string>__HOME_XML__/Library/Application Support/DcarAIGC/data/dcar_insight.sqlite3</string>
     <key>DCAR_LEGACY_DB</key>
-    <string>__PROJECT_ROOT_XML__/app/data/web_mvp.sqlite3</string>
+    <string>__HOME_XML__/Library/Application Support/DcarAIGC/data/web_mvp.sqlite3</string>
     <key>DCAR_V8_REPORTS_ROOT</key>
     <string>__PROJECT_ROOT_XML__/reports/runs/v8</string>
     <key>DCAR_OPERATOR_FREEZE_LOCK</key>

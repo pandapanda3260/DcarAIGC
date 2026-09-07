@@ -50,6 +50,21 @@ display_effective_evaluations AS (
 """.strip()
 
 
+def display_effective_evaluations_cte_for(content_ids_relation: str) -> str:
+    """Limit the display projection to IDs supplied by a one-column relation."""
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", content_ids_relation) is None:
+        raise ValueError("content ID relation must be a simple SQL identifier")
+    return DISPLAY_EFFECTIVE_EVALUATIONS_CTE.replace(
+        "FROM evaluation_versions ev",
+        (
+            "FROM evaluation_versions ev\n"
+            f"    JOIN {content_ids_relation} selected_content_ids "
+            "ON selected_content_ids.id=ev.content_id"
+        ),
+        1,
+    )
+
+
 FORMAL_CURRENT_EVALUATIONS_CTE = """
 active_evaluation_release AS (
     SELECT id FROM evaluation_releases WHERE status='active'
@@ -213,6 +228,7 @@ def formal_eligible_release_evaluations(
     connection: sqlite3.Connection,
     release_id: str,
     content_ids: Sequence[int],
+    *, cutoff_at: str | None = None,
 ) -> dict[int, dict[str, Any]]:
     """Return report-safe evaluations for one pinned release.
 
@@ -231,7 +247,18 @@ def formal_eligible_release_evaluations(
         raise EvaluationSelectorError(
             f"evaluation release does not exist: {release_id}"
         )
-    evaluations = release_current_evaluations(connection, release_id, content_ids)
+    if cutoff_at is None:
+        evaluations = release_current_evaluations(connection, release_id, content_ids)
+    else:
+        evaluations = {cid: row for cid, row in formal_as_of_evaluations(
+            connection, content_ids, report_cutoff_at=cutoff_at).items() if row["release_id"] == release_id}
+        # evaluated_at alone cannot prove that a late/backdated envelope was
+        # already present. Both evidence establishment and insertion must fit.
+        evaluations = {cid: row for cid, row in evaluations.items() if connection.execute(
+            "SELECT 1 FROM evidence_envelopes WHERE id=? AND content_id=? AND evidence_sha256=? "
+            "AND julianday(created_at)<=julianday(?)",
+            (row["evidence_envelope_id"], cid, row["evidence_sha256"], cutoff_at),
+        ).fetchone() is not None}
     if not evaluations:
         return {}
     base_eligible = {

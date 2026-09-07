@@ -7,6 +7,7 @@ import unittest
 import zipfile
 from pathlib import Path
 
+from v8.account_states import set_account_enabled
 from v8.operations import (
     CONTENT_CHILD_MERGE_POLICIES,
     IdentityConflictError,
@@ -16,6 +17,7 @@ from v8.operations import (
     import_accounts,
     import_contents,
     normalize_unknown_content_directions,
+    update_account,
     update_content,
     upsert_account,
     upsert_content,
@@ -119,7 +121,7 @@ class V8OperationsTest(unittest.TestCase):
         self.assertEqual(rows[0]["title"], "'=HYPERLINK(\"https://example.invalid\")")
         self.assertEqual(rows[0]["account_name"], "'@SUM(1,1)")
 
-    def test_phone_is_the_account_upsert_key_and_new_import_overwrites(self) -> None:
+    def test_identity_is_the_upsert_key_and_duplicate_phones_do_not_merge(self) -> None:
         created = upsert_account(
             {
                 "phone": "13800138000",
@@ -183,12 +185,213 @@ class V8OperationsTest(unittest.TestCase):
         self.assertEqual(identity["real_name_status"], "no")
         self.assertEqual(identity["id"], identity_id)
         self.assertEqual(reference["reference_value"], "MS4w.cached")
+        other = upsert_account(
+            {"phone": "13800138000", "platforms": [{"platform": "douyin", "uid": "987654321"}]},
+            db_path=self.db,
+        )
+        self.assertNotEqual(other["id"], created["id"])
+        with connect(self.db) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM accounts WHERE phone_normalized='13800138000'"
+            ).fetchone()[0], 2)
+
+    def test_blank_phone_uses_platform_identity_without_merging_accounts(self) -> None:
+        first_value = {
+            "phone": "",
+            "operator_name": "运营甲",
+            "platforms": [{"platform": "douyin", "uid": "without-phone-a"}],
+        }
+        first = upsert_account(first_value, db_path=self.db)
+        second = upsert_account(
+            {"platforms": [{"platform": "douyin", "uid": "without-phone-b"}]},
+            db_path=self.db,
+        )
+        repeated = upsert_account(first_value, db_path=self.db)
+        self.assertNotEqual(first["id"], second["id"])
+        self.assertEqual(repeated, {"id": first["id"], "action": "updated"})
+        with connect(self.db) as connection:
+            rows = connection.execute(
+                "SELECT phone,phone_normalized FROM accounts ORDER BY id"
+            ).fetchall()
+        self.assertEqual([tuple(row) for row in rows], [("", None), ("", None)])
+        with self.assertRaisesRegex(OperationError, "至少填写一个平台"):
+            upsert_account({"phone": ""}, db_path=self.db)
+        with self.assertRaisesRegex(OperationError, "7 到 20"):
+            upsert_account({**first_value, "phone": "not-a-phone"}, db_path=self.db)
+
+    def test_adding_phone_keeps_separate_platform_accounts_and_operating_fields(self) -> None:
+        created = upsert_account(
+            {
+                "operator_name": "运营甲",
+                "platforms": [
+                    {"platform": "douyin", "uid": "phone-later"},
+                ],
+            },
+            db_path=self.db,
+        )
+        updated = update_account(
+            created["id"], {"phone": "13800138009"}, db_path=self.db
+        )
+        self.assertEqual(updated["id"], created["id"])
+        other = upsert_account(
+            {"phone": "13800138009", "platforms": [{"platform": "xiaohongshu", "uid": "xhs-phone-later"}]},
+            db_path=self.db,
+        )
+        self.assertNotEqual(other["id"], created["id"])
+        repeated = upsert_account(
+            {"phone": "", "platforms": [{"platform": "douyin", "uid": "phone-later"}]},
+            db_path=self.db,
+        )
+        self.assertEqual(repeated["id"], created["id"])
+        with connect(self.db) as connection:
+            account = connection.execute("SELECT * FROM accounts").fetchone()
+            identities = connection.execute(
+                "SELECT platform,uid FROM account_platform_identities ORDER BY platform"
+            ).fetchall()
+        self.assertEqual(account["phone"], "13800138009")
+        self.assertEqual(account["phone_normalized"], "13800138009")
+        self.assertEqual(account["operator_name"], "运营甲")
+        self.assertEqual(len(identities), 2)
+        update_account(created["id"], {"phone": None}, db_path=self.db)
+        with connect(self.db) as connection:
+            account = connection.execute("SELECT * FROM accounts").fetchone()
+        self.assertEqual(account["phone"], "")
+        self.assertIsNone(account["phone_normalized"])
+
+    def test_enabled_update_appends_account_state_event(self) -> None:
+        created = upsert_account(
+            {
+                "operator_name": "before",
+                "platforms": [{"platform": "douyin", "uid": "enabled-event"}],
+            },
+            db_path=self.db,
+        )
+        update_account(
+            created["id"],
+            {"enabled": False},
+            db_path=self.db,
+            actor="api-operator",
+            reason="pause by operator",
+        )
+        with connect(self.db) as connection:
+            account = connection.execute(
+                "SELECT enabled FROM accounts WHERE id=?", (created["id"],)
+            ).fetchone()
+            event = connection.execute(
+                """SELECT e.* FROM account_state_events e
+                   JOIN account_platform_identities i
+                     ON i.id=e.account_identity_id
+                   WHERE i.account_id=?""",
+                (created["id"],),
+            ).fetchone()
+        self.assertEqual(account["enabled"], 0)
+        self.assertEqual(event["old_enabled"], 1)
+        self.assertEqual(event["new_enabled"], 0)
+        self.assertEqual(event["actor"], "api-operator")
+        self.assertEqual(event["reason"], "pause by operator")
+
+    def test_enabled_event_failure_rolls_back_other_account_edits(self) -> None:
+        created = upsert_account(
+            {
+                "operator_name": "before",
+                "platforms": [{"platform": "douyin", "uid": "enabled-rollback"}],
+            },
+            db_path=self.db,
+        )
+        with connect(self.db) as connection:
+            identity_id = int(
+                connection.execute(
+                    "SELECT id FROM account_platform_identities WHERE account_id=?",
+                    (created["id"],),
+                ).fetchone()[0]
+            )
+            set_account_enabled(
+                connection,
+                identity_id,
+                enabled=False,
+                effective_at="2099-01-01T00:00:00Z",
+                created_at="2099-01-01T00:00:00Z",
+                actor="test",
+                reason="future ordered event",
+            )
+
+        with self.assertRaises(OperationError):
+            update_account(
+                created["id"],
+                {"enabled": True, "operator_name": "must roll back"},
+                db_path=self.db,
+            )
+        with connect(self.db) as connection:
+            account = connection.execute(
+                "SELECT enabled,operator_name FROM accounts WHERE id=?",
+                (created["id"],),
+            ).fetchone()
+            event_count = connection.execute(
+                "SELECT COUNT(*) FROM account_state_events WHERE account_identity_id=?",
+                (identity_id,),
+            ).fetchone()[0]
+        self.assertEqual(tuple(account), (0, "before"))
+        self.assertEqual(event_count, 1)
+
+    def test_shared_phone_is_allowed_but_identity_changes_leave_accounts_unchanged(self) -> None:
+        first = upsert_account(
+            {"phone": "13800138008", "platforms": [{"platform": "douyin", "uid": "first"}]},
+            db_path=self.db,
+        )
+        second = upsert_account(
+            {"platforms": [{"platform": "xiaohongshu", "uid": "second"}]},
+            db_path=self.db,
+        )
+        shared_phone = update_account(second["id"], {"phone": "13800138008"}, db_path=self.db)
+        self.assertEqual(shared_phone["id"], second["id"])
+        with connect(self.db) as connection:
+            before = {
+                table: [tuple(row) for row in connection.execute("SELECT * FROM " + table)]
+                for table in ("accounts", "account_platform_identities")
+            }
+        with self.assertRaises(OperationError):
+            upsert_account(
+                {"platforms": [
+                    {"platform": "douyin", "uid": "first"},
+                    {"platform": "xiaohongshu", "uid": "second"},
+                ]},
+                db_path=self.db,
+            )
+        with self.assertRaises(OperationError):
+            update_account(first["id"], {"platforms": [
+                {"platform": "xiaohongshu", "uid": "second"},
+            ]}, db_path=self.db)
+        with connect(self.db) as connection:
+            after = {
+                table: [tuple(row) for row in connection.execute("SELECT * FROM " + table)]
+                for table in before
+            }
+        self.assertEqual(after, before)
+
+    def test_blank_phone_import_deduplicates_only_matching_platform_uids(self) -> None:
+        result = import_accounts(
+            [
+                {"phone": "", "douyin_uid": "import-a", "operator_name": "旧"},
+                {"phone": "", "douyin_uid": "import-b", "operator_name": "乙"},
+                {"phone": "", "douyin_uid": "import-a", "operator_name": "新"},
+            ],
+            source_name="without-phones.csv",
+            db_path=self.db,
+        )
+        self.assertEqual(result["inserted_rows"], 2)
+        self.assertEqual(result["rejected_rows"], 1)
+        with connect(self.db) as connection:
+            rows = connection.execute(
+                "SELECT a.phone,a.phone_normalized,a.operator_name FROM accounts a "
+                "JOIN account_platform_identities i ON i.account_id=a.id ORDER BY i.uid"
+            ).fetchall()
+        self.assertEqual([tuple(row) for row in rows], [("", None, "新"), ("", None, "乙")])
 
     def test_account_import_keeps_only_last_duplicate_row(self) -> None:
         result = import_accounts(
             [
-                {"phone": "13800138000", "operator_name": "旧", "platforms": []},
-                {"phone": "+8613800138000", "operator_name": "新", "platforms": []},
+                {"phone": "13800138000", "operator_name": "旧", "platforms": [{"platform": "douyin", "uid": "duplicate-stable"}]},
+                {"phone": "+8613800138000", "operator_name": "新", "platforms": [{"platform": "douyin", "uid": "duplicate-stable"}]},
             ],
             source_name="accounts.csv",
             db_path=self.db,
@@ -210,7 +413,7 @@ class V8OperationsTest(unittest.TestCase):
         self.assertEqual(account["operator_name"], "新")
         self.assertEqual([row[0] for row in rows], ["duplicate_in_file", "inserted"])
 
-    def test_account_identity_claims_pending_uid_and_backfills_content(self) -> None:
+    def test_account_identity_backfills_content_without_pending_list(self) -> None:
         content = upsert_content(
             {
                 "platform": "douyin",
@@ -225,14 +428,10 @@ class V8OperationsTest(unittest.TestCase):
             pending = connection.execute(
                 "SELECT * FROM pending_platform_identities"
             ).fetchone()
-            self.assertIsNotNone(pending)
-            self.assertEqual(pending["platform"], "douyin")
-            self.assertEqual(pending["uid"], "99887766")
-            self.assertEqual(pending["nickname"], "待归属车号")
-            self.assertEqual(pending["content_count"], 1)
+            self.assertIsNone(pending)
         account = upsert_account(
             {
-                "phone": "13800138000",
+                "phone": "",
                 "platforms": [{"platform": "douyin", "uid": "99887766"}],
             },
             db_path=self.db,
@@ -247,7 +446,7 @@ class V8OperationsTest(unittest.TestCase):
         self.assertEqual(linked, account["id"])
         self.assertEqual(pending, 0)
 
-    def test_content_uid_change_clears_stale_account_and_materializes_pending(
+    def test_content_uid_change_clears_stale_account_without_pending_list(
         self,
     ) -> None:
         account = upsert_account(
@@ -293,10 +492,9 @@ class V8OperationsTest(unittest.TestCase):
             ).fetchone()
         self.assertIsNone(row["account_id"])
         self.assertEqual(row["raw_account_uid"], "unclaimed-uid")
-        self.assertEqual(pending["uid"], "unclaimed-uid")
-        self.assertEqual(pending["nickname"], "待认领账号")
+        self.assertIsNone(pending)
 
-    def test_removing_account_identity_recreates_pending_assignment(self) -> None:
+    def test_local_identity_removal_is_rejected_and_preserves_assignments(self) -> None:
         account = upsert_account(
             {
                 "phone": "13800138002",
@@ -314,10 +512,13 @@ class V8OperationsTest(unittest.TestCase):
             },
             db_path=self.db,
         )
-        upsert_account(
-            {"phone": "13800138002", "platforms": []},
-            db_path=self.db,
-        )
+        with self.assertRaises(OperationError):
+            upsert_account(
+                {"phone": "13800138002", "platforms": []},
+                db_path=self.db,
+            )
+        with self.assertRaises(OperationError):
+            update_account(account["id"], {"platforms": []}, db_path=self.db)
         with connect(self.db) as connection:
             row = connection.execute(
                 "SELECT account_id FROM content_items WHERE id=?", (content["id"],)
@@ -325,9 +526,8 @@ class V8OperationsTest(unittest.TestCase):
             pending = connection.execute(
                 "SELECT * FROM pending_platform_identities WHERE uid='removable-uid'"
             ).fetchone()
-        self.assertIsNone(row["account_id"])
-        self.assertEqual(pending["content_count"], 1)
-        self.assertEqual(pending["nickname"], "解除绑定后待认领")
+        self.assertEqual(row["account_id"], account["id"])
+        self.assertIsNone(pending)
         self.assertEqual(account["action"], "inserted")
 
     def test_account_export_shape_round_trips_through_flat_csv_import_rows(
@@ -404,25 +604,26 @@ class V8OperationsTest(unittest.TestCase):
             sheet = archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
             workbook_xml = archive.read("xl/workbook.xml").decode("utf-8")
         self.assertIn('name="账号信息"', workbook_xml)
-        # 两行表头：分组行（页面同款分组）+ 与页面表格一致的中文列名。
+        # 一个平台账号一行，平台总作品数与本地收录量是不同列。
         for header in (
-            "账号基础信息",
+            "平台",
             "抖音",
             "小红书",
-            "视频号",
-            "快手",
-            "账号管理",
             "手机号",
             "运营人员",
             "账号类型",
             "内容方向",
-            "平台账号编号",
-            "是否实名",
+            "平台 UID",
+            "短号",
+            "矩阵监测",
+            "矩阵授权",
             "抖音开平授权",
             "昵称",
-            "粉丝量",
-            "关联内容量",
-            "状态",
+            "总粉丝",
+            "平台作品总量",
+            "本地收录量",
+            "账号状态",
+            "采集开关",
         ):
             self.assertIn(f">{header}</t>", sheet)
         # 单元格取值与页面展示口径一致：中文枚举、未填写/未绑定/「—」兜底。
@@ -430,21 +631,23 @@ class V8OperationsTest(unittest.TestCase):
         self.assertIn(">二手车</t>", sheet)
         self.assertIn(">精品 IP</t>", sheet)
         self.assertIn(">已授权</t>", sheet)
-        self.assertIn(">未授权</t>", sheet)
-        self.assertIn(">未绑定</t>", sheet)
+        self.assertNotIn(">未绑定</t>", sheet)
+        self.assertNotIn(">名单状态</t>", sheet)
+        self.assertNotIn(">历史档案</t>", sheet)
+        self.assertIn(">待标记</t>", sheet)
+        self.assertIn(">暂停</t>", sheet)
         self.assertIn(">未填写</t>", sheet)
         self.assertIn(">运营中</t>", sheet)
         self.assertIn(">停用</t>", sheet)
         self.assertIn(">—</t>", sheet)
         self.assertNotIn("mixed_edit", sheet)
-        self.assertNotIn("unknown", sheet)
+        self.assertNotIn(">unknown</t>", sheet)
         # 长编号写成文本单元格（quotePrefix 文本样式），Excel 打开不会变科学计数法。
         self.assertIn('s="12" t="inlineStr"', sheet)
         self.assertIn(">7626610000000000000</t>", sheet)
-        # 分组行做了合并单元格；前 4 列 + 两行表头冻结。
-        self.assertIn('<mergeCell ref="A1:D1"/>', sheet)
-        self.assertIn('xSplit="4" ySplit="2"', sheet)
-        self.assertIn('s="14"', sheet)
+        self.assertNotIn('<mergeCell', sheet)
+        self.assertIn('xSplit="2" ySplit="1"', sheet)
+        self.assertIn('autoFilter ref="A1:R3"', sheet)
 
         wrong_uid = export_accounts_xlsx(
             douyin_authorization_targets=[
@@ -631,6 +834,12 @@ class V8OperationsTest(unittest.TestCase):
             connection.execute(
                 "UPDATE content_items SET account_id=? WHERE id=?",
                 (account["id"], content["id"]),
+            )
+            # A pre-existing migration row remains historical; ordinary edits
+            # must not depend on or maintain this retired list.
+            connection.execute(
+                "INSERT INTO pending_platform_identities(platform,uid,nickname,content_count,created_at,updated_at) "
+                "VALUES('douyin','legacy-unclaimed-uid','历史事实',1,'2026-09-01','2026-09-01')"
             )
             connection.commit()
             pending_before = dict(
@@ -1011,7 +1220,7 @@ class V8OperationsTest(unittest.TestCase):
         )
         self.assertEqual(
             [tuple(row) for row in pending_before],
-            [("merge-pending-a", 1), ("merge-pending-b", 1)],
+            [],
         )
 
         result = update_content(
@@ -1051,7 +1260,7 @@ class V8OperationsTest(unittest.TestCase):
             [(group_a_duplicate["id"], target["id"])],
         )
         self.assertEqual(
-            [tuple(row) for row in pending_after], [("merge-pending-a", 1)]
+            [tuple(row) for row in pending_after], []
         )
         self.assertEqual(violations, [])
 

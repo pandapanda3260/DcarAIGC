@@ -8,13 +8,19 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 from scripts import materialize_full_history_discovery_cache as replay
+from tests.roster_fixture import accept_roster
+from v8 import capture as capture_module
 from v8 import media as media_module
-from v8.capture import ProviderResult, execute_account_fetch
+from v8 import raw_evidence
+from v8.capture import CaptureError, ProviderResult, execute_account_fetch
 from v8.operations import upsert_account, upsert_content
-from v8.storage import connect, initialize_database
+from v8.paid_identity import build_paid_request_identity
+from v8.providers import ensure_operational_budget
+from v8.storage import connect, initialize_database, now_utc
 
 
 class FullHistoryDiscoveryCacheMaterializationTest(unittest.TestCase):
@@ -42,6 +48,23 @@ class FullHistoryDiscoveryCacheMaterializationTest(unittest.TestCase):
             db_path=self.db,
         )
         self.account_id = int(account["id"])
+        with closing(connect(self.db)) as connection:
+            accept_roster(connection, accepted_at="2026-05-01T00:00:00Z")
+            identity_id = int(
+                connection.execute(
+                    "SELECT id FROM account_platform_identities WHERE account_id=?",
+                    (self.account_id,),
+                ).fetchone()[0]
+            )
+            stamp = now_utc()
+            connection.execute(
+                """INSERT INTO account_provider_references(
+                       account_identity_id,provider,reference_kind,reference_value,
+                       created_at,updated_at
+                   ) VALUES (?,'TikHub','sec_user_id','fixture-sec-user',?,?)""",
+                (identity_id, stamp, stamp),
+            )
+            connection.commit()
         content = upsert_content(
             {
                 "platform": "douyin",
@@ -75,6 +98,24 @@ class FullHistoryDiscoveryCacheMaterializationTest(unittest.TestCase):
             ),
             db_path=self.db,
             raw_root=self.raw_root,
+            budget_id=ensure_operational_budget(
+                provider="TikHub", operation="douyin_user_posts", price=0.001,
+                db_path=self.db,
+            ),
+            paid_request_identity=build_paid_request_identity(
+                provider="TikHub",
+                operation="douyin_user_posts",
+                platform="douyin",
+                subject="fixture-sec-user",
+                request_parameters={
+                    "sec_user_id": "fixture-sec-user",
+                    "max_cursor": 0,
+                    "count": 20,
+                    "sort_type": 0,
+                },
+                cursor=None,
+                due_bucket="range:test:page-001",
+            ),
         )
         with closing(connect(self.db)) as connection:
             connection.execute(
@@ -153,6 +194,60 @@ class FullHistoryDiscoveryCacheMaterializationTest(unittest.TestCase):
             return_value=SimpleNamespace(data=page),
         ):
             return replay.build_replay_plan(db_path=self.db, contract=self.contract)
+
+    def test_plan_reads_legacy_and_compressed_raw_evidence(self) -> None:
+        with closing(connect(self.db)) as connection:
+            row = connection.execute(
+                "SELECT id,local_path,sha256,byte_size "
+                "FROM provider_raw_responses ORDER BY id LIMIT 1"
+            ).fetchone()
+        assert row is not None
+        original_path = Path(str(row["local_path"]))
+        loaded = raw_evidence.read_raw_evidence(
+            original_path,
+            expected_stored_sha256=str(row["sha256"]),
+            expected_stored_size=int(row["byte_size"]),
+        )
+        compressed_path = self.raw_root / "fixture-discovery.json.zst"
+        compressed = raw_evidence.write_zstd_raw_evidence(
+            compressed_path,
+            loaded.entity_bytes,
+            provider="TikHub",
+            operation="douyin_user_posts",
+            response_identity="a" * 64,
+            paid_scope_identity="b" * 64,
+            sequence=1,
+        )
+        with closing(connect(self.db)) as connection:
+            connection.execute(
+                "UPDATE provider_raw_responses "
+                "SET local_path=?,sha256=?,byte_size=? WHERE id=?",
+                (
+                    str(compressed.path),
+                    compressed.stored_sha256,
+                    compressed.stored_size,
+                    int(row["id"]),
+                ),
+            )
+            connection.commit()
+        self.assertEqual(len(self._plan().candidates), 1)
+
+        legacy_path = self.raw_root / "fixture-discovery.json"
+        legacy_path.write_bytes(loaded.entity_bytes)
+        legacy_path.chmod(0o600)
+        with closing(connect(self.db)) as connection:
+            connection.execute(
+                "UPDATE provider_raw_responses "
+                "SET local_path=?,sha256=?,byte_size=? WHERE id=?",
+                (
+                    str(legacy_path),
+                    replay._sha256_bytes(loaded.entity_bytes),
+                    len(loaded.entity_bytes),
+                    int(row["id"]),
+                ),
+            )
+            connection.commit()
+        self.assertEqual(len(self._plan().candidates), 1)
 
     def test_clone_materialization_is_zero_cost_isolated_and_idempotent(self) -> None:
         plan = self._plan()
@@ -334,7 +429,7 @@ class FullHistoryDiscoveryCacheMaterializationTest(unittest.TestCase):
         plan = self._plan()
         original = replay.providers._materialize_discovery_stages
 
-        def interrupt_after_write(**kwargs: object) -> None:
+        def interrupt_after_write(**kwargs: Any) -> None:
             original(**kwargs)
             raise KeyboardInterrupt
 
@@ -470,20 +565,31 @@ class FullHistoryDiscoveryCacheMaterializationTest(unittest.TestCase):
         plan = self._plan()
         usage_before = replay._usage_snapshot(self.db)
 
-        def interrupt_derived_result(**_kwargs: object) -> None:
-            raise RuntimeError("fixture derived raw interruption")
+        def interrupt_derived_write(
+            path: Path, _body: bytes, **_kwargs: object
+        ) -> None:
+            expected_root = (self.root / "retry-derived").resolve()
+            self.assertTrue(path.resolve().is_relative_to(expected_root))
+            raise CaptureError(
+                "fixture derived raw interruption", retryable=True,
+                error_code="local_write_failed", billed=False,
+            )
 
+        # Derived results are now values validated before claiming a slot.
+        # Interrupt the local write after the claim to exercise durable retry,
+        # retaining the original zero-cost and two-attempt assertions below.
         with patch.object(
-            replay.providers,
-            "_derived_discovery_result",
-            side_effect=interrupt_derived_result,
-        ), self.assertRaisesRegex(replay.CacheReplayError, "物化失败"):
+            capture_module,
+            "write_zstd_raw_evidence",
+            side_effect=interrupt_derived_write,
+        ) as raw_write, self.assertRaisesRegex(replay.CacheReplayError, "物化失败"):
             replay.apply_replay_plan(
                 plan,
                 db_path=self.db,
                 derived_raw_root=self.root / "retry-derived",
                 media_root=self.root / "retry-media",
             )
+        raw_write.assert_called_once()
         self.assertFalse(Path(f"{self.db}-wal").exists())
         self.assertFalse(Path(f"{self.db}-shm").exists())
         with closing(
@@ -547,6 +653,7 @@ class FullHistoryDiscoveryCacheMaterializationTest(unittest.TestCase):
                 db_path=self.db,
             )
         self.assertIsNotNone(artifact)
+        assert artifact is not None
         self.assertTrue(
             Path(str(artifact.local_path))
             .resolve()

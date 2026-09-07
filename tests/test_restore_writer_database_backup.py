@@ -43,6 +43,23 @@ def _sha256(path: Path) -> str:
 
 
 class WriterDatabaseBackupRestoreTest(unittest.TestCase):
+    @contextmanager
+    def _isolated_installer_runtime(self, layout: dict[str, Path]):
+        with (
+            patch.multiple(
+                safety,
+                PROJECT_ROOT=layout["project"],
+                CANONICAL_OPERATOR_FREEZE_LOCK=layout["freeze"],
+                _formal_mutation_lease=install_fixture._isolated_formal_mutation,
+            ),
+            patch.object(
+                restorer.safety,
+                "_formal_mutation_lease",
+                install_fixture._isolated_formal_mutation,
+            ),
+        ):
+            yield
+
     def _layout(
         self,
         root: Path,
@@ -82,7 +99,6 @@ class WriterDatabaseBackupRestoreTest(unittest.TestCase):
         with patch.multiple(
             migrator,
             PROJECT_ROOT=project,
-            FORMAL_DATABASE=formal,
             CANONICAL_OPERATOR_FREEZE_LOCK=freeze,
         ):
             migrator.prepare_verified_backup(
@@ -93,6 +109,7 @@ class WriterDatabaseBackupRestoreTest(unittest.TestCase):
                 freeze_lock=freeze,
                 migration_lock=migration_lock,
                 receipt=backup_receipt,
+                isolated=True,
                 holder_checker=lambda _: [],
             )
             migrator.build_migration_candidate(
@@ -105,6 +122,7 @@ class WriterDatabaseBackupRestoreTest(unittest.TestCase):
                 migration_lock=migration_lock,
                 backup_receipt=backup_receipt,
                 receipt=migration_receipt,
+                isolated=True,
                 holder_checker=lambda _: [],
             )
         os.replace(candidate, formal)
@@ -142,17 +160,9 @@ class WriterDatabaseBackupRestoreTest(unittest.TestCase):
         return (
             patch.multiple(
                 restorer,
-                FORMAL_DATABASE=layout["formal"],
-                FORMAL_BACKUP_ROOT=layout["formal_backups"],
                 CANONICAL_OPERATOR_FREEZE_LOCK=layout["freeze"],
             ),
-            patch.multiple(
-                safety,
-                PROJECT_ROOT=layout["project"],
-                FORMAL_DATABASE=layout["formal"],
-                FORMAL_BACKUP_ROOT=layout["formal_backups"],
-                CANONICAL_OPERATOR_FREEZE_LOCK=layout["freeze"],
-            ),
+            self._isolated_installer_runtime(layout),
         )
 
     def _assert_version(self, path: Path, version: int) -> None:

@@ -167,7 +167,8 @@ class V12SchemaMigrationTest(unittest.TestCase):
                 [
                     (9, "release-bound-evaluation-schema"),
                     (10, "audience-interaction-user-domain"),
-                    *sorted(storage.SCHEMA_MIGRATION_NAMES.items()),
+                    *sorted((version, name) for version, name in storage.SCHEMA_MIGRATION_NAMES.items()
+                            if version <= storage.SCHEMA_VERSION),
                 ],
             )
             self.assertEqual(
@@ -392,7 +393,24 @@ class V12SchemaMigrationTest(unittest.TestCase):
                 storage.SchemaMigrationError,
                 "metric observation columns|object definition drifted",
             ):
+                storage._validate_v12_structure(connection)
+            # The public initializer now rejects through the complete current
+            # schema gate. Assert that gate separately, without replacing the
+            # exact historical structural diagnostic with an arbitrary error.
+            before = connection.total_changes
+            with self.assertRaises(storage.SchemaMigrationError) as rejected:
                 storage.initialize_database(connection)
+            self.assertEqual(
+                str(rejected.exception),
+                "incompatible or incomplete schema: "
+                f"user_version={storage.SCHEMA_VERSION}, "
+                f"migration={storage.CURRENT_SCHEMA_MIGRATION_NAME!r}, "
+                f"max_migration_version={storage.SCHEMA_VERSION}, "
+                f"recursive_triggers=True, supported=[{storage.SCHEMA_VERSION}]",
+            )
+            self.assertEqual(connection.total_changes, before)
+            self.assertEqual(storage._table_columns(connection, "content_metric_observations"),
+                ["id", "content_id", "captured_at"])
 
     def test_observation_payload_is_immutable_but_content_rekey_is_allowed(
         self,

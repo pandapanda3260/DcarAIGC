@@ -34,7 +34,7 @@ class ScriptCollector(HTMLParser):
         self._buffer: List[str] = []
         self.scripts: List[str] = []
 
-    def handle_starttag(self, tag: str, attrs: List[Tuple[str, str]]) -> None:
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
         if tag == "script":
             self._active = True
             self._buffer = []
@@ -304,7 +304,8 @@ def main() -> int:
             else:
                 state = parse_initial_state(html)
                 detail = detail_object(state, row["note_id"])
-                note = detail.get("note") if isinstance(detail.get("note"), dict) else {}
+                note_value = detail.get("note")
+                note = note_value if isinstance(note_value, dict) else {}
                 returned_note_id = first_string(note, ("noteId", "note_id", "id"))
                 if not returned_note_id:
                     status = "detail_id_missing"

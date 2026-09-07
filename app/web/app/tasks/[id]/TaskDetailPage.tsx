@@ -230,12 +230,9 @@ export default function TaskDetailPage({ taskId }: { taskId: string }) {
       .filter(([key]) => key !== "weekly_comment_coverage" || detail?.task_type === "weekly")
       .map(([key, value]) => genericQualityRow(key, value)),
   ] : [];
-  return <AppShell active="tasks">
-    <Feedback error={error} message={message} onClose={() => { setError(""); setMessage(""); }} />
-    {detailQuery.isError && <Notice tone="error">{detail ? `数据刷新失败，当前显示上次数据。${detailQuery.error instanceof Error ? detailQuery.error.message : ""}` : detailQuery.error instanceof Error ? detailQuery.error.message : "任务详情读取失败"}</Notice>}
-    {reportQuery.isError && <Notice tone="error">{reportQuery.error instanceof Error ? reportQuery.error.message : "报告读取失败"}</Notice>}
-    {detailQuery.isPending && !detail ? <Loading label="正在读取任务详情" /> : !detail ? <section className="page-stack wide-stack"><article className="panel"><div className="empty-state"><strong>暂时无法读取任务详情</strong><span>请稍后重试。</span></div></article></section> : <section className="page-stack wide-stack">
-      <div className="detail-toolbar"><div className="task-detail-heading">
+  return <AppShell active="tasks" header={detail ? <header className="detail-page-header">
+    <h1 className="visually-hidden">数据报告任务</h1>
+    <div className="detail-toolbar"><div className="task-detail-heading">
         <Link href="/tasks" className="task-back-button" aria-label="返回任务列表" title="返回任务列表">
           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false"><path d="m12.5 4.5-5.5 5.5 5.5 5.5" /></svg>
         </Link>
@@ -246,6 +243,11 @@ export default function TaskDetailPage({ taskId }: { taskId: string }) {
         {cancellable && <button className="secondary danger-button" disabled={saving || detail.task_status === "cancel_requested"} onClick={() => void action("cancel")}>{detail.task_status === "cancel_requested" ? "取消中" : "取消任务"}</button>}
         {detail.task_status === "cancelled" && <button className="primary" disabled={saving} onClick={() => void action("resume")}>恢复任务</button>}
       </div></div>
+  </header> : undefined}>
+    <Feedback error={error} message={message} onClose={() => { setError(""); setMessage(""); }} />
+    {detailQuery.isError && <Notice tone="error">{detail ? `数据刷新失败，当前显示上次数据。${detailQuery.error instanceof Error ? detailQuery.error.message : ""}` : detailQuery.error instanceof Error ? detailQuery.error.message : "任务详情读取失败"}</Notice>}
+    {reportQuery.isError && <Notice tone="error">{reportQuery.error instanceof Error ? reportQuery.error.message : "报告读取失败"}</Notice>}
+    {detailQuery.isPending && !detail ? <Loading label="正在读取任务详情" /> : !detail ? <section className="page-stack wide-stack"><article className="panel"><div className="empty-state"><strong>暂时无法读取任务详情</strong><span>请稍后重试。</span></div></article></section> : <section className="page-stack wide-stack">
       {generating && <article className="panel task-progress-panel"><div className="task-progress">
         <div><span>{humanizeTaskMessage(detail.message) || "正在生成报告"}</span><em>{progress}%</em></div>
         <div className="progress-track" role="progressbar" aria-label="报告生成进度" aria-valuenow={progress} aria-valuemin={0} aria-valuemax={100}><i style={{ width: `${progress}%` }} /></div>

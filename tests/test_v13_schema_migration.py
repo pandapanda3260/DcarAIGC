@@ -94,7 +94,8 @@ class V13SchemaMigrationTest(unittest.TestCase):
                 [
                     (9, "release-bound-evaluation-schema"),
                     (10, "audience-interaction-user-domain"),
-                    *sorted(storage.SCHEMA_MIGRATION_NAMES.items()),
+                    *sorted((version, name) for version, name in storage.SCHEMA_MIGRATION_NAMES.items()
+                            if version <= storage.SCHEMA_VERSION),
                 ],
             )
             self.assertEqual(
@@ -547,7 +548,24 @@ class V13SchemaMigrationTest(unittest.TestCase):
                 storage.SchemaMigrationError,
                 "scheduler attempt columns drifted|object definition drifted",
             ):
+                storage._validate_v13_structure(connection)
+            # Keep the precise historical-object assertion above, then prove
+            # the complete current-schema gate rejects without any repair.
+            before = connection.total_changes
+            with self.assertRaises(storage.SchemaMigrationError) as rejected:
                 storage.initialize_database(connection)
+            self.assertEqual(
+                str(rejected.exception),
+                "incompatible or incomplete schema: "
+                f"user_version={storage.SCHEMA_VERSION}, "
+                f"migration={storage.CURRENT_SCHEMA_MIGRATION_NAME!r}, "
+                f"max_migration_version={storage.SCHEMA_VERSION}, "
+                f"recursive_triggers=True, supported=[{storage.SCHEMA_VERSION}]",
+            )
+            self.assertEqual(connection.total_changes, before)
+            self.assertIsNone(connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='trg_scheduler_run_attempts_terminal_update'"
+            ).fetchone())
 
 
 if __name__ == "__main__":

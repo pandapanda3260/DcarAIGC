@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import csv
 import io
 import hashlib
@@ -8,6 +9,7 @@ import logging
 import os
 import sqlite3
 import tempfile
+import threading
 import unittest
 import zipfile
 from dataclasses import replace
@@ -16,8 +18,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from urllib.parse import quote
+from uuid import uuid4
 from xml.etree import ElementTree
 
+from fastapi import FastAPI, Response
 from fastapi.testclient import TestClient
 
 # 测试环境一律关闭 LLM 补空：Mac 上 key 真实存在，associate/update-data 相关
@@ -25,7 +29,13 @@ from fastapi.testclient import TestClient
 os.environ.setdefault("DCAR_LLM_DISABLED", "1")
 
 import v8.api as api_module
+from v8 import media_lifecycle
+from v8.account_roster import runtime_account_summary
 from v8.contracts import CURRENT_REPORT_VERSION
+from v8.operations import upsert_account
+from v8.paid_drain import issue_activation_permit_in_transaction
+from v8.profile_activations import MATRIX_PROFILE, TIKHUB_PROFILE, append_activation
+from v8.system_roster import seal_system_members
 from v8.evaluation import (
     RULE_VERSION,
     build_evidence_envelope,
@@ -49,9 +59,11 @@ from v8.storage import (
     ensure_legacy_evaluation_release,
     initialize_database,
     now_utc,
+    transaction,
 )
 from v8.taxonomy_rule_backfill import backfill_v5_1_matcher_rules
 from tests.v9_report_fixture import activate_v9_report_fixture
+from tests.schema_fixture import initialize_historical_schema
 from workflow.storage import connect as legacy_connect
 from workflow.storage import migrate as migrate_legacy
 
@@ -94,6 +106,7 @@ def _test_config(
         operator_freeze_lock=root / "nonexistent-freeze.lock",
         scheduler_enabled=False,
         startup_catchup_enabled=False,
+        project_root=root,
     )
 
 
@@ -346,6 +359,290 @@ class ApiFactoryIsolationTest(unittest.TestCase):
             self.assertEqual(app_a.state.config.db_path, config_a.db_path)
             self.assertEqual(app_b.state.config.db_path, config_b.db_path)
             self.assertIsNot(app_a.state, app_b.state)
+            self.assertIsNot(
+                app_a.state.data_freshness_cache,
+                app_b.state.data_freshness_cache,
+            )
+            self.assertIsNot(app_a.state.read_model_cache, app_b.state.read_model_cache)
+
+
+class DataFreshnessCacheTest(unittest.TestCase):
+    def test_ttl_deepcopy_and_failed_load_recovery(self) -> None:
+        now = [10.0]
+        calls = [0]
+        cache = api_module.DataFreshnessCache(
+            ttl_seconds=60.0,
+            clock=lambda: now[0],
+        )
+
+        def load() -> dict[str, object]:
+            calls[0] += 1
+            return {"call": calls[0], "nested": {"status": "current"}}
+
+        first = cache.get(load)
+        first["nested"]["status"] = "mutated"  # type: ignore[index]
+        second = cache.get(load)
+        self.assertEqual(calls[0], 1)
+        self.assertEqual(second["nested"], {"status": "current"})
+
+        now[0] = 70.0
+        self.assertEqual(cache.get(load)["call"], 2)
+        self.assertEqual(calls[0], 2)
+
+        attempts = [0]
+        recovering = api_module.DataFreshnessCache(ttl_seconds=60.0)
+
+        def fail_once() -> dict[str, object]:
+            attempts[0] += 1
+            if attempts[0] == 1:
+                raise RuntimeError("fixture load failed")
+            return {"status": "current"}
+
+        with self.assertRaisesRegex(RuntimeError, "fixture load failed"):
+            recovering.get(fail_once)
+        self.assertEqual(recovering.get(fail_once), {"status": "current"})
+        self.assertEqual(attempts[0], 2)
+
+    def test_concurrent_misses_share_one_loader(self) -> None:
+        cache = api_module.DataFreshnessCache(ttl_seconds=60.0)
+        barrier = threading.Barrier(8)
+        release = threading.Event()
+        calls = [0]
+        calls_lock = threading.Lock()
+        results: list[dict[str, object] | None] = [None] * 8
+
+        def load() -> dict[str, object]:
+            with calls_lock:
+                calls[0] += 1
+            self.assertTrue(release.wait(2))
+            return {"status": "current"}
+
+        def read(index: int) -> None:
+            barrier.wait()
+            results[index] = cache.get(load)
+
+        threads = [threading.Thread(target=read, args=(index,)) for index in range(8)]
+        for thread in threads:
+            thread.start()
+        release.set()
+        for thread in threads:
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(calls[0], 1)
+        self.assertEqual(results, [{"status": "current"}] * 8)
+
+
+class ReadModelCacheTest(unittest.TestCase):
+    def test_ttl_bounds_staleness_and_returns_deep_copies(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            db_path = Path(temporary) / "cache.sqlite3"
+            db_path.write_bytes(b"db-v1")
+            now = [10.0]
+            calls = [0]
+            cache = api_module.ReadModelCache(
+                ttl_seconds=30.0,
+                max_entries=4,
+                clock=lambda: now[0],
+            )
+
+            def load() -> dict[str, object]:
+                calls[0] += 1
+                return {"call": calls[0], "nested": {"status": "ready"}}
+
+            first = cache.get(db_path, ("overview",), load)
+            first["nested"]["status"] = "changed"  # type: ignore[index]
+            self.assertEqual(
+                cache.get(db_path, ("overview",), load),
+                {"call": 1, "nested": {"status": "ready"}},
+            )
+
+            # Unrelated operational WAL writes must not defeat the deliberately
+            # bounded read-model TTL.
+            db_path.write_bytes(b"db-version-two")
+            self.assertEqual(cache.get(db_path, ("overview",), load)["call"], 1)
+            now[0] = 41.0
+            self.assertEqual(cache.get(db_path, ("overview",), load)["call"], 2)
+
+    def test_concurrent_misses_share_one_read_model_load(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            db_path = Path(temporary) / "cache.sqlite3"
+            db_path.write_bytes(b"fixture")
+            cache = api_module.ReadModelCache(ttl_seconds=30.0)
+            barrier = threading.Barrier(6)
+            release = threading.Event()
+            calls = [0]
+            calls_lock = threading.Lock()
+            results: list[dict[str, object] | None] = [None] * 6
+
+            def load() -> dict[str, object]:
+                with calls_lock:
+                    calls[0] += 1
+                self.assertTrue(release.wait(2))
+                return {"status": "ready"}
+
+            def read(index: int) -> None:
+                barrier.wait()
+                results[index] = cache.get(db_path, ("overview",), load)
+
+            threads = [threading.Thread(target=read, args=(index,)) for index in range(6)]
+            for thread in threads:
+                thread.start()
+            release.set()
+            for thread in threads:
+                thread.join(timeout=2)
+                self.assertFalse(thread.is_alive())
+            self.assertEqual(calls[0], 1)
+            self.assertEqual(results, [{"status": "ready"}] * 6)
+
+    def test_clear_during_load_uses_a_new_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            db_path = Path(temporary) / "cache.sqlite3"
+            db_path.write_bytes(b"fixture")
+            cache = api_module.ReadModelCache(ttl_seconds=30.0)
+            started = threading.Event()
+            release = threading.Event()
+            old_result: list[dict[str, object]] = []
+
+            def old_load() -> dict[str, object]:
+                started.set()
+                self.assertTrue(release.wait(2))
+                return {"generation": "old"}
+
+            thread = threading.Thread(
+                target=lambda: old_result.append(
+                    cache.get(db_path, ("overview",), old_load)
+                )
+            )
+            thread.start()
+            self.assertTrue(started.wait(2))
+            cache.clear()
+            fresh = cache.get(
+                db_path,
+                ("overview",),
+                lambda: {"generation": "fresh"},
+            )
+            release.set()
+            thread.join(timeout=2)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(old_result, [{"generation": "old"}])
+            self.assertEqual(fresh, {"generation": "fresh"})
+            self.assertEqual(
+                cache.get(
+                    db_path,
+                    ("overview",),
+                    lambda: {"generation": "unexpected"},
+                ),
+                {"generation": "fresh"},
+            )
+
+    def test_successful_mutations_clear_cache_but_read_posts_do_not(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            db_path = Path(temporary) / "cache.sqlite3"
+            db_path.write_bytes(b"fixture")
+            cache = api_module.ReadModelCache(ttl_seconds=30.0)
+            application = FastAPI()
+            application.state.read_model_cache = cache
+            application.middleware("http")(api_module.privacy_safe_request_log)
+
+            @application.post("/api/v8/contents/search")
+            def search() -> dict[str, bool]:
+                return {"ok": True}
+
+            @application.post("/write")
+            def write() -> dict[str, bool]:
+                return {"ok": True}
+
+            calls = [0]
+
+            def load() -> dict[str, int]:
+                calls[0] += 1
+                return {"call": calls[0]}
+
+            self.assertEqual(cache.get(db_path, ("overview",), load)["call"], 1)
+            with TestClient(application) as client:
+                self.assertEqual(client.post("/api/v8/contents/search").status_code, 200)
+                self.assertEqual(cache.get(db_path, ("overview",), load)["call"], 1)
+                self.assertEqual(client.post("/write").status_code, 200)
+            self.assertEqual(cache.get(db_path, ("overview",), load)["call"], 2)
+
+    def test_background_spu_job_clears_interim_cached_stats_on_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            db_path = Path(temporary) / "cache.sqlite3"
+            db_path.write_bytes(b"fixture")
+            cache = api_module.ReadModelCache(ttl_seconds=30.0)
+            started = threading.Event()
+            release = threading.Event()
+            calls = [0]
+
+            def blocked_association(**_kwargs: object) -> None:
+                started.set()
+                self.assertTrue(release.wait(2))
+
+            def load() -> dict[str, int]:
+                calls[0] += 1
+                return {"call": calls[0]}
+
+            with (
+                patch.object(
+                    api_module,
+                    "run_spu_association",
+                    side_effect=blocked_association,
+                ),
+                patch.object(api_module, "default_spu_llm_hook", return_value=None),
+            ):
+                thread = threading.Thread(
+                    target=api_module._run_spu_association_job,
+                    args=(db_path, 1, None, None, cache),
+                )
+                thread.start()
+                self.assertTrue(started.wait(2))
+                self.assertEqual(
+                    cache.get(db_path, ("spu-audience-stats", "all", ""), load)[
+                        "call"
+                    ],
+                    1,
+                )
+                release.set()
+                thread.join(timeout=2)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(
+                cache.get(db_path, ("spu-audience-stats", "all", ""), load)[
+                    "call"
+                ],
+                2,
+            )
+
+
+class JSONGZipMiddlewareTest(unittest.TestCase):
+    def test_binary_range_response_is_not_transformed(self) -> None:
+        application = FastAPI()
+        application.add_middleware(
+            api_module.JSONGZipMiddleware, minimum_size=1_000, compresslevel=5
+        )
+        body = b"0123456789" * 200
+
+        @application.get("/range")
+        def ranged() -> Response:
+            return Response(
+                body,
+                status_code=206,
+                media_type="video/mp4",
+                headers={
+                    "Accept-Ranges": "bytes",
+                    "Content-Range": "bytes 0-1999/4000",
+                },
+            )
+
+        with TestClient(application) as client:
+            response = client.get("/range", headers={"Accept-Encoding": "gzip"})
+
+        self.assertEqual(response.status_code, 206)
+        self.assertEqual(response.content, body)
+        self.assertEqual(response.headers["content-range"], "bytes 0-1999/4000")
+        self.assertEqual(response.headers["content-length"], str(len(body)))
+        self.assertNotIn("content-encoding", response.headers)
 
 
 class ApiStartupSafetyTest(unittest.TestCase):
@@ -387,6 +684,48 @@ class ApiStartupSafetyTest(unittest.TestCase):
             ),
         )
 
+    def test_environment_isolated_candidate_is_rejected_before_sqlite_access(self) -> None:
+        missing = self.root / "missing-candidate.sqlite3"
+        config = _test_config(self.root, db_name=missing.name)
+        config = replace(
+            config,
+            runtime_access_mode=api_module.DatabaseAccessMode.ISOLATED_CANDIDATE,
+        )
+        with (
+            patch.object(
+                api_module,
+                "connect",
+                side_effect=AssertionError("candidate preflight must precede SQLite"),
+            ) as connection,
+            self.assertRaisesRegex(RuntimeError, "isolated candidate database must already exist"),
+        ):
+            with TestClient(api_module.create_app(config)):
+                pass
+        connection.assert_not_called()
+        self.assertFalse(missing.exists())
+
+    def test_direct_config_cannot_relabel_installed_database_as_fixture(self) -> None:
+        database = self.root / "installed.sqlite3"
+        database.write_bytes(b"installed-sentinel")
+        config = _test_config(self.root, db_name=database.name)
+        with (
+            patch.object(
+                api_module,
+                "is_installed_formal_database",
+                return_value=True,
+            ),
+            patch.object(
+                api_module,
+                "connect",
+                side_effect=AssertionError("formal preflight must precede SQLite"),
+            ) as connection,
+            self.assertRaisesRegex(RuntimeError, "explicit writer access mode"),
+        ):
+            with TestClient(api_module.create_app(config)):
+                pass
+        connection.assert_not_called()
+        self.assertEqual(database.read_bytes(), b"installed-sentinel")
+
     def test_formal_database_detection_uses_existing_file_identity(self) -> None:
         formal = self.root / "formal.sqlite3"
         alias = self.root / "apfs-firmlink-spelling.sqlite3"
@@ -423,6 +762,108 @@ class ApiStartupSafetyTest(unittest.TestCase):
                 int(connection.execute("PRAGMA user_version").fetchone()[0]),
                 SCHEMA_VERSION,
             )
+
+    def test_writable_lifespan_keeps_wal_sidecar_inodes_stable(self) -> None:
+        config = _test_config(self.root, db_name="anchor.sqlite3")
+        with connect(config.db_path) as connection:
+            initialize_database(connection)
+        probe = api_module._open_sqlite_runtime_anchor(config.db_path)
+        try:
+            self.assertEqual(probe.execute("PRAGMA query_only").fetchone()[0], 1)
+            self.assertEqual(probe.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+            self.assertFalse(probe.in_transaction)
+        finally:
+            probe.close()
+        recovery_patches = self._patch_runtime_recovery()
+        application = api_module.create_app(config)
+        with (
+            recovery_patches[0],
+            recovery_patches[1],
+            recovery_patches[2],
+            recovery_patches[3],
+            recovery_patches[4],
+            TestClient(application),
+        ):
+            anchor = getattr(application.state, "sqlite_runtime_anchor", None)
+            self.assertIsNotNone(anchor)
+            sidecars = [
+                config.db_path.with_name(config.db_path.name + suffix)
+                for suffix in ("-wal", "-shm")
+            ]
+            self.assertTrue(all(path.is_file() for path in sidecars))
+            inodes = [path.stat().st_ino for path in sidecars]
+            for value in range(3):
+                with connect(config.db_path) as connection:
+                    connection.execute(
+                        "UPDATE schema_migrations SET applied_at=? WHERE version=?",
+                        (f"2026-09-01T00:00:0{value}Z", SCHEMA_VERSION),
+                    )
+                    connection.commit()
+            self.assertEqual([path.stat().st_ino for path in sidecars], inodes)
+        self.assertIsNone(application.state.sqlite_runtime_anchor)
+
+    def test_writable_anchor_closes_when_startup_recovery_fails(self) -> None:
+        config = _test_config(self.root, db_name="anchor-failure.sqlite3")
+        with connect(config.db_path) as connection:
+            initialize_database(connection)
+        application = api_module.create_app(config)
+        with (
+            patch.object(
+                api_module,
+                "recover_interrupted_scheduler_runs",
+                side_effect=RuntimeError("injected recovery failure"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "injected recovery failure"),
+        ):
+            with TestClient(application):
+                pass
+        self.assertIsNone(
+            getattr(application.state, "sqlite_runtime_anchor", None)
+        )
+        with sqlite3.connect(config.db_path) as connection:
+            self.assertEqual(
+                connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0],
+                "delete",
+            )
+
+    def test_existing_local_historical_database_requires_explicit_migration(self) -> None:
+        config = _test_config(self.root, db_name="local-v16.sqlite3")
+        with connect(config.db_path) as connection:
+            initialize_historical_schema(connection, target_version=16)
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        before = config.db_path.read_bytes()
+        sidecars = [
+            config.db_path.with_name(config.db_path.name + suffix)
+            for suffix in ("-wal", "-shm")
+        ]
+        with (
+            patch.object(api_module, "initialize_database") as initialize,
+            patch.object(api_module, "recover_interrupted_scheduler_runs") as recovery,
+            self.assertRaisesRegex(RuntimeError, "offline schema migration is required"),
+        ):
+            with TestClient(api_module.create_app(config)):
+                pass
+        initialize.assert_not_called()
+        recovery.assert_not_called()
+        self.assertEqual(config.db_path.read_bytes(), before)
+        self.assertFalse(any(path.exists() for path in sidecars))
+
+    def test_existing_empty_local_database_can_initialize(self) -> None:
+        config = _test_config(self.root, db_name="empty.sqlite3")
+        with sqlite3.connect(config.db_path) as connection:
+            connection.execute("VACUUM")
+        recovery_patches = self._patch_runtime_recovery()
+        with (
+            recovery_patches[0],
+            recovery_patches[1],
+            recovery_patches[2],
+            recovery_patches[3],
+            recovery_patches[4],
+        ):
+            with TestClient(api_module.create_app(config)):
+                pass
+        with sqlite3.connect(config.db_path) as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
 
     def test_formal_compatible_database_is_validated_without_initialization(
         self,
@@ -472,7 +913,7 @@ class ApiStartupSafetyTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(
                 RuntimeError,
-                r"offline schema migration is required:.*supported=\[16\]",
+                r"offline schema migration is required:.*supported=\[19, 20\]",
             ):
                 with TestClient(api_module.create_app(config)):
                     pass
@@ -490,7 +931,7 @@ class ApiStartupSafetyTest(unittest.TestCase):
         freeze_lock.write_text("{}", encoding="utf-8")
         writer_lock = self.root / "writer-worker.lock"
         config = api_module.ApiConfig(
-            db_path=api_module.DEFAULT_DB,
+            db_path=self.root / "formal.sqlite3",
             reports_root=self.root / "reports",
             legacy_db_path=self.root / "legacy.sqlite3",
             operator_freeze_lock=freeze_lock,
@@ -500,7 +941,7 @@ class ApiStartupSafetyTest(unittest.TestCase):
             daily_capture_reconcile_from=date(2026, 8, 21),
         )
         with (
-            patch.dict(os.environ, {"DCAR_TEST_DENY_FORMAL_DB": "1"}),
+            patch.object(api_module, "_uses_formal_database", return_value=True),
             patch.object(
                 api_module,
                 "_writer_process_lock",
@@ -653,14 +1094,27 @@ class ApiStartupSafetyTest(unittest.TestCase):
         config = replace(
             _test_config(self.root / "enabled"),
             scheduler_enabled=True,
+            startup_catchup_enabled=True,
             daily_capture_reconcile_from=date(2026, 8, 21),
         )
         _seed_read_model_database(config.db_path)
         scheduler = MagicMock()
+        scheduler.state = api_module.STATE_RUNNING
+        scheduler.get_jobs.return_value = [
+            SimpleNamespace(id="pipeline_reconcile"),
+            SimpleNamespace(id="daily_report"),
+        ]
         recovery_patches = self._patch_runtime_recovery()
+        catchup_started = threading.Event()
         with (
-            patch.object(api_module, "BackgroundScheduler", return_value=scheduler),
+            patch.object(
+                api_module, "BackgroundScheduler", return_value=scheduler
+            ) as scheduler_factory,
             patch.object(api_module, "install_jobs") as install_jobs,
+            patch.object(
+                api_module, "_run_startup_catchup",
+                side_effect=lambda *_args, **_kwargs: catchup_started.set(),
+            ) as startup_worker,
             patch.object(api_module, "assert_report_runtime_ready"),
             recovery_patches[0],
             recovery_patches[1],
@@ -669,17 +1123,36 @@ class ApiStartupSafetyTest(unittest.TestCase):
             recovery_patches[4],
         ):
             with TestClient(api_module.create_app(config)) as client:
+                self.assertTrue(catchup_started.wait(2))
+                self.assertEqual(startup_worker.call_args.kwargs, {
+                    "db_path": config.db_path, "reports_root": config.reports_root,
+                    "effective_from": date(2026, 8, 21),
+                })
                 response = client.get("/api/v8/scheduler")
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(
-                    response.json()["daily_capture_reconcile"],
+                    response.json()["pipeline_reconcile"],
                     {
                         "mode": "current_day_only",
                         "enabled": True,
-                        "effective_from": "2026-08-21",
-                        "interval_seconds": 3600,
+                        "interval_seconds": 300,
+                        "paid_round_cutoff": "20:00",
                     },
                 )
+                self.assertEqual(
+                    response.json()["registered_job_ids"],
+                    ["daily_report", "pipeline_reconcile"],
+                )
+                self.assertNotIn("daily_capture_reconcile", response.json())
+        scheduler_factory.assert_called_once_with(
+            timezone="Asia/Shanghai",
+            executors={
+                "default": {"type": "threadpool", "max_workers": 20},
+                "control": {"type": "threadpool", "max_workers": 8},
+                "report": {"type": "threadpool", "max_workers": 1},
+                "reconcile": {"type": "threadpool", "max_workers": 1},
+            },
+        )
         install_jobs.assert_called_once_with(
             scheduler,
             db_path=config.db_path,
@@ -731,7 +1204,20 @@ class V8ApiTest(unittest.TestCase):
         self.client_context.__exit__(None, None, None)
 
     def test_openapi_version_matches_v8_contract_release(self) -> None:
-        self.assertEqual(self.app.version, "8.6")
+        self.assertEqual(self.app.version, CURRENT_REPORT_VERSION)
+
+    def test_large_json_responses_are_gzipped_without_changing_payload(self) -> None:
+        compressed = self.client.get(
+            "/api/v8/overview", headers={"Accept-Encoding": "gzip"}
+        )
+        identity = self.client.get(
+            "/api/v8/overview", headers={"Accept-Encoding": "identity"}
+        )
+
+        self.assertEqual(compressed.status_code, 200)
+        self.assertEqual(compressed.headers.get("content-encoding"), "gzip")
+        self.assertNotIn("content-encoding", identity.headers)
+        self.assertEqual(compressed.json(), identity.json())
 
     def test_health_reports_v8_database(self) -> None:
         response = self.client.get("/api/v8/health")
@@ -762,6 +1248,88 @@ class V8ApiTest(unittest.TestCase):
         assert release is not None
         self.assertEqual(identity["active_release_id"], release["id"])
         self.assertEqual(identity["matcher_rule_sha256"], release["matcher_rule_sha256"])
+        self.assertEqual(response.json()["paid_dispatch_state"], "invalid")
+        self.assertEqual(response.json()["cutover_state"]["state"], "invalid")
+        self.assertEqual(
+            response.json()["cutover_state"]["reason"],
+            "no acquisition profile is active",
+        )
+        self.assertFalse(response.json()["lifecycle_jobs_enabled"])
+        self.assertIsNone(response.json()["media_lifecycle"]["activation"])
+
+    def test_livez_never_opens_sqlite_and_readyz_uses_only_db_receipts(self) -> None:
+        with patch.object(
+            api_module, "connect", side_effect=AssertionError("livez opened SQLite")
+        ):
+            response = self.client.get("/api/v8/livez")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "alive"})
+
+        with patch(
+            "v8.scan_receipts.runtime_coverage",
+            side_effect=AssertionError("readyz traversed raw scan manifests"),
+        ):
+            response = self.client.get("/api/v8/readyz")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "ready")
+        self.assertTrue(all(response.json()["conditions"].values()))
+        self.assertIsNone(response.json()["profile_day_receipt"])
+
+    def test_health_requires_active_lifecycle_and_all_three_registered_jobs(self) -> None:
+        archive = self.config.db_path.parent / "media-archive"
+        archive.mkdir(mode=0o700)
+        with connect(self.db) as connection, transaction(connection):
+            media_lifecycle.activate(
+                connection,
+                mode="enrollment_only",
+                activation_id="health-fixture",
+                release="health-release",
+                rules_sha256="f" * 64,
+                archive_root=archive,
+                now="2026-08-29T00:00:00Z",
+            )
+        scheduler = MagicMock()
+        scheduler.state = api_module.STATE_RUNNING
+        scheduler.get_jobs.return_value = [
+            SimpleNamespace(id="media_archive"),
+            SimpleNamespace(id="media_retention"),
+            SimpleNamespace(id="media_restore"),
+        ]
+        self.app.state.scheduler = scheduler
+        self.app.state.scheduler_enabled = True
+        enrollment_health = self.client.get("/api/v8/health").json()
+        self.assertEqual(
+            enrollment_health["media_lifecycle"]["activation"]["mode"],
+            "enrollment_only",
+        )
+        self.assertFalse(enrollment_health["lifecycle_jobs_enabled"])
+
+        with connect(self.db) as connection, transaction(connection):
+            media_lifecycle.activate(
+                connection,
+                mode="active",
+                activation_id="health-fixture",
+                release="health-release",
+                rules_sha256="f" * 64,
+                archive_root=archive,
+                proofs={
+                    "contract_version": media_lifecycle.FIXTURE_PROOF_CONTRACT,
+                    "fixture_only": True,
+                    "mac_consumers": True,
+                    "server_pairing": True,
+                    "canary_restore": True,
+                },
+                now="2026-08-29T00:01:00Z",
+            )
+        active_health = self.client.get("/api/v8/health").json()
+        self.assertEqual(
+            active_health["media_lifecycle"]["activation"]["mode"], "active"
+        )
+        self.assertTrue(active_health["lifecycle_jobs_enabled"])
+
+        scheduler.get_jobs.return_value.pop()
+        incomplete_health = self.client.get("/api/v8/health").json()
+        self.assertFalse(incomplete_health["lifecycle_jobs_enabled"])
 
     def test_daily_capture_freshness_excludes_backfill_slots(self) -> None:
         reference = datetime(2026, 8, 11, tzinfo=timezone.utc)
@@ -812,12 +1380,11 @@ class V8ApiTest(unittest.TestCase):
                 connection,
                 current_at=reference,
             )
-            self.assertEqual(freshness["status"], "stale")
-            self.assertEqual(
-                freshness["last_successful_capture_at"],
-                daily_finished.isoformat().replace("+00:00", "Z"),
-            )
-            self.assertEqual(freshness["latest_capture_run"]["status"], "failed")
+            self.assertEqual(freshness["status"], "unknown")
+            self.assertIsNone(freshness["last_successful_capture_at"])
+            self.assertIsNone(freshness["latest_capture_run"])
+            self.assertFalse(freshness["discovery_coverage"]["complete"])
+            self.assertIsNone(freshness["discovery_coverage"]["tikhub_expected_members"])
 
             current_finished = reference - timedelta(hours=35)
             connection.execute(
@@ -833,7 +1400,7 @@ class V8ApiTest(unittest.TestCase):
             connection.commit()
             self.assertEqual(
                 api_module._data_freshness(connection, current_at=reference)["status"],
-                "current",
+                "unknown",
             )
 
     def test_startup_catchup_worker_records_results(self) -> None:
@@ -843,12 +1410,17 @@ class V8ApiTest(unittest.TestCase):
             )
         )
         expected = [{"job_id": "daily_report", "status": "partial"}]
-        with patch.object(api_module, "startup_catchup", return_value=expected):
+        with patch.object(api_module, "startup_catchup", return_value=expected) as catchup:
             api_module._run_startup_catchup(
                 fake_app,
                 db_path=self.db,
                 reports_root=self.config.reports_root,
+                effective_from=date(2026, 9, 3),
             )
+        catchup.assert_called_once_with(
+            db_path=self.db, reports_root=self.config.reports_root,
+            effective_from=date(2026, 9, 3),
+        )
         self.assertEqual(fake_app.state.catchup_status, "succeeded")
         self.assertEqual(fake_app.state.catchup_results, expected)
         self.assertIsNone(fake_app.state.catchup_error)
@@ -921,23 +1493,86 @@ class V8ApiTest(unittest.TestCase):
             response.json()["scheduler_run_recovery"], {"interrupted": 0}
         )
         self.assertEqual(
-            response.json()["daily_capture_reconcile"],
+            response.json()["pipeline_reconcile"],
             {
                 "mode": "current_day_only",
                 "enabled": False,
-                "effective_from": None,
-                "interval_seconds": 3600,
+                "interval_seconds": 300,
+                "paid_round_cutoff": "20:00",
             },
         )
+        self.assertEqual(response.json()["registered_job_ids"], [])
+        self.assertNotIn("daily_capture_reconcile", response.json())
         self.assertIn("fetch_slot_recovery", response.json())
         self.assertIn("data_freshness", response.json())
 
+    def test_background_report_waits_for_shared_pipeline_report_lock(self) -> None:
+        called = threading.Event()
+        thread = threading.Thread(
+            target=api_module._run_task_in_background,
+            kwargs={
+                "task_id": "fixture-task",
+                "db_path": self.db,
+                "reports_root": self.config.reports_root,
+            },
+        )
+        with patch.object(api_module, "run_task", side_effect=lambda *_args, **_kwargs: called.set()):
+            with api_module.PIPELINE_REPORT_EXECUTION_LOCK:
+                thread.start()
+                self.assertFalse(called.wait(0.05))
+            thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(called.is_set())
+
     def test_freshness_is_consistent_across_operational_endpoints(self) -> None:
-        health = self.client.get("/api/v8/health").json()["data_freshness"]
-        overview = self.client.get("/api/v8/overview").json()["data_freshness"]
-        scheduler = self.client.get("/api/v8/scheduler").json()["data_freshness"]
+        expected = {"status": "current", "marker": "shared-cache-fixture"}
+        with patch.object(api_module, "_data_freshness", return_value=expected) as freshness:
+            health = self.client.get("/api/v8/health").json()["data_freshness"]
+            overview = self.client.get("/api/v8/overview").json()["data_freshness"]
+            scheduler = self.client.get("/api/v8/scheduler").json()["data_freshness"]
+        freshness.assert_called_once()
         self.assertEqual(overview, health)
         self.assertEqual(scheduler, health)
+
+    def test_partial_publishable_receipt_is_stale_not_unknown(self) -> None:
+        coverage = {
+            "status": "partial_publishable",
+            "complete": False,
+            "partial_publishable": True,
+            "round_run_id": None,
+        }
+        with patch(
+            "v8.runtime_receipts.latest_runtime_coverage",
+            return_value=coverage,
+        ):
+            freshness = self.client.get("/api/v8/health").json()["data_freshness"]
+        self.assertEqual(freshness["status"], "stale")
+        self.assertEqual(freshness["discovery_coverage"], coverage)
+
+    def test_health_exposes_runtime_database_and_writer_lock_identities(self) -> None:
+        health = self.client.get("/api/v8/health").json()
+        identity = self.db.stat()
+        self.assertEqual(
+            health["runtime_database_identity"],
+            {
+                "canonical_path": str(self.db.resolve(strict=True)),
+                "device": identity.st_dev,
+                "inode": identity.st_ino,
+                "nlink": identity.st_nlink,
+                "access_mode": "isolated_candidate",
+            },
+        )
+        scheduler = self.client.get("/api/v8/scheduler").json()
+        self.assertEqual(
+            scheduler["writer_lock"],
+            {
+                "path": str(self.config.writer_lock),
+                "device": None,
+                "inode": None,
+                "held": False,
+            },
+        )
+        self.assertEqual(health["writer_lock"], scheduler["writer_lock"])
 
     def test_read_only_replica_allows_search_and_blocks_writes(self) -> None:
         replica_config = api_module.ApiConfig(
@@ -955,6 +1590,10 @@ class V8ApiTest(unittest.TestCase):
             self.assertEqual(health.status_code, 200)
             self.assertEqual(health.json()["mode"], "read_only_replica")
             self.assertTrue(health.json()["read_only"])
+            self.assertEqual(
+                health.json()["runtime_database_identity"]["access_mode"],
+                "formal_read",
+            )
             self.assertEqual(
                 replica_client.post("/api/v8/accounts/search", json={}).status_code,
                 200,
@@ -1000,6 +1639,9 @@ class V8ApiTest(unittest.TestCase):
         with patch.dict(os.environ, {"DCAR_READ_ONLY": "1"}):
             replica = api_module.create_app(replica_config)
             with TestClient(replica) as replica_client:
+                self.assertIsNone(
+                    getattr(replica.state, "sqlite_runtime_anchor", None)
+                )
                 health = replica_client.get("/api/v8/health")
                 self.assertEqual(health.status_code, 200)
                 self.assertEqual(health.json()["database_state"]["sha256"], before)
@@ -1039,6 +1681,7 @@ class V8ApiTest(unittest.TestCase):
             self.assertIn("duplicate_rate", metrics)
             self.assertEqual(list(window["channels"]), ["douyin", "xiaohongshu"])
             for channel in window["channels"].values():
+                self.assertIsInstance(channel["selling_points"], list)
                 self.assertEqual(
                     list(channel["summary"]["metrics"]),
                     [
@@ -1077,6 +1720,52 @@ class V8ApiTest(unittest.TestCase):
                     self.assertEqual(
                         scene["audience_quality"]["report_cutoff_at"], cutoff
                     )
+
+    def test_overview_reuses_facts_without_changing_window_results(self) -> None:
+        now = datetime(2026, 8, 4, 12, tzinfo=api_module.SHANGHAI)
+        cutoff = "2026-08-04T04:00:00Z"
+        bounds = api_module._windows(now)
+        # The fixture's August 3 publication belongs to both yesterday and
+        # this_week. Compare full summaries with independently selected facts.
+        with connect(self.db) as connection:
+            expected = {
+                key: api_module._window_summary(
+                    connection, start, end, report_cutoff_at=cutoff
+                )
+                for key, (start, end) in bounds.items()
+            }
+        with (
+            patch.object(api_module, "_windows", return_value=bounds),
+            patch.object(api_module, "now_utc", return_value=cutoff),
+            patch.object(
+                api_module, "select_content_metrics", wraps=api_module.select_content_metrics
+            ) as metrics,
+            patch.object(
+                api_module, "formal_eligible_release_evaluations",
+                wraps=api_module.formal_eligible_release_evaluations,
+            ) as evaluations,
+        ):
+            result = api_module.v8_overview(self.db)
+        self.assertEqual(result["windows"], expected)
+        self.assertEqual(metrics.call_count, 1)
+        self.assertEqual(evaluations.call_count, 1)
+        self.assertEqual(len(metrics.call_args.args[1]), 1)
+        self.assertNotIn("cutoff_at", metrics.call_args.kwargs)
+        self.assertEqual(result["windows"]["yesterday"]["metrics"]["publication_count"]["value"], 1)
+        self.assertEqual(result["windows"]["this_week"]["metrics"]["publication_count"]["value"], 1)
+        self.assertEqual(result["windows"]["last_week"]["metrics"]["publication_count"]["value"], 0)
+
+    def test_overview_timing_distinguishes_cached_reads_without_exposing_data(self) -> None:
+        first = self.client.get("/api/v8/overview")
+        second = self.client.get("/api/v8/overview")
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.json(), second.json())
+        self.assertIn('cache;desc="miss"', first.headers["server-timing"])
+        self.assertIn('cache;desc="hit"', second.headers["server-timing"])
+        self.assertIn("queue;dur=", first.headers["server-timing"])
+        self.assertIn("total;dur=", first.headers["server-timing"])
+        self.assertNotIn(str(self.db), first.headers["server-timing"])
+        self.assertNotIn("timings", first.json())
 
     def test_overview_channel_conclusions_use_latest_metrics_and_valid_exposure(
         self,
@@ -1251,9 +1940,16 @@ class V8ApiTest(unittest.TestCase):
                     ) VALUES (
                         ?,'2026-08-02T15:00:00Z','2026-08-02',NULL,'missing','test-missing'
                     )
+                    ON CONFLICT(content_id,window_key) DO UPDATE SET
+                        captured_at=excluded.captured_at, view_count=excluded.view_count,
+                        status=excluded.status, source=excluded.source
                     """,
                     (ids["content-a"],),
                 )
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM content_metric_snapshots WHERE content_id=? AND window_key='2026-08-02'",
+                    (ids["content-a"],),
+                ).fetchone()[0], 1)
                 connection.commit()
                 window = api_module._window_summary(
                     connection,
@@ -1276,6 +1972,21 @@ class V8ApiTest(unittest.TestCase):
             )
             self.assertEqual(douyin["valid_exposure_items"], 2)
             self.assertEqual(douyin["exposure_coverage_percentage"], 100.0)
+            points = {item["code"]: item for item in douyin["selling_points"]}
+            self.assertEqual(set(points), {"E1", "C1"})
+            self.assertEqual(points["E1"]["label"], "核心卖点")
+            self.assertEqual(points["C1"]["label"], "其他卖点")
+            self.assertEqual(points["E1"]["tier"], "core")
+            self.assertEqual(sum(point["publication_count"] for point in points.values()), 2)
+            self.assertEqual(points["E1"]["count_share"]["denominator"], 3)
+            self.assertIsNone(points["E1"]["view_count"]["value"])
+            self.assertEqual(points["E1"]["view_count"]["status"], "missing")
+            self.assertEqual(points["C1"]["view_count"]["value"], 300)
+            self.assertEqual(points["C1"]["view_count"]["status"], "stale")
+            self.assertEqual(points["C1"]["stale_view_items"], 1)
+            self.assertEqual(points["C1"]["exposure_share"]["denominator"], 400)
+            self.assertEqual(points["C1"]["exposure_share"]["status"], "stale")
+            self.assertIsNone(points["C1"]["exposure_share"]["percentage"])
             self.assertEqual(summary["content_verticality"]["value"], 60)
             self.assertEqual(summary["automotive_user_rate"]["kind"], "ratio")
             self.assertIsNone(summary["automotive_user_rate"]["percentage"])
@@ -1297,6 +2008,7 @@ class V8ApiTest(unittest.TestCase):
             self.assertEqual(media["content_verticality"]["status"], "not_applicable")
 
             xiaohongshu = window["channels"]["xiaohongshu"]
+            self.assertEqual(xiaohongshu["selling_points"], [])
             self.assertEqual(xiaohongshu["publication_count"], 0)
             self.assertTrue(
                 all(
@@ -1310,27 +2022,30 @@ class V8ApiTest(unittest.TestCase):
             expected_account_count = int(
                 connection.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
             )
-            expected_unassociated_count = int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM content_items WHERE account_id IS NULL"
-                ).fetchone()[0]
-            )
-            expected_pending_identity_count = int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM pending_platform_identities"
-                ).fetchone()[0]
-            )
             expected_content_count = int(
                 connection.execute("SELECT COUNT(*) FROM content_items").fetchone()[0]
             )
-        tasks = self.client.get("/api/v8/tasks")
+        with patch.object(
+            api_module,
+            "_data_freshness",
+            side_effect=AssertionError("task list must not verify scan receipts"),
+        ) as task_freshness:
+            tasks = self.client.get("/api/v8/tasks")
+        task_freshness.assert_not_called()
         accounts = self.client.post("/api/v8/accounts/search", json={})
-        contents = self.client.post(
-            "/api/v8/contents/search", json={"page": 1, "page_size": 20}
-        )
+        with patch.object(
+            api_module,
+            "_data_freshness",
+            side_effect=AssertionError("content search must not verify scan receipts"),
+        ) as freshness:
+            contents = self.client.post(
+                "/api/v8/contents/search", json={"page": 1, "page_size": 20}
+            )
+        freshness.assert_not_called()
         selling_points = self.client.get("/api/v8/selling-points")
 
         self.assertEqual(tasks.status_code, 200)
+        self.assertNotIn("data_freshness", tasks.json())
         self.assertEqual(tasks.json()["total"], len(tasks.json()["items"]))
         for task in tasks.json()["items"]:
             self.assertTrue(
@@ -1351,19 +2066,11 @@ class V8ApiTest(unittest.TestCase):
             )
         self.assertEqual(accounts.status_code, 200)
         self.assertEqual(accounts.json()["total"], expected_account_count)
-        self.assertEqual(
-            accounts.json()["legacy_unassociated_content_count"],
-            expected_unassociated_count,
-        )
-        self.assertEqual(
-            accounts.json()["pending_platform_identity_count"],
-            expected_pending_identity_count,
-        )
-        self.assertEqual(
-            len(accounts.json()["pending_platform_identities"]),
-            min(expected_pending_identity_count, 100),
-        )
+        self.assertNotIn("legacy_unassociated_content_count", accounts.json())
+        self.assertNotIn("pending_platform_identity_count", accounts.json())
+        self.assertNotIn("pending_platform_identities", accounts.json())
         self.assertEqual(contents.status_code, 200)
+        self.assertNotIn("data_freshness", contents.json())
         self.assertEqual(contents.json()["total"], expected_content_count)
         self.assertEqual(len(contents.json()["items"]), min(expected_content_count, 20))
         overview = self.client.get("/api/v8/overview")
@@ -2210,7 +2917,16 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         self.assertEqual(queued["progress"], 0)
         self.assertEqual(queued["revisions"], [])
         task_id = queued["id"]
-        value = self.client.get(f"/api/v8/tasks/{task_id}").json()
+        with patch.object(
+            api_module,
+            "_data_freshness",
+            side_effect=AssertionError("task detail must not verify scan receipts"),
+        ) as task_freshness:
+            detail_response = self.client.get(f"/api/v8/tasks/{task_id}")
+        task_freshness.assert_not_called()
+        self.assertEqual(detail_response.status_code, 200)
+        self.assertNotIn("data_freshness", detail_response.json())
+        value = detail_response.json()
         self.assertEqual(value["task_status"], "partial")
         self.assertEqual(value["progress"], 100)
         self.assertEqual(len(value["revisions"]), 1)
@@ -2227,8 +2943,10 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         )
         self.assertEqual(
             report.json()["data_quality_details"]["discovery_coverage"]["status"],
-            "not_applicable",
+            "unknown",
         )
+        self.assertFalse(report.json()["data_quality"]["roster_evidence_valid"])
+        self.assertFalse(report.json()["data_quality"]["scan_traceable"])
         with connect(self.db) as connection:
             self.assertEqual(
                 connection.execute(
@@ -2789,12 +3507,458 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
             ]
         self.assertEqual(after, before)
 
-    def test_account_crud_import_and_export_keep_full_phone_with_post_search(
+    def test_writer_acceptance_schedules_same_profile_roster_in_transaction(
         self,
     ) -> None:
-        created = self.client.post(
-            "/api/v8/accounts",
+        upsert_account(
+            {
+                "platforms": [
+                    {
+                        "platform": "douyin",
+                        "uid": "9876543212345678900",
+                        "nickname": "名单成员",
+                    }
+                ]
+            },
+            db_path=self.db,
+        )
+        source = json.dumps(
+            {
+                "members": [
+                    {
+                        "platform": "douyin",
+                        "matrix_account_id": "matrix-writer-schedule",
+                        "uid": "9876543212345678900",
+                        "profile_ref": "https://www.douyin.com/user/MS4w.writer-schedule",
+                        "nickname": "名单成员",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ).encode()
+
+        def schedule(connection, **kwargs):
+            self.assertTrue(connection.in_transaction)
+            self.assertGreater(kwargs["roster_snapshot_id"], 0)
+            return {
+                "scheduled": True,
+                "activation": {
+                    "activation_id": 99,
+                    "effective_at": "2026-09-02T16:00:00.000000Z",
+                },
+            }
+
+        self.app.state.writer_lock_held = True
+        try:
+            with patch.object(
+                api_module,
+                "schedule_accepted_roster_activation_in_transaction",
+                side_effect=schedule,
+            ) as scheduled:
+                response = self.client.post(
+                    "/api/v8/account-roster/import",
+                    json={
+                        "source_name": "matrix-full.json",
+                        "content_base64": base64.b64encode(source).decode(),
+                        "organization": "测试矩阵组织",
+                        "source_exported_at": (
+                            datetime.now(timezone.utc) - timedelta(hours=1)
+                        ).isoformat(),
+                        "source_instance_id": "writer-schedule-export",
+                        "declared_count": 1,
+                        "evidence_note": "当前组织全部平台和全部已添加账号的完整导出。",
+                    },
+                )
+        finally:
+            self.app.state.writer_lock_held = False
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["activation_status"], "scheduled")
+        self.assertEqual(response.json()["scheduled_activation_id"], 99)
+        self.assertEqual(scheduled.call_count, 1)
+
+
+    @patch("v8.account_roster.now_utc", return_value="2026-09-30T00:00:00Z")
+    def test_roster_activation_and_sync_do_not_hide_saved_account_directory(
+        self, _runtime_clock: MagicMock
+    ) -> None:
+        member_account = upsert_account({
+            "phone": "13800138000", "operator_name": "保留运营人",
+            "platforms": [{"platform": "douyin", "uid": "9876543212345678900", "nickname": "历史昵称"}],
+        }, db_path=self.db)
+        upsert_account({
+            "phone": "13800138000",
+            "platforms": [{"platform": "xiaohongshu", "uid": "5c668b3e0000000012021605"}],
+        }, db_path=self.db)
+        def active_roster():
+            with connect(self.db) as connection:
+                return runtime_account_summary(connection)
+
+        before = self.client.post("/api/v8/accounts/search", json={}).json()
+        self.assertEqual(before["total"], 2)
+        self.assertEqual(before["account_management_version"], 2)
+        self.assertNotIn("archive_total", before)
+        self.assertFalse(active_roster()["ready"])
+        members = [{
+            "platform": "douyin", "matrix_account_id": "matrix-official-1",
+            "uid": "9876543212345678900", "profile_ref": "https://www.douyin.com/user/MS4w.member1",
+            "nickname": "当前成员", "monitoring_status": "monitored", "authorization_status": "unknown",
+            "avatar_url": "https://example.invalid/avatar.jpg", "unique_id": "member-short-id",
+        }]
+        exported = datetime.now(timezone.utc) - timedelta(hours=2)
+
+        def upload_rows(rows, sequence, declared_count=None):
+            source = json.dumps({"members": rows, "export_sequence": sequence}, ensure_ascii=False).encode()
+            return self.client.post("/api/v8/account-roster/import", json={
+                "source_name": "matrix-full.json", "content_base64": base64.b64encode(source).decode(),
+                "organization": "测试矩阵组织", "source_exported_at": (exported + timedelta(minutes=15 * sequence)).isoformat(),
+                "source_instance_id": f"official-export-{sequence}",
+                "declared_count": len(rows) if declared_count is None else declared_count,
+                "evidence_note": "测试中的官方导出记录，覆盖本组织全部平台和全部已添加账号。",
+            })
+
+        def activate_snapshot(snapshot_id: int) -> None:
+            activation_time = datetime.now(timezone.utc).isoformat()
+            with connect(self.db) as connection:
+                snapshot = connection.execute(
+                    "SELECT members_sha256 FROM account_roster_snapshots WHERE id=?",
+                    (snapshot_id,),
+                ).fetchone()
+                assert snapshot is not None
+                append_activation(
+                    connection,
+                    profile_id=MATRIX_PROFILE,
+                    roster_snapshot_id=snapshot_id,
+                    roster_members_sha256=snapshot["members_sha256"],
+                    effective_at=activation_time,
+                    build_receipt_sha256="b" * 64,
+                    actor="test",
+                    reason="activate accepted API roster",
+                    created_at=activation_time,
+                )
+
+        initial_zero = upload_rows([], 0)
+        self.assertEqual(initial_zero.status_code, 409)
+        self.assertFalse(self.client.get("/api/v8/account-roster").json()["ready"])
+        wrong_total = upload_rows(members, 0, 2)
+        self.assertEqual(wrong_total.status_code, 409)
+        self.assertFalse(self.client.get("/api/v8/account-roster").json()["ready"])
+        accepted = upload_rows(members, 1)
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+        self.assertEqual(accepted.json()["status"], "accepted")
+        pending = self.client.post("/api/v8/accounts/search", json={}).json()
+        self.assertEqual(pending["total"], 2)
+        self.assertEqual(
+            active_roster()["pending_snapshot_id"],
+            accepted.json()["snapshot_id"],
+        )
+        activate_snapshot(accepted.json()["snapshot_id"])
+        current = self.client.post("/api/v8/accounts/search", json={}).json()
+        self.assertEqual(current["total"], 2)
+        self.assertEqual(active_roster()["current_count"], 1)
+        prepared_system = self.client.post(
+            "/api/v8/account-roster/system/bootstrap",
+            json={"reason": "prepare managed profile rollback-safe roster"},
+        )
+        self.assertEqual(prepared_system.status_code, 200, prepared_system.text)
+        self.assertEqual(prepared_system.json()["activation_status"], "pending_activation")
+        self.assertEqual(
+            active_roster()["active_profile_id"],
+            MATRIX_PROFILE,
+        )
+        self.assertNotIn("archive_total", current)
+        item = next(row for row in current["items"] if row["id"] == member_account["id"])
+        self.assertEqual(item["id"], member_account["id"])
+        self.assertEqual(item["operator_name"], "保留运营人")
+        self.assertNotIn("roster_state", item)
+        self.assertEqual(item["account_status"], "unmarked")
+        identity = item["platforms"][0]
+        self.assertEqual(identity["uid"], "9876543212345678900")
+        self.assertEqual(identity["nickname"], "当前成员")
+        with connect(self.db) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT nickname FROM account_platform_identities WHERE account_id=?",
+                (member_account["id"],),
+            ).fetchone()[0], "历史昵称")
+        self.assertEqual(identity["matrix_account_id"], "matrix-official-1")
+        self.assertEqual(identity["unique_id"], "member-short-id")
+        self.assertEqual(identity["monitoring_status"], "monitored")
+        self.assertEqual(identity["authorization_status"], "unknown")
+        self.assertIsNone(identity["follower_count"])
+        self.assertIsNone(identity["platform_work_count"])
+        self.assertEqual(self.client.post("/api/v8/accounts/search", json={"query": "member-short-id"}).json()["total"], 1)
+        self.assertEqual(self.client.post("/api/v8/accounts/search", json={"query": "当前成员"}).json()["total"], 1)
+        saved_ids = {row["id"] for row in current["items"]}
+        for legacy_scope in ("current", "history", "unresolved", "all"):
+            with self.subTest(legacy_scope=legacy_scope):
+                compatible = self.client.post(
+                    "/api/v8/accounts/search", json={"scope": legacy_scope}
+                ).json()
+                self.assertEqual(compatible["total"], 2)
+                self.assertEqual({row["id"] for row in compatible["items"]}, saved_ids)
+        unresolved = {
+            "platform": "douyin", "matrix_account_id": "matrix-official-unresolved", "uid": None,
+            "profile_ref": "https://www.douyin.com/user/MS4w.unresolved", "nickname": "待对齐成员",
+        }
+        added = upload_rows([*members, unresolved], 2)
+        self.assertEqual(added.status_code, 200, added.text)
+        self.assertEqual(
+            self.client.post(
+                "/api/v8/accounts/search", json={}
+            ).json()["total"],
+            3,
+        )
+        activate_snapshot(added.json()["snapshot_id"])
+        pending = self.client.post("/api/v8/accounts/search", json={}).json()
+        self.assertEqual(pending["total"], 3)
+        unresolved_items = [row for row in pending["items"] if row["platforms"][0]["uid"] is None]
+        self.assertEqual(len(unresolved_items), 1)
+        self.assertNotIn("roster_state", unresolved_items[0])
+        self.assertEqual(active_roster()["unresolved_count"], 1)
+        self.assertEqual(self.client.post("/api/v8/accounts/search", json={}).json()["total"], 3)
+        with connect(self.db) as connection:
+            counts = tuple(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                           for table in ("accounts", "account_roster_snapshots", "provider_raw_responses", "provider_usage"))
+        synced = self.client.post("/api/v8/account-roster/sync", json={})
+        self.assertEqual(synced.status_code, 200)
+        self.assertEqual(synced.json()["status"], "manual_export_required")
+        with connect(self.db) as connection:
+            after_counts = tuple(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                                 for table in ("accounts", "account_roster_snapshots", "provider_raw_responses", "provider_usage"))
+        self.assertEqual(after_counts, counts)
+        diff = self.client.get(f"/api/v8/account-roster/candidates/{accepted.json()['candidate_id']}")
+        self.assertEqual(diff.status_code, 200)
+        self.assertEqual(diff.json()["status"], "accepted")
+        with TestClient(api_module.create_app(replace(self.config, read_only=True))) as replica:
+            self.assertEqual(replica.get("/api/v8/account-roster").status_code, 200)
+            self.assertEqual(replica.post("/api/v8/account-roster/sync", json={}).status_code, 403)
+            self.assertEqual(replica.post("/api/v8/account-roster/import", json={}).status_code, 403)
+        self.assertEqual(self.client.get("/api/v8/account-roster/candidates/999999").status_code, 409)
+        first_zero = upload_rows([], 3)
+        self.assertEqual(first_zero.status_code, 200, first_zero.text)
+        self.assertEqual(first_zero.json()["status"], "pending_removal_confirmation")
+        self.assertEqual(self.client.post("/api/v8/accounts/search", json={}).json()["total"], 3)
+        confirmed_zero = upload_rows([], 4)
+        self.assertEqual(confirmed_zero.status_code, 200, confirmed_zero.text)
+        self.assertEqual(confirmed_zero.json()["status"], "accepted")
+        self.assertEqual(self.client.post("/api/v8/accounts/search", json={}).json()["total"], 3)
+        activate_snapshot(confirmed_zero.json()["snapshot_id"])
+        empty_current = self.client.post("/api/v8/accounts/search", json={}).json()
+        self.assertEqual(empty_current["total"], counts[0])
+        self.assertNotIn("archive_total", empty_current)
+        self.assertTrue(active_roster()["ready"])
+        self.assertEqual(active_roster()["current_count"], 0)
+
+    def test_accounts_allow_missing_or_shared_phone_with_id_only_updates(self) -> None:
+        first = upsert_account(
+            {"operator_name": "运营甲", "platforms": [
+                {"platform": "douyin", "uid": "phone-optional-a", "nickname": "无手机号甲"}
+            ]},
+            db_path=self.db,
+        )
+        second = upsert_account(
+            {"phone": None, "platforms": [
+                {"platform": "douyin", "uid": "phone-optional-b", "nickname": "无手机号乙"}
+            ]},
+            db_path=self.db,
+        )
+        self.assertNotEqual(first["id"], second["id"])
+        searched = self.client.post(
+            "/api/v8/accounts/search", json={"query": "phone-optional"}
+        )
+        self.assertEqual(searched.json()["total"], 2)
+        self.assertEqual([item["phone"] for item in searched.json()["items"]], ["", ""])
+        for account in (first, second):
+            updated = self.client.patch(
+                f"/api/v8/accounts/{account['id']}", json={"phone": "13800138009"}
+            )
+            self.assertEqual(updated.status_code, 200)
+            self.assertEqual(updated.json()["id"], account["id"])
+        denied = self.client.patch(
+            f"/api/v8/accounts/{first['id']}",
+            json={"platforms": [{"platform": "douyin", "uid": "replacement"}]},
+        )
+        self.assertEqual(denied.status_code, 422)
+        searched = self.client.post(
+            "/api/v8/accounts/search", json={"query": "phone-optional-a"}
+        )
+        self.assertEqual(searched.json()["total"], 1)
+        item = searched.json()["items"][0]
+        self.assertEqual(item["phone"], "13800138009")
+        self.assertEqual(item["operator_name"], "运营甲")
+        self.assertEqual(item["platforms"][0]["uid"], "phone-optional-a")
+        self.assertEqual(item["platforms"][0]["nickname"], "无手机号甲")
+        self.assertEqual(len(item["platforms"]), 1)
+        self.assertIsNone(item["platforms"][0]["platform_work_count"])
+        for route, payload, expected_status in (
+            ("/api/v8/accounts", {"phone": "13800138010"}, 422),
+            ("/api/v8/accounts/import", {"source_name": "old.csv", "rows": []}, 410),
+        ):
+            with self.subTest(route=route):
+                self.assertEqual(self.client.post(route, json=payload).status_code, expected_status)
+
+    @patch("v8.account_roster.now_utc", return_value="2026-09-30T00:00:00Z")
+    def test_managed_profile_account_membership_is_immutable_and_activation_bound(
+        self, _runtime_clock: MagicMock
+    ) -> None:
+        _runtime_clock.return_value = datetime.now(timezone.utc).isoformat()
+        initial_seal_at = (
+            datetime.now(timezone.utc) - timedelta(seconds=10)
+        ).isoformat()
+        with connect(self.db) as connection:
+            accepted = seal_system_members(
+                connection,
+                [
+                    {
+                        "platform": "douyin",
+                        "uid": "123456789",
+                        "nickname": "首个系统账号",
+                    }
+                ],
+                raw_root=self.db.parent / "roster_sources",
+                actor="test",
+                reason="initialize managed roster",
+                sealed_at=initial_seal_at,
+            )
+            snapshot = connection.execute(
+                "SELECT members_sha256 FROM account_roster_snapshots WHERE id=?",
+                (accepted["snapshot_id"],),
+            ).fetchone()
+            assert snapshot is not None
+            first_at = (
+                datetime.now(timezone.utc) - timedelta(seconds=9)
+            ).isoformat(timespec="seconds")
+            first_activation = append_activation(
+                connection,
+                profile_id=TIKHUB_PROFILE,
+                roster_snapshot_id=accepted["snapshot_id"],
+                roster_members_sha256=snapshot["members_sha256"],
+                effective_at=first_at,
+                build_receipt_sha256="c" * 64,
+                actor="test",
+                reason="activate managed roster",
+                created_at=first_at,
+            )
+
+        before = self.client.post("/api/v8/accounts/search", json={}).json()
+        self.assertEqual(before["total"], 1)
+        self.assertEqual(before["roster"]["active_profile_id"], TIKHUB_PROFILE)
+        profile_url = "https://www.xiaohongshu.com/user/profile/5c668b3e0000000012021605"
+        payload = {
+            "profile_url": profile_url, "phone": "", "operator_name": "",
+            "account_status": "daily", "request_id": str(uuid4()),
+        }
+        protected_tables = (
+            "accounts", "account_platform_identities", "account_roster_snapshots",
+            "account_state_events", "scheduler_runs", "scheduler_run_attempts",
+            "acquisition_profile_activations", "pipeline_paid_drain_events",
+        )
+        with connect(self.db) as connection:
+            before_rows = {
+                table: [tuple(row) for row in connection.execute(f"SELECT * FROM {table} ORDER BY rowid")]
+                for table in protected_tables
+            }
+        self.app.state.writer_lock_held = True
+        with patch.object(api_module, "_resolve_account_creation_profile", return_value={
+            "platform": "xiaohongshu", "uid": "5c668b3e0000000012021605",
+            "nickname": "新增系统账号", "profile_ref": profile_url,
+        }):
+            # An active profile without its real RELEASE permit cannot admit
+            # the new member; account, roster, status and receipt writes roll back.
+            rejected = self.client.post("/api/v8/accounts", json=payload)
+            self.assertEqual(rejected.status_code, 409, rejected.text)
+            self.assertEqual(rejected.headers["X-DCAR-Roster-Error"], "profile_control_dispatch_not_open")
+            with connect(self.db) as connection:
+                for table, rows in before_rows.items():
+                    self.assertEqual(
+                        [tuple(row) for row in connection.execute(f"SELECT * FROM {table} ORDER BY rowid")], rows,
+                        table,
+                    )
+                with transaction(connection):
+                    issue_activation_permit_in_transaction(
+                        connection, activation_id=first_activation["activation_id"],
+                        drain_id="managed-account-fixture:initial",
+                        source_activation_id=first_activation["activation_id"],
+                        business_day=first_at[:10], planned_effective_at=first_activation["effective_at"],
+                        build_receipt_sha256="c" * 64, runtime_root_receipt_sha256="d" * 64,
+                        now=first_activation["effective_at"],
+                    )
+            created = self.client.post("/api/v8/accounts", json=payload)
+        self.app.state.writer_lock_held = False
+        self.assertEqual(created.status_code, 200, created.text)
+        self.assertEqual(created.json()["activation_status"], "scheduled")
+        self.assertEqual(created.json()["account_status"], "daily")
+        directory = self.client.post("/api/v8/accounts/search", json={}).json()
+        self.assertEqual(directory["total"], 2)
+        self.assertEqual(directory["roster"]["current_count"], 1)
+        with connect(self.db) as connection:
+            scheduled = connection.execute(
+                "SELECT * FROM acquisition_profile_activations WHERE id=?",
+                (created.json()["scheduled_activation_id"],),
+            ).fetchone()
+            assert scheduled is not None
+            self.assertEqual(scheduled["roster_snapshot_id"], created.json()["snapshot_id"])
+            self.assertEqual(scheduled["effective_at"], created.json()["scheduled_effective_at"])
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM pipeline_paid_drain_events WHERE target_activation_id=? AND event_type='release'",
+                (scheduled["id"],),
+            ).fetchone()[0], 1)
+        _runtime_clock.return_value = created.json()["scheduled_effective_at"]
+        active = self.client.post("/api/v8/accounts/search", json={}).json()
+        self.assertEqual(active["total"], 2)
+        added_account_id = created.json()["account_id"]
+        changed = self.client.patch(
+            f"/api/v8/accounts/{added_account_id}", json={"account_status": "paused"}
+        )
+        self.assertEqual(changed.status_code, 200, changed.text)
+        directory = self.client.post("/api/v8/accounts/search", json={}).json()
+        self.assertEqual(directory["total"], 2)
+        paused = next(row for row in directory["items"] if row["id"] == added_account_id)
+        self.assertEqual(paused["account_status"], "paused")
+        self.assertNotIn("roster_state", paused)
+        with connect(self.db) as connection:
+            event = connection.execute(
+                "SELECT activation_id,new_enabled FROM account_state_events ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            assert event is not None
+            self.assertEqual(event["activation_id"], first_activation["activation_id"] + 1)
+            self.assertEqual(event["new_enabled"], 0)
+
+        with connect(self.db) as connection:
+            obsolete_before = {
+                row[0]: sorted((tuple(value) for value in connection.execute(
+                    'SELECT * FROM "' + row[0].replace('"', '""') + '"'
+                )), key=repr)
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                )
+            }
+        imported = self.client.post(
+            "/api/v8/accounts/import",
             json={
+                "source_name": "managed.json",
+                "rows": [
+                    {"platform": "douyin", "uid": "987654321", "nickname": "批量新增"},
+                    {"platform": "invalid", "uid": "bad"},
+                ],
+            },
+        )
+        self.assertEqual(imported.status_code, 410, imported.text)
+        self.assertIn("主页", imported.json()["detail"])
+        removed = self.client.delete(f"/api/v8/accounts/{added_account_id}")
+        self.assertEqual(removed.status_code, 410, removed.text)
+        self.assertIn("暂停", removed.json()["detail"])
+        with connect(self.db) as connection:
+            for table, rows in obsolete_before.items():
+                self.assertEqual(sorted((tuple(value) for value in connection.execute(
+                    'SELECT * FROM "' + table.replace('"', '""') + '"'
+                )), key=repr), rows, table)
+
+    def test_account_id_update_and_export_keep_full_phone_with_post_search(
+        self,
+    ) -> None:
+        created = upsert_account(
+            {
                 "phone": "13800138000",
                 "operator_name": "运营甲",
                 "account_type": "original",
@@ -2808,9 +3972,9 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
                     }
                 ],
             },
+            db_path=self.db,
         )
-        self.assertEqual(created.status_code, 200)
-        account_id = created.json()["id"]
+        account_id = created["id"]
         updated = self.client.patch(
             f"/api/v8/accounts/{account_id}",
             json={
@@ -2818,14 +3982,6 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
                 "operator_name": "运营乙",
                 "account_type": "boutique_ip",
                 "content_direction": "media",
-                "platforms": [
-                    {
-                        "platform": "douyin",
-                        "uid": "123456789",
-                        "nickname": "账号乙",
-                        "real_name_status": "no",
-                    }
-                ],
             },
         )
         self.assertEqual(updated.status_code, 200)
@@ -3191,6 +4347,55 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         self.assertEqual(combined.status_code, 200)
         self.assertEqual(combined.json()["total"], 0)
 
+    def test_content_search_candidate_page_preserves_ties_pages_and_nulls(self) -> None:
+        captured_at = now_utc()
+        with connect(self.db) as connection:
+            connection.executemany(
+                """
+                INSERT INTO content_items(
+                    link_id,platform,platform_content_id,canonical_url,published_at,
+                    title,body,content_type,imported_at,created_at,updated_at
+                ) VALUES (?, 'douyin', ?, ?, ?, ?, '分页排序样本', 'video', ?, ?, ?)
+                """,
+                [
+                    (
+                        f"P{index:05d}",
+                        f"page-{index}",
+                        f"https://www.douyin.com/video/page-{index}",
+                        None if index == 55 else "2099-01-01T00:00:00Z",
+                        f"分页排序样本 {index}",
+                        captured_at,
+                        captured_at,
+                        captured_at,
+                    )
+                    for index in range(56)
+                ],
+            )
+            tied_ids = [
+                int(row["id"])
+                for row in connection.execute(
+                    """
+                    SELECT id FROM content_items
+                    WHERE platform_content_id LIKE 'page-%' AND published_at IS NOT NULL
+                    ORDER BY id DESC
+                    """
+                )
+            ]
+            connection.commit()
+
+        first = self.client.post(
+            "/api/v8/contents/search", json={"page": 1, "page_size": 50}
+        ).json()
+        second = self.client.post(
+            "/api/v8/contents/search", json={"page": 2, "page_size": 50}
+        ).json()
+
+        self.assertEqual([item["id"] for item in first["items"]], tied_ids[:50])
+        self.assertEqual(
+            [item["id"] for item in second["items"][:5]], tied_ids[50:]
+        )
+        self.assertIsNone(second["items"][-1]["published_at"])
+
     def test_content_search_total_matches_rows_for_every_count_dependency(self) -> None:
         captured_at = now_utc()
         with connect(self.db) as connection:
@@ -3339,6 +4544,170 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), expected)
         mocked.assert_called_once_with(self.content_id, db_path=self.db)
+
+
+    def _insert_content(self, connection, link_id: str, platform: str, content_type: str) -> int:
+        captured_at = now_utc()
+        cursor = connection.execute(
+            """
+            INSERT INTO content_items(
+                link_id, platform, platform_content_id, canonical_url, published_at, title, body,
+                content_type, imported_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, '2026-07-02T04:00:00Z', ?, '', ?, ?, ?, ?)
+            """,
+            (
+                link_id,
+                platform,
+                link_id.lower(),
+                f"https://example.invalid/{link_id}",
+                f"媒体框 {link_id}",
+                content_type,
+                captured_at,
+                captured_at,
+                captured_at,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+    def test_content_search_reports_local_media_availability(self) -> None:
+        bundle_id = "b" * 32
+        with connect(self.db) as connection:
+            legacy = self._insert_content(connection, "LEGACY", "douyin", "video")
+            archived = self._insert_content(connection, "ARCHIV", "douyin", "video")
+            hot = self._insert_content(connection, "HOTBND", "douyin", "video")
+            preview = self._insert_content(connection, "PREVIW", "xiaohongshu", "image")
+            rows = [
+                (legacy, "media", "data/cache/v8/media/LEGACY/video.mp4", "{}"),
+                (
+                    archived,
+                    "media",
+                    "data/cache/v8/media/managed-v1/ARCHIV/originals/source.mp4",
+                    json.dumps({"media_lifecycle": {"bundle_id": bundle_id}}),
+                ),
+                (
+                    archived,
+                    "media_lifecycle_manifest",
+                    "data/cache/v8/media/managed-v1/ARCHIV/evidence/lifecycle-manifest.json",
+                    json.dumps({"media_lifecycle": {"bundle_id": bundle_id,
+                                                    "storage_state": "archived",
+                                                    "operation_state": "idle"}}),
+                ),
+                (
+                    hot,
+                    "media_lifecycle_manifest",
+                    "data/cache/v8/media/managed-v1/HOTBND/evidence/lifecycle-manifest.json",
+                    json.dumps({"media_lifecycle": {"bundle_id": "c" * 32,
+                                                    "storage_state": "hot",
+                                                    "operation_state": "idle"}}),
+                ),
+                (
+                    preview,
+                    "media_preview_manifest",
+                    "data/cache/v8/media/managed-v1/PREVIW/evidence/preview-manifest.json",
+                    "{}",
+                ),
+            ]
+            for content_id, artifact_type, local_path, metadata in rows:
+                connection.execute(
+                    """
+                    INSERT INTO evidence_artifacts(
+                        content_id, artifact_type, local_path, status, sha256, metadata_json, created_at
+                    ) VALUES (?, ?, ?, 'available', ?, ?, ?)
+                    """,
+                    (content_id, artifact_type, local_path, "a" * 64, metadata, now_utc()),
+                )
+            connection.commit()
+
+        searched = self.client.post(
+            "/api/v8/contents/search", json={"query": "", "page_size": 20}
+        )
+        self.assertEqual(searched.status_code, 200)
+        flags = {item["link_id"]: item["local_media_available"] for item in searched.json()["items"]}
+        self.assertEqual(
+            flags,
+            {"A2BC3D": False, "LEGACY": True, "ARCHIV": False, "HOTBND": True, "PREVIW": True},
+        )
+        self.assertTrue(all(isinstance(value, bool) for value in flags.values()))
+
+        with connect(self.db) as connection:
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        read_only_app = api_module.create_app(replace(self.config, read_only=True))
+        with TestClient(read_only_app) as read_only_client:
+            replica = read_only_client.post(
+                "/api/v8/contents/search", json={"query": "", "page_size": 20}
+            )
+            self.assertEqual(replica.status_code, 200)
+            self.assertEqual(
+                {item["local_media_available"] for item in replica.json()["items"]}, {False}
+            )
+
+    def test_evidence_bin_files_are_served_with_sniffed_mime(self) -> None:
+        images_dir = Path(self.temp.name) / "images"
+        images_dir.mkdir()
+        payloads = {
+            "image-000.bin": b"\xff\xd8\xff\xe0" + b"jpeg-body" * 8,
+            "image-001.bin": b"\x89PNG\r\n\x1a\n" + b"png-body" * 8,
+            "image-002.bin": b"plain-bytes-without-magic" * 4,
+        }
+        for name, body in payloads.items():
+            (images_dir / name).write_bytes(body)
+        manifest_path = images_dir / "manifest.json"
+        manifest_path.write_text(
+            json.dumps({"status": "complete",
+                        "image_paths": [str(images_dir / name) for name in payloads]}),
+            encoding="utf-8",
+        )
+        with connect(self.db) as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO evidence_artifacts(
+                    content_id, artifact_type, local_path, status, sha256, created_at
+                ) VALUES (?, 'media_manifest', ?, 'available', ?, ?)
+                """,
+                (self.content_id, str(manifest_path), "d" * 64, now_utc()),
+            )
+            artifact_id = int(cursor.lastrowid)
+            connection.commit()
+
+        evidence = self.client.get(f"/api/v8/contents/{self.content_id}/evidence")
+        self.assertEqual(evidence.status_code, 200)
+        self.assertEqual([item["kind"] for item in evidence.json()["media"]], ["image"] * 3)
+
+        expected = ["image/jpeg", "image/png", "application/octet-stream"]
+        for index, media_type in enumerate(expected):
+            response = self.client.get(
+                f"/api/v8/contents/{self.content_id}/evidence/files/{artifact_id}/{index}"
+            )
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.headers["content-type"], media_type)
+            self.assertEqual(response.content, list(payloads.values())[index])
+        head = self.client.head(
+            f"/api/v8/contents/{self.content_id}/evidence/files/{artifact_id}/0"
+        )
+        self.assertEqual(head.status_code, 200)
+        self.assertEqual(head.headers["content-type"], "image/jpeg")
+
+    def test_media_content_type_prefers_suffix_then_magic(self) -> None:
+        from v8 import media_api
+
+        self.assertEqual(media_api.media_content_type(Path("clip.mp4"), b""), "video/mp4")
+        self.assertEqual(media_api.media_content_type(Path("photo.jpg"), b""), "image/jpeg")
+        cases = {
+            b"\xff\xd8\xff\xe1": "image/jpeg",
+            b"\x89PNG\r\n\x1a\n": "image/png",
+            b"GIF89a": "image/gif",
+            b"RIFF\x00\x00\x00\x00WEBPVP8 ": "image/webp",
+            b"\x00\x00\x00\x18ftypisom": "video/mp4",
+            b"\x1a\x45\xdf\xa3": "video/webm",
+        }
+        for header, media_type in cases.items():
+            self.assertEqual(media_api.sniff_media_type(header), media_type)
+            self.assertEqual(media_api.media_content_type(Path("image-000.bin"), header), media_type)
+        self.assertIsNone(media_api.sniff_media_type(b""))
+        self.assertEqual(
+            media_api.media_content_type(Path("image-000.bin"), b"nothing"),
+            "application/octet-stream",
+        )
 
 
 class V8MediaRecoveryApiTest(unittest.TestCase):

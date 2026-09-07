@@ -4,6 +4,25 @@
 > 当前项目根：`/Users/mark/Projects/DcarAIGC`
 > 性质：代码集成 + 离线 v16 切换交接；D 日激活与自然 02:00 验收尚未到时
 
+> 2026-08-31 补充：本文主体是旧 v16 切换记录，不再作为当前部署步骤。
+> 当前正式基线为 schema19 / report v8.9，当前配对迁移为18→19；schema18、
+> report v8.8 与17→18仅作历史/兼容合同保留。当前运行与发布步骤以
+> [`deploy/macos/README.md`](../../deploy/macos/README.md) 和
+> [`运行与备份手册.md`](运行与备份手册.md) 为准。
+
+## 2026-09-01 自动链路修复边界
+
+- `history_recovery` 已退出 APScheduler 注册；旧历史 catalog、旧子扫描和 8 月 28～31 日缺口不补、不删。
+- 两个 `resume_due_work()` 入口都按子扫描冻结日期挡住跨日续跑：TikHub 用 `window_end`，Matrix works 用 `overall_end_at`，Matrix accounts 用“昨天的 `rank_date`”。
+- 小时补偿只处理北京时间当天，每个 registration 只取最后一个到点槽并按时间排序；20:00 后不新建付费补偿轮次。
+- 只有自动/页面报告共用报告专用 RLock；供应商抓取、内容任务不持有该锁。所有通过 `storage.transaction()` 发起的进程内 SQLite 写事务另由一把独立 RLock 串行，只锁 `BEGIN IMMEDIATE` 到 commit/rollback，不锁供应商调用、媒体处理或报告构建；跨进程写入仍不在此锁保护范围。全员 TikHub 对账实测超过 9 小时，因此不得把锁扩大到整个 `dispatch()`，否则会阻塞内容、评论、Matrix 和报告。APScheduler worker 为 20。报告 `partial` 是合法终态；同一报告重复只按精确 occurrence 回查。
+- 父 `pipeline_round:*` 的 checkpoint/finish 有 6 次、最多约 195 秒的有限恢复；子扫描和内容批次的僵尸仍依赖重启恢复，这是已知边界。
+- `startup_catchup` / `report_reconcile` 仍会补过去缺失的报告，但不调用供应商。自动 `content_pipeline`、`comments_refresh` 和指标队列均排除 `history-backfill` 或发布超过 30 天的内容，不再保留 20% 历史席位；运营上只允许在另行明确授权后使用 `range_backfill` 处理历史内容。
+- 本地链路已判定为 terminal、所有失败阶段均显式 `retryable=false` 且错误不是供应商/预算保护时，内容不再因永久 failed 阶段阻止批次收口；`provider_circuit_open`、余额/鉴权阻断和预算保护必须继续留在当天 pending，不能伪装成内容终态。冻结业务日已经过期的批次在任何供应商调用前把剩余项记为 `skipped/business_day_expired`，释放 reserved 后允许队列创建新批次。`daily_pipeline_summary` 即使延迟或由补偿器创建，也必须按冻结的计划时刻写入当天 07:30 凭证。
+- 原审批窗口是北京时间 2026-09-01 00:00～00:30，但实际执行偏离了该窗口：新代码在 2026-08-31 13:55 已启用并创建当天付费补偿；该次复核按 8 月 31 日 13:55 之后的 reconcile 账本快照重算为 4,014 次计费调用、USD 6.14。9 月 1 日 00:53、01:04、01:14、01:28、09:51、09:56 又发生重启，最后两次还打断了正在运行的 TikHub 轮次。不得把这次执行描述成“按窗口部署”。后续上线须完成测试后只做一次必要重启，不为纯测试提交反复重启正式 writer。
+- 发布修复同时改动了快照续传、远端空间预检、rsync 计划解析和 manifest 上限；这些改动保留，但属于原 v6 范围外的生产阻断修复。发布期间远端约 50 GB Docker 缓存、旧日志、旧代码版本和失败部署目录已被删除，其中日志不可恢复；这是未经单独确认的越界操作，今后任何不可逆远端清理都必须先获得明确授权。
+- 2026-09-01 21:09（北京）执行了持久化授权的一次性 TikHub 恢复探针 `#1294`，目标是当天新内容 `79717` 的 detail。供应商返回 HTTP 402 `provider_balance_blocked`，请求未计费，探针失败并按合同保持 circuit open。代码队列不会再因此丢弃 pending，但在 TikHub 余额恢复并由新的显式探针验证成功前，不得声称“供应商抓取已经完全恢复”。
+
 ## 2026-08-18 执行回执摘要
 
 - 本地分支 `codex/daily-capture-recovery-v6`，checkpoint commit 为 `9fad164c314098c9941c72471db00b5f6763df6e`，未 push。

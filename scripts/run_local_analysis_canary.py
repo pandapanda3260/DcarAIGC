@@ -5,6 +5,10 @@ The controller is intentionally not a production publisher.  It binds media
 outputs to an isolated root, freezes every input URL and source manifest, blocks
 all provider/Hugging Face network paths, and writes an intent/receipt pair that
 can be resumed after an ordinary processing failure.
+
+Managed-v1 outputs use the separate read-only ``--verify-managed-contract``
+entrypoint. They never inherit the legacy v1 artifact allowlist or its apply
+workflow, and verification does not seal or move any media.
 """
 
 # ruff: noqa: E402 -- direct execution bootstraps repo imports after disabling pyc.
@@ -60,8 +64,10 @@ from v8 import evaluation_selectors as evaluation_selectors_module
 from v8 import matcher_dsl as matcher_dsl_module
 from v8 import media as media_module
 from v8 import providers as providers_module
+from v8 import raw_evidence as raw_evidence_module
 from v8 import storage as storage_module
 from v8 import taxonomy as taxonomy_module
+from scripts import managed_analysis_validation as managed_validation
 
 
 SCHEMA_VERSION = "local-analysis-canary-v1"
@@ -474,8 +480,12 @@ class _DiscoveryRawCache:
                 "discovery raw DB SHA/bytes与文件不一致"
             )
         try:
-            body = json.loads(raw_bytes)
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            body = raw_evidence_module.read_raw_json(
+                path,
+                expected_stored_sha256=str(row["sha256"]),
+                expected_stored_size=int(row["byte_size"]),
+            )
+        except raw_evidence_module.RawEvidenceError as exc:
             raise LocalAnalysisCanaryError("discovery raw不是合法JSON") from exc
         if not isinstance(body, Mapping):
             raise LocalAnalysisCanaryError("discovery raw正文必须是JSON object")
@@ -1221,7 +1231,7 @@ def _source_snapshot(
         )
     if media_kind == "image" and len(download_urls) != len(raw_urls):
         raise LocalAnalysisCanaryError("图片source必须全部是允许直连的冻结CDN URL")
-    image_groups: list[Mapping[str, Any]] = []
+    image_groups: list[dict[str, Any]] = []
     body_sha = _sha256_bytes(body_bytes)
     if type(artifact["sha256"]) is not str or artifact["sha256"] != body_sha:
         raise LocalAnalysisCanaryError("media_source DB SHA与正文不一致")
@@ -1258,16 +1268,20 @@ def _source_snapshot(
     raw_metadata = _private_file(raw_path, label=f"content {content_id} derived raw")
     if not _is_within(raw_path, step3_derived_raw_root):
         raise LocalAnalysisCanaryError("derived raw未落在冻结Step3 derived_raw_root")
-    raw_bytes = raw_path.read_bytes()
-    raw_sha = _sha256_bytes(raw_bytes)
+    stored_bytes = raw_path.read_bytes()
+    raw_sha = _sha256_bytes(stored_bytes)
     if (
         str(raw["sha256"] or "") != raw_sha
         or int(raw["byte_size"] or -1) != raw_metadata.st_size
     ):
         raise LocalAnalysisCanaryError("derived raw DB SHA/bytes与文件不一致")
     try:
-        raw_body = json.loads(raw_bytes)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raw_body = raw_evidence_module.read_raw_json(
+            raw_path,
+            expected_stored_sha256=str(raw["sha256"]),
+            expected_stored_size=int(raw["byte_size"]),
+        )
+    except raw_evidence_module.RawEvidenceError as exc:
         raise LocalAnalysisCanaryError("derived raw不是合法JSON") from exc
     if not isinstance(raw_body, Mapping) or set(raw_body) != {
         "data",
@@ -3002,7 +3016,7 @@ def _json_artifact(row: sqlite3.Row, *, label: str) -> tuple[Path, Mapping[str, 
     return path, body
 
 
-def _source_image_groups(source: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+def _source_image_groups(source: Mapping[str, Any]) -> list[dict[str, Any]]:
     if str(source["artifact_body"]["media_kind"]) != "image":
         raise LocalAnalysisCanaryError("非图片source不得读取逻辑图组")
     groups = source.get("image_groups")
@@ -8302,6 +8316,9 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    effective_argv = list(sys.argv[1:] if argv is None else argv)
+    if managed_validation.is_managed_verification(effective_argv):
+        return managed_validation.managed_verification_main(effective_argv)
     arguments = _parser().parse_args(argv)
     try:
         keyword_arguments = {
@@ -8332,6 +8349,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0
+
+
+def validate_managed_v1(contract: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Stage acceptance only; legacy canary receipts and writes stay unchanged."""
+    try:
+        return managed_validation.validate_managed_contract(contract)
+    except managed_validation.ManagedAnalysisValidationError as error:
+        raise LocalAnalysisCanaryError(str(error)) from error
 
 
 if __name__ == "__main__":

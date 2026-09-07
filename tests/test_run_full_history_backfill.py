@@ -80,7 +80,7 @@ class FullHistoryWrapperTest(unittest.TestCase):
             connection.commit()
 
     def test_discovery_extension_only_handles_task_budget_block(self) -> None:
-        state = {"phases": {}}
+        state: dict = {"phases": {}}
         with patch.object(
             runner,
             "run_command",
@@ -150,10 +150,15 @@ class FullHistoryWrapperTest(unittest.TestCase):
             key_file.chmod(0o600)
             with patch.object(runner, "TIKHUB_KEY_FILE", key_file), patch(
                 "urllib.request.urlopen", return_value=Response()
-            ) as urlopen, patch.object(runner, "log") as log:
+            ) as urlopen, patch.dict(os.environ, {
+                "TIKHUB_API_KEY_FILE": str(key_file),
+                "TIKHUB_API_KEY": "",
+                "TIKHUB_API_BASE": "",
+            }), patch.object(runner, "log") as log:
                 runner.phase_preflight()
 
         request = urlopen.call_args.args[0]
+        self.assertEqual(request.get_header("Authorization"), "Bearer test-secret")
         self.assertEqual(request.get_header("User-agent"), "DCar-Insight/1.0")
         self.assertEqual(request.get_header("Accept"), "application/json")
         self.assertEqual(
@@ -391,7 +396,7 @@ class FullHistoryWrapperTest(unittest.TestCase):
 
     def test_execute_orders_evidence_before_classifier_and_always_releases_lock(self) -> None:
         events: list[str] = []
-        state = {"phases": {}, "budgets": {}}
+        state: dict = {"phases": {}, "budgets": {}}
         budgets = {
             "metrics_douyin": 1.0,
             "metrics_repair_douyin": 1.0,
@@ -401,9 +406,10 @@ class FullHistoryWrapperTest(unittest.TestCase):
             "comments_xhs": 1.0,
         }
 
-        def mark(name):
+        def mark(name, result=None):
             def inner(*_args, **_kwargs):
                 events.append(name)
+                return result
             return inner
 
         def content(*args, **_kwargs):
@@ -421,15 +427,15 @@ class FullHistoryWrapperTest(unittest.TestCase):
             stack.enter_context(patch.object(runner, "bind_campaign_contract", side_effect=mark("contract")))
             stack.enter_context(patch.object(runner, "ensure_campaign_scope_baseline", side_effect=mark("baseline")))
             stack.enter_context(patch.object(runner, "freeze_campaign_cohort", side_effect=mark("cohort")))
-            stack.enter_context(patch.object(runner, "backup_database", side_effect=lambda: events.append("backup") or {"database": "backup"}))
+            stack.enter_context(patch.object(runner, "backup_database", side_effect=mark("backup", {"database": "backup"})))
             stack.enter_context(patch.object(runner, "phase_recover_stale_slots", side_effect=mark("recover")))
             stack.enter_context(patch.object(runner, "phase_preflight", side_effect=mark("preflight")))
             stack.enter_context(patch.object(runner, "gate_tests", side_effect=mark("tests")))
             stack.enter_context(patch.object(runner, "phase_discover", side_effect=mark("discover")))
-            stack.enter_context(patch.object(runner, "phase_quote", side_effect=lambda *_args, **_kwargs: events.append("quote") or budgets))
+            stack.enter_context(patch.object(runner, "phase_quote", side_effect=mark("quote", budgets)))
             stack.enter_context(patch.object(runner, "run_content_phase", side_effect=content))
             stack.enter_context(patch.object(runner, "phase_repair_metrics", side_effect=mark("repair")))
-            stack.enter_context(patch.object(runner, "phase_local_evidence", side_effect=lambda *_args, **_kwargs: events.append("local") or 0))
+            stack.enter_context(patch.object(runner, "phase_local_evidence", side_effect=mark("local", 0)))
             stack.enter_context(patch.object(runner, "phase_duplicate_rebuild", side_effect=mark("duplicates")))
             stack.enter_context(patch.object(runner, "phase_classifier", side_effect=mark("classifier")))
             stack.enter_context(patch.object(runner, "phase_postflight", side_effect=mark("postflight")))

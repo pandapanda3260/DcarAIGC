@@ -3,10 +3,13 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import sqlite3
 import tempfile
 import unittest
 from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 from unittest.mock import patch
 
 from PIL import Image, ImageDraw
@@ -380,6 +383,48 @@ class V8DuplicateDetectionTest(unittest.TestCase):
         self.assertEqual(
             _pending_content_ids(limit=1, db_path=self.db),
             [true_candidate],
+        )
+
+    def test_pending_fingerprint_scope_uses_bounded_queries(self) -> None:
+        selected = self._content("SCOPE1")
+        fingerprint_content(selected, db_path=self.db)
+        statements: list[str] = []
+
+        @contextmanager
+        def traced_connect(path: Path) -> Iterator[sqlite3.Connection]:
+            with connect(path) as connection:
+                connection.set_trace_callback(statements.append)
+                yield connection
+
+        scope = [selected, *range(10_000, 10_501)]
+        with patch.object(duplicates_module, "connect", traced_connect):
+            self.assertEqual(
+                _pending_content_ids(
+                    limit=None, db_path=self.db, scope_content_ids=scope,
+                ),
+                [],
+            )
+
+        fingerprint_queries = [
+            statement
+            for statement in statements
+            if "FROM duplicate_fingerprints" in statement
+        ]
+        self.assertEqual(len(fingerprint_queries), 2)
+        self.assertTrue(
+            all("content_id IN" in statement for statement in fingerprint_queries)
+        )
+
+        statements.clear()
+        with patch.object(duplicates_module, "connect", traced_connect):
+            self.assertEqual(
+                _pending_content_ids(
+                    limit=None, db_path=self.db, scope_content_ids=[],
+                ),
+                [],
+            )
+        self.assertFalse(
+            any("FROM duplicate_fingerprints" in statement for statement in statements)
         )
 
     def test_queue_updates_relations_after_each_batch_without_waiting_for_drain(self) -> None:

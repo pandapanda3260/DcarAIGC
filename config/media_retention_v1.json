@@ -1,0 +1,26 @@
+{
+  "contract_version": "media-retention-v1",
+  "archive_root": "/Users/mark/Documents/DcarAIGC_MediaArchive",
+  "managed_directory": "managed-v1",
+  "activation_modes": ["enrollment_only", "active", "paused"],
+  "archive_retention_hours": 72,
+  "restored_hot_hours": 24,
+  "completion_gate_aged_days": 14,
+  "minimum_free_bytes_per_volume": 10737418240,
+  "archive_minute": 40,
+  "retention_minute": 30,
+  "restore_interval_minutes": 5,
+  "lifecycle_concurrency": 1,
+  "private_directory_mode": "0700",
+  "private_file_mode": "0600",
+  "preview": {
+    "format": "JPEG",
+    "maximum_edge": 256,
+    "upscale": false,
+    "quality": 70,
+    "maximum_bytes": 102400
+  },
+  "trash_phase": false,
+  "historical_enrollment": false,
+  "automatic_paid_reacquire": false
+}

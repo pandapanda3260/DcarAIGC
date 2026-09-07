@@ -1,0 +1,61 @@
+{
+  "policy_version": "source-routing-matrix-first-v2",
+  "account_freshness_seconds": 86400,
+  "content_recent_days": 7,
+  "content_active_days": 30,
+  "content_recent_freshness_seconds": 86400,
+  "content_established_freshness_seconds": 259200,
+  "content_established_cycle_days": 3,
+  "primary_provider": "newrank_matrix",
+  "fallback_provider": "tikhub",
+  "new_capture_providers": ["newrank_matrix", "tikhub"],
+  "field_states": ["provided", "missing", "invalid", "audit_only", "not_applicable", "not_requested"],
+  "xiaohongshu_exposure": "not_applicable",
+  "tikhub_placeholder_zero_operations": ["douyin_user_posts", "xiaohongshu_user_posts", "douyin_discovery_metrics", "xiaohongshu_discovery_metrics", "douyin_video_detail"],
+  "audit_only_fields": {
+    "douyin_video_statistics": ["share_count"]
+  },
+  "provider_operation_stages": {
+    "newrank_matrix": {
+      "aweme_list": "discovery",
+      "matrix_works_list": "discovery",
+      "matrix_account_list": "discovery"
+    },
+    "tikhub": {
+      "douyin_user_posts": "discovery",
+      "xiaohongshu_user_posts": "discovery",
+      "douyin_discovery_metrics": "discovery",
+      "xiaohongshu_discovery_metrics": "discovery",
+      "douyin_video_detail": ["detail", "metrics", "media_source_refresh"],
+      "xiaohongshu_note_detail": ["detail", "media_source_refresh"],
+      "xiaohongshu_video_detail": ["detail", "media_source_refresh"],
+      "douyin_video_statistics": "metrics",
+      "xiaohongshu_note_statistics": "metrics",
+      "douyin_video_comments": "comments",
+      "douyin_comments": "comments",
+      "xiaohongshu_note_comments": "comments",
+      "xiaohongshu_comments": "comments"
+    },
+    "douyin_openapi": {
+      "aweme_list": "discovery",
+      "douyin_openapi_video_list": "discovery"
+    }
+  },
+  "metric_supplement_groups": {
+    "douyin": [
+      {"name": "detail_counts", "stage": "detail", "fields": ["comment_count", "collect_count"]},
+      {"name": "statistics", "stage": "metrics", "fields": ["view_count", "like_count", "share_count"]}
+    ],
+    "xiaohongshu": [
+      {"name": "note_counts", "stage": "metrics", "fields": ["comment_count", "like_count", "share_count", "collect_count"]}
+    ]
+  },
+  "routes": {
+    "douyin_detail": {"path": "/api/v1/douyin/app/v3/fetch_one_video", "id_parameter": "aweme_id"},
+    "douyin_metrics": {"path": "/api/v1/douyin/app/v3/fetch_video_statistics", "id_parameter": "aweme_ids", "batch_size": 1},
+    "xiaohongshu_image_detail": {"path": "/api/v1/xiaohongshu/app_v2/get_image_note_detail", "id_parameter": "note_id"},
+    "xiaohongshu_video_detail": {"path": "/api/v1/xiaohongshu/app_v2/get_video_note_detail", "id_parameter": "note_id"},
+    "douyin_profile": {"path": "/api/v1/douyin/web/fetch_user_profile_by_uid", "id_parameter": "uid", "enabled_fields": ["follower_count"]},
+    "xiaohongshu_profile": {"path": "/api/v1/xiaohongshu/app_v2/get_user_info", "id_parameter": "user_id", "enabled_fields": []}
+  }
+}

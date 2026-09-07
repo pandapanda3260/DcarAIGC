@@ -9,7 +9,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.backfill_comment_capture_runs import main
+from tests.roster_fixture import accept_roster
 from v8.capture import ProviderResult, execute_content_fetch
+from v8.operations import upsert_account
+from v8.providers import ensure_operational_budget
 from v8.storage import connect, initialize_database
 
 
@@ -20,17 +23,27 @@ class BackfillCommentCaptureRunsTest(unittest.TestCase):
         self.db = self.root / "backfill.sqlite3"
         with connect(self.db) as connection:
             initialize_database(connection)
+        account = upsert_account(
+            {"phone": "13800138000", "platforms": [
+                {"platform": "douyin", "uid": "10000001", "nickname": "评论夹具账号"},
+            ]},
+            db_path=self.db,
+        )
+        with connect(self.db) as connection:
             connection.execute(
                 """
                 INSERT INTO content_items(
                     id,link_id,platform,platform_content_id,canonical_url,content_type,
-                    imported_at,created_at,updated_at
+                    account_id,raw_account_uid,imported_at,created_at,updated_at
                 ) VALUES (1,'AAAAAA','douyin','aweme-1',
                           'https://www.douyin.com/video/aweme-1','video',
+                          ?,'10000001',
                           '2026-08-01T00:00:00Z','2026-08-01T00:00:00Z',
                           '2026-08-01T00:00:00Z')
-                """
+                """,
+                (account["id"],),
             )
+            accept_roster(connection, accepted_at="2026-07-01T00:00:00Z")
             connection.commit()
         page = {
             "comments": [],
@@ -50,6 +63,10 @@ class BackfillCommentCaptureRunsTest(unittest.TestCase):
             ),
             db_path=self.db,
             raw_root=self.root / "raw",
+            budget_id=ensure_operational_budget(
+                provider="TikHub", operation="douyin_video_comments", price=0.001,
+                db_path=self.db,
+            ),
         )
 
     def tearDown(self) -> None:

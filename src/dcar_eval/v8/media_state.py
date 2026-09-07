@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -14,6 +14,8 @@ from .media import (
     MAX_MEDIA_PROCESSING_ATTEMPTS,
     MEDIA_SOURCE_VERSION,
     VIDEO_DOWNLOAD_VERSION,
+    managed_evidence_metadata,
+    managed_slot_source,
     processor_versions,
 )
 
@@ -40,6 +42,10 @@ MediaTerminalReason = Literal[
     "frames_terminal_failed",
     "asr_terminal_failed",
     "ocr_terminal_failed",
+    "managed_source_pending",
+    "restore_required",
+    "expired_non_replayable",
+    "original_unavailable",
 ]
 
 
@@ -244,10 +250,182 @@ def _complete_evaluation_envelope_valid(
     )
 
 
+def _unavailable_evaluation_envelope_valid(
+    evaluation: sqlite3.Row | None,
+    *,
+    content_id: int,
+) -> bool:
+    """Validate a weak automatic envelope with no invented media evidence."""
+
+    if (
+        evaluation is None
+        or evaluation["evaluation_status"] != "insufficient_evidence"
+        or evaluation["evidence_level"] not in {"V0", "V1"}
+        or evaluation["evaluation_source"] != "automatic"
+    ):
+        return False
+    components = _metadata_object(evaluation["components_json"])
+    return bool(
+        type(evaluation["evidence_envelope_id"]) is int
+        and evaluation["envelope_id"] == evaluation["evidence_envelope_id"]
+        and evaluation["envelope_content_id"] == content_id
+        and _valid_sha256(evaluation["evaluation_evidence_sha256"])
+        and evaluation["evaluation_evidence_sha256"]
+        == evaluation["envelope_evidence_sha256"]
+        and evaluation["media_sha256"] is None
+        and evaluation["asr_sha256"] is None
+        and evaluation["ocr_sha256"] is None
+        and components is not None
+        and components.get("media_sha256") is None
+        and components.get("asr_sha256") is None
+        and components.get("ocr_sha256") is None
+    )
+
+
+def provider_terminal_unavailable_content_ids(
+    connection: sqlite3.Connection,
+    content_ids: Sequence[int],
+) -> set[int]:
+    """Return exact provider-confirmed permanent media-source misses."""
+
+    result: set[int] = set()
+    for chunk in _id_chunks(list(dict.fromkeys(content_ids))):
+        if not chunk:
+            continue
+        placeholders = ",".join("?" for _ in chunk)
+        result.update(
+            int(row["content_id"])
+            for row in connection.execute(
+                f"""
+                SELECT DISTINCT content_id
+                FROM fetch_slots
+                WHERE content_id IN ({placeholders})
+                  AND stage IN ('detail','media_source_refresh')
+                  AND window_key IN ('lifetime','xhs-type-probe-v1')
+                  AND status='terminal_failed'
+                  AND last_error_code='content_unavailable'
+                """,
+                chunk,
+            ).fetchall()
+        )
+    return result
+
+
+def _managed_terminal_detail(
+    connection: sqlite3.Connection, *, content_id: int, content_type: str,
+    bundle: Mapping[str, Any], evaluation: sqlite3.Row | None,
+    slots: Mapping[tuple[int, str, str, str], sqlite3.Row],
+    slots_by_id: Mapping[int, sqlite3.Row], versions: Mapping[str, str],
+) -> MediaTerminalDetail:
+    from .media_lifecycle import original_artifact
+    from .media_retention import original_availability
+
+    original = original_artifact(connection, bundle)
+
+    def retained_hash_bound(artifact_type: str, sha256: str | None) -> bool:
+        if sha256 is None:
+            return False
+        for row in connection.execute(
+            """SELECT * FROM evidence_artifacts WHERE content_id=?
+               AND artifact_type=? AND sha256=? AND status='available'""",
+            (content_id, artifact_type, sha256),
+        ):
+            metadata = _metadata_object(row["metadata_json"])
+            if metadata is None:
+                continue
+            namespace = metadata.get("media_lifecycle")
+            expected = managed_evidence_metadata(
+                bundle, source_sha256=str((namespace or {}).get("input_sha256") or ""),
+                processor_version=str(row["processor_version"]),
+            )["media_lifecycle"] if isinstance(namespace, dict) else None
+            if expected is not None and namespace == expected:
+                return True
+        return False
+
+    if (
+        _complete_evaluation_envelope_valid(
+            evaluation, content_id=content_id, content_type=content_type
+        )
+        and evaluation is not None
+        and evaluation["media_sha256"] == original["sha256"]
+        and retained_hash_bound("ocr", evaluation["ocr_sha256"])
+        and (content_type != "video" or retained_hash_bound("asr", evaluation["asr_sha256"]))
+    ):
+        return MediaTerminalDetail("complete", "complete")
+
+    availability = original_availability(connection, content_id)
+    reason = availability["reason"]
+    if reason in {"original_archived", "original_restoring"}:
+        return MediaTerminalDetail("pending", "restore_required")
+    if reason in {"original_expired", "original_expiry_pending", "original_purge_in_progress"}:
+        return MediaTerminalDetail("pending", "expired_non_replayable")
+    if reason != "original_available":
+        return MediaTerminalDetail("pending", "original_unavailable")
+    download = slots_by_id.get(int(bundle["manifest"]["download_slot"]["id"]))
+    outcome, media_artifact = _slot_artifact(
+        download, content_id=content_id,
+        artifact_type="media" if content_type == "video" else "media_manifest",
+    )
+    if (outcome != "succeeded" or media_artifact is None
+            or media_artifact.artifact_id != original["id"]
+            or media_artifact.sha256 != original["sha256"]):
+        return MediaTerminalDetail("pending", "download_pending")
+
+    def stage(
+        processor: str, input_sha256: str, artifact_type: str,
+    ) -> tuple[str, _ArtifactClosure | None]:
+        row = slots.get((content_id, managed_slot_source(bundle, input_sha256),
+                         processor, versions[processor]))
+        result, artifact = _slot_artifact(row, content_id=content_id, artifact_type=artifact_type)
+        if result == "succeeded" and row is not None:
+            metadata = _metadata_object(row["artifact_metadata_json"])
+            if metadata != managed_evidence_metadata(
+                bundle, source_sha256=input_sha256, processor_version=versions[processor]
+            ):
+                return "pending", None
+        return result, artifact
+
+    def waiting(processor: str, outcome: str) -> MediaTerminalDetail:
+        reasons: dict[str, tuple[MediaTerminalReason, MediaTerminalReason]] = {
+            "frames": ("frames_pending", "frames_terminal_failed"),
+            "asr": ("asr_pending", "asr_terminal_failed"),
+            "ocr": ("ocr_pending", "ocr_terminal_failed"),
+        }
+        pending, failed = reasons[processor]
+        return MediaTerminalDetail(
+            "terminal_failed" if outcome == "terminal_failed" else "pending",
+            failed if outcome == "terminal_failed" else pending,
+        )
+
+    asr_sha256 = None
+    ocr_input = media_artifact.sha256
+    if content_type == "video":
+        for processor, artifact_type in (("frames", "frames_manifest"), ("asr", "asr")):
+            outcome, artifact = stage(processor, media_artifact.sha256, artifact_type)
+            if outcome != "succeeded" or artifact is None:
+                return waiting(processor, outcome)
+            if processor == "frames":
+                ocr_input = artifact.sha256
+            else:
+                asr_sha256 = artifact.sha256
+    outcome, ocr = stage("ocr", ocr_input, "ocr")
+    if outcome != "succeeded" or ocr is None:
+        return waiting("ocr", outcome)
+    if not _envelope_matches(
+        evaluation, content_id=content_id, media_sha256=media_artifact.sha256,
+        asr_sha256=asr_sha256, ocr_sha256=ocr.sha256,
+    ):
+        return MediaTerminalDetail("pending", "evaluation_pending")
+    if evaluation is not None and evaluation["evaluation_status"] == "insufficient_evidence":
+        return MediaTerminalDetail("terminal_insufficient", "terminal_insufficient")
+    return MediaTerminalDetail("pending", "evaluation_pending")
+
+
 def media_terminal_state_details(
     connection: sqlite3.Connection,
     release_id: str,
     content_ids: Sequence[int],
+    *, cutoff_at: str | None = None,
 ) -> dict[int, MediaTerminalDetail]:
     """Project each content onto its current media DAG state and stage reason.
 
@@ -275,7 +453,12 @@ def media_terminal_state_details(
     if not ids:
         return {}
 
-    chunks = _id_chunks(ids)
+    # Six cutoff/release binds are added to the largest query; respect the
+    # connection's actual SQLite limit (including small regression fixtures).
+    chunk_size = min(_QUERY_CHUNK_SIZE, connection.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER) - 6)
+    if chunk_size < 1:
+        raise MediaStateError("SQLite variable limit is too small for media state")
+    chunks = [ids[offset:offset + chunk_size] for offset in range(0, len(ids), chunk_size)]
     contents: dict[int, sqlite3.Row] = {}
     for chunk in chunks:
         placeholders = ",".join("?" for _ in chunk)
@@ -314,9 +497,11 @@ def media_terminal_state_details(
                 FROM media_processing_slots m
                 LEFT JOIN evidence_artifacts e ON e.id=m.output_artifact_id
                 WHERE m.content_id IN ({placeholders})
+                  AND (? IS NULL OR (julianday(m.updated_at)<=julianday(?)
+                       AND (e.id IS NULL OR (julianday(e.created_at)<=julianday(?) AND julianday(e.captured_at)<=julianday(?)))))
                 ORDER BY m.id
                 """,
-                chunk,
+                [*chunk, cutoff_at, cutoff_at, cutoff_at, cutoff_at],
             ).fetchall()
         )
     slots_by_content: dict[int, list[sqlite3.Row]] = {value: [] for value in ids}
@@ -341,16 +526,17 @@ def media_terminal_state_details(
         for row in connection.execute(
             f"""
             SELECT * FROM (
-                SELECT content_id,sha256,processor_version,
+                SELECT id,content_id,sha256,processor_version,
                        ROW_NUMBER() OVER (
                            PARTITION BY content_id ORDER BY id DESC
                        ) AS selector_rank
                 FROM evidence_artifacts
                 WHERE artifact_type='media_source' AND status='available'
                   AND content_id IN ({placeholders})
+                  AND (? IS NULL OR (julianday(created_at)<=julianday(?) AND julianday(captured_at)<=julianday(?)))
             ) WHERE selector_rank=1
             """,
-            chunk,
+            [*chunk, cutoff_at, cutoff_at, cutoff_at],
         ).fetchall():
             latest_sources[int(row["content_id"])] = row
 
@@ -384,16 +570,21 @@ def media_terminal_state_details(
                         FROM evaluation_versions ev
                         LEFT JOIN evidence_envelopes envelope
                           ON envelope.id=ev.evidence_envelope_id
-                        WHERE ev.release_id=? AND ev.invalidated_at IS NULL
+                        WHERE ev.release_id=?
+                          AND (ev.invalidated_at IS NULL OR (? IS NOT NULL AND julianday(ev.invalidated_at)>julianday(?)))
                           AND ev.evaluation_source='automatic'
                           AND ev.content_id IN ({placeholders})
+                          AND (? IS NULL OR (julianday(ev.evaluated_at)<=julianday(?) AND julianday(envelope.created_at)<=julianday(?)))
                     ) WHERE selector_rank=1
                     """,
-                    [release_id, *chunk],
+                    [release_id, cutoff_at, cutoff_at, *chunk, cutoff_at, cutoff_at, cutoff_at],
                 ).fetchall()
             }
         )
     versions = processor_versions()
+    provider_unavailable = provider_terminal_unavailable_content_ids(
+        connection, ids
+    )
     result: dict[int, MediaTerminalDetail] = {
         content_id: MediaTerminalDetail("pending", "source_missing")
         for content_id in ids
@@ -411,9 +602,40 @@ def media_terminal_state_details(
 
     for content_id in ids:
         content = contents.get(content_id)
-        if content is None or content["content_type"] not in {"video", "image"}:
+        if content is None:
             continue
         evaluation = evaluations.get(content_id)
+        if content["content_type"] not in {"video", "image"}:
+            if (
+                content_id in provider_unavailable
+                and _unavailable_evaluation_envelope_valid(
+                    evaluation, content_id=content_id
+                )
+            ):
+                result[content_id] = MediaTerminalDetail(
+                    "terminal_insufficient", "terminal_insufficient"
+                )
+            continue
+        from .media import _has_managed_history
+        from .media_lifecycle import current_bundle
+
+        bundle = current_bundle(connection, content_id)
+        if bundle is not None:
+            if cutoff_at is not None and (latest_sources.get(content_id) is None or
+                    bundle["manifest"]["source"]["artifact_id"] != latest_sources[content_id]["id"]):
+                # A later source cannot retroactively close an old report's
+                # media gate. No temporal bundle state is invented here.
+                result[content_id] = MediaTerminalDetail("pending", "managed_source_pending")
+                continue
+            result[content_id] = _managed_terminal_detail(
+                connection, content_id=content_id, content_type=str(content["content_type"]),
+                bundle=bundle, evaluation=evaluation, slots=slots,
+                slots_by_id=slots_by_id, versions=versions,
+            )
+            continue
+        if _has_managed_history(connection, content_id):
+            result[content_id] = MediaTerminalDetail("pending", "managed_source_pending")
+            continue
         if _complete_evaluation_envelope_valid(
             evaluation,
             content_id=content_id,
@@ -427,6 +649,15 @@ def media_terminal_state_details(
             or source_row["processor_version"] != MEDIA_SOURCE_VERSION
             or not _valid_sha256(source_row["sha256"])
         ):
+            if (
+                content_id in provider_unavailable
+                and _unavailable_evaluation_envelope_valid(
+                    evaluation, content_id=content_id
+                )
+            ):
+                result[content_id] = MediaTerminalDetail(
+                    "terminal_insufficient", "terminal_insufficient"
+                )
             continue
         download_row = slot_for(
             content_id,
@@ -564,12 +795,13 @@ def media_terminal_states(
     connection: sqlite3.Connection,
     release_id: str,
     content_ids: Sequence[int],
+    *, cutoff_at: str | None = None,
 ) -> dict[int, MediaTerminalState]:
     """Return the compact state projection used by report coverage."""
 
     return {
         content_id: detail.state
         for content_id, detail in media_terminal_state_details(
-            connection, release_id, content_ids
+            connection, release_id, content_ids, cutoff_at=cutoff_at
         ).items()
     }

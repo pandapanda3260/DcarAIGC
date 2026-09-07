@@ -1,0 +1,29 @@
+[Unit]
+Description=Back up the DcarAIGC authentication store
+ConditionPathIsDirectory=/var/lib/dcar-aigc/auth
+ConditionPathIsDirectory=/var/backups/dcar-aigc/auth
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/dcar-auth-backup --source /var/lib/dcar-aigc/auth/sessions.sqlite3 --backup-dir /var/backups/dcar-aigc/auth --keep-days 30 --expect-user-version 3
+TimeoutStartSec=60s
+UMask=0077
+
+PrivateNetwork=true
+RestrictAddressFamilies=AF_UNIX
+ReadOnlyPaths=/var/lib/dcar-aigc/auth
+ReadWritePaths=/var/backups/dcar-aigc/auth
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+
+CPUQuota=50%
+MemoryMax=256M
+TasksMax=32
+LimitNOFILE=1024

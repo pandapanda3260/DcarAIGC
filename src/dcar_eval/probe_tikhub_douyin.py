@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Run a minimal, cached TikHub Douyin acceptance probe.
+"""Read a cached TikHub Douyin acceptance probe.
 
-The probe fetches one work detail, its dedicated statistics, and the first
-comment page.  Successful and error responses are recursively redacted before
-being cached, and an existing cache is reused unless ``--refresh`` is given.
+The historical direct-network implementation is retired. Provider calls must
+go through the v8 writer so budget, paid identity, transport evidence, and raw
+storage share one fail-closed boundary. Existing cache files remain readable.
 """
 
 from __future__ import annotations
@@ -13,13 +13,10 @@ import datetime as dt
 import json
 import os
 from pathlib import Path
-import subprocess
 from typing import Any
-import urllib.parse
 
 from project_paths import RAW_RESPONSE_CACHE_DIR
 from tikhub_config import (
-    DEFAULT_TIKHUB_API_BASE,
     DEFAULT_TIKHUB_CONFIG_FILE,
     TikHubConfigurationError,
     load_tikhub_api_base,
@@ -28,14 +25,6 @@ from tikhub_config import (
 
 
 KEY_FILE = DEFAULT_TIKHUB_CONFIG_FILE
-# Shared scoring modules import this probe for pure helpers.  Configuration is
-# validated by load_key only when a caller actually requests provider access.
-BASE_URL = DEFAULT_TIKHUB_API_BASE
-USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/138.0.0.0 Safari/537.36"
-)
 SENSITIVE_NAMES = {
     "authorization",
     "cookie",
@@ -45,7 +34,9 @@ SENSITIVE_NAMES = {
     "api_key",
     "token",
 }
-HTTP_MARKER = "\n__TIKHUB_HTTP_STATUS__="
+LEGACY_NETWORK_DISABLED = (
+    "legacy TikHub network entry is retired; use the v8 writer capture path"
+)
 
 
 def load_key(path: Path) -> str:
@@ -84,46 +75,8 @@ def atomic_write_json(path: Path, value: Any) -> None:
 
 
 def fetch(endpoint: str, params: dict[str, Any], key: str) -> tuple[int, Any]:
-    query = urllib.parse.urlencode(params)
-    url = f"{BASE_URL}{endpoint}?{query}"
-    command = [
-        "curl",
-        "-sS",
-        "--http1.1",
-        "--connect-timeout",
-        "15",
-        "--max-time",
-        "45",
-        "-w",
-        HTTP_MARKER + "%{http_code}",
-        url,
-        "-H",
-        f"Authorization: Bearer {key}",
-        "-H",
-        "Accept: application/json",
-        "-H",
-        "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8",
-        "-H",
-        f"User-Agent: {USER_AGENT}",
-    ]
-    result = subprocess.run(
-        command,
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"curl failed with exit code {result.returncode}")
-    if HTTP_MARKER not in result.stdout:
-        raise RuntimeError("TikHub response did not include an HTTP status marker")
-    body, raw_status = result.stdout.rsplit(HTTP_MARKER, 1)
-    status = int(raw_status.strip())
-    try:
-        payload = json.loads(body)
-    except json.JSONDecodeError:
-        payload = {"parse_error": "response was not valid JSON"}
-    return status, payload
+    del endpoint, params, key
+    raise RuntimeError(LEGACY_NETWORK_DISABLED)
 
 
 def safe_message(payload: Any) -> str:

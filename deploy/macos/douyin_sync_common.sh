@@ -25,6 +25,15 @@ dcar_sync_uid() {
   /usr/bin/stat -c '%u' "$path" 2>/dev/null || return 1
 }
 
+dcar_sync_validate_machine_key_value() {
+  local value="$1"
+  local length="${#value}"
+  (( length >= 32 && length <= 512 )) || return 1
+  case "$value" in
+    *[!A-Za-z0-9._~+/=-]*) return 1 ;;
+  esac
+}
+
 dcar_sync_load_env() {
   local sync_env="$1"
   [[ -n "$sync_env" && "$sync_env" = /* ]] || \

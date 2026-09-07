@@ -6,19 +6,23 @@
   已接线：本页是 dcar_auth.gateway（src/dcar_eval/dcar_auth/gateway.py）的
   登录模板。网关把本页挂在 <base>/login（本地 base 为空 → /login；服务器
   设 DCAR_AUTH_BASE_PATH=/dcar → /dcar/login），页面从自身地址推导 base，
-  两种形态无需改动。
+  两种形态无需改动。同一张卡片内有三个视图（登录 / 注册 / 找回密码），
+  只切换显示，不改 URL。
 
-  网关合同：
-    - POST <base>/auth/login，表单 username/password/remember/return_to，
-      必须携带请求头 X-Dcar-Request: login（同源校验）
-    - 成功返回 200 JSON {"redirect_to": 路径}，页面按其跳转
-    - 失败返回 JSON {"detail": 中文提示}（401/403/413/429/503），页面优先展示
+  网关合同（全部 POST，application/x-www-form-urlencoded，必须携带同源
+  标记头 X-Dcar-Request，成功 200 JSON，失败 JSON {"detail": 中文}）：
+    - /auth/login          marker login        username/password/remember/return_to → {redirect_to}
+    - /auth/code           marker code         phone/purpose(register|login|reset) → {}
+    - /auth/login/code     marker login-code   phone/code/remember/return_to → {redirect_to}
+    - /auth/register       marker register     username/phone/password/code/return_to → {redirect_to}
+    - /auth/reset/verify   marker reset-verify phone/code → {reset_token}
+    - /auth/reset/confirm  marker reset-confirm reset_token/password/return_to → {redirect_to}
     - 会话探活 GET <base>/auth/session（已登录 200，未登录 401）
     - 未登录访问受保护页 → 302 <base>/login?return_to=<原路径>
+  新接口的失败响应还带 code 字段，页面只展示 detail。
 
   直接以 file:// 打开 → 自动进入本地预览模式，不发送任何数据。
-  账号密码由网关校验 runtime/auth/users.htpasswd（$6$ sha512_crypt，
-  由 scripts/create_local_auth_user.py 创建）；本页面只负责界面与提交。
+  账号、密码哈希与验证码由网关的 SQLite 账号库管理；本页面只负责界面与提交。
   设计令牌与 app/web/app/globals.css 保持一致（navy/#102c35、品牌黄/#ffcd32、
   荧光绿/#d9ff57、teal/#0d8a7b、ink/#13262d）。
   ============================================================================
@@ -134,7 +138,6 @@
   }
 
   .welcome h1 { margin: 0; font-size: 22px; letter-spacing: -.4px; }
-  .welcome p  { margin: 8px 0 0; color: var(--muted); font-size: 13px; line-height: 1.7; }
 
   form { margin-top: 24px; }
 
@@ -187,7 +190,27 @@
   }
   .field.invalid .control input { border-color: var(--red); background: #fffbfb; }
   .field.invalid .control input:focus { box-shadow: 0 0 0 4px rgba(200, 76, 76, .13); }
-  #username { padding-right: 14px; }
+  #username, #reg-username, #login-phone, #reg-phone, #reset-phone { padding-right: 14px; }
+  .control input.has-action { padding-right: 118px; }
+
+  /* 验证码输入框内嵌的“获取验证码”按钮：倒计时即反馈 */
+  .code-btn {
+    position: absolute;
+    right: 6px; top: 50%;
+    transform: translateY(-50%);
+    height: 34px;
+    padding: 0 10px;
+    border: 0; border-radius: 8px;
+    background: transparent;
+    color: var(--teal);
+    font-size: 12px;
+    font-weight: 750;
+    white-space: nowrap;
+    transition: background .15s ease, color .15s ease;
+  }
+  .code-btn:hover:not(:disabled) { background: #eef2f3; }
+  .code-btn:disabled { color: #9fadb2; cursor: default; }
+  .code-btn:focus-visible { outline: 2px solid var(--teal); outline-offset: 1px; }
 
   .pw-toggle {
     position: absolute;
@@ -287,18 +310,14 @@
   .submit.loading .spinner { display: inline-block; }
   @keyframes spin { to { transform: rotate(360deg); } }
 
-  .secure-note {
+  .links-row {
     display: flex;
     align-items: center;
     justify-content: center;
-    gap: 6px;
-    margin: 22px 0 0;
-    padding-top: 18px;
-    border-top: 1px solid #edf1f2;
-    color: #8b999e;
-    font-size: 11px;
+    gap: 10px;
+    margin-top: 18px;
   }
-  .secure-note svg { width: 13px; height: 13px; color: var(--teal); }
+  .links-row .dot { color: #b7c2c6; }
 
   .page-foot {
     color: #8eabb2;
@@ -338,40 +357,53 @@
 
     <div class="welcome">
       <h1 id="login-title">欢迎回来</h1>
-      <p>请使用管理员分配的运营账号登录工作台</p>
     </div>
 
-    <form id="login-form" method="post" novalidate>
-      <div class="field" id="username-field">
-        <label for="username">账号</label>
-        <div class="control">
-          <svg class="lead-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10" cy="7" r="3"/><path d="M4.5 17c.6-3.1 2.6-4.8 5.5-4.8s4.9 1.7 5.5 4.8"/></svg>
-          <input id="username" name="username" type="text" autocomplete="username" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="请输入账号" required aria-describedby="username-error">
+    <!-- ===================== 登录 ===================== -->
+    <form id="login-form" method="post" novalidate data-view="login">
+      <div id="pw-block">
+        <div class="field">
+          <label for="username">账号</label>
+          <div class="control">
+            <svg class="lead-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10" cy="7" r="3"/><path d="M4.5 17c.6-3.1 2.6-4.8 5.5-4.8s4.9 1.7 5.5 4.8"/></svg>
+            <input id="username" name="username" type="text" autocomplete="username" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="请输入账号" aria-describedby="username-error">
+          </div>
+          <p class="field-msg error" id="username-error" hidden><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="10" cy="10" r="7.2"/><path d="M10 6.6v4.2M10 13.6h.01"/></svg><span></span></p>
         </div>
-        <p class="field-msg error" id="username-error" hidden>
-          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="10" cy="10" r="7.2"/><path d="M10 6.6v4.2M10 13.6h.01"/></svg>
-          <span>请输入账号</span>
-        </p>
+
+        <div class="field" id="password-field">
+          <label for="password">密码</label>
+          <div class="control">
+            <svg class="lead-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="8.6" width="12" height="8" rx="2"/><path d="M6.8 8.6V6.4a3.2 3.2 0 0 1 6.4 0v2.2"/></svg>
+            <input id="password" name="password" type="password" autocomplete="current-password" placeholder="请输入密码" aria-describedby="caps-hint password-error">
+            <button type="button" class="pw-toggle" data-target="password" aria-label="显示密码" aria-pressed="false">
+              <svg class="eye-open" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.2 10S5 4.9 10 4.9 17.8 10 17.8 10 15 15.1 10 15.1 2.2 10 2.2 10Z"/><circle cx="10" cy="10" r="2.4"/></svg>
+              <svg class="eye-closed" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" hidden><path d="M3.5 3.5l13 13"/><path d="M8.3 5.2A8.7 8.7 0 0 1 10 4.9c5 0 7.8 5.1 7.8 5.1a13.9 13.9 0 0 1-2.2 2.9M5.7 6.4A13 13 0 0 0 2.2 10S5 15.1 10 15.1a8 8 0 0 0 3.2-.66"/><path d="M8.3 8.5a2.4 2.4 0 0 0 3.3 3.3"/></svg>
+            </button>
+          </div>
+          <p class="field-msg caps" id="caps-hint" hidden><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3 2.6 16h14.8L10 3Z"/><path d="M10 8.4v3.2M10 14.4h.01"/></svg><span>大写锁定已开启，请注意密码大小写</span></p>
+          <p class="field-msg error" id="password-error" hidden><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="10" cy="10" r="7.2"/><path d="M10 6.6v4.2M10 13.6h.01"/></svg><span></span></p>
+        </div>
       </div>
 
-      <div class="field" id="password-field">
-        <label for="password">密码</label>
-        <div class="control">
-          <svg class="lead-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="8.6" width="12" height="8" rx="2"/><path d="M6.8 8.6V6.4a3.2 3.2 0 0 1 6.4 0v2.2"/></svg>
-          <input id="password" name="password" type="password" autocomplete="current-password" placeholder="请输入密码" required aria-describedby="caps-hint password-error">
-          <button type="button" class="pw-toggle" id="pw-toggle" aria-label="显示密码" aria-pressed="false">
-            <svg id="eye-open" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.2 10S5 4.9 10 4.9 17.8 10 17.8 10 15 15.1 10 15.1 2.2 10 2.2 10Z"/><circle cx="10" cy="10" r="2.4"/></svg>
-            <svg id="eye-closed" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" hidden><path d="M3.5 3.5l13 13"/><path d="M8.3 5.2A8.7 8.7 0 0 1 10 4.9c5 0 7.8 5.1 7.8 5.1a13.9 13.9 0 0 1-2.2 2.9M5.7 6.4A13 13 0 0 0 2.2 10S5 15.1 10 15.1a8 8 0 0 0 3.2-.66"/><path d="M8.3 8.5a2.4 2.4 0 0 0 3.3 3.3"/></svg>
-          </button>
+      <div id="code-block" hidden>
+        <div class="field">
+          <label for="login-phone">手机号</label>
+          <div class="control">
+            <svg class="lead-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="2.5" width="8" height="15" rx="1.8"/><path d="M9 14.6h2"/></svg>
+            <input id="login-phone" name="phone" type="tel" inputmode="numeric" autocomplete="tel" maxlength="11" placeholder="请输入手机号" aria-describedby="login-phone-error">
+          </div>
+          <p class="field-msg error" id="login-phone-error" hidden><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="10" cy="10" r="7.2"/><path d="M10 6.6v4.2M10 13.6h.01"/></svg><span></span></p>
         </div>
-        <p class="field-msg caps" id="caps-hint" hidden>
-          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3 2.6 16h14.8L10 3Z"/><path d="M10 8.4v3.2M10 14.4h.01"/></svg>
-          <span>大写锁定已开启，请注意密码大小写</span>
-        </p>
-        <p class="field-msg error" id="password-error" hidden>
-          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="10" cy="10" r="7.2"/><path d="M10 6.6v4.2M10 13.6h.01"/></svg>
-          <span>请输入密码</span>
-        </p>
+        <div class="field">
+          <label for="login-code">验证码</label>
+          <div class="control">
+            <svg class="lead-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 5.5h13v10h-13z"/><path d="M3.5 6l6.5 5 6.5-5"/></svg>
+            <input id="login-code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" class="has-action" placeholder="请输入验证码" aria-describedby="login-code-error">
+            <button type="button" class="code-btn" data-phone="login-phone" data-purpose="login">获取验证码</button>
+          </div>
+          <p class="field-msg error" id="login-code-error" hidden><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="10" cy="10" r="7.2"/><path d="M10 6.6v4.2M10 13.6h.01"/></svg><span></span></p>
+        </div>
       </div>
 
       <div class="options-row">
@@ -382,21 +414,129 @@
         <button type="button" class="hint-link" id="forgot-btn">忘记密码？</button>
       </div>
 
-      <div class="banner" id="banner" role="alert" hidden>
-        <svg id="banner-icon-error" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="10" cy="10" r="7.5"/><path d="M10 6.4v4.4M10 13.9h.01"/></svg>
-        <svg id="banner-icon-info" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true" hidden><circle cx="10" cy="10" r="7.5"/><path d="M10 9.2v4.4M10 6.4h.01"/></svg>
-        <span id="banner-text"></span>
+      <div class="banner" role="alert" hidden>
+        <svg class="banner-icon-error" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="10" cy="10" r="7.5"/><path d="M10 6.4v4.4M10 13.9h.01"/></svg>
+        <svg class="banner-icon-info" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true" hidden><circle cx="10" cy="10" r="7.5"/><path d="M10 9.2v4.4M10 6.4h.01"/></svg>
+        <span class="banner-text"></span>
       </div>
 
       <button type="submit" class="submit" id="submit-btn">
-        <span class="spinner" aria-hidden="true"></span><span id="submit-text">登 录</span>
+        <span class="spinner" aria-hidden="true"></span><span class="submit-text">登 录</span>
       </button>
+
+      <div class="links-row">
+        <button type="button" class="hint-link" id="login-mode-toggle">验证码登录</button>
+        <span class="dot">·</span>
+        <button type="button" class="hint-link" id="to-register">注册账号</button>
+      </div>
     </form>
 
-    <p class="secure-note">
-      <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="8.6" width="12" height="8" rx="2"/><path d="M6.8 8.6V6.4a3.2 3.2 0 0 1 6.4 0v2.2"/></svg>
-      全程加密传输 · 仅限授权运营人员访问
-    </p>
+    <!-- ===================== 注册 ===================== -->
+    <form id="register-form" method="post" novalidate data-view="register" hidden>
+      <div class="field">
+        <label for="reg-username">账号名称</label>
+        <div class="control">
+          <svg class="lead-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10" cy="7" r="3"/><path d="M4.5 17c.6-3.1 2.6-4.8 5.5-4.8s4.9 1.7 5.5 4.8"/></svg>
+          <input id="reg-username" name="username" type="text" autocomplete="username" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="32" placeholder="请输入账号名称" aria-describedby="reg-username-error">
+        </div>
+        <p class="field-msg error" id="reg-username-error" hidden><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="10" cy="10" r="7.2"/><path d="M10 6.6v4.2M10 13.6h.01"/></svg><span></span></p>
+      </div>
+      <div class="field">
+        <label for="reg-phone">手机号</label>
+        <div class="control">
+          <svg class="lead-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="2.5" width="8" height="15" rx="1.8"/><path d="M9 14.6h2"/></svg>
+          <input id="reg-phone" name="phone" type="tel" inputmode="numeric" autocomplete="tel" maxlength="11" placeholder="请输入手机号" aria-describedby="reg-phone-error">
+        </div>
+        <p class="field-msg error" id="reg-phone-error" hidden><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="10" cy="10" r="7.2"/><path d="M10 6.6v4.2M10 13.6h.01"/></svg><span></span></p>
+      </div>
+      <div class="field">
+        <label for="reg-password">密码</label>
+        <div class="control">
+          <svg class="lead-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="8.6" width="12" height="8" rx="2"/><path d="M6.8 8.6V6.4a3.2 3.2 0 0 1 6.4 0v2.2"/></svg>
+          <input id="reg-password" name="password" type="password" autocomplete="new-password" placeholder="请输入密码" aria-describedby="reg-password-error">
+          <button type="button" class="pw-toggle" data-target="reg-password" aria-label="显示密码" aria-pressed="false">
+            <svg class="eye-open" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.2 10S5 4.9 10 4.9 17.8 10 17.8 10 15 15.1 10 15.1 2.2 10 2.2 10Z"/><circle cx="10" cy="10" r="2.4"/></svg>
+            <svg class="eye-closed" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" hidden><path d="M3.5 3.5l13 13"/><path d="M8.3 5.2A8.7 8.7 0 0 1 10 4.9c5 0 7.8 5.1 7.8 5.1a13.9 13.9 0 0 1-2.2 2.9M5.7 6.4A13 13 0 0 0 2.2 10S5 15.1 10 15.1a8 8 0 0 0 3.2-.66"/><path d="M8.3 8.5a2.4 2.4 0 0 0 3.3 3.3"/></svg>
+          </button>
+        </div>
+        <p class="field-msg error" id="reg-password-error" hidden><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="10" cy="10" r="7.2"/><path d="M10 6.6v4.2M10 13.6h.01"/></svg><span></span></p>
+      </div>
+      <div class="field">
+        <label for="reg-code">验证码</label>
+        <div class="control">
+          <svg class="lead-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 5.5h13v10h-13z"/><path d="M3.5 6l6.5 5 6.5-5"/></svg>
+          <input id="reg-code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" class="has-action" placeholder="请输入验证码" aria-describedby="reg-code-error">
+          <button type="button" class="code-btn" data-phone="reg-phone" data-purpose="register">获取验证码</button>
+        </div>
+        <p class="field-msg error" id="reg-code-error" hidden><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="10" cy="10" r="7.2"/><path d="M10 6.6v4.2M10 13.6h.01"/></svg><span></span></p>
+      </div>
+
+      <div class="banner" role="alert" hidden>
+        <svg class="banner-icon-error" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="10" cy="10" r="7.5"/><path d="M10 6.4v4.4M10 13.9h.01"/></svg>
+        <svg class="banner-icon-info" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true" hidden><circle cx="10" cy="10" r="7.5"/><path d="M10 9.2v4.4M10 6.4h.01"/></svg>
+        <span class="banner-text"></span>
+      </div>
+
+      <button type="submit" class="submit">
+        <span class="spinner" aria-hidden="true"></span><span class="submit-text">完成注册并登录</span>
+      </button>
+
+      <div class="links-row">
+        <button type="button" class="hint-link to-login">返回登录</button>
+      </div>
+    </form>
+
+    <!-- ===================== 找回密码 ===================== -->
+    <form id="reset-form" method="post" novalidate data-view="reset" hidden>
+      <div id="reset-step1">
+        <div class="field">
+          <label for="reset-phone">手机号</label>
+          <div class="control">
+            <svg class="lead-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="2.5" width="8" height="15" rx="1.8"/><path d="M9 14.6h2"/></svg>
+            <input id="reset-phone" name="phone" type="tel" inputmode="numeric" autocomplete="tel" maxlength="11" placeholder="请输入手机号" aria-describedby="reset-phone-error">
+          </div>
+          <p class="field-msg error" id="reset-phone-error" hidden><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="10" cy="10" r="7.2"/><path d="M10 6.6v4.2M10 13.6h.01"/></svg><span></span></p>
+        </div>
+        <div class="field">
+          <label for="reset-code">验证码</label>
+          <div class="control">
+            <svg class="lead-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 5.5h13v10h-13z"/><path d="M3.5 6l6.5 5 6.5-5"/></svg>
+            <input id="reset-code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" class="has-action" placeholder="请输入验证码" aria-describedby="reset-code-error">
+            <button type="button" class="code-btn" data-phone="reset-phone" data-purpose="reset">获取验证码</button>
+          </div>
+          <p class="field-msg error" id="reset-code-error" hidden><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="10" cy="10" r="7.2"/><path d="M10 6.6v4.2M10 13.6h.01"/></svg><span></span></p>
+        </div>
+      </div>
+
+      <div id="reset-step2" hidden>
+        <div class="field">
+          <label for="reset-password">新密码</label>
+          <div class="control">
+            <svg class="lead-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="8.6" width="12" height="8" rx="2"/><path d="M6.8 8.6V6.4a3.2 3.2 0 0 1 6.4 0v2.2"/></svg>
+            <input id="reset-password" name="password" type="password" autocomplete="new-password" placeholder="请输入新密码" aria-describedby="reset-password-error">
+            <button type="button" class="pw-toggle" data-target="reset-password" aria-label="显示密码" aria-pressed="false">
+              <svg class="eye-open" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.2 10S5 4.9 10 4.9 17.8 10 17.8 10 15 15.1 10 15.1 2.2 10 2.2 10Z"/><circle cx="10" cy="10" r="2.4"/></svg>
+              <svg class="eye-closed" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" hidden><path d="M3.5 3.5l13 13"/><path d="M8.3 5.2A8.7 8.7 0 0 1 10 4.9c5 0 7.8 5.1 7.8 5.1a13.9 13.9 0 0 1-2.2 2.9M5.7 6.4A13 13 0 0 0 2.2 10S5 15.1 10 15.1a8 8 0 0 0 3.2-.66"/><path d="M8.3 8.5a2.4 2.4 0 0 0 3.3 3.3"/></svg>
+            </button>
+          </div>
+          <p class="field-msg error" id="reset-password-error" hidden><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="10" cy="10" r="7.2"/><path d="M10 6.6v4.2M10 13.6h.01"/></svg><span></span></p>
+        </div>
+      </div>
+
+      <div class="banner" role="alert" hidden>
+        <svg class="banner-icon-error" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="10" cy="10" r="7.5"/><path d="M10 6.4v4.4M10 13.9h.01"/></svg>
+        <svg class="banner-icon-info" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true" hidden><circle cx="10" cy="10" r="7.5"/><path d="M10 9.2v4.4M10 6.4h.01"/></svg>
+        <span class="banner-text"></span>
+      </div>
+
+      <button type="submit" class="submit">
+        <span class="spinner" aria-hidden="true"></span><span class="submit-text">验 证</span>
+      </button>
+
+      <div class="links-row">
+        <button type="button" class="hint-link to-login">返回登录</button>
+      </div>
+    </form>
   </section>
 
   <footer class="page-foot">
@@ -415,28 +555,40 @@
      ========================================================================== */
   var IS_PREVIEW = window.location.protocol === "file:";
   var BASE_PATH = IS_PREVIEW ? "" : window.location.pathname.replace(/\/login\/?$/, "");
-  var LOGIN_ENDPOINT = IS_PREVIEW ? null : BASE_PATH + "/auth/login";
   var SESSION_PROBE_ENDPOINT = IS_PREVIEW ? null : BASE_PATH + "/auth/session";
   var REDIRECT_FALLBACK = BASE_PATH + "/overview";
+  var ENDPOINTS = {
+    "login": "/auth/login",
+    "code": "/auth/code",
+    "login-code": "/auth/login/code",
+    "register": "/auth/register",
+    "reset-verify": "/auth/reset/verify",
+    "reset-confirm": "/auth/reset/confirm"
+  };
+  var COUNTDOWN_SECONDS = 60;
+  var PHONE_PATTERN = /^1[3-9][0-9]{9}$/;
+  var CODE_PATTERN = /^[0-9]{6}$/;
+  var USERNAME_PATTERN = /^[A-Za-z0-9_]{4,32}$/;
 
-  var form = document.getElementById("login-form");
+  var title = document.getElementById("login-title");
+  var forms = {
+    login: document.getElementById("login-form"),
+    register: document.getElementById("register-form"),
+    reset: document.getElementById("reset-form")
+  };
+  var TITLES = { login: "欢迎回来", register: "注册账号", reset: "找回密码" };
+  var loginForm = forms.login;
   var usernameInput = document.getElementById("username");
   var passwordInput = document.getElementById("password");
-  var usernameField = document.getElementById("username-field");
-  var passwordField = document.getElementById("password-field");
-  var usernameError = document.getElementById("username-error");
-  var passwordError = document.getElementById("password-error");
   var capsHint = document.getElementById("caps-hint");
-  var banner = document.getElementById("banner");
-  var bannerText = document.getElementById("banner-text");
-  var bannerIconError = document.getElementById("banner-icon-error");
-  var bannerIconInfo = document.getElementById("banner-icon-info");
-  var submitBtn = document.getElementById("submit-btn");
-  var submitText = document.getElementById("submit-text");
-  var pwToggle = document.getElementById("pw-toggle");
-  var eyeOpen = document.getElementById("eye-open");
-  var eyeClosed = document.getElementById("eye-closed");
-  var forgotBtn = document.getElementById("forgot-btn");
+  var pwBlock = document.getElementById("pw-block");
+  var codeBlock = document.getElementById("code-block");
+  var loginModeToggle = document.getElementById("login-mode-toggle");
+  var loginByCode = false;
+  var resetStep1 = document.getElementById("reset-step1");
+  var resetStep2 = document.getElementById("reset-step2");
+  var resetToken = "";
+  var countdowns = [];
 
   /* SVG 元素没有 HTMLElement 的 hidden 属性接口，统一用 attribute 切换显隐 */
   function setHidden(element, hidden) {
@@ -444,14 +596,11 @@
     else element.removeAttribute("hidden");
   }
 
-  /* 自动聚焦账号框（autofocus 属性在部分浏览器的 bfcache 恢复后失效，这里兜底） */
-  window.addEventListener("load", function () {
-    if (!usernameInput.value) usernameInput.focus();
-  });
+  function byId(id) { return document.getElementById(id); }
 
   /* 以 file:// 直接打开时亮出"本地预览"角标，避免误以为是正式登录入口 */
   if (IS_PREVIEW) {
-    document.getElementById("preview-badge").removeAttribute("hidden");
+    byId("preview-badge").removeAttribute("hidden");
   }
 
   /* 已持有有效会话时直接进入工作台（网关在服务端也会做同样的跳转，这里
@@ -465,17 +614,22 @@
   }
 
   /* ---- 显示 / 隐藏密码：不抢占输入框焦点 ---- */
-  pwToggle.addEventListener("mousedown", function (event) { event.preventDefault(); });
-  pwToggle.addEventListener("click", function () {
-    var show = passwordInput.type === "password";
-    passwordInput.type = show ? "text" : "password";
-    pwToggle.setAttribute("aria-pressed", String(show));
-    pwToggle.setAttribute("aria-label", show ? "隐藏密码" : "显示密码");
-    setHidden(eyeOpen, show);
-    setHidden(eyeClosed, !show);
+  Array.prototype.forEach.call(document.querySelectorAll(".pw-toggle"), function (toggle) {
+    var input = byId(toggle.getAttribute("data-target"));
+    var eyeOpen = toggle.querySelector(".eye-open");
+    var eyeClosed = toggle.querySelector(".eye-closed");
+    toggle.addEventListener("mousedown", function (event) { event.preventDefault(); });
+    toggle.addEventListener("click", function () {
+      var show = input.type === "password";
+      input.type = show ? "text" : "password";
+      toggle.setAttribute("aria-pressed", String(show));
+      toggle.setAttribute("aria-label", show ? "隐藏密码" : "显示密码");
+      setHidden(eyeOpen, show);
+      setHidden(eyeClosed, !show);
+    });
   });
 
-  /* ---- 大写锁定提示 ---- */
+  /* ---- 大写锁定提示（仅登录密码框）---- */
   function updateCapsHint(event) {
     if (typeof event.getModifierState !== "function") return;
     capsHint.hidden = !event.getModifierState("CapsLock");
@@ -484,49 +638,111 @@
   passwordInput.addEventListener("keyup", updateCapsHint);
   passwordInput.addEventListener("blur", function () { capsHint.hidden = true; });
 
-  /* ---- 字段校验：仅前端必填检查，输入后即时恢复 ---- */
-  function setFieldInvalid(field, message, invalid) {
-    field.classList.toggle("invalid", invalid);
-    message.hidden = !invalid;
+  /* ---- 字段校验：仅前端格式检查，输入后即时恢复 ---- */
+  function fieldOf(input) { return input.closest(".field"); }
+  function setFieldError(input, message) {
+    var field = fieldOf(input);
+    var note = field.querySelector(".field-msg.error");
+    field.classList.toggle("invalid", Boolean(message));
+    note.querySelector("span").textContent = message || "";
+    note.hidden = !message;
   }
-  usernameInput.addEventListener("input", function () {
-    if (usernameInput.value.trim()) setFieldInvalid(usernameField, usernameError, false);
+  Array.prototype.forEach.call(document.querySelectorAll(".field input"), function (input) {
+    input.addEventListener("input", function () { setFieldError(input, ""); });
   });
-  passwordInput.addEventListener("input", function () {
-    if (passwordInput.value) setFieldInvalid(passwordField, passwordError, false);
-  });
+  function requireValue(input, emptyMessage, pattern, formatMessage) {
+    var value = input.type === "password" ? input.value : input.value.trim();
+    if (!value) { setFieldError(input, emptyMessage); return false; }
+    if (pattern && !pattern.test(value)) { setFieldError(input, formatMessage); return false; }
+    setFieldError(input, "");
+    return true;
+  }
+  function requirePassword(input) {
+    var value = input.value;
+    if (!value) { setFieldError(input, "请输入密码"); return false; }
+    var length = Array.from(value).length;
+    if (length < 8 || length > 64 || value.indexOf("\u0000") !== -1) { setFieldError(input, "密码长度需为 8–64 位"); return false; }
+    setFieldError(input, "");
+    return true;
+  }
+  function firstInvalid(inputs) {
+    for (var index = 0; index < inputs.length; index += 1) {
+      if (fieldOf(inputs[index]).classList.contains("invalid")) return inputs[index];
+    }
+    return null;
+  }
 
-  /* ---- 顶部提示条 ---- */
-  function showBanner(kind, text) {
+  /* ---- 表单内提示条 ---- */
+  function showBanner(form, kind, text) {
+    var banner = form.querySelector(".banner");
     banner.hidden = false;
     banner.className = "banner " + kind;
-    setHidden(bannerIconError, kind !== "error");
-    setHidden(bannerIconInfo, kind !== "info");
-    bannerText.textContent = text;
+    setHidden(banner.querySelector(".banner-icon-error"), kind !== "error");
+    setHidden(banner.querySelector(".banner-icon-info"), kind !== "info");
+    banner.querySelector(".banner-text").textContent = text;
   }
-  function hideBanner() { banner.hidden = true; }
+  function hideBanner(form) { form.querySelector(".banner").hidden = true; }
 
   try {
     var params = new URLSearchParams(window.location.search);
     var notice = params.get("notice");
     if (notice === "douyin-session-required") {
-      showBanner("info", "登录状态已失效，请重新登录后再次发起授权。");
+      showBanner(loginForm, "info", "登录状态已失效，请重新登录后再次发起授权。");
     }
   } catch (_) { /* 未识别的提示参数保持静默 */ }
 
-  forgotBtn.addEventListener("click", function () {
-    showBanner("info", "本系统密码由管理员统一管理，如需重置请联系管理员。");
+  /* ---- 视图切换 ---- */
+  function clearForm(form) {
+    hideBanner(form);
+    Array.prototype.forEach.call(form.querySelectorAll(".field input"), function (input) {
+      setFieldError(input, "");
+    });
+  }
+  function stopCountdowns() {
+    countdowns.forEach(function (stop) { stop(); });
+    countdowns = [];
+  }
+  function showView(name) {
+    stopCountdowns();
+    Object.keys(forms).forEach(function (key) {
+      clearForm(forms[key]);
+      forms[key].hidden = key !== name;
+    });
+    title.textContent = TITLES[name];
+    if (name === "reset") {
+      resetToken = "";
+      resetStep1.hidden = false;
+      resetStep2.hidden = true;
+      byId("reset-password").value = "";
+      forms.reset.querySelector(".submit-text").textContent = "验 证";
+      byId("reset-phone").focus();
+    } else if (name === "register") {
+      byId("reg-username").focus();
+    } else {
+      (loginByCode ? byId("login-phone") : usernameInput).focus();
+    }
+  }
+  byId("forgot-btn").addEventListener("click", function () { showView("reset"); });
+  byId("to-register").addEventListener("click", function () { showView("register"); });
+  Array.prototype.forEach.call(document.querySelectorAll(".to-login"), function (button) {
+    button.addEventListener("click", function () { showView("login"); });
+  });
+  loginModeToggle.addEventListener("click", function () {
+    loginByCode = !loginByCode;
+    clearForm(loginForm);
+    stopCountdowns();
+    pwBlock.hidden = loginByCode;
+    codeBlock.hidden = !loginByCode;
+    loginModeToggle.textContent = loginByCode ? "密码登录" : "验证码登录";
+    (loginByCode ? byId("login-phone") : usernameInput).focus();
   });
 
-  /* ---- 提交 ---- */
-  var submitting = false;
-  function setLoading(loading) {
-    submitting = loading;
-    submitBtn.disabled = loading;
-    submitBtn.classList.toggle("loading", loading);
-    submitText.textContent = loading ? "登录中…" : "登 录";
-  }
+  /* 自动聚焦账号框（autofocus 属性在部分浏览器的 bfcache 恢复后失效，这里兜底） */
+  window.addEventListener("load", function () {
+    if (!usernameInput.value) usernameInput.focus();
+  });
 
+  /* ---- 请求 ---- */
   function returnToParam() {
     try {
       var params = new URLSearchParams(window.location.search);
@@ -535,79 +751,252 @@
     } catch (_) { /* 忽略解析异常 */ }
     return "";
   }
-
   function redirectTarget() {
     return returnToParam() || REDIRECT_FALLBACK;
   }
-
-  form.addEventListener("submit", function (event) {
-    event.preventDefault();
-    if (submitting) return;
-    hideBanner();
-
-    var hasUsername = Boolean(usernameInput.value.trim());
-    var hasPassword = Boolean(passwordInput.value);
-    setFieldInvalid(usernameField, usernameError, !hasUsername);
-    setFieldInvalid(passwordField, passwordError, !hasPassword);
-    if (!hasUsername || !hasPassword) {
-      (!hasUsername ? usernameInput : passwordInput).focus();
-      return;
-    }
-
-    /* 本地预览：不发送任何数据，仅演示加载与提示状态 */
-    if (!LOGIN_ENDPOINT) {
-      setLoading(true);
-      window.setTimeout(function () {
-        setLoading(false);
-        showBanner("info", "这是登录页的样式预览，无法在这里登录。请打开线上地址后再登录。");
-      }, 900);
-      return;
-    }
-
-    /* 真实提交：网关校验 htpasswd 并签发会话 Cookie，成功后按其返回跳转 */
-    setLoading(true);
-    var body = new URLSearchParams();
-    body.set("username", usernameInput.value.trim());
-    body.set("password", passwordInput.value);
-    body.set("remember", document.getElementById("remember").checked ? "1" : "0");
-    body.set("return_to", returnToParam());
-
-    fetch(LOGIN_ENDPOINT, {
+  function postForm(marker, body) {
+    return fetch(BASE_PATH + ENDPOINTS[marker], {
       method: "POST",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
-        "X-Dcar-Request": "login"
+        "X-Dcar-Request": marker
       },
       body: body.toString(),
       credentials: "include"
     }).then(function (response) {
       return response.json().catch(function () { return null; }).then(function (data) {
-        if (response.ok) {
-          var target = data && typeof data.redirect_to === "string" && data.redirect_to.charAt(0) === "/"
-            ? data.redirect_to
-            : redirectTarget();
-          window.location.replace(target);
+        return { response: response, data: data };
+      });
+    });
+  }
+  function detailOf(result, fallback) {
+    var detail = result.data && typeof result.data.detail === "string" ? result.data.detail : "";
+    return detail || fallback;
+  }
+  function goTo(result) {
+    var target = result.data && typeof result.data.redirect_to === "string" && result.data.redirect_to.charAt(0) === "/"
+      ? result.data.redirect_to
+      : redirectTarget();
+    window.location.replace(target);
+  }
+  function setLoading(form, loading, idleText, busyText) {
+    var button = form.querySelector(".submit");
+    form.dataset.submitting = loading ? "1" : "";
+    button.disabled = loading;
+    button.classList.toggle("loading", loading);
+    button.querySelector(".submit-text").textContent = loading ? busyText : idleText;
+  }
+  function previewOnly(form) {
+    setLoading(form, true, "", "处理中…");
+    window.setTimeout(function () {
+      setLoading(form, false, form === loginForm ? "登 录" : form.querySelector(".submit-text").textContent, "");
+      showBanner(form, "info", "这是登录页的样式预览，无法在这里操作。请打开线上地址后再试。");
+    }, 900);
+  }
+
+  /* ---- 获取验证码：60 秒倒计时即反馈，不额外提示 ---- */
+  function startCountdown(button) {
+    var remaining = COUNTDOWN_SECONDS;
+    button.disabled = true;
+    button.textContent = remaining + "s";
+    var timer = window.setInterval(function () {
+      remaining -= 1;
+      if (remaining <= 0) {
+        stop();
+        return;
+      }
+      button.textContent = remaining + "s";
+    }, 1000);
+    function stop() {
+      window.clearInterval(timer);
+      button.disabled = false;
+      button.textContent = "重新获取";
+    }
+    countdowns.push(function () {
+      window.clearInterval(timer);
+      button.disabled = false;
+      button.textContent = "获取验证码";
+    });
+  }
+  Array.prototype.forEach.call(document.querySelectorAll(".code-btn"), function (button) {
+    button.addEventListener("click", function () {
+      var form = button.closest("form");
+      var phoneInput = byId(button.getAttribute("data-phone"));
+      hideBanner(form);
+      if (!requireValue(phoneInput, "请输入手机号", PHONE_PATTERN, "手机号格式不正确")) {
+        phoneInput.focus();
+        return;
+      }
+      if (IS_PREVIEW) { startCountdown(button); return; }
+      button.disabled = true;
+      var body = new URLSearchParams();
+      body.set("phone", phoneInput.value.trim());
+      body.set("purpose", button.getAttribute("data-purpose"));
+      postForm("code", body).then(function (result) {
+        if (result.response.ok) {
+          startCountdown(button);
+          var codeInput = button.parentNode.querySelector("input");
+          if (codeInput) codeInput.focus();
           return;
         }
-        setLoading(false);
-        var detail = data && typeof data.detail === "string" ? data.detail : "";
-        if (response.status === 401) {
-          showBanner("error", (detail || "账号或密码不正确") + "，请检查后重试。");
+        button.disabled = false;
+        if (result.response.status === 404 || result.response.status === 405) {
+          showBanner(form, "error", "验证码服务尚未就绪，请联系管理员更新登录服务。");
+          return;
+        }
+        showBanner(form, "error", detailOf(result, "验证码发送失败，请稍后重试") + "。");
+      }).catch(function () {
+        button.disabled = false;
+        showBanner(form, "error", "无法连接到服务器，请检查网络后重试。");
+      });
+    });
+  });
+
+  /* ---- 登录 ---- */
+  loginForm.addEventListener("submit", function (event) {
+    event.preventDefault();
+    if (loginForm.dataset.submitting) return;
+    hideBanner(loginForm);
+    var body = new URLSearchParams();
+    if (loginByCode) {
+      var phoneInput = byId("login-phone");
+      var codeInput = byId("login-code");
+      var okPhone = requireValue(phoneInput, "请输入手机号", PHONE_PATTERN, "手机号格式不正确");
+      var okCode = requireValue(codeInput, "请输入验证码", CODE_PATTERN, "验证码为 6 位数字");
+      if (!okPhone || !okCode) { firstInvalid([phoneInput, codeInput]).focus(); return; }
+      body.set("phone", phoneInput.value.trim());
+      body.set("code", codeInput.value.trim());
+    } else {
+      var okUser = requireValue(usernameInput, "请输入账号");
+      var okPassword = requireValue(passwordInput, "请输入密码");
+      if (!okUser || !okPassword) { firstInvalid([usernameInput, passwordInput]).focus(); return; }
+      body.set("username", usernameInput.value.trim());
+      body.set("password", passwordInput.value);
+    }
+    if (IS_PREVIEW) { previewOnly(loginForm); return; }
+    body.set("remember", byId("remember").checked ? "1" : "0");
+    body.set("return_to", returnToParam());
+    setLoading(loginForm, true, "登 录", "登录中…");
+    postForm(loginByCode ? "login-code" : "login", body).then(function (result) {
+      var response = result.response;
+      if (response.ok) { goTo(result); return; }
+      setLoading(loginForm, false, "登 录", "");
+      var detail = detailOf(result, "");
+      if (response.status === 401) {
+        if (loginByCode) {
+          showBanner(loginForm, "error", (detail || "验证码不正确或已失效") + "。");
+          byId("login-code").focus();
+          byId("login-code").select();
+        } else {
+          showBanner(loginForm, "error", (detail || "账号或密码不正确") + "，请检查后重试。");
           passwordInput.focus();
           passwordInput.select();
-        } else if (response.status === 429) {
-          showBanner("error", detail ? detail + "。" : "尝试次数太多，请稍后再登录。");
-        } else if (response.status === 403) {
-          showBanner("error", detail ? detail + "。" : "登录页面已失效，请刷新后重新登录。");
-        } else if (response.status === 413) {
-          showBanner("error", detail ? detail + "。" : "登录信息太长，请刷新页面后重新输入。");
-        } else {
-          showBanner("error", "暂时无法登录，请稍后重试。");
         }
-      });
+      } else if (response.status === 429) {
+        showBanner(loginForm, "error", detail ? detail + "。" : "尝试次数太多，请稍后再登录。");
+      } else if (response.status === 403) {
+        showBanner(loginForm, "error", detail ? detail + "。" : "登录页面已失效，请刷新后重新登录。");
+      } else if (response.status === 413) {
+        showBanner(loginForm, "error", detail ? detail + "。" : "登录信息太长，请刷新页面后重新输入。");
+      } else {
+        showBanner(loginForm, "error", "暂时无法登录，请稍后重试。");
+      }
     }).catch(function () {
-      setLoading(false);
-      showBanner("error", "无法连接到服务器，请检查网络后重试。");
+      setLoading(loginForm, false, "登 录", "");
+      showBanner(loginForm, "error", "无法连接到服务器，请检查网络后重试。");
+    });
+  });
+
+  /* ---- 注册 ---- */
+  forms.register.addEventListener("submit", function (event) {
+    event.preventDefault();
+    var form = forms.register;
+    if (form.dataset.submitting) return;
+    hideBanner(form);
+    var inputs = [byId("reg-username"), byId("reg-phone"), byId("reg-password"), byId("reg-code")];
+    var ok = requireValue(inputs[0], "请输入账号名称", USERNAME_PATTERN, "账号为 4–32 位字母、数字或下划线");
+    ok = requireValue(inputs[1], "请输入手机号", PHONE_PATTERN, "手机号格式不正确") && ok;
+    ok = requirePassword(inputs[2]) && ok;
+    ok = requireValue(inputs[3], "请输入验证码", CODE_PATTERN, "验证码为 6 位数字") && ok;
+    if (!ok) { firstInvalid(inputs).focus(); return; }
+    if (IS_PREVIEW) { previewOnly(form); return; }
+    var body = new URLSearchParams();
+    body.set("username", inputs[0].value.trim());
+    body.set("phone", inputs[1].value.trim());
+    body.set("password", inputs[2].value);
+    body.set("code", inputs[3].value.trim());
+    body.set("return_to", returnToParam());
+    setLoading(form, true, "完成注册并登录", "注册中…");
+    postForm("register", body).then(function (result) {
+      if (result.response.ok) { goTo(result); return; }
+      setLoading(form, false, "完成注册并登录", "");
+      showBanner(form, "error", detailOf(result, "暂时无法注册，请稍后重试") + "。");
+      if (result.response.status === 401) { inputs[3].focus(); inputs[3].select(); }
+    }).catch(function () {
+      setLoading(form, false, "完成注册并登录", "");
+      showBanner(form, "error", "无法连接到服务器，请检查网络后重试。");
+    });
+  });
+
+  /* ---- 找回密码：先验证码，再新密码 ---- */
+  forms.reset.addEventListener("submit", function (event) {
+    event.preventDefault();
+    var form = forms.reset;
+    if (form.dataset.submitting) return;
+    hideBanner(form);
+    if (!resetToken) {
+      var phoneInput = byId("reset-phone");
+      var codeInput = byId("reset-code");
+      var okPhone = requireValue(phoneInput, "请输入手机号", PHONE_PATTERN, "手机号格式不正确");
+      var okCode = requireValue(codeInput, "请输入验证码", CODE_PATTERN, "验证码为 6 位数字");
+      if (!okPhone || !okCode) { firstInvalid([phoneInput, codeInput]).focus(); return; }
+      if (IS_PREVIEW) { previewOnly(form); return; }
+      var verifyBody = new URLSearchParams();
+      verifyBody.set("phone", phoneInput.value.trim());
+      verifyBody.set("code", codeInput.value.trim());
+      setLoading(form, true, "验 证", "验证中…");
+      postForm("reset-verify", verifyBody).then(function (result) {
+        if (result.response.ok && result.data && typeof result.data.reset_token === "string") {
+          resetToken = result.data.reset_token;
+          stopCountdowns();
+          resetStep1.hidden = true;
+          resetStep2.hidden = false;
+          setLoading(form, false, "确认修改并登录", "");
+          byId("reset-password").focus();
+          return;
+        }
+        setLoading(form, false, "验 证", "");
+        showBanner(form, "error", detailOf(result, "验证码不正确或已失效") + "。");
+        codeInput.focus();
+        codeInput.select();
+      }).catch(function () {
+        setLoading(form, false, "验 证", "");
+        showBanner(form, "error", "无法连接到服务器，请检查网络后重试。");
+      });
+      return;
+    }
+    var passwordField = byId("reset-password");
+    if (!requirePassword(passwordField)) { passwordField.focus(); return; }
+    var confirmBody = new URLSearchParams();
+    confirmBody.set("reset_token", resetToken);
+    confirmBody.set("password", passwordField.value);
+    confirmBody.set("return_to", returnToParam());
+    setLoading(form, true, "确认修改并登录", "提交中…");
+    postForm("reset-confirm", confirmBody).then(function (result) {
+      if (result.response.ok) { goTo(result); return; }
+      setLoading(form, false, "确认修改并登录", "");
+      showBanner(form, "error", detailOf(result, "验证已失效，请重新获取验证码") + "。");
+      if (result.response.status === 401) {
+        resetToken = "";
+        resetStep1.hidden = false;
+        resetStep2.hidden = true;
+        form.querySelector(".submit-text").textContent = "验 证";
+        byId("reset-code").value = "";
+        byId("reset-code").focus();
+      }
+    }).catch(function () {
+      setLoading(form, false, "确认修改并登录", "");
+      showBanner(form, "error", "无法连接到服务器，请检查网络后重试。");
     });
   });
 </script>

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import binascii
 import csv
 import fcntl
 import hashlib
@@ -13,21 +16,62 @@ import re
 import sqlite3
 import tempfile
 import threading
+from collections import OrderedDict
+from copy import deepcopy
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Mapping, Optional
+from time import monotonic
+from typing import Any, Callable, Dict, List, Literal, Mapping, Optional
 from urllib.parse import quote, unquote
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler  # type: ignore[import-untyped]
+from apscheduler.schedulers.base import STATE_PAUSED, STATE_RUNNING  # type: ignore[import-untyped]
 from fastapi import APIRouter, BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+from starlette.datastructures import Headers
+from starlette.middleware.gzip import GZipResponder
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from . import media_api, media_consumer_proofs, media_retention
+from .media_lifecycle import LifecycleError
+from .account_roster import (
+    RosterError,
+    accept_candidate,
+    account_summary,
+    candidate_diff,
+    current_snapshot,
+    prepare_candidate,
+    runtime_account_summary,
+)
+from .account_roster_upload import MAX_SOURCE_BYTES, decode_official_export
+from .profile_activations import SYSTEM_PROFILES
+from .content_scope import canonical_content_predicate
+from .account_operating_status import (
+    AccountOperatingStatusError,
+    update_account_operating_status_in_transaction,
+)
+from .account_creation import (
+    create_managed_account_in_transaction,
+    replay_account_creation,
+    validate_creation_request_id,
+)
+from .account_operating_receipts import ACCOUNT_STATUS_JOB, load_admission_members, load_update_frequencies
+from .statistics_scope import content_statistics_scope_sql
+from .profile_control import (
+    ProfileControlError,
+    enqueue_current_activation_hold_command,
+    process_current_activation_hold_commands,
+    read_current_activation_hold_command,
+    schedule_accepted_roster_activation_in_transaction,
+)
+from .system_roster import bootstrap_system_roster_from_matrix
 from .capture import (
     BudgetBlocked,
     CaptureError,
@@ -47,6 +91,7 @@ from .evaluation_selectors import (
     FORMAL_CURRENT_EVALUATIONS_CTE,
     active_release,
     display_effective_evaluation,
+    display_effective_evaluations_cte_for,
     effective_direction,
     effective_direction_sql,
     formal_eligible_release_evaluations,
@@ -69,28 +114,29 @@ from .spu_audience import (
     upsert_spu,
 )
 from .insights import CHANNELS, SCENES, build_channel_conclusions
+from .overview_selling_points import build_overview_selling_points
+from .source_routing import select_content_metrics
 from .media import (
     MediaProcessingError,
     processor_versions,
     recover_stale_media_processing_slots,
 )
 from .operations import (
-    ACCOUNT_IDENTITY_STATS_SQL,
+    account_read_model,
+    account_status_predicate,
     OperationError,
     content_identity,
     export_accounts_xlsx,
     export_contents_csv,
-    import_accounts,
     import_contents,
     update_account,
     update_content,
-    upsert_account,
     upsert_content,
 )
 from .providers import (
     ProviderConfigurationError,
     retry_content_media,
-    update_content_data,
+    update_content_data_manual as update_content_data,
 )
 from .report_export import (
     accounts_workbook_filename,
@@ -99,6 +145,19 @@ from .report_export import (
     platform_content_id_from_url,
     report_bundle_filename,
     report_file_filename,
+)
+from .runtime_database import (
+    DatabaseAccessMode,
+    FileIdentity,
+    ResolvedDatabaseAccess,
+    RuntimeDatabaseError,
+    WriterLockLease,
+    acquire_writer_lock,
+    is_installed_formal_database,
+    resolve_installed_database_access,
+    resolve_isolated_candidate,
+    resolve_isolated_fixture,
+    resolve_read_only_replica,
 )
 from .reports import (
     IMPLICIT_RUN_STATUSES,
@@ -117,20 +176,22 @@ from .reports import (
     run_task,
 )
 from .scheduler import (
+    PIPELINE_REPORT_EXECUTION_LOCK,
     install_jobs,
     recover_interrupted_scheduler_runs,
     startup_catchup,
 )
 from .storage import (
     DEFAULT_DB,
+    INSTALLED_LEGACY_DB,
     PROJECT_ROOT,
-    SCHEMA_VERSION,
     connect,
     initialize_database,
     is_formal_database_path,
     now_utc,
     require_schema_compatibility,
     schema_compatibility_state,
+    transaction,
 )
 from .taxonomy import (
     TaxonomyError,
@@ -146,7 +207,7 @@ from .taxonomy import (
 
 
 LOGGER = logging.getLogger("dcar.api")
-DEFAULT_LEGACY_DB = PROJECT_ROOT / "app" / "data" / "web_mvp.sqlite3"
+DEFAULT_LEGACY_DB = INSTALLED_LEGACY_DB
 DEFAULT_OPERATOR_FREEZE_LOCK = PROJECT_ROOT / "runtime" / "operator-freeze.lock"
 DEFAULT_WRITER_LOCK = PROJECT_ROOT / "runtime" / "writer-worker.lock"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -162,7 +223,49 @@ DOUYIN_URL_RE = re.compile(r"https?://(?:www\.)?douyin\.com/", re.I)
 XHS_URL_RE = re.compile(r"https?://(?:www\.)?xiaohongshu\.com/", re.I)
 UID_RE = re.compile(r"^\d{6,24}$")
 RUNTIME_IDENTITY_SCHEMA = "dcar-runtime-identity-v1"
-DAILY_CAPTURE_RECONCILE_INTERVAL_SECONDS = 3600
+DAILY_CAPTURE_RECONCILE_INTERVAL_SECONDS = 300
+DATA_FRESHNESS_CACHE_TTL_SECONDS = 60.0
+WRITER_HEARTBEAT_INTERVAL_SECONDS = 60
+WRITER_HEARTBEAT_MAX_AGE_SECONDS = 180
+
+
+class JSONGZipResponder(GZipResponder):
+    """Compress JSON while preserving byte ranges and binary/media responses."""
+
+    async def send_with_compression(self, message: Message) -> None:
+        if message["type"] == "http.response.start":
+            self.initial_message = message
+            headers = Headers(raw=message["headers"])
+            media_type = headers.get("content-type", "").split(";", 1)[0].lower()
+            status = int(message["status"])
+            self.content_encoding_set = "content-encoding" in headers
+            self.content_type_is_excluded = (
+                status in {204, 206, 304}
+                or "content-range" in headers
+                or not (media_type == "application/json" or media_type.endswith("+json"))
+            )
+            return
+        await super().send_with_compression(message)
+
+
+class JSONGZipMiddleware:
+    def __init__(
+        self, app: ASGIApp, minimum_size: int = 1_000, compresslevel: int = 5
+    ) -> None:
+        self.app = app
+        self.minimum_size = minimum_size
+        self.compresslevel = compresslevel
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or "gzip" not in Headers(scope=scope).get(
+            "Accept-Encoding", ""
+        ):
+            await self.app(scope, receive, send)
+            return
+        responder = JSONGZipResponder(
+            self.app, self.minimum_size, compresslevel=self.compresslevel
+        )
+        await responder(scope, receive, send)
 
 
 def _enabled(name: str) -> bool:
@@ -189,9 +292,13 @@ class ApiConfig:
     operator_freeze_lock: Path
     writer_lock: Path = DEFAULT_WRITER_LOCK
     scheduler_enabled: bool = False
+    scheduler_start_paused: bool = False
     startup_catchup_enabled: bool = False
     read_only: bool = False
     daily_capture_reconcile_from: date | None = None
+    runtime_access_mode: DatabaseAccessMode | None = None
+    project_root: Path = PROJECT_ROOT
+    runtime_from_environment: bool = False
 
     @classmethod
     def from_env(cls) -> "ApiConfig":
@@ -202,8 +309,28 @@ class ApiConfig:
         reconcile_from = _optional_strict_iso_date(
             "DCAR_DAILY_CAPTURE_RECONCILE_FROM"
         )
+        configured_database = os.environ.get("DCAR_V8_DB")
+        database = Path(configured_database or str(DEFAULT_DB))
+        read_only = _enabled("DCAR_READ_ONLY")
+        isolated_candidate = _enabled("DCAR_V8_ISOLATED_CANDIDATE")
+        if isolated_candidate and (read_only or scheduler_enabled):
+            raise RuntimeError(
+                "DCAR_V8_ISOLATED_CANDIDATE conflicts with writer/read-only mode"
+            )
+        if read_only:
+            access_mode = DatabaseAccessMode.FORMAL_READ
+        elif isolated_candidate:
+            access_mode = DatabaseAccessMode.ISOLATED_CANDIDATE
+        elif scheduler_enabled or (
+            configured_database
+            and os.environ.get("DCAR_PROJECT_ROOT")
+            and os.environ.get("DCAR_WRITER_LOCK")
+        ):
+            access_mode = DatabaseAccessMode.WRITER
+        else:
+            access_mode = None
         config = cls(
-            db_path=Path(os.environ.get("DCAR_V8_DB", str(DEFAULT_DB))),
+            db_path=database,
             reports_root=Path(
                 os.environ.get("DCAR_V8_REPORTS_ROOT", str(REPORTS_ROOT))
             ),
@@ -217,9 +344,13 @@ class ApiConfig:
                 os.environ.get("DCAR_WRITER_LOCK", str(DEFAULT_WRITER_LOCK))
             ),
             scheduler_enabled=scheduler_enabled,
+            scheduler_start_paused=_enabled("DCAR_SCHEDULER_START_PAUSED"),
             startup_catchup_enabled=_enabled("DCAR_STARTUP_CATCHUP_ENABLED"),
-            read_only=_enabled("DCAR_READ_ONLY"),
+            read_only=read_only,
             daily_capture_reconcile_from=reconcile_from,
+            runtime_access_mode=access_mode,
+            project_root=Path(os.environ.get("DCAR_PROJECT_ROOT", str(PROJECT_ROOT))),
+            runtime_from_environment=True,
         )
         config.validate_daily_capture_reconcile_contract()
         return config
@@ -227,16 +358,18 @@ class ApiConfig:
     def validate_daily_capture_reconcile_contract(self) -> None:
         """Reject reconcile settings that cannot be honored by this runtime."""
 
+        if self.scheduler_start_paused and (not self.scheduler_enabled or self.read_only):
+            raise RuntimeError(
+                "DCAR_SCHEDULER_START_PAUSED requires writable mode and DCAR_SCHEDULER_ENABLED=1"
+            )
         if self.daily_capture_reconcile_from is not None:
-            if not self.scheduler_enabled:
+            if not self.scheduler_enabled and not self.read_only:
                 raise RuntimeError(
                     "DCAR_DAILY_CAPTURE_RECONCILE_FROM requires "
                     "DCAR_SCHEDULER_ENABLED=1"
                 )
-            if self.read_only:
-                raise RuntimeError(
-                    "DCAR_DAILY_CAPTURE_RECONCILE_FROM requires writable mode"
-                )
+        if self.read_only and self.scheduler_enabled:
+            raise RuntimeError("DCAR_SCHEDULER_ENABLED requires writable mode")
         if self.scheduler_enabled and self.daily_capture_reconcile_from is None:
             raise RuntimeError(
                 "DCAR_DAILY_CAPTURE_RECONCILE_FROM is required when "
@@ -245,7 +378,7 @@ class ApiConfig:
 
     @property
     def effective_startup_catchup_enabled(self) -> bool:
-        return self.scheduler_enabled and self.startup_catchup_enabled
+        return self.scheduler_enabled and self.startup_catchup_enabled and not self.scheduler_start_paused
 
     @property
     def effective_daily_capture_reconcile_from(self) -> date | None:
@@ -271,10 +404,13 @@ class InputValidationRequest(BaseModel):
 
 
 class AccountSearchRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     query: str = Field(default="", max_length=100)
     account_type: Optional[str] = Field(default=None, max_length=32)
     content_direction: Optional[str] = Field(default=None, max_length=32)
     platform: Optional[str] = Field(default=None, max_length=32)
+    account_status: Optional[Literal["daily", "weekly", "paused", "unmarked"]] = None
     page: int = Field(default=1, ge=1)
     page_size: int = Field(default=50, ge=1, le=100)
 
@@ -289,12 +425,20 @@ class DouyinAuthorizationTarget(BaseModel):
 
 class AccountExportRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    account_status: Optional[Literal["daily", "weekly", "paused", "unmarked"]] = None
 
     # None means the control-plane status request failed.  An empty list means
     # it succeeded and no exact account/UID pair currently has an active grant.
     douyin_authorization_targets: Optional[List[DouyinAuthorizationTarget]] = Field(
         default=None, max_length=100_000
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_obsolete_scope(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "scope" in value:
+            raise ValueError("导出条件已更新，请刷新账号页后重新导出。")
+        return value
 
 
 SELLING_POINT_NONE = "__none__"
@@ -362,12 +506,42 @@ class AccountIdentityRequest(BaseModel):
 
 
 class AccountMutationRequest(BaseModel):
-    phone: str = Field(min_length=1, max_length=50)
+    model_config = ConfigDict(extra="forbid")
+
+    phone: Optional[str] = Field(default="", max_length=50)
     operator_name: str = Field(default="", max_length=100)
     account_type: str = Field(default="unknown", max_length=32)
     content_direction: str = Field(default="unknown", max_length=32)
-    enabled: bool = True
-    platforms: List[AccountIdentityRequest] = Field(default_factory=list, max_length=4)
+    account_status: Optional[Literal["daily", "weekly", "paused"]] = None
+    status_request_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
+
+
+class ProfileAccountCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    profile_url: str = Field(min_length=1, max_length=3000)
+    phone: Optional[str] = Field(default=None, max_length=50)
+    operator_name: Optional[str] = Field(default=None, max_length=100)
+    account_status: Literal["daily", "weekly", "paused"]
+    request_id: str = Field(min_length=36, max_length=36)
+
+
+class SystemRosterBootstrapRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(min_length=1, max_length=1000, pattern=r"\S")
+
+
+class RosterUploadRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_name: str = Field(min_length=1, max_length=300)
+    content_base64: str = Field(min_length=1, max_length=4 * ((MAX_SOURCE_BYTES + 2) // 3))
+    organization: str = Field(min_length=1, max_length=300)
+    source_exported_at: str = Field(min_length=1, max_length=60)
+    source_instance_id: str = Field(min_length=1, max_length=300)
+    declared_count: int = Field(ge=0, le=100_000)
+    evidence_note: str = Field(min_length=1, max_length=4000)
 
 
 class ContentMutationRequest(BaseModel):
@@ -406,7 +580,19 @@ class BulkImportRequest(BaseModel):
 
 
 class MediaRetryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     allow_paid_refresh: bool = False
+
+
+class MediaRestoreRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    bundle_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    purpose: Literal["evidence", "reprocess"]
+
+
+class TaskCorrectionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reason: str = Field(min_length=1, max_length=2000, pattern=r"\S")
 
 
 class MediaProcessingSearchRequest(BaseModel):
@@ -415,6 +601,27 @@ class MediaProcessingSearchRequest(BaseModel):
     content_id: Optional[int] = Field(default=None, ge=1)
     page: int = Field(default=1, ge=1)
     page_size: int = Field(default=50, ge=1, le=100)
+
+
+class CurrentActivationHoldCommandRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    command_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    )
+    command: Literal[
+        "hold_begin",
+        "hold_build_advance",
+        "hold_seal",
+        "hold_release",
+        "forward_only_release",
+        "hold_reopen",
+        "transport_primary",
+        "transport_control",
+        "capture_release",
+    ]
+    parameters: Optional[Dict[str, Any]] = None
+    binding: Optional[Dict[str, Any]] = None
 
 
 def _legacy_connect(legacy_db_path: Path) -> sqlite3.Connection:
@@ -436,7 +643,8 @@ def _legacy_connect(legacy_db_path: Path) -> sqlite3.Connection:
 
 
 def _safe_project_path(value: str) -> Path:
-    path = (PROJECT_ROOT / value).resolve()
+    from .artifact_paths import resolve
+    path = resolve(value, fallback_root=PROJECT_ROOT).resolve()
     root = PROJECT_ROOT.resolve()
     if path != root and root not in path.parents:
         raise HTTPException(status_code=400, detail="文件暂时无法读取，请联系管理员。")
@@ -574,12 +782,98 @@ def _windows(now: Optional[datetime] = None) -> Dict[str, tuple[datetime, dateti
     }
 
 
+def _overview_stage(
+    timings: Optional[Dict[str, Any]], name: str, started_at: float
+) -> None:
+    if timings is not None:
+        timings[name] = timings.get(name, 0.0) + (monotonic() - started_at) * 1000
+
+
+def _window_content_rows(
+    connection: sqlite3.Connection,
+    start: datetime,
+    end: datetime,
+    *,
+    knowledge_at: Optional[str] = None,
+) -> List[sqlite3.Row]:
+    return connection.execute(
+        f"""
+        SELECT c.id, c.account_id, c.platform, c.manual_content_direction,
+               c.evaluation_content_direction, a.content_direction account_content_direction
+        FROM content_items c
+        LEFT JOIN accounts a ON a.id=c.account_id
+        WHERE c.published_at >= ? AND c.published_at < ?
+          AND {content_statistics_scope_sql("c")}
+          AND {canonical_content_predicate(connection, knowledge_at=knowledge_at)}
+        """,
+        (_utc_text(start), _utc_text(end)),
+    ).fetchall()
+
+
+@dataclass
+class _OverviewFacts:
+    evaluations: Dict[int, Dict[str, Any]]
+    metrics: Dict[int, Dict[str, Any]]
+
+
+def _overview_facts(
+    connection: sqlite3.Connection,
+    content_ids: List[int],
+    *,
+    timings: Optional[Dict[str, Any]] = None,
+) -> _OverviewFacts:
+    """Select current facts once for the union of the overview windows."""
+    if not content_ids:
+        return _OverviewFacts({}, {})
+    started_at = monotonic()
+    release = active_release(connection)
+    assert release is not None
+    eligible = formal_eligible_release_evaluations(
+        connection, str(release["id"]), content_ids
+    )
+    point_by_code = {
+        str(row["code"]): dict(row)
+        for row in connection.execute(
+            """
+            SELECT sp.code,sp.tier,sp.label FROM selling_points sp
+            JOIN taxonomy_versions tv ON tv.id=sp.taxonomy_id
+            WHERE tv.version=?
+            """,
+            (release["taxonomy_version"],),
+        )
+    }
+    evaluations = {
+        content_id: {
+            **value,
+            "primary_tier": point_by_code.get(
+                str(value.get("primary_selling_point_code")), {}
+            ).get("tier"),
+            "primary_label": point_by_code.get(
+                str(value.get("primary_selling_point_code")), {}
+            ).get("label"),
+        }
+        for content_id, value in eligible.items()
+    }
+    _overview_stage(timings, "evaluations", started_at)
+    started_at = monotonic()
+    # Keep the current-read selector mode: passing cutoff_at would disable
+    # the explicitly stale legacy-snapshot fallback.
+    metrics = select_content_metrics(
+        connection, content_ids, metric_fields=("view_count", "comment_count")
+    )
+    _overview_stage(timings, "metrics", started_at)
+    return _OverviewFacts(evaluations, metrics)
+
+
 def _window_summary(
     connection: sqlite3.Connection,
     start: datetime,
     end: datetime,
     *,
     report_cutoff_at: Optional[str] = None,
+    content_rows: Optional[List[sqlite3.Row]] = None,
+    facts: Optional[_OverviewFacts] = None,
+    timings: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     contract = load_contract(report_version=CURRENT_REPORT_VERSION)
     coverage_thresholds = contract["required_coverage_thresholds"]
@@ -590,17 +884,8 @@ def _window_summary(
     )
     view_minimum = float(metric_display_thresholds["view_count"])
     comment_minimum = float(metric_display_thresholds["comment_count"])
-    start_utc, end_utc = _utc_text(start), _utc_text(end)
-    content_rows = connection.execute(
-        """
-        SELECT c.id, c.account_id, c.platform, c.manual_content_direction,
-               c.evaluation_content_direction, a.content_direction account_content_direction
-        FROM content_items c
-        LEFT JOIN accounts a ON a.id=c.account_id
-        WHERE c.published_at >= ? AND c.published_at < ?
-        """,
-        (start_utc, end_utc),
-    ).fetchall()
+    if content_rows is None:
+        content_rows = _window_content_rows(connection, start, end, knowledge_at=report_cutoff_at)
     content_ids = [int(row["id"]) for row in content_rows]
     total = len(content_ids)
     active_accounts = len(
@@ -612,45 +897,16 @@ def _window_summary(
     )
     if content_ids:
         placeholders = ",".join("?" for _ in content_ids)
-        release = active_release(connection)
-        assert release is not None
-        eligible_by_content = formal_eligible_release_evaluations(
-            connection, str(release["id"]), content_ids
-        )
-        tier_by_code = {
-            str(row["code"]): row["tier"]
-            for row in connection.execute(
-                """
-                SELECT sp.code,sp.tier FROM selling_points sp
-                JOIN taxonomy_versions tv ON tv.id=sp.taxonomy_id
-                WHERE tv.version=?
-                """,
-                (release["taxonomy_version"],),
-            ).fetchall()
-        }
+        if facts is None:
+            facts = _overview_facts(connection, content_ids, timings=timings)
         evaluations = [
-            {
-                **value,
-                "primary_tier": tier_by_code.get(
-                    str(value["primary_selling_point_code"])
-                )
-                if value.get("primary_selling_point_code")
-                else None,
-            }
-            for value in eligible_by_content.values()
+            facts.evaluations[content_id]
+            for content_id in content_ids if content_id in facts.evaluations
         ]
-        metrics = connection.execute(
-            f"""
-            SELECT ms.* FROM content_metric_snapshots ms
-            WHERE ms.content_id IN ({placeholders})
-              AND ms.id=(
-                  SELECT ms2.id FROM content_metric_snapshots ms2
-                  WHERE ms2.content_id=ms.content_id
-                  ORDER BY ms2.captured_at DESC, ms2.id DESC LIMIT 1
-              )
-            """,
-            content_ids,
-        ).fetchall()
+        metrics = [
+            facts.metrics[content_id]
+            for content_id in content_ids if content_id in facts.metrics
+        ]
         duplicate_count = int(
             connection.execute(
                 f"""
@@ -701,6 +957,7 @@ def _window_summary(
         content_id = int(content["id"])
         evaluation = evaluation_by_content.get(content_id, {})
         metric = metric_by_content.get(content_id, {})
+        view_field = metric.get("fields", {}).get("view_count", {})
         formal_content = {**content, "evaluation_content_direction": None}
         conclusion_rows.append(
             {
@@ -712,6 +969,8 @@ def _window_summary(
                     evaluation.get("selling_point_included")
                 ),
                 "primary_tier": evaluation.get("primary_tier"),
+                "primary_selling_point_code": evaluation.get("primary_selling_point_code"),
+                "primary_label": evaluation.get("primary_label"),
                 "content_automotive_score": evaluation.get("content_automotive_score"),
                 "audience_automotive_score": evaluation.get(
                     "audience_automotive_score"
@@ -720,6 +979,8 @@ def _window_summary(
                     "acquisition_potential_score"
                 ),
                 "view_count": metric.get("view_count"),
+                "view_count_status": view_field.get("status", "missing"),
+                "view_count_freshness": view_field.get("freshness", "unknown"),
             }
         )
     eligible = sum(
@@ -743,7 +1004,8 @@ def _window_summary(
         for row in metric_values
         if row["comment_count"] is not None
     ]
-    view_coverage = round(len(view_values) * 100 / total, 2) if total else None
+    view_eligible = sum(str(row["platform"]) == "douyin" for row in content_rows)
+    view_coverage = round(len(view_values) * 100 / view_eligible, 2) if view_eligible else None
     comment_coverage = round(len(comment_values) * 100 / total, 2) if total else None
     views = sum(view_values)
     comments = sum(comment_values)
@@ -767,6 +1029,17 @@ def _window_summary(
         duplicate_calibrated,
         threshold=fingerprint_minimum,
     )
+    started_at = monotonic()
+    audience_rates = _audience_rates(
+        connection, conclusion_rows, end, report_cutoff_at=report_cutoff_at
+    )
+    _overview_stage(timings, "audience", started_at)
+    channels = build_channel_conclusions(conclusion_rows, audience_rates=audience_rates)
+    point_details = build_overview_selling_points(
+        conclusion_rows, channels, minimum_view_coverage=view_minimum
+    )
+    for platform, channel in channels.items():
+        channel["selling_points"] = point_details[platform]
     return {
         "period_start": start.isoformat(),
         "period_end": end.isoformat(),
@@ -785,7 +1058,7 @@ def _window_summary(
                 views if view_values else None,
                 unit="view",
                 status="not_applicable"
-                if total == 0
+                if view_eligible == 0
                 else "missing"
                 if not view_values
                 else "available"
@@ -860,15 +1133,7 @@ def _window_summary(
                 reason="系统暂时无法计算这项数据。",
             ),
         },
-        "channels": build_channel_conclusions(
-            conclusion_rows,
-            audience_rates=_audience_rates(
-                connection,
-                conclusion_rows,
-                end,
-                report_cutoff_at=report_cutoff_at,
-            ),
-        ),
+        "channels": channels,
     }
 
 
@@ -923,54 +1188,220 @@ def _data_freshness(
     *,
     current_at: Optional[datetime] = None,
 ) -> Dict[str, Any]:
-    """Summarize daily-capture freshness without treating backfills as daily runs."""
+    """Read the latest DB coverage receipt without traversing raw manifests."""
+    from .runtime_receipts import latest_runtime_coverage
 
-    latest_published_at = connection.execute(
-        """
-        SELECT MAX(published_at) FROM content_items
-        WHERE platform IN ('douyin','xiaohongshu')
-        """
-    ).fetchone()[0]
-    last_successful_capture_at = connection.execute(
-        """
-        SELECT MAX(finished_at) FROM fetch_slots
-        WHERE stage='discovery' AND status='succeeded'
-          AND window_key GLOB
-              '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*'
-        """
-    ).fetchone()[0]
-    latest_capture_row = connection.execute(
-        """
-        SELECT scheduled_for,status,completed_at
-        FROM scheduler_runs
-        WHERE job_id='daily_capture'
-        ORDER BY scheduled_for DESC,id DESC
-        LIMIT 1
-        """
-    ).fetchone()
-
-    captured_at = _parse_timestamp(last_successful_capture_at)
+    if not connection.in_transaction:
+        connection.execute("BEGIN")
     reference = current_at or datetime.now(timezone.utc)
     if reference.tzinfo is None:
         reference = reference.replace(tzinfo=timezone.utc)
-    reference = reference.astimezone(timezone.utc)
-    if captured_at is not None:
-        status = (
-            "current" if reference - captured_at <= timedelta(hours=36) else "stale"
-        )
-    elif latest_published_at:
-        status = "stale"
-    else:
-        status = "unknown"
-
-    return {
-        "status": status,
-        "latest_published_at": latest_published_at,
-        "last_successful_capture_at": last_successful_capture_at,
-        "latest_capture_run": dict(latest_capture_row)
-        if latest_capture_row is not None
-        else None,
+    timestamp = reference.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    coverage = latest_runtime_coverage(connection, at=timestamp)
+    latest = None
+    if coverage.get("round_run_id") is not None:
+        row = connection.execute("SELECT * FROM scheduler_runs WHERE id=?", (coverage["round_run_id"],)).fetchone()
+        if row is not None:
+            identity = json.loads(row["details_json"]).get("identity", {})
+            latest = {"id": row["id"], "job_id": row["job_id"],
+                      "scheduled_for": identity.get("scheduled_at") or row["started_at"],
+                      "status": row["status"], "completed_at": row["completed_at"]}
+    stage_queries = {
+        "matrix_work_metrics": "SELECT MAX(captured_at) FROM content_metric_observations WHERE source='newrank_matrix' AND observation_origin='provider_capture' AND julianday(captured_at)<=julianday(?) AND julianday(recorded_at)<=julianday(?)",
+        "matrix_account_metrics": "SELECT MAX(captured_at) FROM account_metric_observations WHERE source='newrank_matrix' AND julianday(captured_at)<=julianday(?) AND julianday(recorded_at)<=julianday(?)",
+        "tikhub_detail": """SELECT MAX(p.captured_at) FROM provider_raw_responses p
+            JOIN fetch_attempts a ON a.id=p.fetch_attempt_id JOIN fetch_slots s ON s.id=a.slot_id
+            WHERE lower(p.provider)='tikhub' AND p.source IN ('live_applied','derived_applied')
+              AND s.stage='detail' AND s.status='succeeded' AND a.error_code IS NULL
+              AND julianday(p.captured_at)<=julianday(?) AND julianday(s.finished_at)<=julianday(?)""",
+        "tikhub_metric_supplement": "SELECT MAX(captured_at) FROM content_metric_observations WHERE source='tikhub' AND observation_origin='provider_capture' AND julianday(captured_at)<=julianday(?) AND julianday(recorded_at)<=julianday(?)",
+        "tikhub_comments": """SELECT MAX(c.captured_at) FROM comment_evidence_versions c
+            JOIN comment_capture_runs r ON r.id=c.capture_run_id
+            WHERE lower(r.provider)='tikhub' AND r.status='succeeded' AND c.status='available'
+              AND julianday(c.captured_at)<=julianday(?) AND julianday(c.created_at)<=julianday(?)""",
+        "local_media": "SELECT MAX(updated_at) FROM media_processing_slots WHERE status='succeeded' AND julianday(updated_at)<=julianday(?) AND julianday(created_at)<=julianday(?)",
+        "local_evaluation": "SELECT MAX(evaluated_at) FROM evaluation_versions WHERE evaluation_source='automatic' AND evaluation_status='evaluated' AND invalidated_at IS NULL AND julianday(evaluated_at)<=julianday(?) AND julianday(evaluated_at)<=julianday(?)",
     }
+    stage_data = {name: connection.execute(sql, (timestamp, timestamp)).fetchone()[0] for name, sql in stage_queries.items()}
+    latest_published = connection.execute(
+        f"SELECT MAX(c.published_at) FROM content_items c "
+        f"WHERE c.platform IN ('douyin','xiaohongshu') AND {content_statistics_scope_sql('c')} "
+        f"AND {canonical_content_predicate(connection)}"
+    ).fetchone()[0]
+    return {
+        "status": (
+            "current"
+            if coverage["complete"]
+            else "stale"
+            if coverage["status"] in {"incomplete", "partial_publishable"}
+            else "unknown"
+        ),
+        "basis": "profile-day-coverage-receipt-v2",
+        "latest_published_at": latest_published,
+        # Match the sealing gate: runtime_receipts._anchor_binding seals a profile day on a
+        # terminal round that is "succeeded" OR "partial", so demanding "succeeded" here reported
+        # a complete day as having no successful capture at all.
+        "last_successful_capture_at": latest["completed_at"] if latest and latest["status"] in {"succeeded", "partial"} and coverage["complete"] else None,
+        "latest_capture_run": latest, "discovery_coverage": coverage,
+        "stage_data": stage_data,
+    }
+
+
+@dataclass(slots=True)
+class DataFreshnessCache:
+    """Single-flight cache for the expensive verified runtime coverage scan."""
+
+    ttl_seconds: float = DATA_FRESHNESS_CACHE_TTL_SECONDS
+    clock: Callable[[], float] = field(default=monotonic, repr=False)
+    _lock: Any = field(default_factory=threading.Lock, init=False, repr=False)
+    _value: Optional[Dict[str, Any]] = field(default=None, init=False, repr=False)
+    _expires_at: float = field(default=0.0, init=False, repr=False)
+    _inflight: Optional[Future[Dict[str, Any]]] = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+
+    def get(self, loader: Callable[[], Dict[str, Any]]) -> Dict[str, Any]:
+        if self.ttl_seconds <= 0:
+            return loader()
+        with self._lock:
+            if self._value is not None and self.clock() < self._expires_at:
+                return deepcopy(self._value)
+            future = self._inflight
+            owner = future is None
+            if owner:
+                future = Future()
+                self._inflight = future
+        assert future is not None
+        if not owner:
+            return deepcopy(future.result())
+        try:
+            value = deepcopy(loader())
+        except BaseException as exc:
+            future.set_exception(exc)
+            with self._lock:
+                if self._inflight is future:
+                    self._inflight = None
+            raise
+        with self._lock:
+            self._value = value
+            self._expires_at = self.clock() + self.ttl_seconds
+            if self._inflight is future:
+                self._inflight = None
+        future.set_result(value)
+        return deepcopy(value)
+
+
+@dataclass(slots=True)
+class ReadModelCache:
+    """Short, bounded single-flight cache for expensive dashboard responses.
+
+    The writer frequently commits operational progress to the WAL, so file
+    timestamps are not a useful semantic invalidation signal for these read
+    models: using them turns expensive reads into cache misses.  The TTL matches
+    the UI's already bounded-stale reads while keeping repeat visits instant.
+    """
+
+    ttl_seconds: float = 30.0
+    max_entries: int = 32
+    clock: Callable[[], float] = field(default=monotonic, repr=False)
+    _lock: Any = field(default_factory=threading.Lock, init=False, repr=False)
+    _values: Any = field(default_factory=OrderedDict, init=False, repr=False)
+    _generation: int = field(default=0, init=False, repr=False)
+    _inflight: dict[tuple[Any, ...], Future[Dict[str, Any]]] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+
+    def clear(self) -> None:
+        """Invalidate values without letting an older in-flight load refill them."""
+        with self._lock:
+            self._generation += 1
+            self._values.clear()
+
+    def get(
+        self,
+        db_path: Path,
+        key: tuple[Any, ...],
+        loader: Callable[[], Dict[str, Any]],
+        *,
+        timings: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        if self.ttl_seconds <= 0 or self.max_entries <= 0:
+            if timings is not None:
+                timings["cache"] = "bypass"
+            return loader()
+        with self._lock:
+            generation = self._generation
+            cache_key = (generation, str(db_path.resolve()), *key)
+            cached = self._values.get(cache_key)
+            if cached is not None:
+                expires_at, value = cached
+                if self.clock() < expires_at:
+                    if timings is not None:
+                        timings["cache"] = "hit"
+                    self._values.move_to_end(cache_key)
+                    return deepcopy(value)
+                del self._values[cache_key]
+            future = self._inflight.get(cache_key)
+            owner = future is None
+            if owner:
+                future = Future()
+                self._inflight[cache_key] = future
+        assert future is not None
+        if timings is not None:
+            timings["cache"] = "miss" if owner else "wait"
+        if not owner:
+            return deepcopy(future.result())
+        try:
+            value = deepcopy(loader())
+        except BaseException as exc:
+            future.set_exception(exc)
+            with self._lock:
+                self._inflight.pop(cache_key, None)
+            raise
+        with self._lock:
+            if generation == self._generation:
+                self._values[cache_key] = (self.clock() + self.ttl_seconds, value)
+                self._values.move_to_end(cache_key)
+                while len(self._values) > self.max_entries:
+                    self._values.popitem(last=False)
+            self._inflight.pop(cache_key, None)
+        future.set_result(value)
+        return deepcopy(value)
+
+
+def _request_read_model(
+    request: Request,
+    key: tuple[Any, ...],
+    loader: Callable[[], Dict[str, Any]],
+    *,
+    timings: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    cache = getattr(request.app.state, "read_model_cache", None)
+    config = _request_config(request)
+    return (
+        cache.get(config.db_path, key, loader, timings=timings)
+        if isinstance(cache, ReadModelCache)
+        else loader()
+    )
+
+
+def _request_data_freshness(
+    request: Request,
+    *,
+    current_at: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    config = _request_config(request)
+
+    def load() -> Dict[str, Any]:
+        with connect(config.db_path, read_only=config.read_only) as connection:
+            return _data_freshness(connection, current_at=current_at)
+
+    cache = getattr(request.app.state, "data_freshness_cache", None)
+    return cache.get(load) if isinstance(cache, DataFreshnessCache) else load()
 
 
 def _database_state(connection: sqlite3.Connection) -> Dict[str, Any]:
@@ -1033,29 +1464,59 @@ def _cached_file_sha256(path_value: str, byte_size: int, mtime_ns: int) -> str:
     return _file_sha256(Path(path_value))
 
 
-def v8_overview(db_path: Path, *, read_only: bool = False) -> Dict[str, Any]:
+def v8_overview(
+    db_path: Path,
+    *,
+    read_only: bool = False,
+    data_freshness: Optional[Mapping[str, Any]] = None,
+    timings: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     overview_now = datetime.now(SHANGHAI)
     report_cutoff_at = now_utc()
+    started_at = monotonic()
     with connect(db_path, read_only=read_only) as connection:
+        _overview_stage(timings, "connect", started_at)
+        # All three windows observe the same committed database snapshot.
+        connection.execute("BEGIN")
+        window_bounds = _windows(overview_now)
+        started_at = monotonic()
+        window_rows = {
+            key: _window_content_rows(connection, start, end, knowledge_at=report_cutoff_at)
+            for key, (start, end) in window_bounds.items()
+        }
+        content_ids = sorted({
+            int(row["id"]) for rows in window_rows.values() for row in rows
+        })
+        _overview_stage(timings, "contents", started_at)
+        facts = _overview_facts(connection, content_ids, timings=timings)
+        started_at = monotonic()
         windows = {
             key: _window_summary(
                 connection,
                 start,
                 end,
                 report_cutoff_at=report_cutoff_at,
+                content_rows=window_rows[key],
+                facts=facts,
+                timings=timings,
             )
-            for key, (start, end) in _windows(overview_now).items()
+            for key, (start, end) in window_bounds.items()
         }
+        _overview_stage(timings, "windows", started_at)
+        started_at = monotonic()
         quality = {
             "missing_published_at": int(
                 connection.execute(
-                    "SELECT COUNT(*) FROM content_items WHERE published_at IS NULL"
+                    "SELECT COUNT(*) FROM content_items c WHERE published_at IS NULL "
+                    f"AND {canonical_content_predicate(connection)} AND {content_statistics_scope_sql('c')}"
                 ).fetchone()[0]
             ),
             "duplicate_fingerprint_coverage": round(
                 int(
                     connection.execute(
-                        "SELECT COUNT(DISTINCT content_id) FROM duplicate_fingerprints WHERE fingerprint_version=?",
+                        "SELECT COUNT(DISTINCT f.content_id) FROM duplicate_fingerprints f "
+                        "JOIN content_items c ON c.id=f.content_id WHERE fingerprint_version=? "
+                        f"AND {canonical_content_predicate(connection)} AND {content_statistics_scope_sql('c')}",
                         (FINGERPRINT_VERSION,),
                     ).fetchone()[0]
                 )
@@ -1064,7 +1525,8 @@ def v8_overview(db_path: Path, *, read_only: bool = False) -> Dict[str, Any]:
                     1,
                     int(
                         connection.execute(
-                            "SELECT COUNT(*) FROM content_items"
+                            f"SELECT COUNT(*) FROM content_items c WHERE {canonical_content_predicate(connection)} "
+                            f"AND {content_statistics_scope_sql('c')}"
                         ).fetchone()[0]
                     ),
                 ),
@@ -1088,14 +1550,18 @@ def v8_overview(db_path: Path, *, read_only: bool = False) -> Dict[str, Any]:
             is not None,
             "confirmed_duplicate_count": int(
                 connection.execute(
-                    "SELECT COUNT(DISTINCT duplicate_content_id) FROM duplicate_relations WHERE status='confirmed'"
+                    "SELECT COUNT(DISTINCT d.duplicate_content_id) FROM duplicate_relations d "
+                    "JOIN content_items c ON c.id=d.duplicate_content_id WHERE d.status='confirmed' "
+                    f"AND {canonical_content_predicate(connection)} AND {content_statistics_scope_sql('c')}"
                 ).fetchone()[0]
             ),
         }
-        data_freshness = _data_freshness(
-            connection,
-            current_at=overview_now,
+        freshness = (
+            deepcopy(dict(data_freshness))
+            if data_freshness is not None
+            else _data_freshness(connection, current_at=overview_now)
         )
+        _overview_stage(timings, "quality", started_at)
     return {
         "status": "ready",
         "report_version": CURRENT_REPORT_VERSION,
@@ -1103,7 +1569,7 @@ def v8_overview(db_path: Path, *, read_only: bool = False) -> Dict[str, Any]:
         "timezone": "Asia/Shanghai",
         "windows": windows,
         "data_quality": quality,
-        "data_freshness": data_freshness,
+        "data_freshness": freshness,
     }
 
 
@@ -1112,16 +1578,24 @@ def _account_search(
 ) -> Dict[str, Any]:
     where: List[str] = []
     parameters: List[Any] = []
+    admission_query_index: int | None = None
     if payload.query:
         where.append(
             "(a.phone LIKE ? OR a.phone_normalized LIKE ? OR a.operator_name LIKE ? OR "
             "EXISTS (SELECT 1 FROM account_platform_identities i "
-            "WHERE i.account_id=a.id AND (i.uid LIKE ? OR i.nickname LIKE ?)))"
+            "LEFT JOIN account_roster_members m ON m.account_identity_id=i.id "
+            "WHERE i.account_id=a.id AND (i.uid LIKE ? OR i.nickname LIKE ? OR "
+            "m.matrix_account_id LIKE ? OR json_extract(m.metadata_json,'$.display_account_id') LIKE ? OR "
+            "json_extract(m.metadata_json,'$.nickname') LIKE ?)) OR a.id IN "
+            "(SELECT json_extract(value,'$.account_id') FROM json_each(?) WHERE "
+            "json_extract(value,'$.nickname') LIKE ? OR json_extract(value,'$.display_account_id') LIKE ?))"
         )
         pattern = f"%{payload.query}%"
         phone_digits = re.sub(r"\D", "", payload.query)
         normalized_pattern = f"%{phone_digits}%" if phone_digits else pattern
-        parameters.extend([pattern, normalized_pattern, pattern, pattern, pattern])
+        parameters.extend([pattern, normalized_pattern, pattern, pattern, pattern, pattern, pattern, pattern])
+        admission_query_index = len(parameters)
+        parameters.extend(["[]", pattern, pattern])
     if payload.account_type:
         where.append("a.account_type=?")
         parameters.append(payload.account_type)
@@ -1138,6 +1612,27 @@ def _account_search(
     offset = (payload.page - 1) * payload.page_size
     with connect(db_path, read_only=read_only) as connection:
         active_release(connection)
+        roster = runtime_account_summary(connection)
+        try:
+            frequencies = load_update_frequencies(connection)
+            admissions = load_admission_members(connection)
+        except AccountOperatingStatusError as exc:
+            raise HTTPException(status_code=503, detail="账号状态记录校验失败，暂时无法读取。") from exc
+        if admission_query_index is not None:
+            parameters[admission_query_index] = json.dumps([
+                {
+                    "account_id": binding["account_id"],
+                    "nickname": binding["member"].get("nickname") or binding["member"].get("metadata", {}).get("nickname"),
+                    "display_account_id": binding["member"].get("metadata", {}).get("display_account_id"),
+                }
+                for binding in admissions.values()
+            ])
+        status_predicate, status_parameters = account_status_predicate(payload.account_status, frequencies)
+        where_sql = (
+            f"{where_sql} AND ({status_predicate})"
+            if where_sql else f"WHERE {status_predicate}"
+        )
+        parameters.extend(status_parameters)
         total = int(
             connection.execute(
                 f"SELECT COUNT(*) FROM accounts a {where_sql}", parameters
@@ -1153,55 +1648,104 @@ def _account_search(
         ).fetchall()
         items: List[Dict[str, Any]] = []
         for row in account_rows:
-            identities = connection.execute(
-                ACCOUNT_IDENTITY_STATS_SQL, (row["id"],)
-            ).fetchall()
-            items.append(
-                {
-                    "id": row["id"],
-                    "phone": row["phone"],
-                    "operator_name": row["operator_name"],
-                    "account_type": row["account_type"],
-                    "content_direction": row["content_direction"],
-                    "enabled": bool(row["enabled"]),
-                    "platforms": [dict(identity) for identity in identities],
-                    "updated_at": row["updated_at"],
-                }
-            )
-        legacy_unassociated = int(
-            connection.execute(
-                "SELECT COUNT(*) FROM content_items WHERE account_id IS NULL"
-            ).fetchone()[0]
-        )
-        pending_identities = connection.execute(
-            """
-            SELECT platform, uid, nickname, content_count,
-                   first_published_at, last_published_at
-            FROM pending_platform_identities
-            ORDER BY content_count DESC, platform, uid
-            LIMIT 100
-            """
-        ).fetchall()
-        pending_identity_count = int(
-            connection.execute(
-                "SELECT COUNT(*) FROM pending_platform_identities"
-            ).fetchone()[0]
-        )
+            items.append(account_read_model(connection, row, roster=roster,
+                                            update_frequencies=frequencies, admission_members=admissions))
     return {
         "items": items,
         "total": total,
         "page": payload.page,
         "page_size": payload.page_size,
-        "legacy_unassociated_content_count": legacy_unassociated,
-        "pending_platform_identity_count": pending_identity_count,
-        "pending_platform_identities": [dict(row) for row in pending_identities],
+        "account_management_version": 2,
+        "roster": roster,
     }
+
+
+_LOCAL_MEDIA_FLAGS_SQL = """
+    SELECT DISTINCT e.content_id
+    FROM evidence_artifacts e
+    WHERE e.content_id IN ({placeholders})
+      AND e.status = 'available'
+      AND (
+        (e.artifact_type IN ('media', 'media_manifest')
+          AND (NOT json_valid(e.metadata_json)
+               OR json_extract(e.metadata_json, '$.media_lifecycle.bundle_id') IS NULL))
+        OR e.artifact_type = 'media_preview_manifest'
+        OR (e.artifact_type = 'media_lifecycle_manifest'
+          AND json_valid(e.metadata_json)
+          AND json_extract(e.metadata_json, '$.media_lifecycle.storage_state') = 'hot'
+          AND COALESCE(json_extract(e.metadata_json, '$.media_lifecycle.operation_state'), '')
+              NOT IN ('purging', 'restoring'))
+      )
+"""
+
+
+_READONLY_PREVIEW_FLAGS_SQL = """
+    WITH page_artifacts AS (
+        SELECT * FROM evidence_artifacts WHERE content_id IN ({placeholders})
+    ), latest_sources AS (
+        SELECT content_id, MAX(id) AS id
+        FROM page_artifacts WHERE artifact_type = 'media_source'
+        GROUP BY content_id
+    ), current_controls AS (
+        SELECT b.content_id, MAX(b.id) AS id
+        FROM page_artifacts b
+        JOIN latest_sources s ON s.content_id = b.content_id
+        JOIN page_artifacts source ON source.id = s.id
+        WHERE b.artifact_type = 'media_lifecycle_manifest'
+          AND json_valid(b.metadata_json)
+          AND json_extract(b.metadata_json, '$.media_lifecycle.source_artifact_id') = source.id
+          AND json_extract(b.metadata_json, '$.media_lifecycle.source_sha256') = source.sha256
+        GROUP BY b.content_id
+    ), latest_previews AS (
+        SELECT p.content_id,
+               json_extract(p.metadata_json, '$.media_lifecycle.bundle_id') AS bundle_id,
+               MAX(p.id) AS id
+        FROM page_artifacts p
+        WHERE p.artifact_type = 'media_preview_manifest'
+          AND p.status = 'available' AND json_valid(p.metadata_json)
+        GROUP BY p.content_id, bundle_id
+    )
+    SELECT b.content_id
+    FROM current_controls current
+    JOIN page_artifacts b ON b.id = current.id
+    JOIN latest_previews latest ON latest.content_id = b.content_id
+      AND latest.bundle_id = json_extract(b.metadata_json, '$.media_lifecycle.bundle_id')
+    JOIN page_artifacts p ON p.id = latest.id
+    WHERE b.status = 'available'
+      AND json_extract(b.metadata_json, '$.media_lifecycle.manifest_sha256') = b.sha256
+      AND json_extract(p.metadata_json, '$.media_lifecycle.control_artifact_id') = b.id
+      AND json_extract(p.metadata_json, '$.media_lifecycle.manifest_sha256') = b.sha256
+      AND p.processor_version = ?
+"""
+
+
+def _content_local_media_flags(
+    connection: sqlite3.Connection, content_ids: List[int], *, read_only: bool
+) -> set[int]:
+    """Project which listed contents have locally viewable media.
+
+    A writer answers from the artifact ledger: legacy originals (rows without
+    a lifecycle namespace), retained previews, or managed bundles still hot
+    and not being purged or restored.  A read replica never serves managed originals,
+    but can serve retained previews bound to the latest source and its current
+    bundle.  This is a page-scoped ledger projection without file I/O; evidence
+    and file endpoints remain responsible for checking the actual bytes.
+    """
+    if not content_ids:
+        return set()
+    placeholders = ",".join("?" * len(content_ids))
+    sql = _READONLY_PREVIEW_FLAGS_SQL if read_only else _LOCAL_MEDIA_FLAGS_SQL
+    parameters = [*content_ids, media_api.PREVIEW_VERSION] if read_only else content_ids
+    rows = connection.execute(
+        sql.format(placeholders=placeholders), parameters
+    ).fetchall()
+    return {int(row[0]) for row in rows}
 
 
 def _content_search(
     payload: ContentSearchRequest, *, db_path: Path, read_only: bool = False
 ) -> Dict[str, Any]:
-    where: List[str] = []
+    where: List[str] = [content_statistics_scope_sql("c")]
     parameters: List[Any] = []
     direction_sql = effective_direction_sql()
     if payload.query:
@@ -1267,10 +1811,6 @@ def _content_search(
         FROM content_items c
         LEFT JOIN accounts a ON a.id=c.account_id
         LEFT JOIN display_effective_evaluations ev ON ev.content_id=c.id
-        LEFT JOIN content_metric_snapshots ms ON ms.id=(
-            SELECT ms2.id FROM content_metric_snapshots ms2
-            WHERE ms2.content_id=c.id ORDER BY ms2.captured_at DESC, ms2.id DESC LIMIT 1
-        )
         LEFT JOIN duplicate_relations duplicate ON duplicate.id=(
             SELECT d2.id FROM duplicate_relations d2
             WHERE d2.duplicate_content_id=c.id AND d2.status='confirmed'
@@ -1294,19 +1834,18 @@ def _content_search(
     offset = (payload.page - 1) * payload.page_size
     with connect(db_path, read_only=read_only) as connection:
         labels_ready = spu_domain_ready(connection)
+        where.append(canonical_content_predicate(connection))
         if labels_ready and spu_filters:
             where.extend(spu_filters)
             parameters.extend(spu_parameters)
-            where_sql = f"WHERE {' AND '.join(where)}"
+        where_sql = f"WHERE {' AND '.join(where)}"
         total = int(
             connection.execute(
                 f"{count_with_sql}SELECT COUNT(*) {count_from_sql} {where_sql}",
                 parameters,
             ).fetchone()[0]
         )
-        rows = connection.execute(
-            f"""
-            WITH {DISPLAY_EFFECTIVE_EVALUATIONS_CTE}
+        select_sql = f"""
             SELECT c.id, c.link_id, c.platform, c.platform_content_id,
                    c.canonical_url, c.published_at, c.title, c.body, c.content_type,
                    c.raw_account_uid, c.raw_account_name,
@@ -1318,22 +1857,68 @@ def _content_search(
                    ev.release_id evaluation_release_id,
                    COALESCE(ev.evaluation_freshness, 'missing') evaluation_freshness,
                    CASE WHEN ev.evaluation_freshness='stale' THEN 1 ELSE 0 END evaluation_is_stale,
-                   ms.view_count, ms.comment_count, ms.like_count, ms.share_count,
-                   ms.collect_count, ms.captured_at metrics_captured_at,
                    original.link_id duplicate_original_link_id
-            {from_sql} {where_sql}
-            ORDER BY c.published_at IS NULL, c.published_at DESC, c.id DESC
-            LIMIT ? OFFSET ?
-            """,
-            [*parameters, payload.page_size, offset],
-        ).fetchall()
+        """
+        if payload.selling_point or payload.content_direction:
+            rows = connection.execute(
+                f"""
+                WITH {DISPLAY_EFFECTIVE_EVALUATIONS_CTE}
+                {select_sql}
+                {from_sql} {where_sql}
+                ORDER BY c.published_at IS NULL, c.published_at DESC, c.id DESC
+                LIMIT ? OFFSET ?
+                """,
+                [*parameters, payload.page_size, offset],
+            ).fetchall()
+        else:
+            # Pick the requested page with the publication index before ranking
+            # evaluations. Most list reads do not filter on evaluation fields;
+            # restricting that CTE to at most one page avoids scanning every
+            # historical evaluation merely to render 50 rows.
+            rows = connection.execute(
+                f"""
+                WITH page_ids AS MATERIALIZED (
+                    SELECT c.id
+                    FROM content_items c
+                    LEFT JOIN accounts a ON a.id=c.account_id
+                    {where_sql}
+                    ORDER BY c.published_at DESC, c.id DESC
+                    LIMIT ? OFFSET ?
+                ),
+                {display_effective_evaluations_cte_for("page_ids")}
+                {select_sql}
+                FROM page_ids page
+                JOIN content_items c ON c.id=page.id
+                LEFT JOIN accounts a ON a.id=c.account_id
+                LEFT JOIN display_effective_evaluations ev ON ev.content_id=c.id
+                LEFT JOIN duplicate_relations duplicate ON duplicate.id=(
+                    SELECT d2.id FROM duplicate_relations d2
+                    WHERE d2.duplicate_content_id=c.id AND d2.status='confirmed'
+                    ORDER BY d2.id LIMIT 1
+                )
+                LEFT JOIN content_items original ON original.id=duplicate.original_content_id
+                ORDER BY c.published_at DESC, c.id DESC
+                """,
+                [*parameters, payload.page_size, offset],
+            ).fetchall()
         items = [dict(row) for row in rows]
+        metrics = select_content_metrics(connection, [int(item["id"]) for item in items])
+        for item in items:
+            selected = metrics.get(int(item["id"]), {})
+            for field in ("view_count", "comment_count", "like_count", "share_count", "collect_count"):
+                item[field] = selected.get(field)
+            item["metrics_captured_at"] = selected.get("captured_at")
+            item["metric_fields"] = selected.get("fields", {})
         tag_labels = (
             spu_content_labels(connection, [int(item["id"]) for item in items])
             if labels_ready
             else {}
         )
+        media_flags = _content_local_media_flags(
+            connection, [int(item["id"]) for item in items], read_only=read_only
+        )
     for item in items:
+        item["local_media_available"] = int(item["id"]) in media_flags
         entry = tag_labels.get(int(item["id"])) or {
             "spu": None,
             "spu_secondary_count": 0,
@@ -1346,6 +1931,8 @@ def _content_search(
         item["spu_gray_count"] = entry["spu_gray_count"]
         item["audience"] = entry["audience"]
         item["scenes"] = entry["scenes"]
+    # Freshness verifies and hashes archived scan receipts; keep that proof on
+    # operational endpoints instead of repeating it for every list page.
     return {
         "items": items,
         "total": total,
@@ -1356,19 +1943,6 @@ def _content_search(
 
 _SELLING_POINT_STAT_CHANNELS = ("douyin", "xiaohongshu")
 _SELLING_POINT_STAT_SCENES = ("used_car", "new_car", "media")
-_LATEST_METRICS_CTE = """
-latest_metrics AS (
-    SELECT ms.content_id, ms.view_count
-    FROM content_metric_snapshots ms
-    WHERE ms.id=(
-        SELECT ms2.id FROM content_metric_snapshots ms2
-        WHERE ms2.content_id=ms.content_id
-        ORDER BY ms2.captured_at DESC, ms2.id DESC LIMIT 1
-    )
-)
-""".strip()
-
-
 def _selling_point_window_stats(
     connection: sqlite3.Connection,
 ) -> tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
@@ -1392,16 +1966,11 @@ def _selling_point_window_stats(
             }
             for scene in _SELLING_POINT_STAT_SCENES
         }
-        # Correlated indexed lookups instead of joining the materialized
-        # formal/latest CTEs: SQLite nest-loops those materializations without
-        # an index (full scan per content row), which made each window query
-        # take seconds on a ~60k-content library.  Semantics are unchanged:
-        # latest valid active-release evaluation and latest metric snapshot.
+        # Keep indexed evaluation lookups; select metric facts once per window,
+        # using the same provider/cutoff rules as content pages and reports.
         denominator_rows = connection.execute(
             f"""
-            SELECT {direction_sql} direction, c.platform,
-                   COUNT(*) publication_count,
-                   SUM(CASE WHEN COALESCE(lm.view_count,0)>0 THEN lm.view_count ELSE 0 END) valid_exposure_views
+            SELECT c.id, {direction_sql} direction, c.platform
             FROM content_items c
             LEFT JOIN accounts a ON a.id=c.account_id
             LEFT JOIN evaluation_versions ev ON ev.id=(
@@ -1413,16 +1982,21 @@ def _selling_point_window_stats(
                   AND ev2.invalidated_at IS NULL
                 ORDER BY ev2.evaluated_at DESC, ev2.id DESC LIMIT 1
             )
-            LEFT JOIN content_metric_snapshots lm ON lm.id=(
-                SELECT ms2.id FROM content_metric_snapshots ms2
-                WHERE ms2.content_id=c.id
-                ORDER BY ms2.captured_at DESC, ms2.id DESC LIMIT 1
-            )
             WHERE c.published_at >= ? AND c.published_at < ?
-            GROUP BY direction, c.platform
+              AND {canonical_content_predicate(connection)}
+              AND {content_statistics_scope_sql("c")}
             """,
             (start_utc, end_utc),
         ).fetchall()
+        metric_values = select_content_metrics(
+            connection,
+            [int(row["id"]) for row in denominator_rows],
+            metric_fields=("view_count",),
+        )
+
+        def valid_views(content_id: int) -> int:
+            return max(0, int(metric_values.get(content_id, {}).get("view_count") or 0))
+
         for row in denominator_rows:
             scene, channel = str(row["direction"]), str(row["platform"])
             if (
@@ -1430,10 +2004,8 @@ def _selling_point_window_stats(
                 or channel not in _SELLING_POINT_STAT_CHANNELS
             ):
                 continue
-            scene_denominators[scene][channel] = {
-                "publication_count": int(row["publication_count"] or 0),
-                "valid_exposure_views": int(row["valid_exposure_views"] or 0),
-            }
+            scene_denominators[scene][channel]["publication_count"] += 1
+            scene_denominators[scene][channel]["valid_exposure_views"] += valid_views(int(row["id"]))
         windows_meta[window_key] = {
             "period_start": start.isoformat(),
             "period_end": end.isoformat(),
@@ -1442,7 +2014,6 @@ def _selling_point_window_stats(
         hit_rows = connection.execute(
             f"""
             WITH {FORMAL_CURRENT_EVALUATIONS_CTE},
-            {_LATEST_METRICS_CTE},
             matched AS (
                 SELECT DISTINCT em.selling_point_code code, em.scene, em.match_role,
                        ev.content_id, c.platform
@@ -1450,22 +2021,25 @@ def _selling_point_window_stats(
                 JOIN evaluation_matches em ON em.evaluation_id=ev.id
                 JOIN content_items c ON c.id=ev.content_id
                 WHERE c.published_at >= ? AND c.published_at < ?
+                  AND {canonical_content_predicate(connection)}
+                  AND {content_statistics_scope_sql("c")}
             )
-            SELECT m.code, m.scene, m.platform,
-                   COUNT(DISTINCT CASE WHEN m.match_role='primary' THEN m.content_id END) primary_hits,
-                   COUNT(DISTINCT m.content_id) total_hits,
-                   SUM(CASE WHEN m.match_role='primary' AND COALESCE(lm.view_count,0)>0 THEN lm.view_count ELSE 0 END) primary_views
+            SELECT m.code, m.scene, m.platform, m.match_role, m.content_id
             FROM matched m
-            LEFT JOIN latest_metrics lm ON lm.content_id=m.content_id
-            GROUP BY m.code, m.scene, m.platform
             """,
             (start_utc, end_utc),
         ).fetchall()
+        hit_groups: Dict[tuple[str, str, str], Dict[str, set[int]]] = {}
         for row in hit_rows:
-            scene, channel = str(row["scene"]), str(row["platform"])
+            key = (str(row["code"]), str(row["scene"]), str(row["platform"]))
+            group = hit_groups.setdefault(key, {"primary": set(), "all": set()})
+            group["all"].add(int(row["content_id"]))
+            if row["match_role"] == "primary":
+                group["primary"].add(int(row["content_id"]))
+        for (code, scene, channel), group in hit_groups.items():
             if scene not in _SELLING_POINT_STAT_SCENES:
                 continue
-            scene_map = point_windows.setdefault(str(row["code"]), {}).setdefault(
+            scene_map = point_windows.setdefault(code, {}).setdefault(
                 window_key, {}
             )
             entry = scene_map.setdefault(
@@ -1479,12 +2053,12 @@ def _selling_point_window_stats(
                     },
                 },
             )
-            entry["primary_hits"] += int(row["primary_hits"] or 0)
-            entry["total_hits"] += int(row["total_hits"] or 0)
+            entry["primary_hits"] += len(group["primary"])
+            entry["total_hits"] += len(group["all"])
             if channel in entry["channels"]:
                 entry["channels"][channel] = {
-                    "primary_hits": int(row["primary_hits"] or 0),
-                    "primary_views": int(row["primary_views"] or 0),
+                    "primary_hits": len(group["primary"]),
+                    "primary_views": sum(valid_views(cid) for cid in group["primary"]),
                 }
     return windows_meta, point_windows
 
@@ -1519,6 +2093,8 @@ def _selling_point_list(*, db_path: Path, read_only: bool = False) -> Dict[str, 
                        em.scene
                 FROM formal_current_evaluations ev
                 JOIN evaluation_matches em ON em.evaluation_id=ev.id
+                JOIN content_items c ON c.id=ev.content_id
+                WHERE {content_statistics_scope_sql("c")}
             )
             SELECT sp.*,
                    COUNT(DISTINCT CASE WHEN rm.match_role='primary' THEN rm.content_id END) primary_hits,
@@ -1581,6 +2157,11 @@ def _read_local_json(local_path: str) -> Dict[str, Any]:
 
 
 def _replica_artifact_path(value: str, *, read_only: bool) -> Path:
+    from .artifact_paths import installed_snapshot
+    if read_only and installed_snapshot() is not None:
+        # A v2 receipt provides one exact writer root and allowlist. Never use
+        # the legacy suffix heuristic to borrow an unlisted same-name file.
+        return _safe_project_path(value)
     try:
         return _safe_project_path(value)
     except HTTPException:
@@ -1596,7 +2177,7 @@ def _replica_artifact_path(value: str, *, read_only: bool) -> Path:
 
 def _artifact_media_paths(
     row: sqlite3.Row, *, read_only: bool = False
-) -> List[Path]:
+) -> List[Optional[Path]]:
     try:
         path = _replica_artifact_path(str(row["local_path"]), read_only=read_only)
     except (HTTPException, OSError):
@@ -1641,14 +2222,13 @@ def _artifact_media_paths(
     candidates.extend(
         str(item) for item in value.get("image_paths", []) if isinstance(item, str)
     )
-    paths: List[Path] = []
+    paths: List[Optional[Path]] = []
     for candidate in candidates:
         try:
             resolved = _replica_artifact_path(candidate, read_only=read_only)
-            if resolved.is_file():
-                paths.append(resolved)
+            paths.append(resolved if resolved.is_file() else None)
         except (HTTPException, OSError):
-            continue
+            paths.append(None)
     return paths
 
 
@@ -1766,14 +2346,17 @@ def _content_evidence(
             """,
             (content_id,),
         ).fetchall()
+        managed = media_api.managed_evidence(connection, content_id, read_only=read_only)
     media_items: List[Dict[str, Any]] = []
     media_availability = {
         "status": "missing",
         "reason": "还没有可查看的图片或视频。",
     }
-    if media_row is not None:
+    if media_row is not None and managed is None:
         media_paths = _artifact_media_paths(media_row, read_only=read_only)
         for index, path in enumerate(media_paths):
+            if path is None:
+                continue
             suffix = path.suffix.lower()
             media_items.append(
                 {
@@ -1786,7 +2369,7 @@ def _content_evidence(
                     "url": f"/api/v8/contents/{content_id}/evidence/files/{media_row['id']}/{index}",
                 }
             )
-        if media_paths:
+        if any(path is not None for path in media_paths):
             media_availability = {"status": "available", "reason": ""}
         elif read_only:
             media_availability = {
@@ -1798,8 +2381,13 @@ def _content_evidence(
                 "status": "missing",
                 "reason": "本地图片或视频文件丢失，请重新处理媒体。",
             }
-    asr_payload = _read_local_json(str(asr_row["local_path"])) if asr_row else {}
-    ocr_payload = _read_local_json(str(ocr_row["local_path"])) if ocr_row else {}
+    asr_payload = _read_local_json(str(asr_row["local_path"])) if asr_row and managed is None else {}
+    ocr_payload = _read_local_json(str(ocr_row["local_path"])) if ocr_row and managed is None else {}
+    if managed is not None:
+        media_items = managed["media"]
+        media_availability = managed["media_availability"]
+        asr_payload = managed["asr_payload"]
+        ocr_payload = managed["ocr_payload"]
     evaluation_payload = (
         json.loads(str(evaluation["payload_json"])) if evaluation is not None else None
     )
@@ -1831,6 +2419,9 @@ def _content_evidence(
         "evaluation": evaluation_payload,
         "media": media_items,
         "media_availability": media_availability,
+        "previews": managed["previews"] if managed is not None else [],
+        "media_lifecycle": managed["media_lifecycle"] if managed is not None else None,
+        "read_only": read_only,
         "asr": {
             "status": asr_payload.get("status")
             or ("missing" if asr_row is None else "available"),
@@ -1883,11 +2474,13 @@ def _run_startup_catchup(
     *,
     db_path: Path,
     reports_root: Path,
+    effective_from: date | None = None,
 ) -> None:
     """Run report-only catch-up without blocking API startup."""
     try:
         results = startup_catchup(
-            db_path=db_path, reports_root=reports_root
+            db_path=db_path, reports_root=reports_root,
+            effective_from=effective_from,
         )
     except Exception as exc:
         LOGGER.exception("startup catch-up failed")
@@ -1912,16 +2505,22 @@ def _run_startup_catchup(
 
 @contextmanager
 def _writer_process_lock(path: Path, *, enabled: bool):
-    """Hold the single-writer lock for the scheduler process lifetime."""
+    """Hold a checkout-local lock for an explicitly isolated runtime."""
 
     if not enabled:
-        yield
+        yield None
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.is_symlink():
         raise RuntimeError(f"writer lock path must not be a symlink: {path}")
     descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+    lease: WriterLockLease | None = None
     try:
+        identity = FileIdentity.from_stat(os.fstat(descriptor))
+        current = path.stat()
+        if not os.path.samestat(os.fstat(descriptor), current):
+            raise RuntimeError(f"writer lock identity changed: {path}")
+        lease = WriterLockLease(path=path.resolve(strict=True), identity=identity)
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
@@ -1931,7 +2530,7 @@ def _writer_process_lock(path: Path, *, enabled: bool):
         os.ftruncate(descriptor, 0)
         os.write(descriptor, f"pid={os.getpid()}\n".encode("ascii"))
         os.fsync(descriptor)
-        yield
+        yield lease
     finally:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
@@ -1939,10 +2538,96 @@ def _writer_process_lock(path: Path, *, enabled: bool):
             os.close(descriptor)
 
 
+def _open_sqlite_runtime_anchor(path: Path) -> sqlite3.Connection:
+    """Keep writable WAL sidecars attached for the API process lifetime."""
+
+    connection = connect(path, read_only=False)
+    try:
+        connection.execute("PRAGMA query_only = ON")
+        journal_mode = str(
+            connection.execute("PRAGMA journal_mode").fetchone()[0]
+        ).lower()
+        if journal_mode != "wal":
+            raise RuntimeError("writable runtime SQLite anchor requires WAL mode")
+        if connection.in_transaction:
+            raise RuntimeError("writable runtime SQLite anchor must remain idle")
+        return connection
+    except BaseException:
+        connection.close()
+        raise
+
+
 def _uses_formal_database(path: Path) -> bool:
     """Return whether one runtime points at the checked-out formal database."""
 
     return is_formal_database_path(path, formal_database=DEFAULT_DB)
+
+
+def _resolve_runtime_access_before_database(
+    config: ApiConfig,
+) -> ResolvedDatabaseAccess | None:
+    """Resolve environment-backed capabilities before SQLite or mkdir calls."""
+
+    mode = config.runtime_access_mode
+    if config.read_only:
+        if mode not in {None, DatabaseAccessMode.FORMAL_READ}:
+            raise RuntimeError("read-only replica requires formal_read access")
+        return resolve_read_only_replica(config.db_path)
+    if mode is DatabaseAccessMode.FORMAL_READ:
+        raise RuntimeError("formal_read access requires read-only API mode")
+    if mode in {DatabaseAccessMode.WRITER, DatabaseAccessMode.FORMAL_MUTATION}:
+        try:
+            access = resolve_installed_database_access(
+                mode,
+                database=config.db_path,
+                project_root=config.project_root,
+            )
+        except (OSError, RuntimeDatabaseError, ValueError) as error:
+            raise RuntimeError(f"installed runtime database refused: {error}") from error
+        if access.writer_lock is None or (
+            config.writer_lock.expanduser().resolve(strict=False)
+            != access.writer_lock.resolve(strict=False)
+        ):
+            raise RuntimeError("ApiConfig writer lock differs from installed runtime")
+        return access
+    if mode is DatabaseAccessMode.ISOLATED_CANDIDATE:
+        try:
+            return resolve_isolated_candidate(config.db_path)
+        except (OSError, RuntimeDatabaseError, ValueError) as error:
+            raise RuntimeError(f"installed runtime database refused: {error}") from error
+    if mode is None and config.db_path.exists():
+        try:
+            if is_installed_formal_database(config.db_path, required=False):
+                raise RuntimeError(
+                    "installed writer database requires an explicit writer access mode"
+                )
+        except RuntimeDatabaseError as error:
+            raise RuntimeError(f"installed runtime database refused: {error}") from error
+    if mode is None and config.runtime_from_environment:
+        raise RuntimeError(
+            "formal_database_identity_unresolved: set the installed writer/read-only "
+            "contract or explicitly select DCAR_V8_ISOLATED_CANDIDATE=1"
+        )
+    return None
+
+
+@contextmanager
+def _runtime_writer_lock(
+    config: ApiConfig,
+    access: ResolvedDatabaseAccess | None,
+):
+    if access is not None and access.access_mode in {
+        DatabaseAccessMode.WRITER,
+        DatabaseAccessMode.FORMAL_MUTATION,
+    }:
+        with acquire_writer_lock(access) as lease:
+            yield lease
+        return
+    with _writer_process_lock(
+        config.writer_lock,
+        enabled=bool(config.scheduler_enabled and not config.read_only),
+    ) as lease:
+        yield lease
 
 
 @asynccontextmanager
@@ -1963,10 +2648,19 @@ async def _lifespan_runtime(app: FastAPI):
             )
         with connect(config.db_path, read_only=True) as connection:
             require_schema_compatibility(
-                connection, supported_versions=frozenset({SCHEMA_VERSION})
+                connection, supported_versions=frozenset({19, 20})
             )
             connection.execute("SELECT 1 FROM content_items LIMIT 1").fetchone()
         app.state.database_sha256 = _file_sha256(config.db_path)
+        from .artifact_paths import installed_snapshot
+        installed = installed_snapshot()
+        if installed is not None:
+            with connect(config.db_path, read_only=True) as connection:
+                identity = _database_state(connection)["runtime_identity"]
+            receipt = installed["receipt"]
+            if (receipt.get("database_sha256", {}).get("dcar_insight.sqlite3") != app.state.database_sha256
+                    or receipt.get("runtime_identity") != identity):
+                raise RuntimeError("installed snapshot does not bind the read-only database")
         app.state.recovered_fetch_slots = {
             "stale_candidates": 0,
             "recovered": 0,
@@ -1984,7 +2678,10 @@ async def _lifespan_runtime(app: FastAPI):
         app.state.recovered_tasks = 0
         app.state.recovered_scheduler_runs = 0
     else:
-        if _uses_formal_database(config.db_path):
+        if config.runtime_access_mode in {
+            DatabaseAccessMode.WRITER,
+            DatabaseAccessMode.FORMAL_MUTATION,
+        } or _uses_formal_database(config.db_path):
             if not config.db_path.is_file():
                 raise RuntimeError(
                     f"formal SQLite database is missing: {config.db_path}"
@@ -1997,7 +2694,7 @@ async def _lifespan_runtime(app: FastAPI):
                 try:
                     require_schema_compatibility(
                         connection,
-                        supported_versions=frozenset({SCHEMA_VERSION}),
+                        supported_versions=frozenset({19, 20}),
                     )
                 except RuntimeError as exc:
                     raise RuntimeError(
@@ -2006,8 +2703,31 @@ async def _lifespan_runtime(app: FastAPI):
                         f"{exc}"
                     ) from exc
         else:
+            # Existing local databases obey the same explicit-upgrade rule as
+            # the writer.  Validate before opening a writable connection so a
+            # rejected historical database does not gain WAL/SHM sidecars.
+            if config.db_path.is_file() and config.db_path.stat().st_size:
+                with connect(config.db_path, read_only=True) as connection:
+                    has_tables = connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1"
+                    ).fetchone()
+                    if has_tables is not None:
+                        try:
+                            require_schema_compatibility(
+                                connection,
+                                supported_versions=frozenset({19, 20}),
+                            )
+                        except RuntimeError as exc:
+                            raise RuntimeError(
+                                "existing database schema is incompatible; "
+                                "offline schema migration is required: "
+                                f"{exc}"
+                            ) from exc
             with connect(config.db_path) as connection:
-                initialize_database(connection)
+                initialize_database(connection, allow_migrations=False)
+        app.state.sqlite_runtime_anchor = _open_sqlite_runtime_anchor(
+            config.db_path
+        )
         app.state.recovered_scheduler_runs = recover_interrupted_scheduler_runs(
             db_path=config.db_path
         )
@@ -2027,12 +2747,7 @@ async def _lifespan_runtime(app: FastAPI):
     app.state.scheduler_enabled = False
     app.state.startup_catchup_requested = config.startup_catchup_enabled
     app.state.startup_catchup_enabled = False
-    app.state.daily_capture_reconcile_enabled = False
-    app.state.daily_capture_reconcile_effective_from = (
-        config.daily_capture_reconcile_from.isoformat()
-        if config.daily_capture_reconcile_from is not None
-        else None
-    )
+    app.state.pipeline_reconcile_enabled = False
     app.state.report_runtime_ready = None
     app.state.report_runtime_error = None
     scheduler: Optional[BackgroundScheduler] = None
@@ -2055,7 +2770,15 @@ async def _lifespan_runtime(app: FastAPI):
                 "daily capture reconcile requires an effective date when "
                 "scheduler is enabled"
             )
-        scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
+        scheduler = BackgroundScheduler(
+            timezone="Asia/Shanghai",
+            executors={
+                "default": {"type": "threadpool", "max_workers": 20},
+                "control": {"type": "threadpool", "max_workers": 8},
+                "report": {"type": "threadpool", "max_workers": 1},
+                "reconcile": {"type": "threadpool", "max_workers": 1},
+            },
+        )
         install_jobs(
             scheduler,
             db_path=config.db_path,
@@ -2063,9 +2786,12 @@ async def _lifespan_runtime(app: FastAPI):
             capture_call_override=None,
             reconcile_effective_date=reconcile_effective_date,
         )
-        scheduler.start()
+        if config.scheduler_start_paused:
+            scheduler.start(paused=True)
+        else:
+            scheduler.start()
         app.state.scheduler_enabled = True
-        app.state.daily_capture_reconcile_enabled = True
+        app.state.pipeline_reconcile_enabled = True
     if config.effective_startup_catchup_enabled:
         app.state.startup_catchup_enabled = True
         app.state.catchup_status = "running"
@@ -2077,6 +2803,7 @@ async def _lifespan_runtime(app: FastAPI):
             kwargs={
                 "db_path": config.db_path,
                 "reports_root": config.reports_root,
+                "effective_from": config.effective_daily_capture_reconcile_from,
             },
             name="dcar-startup-catchup",
             daemon=True,
@@ -2095,6 +2822,126 @@ async def _lifespan_runtime(app: FastAPI):
             scheduler.shutdown(wait=False)
 
 
+def _current_hold_mirror_root(config: ApiConfig) -> Path:
+    configured = os.environ.get("DCAR_CURRENT_HOLD_MIRROR_ROOT", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve(strict=False)
+    return config.db_path.expanduser().resolve(strict=False).parent / "current-hold-control"
+
+
+def _drain_current_hold_control(
+    *, request_app: FastAPI, config: ApiConfig
+) -> dict[str, int]:
+    """Drain bounded command batches until one batch proves the queue is short."""
+
+    total = 0
+    batches = 0
+    while True:
+        control_lock = request_app.state.current_hold_control_lock
+        with control_lock:
+            batch_generation = int(
+                getattr(request_app.state, "current_hold_control_wake_generation", 0)
+            )
+        batch = process_current_activation_hold_commands(
+            db_path=config.db_path,
+            mirror_root=_current_hold_mirror_root(config),
+            limit=10,
+            scheduler=getattr(request_app.state, "scheduler", None),
+        )
+        count = batch.get("count")
+        if type(count) is not int or count < 0 or count > 10:
+            raise RuntimeError(
+                "current-hold control executor returned an invalid batch count"
+            )
+        total += count
+        batches += 1
+        with control_lock:
+            latest_generation = int(
+                getattr(request_app.state, "current_hold_control_wake_generation", 0)
+            )
+        # A short batch proves the queue was exhausted at that instant. If a
+        # POST committed while the batch was running, take another bounded pass
+        # before handing the worker back to the executor.
+        if count < 10 and latest_generation == batch_generation:
+            return {
+                "count": total,
+                "batches": batches,
+                "wake_generation": latest_generation,
+            }
+
+
+def _submit_current_hold_control(*, request_app: FastAPI) -> Future[Any]:
+    executor = getattr(request_app.state, "current_hold_control_executor", None)
+    if not isinstance(executor, ThreadPoolExecutor) or not bool(
+        getattr(request_app.state, "writer_lock_held", False)
+    ):
+        raise RuntimeError("current-hold control executor has no writer lock")
+    config = getattr(request_app.state, "config", None)
+    if not isinstance(config, ApiConfig):
+        raise RuntimeError("current-hold control executor has no ApiConfig")
+    control_lock = request_app.state.current_hold_control_lock
+    with control_lock:
+        generation = (
+            int(getattr(request_app.state, "current_hold_control_wake_generation", 0))
+            + 1
+        )
+        request_app.state.current_hold_control_wake_generation = generation
+        existing = getattr(request_app.state, "current_hold_control_future", None)
+        if isinstance(existing, Future) and not existing.done():
+            return existing
+        future = executor.submit(
+            _drain_current_hold_control,
+            request_app=request_app,
+            config=config,
+        )
+        request_app.state.current_hold_control_future = future
+        futures = getattr(request_app.state, "current_hold_control_futures", None)
+        if not isinstance(futures, set):
+            futures = set()
+            request_app.state.current_hold_control_futures = futures
+        futures.add(future)
+
+    def completed(item: Future[Any]) -> None:
+        drained_generation = generation
+        try:
+            result = item.result()
+            if (
+                isinstance(result, Mapping)
+                and type(result.get("wake_generation")) is int
+            ):
+                drained_generation = int(result["wake_generation"])
+        except Exception:
+            LOGGER.exception("current-hold control executor failed")
+        resubmit = False
+        with control_lock:
+            futures.discard(item)
+            if getattr(request_app.state, "current_hold_control_future", None) is item:
+                request_app.state.current_hold_control_future = None
+                resubmit = bool(
+                    getattr(request_app.state, "writer_lock_held", False)
+                    and getattr(
+                        request_app.state, "current_hold_control_executor", None
+                    )
+                    is executor
+                    and int(
+                        getattr(
+                            request_app.state,
+                            "current_hold_control_wake_generation",
+                            0,
+                        )
+                    )
+                    > drained_generation
+                )
+        if resubmit:
+            try:
+                _submit_current_hold_control(request_app=request_app)
+            except RuntimeError:
+                LOGGER.exception("current-hold control executor resubmit failed")
+
+    future.add_done_callback(completed)
+    return future
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     config = getattr(app.state, "config", None)
@@ -2102,8 +2949,15 @@ async def lifespan(app: FastAPI):
         raise RuntimeError("FastAPI application is missing ApiConfig")
     # Validate before the freeze check, writer-lock context, or any database
     # access so an impossible reconcile setting cannot leave runtime sidecars.
+    app.state.sqlite_runtime_anchor = None
     config.validate_daily_capture_reconcile_contract()
-    if _uses_formal_database(config.db_path) and config.operator_freeze_lock.exists():
+    access = _resolve_runtime_access_before_database(config)
+    formal_runtime = bool(
+        access is not None
+        and access.access_mode
+        in {DatabaseAccessMode.WRITER, DatabaseAccessMode.FORMAL_MUTATION}
+    ) or _uses_formal_database(config.db_path)
+    if formal_runtime and config.operator_freeze_lock.exists():
         # Check the operator freeze before the scheduler lock context: entering
         # that context creates/truncates the lock file even when DB startup is
         # subsequently rejected.
@@ -2111,15 +2965,85 @@ async def lifespan(app: FastAPI):
             "production startup blocked by operator freeze lock: "
             f"{config.operator_freeze_lock}"
         )
-    app.state.writer_lock_path = str(config.writer_lock)
+    lock_path = access.writer_lock if access is not None else config.writer_lock
+    app.state.writer_lock_path = str(lock_path) if lock_path is not None else None
     app.state.writer_lock_held = False
-    with _writer_process_lock(config.writer_lock, enabled=config.scheduler_enabled):
-        app.state.writer_lock_held = config.scheduler_enabled
+    app.state.writer_lock = {
+        "path": app.state.writer_lock_path,
+        "device": None,
+        "inode": None,
+        "held": False,
+    }
+    app.state.runtime_database_identity = (
+        access.health_identity() if access is not None else None
+    )
+    with _runtime_writer_lock(config, access) as writer_lease:
+        control_executor: ThreadPoolExecutor | None = None
+        app.state.current_hold_control_executor = None
+        app.state.current_hold_control_future = None
+        app.state.current_hold_control_wake_generation = 0
+        app.state.current_hold_control_futures = set()
+        if writer_lease is not None:
+            app.state.writer_lock = writer_lease.health_identity(held=True)
+            app.state.writer_lock_held = True
+            control_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="dcar-current-hold-control"
+            )
+            app.state.current_hold_control_executor = control_executor
+        heartbeat_task: asyncio.Task[None] | None = None
         try:
             async with _lifespan_runtime(app):
+                if access is None:
+                    try:
+                        resolved = (
+                            resolve_isolated_candidate(config.db_path)
+                            if config.runtime_access_mode
+                            is DatabaseAccessMode.ISOLATED_CANDIDATE
+                            else resolve_isolated_fixture(config.db_path)
+                        )
+                    except (OSError, RuntimeDatabaseError) as error:
+                        raise RuntimeError(
+                            f"isolated runtime database refused: {error}"
+                        ) from error
+                    app.state.runtime_database_identity = resolved.health_identity()
+                if writer_lease is not None:
+                    app.state.writer_heartbeat_at = now_utc()
+
+                    async def heartbeat() -> None:
+                        while bool(getattr(app.state, "writer_lock_held", False)):
+                            app.state.writer_heartbeat_at = now_utc()
+                            await asyncio.sleep(WRITER_HEARTBEAT_INTERVAL_SECONDS)
+
+                    heartbeat_task = asyncio.create_task(
+                        heartbeat(), name="dcar-writer-heartbeat"
+                    )
+                    _submit_current_hold_control(request_app=app)
+                else:
+                    app.state.writer_heartbeat_at = None
                 yield
         finally:
-            app.state.writer_lock_held = False
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+            app.state.writer_heartbeat_at = None
+            if control_executor is not None:
+                control_executor.shutdown(wait=True, cancel_futures=False)
+            app.state.current_hold_control_executor = None
+            app.state.current_hold_control_future = None
+            anchor = getattr(app.state, "sqlite_runtime_anchor", None)
+            app.state.sqlite_runtime_anchor = None
+            try:
+                if anchor is not None:
+                    anchor.close()
+            finally:
+                app.state.writer_lock_held = False
+                app.state.writer_lock = {
+                    **app.state.writer_lock,
+                    "held": False,
+                }
 
 
 router = APIRouter()
@@ -2137,7 +3061,27 @@ READ_ONLY_POST_PATHS = frozenset(
 
 
 async def privacy_safe_request_log(request: Request, call_next):
+    overview_request = request.method == "GET" and request.url.path == "/api/v8/overview"
+    if overview_request:
+        request.state.overview_started_at = monotonic()
+        request.state.overview_timings = {}
     response = await call_next(request)
+    if overview_request:
+        timings = request.state.overview_timings
+        _overview_stage(timings, "total", request.state.overview_started_at)
+        # Only bounded stage names and durations; never query strings or IDs.
+        response.headers["Server-Timing"] = ", ".join(
+            f'{name};dur={duration:.2f}'
+            for name, duration in timings.items() if isinstance(duration, (int, float))
+        ) + f', cache;desc="{timings.get("cache", "unavailable")}"'
+        LOGGER.info("overview_timing %s", json.dumps(timings, sort_keys=True))
+    is_read = request.method in {"GET", "HEAD", "OPTIONS"} or (
+        request.method == "POST" and request.url.path in READ_ONLY_POST_PATHS
+    )
+    if not is_read and 200 <= response.status_code < 400:
+        cache = getattr(request.app.state, "read_model_cache", None)
+        if isinstance(cache, ReadModelCache):
+            cache.clear()
     LOGGER.info("%s %s %s", request.method, request.url.path, response.status_code)
     return response
 
@@ -2158,8 +3102,17 @@ async def read_only_replica_guard(request: Request, call_next):
 
 
 def create_app(config: Optional[ApiConfig] = None) -> FastAPI:
-    application = FastAPI(title="DCar Insight API", version="8.6", lifespan=lifespan)
-    application.state.config = config or ApiConfig.from_env()
+    application = FastAPI(title="DCar Insight API", version=CURRENT_REPORT_VERSION, lifespan=lifespan)
+    application_config = config or ApiConfig.from_env()
+    application.state.config = application_config
+    # Each app/database pair shares one verified receipt scan per TTL.
+    application.state.data_freshness_cache = DataFreshnessCache()
+    application.state.read_model_cache = ReadModelCache()
+    application.state.current_hold_control_lock = threading.RLock()
+    application.state.current_hold_control_future = None
+    application.state.current_hold_control_wake_generation = 0
+    application.state.current_hold_control_futures = set()
+    application.add_middleware(JSONGZipMiddleware, minimum_size=1_000, compresslevel=5)
     application.add_middleware(
         CORSMiddleware,
         allow_origin_regex=r"http://(?:localhost|127\.0\.0\.1):\d{2,5}",
@@ -2174,28 +3127,343 @@ def create_app(config: Optional[ApiConfig] = None) -> FastAPI:
     return application
 
 
+def _scheduler_execution_state(config: ApiConfig, scheduler: Any) -> str:
+    if config.read_only:
+        return "read_only"
+    state = getattr(scheduler, "state", None)
+    if state == STATE_RUNNING:
+        return "running"
+    if state == STATE_PAUSED:
+        return "paused"
+    return "stopped"
+
+
 @router.get("/api/v8/health")
 def v8_health(request: Request) -> Dict[str, Any]:
+    from .paid_drain import dispatch_state
+    from .snapshot_contract import descriptor
     config = _request_config(request)
     with connect(config.db_path, read_only=config.read_only) as connection:
-        data_freshness = _data_freshness(connection)
         database_state = _database_state(connection)
+        media_lifecycle = media_api.lifecycle_status(connection, read_only=config.read_only)
+        drain = dispatch_state(connection)
         database_state["sha256"] = getattr(request.app.state, "database_sha256", None)
+    data_freshness = _request_data_freshness(request)
+    scheduler = getattr(request.app.state, "scheduler", None)
+    scheduler_state = _scheduler_execution_state(config, scheduler)
+    registered_job_ids = {
+        str(job.id) for job in scheduler.get_jobs()
+    } if scheduler is not None else set()
+    activation = media_lifecycle.get("activation") or {}
+    lifecycle_jobs_enabled = bool(
+        not config.read_only
+        and scheduler_state == "running"
+        and activation.get("mode") == "active"
+        and media_retention.LIFECYCLE_JOB_IDS <= registered_job_ids
+    )
     return {
         "status": "ok",
+        "automation": {
+            "scheduler_state": scheduler_state,
+            "report_from_date": config.daily_capture_reconcile_from.isoformat() if config.daily_capture_reconcile_from else None,
+            "paid_dispatch_state": drain.state,
+        },
         "mode": "read_only_replica" if config.read_only else "local_v8",
         "read_only": config.read_only,
         "report_version": CURRENT_REPORT_VERSION,
         "database": config.db_path.name,
+        "database_path": str(config.db_path.resolve()),
+        "runtime_database_identity": getattr(
+            request.app.state, "runtime_database_identity", None
+        ),
+        "writer_lock": getattr(
+            request.app.state,
+            "writer_lock",
+            {
+                "path": getattr(request.app.state, "writer_lock_path", None),
+                "device": None,
+                "inode": None,
+                "held": False,
+            },
+        ),
         "database_state": database_state,
         "data_freshness": data_freshness,
+        "paid_dispatch_state": (
+            "open"
+            if drain.state == "open"
+            else "drained"
+            if drain.state in {"draining", "sealed"}
+            else "invalid"
+        ),
+        "cutover_state": {
+            "state": drain.state,
+            "drain_id": drain.drain_id,
+            "last_event_id": drain.last_event_id,
+            "reason": drain.reason,
+        },
+        "media_lifecycle": media_lifecycle,
+        "snapshot_contract": descriptor(),
+        "media_consumers": media_consumer_proofs.runtime_identity(),
+        "lifecycle_jobs_enabled": lifecycle_jobs_enabled,
     }
+
+
+@router.get("/api/v8/livez")
+def v8_livez() -> Dict[str, Any]:
+    """Process liveness is deliberately O(1) and never touches SQLite."""
+
+    return {"status": "alive"}
+
+
+@router.post(
+    "/api/v8/internal/current-activation-hold/commands", status_code=202
+)
+def submit_current_activation_hold_command(
+    request: Request, payload: CurrentActivationHoldCommandRequest
+) -> Dict[str, Any]:
+    """Persist an operator command; the single writer executor runs it later."""
+
+    config = _request_config(request)
+    if config.read_only:
+        raise HTTPException(status_code=403, detail="read_only_replica")
+    if not bool(getattr(request.app.state, "writer_lock_held", False)) or getattr(
+        request.app.state, "current_hold_control_executor", None
+    ) is None:
+        raise HTTPException(status_code=503, detail="writer_lock_not_held")
+    if payload.parameters is not None and payload.binding is not None:
+        raise HTTPException(status_code=422, detail="command_binding_is_ambiguous")
+    parameters = payload.parameters if payload.parameters is not None else payload.binding
+    if parameters is None:
+        raise HTTPException(status_code=422, detail="command_binding_is_required")
+    try:
+        queued = enqueue_current_activation_hold_command(
+            db_path=config.db_path,
+            command_id=payload.command_id,
+            command=payload.command,
+            parameters=parameters,
+        )
+    except ProfileControlError as exc:
+        status_code = 409 if exc.code.endswith("conflict") else 422
+        raise HTTPException(
+            status_code=status_code, detail={"code": exc.code, "message": str(exc)}
+        ) from exc
+    except (OSError, sqlite3.Error, RuntimeDatabaseError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "durable_command_persist_failed",
+                "message": str(exc),
+            },
+        ) from exc
+    command_status = str(queued.get("status") or "")
+    if command_status not in {"succeeded", "failed"}:
+        try:
+            _submit_current_hold_control(request_app=request.app)
+        except RuntimeError:
+            # The command is already durable.  A concurrent executor shutdown must
+            # not turn a safely queued command into an ambiguous client retry; the
+            # next writer startup drains it.
+            LOGGER.exception("current-hold command queued but executor wakeup failed")
+    return {
+        "run_id": int(queued["run_id"]),
+        "status": (
+            command_status if command_status in {"succeeded", "failed"} else "pending"
+        ),
+    }
+
+
+@router.get("/api/v8/internal/current-activation-hold/commands/{run_id}")
+def get_current_activation_hold_command(
+    request: Request, run_id: int
+) -> Dict[str, Any]:
+    """Pure read of one durable command; this endpoint never claims work."""
+
+    config = _request_config(request)
+    try:
+        return read_current_activation_hold_command(
+            db_path=config.db_path,
+            run_id=run_id,
+            read_only=True,
+            live_wal=bool(getattr(request.app.state, "writer_lock_held", False)),
+        )
+    except ProfileControlError as exc:
+        if exc.code == "current_hold_command_missing":
+            raise HTTPException(status_code=404, detail=exc.code) from exc
+        raise HTTPException(
+            status_code=503, detail={"code": exc.code, "message": str(exc)}
+        ) from exc
+
+
+@router.get("/api/v8/readyz")
+def v8_readyz(request: Request):
+    """Cheap readiness from DB summaries; never verify raw scan manifests."""
+
+    from .paid_drain import dispatch_state
+    from .runtime_receipts import (
+        current_activation_readiness,
+        latest_runtime_coverage,
+    )
+
+    config = _request_config(request)
+    timestamp = now_utc()
+    with connect(config.db_path, read_only=config.read_only) as connection:
+        connection.execute("SELECT 1").fetchone()
+        compatibility = schema_compatibility_state(connection)
+        if connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='acquisition_profile_activations'"
+        ).fetchone() is not None:
+            from .profile_activations import activation_at
+
+            active = activation_at(connection, timestamp)
+            activation_id = (
+                int(active["activation_id"]) if active is not None else None
+            )
+            profile_id = str(active["profile_id"]) if active is not None else None
+        else:
+            activation_row = connection.execute(
+                "SELECT id,completed_at FROM scheduler_runs "
+                "WHERE job_id='matrix_pipeline_activation' AND status='succeeded' "
+                "ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            activation_id = (
+                int(activation_row["id"]) if activation_row is not None else None
+            )
+            profile_id = "matrix_hybrid_v1" if activation_row is not None else None
+        coverage = latest_runtime_coverage(connection, at=timestamp)
+        drain = dispatch_state(connection)
+        current = (
+            current_activation_readiness(connection, at=timestamp)
+            if activation_id is not None
+            else {
+                "control_readiness": False,
+                "data_readiness": False,
+                "reason": "current_activation_receipt_mismatch",
+                "receipt": None,
+            }
+        )
+    writer_lock_held = bool(getattr(request.app.state, "writer_lock_held", False))
+    writer_runtime = bool(
+        config.runtime_access_mode
+        in {DatabaseAccessMode.WRITER, DatabaseAccessMode.FORMAL_MUTATION}
+        or getattr(request.app.state, "scheduler_requested", False)
+        or writer_lock_held
+    )
+    requires_pipeline_evidence = bool(config.read_only or writer_runtime)
+    heartbeat_at = getattr(request.app.state, "writer_heartbeat_at", None)
+    heartbeat_age_seconds: float | None = None
+    if isinstance(heartbeat_at, str):
+        try:
+            heartbeat_age_seconds = max(
+                0.0,
+                (
+                    datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                    - datetime.fromisoformat(heartbeat_at.replace("Z", "+00:00"))
+                ).total_seconds(),
+            )
+        except ValueError:
+            heartbeat_age_seconds = None
+    heartbeat_fresh = bool(
+        heartbeat_age_seconds is not None
+        and heartbeat_age_seconds <= WRITER_HEARTBEAT_MAX_AGE_SECONDS
+    )
+    conditions = {
+        "database": bool(compatibility["compatible"]),
+        # A read-only/local read model may be healthy before an acquisition
+        # activation is installed. Only a runtime that requests pipeline
+        # evidence treats a closed/invalid paid-dispatch chain as not ready.
+        "control_readiness": (
+            bool(current["control_readiness"])
+            if requires_pipeline_evidence
+            else True
+        ),
+        "writer_lock": (
+            writer_lock_held
+            if writer_runtime
+            else True
+        ),
+        "writer_heartbeat": (
+            heartbeat_fresh
+            if writer_runtime
+            else True
+        ),
+        "activation": activation_id is not None if requires_pipeline_evidence else True,
+        "profile_day_receipt": (
+            bool(current["data_readiness"])
+            if requires_pipeline_evidence
+            else True
+        ),
+    }
+    ready = all(conditions.values())
+    reason: str | None = None
+    if not ready:
+        if not conditions["database"]:
+            reason = "database_incompatible"
+        elif not conditions["writer_lock"]:
+            reason = "writer_lock_missing"
+        elif not conditions["writer_heartbeat"]:
+            reason = "writer_heartbeat_stale"
+        elif requires_pipeline_evidence:
+            reason = str(current.get("reason") or "current_activation_receipt_mismatch")
+    payload = {
+        "status": "ready" if ready else "not_ready",
+        "reason": reason,
+        "checked_at": timestamp,
+        "conditions": conditions,
+        "writer_heartbeat": (
+            {
+                "observed_at": heartbeat_at,
+                "age_seconds": heartbeat_age_seconds,
+                "max_age_seconds": WRITER_HEARTBEAT_MAX_AGE_SECONDS,
+            }
+            if heartbeat_at is not None
+            else None
+        ),
+        "activation_id": activation_id,
+        "profile_id": profile_id,
+        "profile_day_receipt": current.get("receipt"),
+        "closed_business_day_receipt": coverage.get("receipt"),
+        "control_readiness": bool(current.get("control_readiness")),
+        "data_readiness": bool(current.get("data_readiness")),
+        "paid_dispatch_state": drain.state,
+        "drain_id": drain.drain_id,
+        "loaded_build_id": os.environ.get("DCAR_LOADED_BUILD_ID"),
+    }
+    return payload if ready else JSONResponse(status_code=503, content=payload)
 
 
 @router.get("/api/v8/overview")
 def get_v8_overview(request: Request) -> Dict[str, Any]:
+    timings = getattr(request.state, "overview_timings", None)
+    if timings is not None:
+        _overview_stage(timings, "queue", request.state.overview_started_at)
     config = _request_config(request)
-    return v8_overview(config.db_path, read_only=config.read_only)
+    started_at = monotonic()
+    data_freshness = _request_data_freshness(request)
+    _overview_stage(timings, "freshness", started_at)
+    freshness_signature = hashlib.sha256(
+        json.dumps(
+            data_freshness,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    started_at = monotonic()
+    try:
+        return _request_read_model(
+            request,
+            ("overview", freshness_signature),
+            lambda: v8_overview(
+                config.db_path,
+                read_only=config.read_only,
+                data_freshness=data_freshness,
+                timings=timings,
+            ),
+            timings=timings,
+        )
+    finally:
+        _overview_stage(timings, "read_model", started_at)
 
 
 @router.get("/api/v8/tasks")
@@ -2207,6 +3475,11 @@ def get_v8_tasks(request: Request) -> Dict[str, Any]:
 @router.get("/api/v8/scheduler")
 def get_v8_scheduler_status(request: Request) -> Dict[str, Any]:
     config = _request_config(request)
+    scheduler = getattr(request.app.state, "scheduler", None)
+    scheduler_state = _scheduler_execution_state(config, scheduler)
+    registered_jobs = sorted(scheduler.get_jobs(), key=lambda job: str(job.id)) if scheduler is not None else []
+    registered_job_ids = [str(job.id) for job in registered_jobs]
+    next_runs = [job.next_run_time for job in registered_jobs if isinstance(getattr(job, "next_run_time", None), datetime)]
     with connect(config.db_path, read_only=config.read_only) as connection:
         rows = connection.execute(
             """
@@ -2226,21 +3499,38 @@ def get_v8_scheduler_status(request: Request) -> Dict[str, Any]:
                    ) latest_invocation_source
             FROM scheduler_runs sr
             JOIN (
-                SELECT job_id, MAX(scheduled_for) scheduled_for
-                FROM scheduler_runs GROUP BY job_id
-            ) latest ON latest.job_id=sr.job_id AND latest.scheduled_for=sr.scheduled_for
+                SELECT job_id, MAX(id) latest_id
+                FROM scheduler_runs WHERE job_id<>? GROUP BY job_id
+            ) latest ON latest.job_id=sr.job_id AND latest.latest_id=sr.id
             ORDER BY sr.job_id
-            """
+            """,
+            (ACCOUNT_STATUS_JOB,),
         ).fetchall()
-        data_freshness = _data_freshness(connection)
+    data_freshness = _request_data_freshness(request)
     return {
         "read_only": config.read_only,
         "requested": bool(getattr(request.app.state, "scheduler_requested", False)),
-        "enabled": bool(getattr(request.app.state, "scheduler_enabled", False)),
-        "writer_lock": {
-            "path": getattr(request.app.state, "writer_lock_path", None),
-            "held": bool(getattr(request.app.state, "writer_lock_held", False)),
-        },
+        "enabled": scheduler_state == "running",
+        "state": scheduler_state,
+        "paused": scheduler_state == "paused",
+        "reconcile_from": config.daily_capture_reconcile_from.isoformat() if config.daily_capture_reconcile_from else None,
+        "next_run_at": min(next_runs).isoformat() if next_runs and scheduler_state == "running" else None,
+        "registered_job_ids": registered_job_ids,
+        "registered_jobs": [
+            {"id": str(job.id), "next_run_at": job.next_run_time.isoformat()
+             if isinstance(getattr(job, "next_run_time", None), datetime) else None}
+            for job in registered_jobs
+        ],
+        "writer_lock": getattr(
+            request.app.state,
+            "writer_lock",
+            {
+                "path": getattr(request.app.state, "writer_lock_path", None),
+                "device": None,
+                "inode": None,
+                "held": False,
+            },
+        ),
         "report_runtime": {
             "ready": getattr(request.app.state, "report_runtime_ready", None),
             "error": getattr(request.app.state, "report_runtime_error", None),
@@ -2257,21 +3547,17 @@ def get_v8_scheduler_status(request: Request) -> Dict[str, Any]:
             "error": getattr(request.app.state, "catchup_error", None),
             "results": getattr(request.app.state, "catchup_results", []),
         },
-        "daily_capture_reconcile": {
+        "pipeline_reconcile": {
             "mode": "current_day_only",
             "enabled": bool(
-                getattr(
-                    request.app.state,
-                    "daily_capture_reconcile_enabled",
-                    False,
+                scheduler_state == "running"
+                and getattr(
+                    request.app.state, "pipeline_reconcile_enabled", False
                 )
-            ),
-            "effective_from": getattr(
-                request.app.state,
-                "daily_capture_reconcile_effective_from",
-                None,
+                and "pipeline_reconcile" in registered_job_ids
             ),
             "interval_seconds": DAILY_CAPTURE_RECONCILE_INTERVAL_SECONDS,
+            "paid_round_cutoff": "20:00",
         },
         "data_freshness": data_freshness,
         "jobs": [dict(row) for row in rows],
@@ -2300,16 +3586,10 @@ def get_v8_scheduler_status(request: Request) -> Dict[str, Any]:
     }
 
 
-# Report generation is minutes long, so it never runs inside the request that
-# asks for it: the endpoint returns a queued task and the workbench polls the
-# task read model for progress. One lock keeps the single SQLite writer serial.
-_TASK_RUN_LOCK = threading.Lock()
-
-
 def _run_task_in_background(
     task_id: str, *, db_path: Path, reports_root: Path
 ) -> None:
-    with _TASK_RUN_LOCK:
+    with PIPELINE_REPORT_EXECUTION_LOCK:
         try:
             run_task(task_id, db_path=db_path, reports_root=reports_root)
         except TaskCancelled:
@@ -2383,6 +3663,24 @@ def get_v8_task(request: Request, task_id: str) -> Dict[str, Any]:
             status_code=404,
             detail="找不到这个报告任务，请返回列表刷新后重试。",
         ) from exc
+
+
+@router.post("/api/v8/tasks/{task_id}/corrections", status_code=202)
+def correct_v8_task(request: Request, task_id: str, payload: TaskCorrectionRequest,
+                    background: BackgroundTasks) -> Dict[str, Any]:
+    from .reports import create_correction_task
+
+    config = _request_config(request)
+    try:
+        with connect(config.db_path) as connection:
+            assert_report_runtime_ready(connection)
+        task = create_correction_task(task_id, reason=payload.reason.strip(), db_path=config.db_path)
+    except ReportTaskError as exc:
+        raise _user_facing_http_error(exc, status_code=409,
+                                     detail="不能创建更正报告，请核查原报告与更正原因；原报告不会被覆盖。") from exc
+    if str(task["task_status"]) in IMPLICIT_RUN_STATUSES:
+        _queue_task_run(background, str(task["id"]), config)
+    return task
 
 
 @router.post("/api/v8/tasks/{task_id}/retry")
@@ -2816,6 +4114,218 @@ def download_v8_task_report(
     )
 
 
+
+def _roster_http_error(error: RosterError) -> HTTPException:
+    messages = {
+        "missing_stable_key": "官方导出缺少矩阵账号编号或主页链接，请重新导出完整名册。",
+        "unrecognized_export": "未识别到完整名册的必要字段，统计列表不能用作账号名册。",
+        "incomplete_roster": "文件实取数量与官方声明总量不一致，请上传完整名册。",
+               "incomplete_scope": "必须提供当前组织、全部平台和全部已添加账号的完整范围证明。",
+        "identity_conflict": "矩阵账号编号、平台编号或主页归属冲突，本次未更新名单。",
+        "identity_unresolved": "首次初始化仍有身份未对齐，不能重复建档或按手机号合并。",
+        "rounded_numeric_id": "导出含可能失真的数字长编号，请使用文本格式的原始编号。",
+        "stale_source": "该导出早于已接受名册，请重新从矩阵通导出。",
+        "scope_changed": "组织或全量范围与当前名册不同，本次未更新名单。",
+        "export_too_large": "导出文件为空或超过大小限制，请检查后重试。",
+        "manual_export_required": "全量名册接口尚未验证，请上传新的矩阵通官方完整导出。",
+        "system_member_exists": "该平台 UID 已在系统名单中，请直接修改运营信息。",
+        "system_member_not_found": "该账号不在当前系统名单中。",
+        "system_roster_already_exists": "系统名单已经初始化，无需重复从矩阵通复制。",
+        "system_roster_reason_required": "系统名单变更必须填写操作原因。",
+    }
+    return HTTPException(
+        status_code=409,
+        detail=messages.get(error.code, "完整名册未通过校验，请检查导出字段、来源证明和独立导出时间。"),
+        headers={"X-DCAR-Roster-Error": error.code},
+    )
+
+
+def _schedule_writer_roster_activation(
+    request: Request,
+    connection: sqlite3.Connection,
+    result: Mapping[str, Any],
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    """Bind an accepted same-family roster while the owning writer lock is held."""
+
+    value = dict(result)
+    if value.get("status") != "accepted" or not bool(
+        getattr(request.app.state, "writer_lock_held", False)
+    ):
+        return value
+    try:
+        if int(connection.execute("PRAGMA user_version").fetchone()[0]) == 20:
+            from .account_roster_capture import (
+                AccountRosterCaptureError,
+                schedule_account_roster_capture_in_transaction,
+            )
+
+            try:
+                scheduled = schedule_account_roster_capture_in_transaction(
+                    connection,
+                    roster_snapshot_id=int(value["snapshot_id"]),
+                    account_id=int(value["account_id"]) if value.get("account_id") is not None else None,
+                    actor="api-operator",
+                    reason=reason,
+                )
+            except AccountRosterCaptureError as error:
+                raise HTTPException(
+                    status_code=409,
+                    detail=str(error),
+                    headers={"X-DCAR-Account-Error": error.code},
+                ) from error
+        else:
+            scheduled = schedule_accepted_roster_activation_in_transaction(
+                connection,
+                roster_snapshot_id=int(value["snapshot_id"]),
+                actor="api-operator",
+                reason=reason,
+            )
+    except ProfileControlError as error:
+        raise RosterError(error.code, str(error)) from error
+    if not scheduled["scheduled"]:
+        return value
+    activation = scheduled["activation"]
+    return {
+        **value,
+        "activation_status": "scheduled",
+        "scheduled_activation_id": int(activation["activation_id"]),
+        "scheduled_effective_at": str(activation["effective_at"]),
+    }
+
+
+def _roster_source_root(config: ApiConfig) -> Path:
+    """Keep new roster evidence in this runtime's snapshot-transferable cache."""
+
+    return (
+        config.project_root.expanduser().resolve()
+        / "data/cache/v8/raw_responses/roster_sources"
+    )
+
+
+@router.get("/api/v8/account-roster")
+def get_v8_account_roster(request: Request) -> Dict[str, Any]:
+    with _connect_for_request(request) as connection:
+        return runtime_account_summary(connection)
+
+
+@router.get("/api/v8/account-roster/candidates/{candidate_id}")
+def get_v8_roster_diff(request: Request, candidate_id: int) -> Dict[str, Any]:
+    try:
+        with _connect_for_request(request) as connection:
+            return candidate_diff(connection, candidate_id)
+    except RosterError as error:
+        raise _roster_http_error(error) from error
+
+
+@router.post("/api/v8/account-roster/sync")
+def sync_v8_account_roster(request: Request) -> Dict[str, Any]:
+    # There is no verified full-roster endpoint yet. Do not reuse account/list,
+    # discover authors, or silently accept a cached candidate as a fresh sync.
+    with _connect_for_request(request) as connection:
+        runtime = runtime_account_summary(connection)
+        if runtime.get("active_profile_id") in SYSTEM_PROFILES:
+            return {
+                "status": "managed_locally",
+                "message": "当前使用系统名单；成员变更会封存新快照并在下一次名单激活边界生效。",
+                "roster": runtime,
+            }
+        summary = account_summary(connection)
+    return {
+        "status": "manual_export_required",
+        "message": "全量名册接口尚未验证。请上传新的矩阵通官方完整导出；当前名单未改变。",
+        "roster": summary,
+    }
+
+
+@router.post("/api/v8/account-roster/system/bootstrap")
+def bootstrap_v8_system_roster(
+    request: Request, payload: SystemRosterBootstrapRequest
+) -> Dict[str, Any]:
+    """Prepare the first inactive system roster without changing the live profile."""
+
+    config = _request_config(request)
+    try:
+        with _connect_for_request(request) as connection, transaction(connection):
+            result = bootstrap_system_roster_from_matrix(
+                connection,
+                raw_root=_roster_source_root(config),
+                actor="api-operator",
+                reason=payload.reason,
+            )
+            result = _schedule_writer_roster_activation(
+                request,
+                connection,
+                result,
+                reason="activate accepted system roster",
+            )
+        return {
+            **result,
+            "message": "系统名单已从 UID 完整的矩阵通当前名单封存；尚未切换采集模式。",
+        }
+    except RosterError as error:
+        raise _roster_http_error(error) from error
+
+
+@router.post("/api/v8/account-roster/import")
+def import_v8_account_roster(request: Request, payload: RosterUploadRequest) -> Dict[str, Any]:
+    config = _request_config(request)
+    try:
+        source = base64.b64decode(payload.content_base64, validate=True)
+    except (ValueError, binascii.Error) as error:
+        raise HTTPException(status_code=422, detail="导出文件编码无效。") from error
+    try:
+        with _connect_for_request(request) as connection, transaction(connection):
+            first = current_snapshot(connection) is None
+            members = decode_official_export(source, source_name=payload.source_name, allow_empty=not first)
+            candidate = prepare_candidate(
+                connection,
+                {
+                    "source_type": "bootstrap_export" if first else "manual_export",
+                    "require_existing_identities": first,
+                    "scope": {
+                        "organization": payload.organization,
+                        "coverage": "full", "account_scope": "all_added_accounts",
+                        "platforms": ["douyin", "xiaohongshu", "wechat_channels", "kuaishou"],
+                    },
+                    "source_captured_at": payload.source_exported_at,
+                    "source_evidence": {
+                        "kind": "official_export", "evidence_kind": "operator_declaration",
+                        "export_record_id": payload.source_instance_id,
+                        "exported_at": payload.source_exported_at,
+                        "scope_evidence": payload.evidence_note,
+                        "source_sha256": hashlib.sha256(source).hexdigest(),
+                        "source_name": payload.source_name,
+                    },
+                    "members": members, "declared_count": payload.declared_count,
+                    "pagination": {
+                        "expected_pages": 1, "pages": [1], "terminal": True,
+                        "declared_totals": [payload.declared_count],
+                    },
+                },
+                source_bytes=source,
+                raw_root=_roster_source_root(config),
+            )
+            accepted = accept_candidate(connection, int(candidate["candidate_id"]))
+            accepted = _schedule_writer_roster_activation(
+                request,
+                connection,
+                accepted,
+                reason="activate accepted Matrix roster",
+            )
+            summary = account_summary(connection)
+        return {
+            **accepted,
+            "message": "完整名册已接受并同步。"
+            if accepted["status"] == "accepted"
+            else "检测到移除，暂保留原名单。请至少十分钟后重新导出独立的完整名册确认。",
+            "roster": summary,
+        }
+    except RosterError as error:
+        raise _roster_http_error(error) from error
+
+
 @router.post("/api/v8/accounts/search")
 def search_v8_accounts(
     request: Request, payload: AccountSearchRequest
@@ -2828,20 +4338,109 @@ def search_v8_accounts(
     )
 
 
+def _resolve_account_creation_profile(
+    request: Request, connection: sqlite3.Connection, profile_url: str
+) -> dict[str, Any]:
+    # The resolver accepts only validated platform profiles. Public lookup and
+    # short-link expansion are injected at this boundary, never paid fallbacks.
+    from .account_profile_input import ProfileInputError, ResolvedProfile, resolve_profile
+    from .account_profile_public import expand_public_profile_url, public_profile_lookup
+
+    try:
+        resolved = resolve_profile(
+            profile_url, connection=connection,
+            profile_lookup=public_profile_lookup, expand_url=expand_public_profile_url,
+        )
+    except ProfileInputError as error:
+        code = 409 if error.code == "identity_conflict" else 503 if error.code in {
+            "profile_lookup_failed", "profile_expansion_failed", "profile_unavailable", "public_profile_unavailable",
+            "public_profile_dependency_unavailable", "public_profile_busy", "public_profile_transport_failed",
+            "public_profile_signing_failed",
+        } else 422
+        raise HTTPException(status_code=code, detail=str(error),
+                            headers={"X-DCAR-Profile-Error": error.code}) from error
+    if not isinstance(resolved, ResolvedProfile) or not resolved.uid:
+        raise HTTPException(status_code=422, detail="主页尚未解析出平台 UID，账号没有保存。")
+    return {
+        "platform": resolved.platform, "uid": resolved.uid,
+        "nickname": resolved.nickname, "profile_ref": resolved.profile_url,
+        "sec_user_id": resolved.sec_user_id,
+        "metadata": {"display_account_id": resolved.display_account_id}
+        if resolved.display_account_id else {},
+    }
+
+
+def _require_system_account_creation(runtime: Mapping[str, Any]) -> None:
+    if runtime.get("active_profile_id") not in SYSTEM_PROFILES:
+        raise HTTPException(
+            status_code=410,
+            detail="当前账号成员由矩阵通管理，请在矩阵通添加后上传官方完整名册。",
+        )
+
+
+def _validate_active_account_capture(connection: sqlite3.Connection, account_id: int) -> None:
+    """A restored existing member must also have a usable current capture route."""
+    if int(connection.execute("PRAGMA user_version").fetchone()[0]) != 20:
+        return
+    from .account_roster_capture import AccountRosterCaptureError, validate_current_account_capture
+
+    try:
+        validate_current_account_capture(connection, account_id=account_id)
+    except AccountRosterCaptureError as error:
+        raise HTTPException(status_code=409, detail=str(error),
+                            headers={"X-DCAR-Account-Error": error.code}) from error
+
+
 @router.post("/api/v8/accounts")
 def create_v8_account(
-    request: Request, payload: AccountMutationRequest
+    request: Request, payload: Dict[str, Any]
 ) -> Dict[str, Any]:
+    config = _request_config(request)
     try:
-        return upsert_account(
-            payload.model_dump(), db_path=_request_config(request).db_path
-        )
-    except OperationError as exc:
-        raise _user_facing_http_error(
-            exc,
-            status_code=409,
-            detail="账号保存失败，请检查手机号和填写内容后重试。",
-        ) from exc
+        try:
+            parsed = ProfileAccountCreateRequest.model_validate(payload).model_dump()
+            validate_creation_request_id(parsed["request_id"])
+        except (ValueError, TypeError) as error:
+            raise HTTPException(
+                status_code=422,
+                detail="新增方式已更新，请刷新账号页后使用主页链接，并选择日更、周更或暂停。",
+            ) from error
+        context = dict(parsed)
+        with _connect_for_request(request) as connection:
+            _require_system_account_creation(runtime_account_summary(connection))
+            replay = replay_account_creation(connection, request_id=parsed["request_id"], request_context=context)
+            if replay is not None:
+                return replay
+            # Network resolution must not hold a SQLite write transaction.
+            member = _resolve_account_creation_profile(request, connection, parsed["profile_url"])
+            with transaction(connection):
+                runtime = runtime_account_summary(connection)
+                _require_system_account_creation(runtime)
+                result = create_managed_account_in_transaction(
+                    connection, member, account_status=parsed["account_status"],
+                    phone=parsed["phone"], operator_name=parsed["operator_name"],
+                    request_id=parsed["request_id"], request_context=context,
+                    raw_root=_roster_source_root(config), actor="api-operator",
+                    reason="add managed account member",
+                    activation_id=runtime.get("activation_id"),
+                    active_snapshot_id=runtime.get("snapshot_id"),
+                    schedule_activation=lambda conn, result: _schedule_writer_roster_activation(
+                        request, conn, result, reason="activate added managed account"
+                    ),
+                )
+                if result.get("activation_status") == "active":
+                    _validate_active_account_capture(connection, int(result["account_id"]))
+                return result
+    except AccountOperatingStatusError as error:
+        raise HTTPException(status_code=409, detail=str(error),
+                            headers={"X-DCAR-Account-Error": error.code}) from error
+    except RosterError as error:
+        if error.code in {"invalid_uid", "invalid_profile", "invalid_stable_key", "invalid_sec_user_id"}:
+            raise HTTPException(status_code=422, detail="平台 UID 或主页格式无效，账号没有保存。",
+                                headers={"X-DCAR-Roster-Error": error.code}) from error
+        raise _roster_http_error(error) from error
+    except OperationError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
 
 
 @router.patch("/api/v8/accounts/{account_id}")
@@ -2849,11 +4448,51 @@ def patch_v8_account(
     request: Request, account_id: int, payload: AccountMutationRequest
 ) -> Dict[str, Any]:
     try:
+        values = payload.model_dump(exclude_unset=True)
+        if "status_request_id" in values and "account_status" not in values:
+            raise HTTPException(status_code=422, detail="账号状态请求编号需要同时提交账号状态。")
+        if "account_status" in values:
+            if values["account_status"] is None:
+                raise HTTPException(status_code=422, detail="请选择日更、周更或暂停。")
+            config = _request_config(request)
+            with _connect_for_request(request) as connection, transaction(connection):
+                runtime = runtime_account_summary(connection)
+                if runtime.get("active_profile_id") not in SYSTEM_PROFILES:
+                    raise HTTPException(status_code=409, detail="账号状态仅支持系统托管名单模式。")
+                activation_id = runtime.get("activation_id")
+                before = connection.execute("SELECT enabled FROM accounts WHERE id=?", (account_id,)).fetchone()
+                result = update_account_operating_status_in_transaction(
+                    connection,
+                    account_id,
+                    values,
+                    raw_root=_roster_source_root(config),
+                    actor="api-operator",
+                    reason="manual account status update",
+                    activation_id=int(activation_id) if activation_id is not None else None,
+                    schedule_activation=lambda conn, roster_result: _schedule_writer_roster_activation(
+                        request, conn, roster_result, reason="activate account status roster change"
+                    ),
+                )
+                if before is not None and not before["enabled"] and result["enabled"] and not result.get("roster_change"):
+                    _validate_active_account_capture(connection, account_id)
+            return result
+        with _connect_for_request(request) as connection:
+            activation_id = runtime_account_summary(connection).get("activation_id")
         return update_account(
             account_id,
-            payload.model_dump(),
+            values,
             db_path=_request_config(request).db_path,
+            actor="api-operator",
+            reason="account operations update",
+            activation_id=(int(activation_id) if activation_id is not None else None),
         )
+    except AccountOperatingStatusError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=str(exc),
+        ) from exc
+    except RosterError as exc:
+        raise _roster_http_error(exc) from exc
     except OperationError as exc:
         raise _user_facing_http_error(
             exc,
@@ -2863,17 +4502,26 @@ def patch_v8_account(
 
 
 @router.post("/api/v8/accounts/import")
-def import_v8_accounts(request: Request, payload: BulkImportRequest) -> Dict[str, Any]:
-    return import_accounts(
-        payload.rows,
-        source_name=payload.source_name,
-        db_path=_request_config(request).db_path,
+def import_v8_accounts() -> Dict[str, Any]:
+    raise HTTPException(
+        status_code=410,
+        detail="旧账号导入已停用，请刷新账号页，通过主页链接新增账号并选择账号状态。",
+    )
+
+
+@router.delete("/api/v8/accounts/{account_id}")
+def remove_v8_account(account_id: int) -> Dict[str, Any]:
+    raise HTTPException(
+        status_code=410,
+        detail="移出名单已停用，请将账号状态改为暂停；账号和历史数据会保留。",
     )
 
 
 @router.post("/api/v8/accounts/export")
 def export_v8_accounts(request: Request, payload: AccountExportRequest) -> Response:
     workbook = export_accounts_xlsx(
+        account_status=payload.account_status,
+        read_only=_request_config(request).read_only,
         douyin_authorization_targets=(
             None
             if payload.douyin_authorization_targets is None
@@ -2984,10 +4632,19 @@ def import_v8_contents(request: Request, payload: BulkImportRequest) -> Dict[str
 
 
 @router.post("/api/v8/contents/{content_id}/update-data")
-def update_v8_content_data(request: Request, content_id: int) -> Dict[str, Any]:
+def update_v8_content_data(request: Request, content_id: int) -> Any:
     db_path = _request_config(request).db_path
+    with _connect_for_request(request) as connection:
+        schema20 = connection.execute("PRAGMA user_version").fetchone()[0] == 20
+    if schema20:
+        return _submit_capture_command(request, content_id=content_id, kind="manual_update")
     try:
         result = update_content_data(content_id, db_path=db_path)
+    except LifecycleError as exc:
+        return media_api.error_response(exc)
+    except (BudgetBlocked, SlotUnavailable, CaptureError, RosterError) as exc:
+        raise _user_facing_http_error(exc, status_code=409,
+                                     detail="当前名单、采集周期或预算不允许更新；系统不会绕过固定取数规则。") from exc
     except ProviderConfigurationError as exc:
         raise _user_facing_http_error(
             exc,
@@ -3002,21 +4659,62 @@ def update_v8_content_data(request: Request, content_id: int) -> Dict[str, Any]:
     return result
 
 
-@router.get("/api/v8/contents/{content_id}/evidence")
-def get_v8_content_evidence(request: Request, content_id: int) -> Dict[str, Any]:
+def _submit_capture_command(request: Request, *, content_id: int, kind: str) -> JSONResponse:
+    from .capture_commands import submit_command
+
     config = _request_config(request)
-    return _content_evidence(
-        content_id,
-        db_path=config.db_path,
-        read_only=config.read_only,
-    )
+    if config.read_only or not bool(getattr(request.app.state, "writer_lock_held", False)):
+        raise HTTPException(status_code=503, detail="writer_lock_not_held")
+    try:
+        result = submit_command(db_path=config.db_path, content_id=content_id, kind=kind)
+    except LifecycleError as error:
+        return media_api.error_response(error)
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except (OSError, sqlite3.Error, RuntimeError) as error:
+        raise HTTPException(status_code=503, detail="durable_command_persist_failed") from error
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return JSONResponse(result, status_code=202)
 
 
-@router.get("/api/v8/contents/{content_id}/evidence/files/{artifact_id}/{index}")
+@router.get("/api/v8/contents/{content_id}/update-data/commands/{run_id}")
+def get_v8_content_update_command(request: Request, content_id: int, run_id: int) -> Any:
+    from .capture_commands import read_command
+    from .storage import live_wal_read_only_connections
+
+    try:
+        with live_wal_read_only_connections(), connect(_request_config(request).db_path, read_only=True) as connection:
+            return read_command(connection, run_id=run_id, content_id=content_id)
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail="capture_command_not_found") from error
+    except (OSError, sqlite3.Error, RuntimeError, ValueError) as error:
+        raise HTTPException(status_code=503, detail="capture_command_read_failed") from error
+
+
+@router.get("/api/v8/contents/{content_id}/evidence")
+def get_v8_content_evidence(request: Request, content_id: int) -> Any:
+    config = _request_config(request)
+    try:
+        return _content_evidence(content_id, db_path=config.db_path, read_only=config.read_only)
+    except (LifecycleError, MediaProcessingError) as error:
+        LOGGER.warning("media evidence unavailable content=%s code=%s", content_id, getattr(error, "error_code", type(error).__name__))
+        return media_api.error_response(error)
+
+
+@router.api_route("/api/v8/contents/{content_id}/evidence/files/{artifact_id}/{index}", methods=["GET", "HEAD"])
 def get_v8_content_evidence_file(
     request: Request, content_id: int, artifact_id: int, index: int
-) -> FileResponse:
+) -> Response:
+    config = _request_config(request)
     with _connect_for_request(request) as connection:
+        try:
+            managed_response = media_api.original_response(connection, content_id, artifact_id, index,
+                                                         db_path=config.db_path, read_only=config.read_only)
+        except (LifecycleError, MediaProcessingError) as error:
+            return media_api.error_response(error)
+        if managed_response is not None:
+            return managed_response
         row = connection.execute(
             """
             SELECT * FROM evidence_artifacts
@@ -3027,7 +4725,6 @@ def get_v8_content_evidence_file(
         ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="还没有可查看的图片或视频。")
-    config = _request_config(request)
     paths = _artifact_media_paths(row, read_only=config.read_only)
     if not paths:
         if config.read_only:
@@ -3042,19 +4739,52 @@ def get_v8_content_evidence_file(
         raise HTTPException(
             status_code=404, detail="本地图片或视频文件丢失，请重新处理媒体。"
         )
-    return FileResponse(paths[index])
+    path = paths[index]
+    if path is None:
+        raise HTTPException(status_code=404, detail="该编号的原件缺失，其他图片不会改用这个编号。")
+    return FileResponse(path, media_type=media_api.media_content_type(path))
+
+
+@router.get("/api/v8/contents/{content_id}/evidence/previews/{artifact_id}/{index}")
+def get_v8_content_preview(request: Request, content_id: int, artifact_id: int, index: int) -> Response:
+    try:
+        with _connect_for_request(request) as connection:
+            return media_api.preview_response(connection, content_id, artifact_id, index)
+    except (LifecycleError, MediaProcessingError, OSError, ValueError) as error:
+        return media_api.error_response(error)
+
+
+@router.post("/api/v8/contents/{content_id}/media/restore", status_code=202)
+def restore_v8_content_media(request: Request, content_id: int, payload: MediaRestoreRequest) -> Response:
+    from .media_retention import request_restore
+
+    config = _request_config(request)
+    if config.read_only:
+        raise HTTPException(status_code=403, detail="只读副本不能恢复原件，请在本地写入服务操作。")
+    try:
+        result = request_restore(content_id, payload.bundle_id, payload.purpose, db_path=config.db_path)
+        return JSONResponse({**result, "bundle_id": payload.bundle_id, "provider_cost": 0.0}, status_code=202)
+    except (LifecycleError, MediaProcessingError, OSError, ValueError) as error:
+        return media_api.error_response(error)
 
 
 @router.post("/api/v8/contents/{content_id}/media/retry")
 def retry_v8_content_media(
     request: Request, content_id: int, payload: MediaRetryRequest
-) -> Dict[str, Any]:
+) -> Any:
+    if payload.allow_paid_refresh:
+        with _connect_for_request(request) as connection:
+            schema20 = connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        if schema20:
+            return _submit_capture_command(request, content_id=content_id, kind="media_retry")
     try:
         return retry_content_media(
             content_id,
             allow_paid_refresh=payload.allow_paid_refresh,
             db_path=_request_config(request).db_path,
         )
+    except LifecycleError as exc:
+        return media_api.error_response(exc)
     except (
         ProviderConfigurationError,
         MediaProcessingError,
@@ -3067,6 +4797,16 @@ def retry_v8_content_media(
             status_code=409,
             detail="媒体重新处理失败，请稍后重试；如果一直失败，请联系管理员。",
         ) from exc
+
+
+@router.get("/api/v8/media/lifecycle")
+def get_v8_media_lifecycle(request: Request) -> Any:
+    config = _request_config(request)
+    try:
+        with _connect_for_request(request) as connection:
+            return media_api.lifecycle_status(connection, read_only=config.read_only)
+    except (LifecycleError, MediaProcessingError, OSError, ValueError) as error:
+        return media_api.error_response(error)
 
 
 @router.post("/api/v8/media-processing/search")
@@ -3151,9 +4891,13 @@ def export_v8_contents(request: Request) -> Response:
 def get_v8_selling_points(request: Request) -> Dict[str, Any]:
     try:
         config = _request_config(request)
-        return _selling_point_list(
-            db_path=config.db_path,
-            read_only=config.read_only,
+        return _request_read_model(
+            request,
+            ("selling-points",),
+            lambda: _selling_point_list(
+                db_path=config.db_path,
+                read_only=config.read_only,
+            ),
         )
     except TaxonomyError as exc:
         raise _user_facing_http_error(
@@ -3283,11 +5027,15 @@ def get_v8_spu_audience_stats(
     if platform and platform not in STAT_PLATFORMS:
         raise HTTPException(status_code=422, detail="所选平台无效，请刷新页面后重试。")
     try:
-        return build_spu_audience_stats(
-            db_path=config.db_path,
-            window=window,
-            platform=platform,
-            read_only=config.read_only,
+        return _request_read_model(
+            request,
+            ("spu-audience-stats", window, platform),
+            lambda: build_spu_audience_stats(
+                db_path=config.db_path,
+                window=window,
+                platform=platform,
+                read_only=config.read_only,
+            ),
         )
     except SpuAudienceError as exc:
         raise _user_facing_http_error(
@@ -3327,8 +5075,12 @@ def run_v8_spu_association(
             status_code=409,
             detail="当前无法开始刷新，请稍后重试。",
         ) from exc
+    read_model_cache = getattr(request.app.state, "read_model_cache", None)
     background.add_task(
-        _run_spu_association_job, config.db_path, run_id, since, scope_window
+        _run_spu_association_job, config.db_path, run_id, since, scope_window,
+        read_model_cache=(
+            read_model_cache if isinstance(read_model_cache, ReadModelCache) else None
+        ),
     )
     if since:
         resolved_mode = "incremental"
@@ -3348,6 +5100,7 @@ def _run_spu_association_job(
     run_id: int,
     since: Optional[str] = None,
     scope_window: Optional[str] = None,
+    read_model_cache: Optional[ReadModelCache] = None,
 ) -> None:
     """后台执行刷新；失败结论由 run_association 写回运行记录，这里补日志。
 
@@ -3363,6 +5116,11 @@ def _run_spu_association_job(
         )
     except Exception:  # noqa: BLE001 —— 运行记录已标记 failed，仅记录堆栈
         LOGGER.exception("SPU 数据刷新后台任务失败 run_id=%s", run_id)
+    finally:
+        # Clear after completion so an interim poll cannot outlive the newly
+        # committed associations.  Direct worker callers use the same path.
+        if read_model_cache is not None:
+            read_model_cache.clear()
 
 
 @router.post("/api/v8/spu-audience/spu")

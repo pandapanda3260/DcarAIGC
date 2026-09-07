@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
 import v8.storage as storage
+from tests.roster_fixture import accept_roster
 from v8.capture import execute_content_fetch
+from v8.operations import upsert_account
 
 try:  # providers pulls in media/duplicates (Pillow, imagehash)
     import v8.providers as providers
@@ -30,23 +33,42 @@ class CommentPagingLiveBridgeTest(unittest.TestCase):
         self._patch_roots()
         self.connection = storage.connect(self.db)
         storage.initialize_database(self.connection)
+        self.connection.close()
+        account = upsert_account({
+            "phone": "",
+            "platforms": [{"platform": "douyin", "uid": "comment-fixture-account"}],
+        }, db_path=self.db)
+        self.connection = storage.connect(self.db)
         with storage.transaction(self.connection):
             self.connection.execute(
                 """
                 INSERT INTO content_items(
                     id, link_id, platform, platform_content_id, canonical_url,
-                    content_type, imported_at, created_at, updated_at
+                    content_type, imported_at, created_at, updated_at,
+                    account_id,raw_account_uid
                 ) VALUES (1,'AAAAAA','douyin','aweme-1',
                           'https://www.douyin.com/video/aweme-1','video',
-                          '2026-08-01T00:00:00Z','2026-08-01T00:00:00Z','2026-08-01T00:00:00Z')
-                """
+                          '2026-08-01T00:00:00Z','2026-08-01T00:00:00Z','2026-08-01T00:00:00Z',
+                          ?,'comment-fixture-account')
+                """, (account["id"],),
             )
+            accept_roster(self.connection, accepted_at="2026-07-01T00:00:00Z")
         self.connection.close()
+        self.budget_id = providers.ensure_operational_budget(
+            provider="TikHub", operation="douyin_video_comments", price=0.001,
+            db_path=self.db,
+        )
         self.hasher = PlatformUserHasher(salt_path=self.root / ".platform_salt")
         self.call_log: List[Optional[Mapping[str, Any]]] = []
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def _usage_rows(self) -> list[tuple]:
+        with closing(storage.connect(self.db)) as connection:
+            return [tuple(row) for row in connection.execute(
+                "SELECT * FROM provider_usage ORDER BY id"
+            )]
 
     def _patch_roots(self) -> None:
         import v8.capture as capture
@@ -201,7 +223,12 @@ class CommentPagingLiveBridgeTest(unittest.TestCase):
             ),
             db_path=self.db,
             raw_root=self.raw_root,
+            budget_id=self.budget_id,
         )
+        # Purchasing the fixture page is accounted for; adopting it must add no
+        # request, cost, or other mutation to that existing usage record.
+        acquired_usage = self._usage_rows()
+        self.assertEqual(len(acquired_usage), 1)
         calls = []
 
         def no_provider(stage: str, content: Mapping[str, Any]):
@@ -224,12 +251,7 @@ class CommentPagingLiveBridgeTest(unittest.TestCase):
             ).fetchone()
             self.assertEqual(page_row["fetch_slot_id"], outcome.slot_id)
             self.assertEqual(page_row["raw_response_id"], outcome.raw_response_id)
-            self.assertEqual(
-                connection.execute(
-                    "SELECT COUNT(*) FROM provider_usage"
-                ).fetchone()[0],
-                0,
-            )
+            self.assertEqual(self._usage_rows(), acquired_usage)
         finally:
             connection.close()
 
@@ -278,7 +300,10 @@ class CommentPagingLiveBridgeTest(unittest.TestCase):
             ),
             db_path=self.db,
             raw_root=self.raw_root,
+            budget_id=self.budget_id,
         )
+        acquired_usage = self._usage_rows()
+        self.assertEqual(len(acquired_usage), 1)
         result = providers.capture_content_comments_live(
             1,
             as_of=__import__("datetime").date(2026, 7, 31),
@@ -294,10 +319,7 @@ class CommentPagingLiveBridgeTest(unittest.TestCase):
                 "SELECT fetch_slot_id FROM comment_capture_pages"
             ).fetchone()
             self.assertEqual(stored["fetch_slot_id"], outcome.slot_id)
-            self.assertEqual(
-                connection.execute("SELECT COUNT(*) FROM provider_usage").fetchone()[0],
-                0,
-            )
+            self.assertEqual(self._usage_rows(), acquired_usage)
             self.assertEqual(
                 connection.execute(
                     "SELECT status FROM comment_evidence_versions"

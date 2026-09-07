@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Build a verified v16 candidate from the frozen formal v15 database.
+"""Build a receipt-bound candidate under a sealed offline schema contract.
 
 This command never migrates or replaces the formal database in place.  It
 copies the frozen source with SQLite's backup API, migrates a private staging
-file, proves the v15-to-v16 lineage, and then publishes a self-contained
+file, independently proves the selected lineage, and publishes a self-contained
 candidate plus an O_EXCL receipt.  Installation remains a separate atomic
 operation performed by ``install_writer_database_candidate.py``.
 """
@@ -22,8 +22,8 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from contextlib import ExitStack, contextmanager
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -34,34 +34,44 @@ PACKAGE_ROOT = PROJECT_ROOT / "src" / "dcar_eval"
 if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
+SCRIPT_ROOT = Path(__file__).resolve().parent
+if str(SCRIPT_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_ROOT))
+
+import writer_database_safety as shared_safety  # noqa: E402
+
 from v8.storage import (  # noqa: E402
-    CURRENT_SCHEMA_MIGRATION_NAME,
-    DEFAULT_DB,
-    SCHEMA_MIGRATION_NAMES,
     _V16_DROPPED_TABLES,
     _V16_EVALUATION_COPY_COLUMNS,
     _V16_REMOVED_INDEXES,
     _table_projection_sha256,
     configure_connection_safety,
-    initialize_database,
-    is_formal_database_path,
+    _migrate_v15_to_v16,
+    migrate_database,
     require_schema_compatibility,
     same_database_path,
 )
+from v8.runtime_database import (  # noqa: E402
+    ResolvedDatabaseAccess,
+    RuntimeDatabaseError,
+    hold_formal_mutation,
+    resolve_isolated_candidate,
+)
 
 
-FORMAL_DATABASE = DEFAULT_DB
 CANONICAL_OPERATOR_FREEZE_LOCK = PROJECT_ROOT / "runtime" / "operator-freeze.lock"
-BACKUP_RECEIPT_SCHEMA = "dcar-v16-offline-backup-v1"
-MIGRATION_RECEIPT_SCHEMA = "dcar-v16-offline-migration-v1"
-EXPECTED_FROM_VERSION = 15
-EXPECTED_TO_VERSION = 16
-EXPECTED_FROM_MIGRATION = SCHEMA_MIGRATION_NAMES[EXPECTED_FROM_VERSION]
-EXPECTED_TO_MIGRATION = CURRENT_SCHEMA_MIGRATION_NAME
+OFFLINE_CONTRACT = shared_safety.LEGACY_V15_V16
+_contract = shared_safety.current_contract
+BACKUP_RECEIPT_SCHEMA = OFFLINE_CONTRACT.backup_receipt_schema
+MIGRATION_RECEIPT_SCHEMA = OFFLINE_CONTRACT.migration_receipt_schema
+EXPECTED_FROM_VERSION = OFFLINE_CONTRACT.source.version
+EXPECTED_TO_VERSION = OFFLINE_CONTRACT.candidate.version
+EXPECTED_FROM_MIGRATION = OFFLINE_CONTRACT.source.migration
+EXPECTED_TO_MIGRATION = OFFLINE_CONTRACT.candidate.migration
 HEX_SHA256 = re.compile(r"[0-9a-f]{64}", re.ASCII)
 SQLITE_TRANSIENT_SUFFIXES = ("-wal", "-shm", "-journal")
 MAX_BACKUP_RECEIPT_BYTES = 64 * 1024
-MIGRATION_LOCK_PAYLOAD = b"dcar-v16-offline-migration-lock-v1\n"
+MIGRATION_LOCK_PAYLOAD = OFFLINE_CONTRACT.lock_payload
 MIGRATION_CHECKPOINTS = (
     "after_preflight",
     "after_backup_copy",
@@ -84,39 +94,10 @@ class OfflineMigrationError(RuntimeError):
     """Raised when the offline migration contract cannot be proved."""
 
 
-@dataclass(frozen=True)
-class FileIdentity:
-    device: int
-    inode: int
-    link_count: int
-    mode: int
-    size: int
-    mtime_ns: int
+FileIdentity = shared_safety.FileIdentity
 
 
-class _MigrationLockLease:
-    """Keep the lock held while moving its final binding check into commit."""
-
-    def __init__(
-        self,
-        *,
-        identity: FileIdentity,
-        verify_binding: Callable[[], None],
-    ) -> None:
-        self.identity = identity
-        self._verify_binding = verify_binding
-        self.commit_verified = False
-        self.binding_failed = False
-
-    def verify_for_commit(self) -> None:
-        if self.commit_verified:
-            return
-        try:
-            self._verify_binding()
-        except BaseException:
-            self.binding_failed = True
-            raise
-        self.commit_verified = True
+_MigrationLockLease = shared_safety.MigrationLockLease
 
 
 def _utc_now() -> str:
@@ -131,35 +112,13 @@ def _path_exists(path: Path) -> bool:
     return path.exists() or path.is_symlink()
 
 
-def _identity(path: Path) -> FileIdentity:
-    value = path.lstat()
-    return FileIdentity(
-        device=value.st_dev,
-        inode=value.st_ino,
-        link_count=value.st_nlink,
-        mode=stat.S_IMODE(value.st_mode),
-        size=value.st_size,
-        mtime_ns=value.st_mtime_ns,
-    )
+_identity = shared_safety.file_identity
 
 
-def _identity_from_stat(value: os.stat_result) -> FileIdentity:
-    return FileIdentity(
-        device=value.st_dev,
-        inode=value.st_ino,
-        link_count=value.st_nlink,
-        mode=stat.S_IMODE(value.st_mode),
-        size=value.st_size,
-        mtime_ns=value.st_mtime_ns,
-    )
+_identity_from_stat = shared_safety.identity_from_stat
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+_sha256_file = shared_safety.sha256_file
 
 
 def _fingerprint(path: Path) -> dict[str, Any]:
@@ -170,6 +129,55 @@ def _require_sha256(value: str, *, label: str) -> str:
     if HEX_SHA256.fullmatch(value) is None:
         raise OfflineMigrationError(f"{label} must be a lowercase SHA-256 digest")
     return value
+
+
+def _requires_code_identity() -> bool:
+    return _contract() != shared_safety.LEGACY_V15_V16
+
+
+@contextmanager
+def _source_authority(
+    source_database: Path,
+    *,
+    isolated: bool,
+    project_root: Path | None,
+) -> Iterator[tuple[ResolvedDatabaseAccess, Path]]:
+    requested_root = (PROJECT_ROOT if project_root is None else project_root).expanduser()
+    if isolated:
+        try:
+            access = resolve_isolated_candidate(source_database)
+            root = requested_root.resolve(strict=True)
+        except (OSError, RuntimeDatabaseError) as error:
+            raise OfflineMigrationError(
+                f"formal_database_identity_unresolved: {error}"
+            ) from error
+        yield access, root / "runtime" / "operator-freeze.lock"
+        return
+    stack = ExitStack()
+    try:
+        if requested_root.resolve(strict=True) != PROJECT_ROOT.resolve(strict=True):
+            raise RuntimeDatabaseError(
+                "formal mutation project root must be this checked-out implementation"
+            )
+        access = stack.enter_context(
+            hold_formal_mutation(
+                source_database,
+                project_root=requested_root,
+            )
+        )
+        if access.project_root is None:
+            raise RuntimeDatabaseError(
+                "installed formal mutation did not resolve a project root"
+            )
+    except (OSError, RuntimeDatabaseError) as error:
+        stack.close()
+        raise OfflineMigrationError(
+            f"formal_database_identity_unresolved: {error}"
+        ) from error
+    try:
+        yield access, access.project_root / "runtime" / "operator-freeze.lock"
+    finally:
+        stack.close()
 
 
 def _require_regular_single_link(path: Path, *, label: str) -> FileIdentity:
@@ -259,83 +267,21 @@ def _require_secure_lock_parent(path: Path) -> Path:
     return parent
 
 
-def _fsync_file(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+_fsync_file = shared_safety.fsync_file
 
 
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(
-        path,
-        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-    )
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+_fsync_directory = shared_safety.fsync_directory
 
 
 def _write_json_exclusive(
     path: Path,
     value: Mapping[str, Any],
 ) -> FileIdentity:
-    payload = (
-        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    ).encode("utf-8")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags, 0o600)
-    created_identity = _identity_from_stat(os.fstat(descriptor))
-    try:
-        written = 0
-        while written < len(payload):
-            count = os.write(descriptor, payload[written:])
-            if count <= 0:
-                raise OSError("receipt write made no progress")
-            written += count
-        os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = -1
-        current = _identity(path)
-        if (current.device, current.inode) != (
-            created_identity.device,
-            created_identity.inode,
-        ):
-            raise OSError("receipt path identity changed during write")
-        _fsync_directory(path.parent)
-        return current
-    except BaseException as error:
-        close_error: BaseException | None = None
-        if descriptor >= 0:
-            try:
-                os.close(descriptor)
-            except BaseException as exc:
-                close_error = exc
-            finally:
-                descriptor = -1
-        try:
-            if _path_exists(path):
-                current = _identity(path)
-                if (current.device, current.inode) == (
-                    created_identity.device,
-                    created_identity.inode,
-                ):
-                    path.unlink()
-                    _fsync_directory(path.parent)
-        except BaseException as cleanup_error:
-            raise OfflineMigrationError(
-                f"receipt write failed and cleanup was not durable: {cleanup_error}"
-            ) from error
-        if close_error is not None:
-            raise OfflineMigrationError(
-                f"receipt write failed while closing its file: {close_error}"
-            ) from error
-        raise
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
+    return shared_safety.write_json_exclusive(
+        path, value,
+        error_type=OfflineMigrationError,
+        sync_directory=_fsync_directory,
+    )
 
 
 def _checkpoint(
@@ -485,8 +431,8 @@ def _exclusive_migration_lock(
             os.fchmod(descriptor, 0o600)
             written = 0
             try:
-                while written < len(MIGRATION_LOCK_PAYLOAD):
-                    count = os.write(descriptor, MIGRATION_LOCK_PAYLOAD[written:])
+                while written < len(_contract().lock_payload):
+                    count = os.write(descriptor, _contract().lock_payload[written:])
                     if count <= 0:
                         raise OSError("migration lock write made no progress")
                     written += count
@@ -508,8 +454,8 @@ def _exclusive_migration_lock(
             if stat.S_IMODE(value.st_mode) != 0o600:
                 raise OfflineMigrationError("migration lock permissions must be 0600")
             os.lseek(descriptor, 0, os.SEEK_SET)
-            payload = os.read(descriptor, len(MIGRATION_LOCK_PAYLOAD) + 1)
-            if payload != MIGRATION_LOCK_PAYLOAD:
+            payload = os.read(descriptor, len(_contract().lock_payload) + 1)
+            if payload != _contract().lock_payload:
                 raise OfflineMigrationError(
                     "existing migration lock does not have the exact lock contract"
                 )
@@ -565,24 +511,9 @@ def _assert_lock_binding(
     parent_descriptor: int,
     descriptor: int,
 ) -> None:
-    parent_fd_value = os.fstat(parent_descriptor)
-    parent_path_value = parent.stat()
-    if (parent_fd_value.st_dev, parent_fd_value.st_ino) != (
-        parent_path_value.st_dev,
-        parent_path_value.st_ino,
-    ):
-        raise OfflineMigrationError("migration lock parent identity changed")
-    file_fd_value = os.fstat(descriptor)
-    file_path_value = os.stat(
-        path.name,
-        dir_fd=parent_descriptor,
-        follow_symlinks=False,
+    shared_safety.assert_lock_binding(
+        path, parent, parent_descriptor, descriptor, error_type=OfflineMigrationError,
     )
-    if (file_fd_value.st_dev, file_fd_value.st_ino) != (
-        file_path_value.st_dev,
-        file_path_value.st_ino,
-    ):
-        raise OfflineMigrationError("migration lock path identity changed")
 
 
 def _connect_immutable(path: Path, *, label: str) -> sqlite3.Connection:
@@ -839,10 +770,80 @@ def _validate_backup_lineage(
         source.close()
 
 
+def _run_contract_migration(connection: sqlite3.Connection, *, legacy_project_root: Path | None = None,
+                            migration_blob_root: Path | None = None) -> None:
+    if _contract() == shared_safety.INTEGRATED_V19_V20:
+        from v8.schema_v20 import migrate
+
+        if legacy_project_root is None or migration_blob_root is None:
+            raise OfflineMigrationError("19->20 requires explicit historical root and candidate-owned blob directory")
+        migrate(connection, legacy_project_root=legacy_project_root, migration_blob_root=migration_blob_root)
+        return
+    if legacy_project_root is not None:
+        raise OfflineMigrationError("historical raw root is only supported by exact 19->20 migration")
+    if _contract() == shared_safety.LEGACY_V15_V16:
+        _migrate_v15_to_v16(connection)
+        return
+    migrate_database(
+        connection,
+        from_version=_contract().source.version,
+        to_version=_contract().candidate.version,
+    )
+
+
+def _bootstrap_spec(path: Path, raw_root: Path) -> tuple[dict[str, Any], bytes, Path]:
+    if _contract() != shared_safety.MATRIX_V17_V18:
+        raise OfflineMigrationError("bootstrap is only supported by the 17->18 contract")
+    identity = _require_regular_single_link(path, label="bootstrap envelope")
+    if identity.size > 8 * 1024 * 1024:
+        raise OfflineMigrationError("bootstrap envelope is too large")
+    value = json.loads(path.read_bytes())
+    if not isinstance(value, dict) or set(value) != {"payload", "source_path", "source_sha256"}:
+        raise OfflineMigrationError("bootstrap envelope fields differ from the sealed contract")
+    if not isinstance(value["source_path"], str):
+        raise OfflineMigrationError("bootstrap source path must be text")
+    _require_sha256(value["source_sha256"], label="bootstrap source SHA-256")
+    source = Path(value["source_path"])
+    if not source.is_absolute():
+        raise OfflineMigrationError("bootstrap source path must be absolute")
+    source_identity = _require_regular_single_link(source, label="bootstrap original source")
+    if source_identity.size > 20 * 1024 * 1024:
+        raise OfflineMigrationError("bootstrap original source is too large")
+    source_bytes = source.read_bytes()
+    if hashlib.sha256(source_bytes).hexdigest() != value["source_sha256"]:
+        raise OfflineMigrationError("bootstrap original source SHA-256 differs")
+    payload = value["payload"]
+    if not isinstance(payload, dict) or payload.get("source_type") != "bootstrap_export":
+        raise OfflineMigrationError("only the first official bootstrap export can accompany migration")
+    payload = {**payload, "require_existing_identities": True}
+    return payload, source_bytes, raw_root
+
+
 def _validate_lineage(source_path: Path, candidate_path: Path) -> dict[str, Any]:
     source = _connect_immutable(source_path, label="formal source database")
     candidate = _connect_immutable(candidate_path, label="candidate database")
     try:
+        if _contract() == shared_safety.MATRIX_V17_V18:
+            from v8.storage import validate_v17_v18_lineage
+
+            try:
+                return validate_v17_v18_lineage(source, candidate)
+            except (RuntimeError, ValueError, sqlite3.Error) as error:
+                raise OfflineMigrationError(str(error)) from error
+        if _contract() == shared_safety.DUAL_V18_V19:
+            from v8.storage import validate_v18_v19_lineage
+
+            try:
+                return validate_v18_v19_lineage(source, candidate)
+            except (RuntimeError, ValueError, sqlite3.Error) as error:
+                raise OfflineMigrationError(str(error)) from error
+        if _contract() == shared_safety.INTEGRATED_V19_V20:
+            from v8.schema_v20 import validate_lineage
+
+            try:
+                return validate_lineage(source, candidate)
+            except (RuntimeError, ValueError, sqlite3.Error) as error:
+                raise OfflineMigrationError(str(error)) from error
         source_manifest = _projection_manifest(source)
         candidate_manifest = _projection_manifest(candidate)
         source_tables = set(source_manifest["tables"])
@@ -889,8 +890,8 @@ def _validate_lineage(source_path: Path, candidate_path: Path) -> dict[str, Any]
             )
         if (
             len(candidate_migrations) != len(source_migrations) + 1
-            or candidate_migrations[-1][0] != EXPECTED_TO_VERSION
-            or candidate_migrations[-1][1] != EXPECTED_TO_MIGRATION
+            or candidate_migrations[-1][0] != _contract().candidate.version
+            or candidate_migrations[-1][1] != _contract().candidate.migration
         ):
             raise OfflineMigrationError(
                 "candidate did not append exactly the v16 migration record"
@@ -926,7 +927,7 @@ def _validate_lineage(source_path: Path, candidate_path: Path) -> dict[str, Any]
                 "evaluation_manual_review_count"
             ],
             "sqlite_sequence": candidate_manifest["sqlite_sequence"],
-            "appended_migration_versions": [EXPECTED_TO_VERSION],
+            "appended_migration_versions": [_contract().candidate.version],
             "removed_tables": sorted(_V16_DROPPED_TABLES),
             "removed_indexes": sorted(_V16_REMOVED_INDEXES),
             "schema_objects": schema_objects,
@@ -973,6 +974,9 @@ def _read_backup_receipt(
         "migration_lock": str,
         "migration_lock_file": dict,
     }
+    if _requires_code_identity():
+        required["code_identity"] = dict
+        shared_safety.require_code_identity(value.get("code_identity"), PROJECT_ROOT)
     if set(value) != set(required):
         raise OfflineMigrationError(
             "backup receipt fields are not the exact supported contract"
@@ -985,7 +989,7 @@ def _read_backup_receipt(
             raise OfflineMigrationError(
                 f"backup receipt field {key!r} has an invalid type"
             )
-    if value["schema_version"] != BACKUP_RECEIPT_SCHEMA:
+    if value["schema_version"] != _contract().backup_receipt_schema:
         raise OfflineMigrationError("backup receipt schema version is unsupported")
     declared_lock = Path(value["migration_lock"])
     if (
@@ -1011,10 +1015,13 @@ def _read_backup_receipt(
     _require_sha256(value["source_sha256"], label="backup receipt source SHA-256")
     _require_sha256(value["backup_sha256"], label="backup receipt backup SHA-256")
     if (
-        value["source_schema_version"] != EXPECTED_FROM_VERSION
-        or value["source_schema_migration"] != EXPECTED_FROM_MIGRATION
+        value["source_schema_version"] != _contract().source.version
+        or value["source_schema_migration"] != _contract().source.migration
     ):
-        raise OfflineMigrationError("backup receipt source schema is not exact v15")
+        raise OfflineMigrationError(
+            "backup receipt source schema is not exact "
+            f"v{_contract().source.version}"
+        )
     if value["restore_verified"] is not True:
         raise OfflineMigrationError("backup receipt restore_verified must be true")
     if (
@@ -1046,8 +1053,8 @@ def _read_backup_receipt(
         raise OfflineMigrationError("verified backup SHA-256 does not match receipt")
     validation = _validate_database(
         backup_path,
-        expected_version=EXPECTED_FROM_VERSION,
-        expected_migration=EXPECTED_FROM_MIGRATION,
+        expected_version=_contract().source.version,
+        expected_migration=_contract().source.migration,
         label="verified backup database",
     )
     lineage = _validate_backup_lineage(source_database, backup_path)
@@ -1173,7 +1180,8 @@ def _cleanup_staging(path: Path | None, errors: list[str]) -> None:
         errors.append(f"cleanup directory sync failed: {exc}")
 
 
-def prepare_verified_backup(
+@shared_safety.bind_operation_contract("backup", error_type=OfflineMigrationError)
+def _prepare_verified_backup(
     *,
     source_database: Path,
     backup: Path,
@@ -1182,10 +1190,11 @@ def prepare_verified_backup(
     freeze_lock: Path,
     migration_lock: Path,
     receipt: Path,
+    canonical_freeze_lock: Path,
     holder_checker: Callable[[Sequence[Path]], list[dict[str, Any]]] | None = None,
     fault_injector: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
-    """Create and independently restore-verify a project-external v15 backup."""
+    """Create and independently restore-verify a project-external backup."""
 
     source_database = source_database.absolute()
     backup = backup.absolute()
@@ -1196,25 +1205,11 @@ def prepare_verified_backup(
         expected_source_sha256,
         label="expected source SHA-256",
     )
-    if (
-        os.environ.get("DCAR_TEST_DENY_FORMAL_DB") == "1"
-        and (
-            is_formal_database_path(
-                source_database,
-                formal_database=DEFAULT_DB,
-            )
-        )
-    ):
+    if from_version != _contract().source.version:
         raise OfflineMigrationError(
-            "test process attempted to open the formal DCar database"
+            "verified backup requires exact "
+            f"--from {_contract().source.version}"
         )
-    if from_version != EXPECTED_FROM_VERSION:
-        raise OfflineMigrationError("verified backup requires exact --from 15")
-    if not is_formal_database_path(
-        source_database,
-        formal_database=FORMAL_DATABASE,
-    ):
-        raise OfflineMigrationError("source database must be the canonical formal DB")
     source_identity = _require_regular_single_link(
         source_database,
         label="formal source database",
@@ -1225,7 +1220,7 @@ def prepare_verified_backup(
         freeze_lock,
         label="operator freeze lock",
     )
-    if freeze_lock.resolve(strict=True) != CANONICAL_OPERATOR_FREEZE_LOCK.resolve(
+    if freeze_lock.resolve(strict=True) != canonical_freeze_lock.resolve(
         strict=False
     ):
         raise OfflineMigrationError("operator freeze lock is not canonical")
@@ -1287,8 +1282,8 @@ def prepare_verified_backup(
                 )
             _validate_database(
                 source_database,
-                expected_version=EXPECTED_FROM_VERSION,
-                expected_migration=EXPECTED_FROM_MIGRATION,
+                expected_version=_contract().source.version,
+                expected_migration=_contract().source.migration,
                 label="formal source database",
             )
             _assert_source_unchanged(
@@ -1314,8 +1309,8 @@ def prepare_verified_backup(
 
             backup_validation = _validate_database(
                 staging,
-                expected_version=EXPECTED_FROM_VERSION,
-                expected_migration=EXPECTED_FROM_MIGRATION,
+                expected_version=_contract().source.version,
+                expected_migration=_contract().source.migration,
                 label="verified backup database",
             )
             backup_lineage = _validate_backup_lineage(source_database, staging)
@@ -1331,8 +1326,8 @@ def prepare_verified_backup(
             _copy_database(staging, restore_staging)
             restore_validation = _validate_database(
                 restore_staging,
-                expected_version=EXPECTED_FROM_VERSION,
-                expected_migration=EXPECTED_FROM_MIGRATION,
+                expected_version=_contract().source.version,
+                expected_migration=_contract().source.migration,
                 label="restored backup database",
             )
             restore_lineage = _validate_backup_lineage(
@@ -1378,12 +1373,12 @@ def prepare_verified_backup(
 
             backup_fingerprint = _fingerprint(backup)
             result: dict[str, Any] = {
-                "schema_version": BACKUP_RECEIPT_SCHEMA,
+                "schema_version": _contract().backup_receipt_schema,
                 "source_path": str(source_database),
                 "source_sha256": expected_source_sha256,
                 "source_byte_size": source_identity.size,
-                "source_schema_version": EXPECTED_FROM_VERSION,
-                "source_schema_migration": EXPECTED_FROM_MIGRATION,
+                "source_schema_version": _contract().source.version,
+                "source_schema_migration": _contract().source.migration,
                 "backup_path": str(backup),
                 "backup_sha256": backup_fingerprint["sha256"],
                 "backup_byte_size": backup_fingerprint["size"],
@@ -1399,6 +1394,8 @@ def prepare_verified_backup(
                     "sha256": _sha256_file(migration_lock),
                 },
             }
+            if _requires_code_identity():
+                result["code_identity"] = shared_safety.code_identity(PROJECT_ROOT)
             receipt_identity = _write_json_exclusive(receipt, result)
             _checkpoint("after_backup_receipt_written", fault_injector)
             _assert_source_unchanged(
@@ -1445,7 +1442,43 @@ def prepare_verified_backup(
         ) from exc
 
 
-def build_migration_candidate(
+def prepare_verified_backup(
+    *,
+    source_database: Path,
+    backup: Path,
+    expected_source_sha256: str,
+    from_version: int,
+    freeze_lock: Path,
+    migration_lock: Path,
+    receipt: Path,
+    isolated: bool = False,
+    project_root: Path | None = None,
+    holder_checker: Callable[[Sequence[Path]], list[dict[str, Any]]] | None = None,
+    fault_injector: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Authorize the source, hold the writer lock, and prepare its backup."""
+
+    with _source_authority(
+        source_database,
+        isolated=isolated,
+        project_root=project_root,
+    ) as (access, canonical_freeze_lock):
+        return _prepare_verified_backup(
+            source_database=access.database,
+            backup=backup,
+            expected_source_sha256=expected_source_sha256,
+            from_version=from_version,
+            freeze_lock=freeze_lock,
+            migration_lock=migration_lock,
+            receipt=receipt,
+            canonical_freeze_lock=canonical_freeze_lock,
+            holder_checker=holder_checker,
+            fault_injector=fault_injector,
+        )
+
+
+@shared_safety.bind_operation_contract("migration", error_type=OfflineMigrationError)
+def _build_migration_candidate(
     *,
     source_database: Path,
     candidate: Path,
@@ -1456,6 +1489,10 @@ def build_migration_candidate(
     migration_lock: Path,
     backup_receipt: Path,
     receipt: Path,
+    canonical_freeze_lock: Path,
+    bootstrap_roster: Path | None = None,
+    roster_raw_root: Path | None = None,
+    legacy_project_root: Path | None = None,
     holder_checker: Callable[[Sequence[Path]], list[dict[str, Any]]] | None = None,
     fault_injector: Callable[[str], None] | None = None,
     migration_runner: Callable[[sqlite3.Connection], None] | None = None,
@@ -1472,25 +1509,12 @@ def build_migration_candidate(
         expected_source_sha256,
         label="expected source SHA-256",
     )
-    if (
-        os.environ.get("DCAR_TEST_DENY_FORMAL_DB") == "1"
-        and (
-            is_formal_database_path(
-                source_database,
-                formal_database=DEFAULT_DB,
-            )
-        )
-    ):
+    if from_version != _contract().source.version or to_version != _contract().candidate.version:
         raise OfflineMigrationError(
-            "test process attempted to open the formal DCar database"
+            "offline migration requires exact "
+            f"--from {_contract().source.version} "
+            f"--to {_contract().candidate.version}"
         )
-    if from_version != EXPECTED_FROM_VERSION or to_version != EXPECTED_TO_VERSION:
-        raise OfflineMigrationError("offline migration requires exact --from 15 --to 16")
-    if not is_formal_database_path(
-        source_database,
-        formal_database=FORMAL_DATABASE,
-    ):
-        raise OfflineMigrationError("source database must be the canonical formal DB")
     source_identity = _require_regular_single_link(
         source_database,
         label="formal source database",
@@ -1501,7 +1525,7 @@ def build_migration_candidate(
         freeze_lock,
         label="operator freeze lock",
     )
-    if freeze_lock.resolve(strict=True) != CANONICAL_OPERATOR_FREEZE_LOCK.resolve(
+    if freeze_lock.resolve(strict=True) != canonical_freeze_lock.resolve(
         strict=False
     ):
         raise OfflineMigrationError("operator freeze lock is not canonical")
@@ -1512,6 +1536,16 @@ def build_migration_candidate(
     _require_project_external(candidate, label="candidate")
     if _path_exists(candidate):
         raise OfflineMigrationError("candidate path must be new")
+    migration_blob_root = None
+    if _contract() == shared_safety.INTEGRATED_V19_V20:
+        if legacy_project_root is None or not legacy_project_root.is_absolute():
+            raise OfflineMigrationError("19->20 requires explicit --legacy-project-root")
+        legacy_project_root = _require_directory(legacy_project_root, label="historical raw project root")
+        migration_blob_root = candidate.with_name(candidate.name + ".legacy-blobs")
+        if _path_exists(migration_blob_root):
+            raise OfflineMigrationError("candidate legacy blob directory must be new")
+    elif legacy_project_root is not None:
+        raise OfflineMigrationError("historical raw root is only supported by exact 19->20 migration")
     if candidate_parent.stat().st_dev != source_identity.device:
         raise OfflineMigrationError(
             "candidate must share the formal database filesystem for atomic install"
@@ -1552,7 +1586,27 @@ def build_migration_candidate(
         label="offline migration paths",
     )
     checker = holder_checker or _database_handles
-    runner = migration_runner or initialize_database
+    selected_runner = migration_runner or (lambda connection: _run_contract_migration(
+        connection, legacy_project_root=legacy_project_root, migration_blob_root=migration_blob_root))
+    if (bootstrap_roster is None) != (roster_raw_root is None):
+        raise OfflineMigrationError("bootstrap roster and raw root must be supplied together")
+    bootstrap = (
+        _bootstrap_spec(bootstrap_roster, roster_raw_root)
+        if bootstrap_roster is not None and roster_raw_root is not None else None
+    )
+
+    def runner(connection: sqlite3.Connection) -> None:
+        selected_runner(connection)
+        if bootstrap is not None:
+            from v8.account_roster import accept_candidate, prepare_candidate
+
+            payload, source_bytes, raw_root = bootstrap
+            prepared = prepare_candidate(
+                connection, payload, source_bytes=source_bytes, raw_root=raw_root,
+            )
+            accepted = accept_candidate(connection, int(prepared["candidate_id"]))
+            if accepted.get("status") != "accepted":
+                raise OfflineMigrationError("bootstrap candidate did not reach accepted status")
 
     staging: Path | None = None
     staging_identity: FileIdentity | None = None
@@ -1569,8 +1623,8 @@ def build_migration_candidate(
                 )
             source_validation = _validate_database(
                 source_database,
-                expected_version=EXPECTED_FROM_VERSION,
-                expected_migration=EXPECTED_FROM_MIGRATION,
+                expected_version=_contract().source.version,
+                expected_migration=_contract().source.migration,
                 label="formal source database",
             )
             backup_value, backup_path, backup_validation = _read_backup_receipt(
@@ -1607,8 +1661,8 @@ def build_migration_candidate(
             _checkpoint("after_candidate_migration", fault_injector)
             candidate_validation = _validate_database(
                 staging,
-                expected_version=EXPECTED_TO_VERSION,
-                expected_migration=EXPECTED_TO_MIGRATION,
+                expected_version=_contract().candidate.version,
+                expected_migration=_contract().candidate.migration,
                 label="candidate database",
             )
             lineage = _validate_lineage(source_database, staging)
@@ -1652,13 +1706,13 @@ def build_migration_candidate(
 
             candidate_fingerprint = _fingerprint(candidate)
             result: dict[str, Any] = {
-                "schema_version": MIGRATION_RECEIPT_SCHEMA,
+                "schema_version": _contract().migration_receipt_schema,
                 "status": "candidate_ready",
                 "completed_at": _utc_now(),
                 "from_version": from_version,
-                "from_migration": EXPECTED_FROM_MIGRATION,
+                "from_migration": _contract().source.migration,
                 "to_version": to_version,
-                "to_migration": EXPECTED_TO_MIGRATION,
+                "to_migration": _contract().candidate.migration,
                 "formal_source": {
                     "path": str(source_database),
                     "file": _fingerprint(source_database),
@@ -1686,6 +1740,17 @@ def build_migration_candidate(
                 "database_handles": [],
                 "receipt": str(receipt),
             }
+            if _requires_code_identity():
+                shared_safety.require_code_identity(backup_value["code_identity"], PROJECT_ROOT)
+                result["code_identity"] = backup_value["code_identity"]
+            if _contract() == shared_safety.INTEGRATED_V19_V20:
+                from v20_release_contract import legacy_raw_manifest
+
+                assert legacy_project_root is not None and migration_blob_root is not None
+                with _connect_immutable(candidate, label="schema20 raw ledger") as raw_connection:
+                    result["legacy_raw"] = legacy_raw_manifest(
+                        raw_connection, legacy_project_root=legacy_project_root, migration_blob_root=migration_blob_root,
+                    )
             receipt_identity = _write_json_exclusive(receipt, result)
             _checkpoint("after_receipt_written", fault_injector)
             _assert_source_unchanged(
@@ -1724,11 +1789,62 @@ def build_migration_candidate(
                 "offline migration failed with incomplete cleanup: "
                 f"{type(exc).__name__}: {exc}; cleanup={cleanup_errors}"
             ) from exc
+        if migration_blob_root is not None and migration_blob_root.exists():
+            raise OfflineMigrationError(
+                f"offline migration failed; candidate removed, diagnostic raw copies retained at {migration_blob_root}: {exc}"
+            ) from exc
         if isinstance(exc, OfflineMigrationError):
             raise
         raise OfflineMigrationError(
             f"offline migration failed: {type(exc).__name__}: {exc}"
         ) from exc
+
+
+def build_migration_candidate(
+    *,
+    source_database: Path,
+    candidate: Path,
+    expected_source_sha256: str,
+    from_version: int,
+    to_version: int,
+    freeze_lock: Path,
+    migration_lock: Path,
+    backup_receipt: Path,
+    receipt: Path,
+    bootstrap_roster: Path | None = None,
+    roster_raw_root: Path | None = None,
+    legacy_project_root: Path | None = None,
+    isolated: bool = False,
+    project_root: Path | None = None,
+    holder_checker: Callable[[Sequence[Path]], list[dict[str, Any]]] | None = None,
+    fault_injector: Callable[[str], None] | None = None,
+    migration_runner: Callable[[sqlite3.Connection], None] | None = None,
+) -> dict[str, Any]:
+    """Authorize the source, hold the writer lock, and build its candidate."""
+
+    with _source_authority(
+        source_database,
+        isolated=isolated,
+        project_root=project_root,
+    ) as (access, canonical_freeze_lock):
+        return _build_migration_candidate(
+            source_database=access.database,
+            candidate=candidate,
+            expected_source_sha256=expected_source_sha256,
+            from_version=from_version,
+            to_version=to_version,
+            freeze_lock=freeze_lock,
+            migration_lock=migration_lock,
+            backup_receipt=backup_receipt,
+            receipt=receipt,
+            canonical_freeze_lock=canonical_freeze_lock,
+            bootstrap_roster=bootstrap_roster,
+            roster_raw_root=roster_raw_root,
+            legacy_project_root=legacy_project_root,
+            holder_checker=holder_checker,
+            fault_injector=fault_injector,
+            migration_runner=migration_runner,
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1748,14 +1864,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--migration-lock", type=Path, required=True)
     parser.add_argument("--backup-receipt", type=Path, required=True)
     parser.add_argument("--receipt", type=Path, required=True)
+    parser.add_argument("--bootstrap-roster", type=Path)
+    parser.add_argument("--roster-raw-root", type=Path)
+    parser.add_argument("--legacy-project-root", type=Path,
+                        help="Explicit read-only historical raw root for exact 19->20 migration.")
+    parser.add_argument(
+        "--isolated",
+        action="store_true",
+        help="explicitly authorize a non-installed test/candidate source",
+    )
+    parser.add_argument(
+        "--project-root",
+        type=Path,
+        help="installed writer project root (defaults to this checkout)",
+    )
     return parser
 
 
 def build_backup_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Create a project-external, independently restore-verified v15 "
-            "backup and O_EXCL dcar-v16-offline-backup-v1 receipt."
+            "Create a project-external, independently restore-verified source "
+            "backup and an O_EXCL receipt for the selected sealed contract."
         )
     )
     parser.add_argument("--source-db", type=Path, required=True)
@@ -1765,6 +1895,16 @@ def build_backup_parser() -> argparse.ArgumentParser:
     parser.add_argument("--freeze-lock", type=Path, required=True)
     parser.add_argument("--migration-lock", type=Path, required=True)
     parser.add_argument("--receipt", type=Path, required=True)
+    parser.add_argument(
+        "--isolated",
+        action="store_true",
+        help="explicitly authorize a non-installed test/candidate source",
+    )
+    parser.add_argument(
+        "--project-root",
+        type=Path,
+        help="installed writer project root (defaults to this checkout)",
+    )
     return parser
 
 
@@ -1776,6 +1916,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if mode == "prepare-backup":
             arguments = build_backup_parser().parse_args(values)
+            access_arguments: dict[str, Any] = {}
+            if arguments.isolated:
+                access_arguments["isolated"] = True
+            if arguments.project_root is not None:
+                access_arguments["project_root"] = arguments.project_root
             result = prepare_verified_backup(
                 source_database=arguments.source_db,
                 backup=arguments.backup,
@@ -1784,9 +1929,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 freeze_lock=arguments.freeze_lock,
                 migration_lock=arguments.migration_lock,
                 receipt=arguments.receipt,
+                **access_arguments,
             )
         else:
             arguments = build_parser().parse_args(values)
+            bootstrap_arguments: dict[str, Any] = {}
+            if arguments.bootstrap_roster is not None or arguments.roster_raw_root is not None:
+                bootstrap_arguments = {
+                    "bootstrap_roster": arguments.bootstrap_roster,
+                    "roster_raw_root": arguments.roster_raw_root,
+                }
+            if arguments.isolated:
+                bootstrap_arguments["isolated"] = True
+            if arguments.project_root is not None:
+                bootstrap_arguments["project_root"] = arguments.project_root
+            if arguments.legacy_project_root is not None:
+                bootstrap_arguments["legacy_project_root"] = arguments.legacy_project_root
             result = build_migration_candidate(
                 source_database=arguments.source_db,
                 candidate=arguments.candidate,
@@ -1797,6 +1955,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 migration_lock=arguments.migration_lock,
                 backup_receipt=arguments.backup_receipt,
                 receipt=arguments.receipt,
+                **bootstrap_arguments,
             )
     except OfflineMigrationError as exc:
         print(f"offline schema migration refused: {exc}", file=sys.stderr)

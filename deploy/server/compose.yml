@@ -240,16 +240,24 @@ services:
       DCAR_AUTH_API_UPSTREAM: http://api:8765
       DCAR_AUTH_DOUYIN_UPSTREAM: http://control:4175
       DCAR_AUTH_DOUYIN_EDGE_KEY_FILE: /run/secrets/douyin-edge-key
-      DCAR_AUTH_HTPASSWD: /run/secrets/dcar-htpasswd
       DCAR_AUTH_SESSION_DB: /var/lib/dcar-aigc/auth/sessions.sqlite3
       DCAR_AUTH_LOGIN_TEMPLATE: /app/deploy/server/nginx/login.html
       DCAR_AUTH_SECURE_COOKIE: "1"
+      DCAR_AUTH_SMS_PROVIDER: tencent
+      DCAR_AUTH_SMS_CREDENTIALS_FILE: /run/secrets/sms-tencent
+      DCAR_AUTH_PEPPER_FILE: /run/secrets/auth-pepper
     ports:
       - "127.0.0.1:4173:4173"
     volumes:
       - type: bind
-        source: ${DCAR_AUTH_CREDENTIAL_ROOT:-/var/lib/dcar-aigc/auth-compose-credentials}/users.htpasswd
-        target: /run/secrets/dcar-htpasswd
+        source: ${DCAR_AUTH_CREDENTIAL_ROOT:-/var/lib/dcar-aigc/auth-compose-credentials}/sms-tencent
+        target: /run/secrets/sms-tencent
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${DCAR_AUTH_CREDENTIAL_ROOT:-/var/lib/dcar-aigc/auth-compose-credentials}/auth-pepper
+        target: /run/secrets/auth-pepper
         read_only: true
         bind:
           create_host_path: false

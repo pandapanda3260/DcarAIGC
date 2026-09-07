@@ -127,7 +127,7 @@ def process_one(row: dict[str, Any]) -> dict[str, Any]:
                 paths.append(path)
                 path_to_time[str(path)] = timestamp
         raw = ocr_frames(paths)
-        observations = []
+        observations: list[dict[str, Any]] = []
         seen: set[str] = set()
         for item in raw:
             text = str(item.get("text") or "").strip()

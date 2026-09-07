@@ -18,15 +18,20 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+from contextvars import copy_context
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from functools import lru_cache
+from functools import lru_cache, wraps
 from importlib.metadata import version as package_version
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
+from threading import Lock
+from typing import Any, Callable, Concatenate, Dict, Iterable, List, Mapping, Optional, ParamSpec, TypeVar, cast
 
 from huggingface_hub import snapshot_download
 
+from . import raw_evidence as raw_evidence_module
+from . import raw_archive
 from .storage import DEFAULT_DB, PROJECT_ROOT, connect, now_utc, transaction
 
 
@@ -58,6 +63,7 @@ _XHS_IMAGE_PREVIEW_TRANSFORMS = frozenset(
 _XHS_IMAGE_DETAIL_TRANSFORMS = frozenset(
     {"imageView2/2/w/1440/format/webp"}
 )
+_MLX_ASR_LOCK = Lock()
 
 
 class MediaProcessingError(RuntimeError):
@@ -66,6 +72,10 @@ class MediaProcessingError(RuntimeError):
 
 class TerminalMediaSlotError(MediaProcessingError):
     """The same evidence source exhausted its bounded processing attempts."""
+
+
+class RawMediaSourceExpiredError(MediaProcessingError):
+    """Raw source expired intentionally; never reacquire it from a provider."""
 
 
 class _ResponseTargetCollisionError(MediaProcessingError):
@@ -958,8 +968,8 @@ def _relative(path: Path) -> str:
 
 
 def _resolved(local_path: str) -> Path:
-    path = Path(local_path)
-    return path if path.is_absolute() else PROJECT_ROOT / path
+    from .artifact_paths import resolve
+    return resolve(local_path, fallback_root=PROJECT_ROOT)
 
 
 def _validated_link_id(value: Any) -> str:
@@ -1026,13 +1036,33 @@ def register_artifact(
         connection.execute("BEGIN IMMEDIATE")
     row = connection.execute(
         """
-        SELECT id FROM evidence_artifacts
+        SELECT * FROM evidence_artifacts
         WHERE content_id=? AND artifact_type=? AND local_path=?
         """,
         (content_id, artifact_type, local_path),
     ).fetchone()
     if row is not None:
         artifact_id = int(row["id"])
+        existing_metadata = json.loads(row["metadata_json"])
+        if isinstance(existing_metadata, dict) and "media_lifecycle" in existing_metadata:
+            namespace = existing_metadata["media_lifecycle"]
+            if not isinstance(namespace, dict) or not namespace:
+                raise MediaProcessingError("managed artifact lifecycle binding is invalid")
+            proposed_metadata = dict(existing_metadata if metadata is None else metadata)
+            proposed_metadata.setdefault("media_lifecycle", namespace)
+            if (
+                proposed_metadata != existing_metadata
+                or row["sha256"] != sha256
+                or row["byte_size"] != path.stat().st_size
+                or row["processor_version"] != processor_version
+                or captured_at is not None and captured_at != row["captured_at"]
+            ):
+                raise MediaProcessingError("managed artifact identity is immutable")
+            return Artifact(
+                id=artifact_id, content_id=content_id, artifact_type=artifact_type,
+                local_path=local_path, sha256=str(row["sha256"]),
+                processor_version=str(row["processor_version"]),
+            )
         connection.execute(
             """
             UPDATE evidence_artifacts
@@ -1080,6 +1110,254 @@ def register_artifact(
         sha256=sha256,
         processor_version=processor_version,
     )
+
+
+def _expected_metadata_json(
+    expected: Mapping[str, Any], actual_json: str,
+) -> str:
+    """Permit only the explicitly reserved lifecycle namespace on old contracts."""
+    value = json.loads(actual_json)
+    normalized = dict(expected)
+    if isinstance(value, dict) and "media_lifecycle" in value:
+        namespace = value["media_lifecycle"]
+        if not isinstance(namespace, dict) or not namespace:
+            raise MediaProcessingError("artifact lifecycle namespace is invalid")
+        normalized.setdefault("media_lifecycle", namespace)
+        if value == normalized:
+            return actual_json
+    return json.dumps(normalized, ensure_ascii=False, sort_keys=True)
+
+
+def _protect_managed_evidence_directory(directory: Path, *, root: Path) -> None:
+    """Publish newly produced stage files with the managed private-file contract."""
+    _require_no_symlink_below_root(directory, root=root, label="managed evidence")
+    for parent, directories, files in os.walk(directory, followlinks=False):
+        parent_path = Path(parent)
+        for folder in [parent_path, *(parent_path / item for item in directories)]:
+            if folder.is_symlink() or not folder.is_dir():
+                raise MediaProcessingError("managed evidence directory alias")
+            os.chmod(folder, 0o700)
+        for name in files:
+            path = parent_path / name
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                identity = os.fstat(descriptor)
+                if (not stat.S_ISREG(identity.st_mode) or identity.st_nlink != 1
+                        or identity.st_uid != os.getuid()):
+                    raise MediaProcessingError("managed evidence file is not privately owned")
+                os.fchmod(descriptor, 0o600)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        _fsync_directory(parent_path)
+
+
+
+def _managed_bundle(connection: sqlite3.Connection, content_id: int) -> Optional[Dict[str, Any]]:
+    from .media_lifecycle import LifecycleError, current_bundle, original_artifact
+
+    bundle = current_bundle(connection, content_id)
+    if bundle is not None:
+        original_artifact(connection, bundle)
+        content = connection.execute(
+            "SELECT * FROM content_items WHERE id=?", (content_id,)
+        ).fetchone()
+        manifest = bundle["manifest"]
+        if content is None or any(
+            content[column] != manifest[field] for column, field in (
+                ("link_id", "link_id"), ("platform", "platform"),
+                ("platform_content_id", "platform_content_id"), ("account_id", "account_id"),
+                ("raw_account_uid", "account_uid"), ("content_type", "media_kind"),
+            )
+        ):
+            raise LifecycleError("managed_content_identity_changed")
+    return bundle
+
+
+def _has_managed_history(connection: sqlite3.Connection, content_id: int) -> bool:
+    return connection.execute(
+        "SELECT 1 FROM evidence_artifacts WHERE content_id=? AND artifact_type='media_lifecycle_manifest' LIMIT 1",
+        (content_id,),
+    ).fetchone() is not None
+
+
+def managed_evidence_path(
+    bundle: Mapping[str, Any], *, stage: str, source_sha256: str,
+    processor_version: str, filename: str,
+) -> Path:
+    if (
+        not _valid_sha256(source_sha256)
+        or Path(stage).name != stage or stage in {"", ".", ".."}
+        or Path(filename).name != filename or filename in {"", ".", ".."}
+    ):
+        raise MediaProcessingError("managed evidence path identity is invalid")
+    version_sha256 = hashlib.sha256(processor_version.encode("utf-8")).hexdigest()
+    target = Path(bundle["evidence_root"]) / stage / source_sha256 / version_sha256 / filename
+    _require_no_symlink_below_root(
+        target, root=Path(bundle["instance_root"]), label="managed evidence target"
+    )
+    return target
+
+
+def managed_slot_source(bundle: Mapping[str, Any], input_sha256: str) -> str:
+    if not _valid_sha256(input_sha256):
+        raise MediaProcessingError("managed processing input hash is invalid")
+    value = {
+        "contract": "managed-media-slot-source-v1",
+        "bundle_id": bundle["manifest"]["bundle_id"],
+        "source_sha256": bundle["manifest"]["source"]["sha256"],
+        "input_sha256": input_sha256,
+    }
+    return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
+
+
+
+def managed_evidence_metadata(
+    bundle: Mapping[str, Any], *, source_sha256: str, processor_version: str,
+) -> Dict[str, Any]:
+    manifest = bundle["manifest"]
+    original = manifest["original_artifact"]
+    return {"media_lifecycle": {
+        "bundle_id": manifest["bundle_id"],
+        "control_artifact_id": bundle["control_artifact_id"],
+        "source_sha256": manifest["source"]["sha256"],
+        "original_artifact_id": original["artifact_id"],
+        "original_sha256": original["sha256"],
+        "input_sha256": source_sha256,
+        "processor_version": processor_version,
+    }}
+
+
+def managed_bound_artifact(
+    connection: sqlite3.Connection, content_id: int, artifact_types: Iterable[str],
+) -> tuple[Optional[Dict[str, Any]], Optional[sqlite3.Row]]:
+    """Select immutable bundle identity before any availability decision."""
+    from .media_lifecycle import LifecycleError, original_artifact
+
+    bundle = _managed_bundle(connection, content_id)
+    if bundle is None:
+        if _has_managed_history(connection, content_id):
+            raise LifecycleError("managed_source_pending")
+        return None, None
+    types = tuple(artifact_types)
+    manifest = bundle["manifest"]
+    if "media" in types or "media_manifest" in types:
+        original = original_artifact(connection, bundle)
+        return bundle, connection.execute(
+            "SELECT * FROM evidence_artifacts WHERE id=?", (original["id"],)
+        ).fetchone()
+    placeholders = ",".join("?" for _ in types)
+    candidates = connection.execute(
+        f"""SELECT * FROM evidence_artifacts WHERE content_id=?
+            AND artifact_type IN ({placeholders}) ORDER BY id DESC""",
+        (content_id, *types),
+    ).fetchall()
+    for row in candidates:
+        try:
+            metadata = json.loads(row["metadata_json"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        namespace = metadata.get("media_lifecycle") if isinstance(metadata, dict) else None
+        if (
+            isinstance(namespace, dict)
+            and namespace.get("bundle_id") == manifest["bundle_id"]
+            and namespace.get("control_artifact_id") == bundle["control_artifact_id"]
+            and namespace.get("source_sha256") == manifest["source"]["sha256"]
+            and namespace.get("original_artifact_id") == manifest["original_artifact"]["artifact_id"]
+            and namespace.get("original_sha256") == manifest["original_artifact"]["sha256"]
+            and namespace.get("processor_version") == row["processor_version"]
+        ):
+            if (
+                not _valid_sha256(namespace.get("input_sha256"))
+                or metadata != managed_evidence_metadata(
+                    bundle, source_sha256=namespace["input_sha256"],
+                    processor_version=str(row["processor_version"]),
+                )
+            ):
+                raise LifecycleError("managed_evidence_binding_invalid")
+            if row["status"] != "available":
+                raise LifecycleError("managed_evidence_unavailable")
+            evidence = _read_private_file_evidence(
+                _resolved(str(row["local_path"])), label="managed derived evidence"
+            )
+            if evidence.sha256 != row["sha256"] or evidence.byte_size != row["byte_size"]:
+                raise LifecycleError("managed_evidence_hash_mismatch")
+            return bundle, row
+    return bundle, None
+
+
+
+_MediaParams = ParamSpec("_MediaParams")
+_MediaResult = TypeVar("_MediaResult")
+
+
+def _original_lease(
+    purpose: str,
+) -> Callable[
+    [Callable[Concatenate[int, _MediaParams], _MediaResult]],
+    Callable[Concatenate[int, _MediaParams], _MediaResult],
+]:
+    def decorate(
+        operation: Callable[Concatenate[int, _MediaParams], _MediaResult],
+    ) -> Callable[Concatenate[int, _MediaParams], _MediaResult]:
+        @wraps(operation)
+        def leased(content_id: int, *args: _MediaParams.args, **kwargs: _MediaParams.kwargs) -> _MediaResult:
+            from .media_retention import media_read_lease
+
+            db_path = cast(Path, kwargs.get("db_path", DEFAULT_DB))
+            with media_read_lease(content_id, db_path=db_path, purpose=purpose):
+                return operation(content_id, *args, **kwargs)
+        return leased
+    return decorate
+
+
+def _media_availability_result(operation: Callable[..., Dict[str, Any]]) -> Callable[..., Dict[str, Any]]:
+    @wraps(operation)
+    def run(content_id: int, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        from .media_lifecycle import LifecycleError
+
+        try:
+            return operation(content_id, *args, **kwargs)
+        except RawMediaSourceExpiredError:
+            return {"content_id": content_id, "status": "expired_non_replayable", "reason": "raw_expired"}
+        except LifecycleError as exc:
+            reason = exc.error_code
+            if reason in {"original_archived", "original_restoring", "restore_required"}:
+                status = "restore_required"
+            elif reason in {
+                "expired_non_replayable", "original_expiry_pending",
+                "original_purge_in_progress", "original_expired", "retention_due",
+            }:
+                status = "expired_non_replayable"
+            else:
+                raise
+            return {"content_id": content_id, "status": status, "reason": reason}
+    return run
+
+
+def _download_intent(
+    content_id: int, *, source_artifact_id: Optional[int], media_root: Path,
+    db_path: Path, preclaimed_slot_id: Optional[int], source_sha256: str,
+) -> Optional[Dict[str, Any]]:
+    from .media_lifecycle import LifecycleError, activation, prepare_download
+
+    if source_artifact_id is None:
+        with connect(db_path) as connection:
+            active = activation(connection)
+            old = connection.execute(
+                """SELECT 1 FROM media_processing_slots WHERE content_id=?
+                   AND processor_type='download' AND source_sha256=? AND status='succeeded'""",
+                (content_id, source_sha256),
+            ).fetchone()
+        if active is not None and old is None:
+            raise LifecycleError("managed_source_required")
+        return None
+    return prepare_download(
+        content_id, source_artifact_id=source_artifact_id, media_root=media_root,
+        db_path=db_path, preclaimed_slot_id=preclaimed_slot_id,
+        download_source_sha256=source_sha256,
+    )
+
 
 
 def _claim_processing_slot(
@@ -1233,6 +1511,7 @@ def _run_processing_slot(
         Callable[[sqlite3.Connection, Artifact, _PrivateFileEvidence], None]
     ] = None,
     preclaimed_slot_id: Optional[int] = None,
+    artifact_registered: Optional[Callable[[sqlite3.Connection, Artifact, int], None]] = None,
 ) -> Artifact:
     _before_processing_slot_claim(content_id, processor_type)
     with connect(db_path) as connection, transaction(connection):
@@ -1269,6 +1548,16 @@ def _run_processing_slot(
             or claimed_row["output_artifact_id"] is not None
         ):
             raise MediaProcessingError("preclaimed media slot identity drifted")
+        managed_output = bool(metadata and isinstance(metadata.get("media_lifecycle"), dict))
+        if managed_output and cached is None:
+            if expected_output_path is None or expected_output_root is None:
+                raise MediaProcessingError("managed evidence output must have a bound path")
+            if connection.execute(
+                """SELECT 1 FROM evidence_artifacts WHERE content_id=?
+                   AND artifact_type=? AND local_path=?""",
+                (content_id, artifact_type, _relative(expected_output_path)),
+            ).fetchone() is not None:
+                raise MediaProcessingError("registered managed evidence cannot be overwritten")
         if cached is not None:
             artifact_row = connection.execute(
                 "SELECT * FROM evidence_artifacts WHERE id=?", (cached.id,)
@@ -1282,7 +1571,9 @@ def _run_processing_slot(
             expected_metadata_json = (
                 artifact_row["metadata_json"]
                 if legacy_video_cache and artifact_row is not None
-                else json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True)
+                else _expected_metadata_json(
+                    metadata or {}, artifact_row["metadata_json"] if artifact_row is not None else "{}"
+                )
             )
             if expected_output_path is not None and not legacy_video_cache:
                 if expected_output_root is not None:
@@ -1381,7 +1672,18 @@ def _run_processing_slot(
     ):
         raise MediaProcessingError("claimed media slot identity is invalid")
     try:
+        if managed_output:
+            assert expected_output_path is not None and expected_output_root is not None
+            directory_descriptor = _open_private_output_parent(
+                expected_output_path, root=expected_output_root, label="managed stage"
+            )
+            os.close(directory_descriptor)
         output_path = produce()
+        if managed_output:
+            assert expected_output_path is not None and expected_output_root is not None
+            if output_path != expected_output_path:
+                raise MediaProcessingError("managed stage output path drifted")
+            _protect_managed_evidence_directory(output_path.parent, root=expected_output_root)
         _before_processing_slot_commit(content_id, processor_type)
         with connect(db_path) as connection, transaction(connection):
             if commit_validator is not None:
@@ -1419,6 +1721,8 @@ def _run_processing_slot(
                 raise MediaProcessingError(
                     "claimed media slot identity changed before success commit"
                 )
+            if artifact_registered is not None:
+                artifact_registered(connection, artifact, slot_id)
         return artifact
     except Exception as exc:
         with connect(db_path) as connection, transaction(connection):
@@ -1505,6 +1809,23 @@ def _has_video_stream(
     }
 
 
+def _has_decodable_video_frame(
+    path: Path, *, inherited_descriptor: Optional[int] = None
+) -> bool:
+    pass_fds = () if inherited_descriptor is None else (inherited_descriptor,)
+    completed = subprocess.run(
+        [
+            "ffmpeg", "-nostdin", "-v", "error", "-xerror", "-i", str(path),
+            "-map", "0:v:0", "-frames:v", "1", "-f", "null", "-",
+        ],
+        check=False,
+        capture_output=True,
+        timeout=60,
+        pass_fds=pass_fds,
+    )
+    return completed.returncode == 0
+
+
 def _valid_media(
     path: Path,
     *,
@@ -1531,6 +1852,9 @@ def _valid_media(
         and _has_video_stream(
             path, inherited_descriptor=inherited_descriptor
         )
+        and _has_decodable_video_frame(
+            path, inherited_descriptor=inherited_descriptor
+        )
     )
 
 
@@ -1540,15 +1864,25 @@ def _write_bounded_response(
     maximum_bytes: Optional[int],
 ) -> _SpooledResponse:
     raw_length = response.headers.get("Content-Length") if response.headers else None
+    declared_length: Optional[int] = None
     if maximum_bytes is not None and raw_length:
         try:
             declared_length = int(raw_length)
         except (TypeError, ValueError):
-            declared_length = 0
-        if declared_length > maximum_bytes:
+            declared_length = None
+        if declared_length is not None and declared_length < 0:
+            declared_length = None
+        if declared_length is not None and declared_length > maximum_bytes:
             raise MediaProcessingError(
                 f"media response exceeds byte limit: {declared_length}>{maximum_bytes}"
             )
+    elif raw_length:
+        try:
+            declared_length = int(raw_length)
+        except (TypeError, ValueError):
+            declared_length = None
+        if declared_length is not None and declared_length < 0:
+            declared_length = None
     handle = tempfile.TemporaryFile(mode="w+b")
     descriptor = handle.fileno()
     total = 0
@@ -1577,6 +1911,10 @@ def _write_bounded_response(
                             "media response write failed"
                         )
                     view = view[written:]
+            if declared_length is not None and total != declared_length:
+                raise MediaProcessingError(
+                    f"media response length mismatch: {total}!={declared_length}"
+                )
         except BaseException as exc:
             failure = exc
         os.fsync(descriptor)
@@ -2064,6 +2402,7 @@ def _download_video(
     raise MediaProcessingError("media download failed: " + " | ".join(errors[-3:]))
 
 
+@_original_lease("media_download")
 def download_video_sources(
     content_id: int,
     urls: Iterable[str],
@@ -2127,6 +2466,31 @@ def download_video_sources(
         / source_sha256
         / "source.mp4"
     )
+    effective_slot_source_sha256 = (
+        _slot_source_sha256
+        or (
+            str(source_rows[0]["sha256"])
+            if source_rows
+            and source_rows[0]["processor_version"] == MEDIA_SOURCE_VERSION
+            and _valid_sha256(source_rows[0]["sha256"])
+            else source_sha256
+        )
+    )
+    with connect(db_path) as connection:
+        managed_bundle = _managed_bundle(connection, content_id)
+    intent = None if managed_bundle is not None else _download_intent(
+        content_id, source_artifact_id=source_artifact_id,
+        media_root=effective_media_root, db_path=db_path,
+        preclaimed_slot_id=_preclaimed_slot_id, source_sha256=effective_slot_source_sha256,
+    )
+    if managed_bundle is not None:
+        target = _resolved(managed_bundle["manifest"]["original_artifact"]["local_path"])
+    elif intent is not None:
+        target = Path(intent["originals_root"]) / "source.mp4"
+    effective_maximum_bytes = (
+        DEFAULT_MAX_MEDIA_DOWNLOAD_BYTES
+        if intent is not None and maximum_bytes is None else maximum_bytes
+    )
     _require_no_symlink_below_root(
         target, root=effective_media_root, label="video download target"
     )
@@ -2175,6 +2539,28 @@ def download_video_sources(
                 )
 
     def produce() -> Path:
+        if managed_bundle is not None:
+            raise MediaProcessingError("registered managed download cannot be overwritten")
+        if intent is not None:
+            from .media_retention import media_space_reservation
+
+            if reuse_existing and target.is_file() and _valid_media(
+                target, maximum_duration_seconds=maximum_duration_seconds
+            ):
+                return target
+            with media_space_reservation(
+                db_path=db_path,
+                allocations=[(target.parent, int(effective_maximum_bytes or 0)),
+                             (Path(tempfile.gettempdir()).resolve(), int(effective_maximum_bytes or 0))],
+                purpose="managed_media_download",
+            ):
+                return _download_video(
+                    selected_values, target, urlopen_fn=urlopen_fn,
+                    maximum_bytes=effective_maximum_bytes,
+                    require_exact_response_url=require_exact_response_url,
+                    reuse_existing=reuse_existing,
+                    maximum_duration_seconds=maximum_duration_seconds,
+                )
         if (
             urlopen_fn is None
             and maximum_bytes is None
@@ -2194,16 +2580,12 @@ def download_video_sources(
             maximum_duration_seconds=maximum_duration_seconds,
         )
 
-    effective_slot_source_sha256 = (
-        _slot_source_sha256
-        or (
-            str(source_rows[0]["sha256"])
-            if source_rows
-            and source_rows[0]["processor_version"] == MEDIA_SOURCE_VERSION
-            and _valid_sha256(source_rows[0]["sha256"])
-            else source_sha256
-        )
-    )
+    def registered(connection: sqlite3.Connection, artifact: Artifact, slot_id: int) -> None:
+        if intent is not None:
+            from .media_lifecycle import register_download
+
+            register_download(connection, intent, artifact_id=artifact.id, slot_id=slot_id)
+
     return _run_processing_slot(
         db_path=db_path,
         content_id=content_id,
@@ -2223,6 +2605,7 @@ def download_video_sources(
         claim_validator=revalidate_context,
         commit_validator=revalidate_context,
         preclaimed_slot_id=_preclaimed_slot_id,
+        artifact_registered=registered,
     )
 
 
@@ -2741,6 +3124,7 @@ def _download_images(
     require_exact_response_url: bool = False,
     reuse_existing: bool = True,
     trusted_root: Optional[Path] = None,
+    manifest_output_path: Optional[Path] = None,
 ) -> Path:
     raw_values = list(urls)
     if any(type(value) is not str for value in raw_values):
@@ -2767,6 +3151,15 @@ def _download_images(
     )
     if not groups:
         raise MediaProcessingError("image download has no logical source groups")
+    manifest = manifest_output_path if manifest_output_path is not None else target_dir / "manifest.json"
+    if manifest_output_path is not None and reuse_existing and manifest.is_file():
+        evidence = _read_private_file_evidence(manifest, label="managed image manifest", capture_body=True)
+        body = _cached_json_body(evidence, label="managed image manifest")
+        _validate_current_grouped_image_manifest(
+            manifest, body, source_urls=values, platform=platform,
+            frozen_image_groups=groups, originals_root=target_dir,
+        )
+        return manifest
     _prepare_image_download_directory(
         target_dir,
         groups=groups,
@@ -2951,7 +3344,6 @@ def _download_images(
     finally:
         for _target, selected_spool in selected_spools:
             selected_spool.close()
-    manifest = target_dir / "manifest.json"
     _publish_private_image_manifest(
         manifest,
         {
@@ -2974,6 +3366,7 @@ def _download_images(
     return manifest
 
 
+@_original_lease("media_download")
 def download_image_sources(
     content_id: int,
     urls: Iterable[str],
@@ -3068,6 +3461,31 @@ def download_image_sources(
         / download_binding_sha256
         / "images"
     )
+    effective_slot_source_sha256 = (
+        _slot_source_sha256
+        or (
+            str(source_rows[0]["sha256"])
+            if source_rows[0]["processor_version"] == MEDIA_SOURCE_VERSION
+            and _valid_sha256(source_rows[0]["sha256"])
+            else download_binding_sha256
+        )
+    )
+    with connect(db_path) as connection:
+        managed_bundle = _managed_bundle(connection, content_id)
+    intent = None if managed_bundle is not None else _download_intent(
+        content_id, source_artifact_id=source_artifact_id,
+        media_root=effective_media_root, db_path=db_path,
+        preclaimed_slot_id=_preclaimed_slot_id, source_sha256=effective_slot_source_sha256,
+    )
+    managed_paths = managed_bundle if managed_bundle is not None else intent
+    manifest_path = target_dir / "manifest.json"
+    if managed_paths is not None:
+        target_dir = Path(managed_paths["originals_root"])
+        manifest_path = Path(managed_paths["evidence_root"]) / "download-manifest.json"
+    effective_maximum_bytes = (
+        DEFAULT_MAX_MEDIA_DOWNLOAD_BYTES
+        if intent is not None and maximum_bytes is None else maximum_bytes
+    )
     _require_no_symlink_below_root(
         target_dir, root=effective_media_root, label="image download target"
     )
@@ -3107,6 +3525,31 @@ def download_image_sources(
         validate_frozen_image_groups(values, groups, platform=platform)
 
     def produce() -> Path:
+        if managed_bundle is not None:
+            raise MediaProcessingError("registered managed download cannot be overwritten")
+        if managed_paths is not None:
+            from .media_retention import media_space_reservation
+
+            reservation = (
+                media_space_reservation(
+                    db_path=db_path,
+                    allocations=[
+                        (target_dir, len(values) * int(effective_maximum_bytes or 0)),
+                        (Path(tempfile.gettempdir()).resolve(), len(values) * int(effective_maximum_bytes or 0)),
+                    ],
+                    purpose="managed_media_download",
+                )
+                if intent is not None and not manifest_path.is_file() else nullcontext()
+            )
+            with reservation:
+                return _download_images(
+                    values, target_dir, platform=platform, frozen_image_groups=groups,
+                    urlopen_fn=urlopen_fn, maximum_bytes=effective_maximum_bytes,
+                    require_exact_response_url=require_exact_response_url,
+                    reuse_existing=reuse_existing,
+                    trusted_root=Path(managed_paths["instance_root"]),
+                    manifest_output_path=manifest_path,
+                )
         if (
             urlopen_fn is None
             and maximum_bytes is None
@@ -3152,19 +3595,17 @@ def download_image_sources(
             source_urls=values,
             platform=platform,
             frozen_image_groups=groups,
-            expected_manifest=target_dir / "manifest.json",
+            expected_manifest=manifest_path,
             expected_metadata=expected_metadata,
+            originals_root=target_dir if managed_paths is not None else None,
         )
 
-    effective_slot_source_sha256 = (
-        _slot_source_sha256
-        or (
-            str(source_rows[0]["sha256"])
-            if source_rows[0]["processor_version"] == MEDIA_SOURCE_VERSION
-            and _valid_sha256(source_rows[0]["sha256"])
-            else download_binding_sha256
-        )
-    )
+    def registered(connection: sqlite3.Connection, artifact: Artifact, slot_id: int) -> None:
+        if intent is not None:
+            from .media_lifecycle import register_download
+
+            register_download(connection, intent, artifact_id=artifact.id, slot_id=slot_id)
+
     return _run_processing_slot(
         db_path=db_path,
         content_id=content_id,
@@ -3174,12 +3615,13 @@ def download_image_sources(
         artifact_type="media_manifest",
         produce=produce,
         metadata=expected_metadata,
-        expected_output_path=target_dir / "manifest.json",
+        expected_output_path=manifest_path,
         expected_output_root=effective_media_root,
         cached_validator=validate_cached,
         claim_validator=revalidate_context,
         commit_validator=revalidate_context,
         preclaimed_slot_id=_preclaimed_slot_id,
+        artifact_registered=registered,
     )
 
 
@@ -3382,6 +3824,7 @@ def _validate_video_frames_output(
     content_root: Path,
     media_root: Path,
     maximum_duration_seconds: Optional[float],
+    frames_directory: Optional[Path] = None,
 ) -> List[Path]:
     frames = body.get("frames") if type(body) is dict else None
     duration = body.get("duration_seconds") if type(body) is dict else None
@@ -3401,7 +3844,7 @@ def _validate_video_frames_output(
         or len(frames) > int(load_media_config()["frames"]["maximum_frames"])
     ):
         raise MediaProcessingError("cached frames manifest contract drifted")
-    expected_directory = content_root / "frames"
+    expected_directory = frames_directory if frames_directory is not None else content_root / "frames"
     _require_no_symlink_below_root(
         manifest_path,
         root=media_root,
@@ -3548,17 +3991,21 @@ def _run_asr(
     effective_model_path = (
         model_path if model_path is not None else pinned_whisper_model_path()
     )
-    started = time.monotonic()
     try:
-        raw = mlx_whisper.transcribe(
-            str(media_path),
-            path_or_hf_repo=str(effective_model_path),
-            language=str(config["language"]),
-            verbose=None,
-            word_timestamps=False,
-            initial_prompt="汽车，懂车帝，AI小懂，二手车，新车，选车，买车，卖车，试驾，保养，维修，车型，价格，配置。",
-            condition_on_previous_text=True,
-        )
+        # mlx-whisper caches one mutable MLX model globally.  Serialize only
+        # model load/inference; frame extraction, OCR and result persistence
+        # remain free to overlap across contents.
+        with _MLX_ASR_LOCK:
+            started = time.monotonic()
+            raw = mlx_whisper.transcribe(
+                str(media_path),
+                path_or_hf_repo=str(effective_model_path),
+                language=str(config["language"]),
+                verbose=None,
+                word_timestamps=False,
+                initial_prompt="汽车，懂车帝，AI小懂，二手车，新车，选车，买车，卖车，试驾，保养，维修，车型，价格，配置。",
+                condition_on_previous_text=True,
+            )
     except RuntimeError as exc:
         if not str(exc).startswith("Failed to load audio"):
             raise
@@ -3603,6 +4050,7 @@ def _run_asr(
     return target
 
 
+@_original_lease("media_processing")
 def process_video_evidence(
     content_id: int,
     media_path: Path,
@@ -3665,13 +4113,46 @@ def process_video_evidence(
         if content is None:
             raise MediaProcessingError(f"unknown content {content_id}")
         link_id = _validated_link_id(content["link_id"])
+        bundle, bound_original = managed_bound_artifact(connection, content_id, ("media",))
+        if bundle is not None and (
+            bound_original is None or bound_original["id"] != media.id
+            or bound_original["sha256"] != media.sha256
+        ):
+            raise MediaProcessingError("video input is not the current managed original")
     effective_media_root = media_root if media_root is not None else MEDIA_ROOT
     content_root = effective_media_root / link_id
+    frames_target = content_root / "frames" / "frames.json"
+    asr_target = content_root / "asr.json"
+    frames_metadata: Dict[str, Any] = {}
+    asr_metadata: Dict[str, Any] = {}
+    if bundle is not None:
+        frames_target = managed_evidence_path(
+            bundle, stage="frames", source_sha256=media.sha256,
+            processor_version=versions["frames"], filename="frames.json",
+        )
+        asr_target = managed_evidence_path(
+            bundle, stage="asr", source_sha256=media.sha256,
+            processor_version=versions["asr"], filename="asr.json",
+        )
+        frames_metadata = managed_evidence_metadata(
+            bundle, source_sha256=media.sha256, processor_version=versions["frames"]
+        )
+        asr_metadata = managed_evidence_metadata(
+            bundle, source_sha256=media.sha256, processor_version=versions["asr"]
+        )
     media_input_evidence = _read_private_file_evidence(
         media_path, label="video processing media input"
     )
 
     def validate_media_input(connection: sqlite3.Connection) -> None:
+        if bundle is not None:
+            current_bundle, current_original = managed_bound_artifact(connection, content_id, ("media",))
+            if (
+                current_bundle is None
+                or current_bundle["control_artifact_id"] != bundle["control_artifact_id"]
+                or current_original is None or current_original["id"] != media.id
+            ):
+                raise MediaProcessingError("managed video source changed during processing")
         current_content = connection.execute(
             "SELECT link_id,content_type FROM content_items WHERE id=?",
             (content_id,),
@@ -3721,24 +4202,28 @@ def process_video_evidence(
             content_root=content_root,
             media_root=effective_media_root,
             maximum_duration_seconds=maximum_duration_seconds,
+            frames_directory=frames_target.parent,
         )
 
     frames = _run_processing_slot(
         db_path=db_path,
         content_id=content_id,
-        source_sha256=media.sha256,
+        source_sha256=managed_slot_source(bundle, media.sha256) if bundle is not None else media.sha256,
         processor_type="frames",
         processor_version=versions["frames"],
         artifact_type="frames_manifest",
-        produce=lambda: _extract_frames(media_path, content_root / "frames"),
-        expected_output_path=content_root / "frames" / "frames.json",
+        produce=lambda: _extract_frames(media_path, frames_target.parent),
+        expected_output_path=frames_target,
         expected_output_root=effective_media_root,
         cached_validator=validate_cached_frames,
+        metadata=frames_metadata,
+        claim_validator=validate_media_input if bundle is not None else None,
+        commit_validator=validate_media_input if bundle is not None else None,
     )
 
     def validate_current_frames(connection: sqlite3.Connection) -> List[Path]:
         validate_media_input(connection)
-        expected_manifest = content_root / "frames" / "frames.json"
+        expected_manifest = frames_target
         current_frames = connection.execute(
             "SELECT * FROM evidence_artifacts WHERE id=?", (frames.id,)
         ).fetchone()
@@ -3748,7 +4233,7 @@ def process_video_evidence(
             WHERE content_id=? AND source_sha256=? AND processor_type='frames'
               AND processor_version=?
             """,
-            (content_id, media.sha256, versions["frames"]),
+            (content_id, managed_slot_source(bundle, media.sha256) if bundle is not None else media.sha256, versions["frames"]),
         ).fetchall()
         if (
             current_frames is None
@@ -3763,7 +4248,7 @@ def process_video_evidence(
             or current_frames["sha256"] != frames.sha256
             or current_frames["processor_version"] != versions["frames"]
             or current_frames["processor_version"] != frames.processor_version
-            or current_frames["metadata_json"] != "{}"
+            or current_frames["metadata_json"] != _expected_metadata_json(frames_metadata, current_frames["metadata_json"])
             or len(frame_slots) != 1
             or frame_slots[0]["status"] != "succeeded"
             or frame_slots[0]["output_artifact_id"] != frames.id
@@ -3791,6 +4276,7 @@ def process_video_evidence(
             content_root=content_root,
             media_root=effective_media_root,
             maximum_duration_seconds=maximum_duration_seconds,
+            frames_directory=frames_target.parent,
         )
 
     def validate_cached_asr(
@@ -3806,22 +4292,25 @@ def process_video_evidence(
     asr = _run_processing_slot(
         db_path=db_path,
         content_id=content_id,
-        source_sha256=media.sha256,
+        source_sha256=managed_slot_source(bundle, media.sha256) if bundle is not None else media.sha256,
         processor_type="asr",
         processor_version=versions["asr"],
         artifact_type="asr",
         produce=(
-            (lambda: _run_asr(media_path, content_root / "asr.json"))
+            (lambda: _run_asr(media_path, asr_target))
             if whisper_model_path is None
             else lambda: _run_asr(
                 media_path,
-                content_root / "asr.json",
+                asr_target,
                 model_path=whisper_model_path,
             )
         ),
-        expected_output_path=content_root / "asr.json",
+        expected_output_path=asr_target,
         expected_output_root=effective_media_root,
         cached_validator=validate_cached_asr,
+        metadata=asr_metadata,
+        claim_validator=validate_media_input if bundle is not None else None,
+        commit_validator=validate_media_input if bundle is not None else None,
     )
 
     def validate_cached_video_ocr(
@@ -3835,27 +4324,43 @@ def process_video_evidence(
             expected_source_count=len(frame_paths),
         )
 
+    ocr_target = content_root / "ocr.json"
+    ocr_metadata: Dict[str, Any] = {}
+    if bundle is not None:
+        ocr_target = managed_evidence_path(
+            bundle, stage="ocr", source_sha256=frames.sha256,
+            processor_version=versions["ocr"], filename="ocr.json",
+        )
+        ocr_metadata = managed_evidence_metadata(
+            bundle, source_sha256=frames.sha256, processor_version=versions["ocr"]
+        )
+    def validate_frames_context(connection: sqlite3.Connection) -> None:
+        validate_current_frames(connection)
+
     ocr = _run_processing_slot(
         db_path=db_path,
         content_id=content_id,
-        source_sha256=frames.sha256,
+        source_sha256=managed_slot_source(bundle, frames.sha256) if bundle is not None else frames.sha256,
         processor_type="ocr",
         processor_version=versions["ocr"],
         artifact_type="ocr",
         produce=(
             (lambda: _run_ocr(
                 _resolved(frames.local_path),
-                content_root / "ocr.json",
+                ocr_target,
                 binary_path=ocr_binary,
             ))
             if ocr_binary is not None
             else lambda: _run_ocr(
-                _resolved(frames.local_path), content_root / "ocr.json"
+                _resolved(frames.local_path), ocr_target
             )
         ),
-        expected_output_path=content_root / "ocr.json",
+        expected_output_path=ocr_target,
         expected_output_root=effective_media_root,
         cached_validator=validate_cached_video_ocr,
+        metadata=ocr_metadata,
+        claim_validator=validate_frames_context if bundle is not None else None,
+        commit_validator=validate_frames_context if bundle is not None else None,
     )
     return {"media": media, "frames": frames, "asr": asr, "ocr": ocr}
 
@@ -3930,6 +4435,7 @@ def _validate_current_grouped_image_manifest(
     source_urls: List[str],
     platform: str,
     frozen_image_groups: Optional[Iterable[Mapping[str, Any]]] = None,
+    originals_root: Optional[Path] = None,
 ) -> List[_PrivateFileEvidence]:
     if platform == "douyin" and frozen_image_groups is None:
         raise MediaProcessingError(
@@ -3987,7 +4493,7 @@ def _validate_current_grouped_image_manifest(
     ):
         raise MediaProcessingError("image manifest logical-group evidence drifted")
     expected_files = [
-        manifest_path.parent / f"image-{index:03d}.bin"
+        (originals_root if originals_root is not None else manifest_path.parent) / f"image-{index:03d}.bin"
         for index in range(len(expected_groups))
     ]
     expected_paths = [_relative(path) for path in expected_files]
@@ -4141,6 +4647,7 @@ def _validate_cached_image_download(
     frozen_image_groups: Iterable[Mapping[str, Any]],
     expected_manifest: Path,
     expected_metadata: Mapping[str, Any],
+    originals_root: Optional[Path] = None,
 ) -> None:
     """Close a cached v8.3 image slot over its artifact, body, and files."""
 
@@ -4197,7 +4704,7 @@ def _validate_cached_image_download(
         or row["byte_size"] != manifest_evidence.byte_size
         or row["sha256"] != manifest_evidence.sha256
         or row["metadata_json"]
-        != json.dumps(dict(expected_metadata), ensure_ascii=False, sort_keys=True)
+        != _expected_metadata_json(expected_metadata, row["metadata_json"])
     ):
         raise MediaProcessingError("cached image download closure drifted")
     try:
@@ -4212,6 +4719,7 @@ def _validate_cached_image_download(
         source_urls=source_urls,
         platform=platform,
         frozen_image_groups=groups,
+        originals_root=originals_root,
     )
     _assert_private_file_evidence_current(
         manifest_evidence, label="cached image manifest"
@@ -4351,12 +4859,18 @@ def _validate_current_image_manifest_source(
         raise MediaProcessingError(
             "image manifest download binding does not match current source slot"
         )
+    bundle, original = managed_bound_artifact(connection, content_id, ("media_manifest",))
+    if bundle is not None and (
+        original is None or original["local_path"] != _relative(manifest_path)
+    ):
+        raise MediaProcessingError("image manifest is not the current managed original")
     return _validate_current_grouped_image_manifest(
         manifest_path,
         manifest_body,
         source_urls=source_urls,
         platform=platform,
         frozen_image_groups=groups,
+        originals_root=Path(bundle["originals_root"]) if bundle is not None else None,
     )
 
 
@@ -4432,6 +4946,11 @@ def _revalidate_image_ocr_inputs(
         / "images"
         / "manifest.json"
     )
+    bundle, original = managed_bound_artifact(connection, content_id, ("media_manifest",))
+    if bundle is not None:
+        if original is None or original["id"] != manifest_artifact_id:
+            raise MediaProcessingError("image manifest managed binding changed before OCR")
+        expected_manifest = Path(bundle["evidence_root"]) / "download-manifest.json"
     _require_no_symlink_below_root(
         manifest_evidence.path, root=media_root, label="image manifest"
     )
@@ -4478,6 +4997,7 @@ def _revalidate_image_ocr_inputs(
     return [frame.path for frame in current_frames]
 
 
+@_original_lease("media_processing")
 def process_image_evidence(
     content_id: int,
     manifest_path: Path,
@@ -4537,6 +5057,9 @@ def process_image_evidence(
             raise MediaProcessingError(
                 "unregistered or legacy image manifest requires explicit migration"
             )
+        bundle, original = managed_bound_artifact(connection, content_id, ("media_manifest",))
+        if bundle is not None and (original is None or original["id"] != row["id"]):
+            raise MediaProcessingError("image input is not the current managed original")
         try:
             artifact_metadata = json.loads(str(row["metadata_json"] or ""))
         except json.JSONDecodeError as exc:
@@ -4627,6 +5150,8 @@ def process_image_evidence(
             / "images"
             / "manifest.json"
         )
+        if bundle is not None:
+            expected_manifest = Path(bundle["evidence_root"]) / "download-manifest.json"
         _require_no_symlink_below_root(
             lexical_manifest,
             root=effective_media_root,
@@ -4649,9 +5174,8 @@ def process_image_evidence(
             "download_binding_sha256": download_binding_sha256,
         }
         metadata_is_current = (
-            set(artifact_metadata) == expected_metadata_keys
-            and _canonical_json_bytes(artifact_metadata)
-            == _canonical_json_bytes(expected_metadata)
+            set(artifact_metadata) - {"media_lifecycle"} == expected_metadata_keys
+            and artifact_metadata == json.loads(_expected_metadata_json(expected_metadata, row["metadata_json"]))
             and _valid_sha256(body.get("source_sha256"))
             and _valid_sha256(body.get("image_groups_sha256"))
             and _valid_sha256(body.get("download_binding_sha256"))
@@ -4684,6 +5208,15 @@ def process_image_evidence(
             processor_version=IMAGE_DOWNLOAD_VERSION,
         )
     target = effective_media_root / str(content["link_id"]) / "ocr.json"
+    output_metadata: Dict[str, Any] = {}
+    if bundle is not None:
+        target = managed_evidence_path(
+            bundle, stage="ocr", source_sha256=media_manifest.sha256,
+            processor_version=versions["ocr"], filename="ocr.json",
+        )
+        output_metadata = managed_evidence_metadata(
+            bundle, source_sha256=media_manifest.sha256, processor_version=versions["ocr"]
+        )
 
     def revalidate(connection: sqlite3.Connection) -> List[Path]:
         return _revalidate_image_ocr_inputs(
@@ -4730,11 +5263,12 @@ def process_image_evidence(
     ocr = _run_processing_slot(
         db_path=db_path,
         content_id=content_id,
-        source_sha256=media_manifest.sha256,
+        source_sha256=managed_slot_source(bundle, media_manifest.sha256) if bundle is not None else media_manifest.sha256,
         processor_type="ocr",
         processor_version=versions["ocr"],
         artifact_type="ocr",
         produce=produce_ocr,
+        metadata=output_metadata,
         claim_validator=revalidate_without_result,
         commit_validator=revalidate_without_result,
         expected_output_path=target,
@@ -5039,6 +5573,14 @@ def _existing_complete_evidence(
         content = connection.execute(
             "SELECT content_type FROM content_items WHERE id=?", (content_id,)
         ).fetchone()
+        bundle, original = managed_bound_artifact(connection, content_id, ("media", "media_manifest"))
+        if bundle is not None:
+            managed_required = {"media": original}
+            for category in (("asr", "ocr") if content is not None and content["content_type"] == "video" else ("ocr",)):
+                managed_required[category] = managed_bound_artifact(connection, content_id, (category,))[1]
+            return {
+                key: int(row["id"]) for key, row in managed_required.items() if row is not None
+            } if all(row is not None for row in managed_required.values()) else None
         rows = connection.execute(
             """
             SELECT id,artifact_type FROM evidence_artifacts
@@ -5065,6 +5607,188 @@ def _existing_complete_evidence(
     return latest if required <= latest.keys() else None
 
 
+def _read_douyin_group_raw(
+    row: sqlite3.Row, *, connection: sqlite3.Connection | None = None
+) -> Dict[str, Any]:
+    """Read existing TikHub evidence; this path must never call a provider."""
+    if (
+        row["provider"] not in {"TikHub", "tikhub"}
+        or type(row["http_status"]) is not int
+        or row["http_status"] != 200
+        or type(row["byte_size"]) is not int
+        or row["byte_size"] <= 0
+        or not _valid_sha256(row["sha256"])
+    ):
+        raise MediaProcessingError("Douyin image raw provider or HTTP evidence is invalid")
+    try:
+        if "raw_blob_id" in row.keys() and row["raw_blob_id"] is not None:
+            if connection is None:
+                raise raw_evidence_module.RawEvidenceError("managed raw source requires its database connection")
+            entity = raw_archive.read_response_entity(connection, int(row["id"]))
+        else:
+            entity = raw_evidence_module.read_raw_evidence(
+                _resolved(str(row["local_path"])),
+                expected_stored_sha256=str(row["sha256"]),
+                expected_stored_size=int(row["byte_size"]),
+            ).entity_bytes
+    except raw_evidence_module.RawEvidenceError as exc:
+        if isinstance(exc, raw_archive.RawArchiveError) and str(exc).startswith("raw_expired:"):
+            raise RawMediaSourceExpiredError(
+                "raw_expired: Douyin image source is unavailable; provider reacquisition is disabled"
+            ) from exc
+        raise MediaProcessingError(
+            "Douyin image raw SHA-256, byte size, or sidecar is invalid"
+        ) from exc
+    try:
+        body = json.loads(entity)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise MediaProcessingError("Douyin image raw is invalid JSON") from exc
+    if not isinstance(body, dict):
+        raise MediaProcessingError("Douyin image raw is not an object")
+    return body
+
+
+def _raw_douyin_image_groups(
+    body: Mapping[str, Any], *, urls: List[str], aweme_id: str, author_uid: str
+) -> List[Dict[str, Any]]:
+    # Do not reuse the discovery parser's ID deduplication: duplicate matches
+    # must be rejected rather than silently choosing one image arrangement.
+    from .providers import _douyin_image_url_groups
+
+    data = body.get("data")
+    if type(body.get("code")) is not int or body["code"] != 200 or not isinstance(data, dict):
+        raise MediaProcessingError("Douyin image raw has an unsuccessful provider code")
+    upstream_code = data.get("status_code")
+    if upstream_code is not None and not (
+        type(upstream_code) is int and upstream_code == 0
+        or type(upstream_code) is str and upstream_code == "0"
+    ):
+        raise MediaProcessingError("Douyin image raw has an unsuccessful business code")
+    matches: List[Mapping[str, Any]] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            if "aweme_id" in value:
+                if type(value["aweme_id"]) is str and value["aweme_id"] == aweme_id:
+                    matches.append(value)
+                return
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(data)
+    if len(matches) != 1:
+        raise MediaProcessingError("Douyin image raw must uniquely match the requested work")
+    aweme = matches[0]
+    author = aweme.get("author")
+    if not isinstance(author, dict) or type(author.get("uid")) is not str or author["uid"] != author_uid:
+        raise MediaProcessingError("Douyin image raw author UID does not match the content")
+    images = aweme.get("images")
+    if not isinstance(images, list) or not images or any(not isinstance(value, dict) for value in images):
+        raise MediaProcessingError("Douyin image raw has no complete images array")
+    exact: List[List[str]] = []
+    for item in images:
+        download_urls, url_list = item.get("download_url_list"), item.get("url_list")
+        if (
+            not isinstance(download_urls, list) or not isinstance(url_list, list)
+            or any(type(url) is not str for url in download_urls + url_list)
+            or not download_urls + url_list
+        ):
+            raise MediaProcessingError("Douyin image raw has an incomplete candidate group")
+        exact.append(list(dict.fromkeys(download_urls + url_list)))
+    candidates = _douyin_image_url_groups(aweme)
+    if candidates != exact or len(candidates) != len(images):
+        raise MediaProcessingError("Douyin image raw candidates were normalized or skipped")
+    return douyin_image_source_groups(urls, candidates)
+
+
+
+def _derive_douyin_image_groups(
+    content_id: int, *, source_artifact: Mapping[str, Any], db_path: Path
+) -> List[Dict[str, Any]]:
+    """Bind default queues to the original images[] boundaries, not URL guesses."""
+    with connect(db_path) as connection:
+        connection.execute("BEGIN")
+        source = connection.execute(
+            """SELECT * FROM evidence_artifacts WHERE content_id=?
+               AND artifact_type='media_source' AND status='available' ORDER BY id DESC LIMIT 1""",
+            (content_id,),
+        ).fetchone()
+        if (
+            source is None or source["id"] != source_artifact["id"]
+            or source["sha256"] != source_artifact["sha256"]
+        ):
+            raise MediaProcessingError("Douyin image current media source changed")
+        urls, _source_sha256 = _validated_image_media_source(source)
+        raw_id = json.loads(source["metadata_json"])["raw_response_id"]
+        content = connection.execute(
+            "SELECT * FROM content_items WHERE id=?", (content_id,)
+        ).fetchone()
+        if content is None or content["platform"] != "douyin" or content["content_type"] != "image":
+            raise MediaProcessingError("Douyin image source content identity changed")
+        aweme_id, uid = content["platform_content_id"], content["raw_account_uid"]
+        account_id = content["account_id"]
+        if type(aweme_id) is not str or not aweme_id or type(uid) is not str or not uid:
+            raise MediaProcessingError("Douyin frozen discovery groups require exact work and author identities")
+        if account_id is not None:
+            identity = connection.execute(
+                "SELECT uid FROM account_platform_identities WHERE account_id=? AND platform='douyin'",
+                (account_id,),
+            ).fetchall()
+            if len(identity) != 1 or identity[0]["uid"] != uid:
+                raise MediaProcessingError("Douyin image account identity does not match content UID")
+        raw = connection.execute(
+            "SELECT * FROM provider_raw_responses WHERE id=?", (raw_id,)
+        ).fetchone()
+        if raw is None:
+            raise MediaProcessingError("Douyin image source raw is missing")
+        if raw["operation"] == "douyin_video_detail":
+            if raw["content_id"] != content_id or raw["account_id"] not in (None, account_id):
+                raise MediaProcessingError("Douyin image detail raw belongs to another target")
+        elif raw["operation"] == "douyin_user_posts":
+            if account_id is None or raw["account_id"] != account_id or raw["content_id"] is not None:
+                raise MediaProcessingError("Douyin image discovery raw belongs to another account")
+        else:
+            raise MediaProcessingError("Douyin image source raw operation is unsupported")
+        body = _read_douyin_group_raw(raw, connection=connection)
+        if "derived_from_operation" in body:
+            normalized = body.get("data")
+            source_id = body.get("source_raw_response_id")
+            if (
+                set(body) != {
+                    "stage", "data", "derived_from_operation", "source_raw_response_id",
+                    "source_sha256", "source_captured_at",
+                }
+                or raw["operation"] != "douyin_video_detail"
+                or body.get("stage") != "detail"
+                or body.get("derived_from_operation") != "douyin_user_posts"
+                or type(source_id) is not int or source_id <= 0 or source_id == raw_id
+                or not isinstance(normalized, dict)
+                or normalized.get("content_type") != "image"
+                or normalized.get("account_uid") != uid
+                or normalized.get("media_urls") != urls
+            ):
+                raise MediaProcessingError("Douyin image derived detail binding is invalid")
+            discovery = connection.execute(
+                "SELECT * FROM provider_raw_responses WHERE id=?", (source_id,)
+            ).fetchone()
+            if (
+                discovery is None or account_id is None
+                or discovery["account_id"] != account_id or discovery["content_id"] is not None
+                or discovery["operation"] != "douyin_user_posts"
+                or discovery["sha256"] != body["source_sha256"]
+                or discovery["captured_at"] != body["source_captured_at"]
+            ):
+                raise MediaProcessingError("Douyin image derived discovery evidence changed")
+            body = _read_douyin_group_raw(discovery, connection=connection)
+        return _raw_douyin_image_groups(body, urls=urls, aweme_id=aweme_id, author_uid=uid)
+
+
+
+@_media_availability_result
+@_original_lease("media_processing")
 def process_content_media(
     content_id: int,
     *,
@@ -5131,8 +5855,13 @@ def process_content_media(
         source=source_artifact,
         db_path=db_path,
     )
+    effective_groups = frozen_image_groups
     if cached_media is not None:
         media = cached_media
+        if media_kind == "image" and content["platform"] == "douyin" and effective_groups is None:
+            effective_groups = _derive_douyin_image_groups(
+                content_id, source_artifact=source_artifact, db_path=db_path
+            )
     else:
         try:
             with connect(db_path) as connection:
@@ -5145,14 +5874,13 @@ def process_content_media(
             urls, _logical_source_sha256 = _validated_media_source(
                 source_row, expected_media_kind=media_kind
             )
-            effective_groups = frozen_image_groups
             if (
                 media_kind == "image"
                 and effective_groups is None
                 and content["platform"] == "douyin"
             ):
-                raise MediaProcessingError(
-                    "Douyin image processing requires frozen discovery groups"
+                effective_groups = _derive_douyin_image_groups(
+                    content_id, source_artifact=source_artifact, db_path=db_path
                 )
             reuse_legacy = _legacy_download_succeeded(
                 content_id=content_id,
@@ -5240,12 +5968,6 @@ def process_content_media(
             maximum_duration_seconds=maximum_video_duration_seconds,
         )
     elif media_kind == "image":
-        effective_groups = frozen_image_groups
-        if effective_groups is None:
-            if content["platform"] == "douyin":
-                raise MediaProcessingError(
-                    "Douyin image processing requires frozen discovery groups"
-                )
         artifacts = process_image_evidence(
             content_id,
             _resolved(media.local_path),
@@ -5394,7 +6116,7 @@ def _validated_recovery_artifact(
         or row["byte_size"] != evidence.byte_size
         or row["sha256"] != evidence.sha256
         or row["metadata_json"]
-        != json.dumps(dict(expected_metadata), ensure_ascii=False, sort_keys=True)
+        != _expected_metadata_json(expected_metadata, row["metadata_json"])
     ):
         return None
     if evidence.body is not None:
@@ -5426,6 +6148,12 @@ def _current_recovery_download(
     ).fetchone()
     if content is None:
         return None
+    bundle = _managed_bundle(connection, content_id)
+    if bundle is not None:
+        from .media_retention import original_availability
+
+        if original_availability(connection, content_id)["reason"] != "original_available":
+            return None
     try:
         source_row, body, urls, flat_source_sha256 = _validated_recovery_media_source(
             connection, content_id=content_id
@@ -5440,8 +6168,17 @@ def _current_recovery_download(
     groups: Optional[List[Dict[str, Any]]] = None
     if media_kind == "image":
         if platform == "douyin":
-            return None
-        groups = image_source_groups(urls, platform=platform)
+            if bundle is None:
+                return None
+            try:
+                groups = _derive_douyin_image_groups(
+                    content_id, source_artifact=dict(source_row),
+                    db_path=Path(connection.execute("PRAGMA database_list").fetchone()[2]),
+                )
+            except MediaProcessingError:
+                return None
+        else:
+            groups = image_source_groups(urls, platform=platform)
         groups_sha256 = image_groups_sha256(groups)
         logical_source_sha256 = image_download_binding_sha256(
             flat_source_sha256, groups_sha256
@@ -5472,6 +6209,12 @@ def _current_recovery_download(
     ):
         return None
     output_artifact_id = slots[0]["output_artifact_id"]
+    effective_root = MEDIA_ROOT
+    if bundle is not None:
+        if (output_artifact_id != bundle["manifest"]["original_artifact"]["artifact_id"]
+                or slots[0]["id"] != bundle["manifest"]["download_slot"]["id"]):
+            return None
+        effective_root = Path(bundle["instance_root"])
     if media_kind == "video":
         artifact = _validated_recovery_artifact(
             connection,
@@ -5479,14 +6222,14 @@ def _current_recovery_download(
             content_id=content_id,
             artifact_type="media",
             processor_version=VIDEO_DOWNLOAD_VERSION,
-            expected_path=(
+            expected_path=_resolved(bundle["manifest"]["original_artifact"]["local_path"]) if bundle is not None else (
                 MEDIA_ROOT
                 / link_id
                 / "downloads"
                 / logical_source_sha256
                 / "source.mp4"
             ),
-            expected_root=MEDIA_ROOT,
+            expected_root=effective_root,
             expected_metadata={
                 "source_count": len(urls),
                 "source_sha256": flat_source_sha256,
@@ -5501,6 +6244,8 @@ def _current_recovery_download(
             / "images"
             / "manifest.json"
         )
+        if bundle is not None:
+            expected_manifest = Path(bundle["evidence_root"]) / "download-manifest.json"
         artifact_row = connection.execute(
             "SELECT * FROM evidence_artifacts WHERE id=?", (output_artifact_id,)
         ).fetchone()
@@ -5511,7 +6256,7 @@ def _current_recovery_download(
         try:
             _require_no_symlink_below_root(
                 expected_manifest,
-                root=MEDIA_ROOT,
+                root=effective_root,
                 label="current image download manifest",
             )
             manifest_evidence = _read_private_file_evidence(
@@ -5543,6 +6288,7 @@ def _current_recovery_download(
                     "image_groups_sha256": image_groups_sha256(groups or []),
                     "download_binding_sha256": logical_source_sha256,
                 },
+                originals_root=Path(bundle["originals_root"]) if bundle is not None else None,
             )
         except MediaProcessingError:
             return None
@@ -5558,13 +6304,15 @@ def _current_recovery_frames_artifact(
     media_artifact: Artifact,
 ) -> Optional[Artifact]:
     version = processor_versions()["frames"]
+    bundle = _managed_bundle(connection, content_id)
+    source_key = managed_slot_source(bundle, media_artifact.sha256) if bundle is not None else media_artifact.sha256
     slot = connection.execute(
         """
         SELECT * FROM media_processing_slots
         WHERE content_id=? AND source_sha256=? AND processor_type='frames'
           AND processor_version=?
         """,
-        (content_id, media_artifact.sha256, version),
+        (content_id, source_key, version),
     ).fetchone()
     if (
         slot is None
@@ -5589,9 +6337,14 @@ def _current_recovery_frames_artifact(
         content_id=content_id,
         artifact_type="frames_manifest",
         processor_version=version,
-        expected_path=MEDIA_ROOT / link_id / "frames" / "frames.json",
-        expected_root=MEDIA_ROOT,
-        expected_metadata={},
+        expected_path=managed_evidence_path(
+            bundle, stage="frames", source_sha256=media_artifact.sha256,
+            processor_version=version, filename="frames.json",
+        ) if bundle is not None else MEDIA_ROOT / link_id / "frames" / "frames.json",
+        expected_root=Path(bundle["instance_root"]) if bundle is not None else MEDIA_ROOT,
+        expected_metadata=managed_evidence_metadata(
+            bundle, source_sha256=media_artifact.sha256, processor_version=version
+        ) if bundle is not None else {},
     )
 
 
@@ -5615,7 +6368,8 @@ def _generic_recovery_slot_allowed(
     ).fetchone()
     if content is None:
         return False
-    if content["platform"] == "douyin" and content["content_type"] == "image":
+    bundle = _managed_bundle(connection, int(row["content_id"]))
+    if bundle is None and content["platform"] == "douyin" and content["content_type"] == "image":
         return False
     current_download = _current_recovery_download(
         connection,
@@ -5632,11 +6386,14 @@ def _generic_recovery_slot_allowed(
         )
     if expected_version is None or download_artifact is None:
         return False
+    def source_key(sha256: str) -> str:
+        return managed_slot_source(bundle, sha256) if bundle is not None else sha256
+
     if processor_type in {"frames", "asr"}:
-        return row["source_sha256"] == download_artifact.sha256
+        return row["source_sha256"] == source_key(download_artifact.sha256)
     if processor_type == "ocr":
         if content["content_type"] == "image":
-            return row["source_sha256"] == download_artifact.sha256
+            return row["source_sha256"] == source_key(download_artifact.sha256)
         frames_artifact = _current_recovery_frames_artifact(
             connection,
             content_id=int(row["content_id"]),
@@ -5644,7 +6401,7 @@ def _generic_recovery_slot_allowed(
         )
         return (
             frames_artifact is not None
-            and row["source_sha256"] == frames_artifact.sha256
+            and row["source_sha256"] == source_key(frames_artifact.sha256)
         )
     return False
 
@@ -5852,7 +6609,8 @@ def _queue_content_ids(
             SELECT c.id,c.content_type,c.platform,
                    source.id AS source_artifact_id,
                    source.sha256 AS source_artifact_sha256,
-                   source.processor_version AS source_processor_version
+                   source.processor_version AS source_processor_version,
+                   source_raw.id AS source_raw_id
             FROM content_items c
             JOIN evidence_artifacts source ON source.id=(
                 SELECT current_source.id FROM evidence_artifacts current_source
@@ -5860,6 +6618,10 @@ def _queue_content_ids(
                   AND current_source.artifact_type='media_source'
                   AND current_source.status='available'
                 ORDER BY current_source.id DESC LIMIT 1
+            )
+            LEFT JOIN provider_raw_responses source_raw ON source_raw.id=(
+                CASE WHEN json_valid(source.metadata_json)
+                     THEN json_extract(source.metadata_json,'$.raw_response_id') END
             )
             {scope_clause}
             ORDER BY (c.published_at IS NULL) ASC, c.published_at DESC, c.id DESC
@@ -5898,6 +6660,21 @@ def _queue_content_ids(
             f"WHERE status='available'{artifact_scope_clause}",
             artifact_scope_parameters,
         ).fetchall()
+        managed_ids = {
+            int(item[0]) for item in connection.execute(
+                "SELECT DISTINCT content_id FROM evidence_artifacts WHERE artifact_type='media_lifecycle_manifest'"
+            )
+        }
+        bundles = {
+            int(item["id"]): _managed_bundle(connection, int(item["id"]))
+            for item in rows if int(item["id"]) in managed_ids
+        }
+        from .media_retention import original_availability
+
+        original_reasons = {
+            content_id: original_availability(connection, content_id)["reason"]
+            for content_id, bundle in bundles.items() if bundle is not None
+        } if stage == "process" else {}
     slots_by_content: Dict[int, List[sqlite3.Row]] = {}
     for slot_row in slot_rows:
         slots_by_content.setdefault(int(slot_row["content_id"]), []).append(slot_row)
@@ -5936,14 +6713,21 @@ def _queue_content_ids(
     selected: List[int] = []
     for row in rows:
         content_id = int(row["id"])
-        platform = str(row["platform"] or "")
+        bundle = bundles.get(content_id)
+        if stage == "process" and content_id in managed_ids and (
+            bundle is None or original_reasons.get(content_id) != "original_available"
+        ):
+            continue
         media_kind = str(row["content_type"] or "")
         source_sha256 = row["source_artifact_sha256"]
         if (
             media_kind not in {"video", "image"}
             or row["source_processor_version"] != MEDIA_SOURCE_VERSION
             or not _valid_sha256(source_sha256)
-            or (media_kind == "image" and platform == "douyin")
+            or (
+                media_kind == "image" and row["platform"] == "douyin"
+                and row["source_raw_id"] is None
+            )
         ):
             continue
         download_version = (
@@ -5970,19 +6754,25 @@ def _queue_content_ids(
             output_artifact_id = effective_download["output_artifact_id"]
             if output_artifact_id is None:
                 continue
+            if bundle is not None and (
+                output_artifact_id != bundle["manifest"]["original_artifact"]["artifact_id"]
+                or effective_download["id"] != bundle["manifest"]["download_slot"]["id"]
+            ):
+                continue
             media_sha256 = artifact_sha256s.get(int(output_artifact_id))
             if media_sha256 is None:
                 continue
+            media_slot_source = managed_slot_source(bundle, media_sha256) if bundle is not None else media_sha256
             if row["content_type"] == "video":
                 frames = slot_for(
                     content_slots,
-                    source_sha256=media_sha256,
+                    source_sha256=media_slot_source,
                     processor_type="frames",
                     processor_version=current_versions["frames"],
                 )
                 asr = slot_for(
                     content_slots,
-                    source_sha256=media_sha256,
+                    source_sha256=media_slot_source,
                     processor_type="asr",
                     processor_version=current_versions["asr"],
                 )
@@ -5999,7 +6789,7 @@ def _queue_content_ids(
                     required_slots.append(
                         slot_for(
                             content_slots,
-                            source_sha256=frames_sha256,
+                            source_sha256=managed_slot_source(bundle, frames_sha256) if bundle is not None else frames_sha256,
                             processor_type="ocr",
                             processor_version=current_versions["ocr"],
                         )
@@ -6008,7 +6798,7 @@ def _queue_content_ids(
                 required_slots = [
                     slot_for(
                         content_slots,
-                        source_sha256=media_sha256,
+                        source_sha256=media_slot_source,
                         processor_type="ocr",
                         processor_version=current_versions["ocr"],
                     )
@@ -6153,7 +6943,10 @@ def run_media_download_queue(
 
     workers = max(1, min(max_workers, len(content_ids))) if content_ids else 1
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        results = list(executor.map(download, content_ids))
+        # Keep the frozen scheduler owner and history budget class when a
+        # worker needs a paid URL refresh. Each worker needs its own context.
+        futures = [executor.submit(copy_context().run, download, cid) for cid in content_ids]
+        results = [future.result() for future in futures]
     retryable_failed = sum(item["status"] == "retryable_failed" for item in results)
     terminal_failed = sum(item["status"] == "terminal_failed" for item in results)
     return {

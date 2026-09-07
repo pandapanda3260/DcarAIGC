@@ -13,12 +13,22 @@ project_root="${DCAR_PROJECT_ROOT:-}"
 [[ -d "$project_root" ]] || fail "project root does not exist"
 project_root="$(cd "$project_root" && pwd -P)"
 
+scheduler_start_paused="${DCAR_SCHEDULER_START_PAUSED:-0}"
+case "$scheduler_start_paused" in
+  0|1) ;;
+  *) fail "DCAR_SCHEDULER_START_PAUSED must be 0 or 1" ;;
+esac
+
 [[ "${DCAR_WORKER_HOST:-}" == "127.0.0.1" ]] || \
   fail "worker host must be 127.0.0.1"
 [[ "${DCAR_WORKER_PORT:-}" == "8766" ]] || \
   fail "worker port must be 8766; port 8765 is reserved for the freeze read-only viewer"
 [[ -z "${TIKHUB_API_KEY:-}" ]] || \
   fail "direct TIKHUB_API_KEY values are forbidden; use an external key file"
+[[ -z "${TIKHUB_API_BASE:-}" ]] || \
+  fail "direct TIKHUB_API_BASE values are forbidden; use the external TikHub config file"
+[[ -z "${DCAR_LOADED_BUILD_ID:-}" ]] || \
+  fail "DCAR_LOADED_BUILD_ID must be derived from the loaded build receipt"
 
 reconcile_from="${DCAR_DAILY_CAPTURE_RECONCILE_FROM:-}"
 unset DCAR_DAILY_CAPTURE_RECONCILE_FROM
@@ -42,6 +52,32 @@ case "$writer_env_mode" in
   *) fail "writer environment file must have mode 0400 or 0600" ;;
 esac
 
+loaded_build_receipt="${DCAR_LOADED_BUILD_RECEIPT:-}"
+[[ -n "$loaded_build_receipt" ]] || fail "DCAR_LOADED_BUILD_RECEIPT is missing"
+[[ "$loaded_build_receipt" = /* ]] || \
+  fail "DCAR_LOADED_BUILD_RECEIPT must be absolute"
+[[ -f "$loaded_build_receipt" && ! -L "$loaded_build_receipt" ]] || \
+  fail "loaded build receipt must be a regular, non-symlink file"
+[[ "$(/usr/bin/stat -f '%l' "$loaded_build_receipt")" == "1" ]] || \
+  fail "loaded build receipt must be a single-link file"
+[[ "$(/usr/bin/stat -f '%u' "$loaded_build_receipt")" == "$(/usr/bin/id -u)" ]] || \
+  fail "loaded build receipt must be owned by the current user"
+[[ "$(/usr/bin/stat -f '%Lp' "$loaded_build_receipt")" == "600" ]] || \
+  fail "loaded build receipt must have mode 0600"
+loaded_build_receipt_dir="$(cd "$(dirname "$loaded_build_receipt")" && pwd -P)" || \
+  fail "loaded build receipt parent is unavailable"
+loaded_build_receipt_path="$loaded_build_receipt_dir/$(basename "$loaded_build_receipt")"
+case "$loaded_build_receipt_path" in
+  "$project_root"|"$project_root"/*)
+    fail "loaded build receipt must stay outside the repository"
+    ;;
+esac
+loaded_build_sha256="$(
+  /usr/bin/shasum -a 256 "$loaded_build_receipt_path" | /usr/bin/awk '{print $1}'
+)" || fail "loaded build receipt SHA-256 could not be calculated"
+[[ "$loaded_build_sha256" =~ ^[0-9a-f]{64}$ ]] || \
+  fail "loaded build receipt SHA-256 is invalid"
+
 tikhub_key_file=""
 cost_authorization=""
 while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
@@ -64,8 +100,8 @@ while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
   esac
 done < "$writer_env"
 
-[[ "$cost_authorization" == "I_ACKNOWLEDGE_DAILY_PROVIDER_LIMIT_USD_20" ]] || \
-  fail "daily USD 20 provider budget has not been explicitly authorized"
+[[ "$cost_authorization" == "I_ACKNOWLEDGE_DAILY_PROVIDER_LIMIT_USD_100" ]] || \
+  fail "daily USD 100 provider budget has not been explicitly authorized"
 [[ -n "$tikhub_key_file" && "$tikhub_key_file" = /* ]] || \
   fail "TIKHUB_API_KEY_FILE must be an absolute external path"
 [[ -f "$tikhub_key_file" && ! -L "$tikhub_key_file" ]] || \
@@ -88,27 +124,68 @@ esac
   fail "TikHub config file must contain exactly one TIKHUB_API_KEY"
 [[ "$(/usr/bin/grep -Ec '^[[:space:]]*TIKHUB_API_BASE=' "$key_file_path")" == "1" ]] || \
   fail "TikHub config file must contain exactly one TIKHUB_API_BASE"
-/usr/bin/grep -Fxq 'TIKHUB_API_BASE=https://api.tikhub.io' "$key_file_path" || \
-  fail "TIKHUB_API_BASE must be exactly https://api.tikhub.io"
+if ! /usr/bin/grep -Fxq 'TIKHUB_API_BASE=https://api.tikhub.dev' "$key_file_path" && \
+  ! /usr/bin/grep -Fxq 'TIKHUB_API_BASE=https://api.tikhub.io' "$key_file_path"; then
+  fail "TIKHUB_API_BASE must be exactly https://api.tikhub.dev or https://api.tikhub.io"
+fi
 
 python_bin="$project_root/.venv/bin/python"
 [[ -x "$python_bin" ]] || fail "project virtualenv Python is missing"
+writer_database="${DCAR_V8_DB:-}"
+[[ "$writer_database" = /* && -s "$writer_database" && ! -L "$writer_database" ]] || \
+  fail "formal writer database is missing or unsafe; refusing to create a new one"
+writer_lock="${DCAR_WRITER_LOCK:-}"
+[[ "$writer_lock" = /* && -f "$writer_lock" && ! -L "$writer_lock" ]] || \
+  fail "installed writer lock is missing or unsafe"
+PYTHONPATH="$project_root/src/dcar_eval" \
+  "$python_bin" -m v8.runtime_database \
+  --access writer \
+  --db "$writer_database" \
+  --project-root "$project_root" \
+  --check >/dev/null || fail "installed writer database contract mismatch"
+
 for required_command in ffmpeg ffprobe swiftc; do
   command -v "$required_command" >/dev/null 2>&1 || \
     fail "$required_command is missing from the LaunchAgent PATH"
 done
 "$python_bin" -c 'import mlx_whisper' >/dev/null 2>&1 || \
   fail "mlx-whisper is not importable from the project virtualenv"
-[[ -s "${DCAR_V8_DB:-}" ]] || \
-  fail "formal writer database is missing or empty; refusing to create a new one"
+writer_database_dir="$(cd "$(dirname "$writer_database")" && pwd -P)"
+writer_database_path="$writer_database_dir/$(basename "$writer_database")"
+case "$writer_database_path" in
+  "$project_root"|"$project_root"/*)
+    fail "writer database must stay outside the repository"
+    ;;
+esac
+legacy_database="${DCAR_LEGACY_DB:-}"
+[[ "$legacy_database" = /* && -s "$legacy_database" && ! -L "$legacy_database" ]] || \
+  fail "legacy database is missing or unsafe"
+legacy_database_dir="$(cd "$(dirname "$legacy_database")" && pwd -P)"
+legacy_database_path="$legacy_database_dir/$(basename "$legacy_database")"
+case "$legacy_database_path" in
+  "$project_root"|"$project_root"/*)
+    fail "legacy database must stay outside the repository"
+    ;;
+esac
 
 export TIKHUB_API_KEY_FILE="$key_file_path"
+export DCAR_LOADED_BUILD_RECEIPT="$loaded_build_receipt_path"
+export DCAR_LOADED_BUILD_ID="sha256:$loaded_build_sha256"
 export DCAR_READ_ONLY=0
 export DCAR_SCHEDULER_ENABLED=1
-export DCAR_STARTUP_CATCHUP_ENABLED=1
+export DCAR_SCHEDULER_START_PAUSED="$scheduler_start_paused"
+if [[ "$scheduler_start_paused" == "1" ]]; then
+  export DCAR_STARTUP_CATCHUP_ENABLED=0
+else
+  export DCAR_STARTUP_CATCHUP_ENABLED=1
+fi
 export DCAR_DAILY_CAPTURE_RECONCILE_FROM="$reconcile_from"
 
-echo "Dcar writer worker starting on 127.0.0.1:8766; scheduler=1 catchup=report_only"
+if [[ "$scheduler_start_paused" == "1" ]]; then
+  echo "Dcar writer worker starting on 127.0.0.1:8766; scheduler=paused catchup=disabled"
+else
+  echo "Dcar writer worker starting on 127.0.0.1:8766; scheduler=1 catchup=report_only"
+fi
 exec /usr/bin/caffeinate -s \
   "$python_bin" -m uvicorn v8.api:app \
   --app-dir "$project_root/src/dcar_eval" \

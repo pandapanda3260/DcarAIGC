@@ -22,12 +22,12 @@ publisher_env="${DCAR_PUBLISHER_ENV_FILE:-}"
 
 python_bin="$project_root/.venv/bin/python"
 [[ -x "$python_bin" ]] || fail "project virtualenv Python is missing"
-[[ -s "${DCAR_V8_DB:-}" && ! -L "${DCAR_V8_DB:-}" ]] || \
-  fail "formal writer database is missing or unsafe"
 [[ -z "${TIKHUB_API_KEY:-}" ]] || \
   fail "the snapshot publisher must not receive a provider key"
 [[ -z "${TIKHUB_API_KEY_FILE:-}" ]] || \
   fail "the snapshot publisher must not receive a provider key file"
+[[ "${DCAR_READ_ONLY:-}" == "1" ]] || \
+  fail "the publisher runtime must remain read-only"
 [[ "${DCAR_SCHEDULER_ENABLED:-}" == "0" ]] || \
   fail "the publisher LaunchAgent must not enable a scheduler"
 [[ "${DCAR_STARTUP_CATCHUP_ENABLED:-}" == "0" ]] || \
@@ -37,20 +37,59 @@ arguments=(
   "$project_root/deploy/macos/publish_snapshot.py"
   --project-root "$project_root"
   --env-file "$publisher_env"
-  --db "$DCAR_V8_DB"
 )
-if [[ -n "${DCAR_LEGACY_DB:-}" ]]; then
-  arguments+=(--legacy-db "$DCAR_LEGACY_DB")
-fi
-if [[ "${1:-}" == "--check" ]]; then
+publisher_intent=""
+if [[ "${1:-}" == "--check" && $# -eq 1 ]]; then
+  publisher_intent="formal_read"
   arguments+=(--check)
-elif [[ "${1:-}" == "--remote-check" ]]; then
+elif [[ "${1:-}" == "--remote-check" && $# -eq 1 ]]; then
+  publisher_intent="remote_only"
   arguments+=(--remote-check)
+elif [[ "${1:-}" == "--resume-local-snapshot" && $# -eq 2 ]]; then
+  publisher_intent="sealed_resume"
+  snapshot_id="$2"
+  [[ "$snapshot_id" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$ ]] || \
+    fail "resume snapshot ID is invalid"
+  arguments+=(--resume-local-snapshot "$snapshot_id")
+elif [[ "${1:-}" == "--resume-staged-snapshot" && $# -eq 2 ]]; then
+  publisher_intent="sealed_resume"
+  snapshot_id="$2"
+  [[ "$snapshot_id" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$ ]] || \
+    fail "resume snapshot ID is invalid"
+  arguments+=(--resume-staged-snapshot "$snapshot_id")
 elif [[ $# -eq 0 ]]; then
+  publisher_intent="formal_read"
   arguments+=(--automatic)
 else
-  fail "only the optional --check or --remote-check argument is supported"
+  fail "only --check, --remote-check, or --resume-staged-snapshot SNAPSHOT_ID or --resume-local-snapshot SNAPSHOT_ID is supported"
 fi
 
-echo "Dcar snapshot publisher starting; provider_calls=0 catchup=0"
+if [[ "$publisher_intent" == "formal_read" ]]; then
+  [[ -s "${DCAR_V8_DB:-}" && ! -L "${DCAR_V8_DB:-}" ]] || \
+    fail "formal writer database is missing or unsafe"
+  writer_database_dir="$(cd "$(dirname "$DCAR_V8_DB")" && pwd -P)"
+  writer_database_path="$writer_database_dir/$(basename "$DCAR_V8_DB")"
+  case "$writer_database_path" in
+    "$project_root"|"$project_root"/*)
+      fail "writer database must stay outside the repository"
+      ;;
+  esac
+  arguments+=(--db "$writer_database_path")
+  if [[ -n "${DCAR_LEGACY_DB:-}" ]]; then
+    [[ -s "$DCAR_LEGACY_DB" && ! -L "$DCAR_LEGACY_DB" ]] || \
+      fail "legacy database is missing or unsafe"
+    legacy_database_dir="$(cd "$(dirname "$DCAR_LEGACY_DB")" && pwd -P)"
+    legacy_database_path="$legacy_database_dir/$(basename "$DCAR_LEGACY_DB")"
+    case "$legacy_database_path" in
+      "$project_root"|"$project_root"/*)
+        fail "legacy database must stay outside the repository"
+        ;;
+    esac
+    arguments+=(--legacy-db "$legacy_database_path")
+  fi
+else
+  unset DCAR_V8_DB DCAR_LEGACY_DB DCAR_WRITER_LOCK
+fi
+
+echo "Dcar snapshot publisher starting; intent=$publisher_intent provider_calls=0 catchup=0"
 exec /usr/bin/caffeinate -i "$python_bin" "${arguments[@]}"

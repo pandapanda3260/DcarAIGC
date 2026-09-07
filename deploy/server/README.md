@@ -35,9 +35,22 @@ sudo install -d -o dcar-douyin -g dcar-douyin -m 0700 \
   /var/lib/dcar-aigc/douyin-control
 sudo install -d -o root -g root -m 0700 \
   /var/backups/dcar-aigc/douyin-control \
+  /var/backups/dcar-aigc/auth \
   /etc/dcar-aigc/credentials
+sudo install -d -o dcar-aigc -g dcar-aigc -m 0700 /var/lib/dcar-aigc/auth-smoke
 sudo install -d -o root -g root -m 0755 /var/lib/dcar-aigc/runtime
 ```
+
+The authentication gateway reads two root-only credential files through
+systemd `LoadCredential`: `/etc/dcar-aigc/credentials/sms-tencent` (Tencent
+Cloud SMS, `KEY=VALUE` lines — the `TENCENT_SMS_*` section of `dcar.env.local`
+copied verbatim: `TENCENT_SMS_SECRET_ID`, `TENCENT_SMS_SECRET_KEY`,
+`TENCENT_SMS_SDK_APP_ID`, `TENCENT_SMS_SIGN_NAME`, `TENCENT_SMS_TEMPLATE_ID`,
+optional `TENCENT_SMS_REGION` and `TENCENT_SMS_CODE_TTL_MINUTES`; quotes are
+accepted, unrelated keys are ignored) and `/etc/dcar-aigc/credentials/auth-pepper` (at least 32
+random hex characters, for example `python3 -c 'import secrets; print(secrets.token_hex(32))'`).
+Install both as `root:root` mode `0600` before the first release that ships the
+SQLite account store; see `AUTH.md`.
 
 The systemd units bind the persistent directories into the versioned release
 tree. Code releases must never carry or overwrite `app/data`, `data/cache`, or
@@ -158,30 +171,148 @@ a symlink or hard-link clone that lets a later install mutate the rollback
 environment.
 
 Keep each release's `.venv` inside that release. Installing a new dependency
-must not mutate the running or rollback release. The stage-0 release process
-must not invoke the snapshot installer. The unattended publisher may continue
-to reconcile; its installer blocks on the same snapshot-install lock, so the
-code-release critical section must remain short. The release script first takes
-that lock with non-blocking `flock -n` and exits without changing anything if
-the lock is held. After temporary-port API/Web/Auth/Control smoke checks pass,
-stop the four services, then switch `current` atomically:
+must not mutate the running or rollback release. For an auth-only upgrade,
+physically copy the current production release, then overlay only the reviewed
+auth/Web delta: production business/schema19 code may be newer than the branch
+baseline. Do not replace that code with a stale full repository archive. The
+code release does not invoke the snapshot installer or restart the macOS writer.
+
+The executable `deploy/server/libexec/dcar-auth-release.py` is the single auth
+cutover entrypoint. It checks the candidate on temporary ports while production
+is still running, then takes `snapshot-install.lock` using nonblocking
+`fcntl.flock(LOCK_EX | LOCK_NB)`, checks `current` again, stops services and the
+backup timer, makes a verified pre-migration backup, migrates/imports, provisions
+the first superadmin, makes a post-migration backup, installs the auth/backup
+units and both helpers, switches `current` atomically, and starts/checks services.
+It holds `/var/lib/dcar-aigc/runtime/snapshot-install.lock` through this critical
+section, matching the snapshot installer. A busy lock causes no service changes.
+
+The helper also checks disk headroom before smoke and again under the lock,
+before any service is stopped. For each actual filesystem containing the auth
+DB/sidecars, backups, audit log, receipt/saved units or installed helpers, it
+budgets migration journals, schema growth, both backups and atomic file writes,
+then requires **at least 2 GiB and 3% of total capacity still available**. Budgets
+sharing a device are added, and root-reserved blocks do not count. The two
+measurements are saved as `disk_preflight` / `disk_locked` in the receipt.
+Rollback/restore use the same checks with recovery-specific budgets. There is
+no environment variable or CLI flag to skip or lower this floor. A disk at 96%
+usage is not automatically rejected if its remaining capacity satisfies the
+actual budget; do not delete historical data or rollback releases just to reach
+an arbitrary 10% threshold. If the check fails, keep production running, add
+capacity or review precisely which generated artifacts are safe to relocate,
+and rerun preflight. Candidate cloning/build capacity must be checked before
+preparing the candidate; this helper sees that already-allocated space.
+
+The temporary-port Auth smoke must run through a transient systemd unit so the
+root-only credentials reach the `dcar-aigc` user exactly as in production, and
+it must use a scratch account store, never the live one:
 
 ```sh
-sudo systemctl stop dcar-auth dcar-douyin-control dcar-web dcar-api
-ln -s /var/www/dcar-aigc/releases/<release> /var/www/dcar-aigc/current.next
-mv -Tf /var/www/dcar-aigc/current.next /var/www/dcar-aigc/current
+REL=/var/www/dcar-aigc/releases/<release>
+sudo install -d -o dcar-aigc -g dcar-aigc -m 0700 /var/lib/dcar-aigc/auth-smoke
+sudo install -d -o root -g root -m 0700 /var/backups/dcar-aigc/auth
+sudo systemd-run --wait --pipe --collect --unit dcar-sms-test \
+  -p User=dcar-aigc -p Group=dcar-aigc \
+  -p LoadCredential=sms-tencent:/etc/dcar-aigc/credentials/sms-tencent \
+  -E PYTHONPATH="$REL/src/dcar_eval" \
+  "$REL/.venv/bin/python" -m dcar_auth.admin sms-test <verification-phone> \
+  --sms-credentials-file /run/credentials/dcar-sms-test.service/sms-tencent
+sudo systemd-run --unit dcar-auth-smoke -p User=dcar-aigc -p Group=dcar-aigc \
+  -p LoadCredential=sms-tencent:/etc/dcar-aigc/credentials/sms-tencent \
+  -p LoadCredential=auth-pepper:/etc/dcar-aigc/credentials/auth-pepper \
+  -E PYTHONPATH=$REL/src/dcar_eval -E DCAR_AUTH_BASE_PATH=/dcar \
+  -E DCAR_AUTH_WEB_UPSTREAM=http://127.0.0.1:<web-smoke-port> \
+  -E DCAR_AUTH_API_UPSTREAM=http://127.0.0.1:<api-smoke-port> \
+  -E DCAR_AUTH_SESSION_DB=/var/lib/dcar-aigc/auth-smoke/sessions.sqlite3 \
+  -E DCAR_AUTH_LOGIN_TEMPLATE=$REL/deploy/server/nginx/login.html \
+  -E DCAR_AUTH_SECURE_COOKIE=1 -E DCAR_AUTH_SMS_PROVIDER=tencent \
+  $REL/.venv/bin/python -m uvicorn dcar_auth.gateway:app \
+  --app-dir $REL/src/dcar_eval --host 127.0.0.1 --port 14173 --workers 1
+curl -fsS http://127.0.0.1:14173/dcar/auth/health
+curl -fsS http://127.0.0.1:14173/dcar/login | grep -c '<form '     # expect 3
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
+  -H 'Origin: http://127.0.0.1:14173' -H 'X-Dcar-Request: code' \
+  --data 'phone=13000000000&purpose=login' http://127.0.0.1:14173/dcar/auth/code   # expect 404, no SMS
 ```
 
-Record the previous symlink target and unit/Nginx files before this step. If any
-service or the public-path smoke check fails, first restore the previous Nginx
-configuration and reload it so no request reaches a stopped control plane; then
-stop the four new services, restore that exact symlink and the prior units,
-reload systemd, and start the previous four services. Before a code-only rollback,
-verify that the previous release supports
-the active SQLite `user_version`; otherwise roll back its matching data snapshot
-at the same time.
+Before cutover, also run `tests/run_auth_integration_browser_smoke.sh` against
+the candidate build/scratch stores: password/code login, reset and old-session
+revocation, disabled account 403 banner, and operator/admin/superadmin route and
+mutation controls. API/Web/Control temporary-port processes must be running and
+verified independently. Keep them and the scratch Auth service alive through
+the helper's pre-smoke; these are not production ports. A real Tencent send and
+phone receipt must already have passed with the production signature/template.
 
-Install the units and the Nginx include, then reload their configurations:
+Before cutover, **do not run new account CLI commands against the live old
+database**. Only explicit `migrate` changes the schema; normal commands such as
+`list`, `set-phone` and `allow-phone` check schema/health and reject an old or
+missing database with a "run migrate first" error. `sms-test` does not open the
+account database. Use it for the real receipt test, and keep other candidate
+experiments on scratch databases. Leave formal migration/import/bootstrap to
+`dcar-auth-release deploy`, which coordinates it with stop/backup/rollback.
+
+Use a new receipt filename for every attempt. Schema 0 imports htpasswd once;
+schema 1/2 migrates to schema 3 without re-importing its existing accounts; schema 3 is
+validated without re-import. New registrations receive `new_user` and must be
+explicitly authorized by an administrator before any business access. All paths below are server paths:
+
+```sh
+REL=/var/www/dcar-aigc/releases/<release>
+RECEIPT=/var/lib/dcar-aigc/runtime/auth-release-<UTC-timestamp>.json
+sudo "$REL/.venv/bin/python" "$REL/deploy/server/libexec/dcar-auth-release.py" deploy \
+  --candidate-release "$REL" --receipt "$RECEIPT" --superadmin dcar \
+  --pre-smoke-url http://127.0.0.1:14173/dcar/auth/health \
+  --pre-smoke-url http://127.0.0.1:<api-smoke-port>/health \
+  --pre-smoke-url http://127.0.0.1:<web-smoke-port>/dcar/overview \
+  --post-smoke-url http://127.0.0.1:4173/dcar/auth/health \
+  --post-smoke-url https://<public-host>/dcar/login
+sudo systemctl stop dcar-auth-smoke
+```
+
+Existing session fingerprints are unchanged by the import, so browsers that were
+logged in before the release do not need to log in again. Every CLI change and
+every change made on the user-management page is appended to
+`/var/lib/dcar-aigc/auth/auth-changes.log`; version-2 intent is durable before
+the database transaction commits, and a commit marker supplies the completion
+time. `changes --since <ISO time>` emits normalized committed/conservative
+records. Exit 3 requires reconciliation, not retrying or ignoring the warning.
+Only after `deploy` returns success, bind the verified operator phone with `set-phone dcar <phone>`
+and `allow-phone <phone> --note <operator>` using the CLI below. Do not guess a
+phone or send registration SMS to a person whose number has not been confirmed.
+Do not insert these account writes between the deploy helper's migration and
+its successful final smoke. A corrupt or partially written change log fails
+closed; stop account writers and use the evidence-preserving offline procedure
+in [the operations manual](../../docs/v8/运行与备份手册.md#认证安全变更日志损坏处置).
+
+The receipt and its sibling `.files` directory retain the previous symlink,
+four old service units, prior auth helper files, their modes/ownership/hashes,
+and verified before/after backups. This auth overlay does not change Nginx or
+the API/Web/Control units. On a failed pre-switch migration it restores old
+units and leaves htpasswd untouched. A schema-1/2 binary cannot safely run a schema-3
+database, so that failure stays stopped until the rollback below completes.
+For a trusted database and an unsuccessful cutover, use the same receipt:
+
+```sh
+sudo "$REL/.venv/bin/python" "$REL/deploy/server/libexec/dcar-auth-release.py" rollback \
+  --candidate-release "$REL" --receipt "$RECEIPT" \
+  --post-smoke-url https://<public-host>/dcar/login
+```
+
+Rollback is phase-aware. Before `current` switched, it never exports htpasswd.
+After a schema-0 cutover it exports current active users with business access
+and current password hashes (excluding `new_user`), refuses an empty export,
+installs it atomically, and preserves schema-3 tables for a future upgrade.
+A schema-3 previous release uses the current DB. A schema-1/2 previous release
+requires restoration of the receipt's verified backup at that version, first
+preserves the current DB, revokes sessions/challenges,
+restores old units/code, and exits 3 with services stopped for account-change
+reconciliation. Corruption or suspected compromise is not a code-only rollback:
+use the offline restore procedure in `docs/v8/运行与备份手册.md`; never export an
+untrusted current database into htpasswd.
+
+The following unit/Nginx installation block is for first server provisioning,
+not an auth-overlay release or its rollback. Existing servers use the helper
+above so that their prior units remain recoverable:
 
 ```sh
 sudo install -m 0644 deploy/server/systemd/dcar-api.service \
@@ -200,13 +331,21 @@ sudo install -m 0644 deploy/server/systemd/dcar-douyin-vault-backup.timer \
   /etc/systemd/system/dcar-douyin-vault-backup.timer
 sudo install -m 0755 deploy/server/libexec/dcar-douyin-vault-backup.py \
   /usr/local/libexec/dcar-douyin-vault-backup
+sudo install -m 0644 deploy/server/systemd/dcar-auth-backup.service \
+  /etc/systemd/system/dcar-auth-backup.service
+sudo install -m 0644 deploy/server/systemd/dcar-auth-backup.timer \
+  /etc/systemd/system/dcar-auth-backup.timer
+sudo install -m 0755 deploy/server/libexec/dcar-auth-backup.py \
+  /usr/local/libexec/dcar-auth-backup
+sudo install -m 0755 deploy/server/libexec/dcar-auth-release.py \
+  /usr/local/libexec/dcar-auth-release
 sudo systemctl daemon-reload
 sudo systemctl enable dcar-api dcar-web dcar-douyin-egress \
   dcar-douyin-control dcar-auth \
-  dcar-douyin-vault-backup.timer
+  dcar-douyin-vault-backup.timer dcar-auth-backup.timer
 sudo systemctl start dcar-api dcar-web dcar-douyin-egress \
   dcar-douyin-control dcar-auth \
-  dcar-douyin-vault-backup.timer
+  dcar-douyin-vault-backup.timer dcar-auth-backup.timer
 curl -fsS http://127.0.0.1:4173/dcar/auth/health
 curl -fsS -H "X-Dcar-Machine-Key: $(sudo cat /etc/dcar-aigc/credentials/douyin-machine-key)" \
   http://127.0.0.1:4175/internal/v1/health
@@ -224,13 +363,15 @@ process-only response.
 
 ## Build a consistent snapshot on the macOS writer
 
-Run this only after today's 02:00 capture has reached a terminal state and the
-07:30 media cutoff has succeeded. The script uses SQLite's online backup API,
+Run this only after the Matrix-first frozen scan/report dependency receipts
+pass the publisher gate (or the explicit first-day cutover receipt). The
+retired 02:00/07:30 jobs are not substitutes. The script uses SQLite's online backup API,
 so it never copies a live WAL database directly. It then requires
 `quick_check=ok`, zero foreign key violations, the expected schema, and exact
 hashes for report and visible evidence files. It also freezes one
 `dcar-runtime-identity-v1` value from the backup DB and refuses to build unless
-that identity is report v8.7, schema 16 / `remove-manual-review`, and
+that identity is report v8.9, schema 19 /
+`dual-acquisition-profile-roster-v1`, and
 the active `evaluation-v9__selling-points-v5.2` release on the published v5.2
 taxonomy. The matcher SHA-256 is read from that release row, never hard-coded.
 
@@ -242,7 +383,7 @@ snapshot_dir="/private/tmp/dcar-snapshot-$(date -u +%Y%m%dT%H%M%SZ)"
   --project-root "$PWD" \
   --db app/data/dcar_insight.sqlite3 \
   --legacy-db app/data/web_mvp.sqlite3 \
-  --expected-user-version 16 \
+  --expected-user-version 19 \
   --output "$snapshot_dir"
 ```
 
@@ -253,14 +394,36 @@ The output contains:
 - the exact report/schema/release/taxonomy/matcher runtime identity;
 - NUL-delimited `cache-files-from0` and `reports-files-from0` lists.
 
-The manifest uses the explicit `thin-server-v1` policy. Databases, legacy DB,
+The manifest uses the explicit `thin-server-v2` policy. Databases, legacy DB,
 reports, the two HMAC salt files required by the read-only API, and small
 JSON/text evidence are included and transferred. Large
 binary evidence is listed separately as optional reuse: it is never transferred
 by this publisher, and is served only when the active file at the same path has
 the exact recorded size and SHA-256. Missing or mismatched optional evidence is
 explicitly omitted; it is not deleted or overwritten. Unregistered cache files
-outside these database-backed evidence paths are not published.
+outside these database-backed evidence paths are not published. All newly
+managed originals are instead listed in `managed_originals-v1`: none are
+transferred or opportunistically reused. Their exact manifest, preview,
+completion and lifecycle proofs remain required. An unknown missing required
+file still fails the build. Signed database and JSON paths are not rewritten;
+the read-only API resolves only exact members of the installed, hash-bound
+manifest. Legacy v1 bundles are historical rollback evidence, not new builds.
+
+The normal publisher/install path is 19→19 only. The schema-19 deployment
+requires an installed schema18/report-v8.8 compatibility release whose
+installer recognizes the exact 18→19 contract, followed by the sealed new
+release's `seal-schema-upgrade --from-schema 18 --to-schema 19` and
+`schema-upgrade --from-schema 18 --to-schema 19` operations. The historical
+17→18 pair remains supported only by its own exact seal and transition
+contracts; neither pair accepts skipped or widened source/target versions. A
+schema17 source is a blocker for the 18→19 operation, not an invitation to skip
+a gate. The v2 bundle is sealed into the paired transaction.
+The paired transaction owns the existing snapshot-install lock, stops the
+four API/Web/Auth/Control services, and restores code, configuration, databases,
+artifacts and the previous active receipt together on failure. An unsettled
+transition blocks normal installation/publication; do not manually replace
+`current` or clear its marker. A successful source seal is not a successful
+deployment: the production runtime and read-only smoke checks must pass.
 
 Remote capacity gates use only included artifact bytes plus the bundle and the
 configured free-space reserve. Optional large-byte totals are reported for
@@ -414,9 +577,11 @@ Sessions in `/var/lib/dcar-aigc/auth`, then forwards authenticated Web traffic
 to 4174, API traffic to 8765, and bounded Douyin control traffic to 4175. All
 four ports stay bound to server loopback. The callback location disables access
 logging, raises error logging to `crit`, rate-limits GET, and never bypasses the
-gateway. The existing htpasswd file remains the account source, but browser HTTP
-Basic authentication is no longer used. See `AUTH.md` for the complete login,
-logout and acceptance contract.
+gateway. Accounts, phone bindings, the operator admission list, verification
+codes and sessions all live in the gateway's SQLite store
+`/var/lib/dcar-aigc/auth/sessions.sqlite3`; the old htpasswd file is only an
+import source for the first release and a rollback target. See `AUTH.md` for the
+complete login, registration, recovery, backup and acceptance contract.
 
 ## Douyin authorization operations
 
@@ -447,6 +612,43 @@ sudo systemctl start dcar-douyin-control
 sudo systemctl enable --now dcar-douyin-vault-backup.timer
 sudo systemctl list-timers dcar-douyin-vault-backup.timer --no-pager
 ```
+
+## Authentication store backup
+
+The account store shares the Vault's rules: rollback journal only
+(`journal_mode=DELETE`), never WAL. `/usr/local/libexec/dcar-auth-backup`
+mirrors the Vault helper (read-only source, online `Connection.backup()`,
+`synchronous=EXTRA`, `quick_check`, `user_version`, required tables, sha256
+dedupe, atomic install of a mode-`0600` backup plus manifest) and additionally
+prunes pairs older than `--keep-days` while always keeping the newest valid
+pair. Backups contain password hashes, phone numbers and session digests but
+never the pepper, so a leaked backup cannot be used to brute-force codes.
+
+Run one backup by hand, verify it, and rehearse a restore before relying on the
+timer:
+
+```sh
+sudo systemctl start dcar-auth-backup.service
+sudo systemctl status dcar-auth-backup.service --no-pager
+sudo /usr/local/libexec/dcar-auth-backup --verify \
+  "$(ls -t /var/backups/dcar-aigc/auth/dcar-auth-*.sqlite3 | head -1)" --expect-user-version 3
+sudo systemctl enable --now dcar-auth-backup.timer
+sudo systemctl list-timers dcar-auth-backup.timer --no-pager
+```
+
+For a trusted restore, use the `dcar-auth-release.py restore` command in
+`docs/v8/运行与备份手册.md`; do not copy or move a backup over the live database
+by hand. The helper checks disk headroom, holds the shared snapshot lock,
+stops the timer/services, verifies the selected pair, preserves the current
+database and sidecars, restores/migrates, and revokes sessions/challenges. Its
+expected exit code is 3: services remain stopped until identity reconciliation.
+Use the original `auth-changes.log`, the backup time, and the restore receipt to
+reconcile deletions, role/status changes and password resets before restarting.
+If the store or credentials may have been exposed, also rotate `auth-pepper`
+and the Tencent SecretKey, disable accounts, and re-enable each only after an
+out-of-band identity check and password reset. For a damaged audit log, follow
+the runbook's evidence-preserving tail-repair procedure; never delete middle
+records to make validation pass.
 
 ## Restricted Mac tunnel
 
@@ -561,8 +763,9 @@ Post-install acceptance must cover:
   domains, methods, and ports;
 - stopping Squid makes the real provider fail closed instead of connecting
   directly;
-- `sudo -u dcar-douyin test -r /etc/nginx/.htpasswd-dcar` and equivalent checks
-  for the Auth Session DB and read-replica DB fail;
+- `sudo -u dcar-douyin test -r /var/lib/dcar-aigc/auth/sessions.sqlite3`,
+  `sudo -u dcar-douyin test -r /etc/dcar-aigc/credentials/auth-pepper` and the
+  equivalent read-replica DB check all fail;
 - the active snapshot receipt, database SHA-256, schema version, content count,
   and latest published timestamp are unchanged by the code release;
 - an offline Vault backup passes while 4175 is stopped.

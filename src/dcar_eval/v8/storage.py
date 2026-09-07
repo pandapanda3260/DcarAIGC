@@ -5,28 +5,70 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import pwd
 import re
 import sqlite3
+import stat
+import threading
+import time as monotonic_time
+import uuid
+from collections import deque
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from types import TracebackType
 from typing import Iterator, Literal
 
+from .schema_v19 import PROFILE_SCHEMA_SQL
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_DB = PROJECT_ROOT / "app" / "data" / "dcar_insight.sqlite3"
-SCHEMA_VERSION = 16
-CURRENT_SCHEMA_MIGRATION_NAME = "remove-manual-review"
+
+
+def installed_data_root() -> Path:
+    """Return the per-account runtime root without trusting ``HOME``."""
+
+    account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    return account_home / "Library" / "Application Support" / "DcarAIGC" / "data"
+
+
+INSTALLED_DATA_ROOT = installed_data_root()
+INSTALLED_DEFAULT_DB = INSTALLED_DATA_ROOT / "dcar_insight.sqlite3"
+INSTALLED_LEGACY_DB = INSTALLED_DATA_ROOT / "web_mvp.sqlite3"
+CHECKOUT_DEFAULT_DB = PROJECT_ROOT / "app" / "data" / "dcar_insight.sqlite3"
+
+
+def configured_default_database() -> Path:
+    """Resolve the live database without forcing it into the code checkout."""
+
+    configured = os.environ.get("DCAR_V8_DB")
+    if configured:
+        return Path(configured).expanduser()
+    return INSTALLED_DEFAULT_DB
+
+
+DEFAULT_DB = configured_default_database()
+SCHEMA_VERSION = 19
+# Keep the historical fixture/bootstrap schema stable. Production schema20 is
+# installed only through the explicit offline migration and paired release.
+LATEST_SCHEMA_VERSION = 20
+CURRENT_SCHEMA_MIGRATION_NAME = "dual-acquisition-profile-roster-v1"
 SCHEMA_MIGRATION_NAMES = {
     11: "interaction-user-v1-fallback-keys",
     12: "append-only-metric-observations",
     13: "scheduler-run-attempt-history",
     14: "spu-audience-scene-domain",
     15: "spu-llm-assist",
-    16: CURRENT_SCHEMA_MIGRATION_NAME,
+    16: "remove-manual-review",
+    17: "optional-account-phone",
+    18: "matrix-roster-source-routing",
+    19: "dual-acquisition-profile-roster-v1",
+    20: "integrated-video-capture-v25",
 }
 RUNTIME_COMPATIBLE_SCHEMA_VERSIONS = frozenset(SCHEMA_MIGRATION_NAMES)
+_LIVE_WAL_READ_ONLY = ContextVar("dcar_live_wal_read_only", default=False)
 LEGACY_TAXONOMY_VERSION = "selling-points-v5.0"
 LEGACY_V6_RELEASE_ID = "evaluation-v6__selling-points-v5.0"
 LEGACY_V7_RELEASE_ID = "evaluation-v7__selling-points-v5.0"
@@ -37,7 +79,8 @@ COMMENT_COLLECTION_VERSION = "paged-comments-v2"
 #: 全量历史回溯的内容分组标记（content_items.source_group）。
 #: history-archive：证据窗之外的历史内容，仅入库+指标，不参与自动评估与媒体截止闸门；
 #: history-backfill：证据窗内、由回溯批量入库的内容，待 local-evidence 阶段完成媒体+评估后
-#: 清除标记并回归常规增量链路。两类标记均不影响每日 30 天监控窗内的指标/评论刷新。
+#: 清除标记并回归常规增量链路。自动内容、评论和指标队列排除这两类历史标记；
+#: 运营上仅允许显式授权的 range_backfill 继续处理 history-backfill 内容。
 HISTORY_ARCHIVE_SOURCE_GROUP = "history-archive"
 HISTORY_BACKFILL_SOURCE_GROUP = "history-backfill"
 BACKFILL_SOURCE_GROUPS = (
@@ -47,6 +90,286 @@ BACKFILL_SOURCE_GROUPS = (
 LEGACY_MATCHER_RULE_SHA256 = (
     "38f647e9b05e38777bbe4727b5c563b67c61e28854d8b37027af8119023eefdc"
 )
+
+
+_WritePriority = Literal["normal", "heartbeat"]
+
+
+class _FairWriteLock:
+    """Reentrant FIFO queues with bounded preference for short lease renewals.
+
+    A queued renewal bypasses queued ordinary writes, never the current owner.
+    Ordinary writers get a turn after eight renewals even under continuous
+    priority traffic. This prevents queue starvation, not long transactions;
+    callers must still keep each exclusive section within the lease budget.
+    """
+
+    _MAX_HEARTBEAT_BURST = 8
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition(threading.Lock())
+        self._owner: int | None = None
+        self._depth = 0
+        self._normal_waiters: deque[object] = deque()
+        self._heartbeat_waiters: deque[object] = deque()
+        self._heartbeat_streak = 0
+
+    def acquire(
+        self, blocking: bool = True, timeout: float = -1,
+        *, priority: _WritePriority = "normal",
+    ) -> bool:
+        if priority not in {"normal", "heartbeat"}:
+            raise ValueError("Unknown SQLite write priority")
+        if not blocking and timeout != -1:
+            raise ValueError("Cannot specify timeout for a non-blocking acquire")
+        if timeout != timeout or (timeout < 0 and timeout != -1):
+            raise ValueError("Invalid SQLite write lock timeout")
+        if timeout > threading.TIMEOUT_MAX:
+            raise OverflowError("SQLite write lock timeout is too large")
+        deadline = monotonic_time.monotonic() + timeout if timeout >= 0 else None
+        owner = threading.get_ident()
+        with self._condition:
+            if self._owner == owner:
+                self._depth += 1
+                return True
+            queue = (
+                self._heartbeat_waiters if priority == "heartbeat"
+                else self._normal_waiters
+            )
+            ticket = object()
+            queue.append(ticket)
+            try:
+                while True:
+                    heartbeat_next = bool(self._heartbeat_waiters) and (
+                        not self._normal_waiters
+                        or self._heartbeat_streak < self._MAX_HEARTBEAT_BURST
+                    )
+                    next_queue = (
+                        self._heartbeat_waiters if heartbeat_next
+                        else self._normal_waiters
+                    )
+                    if self._owner is None and next_queue[0] is ticket:
+                        break
+                    remaining = (
+                        deadline - monotonic_time.monotonic()
+                        if deadline is not None else None
+                    )
+                    if not blocking or (remaining is not None and remaining <= 0):
+                        queue.remove(ticket)
+                        self._condition.notify_all()
+                        return False
+                    self._condition.wait(remaining)
+            except BaseException:
+                # A cancelled waiter must not block either queue's next owner.
+                queue.remove(ticket)
+                self._condition.notify_all()
+                raise
+            queue.popleft()
+            self._owner = owner
+            self._depth = 1
+            self._heartbeat_streak = (
+                min(self._heartbeat_streak + 1, self._MAX_HEARTBEAT_BURST)
+                if priority == "heartbeat" and self._normal_waiters else 0
+            )
+            return True
+
+    def release(self) -> None:
+        with self._condition:
+            if self._owner != threading.get_ident():
+                raise RuntimeError("Cannot release an unowned SQLite write lock")
+            self._depth -= 1
+            if self._depth == 0:
+                self._owner = None
+                self._condition.notify_all()
+
+    @contextmanager
+    def hold(self, *, priority: _WritePriority = "normal") -> Iterator[None]:
+        observing = bool(os.environ.get("DCAR_SQLITE_TIMING_FILE", "").strip())
+        with self._condition:
+            outermost = self._owner != threading.get_ident()
+        observing = observing and outermost
+        queued_at = monotonic_time.monotonic_ns() if observing else 0
+        self.acquire(priority=priority)
+        began_at = monotonic_time.monotonic_ns() if observing else 0
+        outcome = "completed"
+        try:
+            yield
+        except BaseException:
+            outcome = "error"
+            raise
+        finally:
+            finished_at = monotonic_time.monotonic_ns() if observing else 0
+            self.release()
+            if observing:
+                # This acquisition was outermost: all recursive holds have
+                # ended. Observability must never delay another writer's turn
+                # or change commit/rollback behavior, even if its own I/O fails.
+                try:
+                    _emit_write_timing(priority=priority, outcome=outcome,
+                        queued_at=queued_at, began_at=began_at, finished_at=finished_at)
+                except Exception:
+                    pass
+
+    def __enter__(self) -> _FairWriteLock:
+        self.acquire()
+        return self
+
+    def __exit__(
+        self,
+        exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.release()
+
+
+# Serialize only in-process SQLite write transactions. Provider calls, local
+# media work, report assembly and the rest of dispatch remain concurrent.
+_SQLITE_WRITE_TRANSACTION_LOCK = _FairWriteLock()
+_SQLITE_TRANSACTION_METRICS_CONTEXT: ContextVar[dict[str, object]] = ContextVar(
+    "dcar_sqlite_transaction_metrics_context", default={}
+)
+_SQLITE_TRANSACTION_METRICS_LOCK = threading.Lock()
+
+
+class TransactionMetricsError(RuntimeError):
+    """Configured transaction telemetry could not be written safely."""
+
+
+@contextmanager
+def transaction_metrics_context(**fields: object) -> Iterator[None]:
+    """Bind low-cardinality job ownership to subsequent transaction metrics."""
+
+    current = dict(_SQLITE_TRANSACTION_METRICS_CONTEXT.get())
+    current.update({key: value for key, value in fields.items() if value is not None})
+    token = _SQLITE_TRANSACTION_METRICS_CONTEXT.set(current)
+    try:
+        yield
+    finally:
+        _SQLITE_TRANSACTION_METRICS_CONTEXT.reset(token)
+
+
+def _transaction_metrics_path() -> Path | None:
+    configured = os.environ.get("DCAR_SQLITE_METRICS_FILE", "").strip()
+    if not configured:
+        return None
+    path = Path(configured).expanduser()
+    if not path.is_absolute():
+        raise TransactionMetricsError("DCAR_SQLITE_METRICS_FILE must be absolute")
+    parent = path.parent
+    if parent.is_symlink() or not parent.is_dir():
+        raise TransactionMetricsError("SQLite metrics parent must already exist")
+    parent_state = parent.stat()
+    if parent_state.st_uid != os.geteuid() or stat.S_IMODE(parent_state.st_mode) & 0o077:
+        raise TransactionMetricsError("SQLite metrics parent must be private and user-owned")
+    if path.exists() or path.is_symlink():
+        if path.is_symlink() or not path.is_file():
+            raise TransactionMetricsError("SQLite metrics target must be a regular file")
+        state = path.stat()
+        if state.st_uid != os.geteuid() or stat.S_IMODE(state.st_mode) & 0o077:
+            raise TransactionMetricsError("SQLite metrics file must be private and user-owned")
+    return path
+
+
+def _emit_transaction_metric(payload: dict[str, object]) -> None:
+    path = _transaction_metrics_path()
+    if path is None:
+        return
+    record = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8") + b"\n"
+    flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    with _SQLITE_TRANSACTION_METRICS_LOCK:
+        try:
+            descriptor = os.open(path, flags, 0o600)
+            try:
+                state = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(state.st_mode)
+                    or state.st_uid != os.geteuid()
+                    or stat.S_IMODE(state.st_mode) & 0o077
+                ):
+                    raise TransactionMetricsError(
+                        "SQLite metrics descriptor is not a private user-owned file"
+                    )
+                offset = 0
+                while offset < len(record):
+                    written = os.write(descriptor, record[offset:])
+                    if written <= 0:
+                        raise TransactionMetricsError(
+                            "SQLite metrics record was truncated"
+                        )
+                    offset += written
+            finally:
+                os.close(descriptor)
+        except OSError as error:
+            raise TransactionMetricsError("SQLite metrics record could not be written") from error
+
+
+def _emit_write_timing(*, priority: _WritePriority, outcome: str,
+                       queued_at: int, began_at: int, finished_at: int) -> None:
+    """Best-effort JSONL after releasing the outermost lock; never touches SQL.
+
+    This opt-in runtime observation is separate from the existing strict audit
+    stream. Only a private regular .jsonl file is accepted. One O_APPEND write
+    keeps each small record together without a second in-process I/O lock.
+    """
+    configured = os.environ.get("DCAR_SQLITE_TIMING_FILE", "").strip()
+    if not configured:
+        return
+    path = Path(configured).expanduser()
+    if not path.is_absolute() or path.suffix != ".jsonl":
+        return
+    parent = path.parent
+    if parent.is_symlink() or not parent.is_dir():
+        return
+    parent_state = parent.stat()
+    if parent_state.st_uid != os.geteuid() or stat.S_IMODE(parent_state.st_mode) & 0o077:
+        return
+    if path.is_symlink():
+        return
+    # Do not serialize arbitrary metric context, SQL, exceptions or identifiers.
+    categories = {"capture_integrated_work", "capture_manual_command", "content_pipeline",
+        "history_recovery", "metrics_backfill", "comments_refresh", "paid_dispatch_preflight",
+        "matrix_works_scan", "matrix_account_metrics", "tikhub_account_scan"}
+    category = _SQLITE_TRANSACTION_METRICS_CONTEXT.get().get("job_id")
+    payload = {"schema": "sqlite-write-lock-timing-v1", "phase": "finish",
+        "priority": priority, "outcome": outcome, "recorded_at": now_utc(),
+        "wait_ms": round((began_at - queued_at) / 1_000_000, 3),
+        "hold_ms": round((finished_at - began_at) / 1_000_000, 3),
+        "pid": os.getpid(), "thread_id": threading.get_ident()}
+    if isinstance(category, str) and category in categories:
+        payload["job_category"] = category
+    record = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8") + b"\n"
+    flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        state = os.fstat(descriptor)
+        if (not stat.S_ISREG(state.st_mode) or state.st_uid != os.geteuid()
+                or stat.S_IMODE(state.st_mode) & 0o077 or state.st_nlink != 1):
+            return
+        os.write(descriptor, record)
+    finally:
+        os.close(descriptor)
+
+
+def _sqlite_error_outcome(error: BaseException) -> str:
+    if not isinstance(error, sqlite3.OperationalError):
+        return "error"
+    message = str(error).lower()
+    if "locked" in message:
+        return "locked"
+    if "busy" in message:
+        return "busy"
+    return "operational_error"
 
 
 def now_utc() -> str:
@@ -82,34 +405,35 @@ def same_database_path(left: Path, right: Path) -> bool:
     the deterministic canonical-path comparison used by create-time guards.
     """
 
-    left_path = Path(left).expanduser()
-    right_path = Path(right).expanduser()
-    try:
-        left_stat = left_path.stat()
-    except (FileNotFoundError, NotADirectoryError):
-        left_stat = None
-    try:
-        right_stat = right_path.stat()
-    except (FileNotFoundError, NotADirectoryError):
-        right_stat = None
-    if left_stat is not None and right_stat is not None:
-        return os.path.samestat(left_stat, right_stat)
+    from .runtime_database import same_file_identity
 
-    # Permission and other I/O failures intentionally propagate instead of
-    # turning an unverified alias into a negative security decision.  Only a
-    # genuinely missing target may use the deterministic create-time fallback.
-    return left_path.resolve(strict=False) == right_path.resolve(strict=False)
+    return same_file_identity(Path(left), Path(right))
 
 
 def is_formal_database_path(
     path: Path, *, formal_database: Path | None = None
 ) -> bool:
-    """Return whether ``path`` names the formal database, including aliases."""
+    """Return whether ``path`` names any installed formal database spelling.
 
-    return same_database_path(
-        path,
+    Security decisions must not depend on whether the invoking shell exported
+    ``DCAR_V8_DB``.  Keep both the installed Application Support location and
+    the retired checkout location as permanent guarded identities, plus any
+    explicit/default path supplied by a caller or deployment.  The installed
+    LaunchAgent remains the runtime authority and can identify aliases or a
+    non-default installed path.
+    """
+
+    candidates = (
         DEFAULT_DB if formal_database is None else formal_database,
+        INSTALLED_DEFAULT_DB,
+        CHECKOUT_DEFAULT_DB,
     )
+    if any(same_database_path(path, candidate) for candidate in candidates):
+        return True
+
+    from .runtime_database import is_installed_formal_database
+
+    return is_installed_formal_database(path, required=False)
 
 
 class _ClosingSQLiteConnection(sqlite3.Connection):
@@ -137,12 +461,30 @@ class _ClosingSQLiteConnection(sqlite3.Connection):
             self.close()
 
 
+@contextmanager
+def live_wal_read_only_connections() -> Iterator[None]:
+    """Make active-database reads WAL-aware in the current context.
+
+    Sealed replicas keep the immutable default so read-only serving cannot
+    create sidecars. Formal reads of the live writer database opt into this
+    context so committed WAL frames remain visible.
+    """
+
+    token = _LIVE_WAL_READ_ONLY.set(True)
+    try:
+        yield
+    finally:
+        _LIVE_WAL_READ_ONLY.reset(token)
+
+
 def connect(
     path: Path = DEFAULT_DB, *, read_only: bool | None = None
 ) -> sqlite3.Connection:
+    path = Path(path).expanduser()
+    formal_database = is_formal_database_path(path)
     if (
         os.environ.get("DCAR_TEST_DENY_FORMAL_DB") == "1"
-        and is_formal_database_path(path)
+        and formal_database
     ):
         raise RuntimeError("test process attempted to open the formal DCar database")
     if read_only is None:
@@ -150,8 +492,11 @@ def connect(
     if read_only:
         if not path.is_file():
             raise RuntimeError(f"read-only SQLite database is missing: {path}")
+        read_only_query = (
+            "mode=ro" if _LIVE_WAL_READ_ONLY.get() else "mode=ro&immutable=1"
+        )
         connection = sqlite3.connect(
-            f"{path.resolve().as_uri()}?mode=ro&immutable=1",
+            f"{path.resolve().as_uri()}?{read_only_query}",
             uri=True,
             timeout=10,
             factory=_ClosingSQLiteConnection,
@@ -165,32 +510,125 @@ def connect(
         connection.execute("PRAGMA query_only = ON")
         connection.execute("PRAGMA busy_timeout = 10000")
         return connection
-    path.parent.mkdir(parents=True, exist_ok=True)
+    if formal_database:
+        if not path.is_file():
+            raise SchemaMigrationError(f"formal SQLite database is missing: {path}")
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(
-        path,
+        f"{path.resolve().as_uri()}?mode=rw" if formal_database else path,
+        uri=formal_database,
         timeout=10,
         factory=_ClosingSQLiteConnection,
     )
     connection.row_factory = sqlite3.Row
     try:
         configure_connection_safety(connection)
+        if formal_database:
+            _require_connection_database_identity(connection, path)
+            require_schema_compatibility(
+                connection, supported_versions=frozenset({19, 20})
+            )
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA busy_timeout = 10000")
     except Exception:
         connection.close()
         raise
-    connection.execute("PRAGMA journal_mode = WAL")
-    connection.execute("PRAGMA busy_timeout = 10000")
     return connection
 
 
 @contextmanager
-def transaction(connection: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
-    try:
-        connection.execute("BEGIN IMMEDIATE")
-        yield connection
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
+def transaction(
+    connection: sqlite3.Connection, *, priority: _WritePriority = "normal"
+) -> Iterator[sqlite3.Connection]:
+    queued_at = monotonic_time.monotonic_ns()
+    with _SQLITE_WRITE_TRANSACTION_LOCK.hold(priority=priority):
+        began_at = monotonic_time.monotonic_ns()
+        outcome = "committed"
+        error: BaseException | None = None
+        journal_mode: str | None = None
+        metrics_enabled = _transaction_metrics_path() is not None
+        transaction_id = uuid.uuid4().hex if metrics_enabled else None
+        try:
+            if metrics_enabled:
+                journal_mode = str(
+                    connection.execute("PRAGMA journal_mode").fetchone()[0]
+                ).lower()
+                _emit_transaction_metric(
+                    {
+                        "schema": "sqlite-write-transaction-v1",
+                        "phase": "begin",
+                        "priority": priority,
+                        "transaction_id": transaction_id,
+                        "recorded_at": now_utc(),
+                        "queue_wait_ms": round(
+                            (began_at - queued_at) / 1_000_000, 3
+                        ),
+                        "pid": os.getpid(),
+                        "thread_id": threading.get_ident(),
+                        "wal": journal_mode == "wal",
+                        **_SQLITE_TRANSACTION_METRICS_CONTEXT.get(),
+                    }
+                )
+            connection.execute("BEGIN IMMEDIATE")
+            yield connection
+            connection.commit()
+        except Exception as caught:
+            error = caught
+            outcome = _sqlite_error_outcome(caught)
+            connection.rollback()
+            raise
+        finally:
+            finished_at = monotonic_time.monotonic_ns()
+            metric: dict[str, object] = {
+                "schema": "sqlite-write-transaction-v1",
+                "phase": "finish",
+                "priority": priority,
+                "transaction_id": transaction_id,
+                "recorded_at": now_utc(),
+                "queue_wait_ms": round((began_at - queued_at) / 1_000_000, 3),
+                "hold_ms": round((finished_at - began_at) / 1_000_000, 3),
+                "outcome": outcome,
+                "pid": os.getpid(),
+                "thread_id": threading.get_ident(),
+                "wal": journal_mode == "wal" if journal_mode is not None else None,
+                **_SQLITE_TRANSACTION_METRICS_CONTEXT.get(),
+            }
+            if error is not None:
+                metric["error_type"] = type(error).__name__
+                metric["error"] = str(error)[:500]
+                sqlite_errorcode = getattr(error, "sqlite_errorcode", None)
+                sqlite_errorname = getattr(error, "sqlite_errorname", None)
+                if sqlite_errorcode is not None:
+                    metric["sqlite_errorcode"] = sqlite_errorcode
+                if sqlite_errorname is not None:
+                    metric["sqlite_errorname"] = sqlite_errorname
+            if metrics_enabled:
+                try:
+                    _emit_transaction_metric(metric)
+                except TransactionMetricsError as metrics_error:
+                    # The BEGIN record is durable evidence of a missing finish
+                    # record. Never turn a committed DB mutation into an
+                    # apparent failure that a caller might replay.
+                    if error is not None:
+                        error.add_note(str(metrics_error))
+
+
+@contextmanager
+def write_lock() -> Iterator[None]:
+    """Hold the process-wide SQLite write serialization lock.
+
+    ``transaction()`` acquires this lock around every ``BEGIN IMMEDIATE``.  A
+    caller that issues its own standalone ``BEGIN IMMEDIATE`` (custom commit
+    semantics, maintenance phases) must hold the same lock for the whole
+    BEGIN..COMMIT/ROLLBACK span.  Otherwise a ``transaction()`` holder can sit
+    on the SQLite file lock for up to ``busy_timeout`` while still holding this
+    lock, stalling every other in-process writer behind it.  The lock is
+    re-entrant, so use inside an existing ``transaction()`` is harmless.
+    """
+
+    with _SQLITE_WRITE_TRANSACTION_LOCK.hold():
+        yield
 
 
 SCHEMA_SQL = r"""
@@ -203,7 +641,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 CREATE TABLE IF NOT EXISTS accounts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     phone TEXT NOT NULL,
-    phone_normalized TEXT NOT NULL UNIQUE,
+    phone_normalized TEXT,
     operator_name TEXT NOT NULL DEFAULT '',
     account_type TEXT NOT NULL DEFAULT 'unknown'
         CHECK(account_type IN ('boutique_ip','original','mixed_edit','unknown')),
@@ -218,7 +656,7 @@ CREATE TABLE IF NOT EXISTS account_platform_identities (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     platform TEXT NOT NULL CHECK(platform IN ('douyin','xiaohongshu','wechat_channels','kuaishou')),
-    uid TEXT NOT NULL,
+    uid TEXT,
     nickname TEXT NOT NULL DEFAULT '',
     real_name_status TEXT NOT NULL DEFAULT 'unknown'
         CHECK(real_name_status IN ('yes','no','unknown')),
@@ -226,7 +664,7 @@ CREATE TABLE IF NOT EXISTS account_platform_identities (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE(platform, uid),
-    UNIQUE(account_id, platform)
+    UNIQUE(account_id)
 );
 
 CREATE TABLE IF NOT EXISTS account_provider_references (
@@ -1183,11 +1621,102 @@ CREATE TABLE IF NOT EXISTS spu_association_runs (
     insufficient_evidence INTEGER NOT NULL DEFAULT 0,
     summary_json TEXT NOT NULL DEFAULT '{}'
 );
-"""
+""" + PROFILE_SCHEMA_SQL
 
 
 class SchemaMigrationError(RuntimeError):
     pass
+
+
+def _require_connection_database_identity(
+    connection: sqlite3.Connection, expected_path: Path
+) -> None:
+    main = next(
+        (row for row in connection.execute("PRAGMA database_list") if row[1] == "main"),
+        None,
+    )
+    if main is None or not main[2] or not same_database_path(Path(main[2]), expected_path):
+        raise SchemaMigrationError("opened SQLite database identity differs from requested file")
+
+
+def _require_non_formal_connection(connection: sqlite3.Connection) -> None:
+    """Refuse schema writes through direct sqlite3 connections and file aliases too."""
+
+    for row in connection.execute("PRAGMA database_list"):
+        if row[2] and is_formal_database_path(Path(row[2])):
+            raise SchemaMigrationError(
+                "formal database initialization/migration is forbidden; "
+                "use an offline candidate and the verified install contract"
+            )
+
+
+@lru_cache(maxsize=2)
+def frozen_schema_sql(version: int) -> str:
+    """Immutable historical DDL, not a transformation of the latest schema.
+
+    v16 was captured from c1b76d1; v17 from the production-baseline commit
+    e2b9ffe. These assets are shared by offline validators and genuine fixtures.
+    """
+
+    if version not in {16, 17}:
+        raise SchemaMigrationError(f"no frozen historical schema for version {version}")
+    return (Path(__file__).parent / "schema_history" / f"schema_v{version}.sql").read_text(
+        encoding="utf-8"
+    )
+
+
+@lru_cache(maxsize=2)
+def _frozen_schema_objects(version: int) -> tuple[tuple[str, str, str], ...]:
+    objects: list[tuple[str, str, str]] = []
+    for statement in _schema_statements(schema_version=version):
+        match = re.match(
+            r"CREATE (?:UNIQUE )?(TABLE|INDEX|TRIGGER) IF NOT EXISTS ([a-z_]+)\b",
+            statement,
+        )
+        if match is None:
+            raise SchemaMigrationError(f"invalid frozen v{version} schema statement")
+        objects.append(
+            (match[1].lower(), match[2], statement.replace(" IF NOT EXISTS", "", 1))
+        )
+    return tuple(objects)
+
+
+def _normalized_historical_sql(value: str) -> str:
+    # SQLite RENAME quotes identifiers in the real migration ladder. This is
+    # semantically identical to their unquoted frozen CREATE form; preserve
+    # string literals and every constraint/trigger expression.
+    return _normalized_schema_sql(re.sub(r'"([A-Za-z_][A-Za-z_0-9]*)"', r"\1", value))
+
+
+@lru_cache(maxsize=1)
+def _historical_table_variants() -> dict[str, str]:
+    document = json.loads(
+        (Path(__file__).parent / "schema_history" / "schema_v16_v17_variants.json")
+        .read_text(encoding="utf-8")
+    )
+    return {str(name): str(sql) for name, sql in document["tables"].items()}
+
+
+def _validate_frozen_schema_structure(connection: sqlite3.Connection, version: int) -> None:
+    expected_objects = _frozen_schema_objects(version)
+    expected_tables = {name for kind, name, _ in expected_objects if kind == "table"}
+    if _table_names(connection) != expected_tables:
+        raise SchemaMigrationError(f"schema v{version} table set differs from frozen history")
+    actual = {
+        (str(row[0]), str(row[1])): str(row[2])
+        for row in connection.execute(
+            "SELECT type,name,sql FROM sqlite_master WHERE sql IS NOT NULL"
+        )
+    }
+    for object_type, name, expected in expected_objects:
+        definition = actual.get((object_type, name))
+        if definition is None:
+            raise SchemaMigrationError(f"schema v{version} is missing {name}")
+        definitions = {_normalized_historical_sql(expected)}
+        if object_type == "table" and name in _historical_table_variants():
+            definitions.add(_normalized_historical_sql(_historical_table_variants()[name]))
+        if _normalized_historical_sql(definition) not in definitions:
+            raise SchemaMigrationError(f"schema v{version} object definition drifted: {name}")
 
 
 def schema_compatibility_state(
@@ -1241,7 +1770,29 @@ def schema_compatibility_state(
         and actual_name == expected_name
         and max_migration_version == user_version
     )
-    if compatible and user_version in {11, 12, 13, 14, 15, 16}:
+    if compatible and user_version == 20:
+        try:
+            from .schema_v20 import validate_structure
+
+            validate_structure(connection)
+        except (SchemaMigrationError, ValueError):
+            compatible = False
+    elif compatible and user_version == 19:
+        try:
+            _validate_v19_structure(connection)
+        except SchemaMigrationError:
+            compatible = False
+    elif compatible and user_version == 18:
+        try:
+            _validate_v18_structure(connection)
+        except SchemaMigrationError:
+            compatible = False
+    elif compatible and user_version in {16, 17}:
+        try:
+            _validate_frozen_schema_structure(connection, user_version)
+        except SchemaMigrationError:
+            compatible = False
+    elif compatible and user_version in {11, 12, 13, 14, 15}:
         try:
             _validate_v9_structure(connection)
             _validate_v10_structure(connection)
@@ -1254,8 +1805,6 @@ def schema_compatibility_state(
                 _validate_v14_structure(connection)
             if user_version >= 15:
                 _validate_v15_structure(connection)
-            if user_version >= 16:
-                _validate_v16_structure(connection)
         except SchemaMigrationError:
             compatible = False
     return {
@@ -1441,10 +1990,11 @@ def _legacy_v15_table_statement(table: str, replacements: dict[str, str]) -> str
     return statement
 
 
-def _schema_statements() -> list[str]:
+def _schema_statements(*, schema_version: int | None = None) -> list[str]:
     statements: list[str] = []
     buffer = ""
-    for line in SCHEMA_SQL.splitlines(keepends=True):
+    sql = SCHEMA_SQL if schema_version is None else frozen_schema_sql(schema_version)
+    for line in sql.splitlines(keepends=True):
         buffer += line
         if sqlite3.complete_statement(buffer):
             statement = buffer.strip().removesuffix(";").strip()
@@ -1502,11 +2052,14 @@ def _table_projection_sha256(
     return digest.hexdigest()
 
 
-def _schema_table_statement(table: str, replacements: dict[str, str]) -> str:
+def _schema_table_statement(
+    table: str, replacements: dict[str, str], *, schema_version: int | None = 17
+) -> str:
     prefix = f"CREATE TABLE IF NOT EXISTS {table} "
     try:
         statement = next(
-            value for value in _schema_statements() if value.startswith(prefix)
+            value for value in _schema_statements(schema_version=schema_version)
+            if value.startswith(prefix)
         )
     except StopIteration as exc:
         raise SchemaMigrationError(f"missing schema template for {table}") from exc
@@ -1897,7 +2450,7 @@ def _migrate_v8_to_v9(connection: sqlite3.Connection) -> None:
             connection.execute(f'ALTER TABLE "{table}_v9_new" RENAME TO "{table}"')
         _migration_checkpoint("new_tables_renamed")
 
-        for statement in _schema_statements():
+        for statement in _schema_statements(schema_version=17):
             is_index = statement.startswith(
                 "CREATE INDEX IF NOT EXISTS"
             ) or statement.startswith("CREATE UNIQUE INDEX IF NOT EXISTS")
@@ -2018,6 +2571,21 @@ def _create_fresh_schema(connection: sqlite3.Connection) -> None:
             VALUES (16,'remove-manual-review',?)
             """,
             (captured_at,),
+        )
+        connection.execute(
+            """
+            INSERT INTO schema_migrations(version,name,applied_at)
+            VALUES (17,'optional-account-phone',?)
+            """,
+            (captured_at,),
+        )
+        connection.execute(
+            "INSERT INTO schema_migrations(version,name,applied_at) VALUES (18,?,?)",
+            ("matrix-roster-source-routing", captured_at),
+        )
+        connection.execute(
+            "INSERT INTO schema_migrations(version,name,applied_at) VALUES (19,?,?)",
+            ("dual-acquisition-profile-roster-v1", captured_at),
         )
         connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         connection.commit()
@@ -2143,7 +2711,7 @@ def _migrate_v9_to_v10(connection: sqlite3.Connection) -> None:
         sequences = {}
 
     captured_at = now_utc()
-    statements = _schema_statements()
+    statements = _schema_statements(schema_version=17)
     tables_by_name: dict[str, str] = {}
     for statement in statements:
         match = re.match(r"CREATE TABLE IF NOT EXISTS ([a-z_]+) ", statement)
@@ -2547,7 +3115,7 @@ def _migrate_v11_to_v12(connection: sqlite3.Connection) -> None:
     snapshot_hash = _table_projection_sha256(
         connection, "content_metric_snapshots", snapshot_columns
     )
-    statements = _schema_statements()
+    statements = _schema_statements(schema_version=17)
     metric_statements = [
         statement
         for statement in statements
@@ -2781,7 +3349,7 @@ def _validate_v12_structure(connection: sqlite3.Connection) -> None:
         ("trigger", "trg_metric_observations_no_delete"):
             "CREATE TRIGGER IF NOT EXISTS trg_metric_observations_no_delete",
     }
-    statements = _schema_statements()
+    statements = _schema_statements(schema_version=17)
     for (object_type, name), prefix in object_prefixes.items():
         expected_candidates = [
             statement for statement in statements if statement.startswith(prefix)
@@ -2821,9 +3389,12 @@ CREATE TABLE scheduler_runs (
 """
 
 
-def _schema_object_sql(*, object_type: str, name: str, prefix: str) -> str:
+def _schema_object_sql(
+    *, object_type: str, name: str, prefix: str, schema_version: int | None = 17
+) -> str:
     candidates = [
-        statement for statement in _schema_statements() if statement.startswith(prefix)
+        statement for statement in _schema_statements(schema_version=schema_version)
+        if statement.startswith(prefix)
     ]
     if len(candidates) != 1:
         raise SchemaMigrationError(f"schema template is missing {name}")
@@ -2917,7 +3488,7 @@ def _migrate_v12_to_v13(connection: sqlite3.Connection) -> None:
         connection, "scheduler_runs", run_columns
     )
 
-    statements = _schema_statements()
+    statements = _schema_statements(schema_version=17)
     scheduler_run_statement = [
         statement
         for statement in statements
@@ -3570,7 +4141,9 @@ def _migrate_v15_to_v16(connection: sqlite3.Connection) -> None:
         connection.execute(
             "ALTER TABLE evaluation_versions RENAME TO evaluation_versions_v15_old"
         )
-        connection.execute(_schema_table_statement("evaluation_versions", {}))
+        connection.execute(
+            _schema_table_statement("evaluation_versions", {}, schema_version=16)
+        )
         names = ",".join(copy_columns)
         connection.execute(
             f"INSERT INTO evaluation_versions({names}) "
@@ -3581,7 +4154,9 @@ def _migrate_v15_to_v16(connection: sqlite3.Connection) -> None:
             connection.execute(f'DROP TABLE "{table}"')
         for name, prefix in _V16_EVALUATION_INDEXES:
             connection.execute(
-                _schema_object_sql(object_type="index", name=name, prefix=prefix)
+                _schema_object_sql(
+                    object_type="index", name=name, prefix=prefix, schema_version=16
+                )
             )
         _restore_sequences(connection, sequences, tables=("evaluation_versions",))
         connection.execute(
@@ -3636,6 +4211,7 @@ def _validate_v16_structure(connection: sqlite3.Connection) -> None:
         object_type="table",
         name="evaluation_versions",
         prefix="CREATE TABLE IF NOT EXISTS evaluation_versions ",
+        schema_version=16,
     )
     row = connection.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='evaluation_versions'"
@@ -3647,7 +4223,9 @@ def _validate_v16_structure(connection: sqlite3.Connection) -> None:
             "schema v16 object definition drifted: evaluation_versions"
         )
     for name, prefix in _V16_EVALUATION_INDEXES:
-        expected = _schema_object_sql(object_type="index", name=name, prefix=prefix)
+        expected = _schema_object_sql(
+            object_type="index", name=name, prefix=prefix, schema_version=16
+        )
         row = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
             (name,),
@@ -3674,27 +4252,158 @@ def _validate_v16(connection: sqlite3.Connection) -> None:
         raise SchemaMigrationError("schema v16 has foreign-key violations")
 
 
-def initialize_database(connection: sqlite3.Connection) -> None:
+def _migrate_v16_to_v17(connection: sqlite3.Connection) -> None:
+    """Allow unknown phones without inventing a phone or merging blank values.
+
+    The visible phone remains an empty string; its normalized uniqueness key
+    is NULL. Preserve account IDs, child foreign keys and AUTOINCREMENT state.
+    """
+
+    if connection.in_transaction:
+        raise SchemaMigrationError("v17 migration requires no active transaction")
+    if int(connection.execute("PRAGMA foreign_keys").fetchone()[0]) != 1:
+        raise SchemaMigrationError("v17 migration requires PRAGMA foreign_keys=ON")
+    require_schema_compatibility(connection, supported_versions=frozenset({16}))
+    if "accounts" not in _table_names(connection):
+        raise SchemaMigrationError("v17 migration requires the accounts table")
+    if "accounts_v16_old" in _table_names(connection):
+        raise SchemaMigrationError("v17 migration found leftover accounts_v16_old")
+    legacy_alter = int(connection.execute("PRAGMA legacy_alter_table").fetchone()[0])
+    connection.execute("PRAGMA foreign_keys=OFF")
+    connection.execute("PRAGMA legacy_alter_table=ON")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        columns = _table_columns(connection, "accounts")
+        before_hash = _table_projection_sha256(connection, "accounts", columns)
+        sequences = {
+            str(row["name"]): int(row["seq"])
+            for row in connection.execute("SELECT name,seq FROM sqlite_sequence")
+        }
+        dependent_sql = [
+            str(row[0])
+            for row in connection.execute(
+                """
+                SELECT sql FROM sqlite_master WHERE tbl_name='accounts'
+                  AND type IN ('index','trigger') AND sql IS NOT NULL
+                ORDER BY type,name
+                """
+            )
+        ]
+        connection.execute("ALTER TABLE accounts RENAME TO accounts_v16_old")
+        connection.execute(_schema_table_statement("accounts", {}, schema_version=17))
+        names = ",".join(columns)
+        connection.execute(
+            f"INSERT INTO accounts({names}) SELECT {names} FROM accounts_v16_old"
+        )
+        connection.execute("DROP TABLE accounts_v16_old")
+        for statement in dependent_sql:
+            connection.execute(statement)
+        _restore_sequences(connection, sequences, tables=("accounts",))
+        if _table_projection_sha256(connection, "accounts", columns) != before_hash:
+            raise SchemaMigrationError("v17 migration changed existing accounts")
+        _migration_checkpoint("v17_accounts_rebuilt")
+        connection.execute(
+            """
+            INSERT INTO schema_migrations(version,name,applied_at)
+            VALUES (17,'optional-account-phone',?)
+            """,
+            (now_utc(),),
+        )
+        connection.execute("PRAGMA user_version=17")
+        _validate_v17_structure(connection)
+        if connection.execute("PRAGMA foreign_key_check").fetchall():
+            raise SchemaMigrationError("v17 migration has foreign-key violations")
+        if str(connection.execute("PRAGMA quick_check").fetchone()[0]) != "ok":
+            raise SchemaMigrationError("v17 migration failed SQLite quick_check")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.execute(f"PRAGMA legacy_alter_table={legacy_alter}")
+        connection.execute("PRAGMA foreign_keys=ON")
+
+
+def _validate_v17_structure(connection: sqlite3.Connection) -> None:
+    expected = _schema_object_sql(
+        object_type="table", name="accounts", prefix="CREATE TABLE IF NOT EXISTS accounts ",
+        schema_version=17,
+    )
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='accounts'"
+    ).fetchone()
+    if row is None or _normalized_schema_sql(str(row[0])) != _normalized_schema_sql(expected):
+        raise SchemaMigrationError("schema v17 account phone definition drifted")
+
+
+def _validate_v18_structure(connection: sqlite3.Connection) -> None:
+    from .schema_v18 import validate_structure
+
+    validate_structure(connection)
+
+
+def _validate_v19_structure(connection: sqlite3.Connection) -> None:
+    from .schema_v19 import validate_structure
+
+    validate_structure(connection)
+
+
+def migration_v18_plan(connection: sqlite3.Connection) -> dict[str, object]:
+    from .schema_v18 import migration_plan
+
+    return migration_plan(connection)
+
+
+def _migrate_v17_to_v18(connection: sqlite3.Connection) -> dict[str, object]:
+    from .schema_v18 import migrate
+
+    return migrate(connection)
+
+
+def migration_v19_plan(connection: sqlite3.Connection) -> dict[str, object]:
+    from .schema_v19 import migration_plan
+
+    return migration_plan(connection)
+
+
+def _migrate_v18_to_v19(connection: sqlite3.Connection) -> dict[str, object]:
+    from .schema_v19 import migrate
+
+    return migrate(connection)
+
+
+def _migrate_v19_to_v20(connection: sqlite3.Connection) -> dict[str, object]:
+    from .schema_v20 import migrate
+
+    return migrate(connection)
+
+
+def validate_v17_v18_lineage(
+    source_connection: sqlite3.Connection, candidate_connection: sqlite3.Connection
+) -> dict[str, object]:
+    from .schema_v18 import validate_lineage
+
+    return validate_lineage(source_connection, candidate_connection)
+
+
+def validate_v18_v19_lineage(
+    source_connection: sqlite3.Connection, candidate_connection: sqlite3.Connection
+) -> dict[str, object]:
+    from .schema_v19 import validate_lineage
+
+    return validate_lineage(source_connection, candidate_connection)
+
+
+def _require_initialization_safety(connection: sqlite3.Connection) -> None:
+    _require_non_formal_connection(connection)
     if int(connection.execute("PRAGMA recursive_triggers").fetchone()[0]) != 1:
         raise SchemaMigrationError(
             "database initialization requires PRAGMA recursive_triggers=ON"
         )
-    tables = _table_names(connection)
-    if not tables:
-        _create_fresh_schema(connection)
-        _validate_v9(connection)
-        _validate_v10(connection)
-        _validate_v11(connection)
-        _validate_v12(connection)
-        _validate_v13(connection)
-        _validate_v14(connection)
-        _validate_v15(connection)
-        _validate_v16(connection)
-        require_schema_compatibility(
-            connection, supported_versions=frozenset({SCHEMA_VERSION})
-        )
-        return
-    if "schema_migrations" not in tables:
+
+
+def _schema_manifest_version(connection: sqlite3.Connection) -> int:
+    if "schema_migrations" not in _table_names(connection):
         raise SchemaMigrationError("database has tables but no schema_migrations")
     row = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
     version = int(row[0]) if row is not None and row[0] is not None else 0
@@ -3704,40 +4413,85 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             "schema manifest and PRAGMA user_version disagree: "
             f"manifest={version},pragma={pragma_version}"
         )
-    if version == 8:
-        _migrate_v8_to_v9(connection)
-        version = 9
-    if version == 9:
-        _migrate_v9_to_v10(connection)
-        version = 10
-    if version == 10:
-        _migrate_v10_to_v11(connection)
-        version = 11
-    if version == 11:
-        _migrate_v11_to_v12(connection)
-        version = 12
-    if version == 12:
-        _migrate_v12_to_v13(connection)
-        version = 13
-    if version == 13:
-        _migrate_v13_to_v14(connection)
-        version = 14
-    if version == 14:
-        _migrate_v14_to_v15(connection)
-        version = 15
-    if version == 15:
-        _migrate_v15_to_v16(connection)
-        version = 16
-    if version != SCHEMA_VERSION:
-        raise SchemaMigrationError(f"unsupported schema version: {version}")
-    _validate_v9(connection)
-    _validate_v10(connection)
-    _validate_v11(connection)
-    _validate_v12(connection)
-    _validate_v13(connection)
-    _validate_v14(connection)
-    _validate_v15(connection)
-    _validate_v16(connection)
+    return version
+
+
+def migrate_database(
+    connection: sqlite3.Connection, *, from_version: int, to_version: int
+) -> None:
+    """Explicit forward migration of an offline candidate, never the formal DB."""
+
+    _require_initialization_safety(connection)
+    migrations = {
+        9: _migrate_v8_to_v9,
+        10: _migrate_v9_to_v10,
+        11: _migrate_v10_to_v11,
+        12: _migrate_v11_to_v12,
+        13: _migrate_v12_to_v13,
+        14: _migrate_v13_to_v14,
+        15: _migrate_v14_to_v15,
+        16: _migrate_v15_to_v16,
+        17: _migrate_v16_to_v17,
+        18: _migrate_v17_to_v18,
+        19: _migrate_v18_to_v19,
+        20: _migrate_v19_to_v20,
+    }
+    if (
+        from_version < 8
+        or from_version >= to_version
+        or to_version > LATEST_SCHEMA_VERSION
+        or any(v not in migrations for v in range(from_version + 1, to_version + 1))
+    ):
+        raise SchemaMigrationError(f"unsupported explicit migration: {from_version}->{to_version}")
+    actual_version = _schema_manifest_version(connection)
+    if actual_version != from_version:
+        raise SchemaMigrationError(
+            f"migration source version mismatch: expected {from_version}, got {actual_version}"
+        )
+    if from_version in RUNTIME_COMPATIBLE_SCHEMA_VERSIONS:
+        require_schema_compatibility(connection, supported_versions=frozenset({from_version}))
+    for version in range(from_version + 1, to_version + 1):
+        migrations[version](connection)
+    if to_version in RUNTIME_COMPATIBLE_SCHEMA_VERSIONS:
+        require_schema_compatibility(connection, supported_versions=frozenset({to_version}))
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        raise SchemaMigrationError(f"schema v{to_version} has foreign-key violations")
+
+
+def initialize_database(
+    connection: sqlite3.Connection, *, allow_migrations: bool = True,
+    target_version: int | None = None,
+) -> None:
+    """Initialize a non-formal database or explicitly upgrade an offline fixture.
+
+    API startup passes allow_migrations=False: an empty local database may be
+    created, but an existing historical database must be migrated explicitly.
+    The default preserves the established explicit offline/test entry point.
+    No environment variable authorizes formal database schema mutation.
+    """
+
+    _require_initialization_safety(connection)
+    requested_version = target_version or SCHEMA_VERSION
+    if requested_version not in {SCHEMA_VERSION, LATEST_SCHEMA_VERSION}:
+        raise SchemaMigrationError("unsupported initialization target")
+    if not _table_names(connection):
+        if int(connection.execute("PRAGMA user_version").fetchone()[0]) != 0:
+            raise SchemaMigrationError("empty database has a nonzero schema version")
+        _create_fresh_schema(connection)
+        if requested_version != SCHEMA_VERSION:
+            migrate_database(connection, from_version=SCHEMA_VERSION, to_version=requested_version)
+    else:
+        version = _schema_manifest_version(connection)
+        if target_version is None and version == LATEST_SCHEMA_VERSION:
+            requested_version = version
+        if version != requested_version:
+            if not allow_migrations:
+                raise SchemaMigrationError(
+                    f"schema {version} requires an explicit offline migration to {requested_version}"
+                )
+            migrate_database(connection, from_version=version, to_version=requested_version)
     require_schema_compatibility(
-        connection, supported_versions=frozenset({SCHEMA_VERSION})
+        connection, supported_versions=frozenset({requested_version})
     )
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        raise SchemaMigrationError(f"schema v{SCHEMA_VERSION} has foreign-key violations")

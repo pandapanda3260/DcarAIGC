@@ -135,7 +135,8 @@ def image_urls(item: dict[str, Any]) -> list[str]:
 
 
 def media_urls(item: dict[str, Any]) -> tuple[str, str, list[str]]:
-    video = item.get("video") if isinstance(item.get("video"), dict) else {}
+    video_value = item.get("video")
+    video = video_value if isinstance(video_value, dict) else {}
     images = image_urls(item)
     cover = first_url(video.get("cover")) or first_url(video.get("origin_cover"))
     if not cover and images:

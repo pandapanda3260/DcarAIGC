@@ -10,7 +10,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -188,6 +188,23 @@ class OfflineSchemaMigrationTest(unittest.TestCase):
                 self.assertEqual(sidecar.stat().st_size, 0)
                 sidecar.unlink()
 
+    def _build_v18_database(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with storage.connect(path) as connection:
+            initialize_historical_schema(connection, target_version=17)
+            storage.migrate_database(connection, from_version=17, to_version=18)
+        with sqlite3.connect(path, isolation_level=None) as connection:
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            self.assertEqual(
+                str(connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0]),
+                "delete",
+            )
+        for suffix in migrator.SQLITE_TRANSIENT_SUFFIXES:
+            sidecar = Path(f"{path}{suffix}")
+            if sidecar.exists():
+                self.assertEqual(sidecar.stat().st_size, 0)
+                sidecar.unlink()
+
     def _layout(
         self,
         root: Path,
@@ -236,6 +253,8 @@ class OfflineSchemaMigrationTest(unittest.TestCase):
                     freeze_lock=freeze,
                     migration_lock=migration_lock,
                     receipt=backup_receipt,
+                    isolated=True,
+                    project_root=project,
                     holder_checker=lambda _: [],
                 )
         return layout
@@ -251,6 +270,8 @@ class OfflineSchemaMigrationTest(unittest.TestCase):
             "migration_lock": layout["migration_lock"],
             "backup_receipt": layout["backup_receipt"],
             "receipt": layout["receipt"],
+            "isolated": True,
+            "project_root": layout["project"],
         }
 
     def _backup_arguments(self, layout: dict[str, Path]) -> dict[str, Any]:
@@ -262,13 +283,14 @@ class OfflineSchemaMigrationTest(unittest.TestCase):
             "freeze_lock": layout["freeze"],
             "migration_lock": layout["migration_lock"],
             "receipt": layout["backup_receipt"],
+            "isolated": True,
+            "project_root": layout["project"],
         }
 
     def _constant_patch(self, layout: dict[str, Path]):
         return patch.multiple(
             migrator,
             PROJECT_ROOT=layout["project"],
-            FORMAL_DATABASE=layout["source"],
             CANONICAL_OPERATOR_FREEZE_LOCK=layout["freeze"],
         )
 
@@ -376,7 +398,7 @@ class OfflineSchemaMigrationTest(unittest.TestCase):
                     )
                 with self.assertRaisesRegex(
                     migrator.OfflineMigrationError,
-                    "exact --from 15",
+                    "exact --from",
                 ):
                     migrator.prepare_verified_backup(
                         **{**arguments, "from_version": 14},
@@ -499,6 +521,94 @@ class OfflineSchemaMigrationTest(unittest.TestCase):
             self.assertEqual(receipt["database_handles"], [])
             self._assert_lock_released(layout["migration_lock"])
 
+    def test_dual_contract_builds_verified_v19_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            external = root / "external"
+            source = project / "data" / "source-v18.sqlite3"
+            freeze = project / "runtime" / "operator-freeze.lock"
+            backup = external / "backups" / "source-v18.sqlite3"
+            backup_receipt = external / "receipts" / "backup-v18.json"
+            candidate = external / "candidates" / "candidate-v19.sqlite3"
+            migration_receipt = external / "receipts" / "migration-v19.json"
+            migration_lock = external / "locks" / "migration.lock"
+            for directory in (
+                source.parent,
+                freeze.parent,
+                backup.parent,
+                backup_receipt.parent,
+                candidate.parent,
+                migration_lock.parent,
+            ):
+                directory.mkdir(parents=True, exist_ok=True)
+            migration_lock.parent.chmod(0o700)
+            freeze.write_text("frozen\n", encoding="utf-8")
+            freeze.chmod(0o600)
+            self._build_v18_database(source)
+            source_sha = _sha256(source)
+            code_identity = {
+                "git_head": "1" * 40,
+                "working_tree_sha256": "2" * 64,
+            }
+            with (
+                patch.object(migrator, "PROJECT_ROOT", project),
+                patch.object(
+                    migrator.shared_safety,
+                    "code_identity",
+                    return_value=code_identity,
+                ),
+            ):
+                backup_result = migrator.prepare_verified_backup(
+                    source_database=source,
+                    backup=backup,
+                    expected_source_sha256=source_sha,
+                    from_version=18,
+                    freeze_lock=freeze,
+                    migration_lock=migration_lock,
+                    receipt=backup_receipt,
+                    isolated=True,
+                    project_root=project,
+                    holder_checker=lambda _: [],
+                )
+                result = migrator.build_migration_candidate(
+                    source_database=source,
+                    candidate=candidate,
+                    expected_source_sha256=source_sha,
+                    from_version=18,
+                    to_version=19,
+                    freeze_lock=freeze,
+                    migration_lock=migration_lock,
+                    backup_receipt=backup_receipt,
+                    receipt=migration_receipt,
+                    isolated=True,
+                    project_root=project,
+                    holder_checker=lambda _: [],
+                )
+
+            self.assertEqual(
+                backup_result["schema_version"],
+                migrator.shared_safety.DUAL_V18_V19.backup_receipt_schema,
+            )
+            self.assertEqual(
+                result["schema_version"],
+                migrator.shared_safety.DUAL_V18_V19.migration_receipt_schema,
+            )
+            self.assertEqual(result["code_identity"], code_identity)
+            self.assertEqual(
+                result["lineage"]["schema_version"],
+                migrator.shared_safety.DUAL_V18_V19.allowed_differences_schema,
+            )
+            self.assertEqual(result["lineage"]["appended_migration_versions"], [19])
+            self.assertEqual(_sha256(source), source_sha)
+            with storage.connect(candidate, read_only=True) as connection:
+                self.assertEqual(
+                    storage.require_schema_compatibility(
+                        connection, supported_versions=frozenset({19})
+                    ),
+                    19,
+                )
+
     def test_every_fault_checkpoint_cleans_candidate_and_preserves_source(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             layout = self._layout(Path(temporary))
@@ -559,7 +669,7 @@ class OfflineSchemaMigrationTest(unittest.TestCase):
             source_sha = _sha256(layout["source"])
 
             def add_destructive_trigger(connection: sqlite3.Connection) -> None:
-                storage.initialize_database(connection)
+                storage._migrate_v15_to_v16(connection)
                 connection.execute(
                     """
                     CREATE TRIGGER injected_accounts_delete
@@ -687,7 +797,7 @@ class OfflineSchemaMigrationTest(unittest.TestCase):
             with self._constant_patch(layout):
                 with self.assertRaisesRegex(
                     migrator.OfflineMigrationError,
-                    "exact --from 15 --to 16",
+                    "exact implemented transition",
                 ):
                     migrator.build_migration_candidate(
                         **{**arguments, "from_version": 14},
@@ -852,20 +962,20 @@ class OfflineSchemaMigrationTest(unittest.TestCase):
             self.assertTrue(failed)
             self.assertFalse(receipt.exists())
 
-    def test_test_guard_refuses_formal_path_before_opening_database(self) -> None:
+    def test_formal_authority_failure_precedes_database_open(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fake_formal = Path(temporary) / "never-open.sqlite3"
             with (
-                patch.dict(os.environ, {"DCAR_TEST_DENY_FORMAL_DB": "1"}),
-                patch.multiple(
+                patch.object(
                     migrator,
-                    DEFAULT_DB=fake_formal,
-                    FORMAL_DATABASE=fake_formal,
+                    "hold_formal_mutation",
+                    side_effect=migrator.RuntimeDatabaseError("installed authority missing"),
                 ),
+                patch.object(migrator, "_require_regular_single_link") as database_open,
             ):
                 with self.assertRaisesRegex(
                     migrator.OfflineMigrationError,
-                    "test process attempted to open the formal",
+                    "formal_database_identity_unresolved",
                 ):
                     migrator.build_migration_candidate(
                         source_database=fake_formal,
@@ -878,6 +988,105 @@ class OfflineSchemaMigrationTest(unittest.TestCase):
                         backup_receipt=Path(temporary) / "backup.json",
                         receipt=Path(temporary) / "receipt.json",
                     )
+            database_open.assert_not_called()
+
+    def test_formal_operation_holds_installed_writer_lock_around_core(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "formal.sqlite3"
+            source.write_bytes(b"not-opened-by-wrapper")
+            project = root / "project"
+            project.mkdir()
+            access = MagicMock(database=source, project_root=project)
+            events: list[str] = []
+
+            @contextmanager
+            def formal_mutation(database: Path, *, project_root: Path):
+                self.assertEqual(database, source)
+                self.assertEqual(project_root, project)
+                events.append("lock-enter")
+                try:
+                    yield access
+                finally:
+                    events.append("lock-exit")
+
+            def prepared(**arguments: Any) -> dict[str, Any]:
+                self.assertEqual(events, ["lock-enter"])
+                self.assertEqual(arguments["source_database"], source)
+                self.assertEqual(
+                    arguments["canonical_freeze_lock"],
+                    project / "runtime" / "operator-freeze.lock",
+                )
+                events.append("core")
+                return {"status": "backup-ready"}
+
+            with (
+                patch.object(
+                    migrator,
+                    "hold_formal_mutation",
+                    side_effect=formal_mutation,
+                ) as hold,
+                patch.object(migrator, "PROJECT_ROOT", project),
+                patch.object(migrator, "_prepare_verified_backup", side_effect=prepared),
+            ):
+                result = migrator.prepare_verified_backup(
+                    source_database=source,
+                    backup=root / "backup.sqlite3",
+                    expected_source_sha256="a" * 64,
+                    from_version=15,
+                    freeze_lock=project / "runtime" / "operator-freeze.lock",
+                    migration_lock=root / "migration.lock",
+                    receipt=root / "backup.json",
+                    project_root=project,
+                )
+            self.assertEqual(result, {"status": "backup-ready"})
+            self.assertEqual(events, ["lock-enter", "core", "lock-exit"])
+            hold.assert_called_once_with(
+                source,
+                project_root=project,
+            )
+
+    def test_formal_lock_is_outermost_to_contract_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "formal.sqlite3"
+            source.write_bytes(b"contract-selection-must-not-open-this")
+            project = root / "project"
+            project.mkdir()
+            access = MagicMock(database=source, project_root=project)
+            events: list[str] = []
+
+            @contextmanager
+            def formal_mutation(_database: Path, *, project_root: Path):
+                self.assertEqual(project_root, project)
+                events.append("lock-enter")
+                try:
+                    yield access
+                finally:
+                    events.append("lock-exit")
+
+            with (
+                patch.object(migrator, "PROJECT_ROOT", project),
+                patch.object(
+                    migrator,
+                    "hold_formal_mutation",
+                    side_effect=formal_mutation,
+                ),
+                self.assertRaisesRegex(
+                    migrator.OfflineMigrationError,
+                    "verified backup requires exact",
+                ),
+            ):
+                migrator.prepare_verified_backup(
+                    source_database=source,
+                    backup=root / "backup.sqlite3",
+                    expected_source_sha256="a" * 64,
+                    from_version=14,
+                    freeze_lock=project / "runtime" / "operator-freeze.lock",
+                    migration_lock=root / "migration.lock",
+                    receipt=root / "backup.json",
+                )
+            self.assertEqual(events, ["lock-enter", "lock-exit"])
 
     def test_cli_dispatches_prepare_backup_and_preserves_build_candidate_alias(
         self,
@@ -900,6 +1109,7 @@ class OfflineSchemaMigrationTest(unittest.TestCase):
                 str(root / "migration.lock"),
                 "--receipt",
                 str(root / "backup.json"),
+                "--isolated",
             ]
             stdout = io.StringIO()
             with (
@@ -920,6 +1130,7 @@ class OfflineSchemaMigrationTest(unittest.TestCase):
                 freeze_lock=root / "freeze.lock",
                 migration_lock=root / "migration.lock",
                 receipt=root / "backup.json",
+                isolated=True,
             )
 
             candidate_arguments = [
@@ -942,6 +1153,7 @@ class OfflineSchemaMigrationTest(unittest.TestCase):
                 str(root / "backup.json"),
                 "--receipt",
                 str(root / "migration.json"),
+                "--isolated",
             ]
             with patch.object(
                 migrator,
@@ -950,6 +1162,7 @@ class OfflineSchemaMigrationTest(unittest.TestCase):
             ) as build, redirect_stdout(io.StringIO()):
                 self.assertEqual(migrator.main(candidate_arguments), 0)
             build.assert_called_once()
+            self.assertTrue(build.call_args.kwargs["isolated"])
 
 
 if __name__ == "__main__":

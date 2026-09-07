@@ -1,0 +1,112 @@
+.tableTitle { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 18px; margin-bottom: -10px; }
+.tableTitle h2 { margin: 0; color: var(--ink); font-size: 16px; font-weight: 650; line-height: 24px; }
+.tableTitle > span { color: var(--muted); font-size: 12px; }
+
+.tablePanel:global(.panel) {
+  --users-muted: #687880;
+  --users-line: #e8edef;
+  min-width: 0;
+  width: 100%;
+  max-width: 1080px;
+  justify-self: start;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: none;
+}
+.tablePanel > :global(.table-scroll) { overscroll-behavior-x: contain; }
+.tablePanel > :global(.empty-state) { padding: 36px 20px 40px; }
+.tablePanel .table { width: 100%; min-width: 960px; border-collapse: separate; border-spacing: 0; table-layout: fixed; }
+
+.table thead th {
+  height: 44px;
+  padding: 12px;
+  border: 0;
+  border-right: 1px solid #e7ecee;
+  border-bottom: 1px solid var(--line);
+  background: #f6f8f9;
+  color: #35474f;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 18px;
+  letter-spacing: normal;
+  white-space: nowrap;
+}
+.table thead th:nth-child(1) { width: 24%; }
+.table thead th:nth-child(2) { width: 17%; }
+.table thead th:nth-child(3) { width: 15%; }
+.table thead th:nth-child(4) { width: 11%; }
+.table thead th:nth-child(5) { width: 20%; }
+.table thead th:nth-child(6) { width: 13%; }
+.table thead th:last-child { border-right: 0; }
+
+.table tbody th,
+.table tbody td {
+  height: 68px;
+  padding: 12px;
+  border: 0;
+  border-bottom: 1px solid var(--users-line);
+  background: #fff;
+  color: #596970;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 20px;
+  letter-spacing: normal;
+  text-align: center;
+  vertical-align: middle;
+  overflow-wrap: anywhere;
+  transition: background-color 120ms;
+}
+.table thead th:first-child,
+.table tbody th:first-child { padding-left: 20px; text-align: left; }
+.table tbody tr:last-child > * { border-bottom: 0; }
+.table tbody tr:hover > *,
+.table tbody tr:focus-within > * { background: #f7f9f9; }
+
+.username { color: var(--ink); font-size: 13px; font-weight: 600; }
+.table :global(.muted-cell) { margin-left: 1px; color: var(--users-muted); font-size: 11px; font-weight: 400; white-space: nowrap; }
+.table .phone,
+.registrationTime { font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.table .role[data-role="new_user"] { color: var(--users-muted); }
+.table .role[data-role="superadmin"] { color: var(--ink); font-weight: 500; }
+.status { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.status::before { width: 6px; height: 6px; flex: 0 0 6px; border-radius: 50%; background: #a9b5ba; content: ""; }
+.status[data-status="active"]::before { background: #2aac9b; }
+.status[data-status="disabled"] { color: var(--users-muted); }
+.time { margin-left: 4px; color: var(--users-muted); font-size: 11px; }
+
+.tablePanel .table :global(.row-actions) { display: grid; grid-template-columns: max-content 36px; justify-content: center; align-items: center; gap: 6px; }
+.table :global(.text-button) {
+  min-height: 28px;
+  padding: 3px 11px;
+  border: 1px solid var(--navy);
+  border-radius: 5px;
+  background: var(--navy);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 20px;
+  text-align: center;
+  white-space: nowrap;
+}
+.table :global(.text-button):not(:disabled):hover { background: #23424c; }
+.table :global(.text-button.danger) { padding-inline: 5px; border-color: transparent; background: transparent; color: #b45858; font-weight: 400; }
+.table :global(.text-button.danger):not(:disabled):hover { background: #fff3f3; }
+.table :global(.text-button):focus-visible { outline: 2px solid var(--dcd-brand); outline-offset: 2px; }
+
+@media (min-width: 1800px) {
+  .table tbody th, .table tbody td { height: 72px; padding-top: 14px; padding-bottom: 14px; }
+  .username { font-size: 14px; }
+}
+@media (max-width: 640px) {
+  .table thead th:first-child, .table tbody th:first-child { padding-left: 12px; }
+}
+@media (pointer: coarse) {
+  .tablePanel .table :global(.row-actions) { grid-template-columns: max-content 44px; gap: 4px; }
+  .table :global(.text-button) { min-width: 44px; min-height: 44px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .table tbody th, .table tbody td { transition: none; }
+}

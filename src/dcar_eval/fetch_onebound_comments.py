@@ -64,6 +64,7 @@ def load_env(path: Path) -> Dict[str, str]:
         missing.append("ONEBOUND_SECRET")
     if missing:
         raise ValueError(f"Missing required fields in {path.name}: {', '.join(missing)}")
+    assert key_value is not None and secret_value is not None
     values["ONEBOUND_KEY"] = key_value
     values["ONEBOUND_SECRET"] = secret_value
     return values
@@ -401,7 +402,7 @@ def main() -> int:
         started = time.monotonic()
         attempt_count = 0
         page_count = 0
-        http_status = ""
+        http_status: int | str = ""
         code = ""
         reason = ""
         request_id = ""

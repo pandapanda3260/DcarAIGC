@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -30,7 +29,7 @@ from collect_rnote_pilot import (
     write_json,
     write_jsonl,
 )
-from probe_tikhub_douyin import KEY_FILE, fetch, load_key
+from probe_tikhub_douyin import KEY_FILE, LEGACY_NETWORK_DISABLED, load_key
 from project_paths import RNOTE_CACHE_DIR
 
 
@@ -81,33 +80,8 @@ class TikHubClient:
         self.billed_requests = 0
 
     def get(self, endpoint: str, params: dict[str, Any]) -> Any:
-        last: Exception | None = None
-        for attempt in range(2):
-            self.request_attempts += 1
-            try:
-                status, payload = fetch(endpoint, params, self.key)
-                if status in {401, 402, 403}:
-                    raise FatalProviderError(f"TikHub HTTP {status}: {message(payload)}")
-                if status in {408, 429} or status >= 500:
-                    raise TimeoutError(f"TikHub transient HTTP {status}")
-                if status != 200:
-                    raise CollectorError(f"TikHub HTTP {status}: {message(payload)}")
-                value = unwrap(payload)
-                self.billed_requests += 1
-                if self.delay:
-                    time.sleep(self.delay)
-                return value
-            except FatalProviderError:
-                raise
-            except (TimeoutError, ConnectionError, RuntimeError) as exc:
-                last = exc
-                if attempt == 0:
-                    time.sleep(0.75)
-                    continue
-                raise CollectorError(f"TikHub transport error: {type(exc).__name__}") from exc
-            except CollectorError:
-                raise
-        raise CollectorError(f"TikHub request failed: {last}")
+        del endpoint, params
+        raise CollectorError(LEGACY_NETWORK_DISABLED)
 
 
 def collect_content(
@@ -217,7 +191,8 @@ def collect_comments(
     comments_path = note_dir / "comments.jsonl"
     metadata_path = note_dir / "collection.json"
     metadata = read_json(metadata_path, {}) or {}
-    comments_meta = metadata.get("comments") if isinstance(metadata.get("comments"), dict) else {}
+    comments_meta_value = metadata.get("comments")
+    comments_meta = comments_meta_value if isinstance(comments_meta_value, dict) else {}
     records = read_jsonl(comments_path)
     apply_duplicate_filter(records)
     if comments_meta.get("stop_reason") in TERMINAL_STOPS:

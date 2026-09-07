@@ -7,7 +7,7 @@ import importlib
 import json
 import re
 import sqlite3
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
@@ -110,6 +110,14 @@ def _artifact(
     content_id: int,
     artifact_types: Sequence[str],
 ) -> Optional[sqlite3.Row]:
+    if set(artifact_types) & {
+        "media", "media_manifest", "asr", "transcript", "media_transcript", "ocr", "media_ocr"
+    }:
+        from .media import managed_bound_artifact
+
+        bundle, artifact = managed_bound_artifact(connection, content_id, artifact_types)
+        if bundle is not None:
+            return artifact
     placeholders = ",".join("?" for _ in artifact_types)
     return connection.execute(
         f"""
@@ -128,6 +136,9 @@ def _artifact_components(
     *,
     rule_version: str,
 ) -> Dict[str, Any]:
+    from .media import managed_bound_artifact
+
+    bundle, _ = managed_bound_artifact(connection, content_id, ("media", "media_manifest"))
     detail = connection.execute(
         """
         SELECT sha256 FROM provider_raw_responses
@@ -156,7 +167,10 @@ def _artifact_components(
         (content_id,),
     ).fetchone()
     return {
-        "detail_raw_sha256": str(detail["sha256"]) if detail is not None else None,
+        "detail_raw_sha256": (
+            bundle["manifest"]["source"]["raw_sha256"] if bundle is not None
+            else str(detail["sha256"]) if detail is not None else None
+        ),
         "media_sha256": str(media["sha256"]) if media is not None else None,
         "asr_sha256": str(asr["sha256"]) if asr is not None else None,
         "ocr_sha256": str(ocr["sha256"]) if ocr is not None else None,
@@ -172,6 +186,7 @@ def _artifact_components(
         else None,
         "asr_path": _resolved_path(str(asr["local_path"])) if asr is not None else None,
         "ocr_path": _resolved_path(str(ocr["local_path"])) if ocr is not None else None,
+        "bundle": bundle,
     }
 
 
@@ -278,8 +293,9 @@ def _evidence_level(
     media_path: Optional[Path],
     asr: Mapping[str, Any],
     ocr: Mapping[str, Any],
+    retained_media_verified: bool = False,
 ) -> tuple[str, str]:
-    media = _media_available(content_type, media_path)
+    media = retained_media_verified or _media_available(content_type, media_path)
     asr_text = str(asr.get("text") or "")
     ocr_text = str(ocr.get("combined_text") or "")
     asr_ok = asr.get("status") == "success" and _chinese_count(asr_text) >= 15
@@ -623,6 +639,7 @@ def _evaluate_content(
     expected_active_release_id: str | None = None,
     _release_id: str | None = None,
     _connection: Optional[sqlite3.Connection] = None,
+    reuse_retained_evidence: bool = False,
 ) -> EvaluationResult:
     if expected_active_release_id is not None:
         if not expected_active_release_id.strip():
@@ -631,7 +648,7 @@ def _evaluate_content(
             raise EvaluationError(
                 "expected_active_release_id cannot be combined with explicit release"
             )
-    with _evaluation_write_scope(db_path, _connection) as connection:
+    with ExitStack() as original_reads, _evaluation_write_scope(db_path, _connection) as connection:
         content = connection.execute(
             "SELECT * FROM content_items WHERE id=?", (content_id,)
         ).fetchone()
@@ -683,6 +700,33 @@ def _evaluate_content(
                 evidence_level=str(existing["evidence_level"]),
                 created=False,
             )
+        retained_media_verified = False
+        if artifacts["bundle"] is not None:
+            from .media_retention import media_read_lease
+
+            if reuse_retained_evidence:
+                from .media_completion import verify_completion
+
+                proof = verify_completion(artifacts["bundle"], db_path=db_path)
+                evidence_files = proof.get("evidence_files")
+                hashes = {
+                    item.get("sha256") for item in evidence_files
+                    if isinstance(item, dict)
+                } if isinstance(evidence_files, list) else set()
+                required = {artifacts["ocr_sha256"]}
+                if content["content_type"] == "video":
+                    required.add(artifacts["asr_sha256"])
+                if not proof.get("ready") or None in required or not required.issubset(hashes):
+                    raise EvaluationError("retained evidence is not sealed for the current media inputs")
+                original_reads.enter_context(media_read_lease(
+                    content_id, db_path=db_path, purpose="retained_evidence_evaluation",
+                    require_original=False,
+                ))
+                retained_media_verified = True
+            else:
+                original_reads.enter_context(media_read_lease(
+                    content_id, db_path=db_path, purpose="media_evaluation"
+                ))
         envelope_id, persisted_evidence_sha, artifacts = build_evidence_envelope(
             connection, content_id, rule_version=rule_version
         )
@@ -706,6 +750,7 @@ def _evaluate_content(
             media_path=artifacts["media_path"],
             asr=asr,
             ocr=ocr,
+            retained_media_verified=retained_media_verified,
         )
         matches: List[Dict[str, Any]]
         if evidence_level not in {"V2", "V3"}:
@@ -905,11 +950,13 @@ def evaluate_content(
     *,
     db_path: Path = DEFAULT_DB,
     expected_active_release_id: str | None = None,
+    reuse_retained_evidence: bool = False,
 ) -> EvaluationResult:
     return _evaluate_content(
         content_id,
         db_path=db_path,
         expected_active_release_id=expected_active_release_id,
+        reuse_retained_evidence=reuse_retained_evidence,
     )
 
 
@@ -918,6 +965,7 @@ def evaluate_release_content(
     *,
     release_id: str,
     db_path: Path = DEFAULT_DB,
+    reuse_retained_evidence: bool = False,
 ) -> EvaluationResult:
     """Evaluate one content item into an explicit v8 backfilling release."""
 
@@ -927,6 +975,7 @@ def evaluate_release_content(
         content_id,
         db_path=db_path,
         _release_id=release_id,
+        reuse_retained_evidence=reuse_retained_evidence,
     )
 
 
@@ -992,12 +1041,24 @@ def incremental_candidates(*, db_path: Path = DEFAULT_DB) -> List[int]:
         blocked: List[int] = []
         for row in content_rows:
             content_id = int(row["id"])
-            _, _, evidence_sha256 = _current_evidence_state(
-                connection, content_id, rule_version=active_rule_version
-            )
+            from .media_lifecycle import LifecycleError
+
+            try:
+                artifacts, _, evidence_sha256 = _current_evidence_state(
+                    connection, content_id, rule_version=active_rule_version
+                )
+            except LifecycleError as exc:
+                if exc.error_code == "managed_source_pending":
+                    continue
+                raise
             evidence_key = (content_id, evidence_sha256)
             if evidence_key in current_evidence:
                 continue
+            if artifacts["bundle"] is not None:
+                from .media_retention import original_availability
+
+                if original_availability(connection, content_id)["reason"] != "original_available":
+                    continue
             if evidence_key in invalidated_automatic_evidence:
                 blocked.append(content_id)
                 continue

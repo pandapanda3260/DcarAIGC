@@ -13,7 +13,7 @@ from unittest.mock import patch
 from scripts import import_dongchedi_spu_series as cli
 from v8 import spu_series_catalog_import as importer
 from v8.spu_audience import ensure_assets
-from v8.storage import connect, initialize_database
+from v8.storage import SCHEMA_VERSION, connect, initialize_database
 
 
 class SpuSeriesCatalogImportTest(unittest.TestCase):
@@ -562,11 +562,12 @@ class SpuSeriesCatalogImportTest(unittest.TestCase):
             connection.execute("PRAGMA user_version=15")
             connection.commit()
         with self.assertRaisesRegex(
-            importer.SpuSeriesCatalogImportError, "must be v16"
+            importer.SpuSeriesCatalogImportError,
+            f"database schema must be v{SCHEMA_VERSION}, got v15",
         ):
             self._dry_run()
         with connect(self.database) as connection:
-            connection.execute("PRAGMA user_version=16")
+            connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             connection.commit()
 
         dry_run = self._dry_run()

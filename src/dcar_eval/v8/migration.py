@@ -13,6 +13,7 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 from .metric_observations import persist_metric_observation
 from .storage import (
     DEFAULT_DB,
+    INSTALLED_LEGACY_DB,
     PROJECT_ROOT,
     connect,
     ensure_legacy_evaluation_release,
@@ -22,7 +23,7 @@ from .storage import (
 )
 
 
-LEGACY_DB = PROJECT_ROOT / "app" / "data" / "web_mvp.sqlite3"
+LEGACY_DB = INSTALLED_LEGACY_DB
 BASELINE_PATH = PROJECT_ROOT / "config" / "v8_migration_baseline.json"
 TAXONOMY_PATH = PROJECT_ROOT / "config" / "business_selling_points_v4_final.json"
 LINK_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"

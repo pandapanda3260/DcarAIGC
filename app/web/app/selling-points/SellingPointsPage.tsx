@@ -1,20 +1,17 @@
 "use client";
 
 import { Fragment, useState } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import {
   CarIcon,
   GameControllerIcon,
-  PlusIcon,
   StarFourIcon,
   TelevisionIcon,
 } from "@phosphor-icons/react";
 import AppShell from "../components/AppShell";
-import { Feedback, Loading, Notice } from "../components/Feedback";
-import { jsonRequest, readJson } from "../lib/api";
+import { Loading, Notice } from "../components/Feedback";
 import { label } from "../lib/format";
-import { activeSellingPointsQueryOptions, draftSellingPointsQueryOptions, queryKeys } from "../lib/queries";
-import sellingPointV53 from "../../../../config/business_selling_points_v5_3.json";
+import { activeSellingPointsQueryOptions } from "../lib/queries";
 import type {
   BusinessSceneKey,
   OverviewChannelKey,
@@ -22,14 +19,6 @@ import type {
   SellingPointResponse,
   WindowKey,
 } from "../lib/types";
-
-type PointForm = {
-  code: string;
-  tier: "core" | "other";
-  label: string;
-  definition: string;
-  matcherRuleJson: string;
-};
 
 type StandardFamilyCode = "E" | "X" | "M";
 type StandardFamily = {
@@ -39,33 +28,7 @@ type StandardFamily = {
   scene: BusinessSceneKey;
 };
 
-const emptyPoint: PointForm = {
-  code: "",
-  tier: "other",
-  label: "",
-  definition: "",
-  matcherRuleJson: "{}",
-};
-
 const emptySellingPoints: SellingPointResponse = { taxonomy: null, items: [] };
-
-const v53PreviewByCode = new Map(
-  sellingPointV53.labels.map((point) => [point.id, point] as const),
-);
-
-function withV53PreviewCopy(response: SellingPointResponse): SellingPointResponse {
-  return {
-    ...response,
-    items: response.items.map((point) => {
-      const preview = v53PreviewByCode.get(point.code);
-      return preview ? {
-        ...point,
-        label: preview.label,
-        definition: preview.definition,
-      } : point;
-    }),
-  };
-}
 
 const standardFamilies = [
   { code: "E", title: "二手车", description: "交易、车况、估值与保障标准", scene: "used_car" },
@@ -108,147 +71,13 @@ function FamilyIcon({ code, size = 22 }: { code: StandardFamilyCode; size?: numb
 
 export default function SellingPointsPage() {
   const [statWindow, setStatWindow] = useState<WindowKey>("last_week");
-  const [draftMode, setDraftMode] = useState(false);
-  const [previewMode, setPreviewMode] = useState(true);
-  const [form, setForm] = useState<PointForm | null>(null);
-  const [editingCode, setEditingCode] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState("");
-  const [message, setMessage] = useState("");
-  const queryClient = useQueryClient();
-  const activeQuery = useQuery({ ...activeSellingPointsQueryOptions(), enabled: !draftMode });
-  const draftQuery = useQuery({ ...draftSellingPointsQueryOptions(), enabled: draftMode });
-  const currentQuery = draftMode ? draftQuery : activeQuery;
-  const currentData = currentQuery.data ?? emptySellingPoints;
-  const data = previewMode && !draftMode ? withV53PreviewCopy(currentData) : currentData;
-
-  async function ensureDraft(): Promise<SellingPointResponse> {
-    if (draftMode) return queryClient.fetchQuery(draftSellingPointsQueryOptions());
-    await readJson("/api/v8/selling-points/draft", { method: "POST" });
-    await queryClient.invalidateQueries({ queryKey: queryKeys.draftSellingPoints, exact: true });
-    const draft = await queryClient.fetchQuery(draftSellingPointsQueryOptions());
-    setDraftMode(true);
-    setPreviewMode(false);
-    setMessage("已进入草稿编辑。发布前不会影响当前的评估结果。");
-    return draft;
-  }
-
-  async function beginPoint(point?: SellingPoint) {
-    setSaving(true);
-    setError("");
-    try {
-      const draft = await ensureDraft();
-      const draftPoint = point ? draft.items.find((item) => item.code === point.code) : undefined;
-      if (point && !draftPoint) throw new Error("这个卖点已不在草稿中，请刷新页面后重试。");
-      open(draftPoint);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "卖点草稿创建失败");
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  function open(point?: SellingPoint) {
-    setEditingCode(point?.code ?? null);
-    setForm(point ? {
-      code: point.code,
-      tier: point.tier === "core" ? "core" : "other",
-      label: point.label,
-      definition: point.definition,
-      matcherRuleJson: JSON.stringify(point.matcher_rule ?? {}, null, 2),
-    } : { ...emptyPoint });
-  }
-
-  async function save() {
-    if (!form) return;
-    setSaving(true);
-    setError("");
-    try {
-      let matcherRule: unknown;
-      try {
-        matcherRule = JSON.parse(form.matcherRuleJson);
-      } catch {
-        throw new Error("匹配规则填写格式不正确，请检查后重试。");
-      }
-      if (!matcherRule || typeof matcherRule !== "object" || Array.isArray(matcherRule)) {
-        throw new Error("匹配规则最外层需要使用大括号，请检查后重试。");
-      }
-      await readJson(
-        editingCode ? `/api/v8/selling-points/items/${editingCode}` : "/api/v8/selling-points/items",
-        jsonRequest({
-          code: form.code,
-          tier: form.tier,
-          label: form.label,
-          definition: form.definition,
-          matcher_rule: matcherRule,
-        }, editingCode ? "PATCH" : "POST"),
-      );
-      await queryClient.invalidateQueries({ queryKey: queryKeys.draftSellingPoints, exact: true });
-      setForm(null);
-      setMessage("卖点草稿已保存");
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "卖点保存失败");
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function remove(code: string) {
-    if (!window.confirm(`确认从草稿删除 ${code}？`)) return;
-    setSaving(true);
-    setError("");
-    try {
-      await ensureDraft();
-      await readJson(`/api/v8/selling-points/items/${code}`, { method: "DELETE" });
-      await queryClient.invalidateQueries({ queryKey: queryKeys.draftSellingPoints, exact: true });
-      setMessage(`${code} 已从草稿删除`);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "卖点删除失败");
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  const projectionPoint = editingCode
-    ? data.items.find((point) => point.code === editingCode) ?? null
-    : null;
-
-  const shellActions = (
-    <>
-      {draftMode && (
-        <span className="selling-point-activation-note" role="status">
-          草稿完成检查并发布后才会正式生效
-        </span>
-      )}
-      {!draftMode && previewMode && (
-        <span className="selling-point-activation-note" role="status">
-          当前仅预览 v5.3 新文案，命中统计和后台评估仍使用 v5.2
-        </span>
-      )}
-      {!draftMode && (
-        <button
-          className="secondary selling-point-edit-standard"
-          disabled={currentQuery.isPending || saving}
-          onClick={() => {
-            setPreviewMode((value) => !value);
-            setMessage(previewMode ? "已切回当前正式生效版 v5.2" : "当前显示 v5.3 新文案预览");
-          }}
-        >
-          {previewMode ? "查看正式生效版" : "预览 v5.3 新文案"}
-        </button>
-      )}
-      <button className="secondary selling-point-edit-standard" disabled={currentQuery.isPending || saving} onClick={() => void beginPoint()}>
-        <PlusIcon size={16} weight="bold" aria-hidden />
-        新增卖点
-      </button>
-    </>
-  );
+  const currentQuery = useQuery(activeSellingPointsQueryOptions());
+  const data = currentQuery.data ?? emptySellingPoints;
 
   return (
-    <AppShell active="selling-points" actions={shellActions}>
-      <Feedback error={error} message={message} onClose={() => { setError(""); setMessage(""); }} />
+    <AppShell active="selling-points">
       {currentQuery.isError && <Notice tone="error">{currentQuery.data ? `数据刷新失败，当前显示上次数据。${currentQuery.error instanceof Error ? currentQuery.error.message : ""}` : currentQuery.error instanceof Error ? currentQuery.error.message : "卖点标准读取失败"}</Notice>}
-      {currentQuery.isPending && !currentQuery.data ? <Loading label="正在读取卖点标准……" /> : (
+      {currentQuery.isPending && !currentQuery.data ? <Loading label="正在读取卖点标准" /> : (
         <section className="page-stack selling-points-page">
           <section className="selling-point-summary" aria-labelledby="selling-point-summary-title">
             <header className="selling-point-summary-head">
@@ -270,8 +99,8 @@ export default function SellingPointsPage() {
                     <span className="selling-point-family-icon"><FamilyIcon code={family.code} size={26} /></span>
                     <div className="selling-point-summary-copy">
                       <span><b>{family.code}</b> {family.title}</span>
-                      <strong>{draftMode || !familyHasHits ? "—" : primaryHits.toLocaleString("zh-CN")}</strong>
-                      <small>{draftMode ? "草稿不含命中统计" : familyHasHits ? `主要卖点命中 · ${familyPoints.length} 项标准` : `${familyPoints.length} 项标准`}</small>
+                      <strong>{!familyHasHits ? "—" : primaryHits.toLocaleString("zh-CN")}</strong>
+                      <small>{familyHasHits ? `主要卖点命中 · ${familyPoints.length} 项标准` : `${familyPoints.length} 项标准`}</small>
                     </div>
                   </article>
                 );
@@ -308,13 +137,11 @@ export default function SellingPointsPage() {
                       <p className="selling-point-family-meta">
                         {familyPoints.length} 个一级类目
                         <span aria-hidden>·</span>
-                        {draftMode
-                          ? "草稿版本"
-                          : data.windows
-                            ? `${statWindowLabels[statWindow]} ${windowPrimaryHits.toLocaleString("zh-CN")} 次主要卖点命中`
-                            : familyHasHits
-                              ? `${primaryHits.toLocaleString("zh-CN")} 次主要卖点命中`
-                              : "暂无命中统计"}
+                        {data.windows
+                          ? `${statWindowLabels[statWindow]} ${windowPrimaryHits.toLocaleString("zh-CN")} 次主要卖点命中`
+                          : familyHasHits
+                            ? `${primaryHits.toLocaleString("zh-CN")} 次主要卖点命中`
+                            : "暂无命中统计"}
                       </p>
                       <span className="selling-point-window-control">
                         <label htmlFor={`selling-point-window-${family.code}`}>统计窗口</label>
@@ -345,7 +172,6 @@ export default function SellingPointsPage() {
                             <col className="selling-point-share-col" />
                           </Fragment>
                         ))}
-                        <col className="selling-point-action-col" />
                       </colgroup>
                       <thead>
                         <tr>
@@ -359,14 +185,13 @@ export default function SellingPointsPage() {
                               <th scope="col">{channel.label}曝光占比</th>
                             </Fragment>
                           ))}
-                          <th scope="col">操作</th>
                         </tr>
                       </thead>
                       <tbody>
                         {familyPoints.map((point) => {
                           const pointSceneHits = sceneHits(point, family.scene);
                           const pointWindowHits = point.window_hits?.[statWindow]?.[family.scene];
-                          const statsReady = !draftMode && Boolean(data.windows);
+                          const statsReady = Boolean(data.windows);
                           return (
                             <tr key={point.code}>
                               <th scope="row"><span className="selling-point-code-pill">{point.code}</span></th>
@@ -393,7 +218,7 @@ export default function SellingPointsPage() {
                                     <strong>{(pointWindowHits?.primary_hits ?? 0).toLocaleString("zh-CN")}</strong>
                                     <small>全部 {(pointWindowHits?.total_hits ?? 0).toLocaleString("zh-CN")}</small>
                                   </span>
-                                ) : !draftMode && pointSceneHits ? (
+                                ) : pointSceneHits ? (
                                   <span className="selling-point-hit-value">
                                     <strong>{pointSceneHits.primary_hits.toLocaleString("zh-CN")}</strong>
                                     <small>全部 {pointSceneHits.total_hits.toLocaleString("zh-CN")}</small>
@@ -434,12 +259,6 @@ export default function SellingPointsPage() {
                                   </Fragment>
                                 );
                               })}
-                              <td>
-                                <span className="selling-point-row-actions">
-                                  <button className="text-button" disabled={saving} onClick={() => void beginPoint(point)}>编辑</button>
-                                  <button className="text-button danger" disabled={saving} onClick={() => void remove(point.code)}>删除</button>
-                                </span>
-                              </td>
                             </tr>
                           );
                         })}
@@ -451,64 +270,6 @@ export default function SellingPointsPage() {
             })}
           </div>
         </section>
-      )}
-
-      {form && (
-        <div className="modal-backdrop" role="presentation">
-          <section className="modal-panel selling-point-rule-modal" role="dialog" aria-modal="true" aria-label="编辑卖点">
-            <div className="panel-head">
-              <div><span className="eyebrow">卖点草稿</span><h3>{editingCode ? `编辑 ${editingCode}` : "新增卖点"}</h3></div>
-              <button className="modal-close" onClick={() => setForm(null)} aria-label="关闭">×</button>
-            </div>
-            <div className="modal-fields">
-              <label>编码<input value={form.code} disabled={Boolean(editingCode)} onChange={(event) => setForm({ ...form, code: event.target.value.toUpperCase() })} /></label>
-              <label>层级<select value={form.tier} onChange={(event) => setForm({ ...form, tier: event.target.value as PointForm["tier"] })}><option value="core">核心</option><option value="other">其他</option></select></label>
-              <label className="span-two">名称<input value={form.label} onChange={(event) => setForm({ ...form, label: event.target.value })} /></label>
-              <label className="span-two">定义<textarea value={form.definition} onChange={(event) => setForm({ ...form, definition: event.target.value })} /></label>
-              <label className="span-two">
-                匹配规则（请按示例格式填写）
-                <textarea
-                  className="matcher-rule-editor"
-                  value={form.matcherRuleJson}
-                  spellCheck={false}
-                  onChange={(event) => setForm({ ...form, matcherRuleJson: event.target.value })}
-                />
-              </label>
-            </div>
-            <section className="selling-point-projection-preview" aria-label="规则效果预览">
-              <header>
-                <strong>规则效果预览</strong>
-                <span>系统会根据匹配规则自动生成适用场景和判断依据，并在保存时再次检查。</span>
-              </header>
-              {projectionPoint ? (
-                <div className="selling-point-projection-grid">
-                  <div>
-                    <h4>适用业务场景</h4>
-                    <p>{projectionPoint.scenes.length ? projectionPoint.scenes.map(label).join("、") : "无"}</p>
-                  </div>
-                  <div>
-                    <h4>会判定为匹配的内容</h4>
-                    <p>{projectionPoint.positive_evidence.length ? projectionPoint.positive_evidence.join("；") : "无"}</p>
-                  </div>
-                  <div>
-                    <h4>会排除的内容</h4>
-                    <p>{projectionPoint.negative_evidence.length ? projectionPoint.negative_evidence.join("；") : "无"}</p>
-                  </div>
-                  <div>
-                    <h4>特殊情况</h4>
-                    <p>{projectionPoint.boundary_rules.length ? projectionPoint.boundary_rules.join("；") : "无"}</p>
-                  </div>
-                </div>
-              ) : (
-                <p className="selling-point-projection-empty">保存并通过检查后，这里会显示适用场景和判断依据。</p>
-              )}
-            </section>
-            <div className="modal-actions">
-              <button className="secondary" onClick={() => setForm(null)}>取消</button>
-              <button className="primary" disabled={saving || !form.code.trim() || !form.matcherRuleJson.trim()} onClick={() => void save()}>{saving ? "保存中" : "保存草稿"}</button>
-            </div>
-          </section>
-        </div>
       )}
     </AppShell>
   );

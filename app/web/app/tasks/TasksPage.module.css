@@ -1,0 +1,323 @@
+/* Only the report list opts into this layout. AppShell, navigation, task
+   details, the creation dialog and the media lifecycle panel stay unchanged. */
+:global(.main-area[data-section="tasks"]):has(.page) {
+  --task-list-ink: #253336;
+  --task-list-muted: #677578;
+  --task-list-line: #e8ecec;
+  background: #fff;
+}
+
+:global(.main-area[data-section="tasks"]):has(.page) > :global(.page-header) {
+  padding-top: 32px;
+  padding-bottom: 20px;
+  background: #fff;
+}
+
+:global(.main-area[data-section="tasks"]):has(.page) :global(.page-header-title) {
+  color: var(--task-list-ink);
+  font-size: 24px;
+  font-weight: 500;
+  line-height: 1.45;
+  letter-spacing: -.4px;
+}
+
+:global(.main-area[data-section="tasks"]):has(.page) :global(.page-header-eyebrow) {
+  margin-bottom: 5px;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--task-list-muted);
+}
+
+:global(.main-area[data-section="tasks"]):has(.page) :global(.page-header-description) {
+  font-size: 13px;
+  line-height: 1.8;
+  color: var(--task-list-muted);
+}
+
+:global(.main-area[data-section="tasks"]):has(.page) :global(.page-header-actions) {
+  gap: 12px;
+}
+
+:global(.main-area[data-section="tasks"]):has(.page) :global(.page-header-actions .primary) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 36px;
+  border-radius: 5px;
+  box-shadow: none;
+  transform: none;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+:global(.main-area[data-section="tasks"]):has(.page) :global(.page-header-actions .rule-chip) {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--task-list-muted);
+  font-size: 12px;
+  font-weight: 400;
+}
+
+/* The shell's existing service state remains the source of truth. Style only
+   the banner directly following this page's header, preserving its tone. */
+:global(.main-area[data-section="tasks"]):has(.page) > :global(.page-header) + [role="status"] {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 5px 14px;
+  margin-bottom: 0;
+  padding: 0 0 18px;
+  border: 0;
+  border-bottom: 1px solid var(--task-list-line);
+  border-radius: 0;
+  background: transparent;
+  font-size: 12px;
+  line-height: 1.8;
+}
+
+:global(.main-area[data-section="tasks"]):has(.page) > :global(.page-header) + [role="status"] > strong {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  font-weight: 500;
+}
+
+:global(.main-area[data-section="tasks"]):has(.page) > :global(.page-header) + [role="status"] > strong::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+:global(.main-area[data-section="tasks"]):has(.page) > :global(.page-header) + [role="status"] > span {
+  color: var(--task-list-muted);
+}
+
+.page {
+  row-gap: 0;
+}
+
+.page > :global(.panel) + :global(.panel) {
+  margin-top: 22px;
+}
+
+.listHeader {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px 18px;
+}
+
+.listHeader h2 {
+  margin: 0;
+  color: var(--task-list-ink);
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.6;
+}
+
+.listHeader p {
+  margin: 0;
+  color: var(--task-list-muted);
+  font-size: 12px;
+  line-height: 1.8;
+  overflow-wrap: anywhere;
+}
+
+.page :global(.task-card-list) {
+  gap: 0;
+  margin-bottom: 26px;
+}
+
+.page :global(.task-card),
+.page :global(.task-card.generating) {
+  grid-template-columns: 66px minmax(0, 1fr) auto;
+  gap: 24px;
+  align-items: start;
+  padding: 26px 0;
+  border: 0;
+  border-bottom: 1px solid var(--task-list-line);
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.dateRail {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding-top: 1px;
+  min-width: 0;
+}
+
+.dateRail strong {
+  color: var(--task-list-ink);
+  font-size: 22px;
+  line-height: 1.4;
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -.8px;
+}
+
+.dateRail span {
+  color: var(--task-list-muted);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.page :global(.task-card-head) {
+  flex-wrap: wrap;
+  gap: 6px 10px;
+}
+
+.page :global(.task-card-head h3) {
+  color: var(--task-list-ink);
+  font-size: 16px;
+  font-weight: 500;
+  line-height: 1.5;
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  overflow-wrap: anywhere;
+}
+
+.page :global(.task-card-head .status-badge) {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+  background: transparent;
+  border-radius: 0;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.6;
+}
+
+.page :global(.task-card-head .status-badge)::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  flex: 0 0 5px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.page :global(.task-card-meta) {
+  margin-top: 7px;
+  gap: 4px 12px;
+  color: var(--task-list-muted);
+  font-size: 12px;
+  line-height: 1.65;
+  font-variant-numeric: tabular-nums;
+}
+
+.page :global(.task-card-meta span) {
+  min-width: 0;
+  color: var(--task-list-muted);
+  overflow-wrap: anywhere;
+}
+
+.page :global(.task-card-facts) {
+  margin-top: 10px;
+  gap: 5px 22px;
+  color: var(--task-list-muted);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.65;
+}
+
+.page :global(.task-card-note) {
+  margin-top: 11px;
+  color: var(--task-list-muted);
+  font-size: 12px;
+  line-height: 1.8;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.page :global(.task-card > .button-link) {
+  justify-self: end;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+  padding: 0;
+  min-height: 24px;
+  border: 0;
+  border-radius: 0;
+  color: var(--task-list-ink);
+  background: transparent;
+  box-shadow: none;
+  transform: none;
+  font-size: 13px;
+  font-weight: 400;
+  white-space: nowrap;
+}
+
+.page :global(.task-card > .button-link:hover) {
+  text-decoration: underline;
+  text-underline-offset: 4px;
+}
+
+.chevron {
+  color: var(--task-list-muted);
+  font-size: 20px;
+  line-height: 1;
+}
+
+.page :global(.task-progress) {
+  max-width: 640px;
+  margin-top: 12px;
+}
+
+.page :global(.task-progress > div:first-child) {
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.7;
+}
+
+.page :global(.task-progress span) {
+  white-space: normal;
+  overflow: visible;
+  overflow-wrap: anywhere;
+}
+
+@container (max-width: 640px) {
+  .page :global(.task-card),
+  .page :global(.task-card.generating) {
+    grid-template-columns: 50px minmax(0, 1fr) auto;
+    column-gap: 16px;
+    padding-block: 22px;
+  }
+
+  .dateRail strong { font-size: 20px; }
+  .dateRail span { font-size: 12px; }
+  .page :global(.task-card-head h3) { font-size: 15px; }
+  .page :global(.task-card-facts) { gap: 5px 15px; }
+}
+
+@container (max-width: 430px) {
+  .page :global(.task-card),
+  .page :global(.task-card.generating) {
+    grid-template-columns: 48px minmax(0, 1fr);
+    gap: 12px;
+  }
+
+  .page :global(.task-card > .button-link) {
+    grid-column: 2;
+    justify-self: start;
+    margin-top: 0;
+  }
+}
+
+@media (pointer: coarse) {
+  .page :global(.task-card > .button-link) { min-height: 44px; }
+}

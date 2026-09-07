@@ -8,6 +8,7 @@ import json
 import math
 import os
 import sqlite3
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +17,8 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
 
 from .capture import BudgetBlocked, ProviderResult
+from .account_roster import current_snapshot
+from .provider_budget import paid_scope
 from .duplicates import (
     calibration_ready,
     fingerprint_content,
@@ -23,13 +26,25 @@ from .duplicates import (
 )
 from .evaluation import evaluate_content
 from .media import process_content_media
-from .media_state import MediaTerminalDetail, media_terminal_state_details
+from .media_state import (
+    MediaTerminalDetail,
+    media_terminal_state_details,
+    provider_terminal_unavailable_content_ids as provider_terminal_unavailable_content_ids,
+)
 from .metric_observations import persist_metric_observation
 from .providers import (
     TIKHUB_PRICE,
     TIKHUB_XHS_PRICE,
     discover_account_content,
     update_content_data,
+)
+from .runtime_database import (
+    DatabaseAccessMode,
+    RuntimeDatabaseError,
+    acquire_writer_lock,
+    is_installed_formal_database,
+    resolve_installed_database_access,
+    resolve_isolated_candidate,
 )
 from .storage import (
     BACKFILL_SOURCE_GROUPS,
@@ -39,6 +54,7 @@ from .storage import (
     PROJECT_ROOT,
     connect,
     is_formal_database_path,
+    live_wal_read_only_connections,
     now_utc,
     transaction,
 )
@@ -62,11 +78,48 @@ COMMENT_CAP = 1000
 BLOCKING_CODES = {
     "provider_balance_blocked",
     "provider_auth_blocked",
+    "provider_circuit_open",
+    "provider_blocked",
+    "provider_transport_blocked",
+    "operation_blocked",
+    "storage_hard",
+    "authorization_hard",
+    "paid_identity_hold",
+    "billing_unknown_retry_blocked",
     "budget_blocked",
     "task_budget_exhausted",
     "budget_daily_quota_exhausted",
+    "category_budget_exhausted",
+    "discovery_budget_exhausted",
+    "metrics_budget_exhausted",
+    "automatic_budget_exhausted",
+    "repair_budget_exhausted",
+    "global_budget_exhausted",
+    "incident_total_budget_exhausted",
+    "incident_bucket_budget_exhausted",
+    "incident_authorization_invalid",
+    "compensation_authorization_required",
+    "compensation_authorization_invalid",
+    "compensation_authorization_consumed",
+    "compensation_gap_invalid",
     "BudgetBlocked",
 }
+
+
+@contextmanager
+def _formal_read_connections():
+    """Force every default storage connection in a read-only CLI phase to ro."""
+
+    previous = os.environ.get("DCAR_READ_ONLY")
+    os.environ["DCAR_READ_ONLY"] = "1"
+    try:
+        with live_wal_read_only_connections():
+            yield
+    finally:
+        if previous is None:
+            os.environ.pop("DCAR_READ_ONLY", None)
+        else:
+            os.environ["DCAR_READ_ONLY"] = previous
 
 
 class RangeBackfillError(RuntimeError):
@@ -474,9 +527,11 @@ def _enabled_identities(
         where.append(f"api.platform IN ({','.join('?' for _ in selected)})")
         parameters.extend(selected)
     sql = f"""
-        SELECT api.account_id, api.platform, api.uid, api.nickname
+        SELECT api.id identity_id,api.account_id, api.platform, api.uid, api.nickname
         FROM account_platform_identities api
         JOIN accounts a ON a.id=api.account_id
+        JOIN account_roster_members m ON m.account_identity_id=api.id
+          AND m.snapshot_id=(SELECT MAX(id) FROM account_roster_snapshots)
         WHERE {' AND '.join(where)}
         ORDER BY api.platform, api.account_id
     """
@@ -486,6 +541,8 @@ def _enabled_identities(
         sql += " LIMIT ?"
         parameters.append(account_limit)
     with connect(db_path) as connection:
+        if current_snapshot(connection) is None:
+            raise RangeBackfillError("roster_not_ready: 补抓必须先接受完整矩阵通名册")
         rows = connection.execute(sql, parameters).fetchall()
     return [dict(row) for row in rows]
 
@@ -695,7 +752,10 @@ def _process_content_batch(
                 "stages": [],
             }
         try:
-            result = processor(content_id)
+            # ContextVars do not flow into ThreadPoolExecutor workers. Enter
+            # the history quota inside the actual worker, not on its caller.
+            with paid_scope("history"):
+                result = processor(content_id)
         except Exception as exc:  # noqa: BLE001 - 长跑批处理需按条隔离异常
             result = {
                 "content_id": content_id,
@@ -761,6 +821,7 @@ def run_discovery_backfill(
     as_of: datetime,
     require_live_detail: bool = False,
     skip_existing_derived_stages: bool = False,
+    resume_completed: bool = False,
 ) -> Dict[str, Any]:
     _require_formal_mutation_freeze(db_path=db_path)
     start_utc, end_utc = _utc(start), _utc(end)
@@ -773,7 +834,7 @@ def run_discovery_backfill(
     if archive_before is not None:
         _utc(archive_before)
     selected_platforms = _selected_platforms(platforms)
-    _prepare_campaign_contract(
+    state_path = _prepare_campaign_contract(
         task_id=task_id,
         start=start,
         end=end,
@@ -787,6 +848,35 @@ def run_discovery_backfill(
     identities = _enabled_identities(
         db_path=db_path, platforms=selected_platforms, account_limit=account_limit
     )
+    previous_completed: Dict[int, Dict[str, Any]] = {}
+    if resume_completed and state_path.is_file():
+        prior = json.loads(state_path.read_text(encoding="utf-8"))
+        prior_results = (prior.get("details") or {}).get("results") or []
+        if not isinstance(prior_results, list):
+            raise RangeBackfillError("已有发现结果不是 list，不能断点续跑")
+        current_contract = {
+            int(identity["identity_id"]): (
+                int(identity["account_id"]), str(identity["platform"]),
+                str(identity["uid"]),
+            )
+            for identity in identities
+        }
+        for item in prior_results:
+            if not isinstance(item, dict) or item.get("completed") is not True:
+                continue
+            identity_id = int(item.get("identity_id") or 0)
+            if current_contract.get(identity_id) != (
+                int(item.get("account_id") or 0), str(item.get("platform") or ""),
+                str(item.get("uid") or ""),
+            ):
+                continue
+            if not isinstance(item.get("pages"), list):
+                continue
+            previous_completed[identity_id] = item
+    pending_identities = [
+        identity for identity in identities
+        if int(identity["identity_id"]) not in previous_completed
+    ]
     blocking_stop = Event()
 
     def initial_source_group(published_at: str) -> str:
@@ -817,7 +907,8 @@ def run_discovery_backfill(
                 start=start, end=end, platform=str(identity["platform"]), cursor=cursor
             )
             try:
-                page = discover_account_content(
+                with paid_scope("history"):
+                    page = discover_account_content(
                     int(identity["account_id"]), str(identity["platform"]),
                     str(identity["uid"]),
                     as_of=as_of.astimezone(SHANGHAI).date(),
@@ -848,7 +939,14 @@ def run_discovery_backfill(
                 datetime.fromisoformat(value.replace("Z", "+00:00"))
                 for value in page.get("page_published_at") or []
             ]
-            if published_values and min(published_values) <= start_utc:
+            # A pinned old post is not proof that the complete range is past.
+            # Every member must have a known date strictly before the start.
+            page_item_count = int(page.get("page_item_count") or 0)
+            if (
+                page_item_count > 0
+                and len(published_values) == page_item_count
+                and max(published_values) < start_utc
+            ):
                 completion_reason = "range_start_reached"
                 break
             next_cursor = page.get("next_cursor")
@@ -874,19 +972,29 @@ def run_discovery_backfill(
             "stopped_reason": local_stop,
         }
 
-    results: List[Dict[str, Any]] = []
+    attempted_results: List[Dict[str, Any]] = []
     if workers == 1:
-        for identity in identities:
-            results.append(discover_identity(identity))
+        for identity in pending_identities:
+            attempted_results.append(discover_identity(identity))
             if blocking_stop.is_set():
                 break
     else:
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            results = [
+            attempted_results = [
                 item
-                for item in pool.map(discover_identity, identities)
+                for item in pool.map(discover_identity, pending_identities)
                 if item["pages"] or not blocking_stop.is_set()
             ]
+    attempted_by_identity = {
+        int(item["identity_id"]): item for item in attempted_results
+    }
+    results = [
+        attempted_by_identity.get(int(identity["identity_id"]))
+        or previous_completed[int(identity["identity_id"])]
+        for identity in identities
+        if int(identity["identity_id"]) in attempted_by_identity
+        or int(identity["identity_id"]) in previous_completed
+    ]
     stopped_reason = next(
         (
             item.get("stopped_reason")
@@ -924,17 +1032,18 @@ def run_discovery_backfill(
         "require_live_detail": require_live_detail,
         "skip_existing_derived_stages": skip_existing_derived_stages,
         "accounts_considered": len(identities),
-        "accounts_processed": sum(1 for item in results if item["pages"]),
+        "accounts_processed": sum(1 for item in attempted_results if item["pages"]),
+        "accounts_reused": len(previous_completed),
         "accounts_completed": accounts_completed,
-        "pages_processed": sum(len(item["pages"]) for item in results),
+        "pages_processed": sum(len(item["pages"]) for item in attempted_results),
         "failed_pages": failed_pages,
         "inserted": sum(
             int(page.get("inserted") or 0)
-            for item in results for page in item["pages"]
+            for item in attempted_results for page in item["pages"]
         ),
         "updated": sum(
             int(page.get("updated") or 0)
-            for item in results for page in item["pages"]
+            for item in attempted_results for page in item["pages"]
         ),
         "stopped_reason": stopped_reason,
         "usage": usage,
@@ -946,7 +1055,7 @@ def run_discovery_backfill(
         inserted_content_ids = sorted(
             {
                 int(change["content_id"])
-                for item in results
+                for item in attempted_results
                 for page in item.get("pages") or []
                 for change in page.get("content_changes") or []
                 if isinstance(change, Mapping)
@@ -1131,6 +1240,15 @@ def repair_discovery_placeholder_metrics(
     repaired_at = now_utc()
     with connect(db_path) as connection, transaction(connection):
         for row in rows:
+            observation = connection.execute(
+                """SELECT id FROM content_metric_observations
+                WHERE content_id=? AND window_key=? AND raw_response_id IS ?
+                  AND observation_origin<>'system_correction'
+                ORDER BY id DESC LIMIT 1""",
+                (row["content_id"], row["snapshot_window_key"], row["raw_response_id"]),
+            ).fetchone()
+            if observation is None:
+                raise RangeBackfillError("曝光修正缺少可引用的原始观测；禁止凭快照制造纠正事实")
             try:
                 metadata = json.loads(str(row["metadata_json"] or "{}"))
             except json.JSONDecodeError:
@@ -1142,6 +1260,11 @@ def repair_discovery_placeholder_metrics(
                     "exposure_observation": "missing_or_placeholder",
                     "repair_reason": "invalid_discovery_exposure",
                     "repaired_at": repaired_at,
+                    "correction": {
+                        "target_observation_id": int(observation["id"]),
+                        "rule_id": "invalid-discovery-exposure-v1",
+                        "action": "invalidate", "fields": ["view_count"],
+                    },
                 }
             )
             persist_metric_observation(
@@ -1853,7 +1976,7 @@ def summarize_range_status(
     return output
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def _main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "phase",
@@ -1916,7 +2039,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--platform", action="append", choices=("douyin", "xiaohongshu"))
     parser.add_argument("--stage", action="append", choices=("detail", "metrics", "comments"))
     parser.add_argument("--apply", action="store_true")
-    parser.add_argument("--db", type=Path, default=DEFAULT_DB)
+    parser.add_argument("--db", type=Path, required=True)
+    parser.add_argument("--isolated-candidate", action="store_true")
     values = parser.parse_args(argv)
     if values.full_history and values.start:
         parser.error("--full-history 与 --start 互斥，只能二选一")
@@ -2006,6 +2130,57 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return 0 if result["status"] not in {"blocked", "partial"} else 2
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Resolve DB authority before campaign state or provider dispatch."""
+
+    preflight = argparse.ArgumentParser(add_help=False)
+    preflight.add_argument("phase")
+    preflight.add_argument("--apply", action="store_true")
+    preflight.add_argument("--db", type=Path, required=True)
+    preflight.add_argument("--isolated-candidate", action="store_true")
+    values, _unknown = preflight.parse_known_args(argv)
+    mutation = values.phase not in {"status", "repair-metrics", "tag"} or bool(
+        values.apply
+    )
+    try:
+        formal = is_installed_formal_database(values.db, required=False)
+        if not formal:
+            if not values.isolated_candidate:
+                raise RuntimeDatabaseError("formal_database_identity_unresolved")
+            resolve_isolated_candidate(values.db)
+            return _main(argv)
+        if values.isolated_candidate:
+            raise RuntimeDatabaseError(
+                "installed writer database cannot be an isolated candidate"
+            )
+        mode = (
+            DatabaseAccessMode.FORMAL_MUTATION
+            if mutation
+            else DatabaseAccessMode.FORMAL_READ
+        )
+        if mutation and (
+            not os.environ.get("DCAR_V8_DB")
+            or not os.environ.get("DCAR_WRITER_LOCK")
+            or not os.environ.get("DCAR_PROJECT_ROOT")
+        ):
+            raise RuntimeDatabaseError(
+                "formal mutation requires DCAR_V8_DB, DCAR_WRITER_LOCK, "
+                "and DCAR_PROJECT_ROOT"
+            )
+        access = resolve_installed_database_access(
+            mode,
+            database=values.db,
+            project_root=PROJECT_ROOT,
+        )
+        if mutation:
+            with acquire_writer_lock(access):
+                return _main(argv)
+        with _formal_read_connections():
+            return _main(argv)
+    except (OSError, RuntimeDatabaseError, ValueError) as error:
+        raise RuntimeError(f"range backfill database access refused: {error}") from error
 
 
 if __name__ == "__main__":

@@ -81,13 +81,14 @@ class V10SchemaMigrationTest(unittest.TestCase):
             versions = connection.execute(
                 "SELECT version, name FROM schema_migrations ORDER BY version"
             ).fetchall()
-            # 清单跟随 storage 的迁移表，避免每加一版就手改一次写死列表
+            # 默认初始化只覆盖稳定 bootstrap 版本；schema20 仍要求显式迁移。
             self.assertEqual(
                 [(int(row[0]), str(row[1])) for row in versions],
                 [
                     (9, "release-bound-evaluation-schema"),
                     (10, "audience-interaction-user-domain"),
-                    *sorted(storage.SCHEMA_MIGRATION_NAMES.items()),
+                    *sorted((version, name) for version, name in storage.SCHEMA_MIGRATION_NAMES.items()
+                            if version <= storage.SCHEMA_VERSION),
                 ],
             )
             self.assertEqual(
@@ -104,7 +105,7 @@ class V10SchemaMigrationTest(unittest.TestCase):
                         "SELECT COUNT(*) FROM schema_migrations"
                     ).fetchone()[0]
                 ),
-                len(storage.SCHEMA_MIGRATION_NAMES) + 2,
+                sum(version <= storage.SCHEMA_VERSION for version in storage.SCHEMA_MIGRATION_NAMES) + 2,
             )
 
     def test_migrating_v9_database_preserves_rows_and_backfills_versions(self) -> None:

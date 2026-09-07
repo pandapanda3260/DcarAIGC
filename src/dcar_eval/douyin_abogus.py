@@ -54,8 +54,8 @@ class ABogus:
 
     def __init__(self,
                  # user_agent: str = USERAGENT,
-                 platform: str = None, ):
-        self.chunk = []
+                 platform: str | None = None, ):
+        self.chunk: list[int] = []
         self.size = 0
         self.reg = self.__reg[:]
         # self.ua_code = self.generate_ua_code(user_agent)
@@ -136,7 +136,7 @@ class ABogus:
 
     @staticmethod
     def random_list(
-            a: float = None,
+            a: float | None = None,
             b=170,
             c=85,
             d=0,
