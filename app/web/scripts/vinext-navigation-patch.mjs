@@ -12,7 +12,7 @@ export const VINEXT_PATCH_FILES = Object.freeze({
 });
 const scriptRoot = dirname(fileURLToPath(import.meta.url));
 const defaultRoot = resolve(scriptRoot, "..");
-const marker = "/* dcar-vinext-navigation-0.0.50-v1 */";
+const marker = "/* dcar-vinext-navigation-0.0.50-v2 */";
 
 function replaceOnce(source, before, after) {
   if (source.split(before).length !== 2) throw new Error(`[dcar vinext patch] expected one source anchor: ${before.slice(0, 100)}`);
@@ -44,6 +44,8 @@ export function transformVinextModule(source, file, { routes = [], runtimeModule
   if (source.startsWith(marker)) return source;
   if (createHash("sha256").update(source).digest("hex") !== VINEXT_PATCH_FILES[file]) throw new Error(`[dcar vinext patch] unrecognized transform input ${file}`);
   if (file === "shims/navigation.js") {
+    source = replaceOnce(source, "\t\t\tconst mountedSlotsHeader = getMountedSlotsHeader();", `\t\t\tconst mountedSlotsHeader = getMountedSlotsHeader();
+\t\t\tif (window.__DCAR_HAS_STATIC_ROUTE_CACHE__?.(fullHref, mountedSlotsHeader) === true) return;`);
     source = replaceOnce(source, "\treturn window.__VINEXT_RSC_PREFETCHED_URLS__;", `\tconst prefetched = window.__VINEXT_RSC_PREFETCHED_URLS__;
 \tfor (const [key, entry] of getPrefetchCache()) if (Date.now() - entry.timestamp >= PREFETCH_CACHE_TTL) {
 \t\tgetPrefetchCache().delete(key);
@@ -94,11 +96,19 @@ export function transformVinextModule(source, file, { routes = [], runtimeModule
     source = replaceOnce(source, '\t\t\t\tpriority: "low"', '\t\t\t\tpriority: "low",\n\t\t\t\tsignal: AbortSignal.timeout(10_000)');
   }
   if (file === "shims/link.js") {
+    source = replaceOnce(source, "\t\t\t\tconst mountedSlotsHeader = getMountedSlotsHeader();", `\t\t\t\tconst mountedSlotsHeader = getMountedSlotsHeader();
+\t\t\t\tif (window.__DCAR_HAS_STATIC_ROUTE_CACHE__?.(fullHref, mountedSlotsHeader) === true) return;`);
     source = replaceOnce(source, "getMountedSlotsHeader, getPrefetchedUrls,", "getMountedSlotsHeader, getPrefetchCache, getPrefetchedUrls,");
     source = replaceOnce(source, "if (prefetched.has(cacheKey)) return;", "if (prefetched.has(cacheKey) && getPrefetchCache().has(cacheKey)) return;");
     source = replaceOnce(source, '\t\t\t\t\tpurpose: "prefetch"', '\t\t\t\t\tpurpose: "prefetch",\n\t\t\t\t\tsignal: AbortSignal.timeout(10_000)');
   }
   if (file === "server/app-browser-entry.js") {
+    source = replaceOnce(source, "\twindow.__VINEXT_CLEAR_NAV_CACHES__ = clearClientNavigationCaches;", `\twindow.__VINEXT_CLEAR_NAV_CACHES__ = clearClientNavigationCaches;
+\t// Peek only: navigation still consumes and validates the original payload.
+\t// Sharing this validity check stops pointer/hover prefetch from refetching a
+\t// route already covered by the guarded cache (including initial hydration).
+\twindow.__DCAR_HAS_STATIC_ROUTE_CACHE__ = (href, mountedSlotsHeader) =>
+\t\tstaticRouteCache.get(href, mountedSlotsHeader, "navigate") !== null;`);
     source = replaceOnce(source, "const prefetchedResponse = consumePrefetchResponse(rscUrl, requestInterceptionContext, mountedSlotsHeader);", "const prefetchedResponse = await consumePrefetchResponse(rscUrl, requestInterceptionContext, mountedSlotsHeader);\n\t\t\t\t\tif (!browserNavigationController.isCurrentNavigation(navId)) return;");
     source = `import { createStaticRouteCache } from ${JSON.stringify(runtimeModule)};\n` + source;
     source = replaceOnce(source, "const visitedResponseCache = /* @__PURE__ */ new Map();", `const visitedResponseCache = /* @__PURE__ */ new Map();

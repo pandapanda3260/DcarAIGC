@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { cp, mkdtemp, readFile, rm, symlink, writeFile, mkdir } from "node:fs/promises";
+import { cp, mkdtemp, readFile, realpath, rm, symlink, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -18,6 +18,7 @@ let nav;
 let wire;
 let rsc;
 let elementsHelpers;
+let prefetchLink;
 let patchedEntry;
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 async function until(predicate) { for (let i = 0; i < 100; i++) { if (predicate()) return; await new Promise((resolve) => setTimeout(resolve, 1)); } assert.fail("condition did not settle"); }
@@ -33,8 +34,10 @@ before(async () => {
   await symlink(join(webRoot, "node_modules"), join(copiedPackage, "node_modules"), "dir");
   for (const file of Object.keys(VINEXT_PATCH_FILES)) {
     const original = await readFile(join(copiedPackage, "dist", file), "utf8");
-    const transformed = transformVinextModule(original, file, { routes: STATIC_NAVIGATION_ROUTES });
+    let transformed = transformVinextModule(original, file, { routes: STATIC_NAVIGATION_ROUTES });
     assert.equal(transformVinextModule(transformed, file), transformed, "patch is idempotent");
+    // Expose the actual Link intent function only inside the isolated test copy.
+    if (file === "shims/link.js") transformed += "\nexport { prefetchUrl as __prefetchUrlForTest };\n";
     await writeFile(join(copiedPackage, "dist", file), transformed);
     if (file === "server/app-browser-entry.js") patchedEntry = transformed;
   }
@@ -43,8 +46,16 @@ before(async () => {
   wire = await import(pathToFileURL(join(copiedPackage, "dist/server/app-elements-wire.js")));
   rsc = await import(pathToFileURL(join(copiedPackage, "dist/server/app-rsc-cache-busting.js")));
   elementsHelpers = await import(pathToFileURL(join(copiedPackage, "dist/server/app-elements.js")));
+  prefetchLink = (await import(pathToFileURL(join(copiedPackage, "dist/shims/link.js")))).__prefetchUrlForTest;
 });
-beforeEach(() => { globalThis.fetch = originalFetch; nav.getPrefetchCache().clear(); nav.getPrefetchedUrls().clear(); });
+beforeEach(() => {
+  globalThis.fetch = originalFetch;
+  nav.getPrefetchCache().clear(); nav.getPrefetchedUrls().clear(); nav.setMountedSlotsHeader(null);
+  delete window.__DCAR_HAS_STATIC_ROUTE_CACHE__;
+  window.__VINEXT_RSC_NAVIGATE__ = async () => {};
+  window.requestIdleCallback = (callback) => callback();
+  Object.assign(window.location, { href: "https://audit.invalid/overview", pathname: "/overview" });
+});
 after(async () => { globalThis.fetch = originalFetch; globalThis.window = originalWindow; await rm(temporaryRoot, { recursive: true, force: true }); });
 
 test("pending prefetch and immediate click share one request through body completion", async () => {
@@ -124,6 +135,62 @@ test("prefetch keeps source/slot separation and original response headers", asyn
   assert.equal(nav.restoreRscResponse(cached).headers.get("x-vinext-mounted-slots"), "slot:modal:/");
 });
 
+const prefetchEntrypoints = [
+  ["router", (href) => nav.appRouterInstance.prefetch(href)],
+  ["Link", (href) => prefetchLink(href, "full")],
+];
+
+test("router and Link skip network for valid static payloads across source routes", async () => {
+  const target = cache();
+  assert.equal(target.store("/contents", snapshot(), {}, elementPayload("/contents"), target.generation), true);
+  window.__DCAR_HAS_STATIC_ROUTE_CACHE__ = (href, slots) => target.get(href, slots, "navigate") !== null;
+  const requests = [];
+  globalThis.fetch = async (href) => { requests.push(href); return new Response("unexpected"); };
+  for (const source of ["/overview", "/accounts", "/tasks"]) {
+    Object.assign(window.location, { href: `https://audit.invalid${source}`, pathname: source });
+    for (const [, prefetch] of prefetchEntrypoints) prefetch("/contents");
+    await tick();
+  }
+  assert.deepEqual(requests, []);
+  assert.equal(nav.getPrefetchCache().size, 0, "skip must not create or consume a prefetch entry");
+  assert.ok(target.get("/contents", null, "navigate"), "peek keeps the payload available to navigation");
+});
+
+for (const [name, prefetch] of prefetchEntrypoints) {
+  test(`${name} resumes prefetch after static TTL or authentication invalidation`, async () => {
+    let now = 0;
+    const target = createStaticRouteCache({ routes: STATIC_NAVIGATION_ROUTES, origin: "https://audit.invalid", readMetadata: wire.AppElementsWire.readMetadata, now: () => now });
+    window.__DCAR_HAS_STATIC_ROUTE_CACHE__ = (href, slots) => target.get(href, slots, "navigate") !== null;
+    let requests = 0;
+    globalThis.fetch = async () => { requests += 1; return new Response("body"); };
+    for (const invalidation of ["ttl", "auth-clear"]) {
+      nav.getPrefetchCache().clear(); nav.getPrefetchedUrls().clear();
+      assert.equal(target.store("/contents", snapshot(), {}, elementPayload("/contents"), target.generation), true);
+      prefetch("/contents"); await tick();
+      const before = requests;
+      if (invalidation === "ttl") now += 300_000;
+      else target.clear();
+      prefetch("/contents");
+      await until(() => requests === before + 1);
+      await Promise.all([...nav.getPrefetchCache().values()].map((entry) => entry.pending));
+    }
+    assert.equal(requests, 2);
+  });
+
+  test(`${name} preserves mounted-slot request context instead of using static skip`, async () => {
+    const target = cache();
+    assert.equal(target.store("/contents", snapshot(), {}, elementPayload("/contents"), target.generation), true);
+    window.__DCAR_HAS_STATIC_ROUTE_CACHE__ = (href, slots) => target.get(href, slots, "navigate") !== null;
+    nav.setMountedSlotsHeader("slot:modal:/");
+    let headers;
+    globalThis.fetch = async (_url, options) => { headers = options.headers; return new Response("body"); };
+    prefetch("/contents");
+    await until(() => headers !== undefined);
+    assert.equal(headers.get("x-vinext-mounted-slots"), "slot:modal:/");
+    await Promise.all([...nav.getPrefetchCache().values()].map((entry) => entry.pending));
+  });
+}
+
 test("cross-source reuse keeps original metadata and requires declared routes", async () => {
   const target = cache();
   const payload = elementPayload("/overview");
@@ -201,6 +268,8 @@ test("patched bootstrap seeds hydration, real navigation reuses it across source
   context.stream = new Response(JSON.stringify(elementPayload("/overview"))).body;
   vm.runInContext("bootstrapHydration(stream)", context);
   await until(() => vm.runInContext('staticRouteCache.get("/overview.rsc?_rsc=another-source", null, "navigate") !== null', context));
+  assert.equal(vm.runInContext('window.__DCAR_HAS_STATIC_ROUTE_CACHE__("/overview", null)', context), true);
+  assert.equal(vm.runInContext('window.__DCAR_HAS_STATIC_ROUTE_CACHE__("/overview", "slot:modal:/")', context), false);
   context.recordCommit = async (payload) => { assert.equal((await payload).__route, "route:/overview"); commits += 1; return "committed"; };
   vm.runInContext("renderNavigationPayload = recordCommit", context);
   await vm.runInContext('window.__VINEXT_RSC_NAVIGATE__("/overview")', context);
@@ -208,6 +277,7 @@ test("patched bootstrap seeds hydration, real navigation reuses it across source
   assert.equal(requests, 0, "initial route from another source must avoid RSC network");
   vm.runInContext("window.__VINEXT_CLEAR_NAV_CACHES__()", context);
   assert.equal(vm.runInContext('staticRouteCache.get("/overview.rsc", null, "navigate")', context), null);
+  assert.equal(vm.runInContext('window.__DCAR_HAS_STATIC_ROUTE_CACHE__("/overview", null)', context), false);
   context.fetch = async (url) => {
     requests += 1;
     const response = new Response(JSON.stringify(elementPayload("/overview")), { headers: { "content-type": "text/x-component" } });
@@ -239,7 +309,7 @@ test("build plugin is mandatory, version locked and does not mutate dependencies
     const result = plugin.transform(original, id);
     modules[id] = {};
     metadata[id] = { meta: result.meta };
-    assert.ok(result.code.includes("dcar-vinext-navigation-0.0.50-v1"));
+    assert.ok(result.code.includes("dcar-vinext-navigation-0.0.50-v2"));
     assert.equal(await readFile(id, "utf8"), original);
     assert.throws(() => transformVinextModule(original + "\n", file), /unrecognized transform input/);
   }
@@ -253,7 +323,7 @@ test("build plugin is mandatory, version locked and does not mutate dependencies
   await symlink(join(webRoot, "app"), join(linkedRoot, "app"), "dir");
   const linkedPlugin = vinextNavigationPatch();
   linkedPlugin.configResolved({ root: linkedRoot });
-  const navigationPath = join(webRoot, "node_modules/vinext/dist/shims/navigation.js");
+  const navigationPath = await realpath(join(webRoot, "node_modules/vinext/dist/shims/navigation.js"));
   assert.ok(linkedPlugin.transform(await readFile(navigationPath, "utf8"), navigationPath)?.code, "Vite real paths must match a symlinked candidate install");
   assert.match(await readFile(join(webRoot, "vite.config.ts"), "utf8"), /vinextNavigationPatch\(\)/);
 });
