@@ -232,6 +232,7 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
         *,
         bypass_auth: bool = False,
         douyin_enabled: bool = False,
+        static_asset_manifest_path: Path | None = None,
     ) -> auth_gateway.AuthGatewayConfig:
         suffix = "root" if not base_path else base_path.strip("/").replace("/", "-")
         edge_key_path = self.root / f"edge-key-{suffix}"
@@ -253,6 +254,7 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
             sms_provider="tencent",
             sms_credentials_path=self._sms_credentials_path(),
             pepper_path=self.pepper_path,
+            static_asset_manifest_path=static_asset_manifest_path,
         )
 
     def _sms_credentials_path(self) -> Path:
@@ -1392,6 +1394,143 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
                         self.assertEqual(response.status_code, 200)
                         self.assertEqual(response.headers["cache-control"], "public, max-age=86400")
                         self.assertNotIn("pragma", response.headers)
+
+    def _code_asset_manifest(self) -> Path:
+        client_root = self.root / "client"
+        (client_root / "assets").mkdir(parents=True, exist_ok=True)
+        (client_root / ".vite").mkdir(exist_ok=True)
+        for name in ("entry-AbcD123_.js", "entry-Qwer1234.css", "plain.js", "data-AbcD123_.json"):
+            (client_root / "assets" / name).write_text("build code", encoding="utf-8")
+        manifest = client_root / ".vite" / "manifest.json"
+        manifest.write_text(json.dumps({
+            "entry": {"file": "assets/entry-AbcD123_.js", "css": ["assets/entry-Qwer1234.css"]},
+            "unhashed": {"file": "assets/plain.js"},
+            "json": {"file": "assets/data-AbcD123_.json"},
+            "missing": {"file": "assets/missing-AbcD123_.js"},
+            "outside": {"file": "../private-AbcD123_.js"},
+        }), encoding="utf-8")
+        return manifest
+
+    def test_manifest_code_assets_revalidate_after_auth_and_reject_revoked_access(self) -> None:
+        manifest = self._code_asset_manifest()
+        for base_path in ("", "/dcar"):
+            with self.subTest(base_path=base_path):
+                seen: list[httpx.Request] = []
+
+                def upstream(request: httpx.Request) -> httpx.Response:
+                    seen.append(request)
+                    etag = 'W/"AbcD123_"'
+                    matched = request.headers.get("if-none-match") == etag
+                    return httpx.Response(304 if matched else 200, headers={
+                        "ETag": etag, "Content-Type": "application/javascript",
+                        "Cache-Control": "public, max-age=31536000, immutable",
+                    }, stream=httpx.ByteStream(b"" if matched or request.method == "HEAD" else b"build code"))
+
+                config = self._config(base_path, static_asset_manifest_path=manifest)
+                store = self._seed(config)
+                transport = httpx.MockTransport(upstream)
+                app = auth_gateway.create_app(config, web_transport=transport, api_transport=transport)
+                path = _route(base_path, "/assets/entry-AbcD123_.js")
+                with TestClient(app, base_url=ORIGIN) as client:
+                    self.assertEqual(self._login(client, base_path).status_code, 200)
+                    first = client.get(path)
+                    self.assertEqual(first.status_code, 200)
+                    self.assertEqual(first.content, b"build code")
+                    self.assertEqual(first.headers["cache-control"], "private, no-cache")
+                    for method in ("GET", "HEAD"):
+                        conditional = client.request(method, path, headers={"If-None-Match": first.headers["etag"]})
+                        self.assertEqual(conditional.status_code, 304)
+                        self.assertEqual(conditional.content, b"")
+                        self.assertEqual(conditional.headers["cache-control"], "private, no-cache")
+                        self.assertEqual(seen[-1].headers["if-none-match"], first.headers["etag"])
+                        self.assertEqual(seen[-1].headers["x-dcar-authenticated-user"], USERNAME)
+                    changed = client.get(path, headers={"If-None-Match": 'W/"older123"'})
+                    self.assertEqual(changed.status_code, 200)
+                    reached_before = len(seen)
+                    store.set_role(USERNAME, "new_user", actor="test")
+                    denied = client.get(path, headers={"If-None-Match": first.headers["etag"]}, follow_redirects=False)
+                    self.assertEqual(denied.status_code, 403)
+                    self.assertEqual(denied.headers["cache-control"], "no-store")
+                    self.assertNotIn("etag", denied.headers)
+                    self.assertEqual(len(seen), reached_before)
+                    store.set_role(USERNAME, "operator", actor="test")
+                    store.revoke_session(client.cookies.get(auth_gateway.SESSION_COOKIE))
+                    signed_out = client.get(path, headers={"If-None-Match": first.headers["etag"]}, follow_redirects=False)
+                    self.assertEqual(signed_out.status_code, 302)
+                    self.assertEqual(signed_out.headers["cache-control"], "no-store")
+                    self.assertNotIn("etag", signed_out.headers)
+                    self.assertEqual(len(seen), reached_before)
+
+    def test_manifest_cache_scope_excludes_business_unknown_range_and_unhashed_responses(self) -> None:
+        manifest = self._code_asset_manifest()
+
+        def upstream(request: httpx.Request) -> httpx.Response:
+            content_type = "text/css" if request.url.path.endswith(".css") else "application/javascript"
+            return httpx.Response(200, headers={
+                "ETag": 'W/"AbcD123_"', "Content-Type": content_type,
+                "Cache-Control": "public, max-age=31536000, immutable",
+            }, stream=httpx.ByteStream(b"build code"))
+
+        config = self._config("/dcar", static_asset_manifest_path=manifest)
+        self._seed(config)
+        transport = httpx.MockTransport(upstream)
+        app = auth_gateway.create_app(config, web_transport=transport, api_transport=transport)
+        with TestClient(app, base_url=ORIGIN) as client:
+            self.assertEqual(self._login(client, "/dcar").status_code, 200)
+            css = client.get("/dcar/assets/entry-Qwer1234.css")
+            self.assertEqual(css.headers["cache-control"], "private, no-cache")
+            for path in (
+                "/assets/other-AbcD123_.js", "/assets/missing-AbcD123_.js", "/assets/plain.js",
+                "/assets/data-AbcD123_.json", "/assets/entry-AbcD123_.js.map",
+                "/assets/entry-AbcD123_.js?version=1", "/overview", "/overview.rsc",
+                "/api/v8/overview", "/reports/report.html", "/api/v8/media/video/original",
+            ):
+                with self.subTest(path=path):
+                    response = client.get("/dcar" + path)
+                    self.assertEqual(response.headers["cache-control"], "private, no-store")
+            ranged = client.get("/dcar/assets/entry-AbcD123_.js", headers={"Range": "bytes=0-3"})
+            self.assertEqual(ranged.headers["cache-control"], "private, no-store")
+
+    def test_manifest_replacement_and_invalid_response_fail_closed(self) -> None:
+        manifest = self._code_asset_manifest()
+        reply = {"status": 200, "headers": {"ETag": 'W/"AbcD123_"', "Content-Type": "application/javascript"}}
+
+        def upstream(request: httpx.Request) -> httpx.Response:
+            del request
+            return httpx.Response(reply["status"], headers=reply["headers"], stream=httpx.ByteStream(b"code"))
+
+        config = self._config("/dcar", static_asset_manifest_path=manifest)
+        self._seed(config)
+        transport = httpx.MockTransport(upstream)
+        app = auth_gateway.create_app(config, web_transport=transport, api_transport=transport)
+        with TestClient(app, base_url=ORIGIN) as client:
+            self.assertEqual(self._login(client, "/dcar").status_code, 200)
+            path = "/dcar/assets/entry-AbcD123_.js"
+            self.assertEqual(client.get(path).headers["cache-control"], "private, no-cache")
+            for headers, status in (
+                ({"Content-Type": "application/javascript"}, 200),
+                ({"ETag": '"error"', "Content-Type": "text/html"}, 200),
+                ({"ETag": '"error"', "Content-Type": "application/javascript"}, 404),
+                ({"ETag": '"partial"', "Content-Type": "application/javascript"}, 206),
+                ({"ETag": '"cookie"', "Content-Type": "application/javascript", "Set-Cookie": "fixture=value"}, 200),
+            ):
+                reply.update(headers=headers, status=status)
+                self.assertEqual(client.get(path).headers["cache-control"], "private, no-store")
+            reply.update(status=200, headers={"ETag": 'W/"AbcD123_"', "Content-Type": "application/javascript"})
+            replacement = manifest.with_suffix(".next")
+            replacement.write_text("{}", encoding="utf-8")
+            replacement.replace(manifest)
+            self.assertEqual(client.get(path).headers["cache-control"], "private, no-store")
+            manifest.unlink()
+            self.assertEqual(client.get(path).headers["cache-control"], "private, no-store")
+            manifest.write_text("not json", encoding="utf-8")
+            self.assertEqual(client.get(path).headers["cache-control"], "private, no-store")
+
+    def test_static_asset_manifest_environment_is_explicit(self) -> None:
+        with patch.dict(os.environ, {"DCAR_AUTH_BYPASS": "1"}, clear=True):
+            self.assertIsNone(auth_gateway.AuthGatewayConfig.from_env().static_asset_manifest_path)
+            os.environ["DCAR_AUTH_STATIC_MANIFEST"] = str(self.root / "manifest.json")
+            self.assertEqual(auth_gateway.AuthGatewayConfig.from_env().static_asset_manifest_path, self.root / "manifest.json")
 
     # ------------------------------------------------------------------
     # Account store bridge

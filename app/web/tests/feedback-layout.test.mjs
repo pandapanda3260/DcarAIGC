@@ -6,7 +6,7 @@ import test from "node:test";
 test("notices render as floating toasts instead of in-flow banners", async () => {
   const [component, shell, styles] = await Promise.all([
     readFile(new URL("../app/components/Feedback.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../app/components/AppShell.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/components/WorkbenchChrome.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
   ]);
 
@@ -23,7 +23,7 @@ test("notices render as floating toasts instead of in-flow banners", async () =>
   assert.match(component, /aria-label="关闭提示"/);
   assert.match(component, /onMouseEnter=\{pauseToastTimers\} onMouseLeave=\{resumeToastTimers\}/);
 
-  // Notice / Feedback 保持原签名（各页面调用处不动），内部派发 toast；AppShell 挂载唯一的 ToastViewport
+  // Notice / Feedback 保持原签名（各页面调用处不动），内部派发 toast；WorkbenchChrome 挂载唯一的 ToastViewport
   assert.match(component, /export function Notice\(\{ tone = "success", children \}/);
   assert.match(component, /export function Feedback\(\{ error, message, onClose \}/);
   assert.match(shell, /<ToastViewport \/>/);

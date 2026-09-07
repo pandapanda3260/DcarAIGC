@@ -62,7 +62,8 @@ function harness({ role, sessionState = "ready", basePath = "" } = {}) {
   };
   const Link = (props) => {
     links.push(props);
-    return React.createElement("a", props);
+    const { prefetch: _prefetch, ...attributes } = props;
+    return React.createElement("a", attributes);
   };
   const Image = (props) => {
     const attributes = { ...props };
@@ -80,7 +81,7 @@ function harness({ role, sessionState = "ready", basePath = "" } = {}) {
     requireApprovedSession: (session) => session, handleApprovalRequired: () => false,
     jsonRequest: (body) => ({ body }), readJson: () => { throw new Error("Unexpected mutation"); } };
   const context = vm.createContext({
-    console, process: { env: { NEXT_PUBLIC_DCAR_BASE_PATH: basePath } },
+    console, URLSearchParams, process: { env: { NEXT_PUBLIC_DCAR_BASE_PATH: basePath } },
     setTimeout: schedule, clearTimeout: cancel,
     window: { setTimeout: schedule, clearTimeout: cancel,
       location: { replace: (url) => destinations.push(url) } },
@@ -98,9 +99,9 @@ function harness({ role, sessionState = "ready", basePath = "" } = {}) {
       if (specifier === "react") return { ...React, useEffect: (effect) => { effects.push(effect); } };
       if (specifier === "react/jsx-runtime") return jsxRuntime;
       if (specifier === "@tanstack/react-query") return queryRuntime;
-      if (specifier === "next/link") return Link;
+      if (specifier === "next/link") return Object.assign(Link, { useLinkStatus: () => ({ pending: false }) });
       if (specifier === "next/image") return Image;
-      if (specifier === "next/navigation") return { usePathname: () => "/accounts" };
+      if (specifier === "next/navigation") return { usePathname: () => "/overview", useRouter: () => ({ prefetch: () => {} }) };
       if (specifier === "@phosphor-icons/react") return new Proxy({}, {
         get: () => () => React.createElement("svg", { "aria-hidden": true }),
       });
@@ -123,7 +124,7 @@ function harness({ role, sessionState = "ready", basePath = "" } = {}) {
     queries, prefetches, links, destinations,
     renderPage: () => renderToStaticMarkup(React.createElement(load(path.join(appRoot, "accounts/AccountsPage.tsx")).default)),
     renderAuthorizationPage: () => renderToStaticMarkup(React.createElement(load(path.join(appRoot, "accounts/douyin-authorization/DouyinAuthorizationPage.tsx")).default)),
-    renderShell: () => renderToStaticMarkup(React.createElement(load(path.join(appRoot, "components/AppShell.tsx")).default,
+    renderShell: () => renderToStaticMarkup(React.createElement(load(path.join(appRoot, "components/WorkbenchChrome.tsx")).default,
       { active: "overview" }, React.createElement("p", null, "普通页面"))),
     accessRule: () => load(path.join(appRoot, "lib/accountAccess.ts")).canAccessAccounts,
     runEffects: () => { for (const effect of effects.splice(0)) effect(); },

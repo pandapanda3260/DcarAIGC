@@ -28,11 +28,7 @@ import { jsonRequest, readJson } from "../lib/api";
 import { didSpuRunReachTerminal, shouldAutoAssociateSpu } from "../lib/queryContracts";
 import { queryKeys, spuAssetsQueryOptions, spuStatsQueryOptions } from "../lib/queries";
 import { VehicleBrandLogo } from "./VehicleBrandLogo";
-import {
-  filterVehicleSeriesGroups,
-  matchVehicleSeriesGroup,
-  sortVehicleCatalogRows,
-} from "./vehicleCatalogSort";
+import { sortVehicleCatalogRows } from "./vehicleCatalogSort";
 import type {
   SpuAssociationRun,
   SpuAssetRow,
@@ -120,12 +116,30 @@ const refreshScopes = [
 ] as const;
 type RefreshScopeKey = (typeof refreshScopes)[number]["key"];
 
+type VehicleCatalogSearch = typeof import("./vehicleCatalogSearch");
+let catalogSearchPromise: Promise<VehicleCatalogSearch> | null = null;
+
+function loadCatalogSearch() {
+  if (!catalogSearchPromise) {
+    catalogSearchPromise = import("./vehicleCatalogSearch").catch((reason) => {
+      catalogSearchPromise = null;
+      throw reason;
+    });
+  }
+  return catalogSearchPromise;
+}
+
 export default function SpuAudiencePage() {
   const [statWindow, setStatWindow] = useState<string>("last_week");
   const [statPlatform, setStatPlatform] = useState<string>("");
   const [catalogPage, setCatalogPage] = useState(1);
   const [catalogPageSize, setCatalogPageSize] = useState(20);
   const [catalogQuery, setCatalogQuery] = useState("");
+  const [catalogSearch, setCatalogSearch] = useState<VehicleCatalogSearch | null>(null);
+  const [catalogSearchLoading, setCatalogSearchLoading] = useState(false);
+  const [catalogSearchError, setCatalogSearchError] = useState(false);
+  const catalogSearchRequestRef = useRef<Promise<void> | null>(null);
+  const catalogSearchMountedRef = useRef(true);
   const [running, setRunning] = useState(false);
   const [saving, setSaving] = useState(false);
   const [refreshPicker, setRefreshPicker] = useState(false);
@@ -145,6 +159,28 @@ export default function SpuAudiencePage() {
   const assets = assetsQuery.data ?? null;
   const stats = statsQuery.data ?? null;
   const lastRunStatus = assets?.last_run?.status ?? null;
+
+  useEffect(() => {
+    catalogSearchMountedRef.current = true;
+    return () => { catalogSearchMountedRef.current = false; };
+  }, []);
+
+  const prepareCatalogSearch = useCallback(() => {
+    if (catalogSearch || catalogSearchRequestRef.current) return;
+    setCatalogSearchLoading(true);
+    setCatalogSearchError(false);
+    catalogSearchRequestRef.current = loadCatalogSearch()
+      .then((search) => {
+        if (catalogSearchMountedRef.current) setCatalogSearch(search);
+      })
+      .catch(() => {
+        if (catalogSearchMountedRef.current) setCatalogSearchError(true);
+      })
+      .finally(() => {
+        catalogSearchRequestRef.current = null;
+        if (catalogSearchMountedRef.current) setCatalogSearchLoading(false);
+      });
+  }, [catalogSearch]);
 
   const startAssociation = useCallback(async (mode: RefreshScopeKey | "incremental") => {
     const path = mode === "full"
@@ -350,8 +386,9 @@ export default function SpuAudiencePage() {
   const catalogBreakdown = `${seriesTotal} 个车系 · ${trimTotal} 个款型`;
   // 过滤只作用于已排序、已聚合的车系数组，因此结果顺序与每个车系的展开状态都保持不变。
   const filteredSeriesGroups = useMemo(
-    () => filterVehicleSeriesGroups(seriesGroups, catalogQuery),
-    [seriesGroups, catalogQuery],
+    // 模块完成加载后使用当前输入；下载期间保留目录，不显示错误的空搜索结果。
+    () => catalogSearch ? catalogSearch.filterVehicleSeriesGroups(seriesGroups, catalogQuery) : seriesGroups,
+    [seriesGroups, catalogQuery, catalogSearch],
   );
   const filteredSeriesTotal = filteredSeriesGroups.length;
   const catalogLastPage = Math.max(1, Math.ceil(filteredSeriesTotal / catalogPageSize));
@@ -501,27 +538,36 @@ export default function SpuAudiencePage() {
                     placeholder="搜索品牌、车系、款型、别名或拼音"
                     autoComplete="off"
                     spellCheck={false}
-                    onChange={(event) => { setCatalogQuery(event.target.value); setCatalogPage(1); }}
+                    onFocus={prepareCatalogSearch}
+                    onChange={(event) => {
+                      setCatalogQuery(event.target.value); setCatalogPage(1);
+                      if (event.target.value.trim()) prepareCatalogSearch();
+                    }}
                   />
                 </label>
                 <span id="spu-catalog-search-status" className="spu-catalog-search-status" role="status" aria-live="polite">
-                  {catalogQuery.trim() ? `${filteredSeriesTotal} 个结果` : ""}
+                  {catalogQuery.trim() ? catalogSearch ? `${filteredSeriesTotal} 个结果`
+                    : catalogSearchError ? "搜索暂不可用，当前显示完整目录。"
+                    : "正在准备搜索，当前显示完整目录…" : ""}
                 </span>
+                {catalogQuery.trim() && catalogSearchError && <button type="button" className="secondary" onClick={prepareCatalogSearch}>重试搜索</button>}
               </div>
               {filteredSeriesTotal > 0 && <Pagination page={catalogSafePage} pageSize={catalogPageSize} total={filteredSeriesTotal} busy={saving} ariaLabel="车型库分页" unitLabel="个车系" placement="top" onChange={(next) => { setCatalogPage(next.page); if (next.pageSize) setCatalogPageSize(next.pageSize); }} />}
             </div>
-            <div className="spu-table-wrap" role="region" aria-label="车系与款型库表格" tabIndex={0}>
+            <div className="spu-table-wrap" role="region" aria-label="车系与款型库表格" aria-busy={Boolean(catalogQuery.trim()) && catalogSearchLoading} tabIndex={0}>
               <table className="spu-catalog-table">
                 <thead><tr><th>品牌</th><th>车系</th><th>款型</th><th>目标人群</th><th>主要用车场景</th><th>识别结果</th><th>抖音条数占比</th><th>抖音曝光占比</th><th>小红书条数占比</th><th>小红书曝光占比</th><th>操作</th></tr></thead>
                 <tbody>
                   {catalogPageGroups.length === 0 && (
                     <tr className="spu-catalog-empty">
-                      <td colSpan={11}>{catalogQuery.trim() ? `未找到匹配“${catalogQuery.trim()}”的车型` : "暂无车系数据"}</td>
+                      <td colSpan={11}>{catalogQuery.trim() && !catalogSearch
+                        ? catalogSearchError ? "搜索暂不可用，请重试。" : "正在准备搜索…"
+                        : catalogQuery.trim() ? `未找到匹配“${catalogQuery.trim()}”的车型` : "暂无车系数据"}</td>
                     </tr>
                   )}
                   {catalogPageGroups.map((group) => {
                     const seriesNode = group.seriesNode;
-                    const catalogMatch = catalogQuery.trim() ? matchVehicleSeriesGroup(group, catalogQuery) : null;
+                    const catalogMatch = catalogQuery.trim() ? catalogSearch?.matchVehicleSeriesGroup(group, catalogQuery) : null;
                     const expanded = expandedSeries.has(group.slug);
                     const aggregate = seriesAggregate(group);
                     const seriesCoreScenes = seriesNode.audience_primary ? coreScenesByAudience.get(seriesNode.audience_primary) ?? [] : [];

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { access, readFile } from "node:fs/promises";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
 import {
   buildContentPatch,
@@ -20,6 +21,12 @@ import {
   plainMetricReason,
   taskWasSuperseded,
 } from "../app/lib/format.ts";
+
+async function readWorkbenchShell() {
+  return (await Promise.all(["AppShell", "WorkbenchChrome"].map((name) =>
+    readFile(new URL(`../app/components/${name}.tsx`, import.meta.url), "utf8"),
+  ))).join("\n");
+}
 
 function ratioMetric(status, reason, percentage = 62.05) {
   return {
@@ -225,11 +232,13 @@ test("task detail places a direct parent-page link beside the task title", async
 });
 
 async function render(path = "/overview") {
-  const workerUrl = new URL("../dist/server/index.js", import.meta.url);
+  const workerUrl = process.env.DCAR_TEST_WEB_DIST
+    ? pathToFileURL(`${process.env.DCAR_TEST_WEB_DIST}/server/index.js`)
+    : new URL("../dist/server/index.js", import.meta.url);
   workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}-${path}`);
   const { default: worker } = await import(workerUrl.href);
   return worker.fetch(
-    new Request(`http://localhost${path}`, { headers: { accept: "text/html" } }),
+    new Request(`http://localhost${process.env.DCAR_TEST_WEB_BASE_PATH ?? ""}${path}`, { headers: { accept: "text/html" } }),
     { ASSETS: { fetch: async () => new Response("Not found", { status: 404 }) } },
     { waitUntil() {}, passThroughOnException() {} },
   );
@@ -254,12 +263,11 @@ test("server-renders every real v8 product route", async () => {
     const html = await response.text();
     assert.match(html, /<html lang="zh-CN">/i);
     assert.match(html, new RegExp(title));
-    assert.match(html, /href="\/overview"/);
-    assert.match(html, /href="\/tasks"/);
-    assert.doesNotMatch(html, /href="\/accounts"/);
-    assert.match(html, /href="\/contents"/);
-    assert.match(html, /href="\/selling-points"/);
-    assert.match(html, /href="\/spu-audience"/);
+    const base = process.env.DCAR_TEST_WEB_BASE_PATH ?? "";
+    for (const route of ["overview", "tasks", "contents", "selling-points", "spu-audience"]) {
+      assert.ok(html.includes(`href="${base}/${route}"`), `${route} link includes its deployment base path`);
+    }
+    assert.ok(!html.includes(`href="${base}/accounts"`), "SSR does not grant an account role before reading session");
     assert.match(html, /class="loading-screen"/);
     assert.doesNotMatch(html, /codex-preview|Your site is taking shape|Starter Project/i);
   }
@@ -334,7 +342,7 @@ test("root redirects to overview instead of keeping hidden client-side view stat
 
 test("sidebar uses the bundled Dongchedi app mark and brand colors", async () => {
   const [shell, styles, icon] = await Promise.all([
-    readFile(new URL("../app/components/AppShell.tsx", import.meta.url), "utf8"),
+    readWorkbenchShell(),
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
     readFile(new URL("../public/dongchedi-app-icon.svg", import.meta.url), "utf8"),
   ]);
@@ -356,7 +364,7 @@ test("sidebar uses the bundled Dongchedi app mark and brand colors", async () =>
 test("logout posts to the session gateway and follows its login redirect", async () => {
   const [component, shell] = await Promise.all([
     readFile(new URL("../app/components/LogoutButton.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../app/components/AppShell.tsx", import.meta.url), "utf8"),
+    readWorkbenchShell(),
   ]);
   assert.match(shell, /<LogoutButton \/>/);
   assert.match(component, /fetch\(publicAssetPath\("\/auth\/logout"\)/);
@@ -377,7 +385,7 @@ test("logout posts to the session gateway and follows its login redirect", async
 
 test("sidebar navigation uses semantic graphical icons instead of character marks", async () => {
   const [shell, styles] = await Promise.all([
-    readFile(new URL("../app/components/AppShell.tsx", import.meta.url), "utf8"),
+    readWorkbenchShell(),
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
   ]);
   assert.doesNotMatch(shell, /mark:\s*"[概任账内卖]"/);
@@ -421,7 +429,7 @@ test("selling point standards retain E/X/M scenes and scene-local hits", async (
   const [source, types, shell, styles] = await Promise.all([
     readFile(new URL("../app/selling-points/SellingPointsPage.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/lib/types.ts", import.meta.url), "utf8"),
-    readFile(new URL("../app/components/AppShell.tsx", import.meta.url), "utf8"),
+    readWorkbenchShell(),
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
   ]);
   for (const [code, title, scene] of [["E", "二手车", "used_car"], ["X", "新车", "new_car"], ["M", "媒体", "media"]]) {
@@ -469,7 +477,7 @@ test("spu audience page keeps rule assets, association and 3D stats together", a
     readFile(new URL("../app/spu-audience/SpuAudiencePage.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/spu-audience/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/contents/ContentsPage.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../app/components/AppShell.tsx", import.meta.url), "utf8"),
+    readWorkbenchShell(),
     readFile(new URL("../app/lib/types.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/lib/format.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
@@ -540,7 +548,8 @@ test("spu audience page keeps rule assets, association and 3D stats together", a
   assert.match(page, /统计数据加载失败，请刷新页面重试。/);
   // 车型库翻页：复用全站 Pagination 组件、放在表格上方（账号页同款），前端切片+末页夹紧
   assert.match(page, /import \{ Pagination \} from "\.\.\/components\/Pagination"/);
-  assert.match(page, /import \{\s*filterVehicleSeriesGroups,\s*matchVehicleSeriesGroup,\s*sortVehicleCatalogRows,\s*\} from "\.\/vehicleCatalogSort"/);
+  assert.match(page, /import \{ sortVehicleCatalogRows \} from "\.\/vehicleCatalogSort"/);
+  assert.match(page, /import\("\.\/vehicleCatalogSearch"\)/);
   assert.match(page, /filteredSeriesTotal > 0 && <Pagination page=\{catalogSafePage\} pageSize=\{catalogPageSize\} total=\{filteredSeriesTotal\} busy=\{saving\} ariaLabel="车型库分页" unitLabel="个车系" placement="top"/);
   assert.match(page, /const catalogRows = useMemo\(\(\) => sortVehicleCatalogRows\(assets\?\.spu \?\? \[\]\), \[assets\]\)/);
   assert.match(page, /热门品牌优先/);
@@ -770,7 +779,7 @@ test("spu audience page keeps rule assets, association and 3D stats together", a
 
 test("routes preserve operations and expose read-only evidence workbench", async () => {
   const [shell, accounts, pagination, contents, evidence, tasks, taskDetail, sellingPoints, apiSource, operationsSource, formatSource, layout, packageJson, queryContracts] = await Promise.all([
-    readFile(new URL("../app/components/AppShell.tsx", import.meta.url), "utf8"),
+    readWorkbenchShell(),
     readFile(new URL("../app/accounts/AccountsPage.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/components/Pagination.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/contents/ContentsPage.tsx", import.meta.url), "utf8"),
@@ -1079,7 +1088,7 @@ test("private account searches stay in POST bodies and obsolete static assets re
   assert.doesNotMatch(accounts, /\?phone=|URLSearchParams/);
   assert.match(contents, /useQuery\(contentSearchQueryOptions\(appliedRequest\)\)/);
   assert.match(queries, /readQueryJson<AccountSearchResult>\("\/api\/v8\/accounts\/search", jsonRequest\(/);
-  assert.match(queries, /readQueryJson<ContentSearchResult>\("\/api\/v8\/contents\/search", jsonRequest\(request\)\)/);
+  assert.match(queries, /readQueryJson<ContentSearchResult>\(CONTENT_SEARCH_PATH, jsonRequest\(request\)\)/);
   assert.doesNotMatch(queries, /\/api\/v8\/(?:accounts|contents)\/search\?/);
   assert.doesNotMatch(contents, /latest-report\.json|channel-structured-conclusions-v7\.0/);
   assert.match(apiSource, /\/api\/v7\/history\/reports/);
@@ -1142,7 +1151,7 @@ test("content editing sends only changed fields and preserves Shanghai timestamp
 
 test("user management is gated by role in the shell and served by the gateway contract", async () => {
   const [shell, page, queries, api, douyin, hook, styles, usersCss] = await Promise.all([
-    readFile(new URL("../app/components/AppShell.tsx", import.meta.url), "utf8"),
+    readWorkbenchShell(),
     readFile(new URL("../app/users/UsersPage.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/lib/queries.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/lib/api.ts", import.meta.url), "utf8"),
@@ -1201,9 +1210,9 @@ test("user management is gated by role in the shell and served by the gateway co
   for (const column of [1, 2, 3, 4, 5, 6]) assert.match(usersCss, new RegExp(`\\.table thead th:nth-child\\(${column}\\) \\{ width: \\d+%; \\}`));
   // 列宽只在页面模块里声明一处，globals 不再放同名副本，避免两处打架
   assert.doesNotMatch(styles, /\.user-table/);
-  // 表格与页头同宽基线；卡片自身收窄并靠左，hover 才能铺满整行
+  // 保留线上已发布的全宽表格，与页头对齐。
   assert.match(page, /<section className="page-stack wide-stack">/);
-  assert.match(usersCss, /max-width: 1080px;/);
+  assert.doesNotMatch(usersCss, /max-width: 1080px;/);
   assert.match(usersCss, /justify-self: start;/);
   assert.doesNotMatch(usersCss, /padding: 8px 16px 6px;/);
 });

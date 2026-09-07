@@ -51,6 +51,7 @@ export function requireApprovedSession<T extends { role?: string }>(session: T):
 // 登录后由网关按 return_to 回跳。服务端渲染阶段不做跳转。
 export function redirectToLogin() {
   if (typeof window === "undefined") return;
+  clearSessionData?.();
   const returnTo = window.location.pathname + window.location.search;
   window.location.replace(LOGIN_PATH + "?return_to=" + encodeURIComponent(returnTo));
 }

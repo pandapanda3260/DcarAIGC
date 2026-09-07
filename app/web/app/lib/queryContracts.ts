@@ -9,6 +9,8 @@ export type ContentSearchFilters = {
   spuSeries: string;
   audience: string;
   scene: string;
+  publishedFrom?: string;
+  publishedTo?: string;
 };
 
 export type ContentSearchRequest = {
@@ -22,6 +24,8 @@ export type ContentSearchRequest = {
   spu_series: string | null;
   audience: string | null;
   scene: string | null;
+  published_from?: string;
+  published_to?: string;
 };
 
 export type AccountSearchFilters = {
@@ -62,6 +66,8 @@ export function buildContentSearchRequest(
     spu_series: filters.spuSeries || null,
     audience: filters.audience || null,
     scene: filters.scene || null,
+    ...(filters.publishedFrom ? { published_from: filters.publishedFrom } : {}),
+    ...(filters.publishedTo ? { published_to: filters.publishedTo } : {}),
   };
 }
 

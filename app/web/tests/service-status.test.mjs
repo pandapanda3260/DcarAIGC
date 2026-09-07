@@ -115,8 +115,10 @@ test("failed refresh overrides cached healthy or read-only status", () => {
   }
 });
 
-test("AppShell reads health with a timeout and renders the derived status", async () => {
-  const shell = await readFile(new URL("../app/components/AppShell.tsx", import.meta.url), "utf8");
+test("persistent chrome reads health and shares the derived status with page shells", async () => {
+  const shell = (await Promise.all(["AppShell", "WorkbenchChrome"].map((name) =>
+    readFile(new URL(`../app/components/${name}.tsx`, import.meta.url), "utf8"),
+  ))).join("\n");
   assert.match(shell, /readQueryJson<ServiceHealth>\("\/api\/v8\/health", undefined, 5_000\)/);
   assert.match(shell, /refetchInterval: 30_000/);
   assert.match(shell, /refetchOnWindowFocus: "always"/);
@@ -127,7 +129,7 @@ test("AppShell reads health with a timeout and renders the derived status", asyn
   assert.match(shell, /serviceStyles\.offline/);
   assert.doesNotMatch(shell, /<strong>数据服务正常<\/strong>/);
   assert.match(shell, /title=\{serviceState\.description \|\| undefined\}/);
-  assert.match(shell, /aria-label=\{`\$\{serviceState\.label\}。\$\{serviceState\.description\}`\}/);
+  assert.match(shell, /aria-label=\{\[serviceState\.label, serviceState\.description\]\.filter\(Boolean\)\.join\("。"\)\}/);
 });
 
 test("report gap starts with the first enabled business day and only after 08:00 Shanghai next day", () => {

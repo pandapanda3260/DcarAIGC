@@ -229,7 +229,7 @@ test("provider is SSR-safe and cached read query functions do not consume AbortS
   assert.match(layout, /<Providers>\{children\}<\/Providers>/);
   assert.doesNotMatch(layout, /\btypeof\s+window\b/);
   assert.match(providers, /^"use client";/);
-  assert.match(providers, /<QueryClientProvider client=\{queryClient\}><ContentUpdateJobsProvider>\{children\}<\/ContentUpdateJobsProvider><\/QueryClientProvider>/);
+  assert.match(providers, /<QueryClientProvider client=\{queryClient\}><ContentUpdateJobsProvider><WorkbenchChrome>\{children\}<\/WorkbenchChrome><\/ContentUpdateJobsProvider><\/QueryClientProvider>/);
   assert.doesNotMatch(providers, /\btypeof\s+window\b/);
   assert.match(client, /if \(isServer\) return makeQueryClient\(\)/);
   assert.match(client, /let browserQueryClient: QueryClient \| undefined/);
@@ -251,9 +251,9 @@ test("provider is SSR-safe and cached read query functions do not consume AbortS
   assert.equal(JSON.parse(packageJson).dependencies["@tanstack/react-query"], "5.101.4");
 });
 
-test("sidebar navigation prefetches only the destination page primary query", async () => {
+test("sidebar navigation prefetches only the destination page data, including default SPU stats", async () => {
   const [shell, queries, contents, accounts] = await Promise.all([
-    readFile(new URL("../app/components/AppShell.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/components/WorkbenchChrome.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/lib/queries.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/contents/ContentsPage.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/accounts/AccountsPage.tsx", import.meta.url), "utf8"),
@@ -261,13 +261,14 @@ test("sidebar navigation prefetches only the destination page primary query", as
 
   assert.match(shell, /^"use client";/);
   assert.match(shell, /const queryClient = useQueryClient\(\)/);
-  assert.equal((shell.match(/queryClient\.prefetchQuery\(/g) ?? []).length, 7);
+  assert.equal((shell.match(/queryClient\.prefetchQuery\(/g) ?? []).length, 8);
   for (const query of [
     "overviewQueryOptions",
     "contentSearchQueryOptions",
     "accountSearchQueryOptions",
     "activeSellingPointsQueryOptions",
     "spuAssetsQueryOptions",
+    "spuStatsQueryOptions",
     "tasksListQueryOptions",
     "usersQueryOptions",
   ]) {
@@ -330,7 +331,7 @@ test("list read failures stay distinct from real empty states and expose retry",
   assert.match(accounts, /!accountsReadFailed && items\.map/);
 
   assert.match(contents, /const contentsReadFailed = contentsQuery\.isLoadingError \|\| retrying/);
-  assert.match(contents, /contentsReadFailed \? "读取失败" : listLoading \? "正在读取…" : `\$\{total\} 条内容`/);
+  assert.match(contents, /contentsReadFailed \? "读取失败" : listLoading \? "正在读取…" : contentsQuery\.isFetching && contentsQuery\.isPlaceholderData \? "正在筛选…" : `\$\{total\} 条内容`/);
   assert.match(contents, /className=\{`panel table-panel \$\{styles\.listPanel\}\$\{contentsReadFailed \? " has-read-error" : ""\}`\}/);
   assert.match(contents, /\{contentsReadFailed && <ReadErrorState title="内容读取失败" retrying=\{retrying\} onRetry=\{retryContentsRead\} \/>\}/);
   assert.match(contents, /\{!contentsReadFailed && !listLoading && <div className=\{styles\.listBody\}>/);
@@ -353,4 +354,20 @@ test("list read failures stay distinct from real empty states and expose retry",
   assert.match(styles, /\.table-panel\.has-read-error \.table-scroll\s*\{[^}]*overflow-x:\s*hidden;/);
   assert.match(styles, /\.read-error-retry\s*\{[^}]*justify-self:\s*center;/);
   assert.doesNotMatch(styles, /\.table-read-error/);
+});
+
+
+test("publication date ranges stay in the canonical payload across pagination and combined filters", () => {
+  const filters = { ...emptyContentFilters, publishedFrom: "2026-08-31", publishedTo: "2026-09-06", platform: "douyin" };
+  const first = buildContentSearchRequest(filters, 1, 50);
+  const second = buildContentSearchRequest(filters, 2, 50);
+  assert.equal(first.published_from, "2026-08-31");
+  assert.equal(first.published_to, "2026-09-06");
+  assert.equal(first.platform, "douyin");
+  assert.deepEqual(second, { ...first, page: 2 });
+  const cleared = buildContentSearchRequest({ ...filters, publishedFrom: "", publishedTo: "" }, 1, 50);
+  assert.equal("published_from" in cleared, false);
+  assert.equal("published_to" in cleared, false);
+  assert.equal(cleared.platform, "douyin");
+  assert.notDeepEqual(first, cleared);
 });

@@ -1,0 +1,18 @@
+.pending {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 12px;
+  margin-left: auto;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: navigation-spin 0.7s linear infinite;
+}
+
+@keyframes navigation-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pending { animation: none; }
+}

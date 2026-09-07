@@ -7,7 +7,6 @@
   --users-line: #e8edef;
   min-width: 0;
   width: 100%;
-  max-width: 1080px;
   justify-self: start;
   padding: 0;
   border: 1px solid var(--line);
@@ -78,6 +77,7 @@
 .time { margin-left: 4px; color: var(--users-muted); font-size: 11px; }
 
 .tablePanel .table :global(.row-actions) { display: grid; grid-template-columns: max-content 36px; justify-content: center; align-items: center; gap: 6px; }
+.tablePanel .table :global(.row-actions) > :only-child { grid-column: 1 / -1; justify-self: center; }
 .table :global(.text-button) {
   min-height: 28px;
   padding: 3px 11px;

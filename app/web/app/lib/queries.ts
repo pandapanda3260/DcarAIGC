@@ -1,4 +1,5 @@
 import { keepPreviousData, queryOptions } from "@tanstack/react-query";
+import { CONTENT_SEARCH_PATH } from "./features";
 import { ApiRequestError, jsonRequest, readQueryJson, requireApprovedSession } from "./api";
 import {
   buildAccountSearchRequest,
@@ -113,7 +114,7 @@ export function overviewQueryOptions() {
 export function contentSearchQueryOptions(request: ContentSearchRequest) {
   return queryOptions({
     queryKey: queryKeys.contentSearch(request),
-    queryFn: () => readQueryJson<ContentSearchResult>("/api/v8/contents/search", jsonRequest(request)),
+    queryFn: () => readQueryJson<ContentSearchResult>(CONTENT_SEARCH_PATH, jsonRequest(request)),
     placeholderData: keepPreviousData,
   });
 }

@@ -156,6 +156,7 @@ test("session refresh observes revocation on focus, reentry and every 30 seconds
   const { sessionQueryOptions } = await loadModule("../app/lib/queries.ts", {
     "./api": url,
     "./queryContracts": new URL("../app/lib/queryContracts.ts", import.meta.url).href,
+    "./features": new URL("../app/lib/features.ts", import.meta.url).href,
   });
   const options = sessionQueryOptions();
   assert.equal(options.refetchInterval, 30_000);

@@ -4,8 +4,8 @@ import test from "node:test";
 import {
   filterVehicleSeriesGroups,
   matchVehicleSeriesGroup,
-  sortVehicleCatalogRows,
-} from "../app/spu-audience/vehicleCatalogSort.ts";
+} from "../app/spu-audience/vehicleCatalogSearch.ts";
+import { sortVehicleCatalogRows } from "../app/spu-audience/vehicleCatalogSort.ts";
 
 function searchRow({ brand, series, aliases = [], trimLabel = null, modelYear = null }) {
   return {
