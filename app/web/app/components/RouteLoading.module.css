@@ -1,0 +1,11 @@
+.skeleton { animation: reveal-skeleton 180ms ease-out both; }
+.toolbar { display: flex; gap: 12px; padding: 4px 0 20px; }
+.toolbar span { width: 120px; height: 34px; border-radius: 8px; background: #e5ebeb; }
+.toolbar span:last-child { margin-left: auto; width: 84px; }
+.panel { padding: 8px 20px; border: 1px solid var(--line); border-radius: 12px; background: #fff; }
+.row { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) minmax(0, 1fr); gap: 32px; padding: 24px 0; }
+.row + .row { border-top: 1px solid #edf1f2; }
+.row span { height: 14px; border-radius: 4px; background: #e8eeee; }
+.row:nth-child(even) span:first-child { width: 76%; }
+@keyframes reveal-skeleton { from { opacity: 0; } to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .skeleton { animation: none; } }

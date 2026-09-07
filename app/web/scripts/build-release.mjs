@@ -65,7 +65,7 @@ const manifest = {
   built_at: new Date().toISOString(), node_version: process.version,
   vinext_patch: { version: VINEXT_PATCH_VERSION, upstream_files: VINEXT_PATCH_FILES },
   build_environment: buildEnvironment,
-  capabilities: ["persistent-navigation", "guarded-route-cache-v1", "lazy-pinyin-search", "read-only-thumbnail-stream", "account-permissions", "snapshot-sync-status", ...(environment === "local" ? ["content-date-filter"] : [])],
+  capabilities: ["immediate-destination-shell", "persistent-navigation", "guarded-route-cache-v1", "lazy-pinyin-search", "read-only-thumbnail-stream", "account-permissions", "snapshot-sync-status", ...(environment === "local" ? ["content-date-filter"] : [])],
   gateway_sha256: sourceFiles["src/dcar_eval/dcar_auth/gateway.py"],
   artifacts,
 };

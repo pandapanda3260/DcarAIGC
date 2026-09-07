@@ -8,6 +8,7 @@ import vm from "node:vm";
 import ts from "typescript";
 import { transformVinextModule, verifyVinextPackage, VINEXT_PATCH_FILES, vinextNavigationPatch } from "../scripts/vinext-navigation-patch.mjs";
 import { createStaticRouteCache } from "../scripts/vinext-route-cache.mjs";
+import { createNavigationFeedbackStore } from "../scripts/navigation-feedback.mjs";
 import { STATIC_NAVIGATION_ROUTES, verifyStaticNavigationRoutes } from "../scripts/vinext-static-route-guard.mjs";
 
 const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -242,9 +243,10 @@ test("patched bootstrap seeds hydration, real navigation reuses it across source
   let navigationId = 0;
   let commits = 0;
   let requests = 0;
+  const feedback = createNavigationFeedbackStore();
   const context = vm.createContext({
     ...nav, ...elementsHelpers, ...rsc, AppElementsWire: wire.AppElementsWire,
-    createStaticRouteCache, Response, Promise, URL, Headers, console, performance,
+    createStaticRouteCache, navigationFeedbackStore: feedback, Response, Promise, URL, Headers, console, performance,
     VINEXT_MOUNTED_SLOTS_HEADER: "x-vinext-mounted-slots", VINEXT_PARAMS_HEADER: "x-vinext-params",
     window: { ...globalThis.window, history: { state: null } }, history: {},
     createAppBrowserNavigationController: () => ({
@@ -294,6 +296,38 @@ test("patched bootstrap seeds hydration, real navigation reuses it across source
   assert.equal(requests, 1);
   assert.equal(vm.runInContext("visitedResponseCache.size", context), 0, "late request cannot refill original visited cache after auth/refresh clear");
   assert.equal(vm.runInContext('staticRouteCache.get("/overview.rsc", null, "navigate")', context), null);
+
+  // A cold route announces its target before transport or the RSC tree settles.
+  // Superseded network responses must neither commit nor remove a newer shell.
+  const waiting = new Map();
+  const committed = [];
+  context.fetch = (url) => {
+    const response = deferred();
+    waiting.set(new URL(url, "https://audit.invalid").pathname, { url, response });
+    return response.promise;
+  };
+  context.recordCommit = async (payload) => { committed.push((await payload).__route); return "committed"; };
+  vm.runInContext("renderNavigationPayload = recordCommit", context);
+  const first = vm.runInContext('window.__VINEXT_RSC_NAVIGATE__("/contents")', context);
+  assert.equal(feedback.getSnapshot()?.section, "contents", "target feedback is synchronous, before the first await");
+  await until(() => waiting.has("/contents.rsc"));
+  const second = vm.runInContext('window.__VINEXT_RSC_NAVIGATE__("/accounts")', context);
+  assert.equal(feedback.getSnapshot()?.section, "accounts");
+  await until(() => waiting.has("/accounts.rsc"));
+  function resolveRoute(path) {
+    const { url, response } = waiting.get(`${path}.rsc`);
+    const result = new Response(JSON.stringify(elementPayload(path)), { headers: { "content-type": "text/x-component" } });
+    Object.defineProperty(result, "url", { value: new URL(url, "https://audit.invalid").href });
+    response.resolve(result);
+  }
+  resolveRoute("/contents");
+  await first;
+  assert.equal(feedback.getSnapshot()?.section, "accounts", "old finally must preserve the new target");
+  assert.deepEqual(committed, []);
+  resolveRoute("/accounts");
+  await second;
+  assert.deepEqual(committed, ["route:/accounts"]);
+  assert.equal(feedback.getSnapshot(), null, "feedback clears after the actual route commit");
 });
 
 test("build plugin is mandatory, version locked and does not mutate dependencies", async () => {

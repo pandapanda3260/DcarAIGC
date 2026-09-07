@@ -1,9 +1,9 @@
 "use client";
 
-import Link, { useLinkStatus } from "next/link";
+import Link from "next/link";
 import Image from "next/image";
 import { usePathname, useRouter } from "next/navigation";
-import { useEffect, useMemo, useRef, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useSyncExternalStore, type ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   accountSearchQueryOptions,
@@ -27,8 +27,9 @@ import { WorkbenchContext, workbenchSection } from "./WorkbenchContext";
 import { ToastViewport } from "./Feedback";
 import LogoutButton from "./LogoutButton";
 import BackToTop from "./BackToTop";
+import RouteLoading from "./RouteLoading";
+import { navigationFeedbackStore } from "../../scripts/navigation-feedback.mjs";
 import serviceStyles from "./DataServiceStatus.module.css";
-import navigationStyles from "./Navigation.module.css";
 
 // Warm the destination's JS and CSS alongside its data, before RSC navigation
 // discovers them. Keep these imports lazy so the initial page stays small.
@@ -66,11 +67,7 @@ function NavIcon({ section }: { section: Section }) {
 }
 
 function NavLabel({ section, label }: { section: Section; label: string }) {
-  const { pending } = useLinkStatus();
-  return <>
-    <NavIcon section={section} />{label}
-    {pending && <span className={navigationStyles.pending} role="status" aria-label={`正在打开${label}`} />}
-  </>;
+  return <><NavIcon section={section} />{label}</>;
 }
 
 // 侧栏"用户管理&质检"分组只对管理员及以上显示；真正的拦截在网关（/users 页面 303、/auth/users* 403），
@@ -86,6 +83,10 @@ export default function WorkbenchChrome({ children }: { children: ReactNode }) {
 }
 
 function ActiveWorkbenchChrome({ active, pathname, children }: { active: Section; pathname: string; children: ReactNode }) {
+  // External-store updates remain urgent even when navigation starts inside a
+  // React transition. Never retain the previous page behind a pending spinner.
+  const pending = useSyncExternalStore(navigationFeedbackStore.subscribe, navigationFeedbackStore.getSnapshot, navigationFeedbackStore.getServerSnapshot);
+  const displayedSection = pending?.section ?? active;
   const router = useRouter();
   const queryClient = useQueryClient();
   const session = useQuery(sessionQueryOptions());
@@ -98,7 +99,7 @@ function ActiveWorkbenchChrome({ active, pathname, children }: { active: Section
     retry: false,
   });
   const serviceState = useMemo(() => dataServiceStatus(serviceHealth.data, serviceHealth.isError), [serviceHealth.data, serviceHealth.isError]);
-  const context = useMemo(() => ({ activeSection: active, serviceState }), [active, serviceState]);
+  const context = useMemo(() => ({ activeSection: displayedSection, serviceState }), [displayedSection, serviceState]);
   const showUserManagement = canManageUsers(session.data?.role);
   const showAccounts = canAccessAccounts(session.data?.role);
   const prefetchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -179,8 +180,8 @@ function ActiveWorkbenchChrome({ active, pathname, children }: { active: Section
               key={item.id}
               href={item.href}
               prefetch={false}
-              className={active === item.id ? "active" : ""}
-              aria-current={active === item.id ? "page" : undefined}
+              className={displayedSection === item.id ? "active" : ""}
+              aria-current={displayedSection === item.id ? "page" : undefined}
               onPointerEnter={() => schedulePrefetch(item.id)}
               onPointerLeave={cancelScheduledPrefetch}
               onClick={(event) => {
@@ -204,8 +205,8 @@ function ActiveWorkbenchChrome({ active, pathname, children }: { active: Section
             <Link
               href="/users"
               prefetch={false}
-              className={active === "users" ? "active" : ""}
-              aria-current={active === "users" ? "page" : undefined}
+              className={displayedSection === "users" ? "active" : ""}
+              aria-current={displayedSection === "users" ? "page" : undefined}
               onPointerEnter={() => schedulePrefetch("users")}
               onPointerLeave={cancelScheduledPrefetch}
               onClick={(event) => {
@@ -227,8 +228,8 @@ function ActiveWorkbenchChrome({ active, pathname, children }: { active: Section
         </nav>
         <div className="sidebar-foot"><i className={`live-dot${serviceState.kind === "online" ? " online" : ""}`} aria-hidden="true" /><div role="status" aria-live="polite" title={serviceState.description || undefined} aria-label={[serviceState.label, serviceState.description].filter(Boolean).join("。")}><strong className={serviceStyles.footerLabel}>{serviceState.label}</strong></div><LogoutButton /></div>
       </aside>
-      {children}
-      <BackToTop pageKey={pathname ?? active} />
+      {pending ? <RouteLoading section={pending.section} /> : children}
+      <BackToTop pageKey={pending?.href ?? pathname} />
       <ToastViewport />
     </div>
     </WorkbenchContext.Provider>

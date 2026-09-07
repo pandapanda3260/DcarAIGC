@@ -39,7 +39,7 @@ export function verifyVinextPackage(root = defaultRoot) {
   return packageRoot;
 }
 
-export function transformVinextModule(source, file, { routes = [], runtimeModule = pathToFileURL(join(scriptRoot, "vinext-route-cache.mjs")).href } = {}) {
+export function transformVinextModule(source, file, { routes = [], runtimeModule = pathToFileURL(join(scriptRoot, "vinext-route-cache.mjs")).href, feedbackModule = pathToFileURL(join(scriptRoot, "navigation-feedback.mjs")).href } = {}) {
   if (!(file in VINEXT_PATCH_FILES)) return null;
   if (source.startsWith(marker)) return source;
   if (createHash("sha256").update(source).digest("hex") !== VINEXT_PATCH_FILES[file]) throw new Error(`[dcar vinext patch] unrecognized transform input ${file}`);
@@ -103,6 +103,12 @@ export function transformVinextModule(source, file, { routes = [], runtimeModule
     source = replaceOnce(source, '\t\t\t\t\tpurpose: "prefetch"', '\t\t\t\t\tpurpose: "prefetch",\n\t\t\t\t\tsignal: AbortSignal.timeout(10_000)');
   }
   if (file === "server/app-browser-entry.js") {
+    source = `import { navigationFeedbackStore } from ${JSON.stringify(feedbackModule)};\n` + source;
+    // Notify before the first await. useSyncExternalStore makes the destination
+    // shell urgent even when vinext's Link initiates navigation in a Transition.
+    source = replaceOnce(source, "\t\tlet pendingRouterState = null;\n\t\tconst navId = browserNavigationController.beginNavigation();", "\t\tlet pendingRouterState = null;\n\t\tconst navId = browserNavigationController.beginNavigation();\n\t\tnavigationFeedbackStore.start(navId, href, __basePath, navigationKind);");
+    source = replaceOnce(source, "\t\t\tbrowserNavigationController.finalizeNavigation(navId, pendingRouterState);", "\t\t\tbrowserNavigationController.finalizeNavigation(navId, pendingRouterState);\n\t\t\tnavigationFeedbackStore.finish(navId);");
+    source = replaceOnce(source, "\t\t\t\t\tcurrentHref = destinationPath;", "\t\t\t\t\tcurrentHref = destinationPath;\n\t\t\t\t\tnavigationFeedbackStore.start(navId, currentHref, __basePath, navigationKind);");
     source = replaceOnce(source, "\twindow.__VINEXT_CLEAR_NAV_CACHES__ = clearClientNavigationCaches;", `\twindow.__VINEXT_CLEAR_NAV_CACHES__ = clearClientNavigationCaches;
 \t// Peek only: navigation still consumes and validates the original payload.
 \t// Sharing this validity check stops pointer/hover prefetch from refetching a
@@ -170,7 +176,7 @@ export function vinextNavigationPatch() {
     transform(code, id) {
       const file = matchedFile(id);
       if (file === null) return null;
-      const patched = transformVinextModule(code, file, { routes, runtimeModule: join(scriptRoot, "vinext-route-cache.mjs") });
+      const patched = transformVinextModule(code, file, { routes, runtimeModule: join(scriptRoot, "vinext-route-cache.mjs"), feedbackModule: join(scriptRoot, "navigation-feedback.mjs") });
       return patched === null ? null : { code: patched, map: null, meta: { dcarVinextNavigationPatch: VINEXT_PATCH_VERSION } };
     },
     generateBundle(_options, bundle) {

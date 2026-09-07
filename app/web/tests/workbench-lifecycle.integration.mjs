@@ -15,13 +15,14 @@ const domModule = process.env.DCAR_TEST_DOM_MODULE;
 assert.ok(domModule, "Set DCAR_TEST_DOM_MODULE to the installed linkedom module path");
 const { parseHTML } = require(domModule);
 const { window } = parseHTML("<!doctype html><html><body><div id=\"root\"></div></body></html>");
+window.location = new URL("https://workbench.example/overview");
 for (const [name, value] of Object.entries({ window, document: window.document, HTMLElement: window.HTMLElement, Node: window.Node, Event: window.Event, navigator: { userAgent: "node" }, IS_REACT_ACT_ENVIRONMENT: true })) {
   Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
 }
 const { createRoot } = require("react-dom/client");
 const appRoot = fileURLToPath(new URL("../app/", import.meta.url));
 
-function setup() {
+function setup({ simulateNavigation = false } = {}) {
   let pathname = "/overview";
   const counts = { session: 0, health: 0 };
   const prefetches = [], modules = [], mounts = {}, unmounts = {};
@@ -44,7 +45,18 @@ function setup() {
   }
   const rsc = [];
   const router = { prefetch: (url) => rsc.push(url) };
-  const Link = (props) => { const attributes = { ...props }; delete attributes.prefetch; return React.createElement("a", attributes); };
+  let navigationId = 0;
+  const Link = (props) => {
+    const attributes = { ...props };
+    delete attributes.prefetch;
+    attributes.onClick = (event) => {
+      props.onClick?.(event);
+      if (!simulateNavigation || event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return;
+      // Model the real router's start event, with the network left unresolved.
+      React.startTransition(() => feedback.start(++navigationId, props.href, "", "navigate"));
+    };
+    return React.createElement("a", attributes);
+  };
   const Image = (props) => { const attributes = { ...props }; delete attributes.unoptimized; return React.createElement("img", attributes); };
   const cache = new Map();
   function load(filename) {
@@ -79,21 +91,29 @@ function setup() {
     new Function("require", "module", "exports", output)(localRequire, compiled, compiled.exports);
     return compiled.exports;
   }
+  const feedback = load(fileURLToPath(new URL("../scripts/navigation-feedback.mjs", import.meta.url))).navigationFeedbackStore;
   const Providers = load(path.join(appRoot, "components/Providers.tsx")).default;
   const AppShell = load(path.join(appRoot, "components/AppShell.tsx")).default;
   const RouteLoading = load(path.join(appRoot, "components/RouteLoading.tsx")).default;
   const ErrorPage = load(path.join(appRoot, "error.tsx")).default;
   const serviceState = load(path.join(appRoot, "lib/serviceStatus.ts")).dataServiceStatus(health, false);
   const { workbenchSection } = load(path.join(appRoot, "components/WorkbenchContext.tsx"));
+  function PageContent({ url }) {
+    const [filter, setFilter] = React.useState("全部");
+    return React.createElement(React.Fragment, null,
+      React.createElement("p", null, url),
+      React.createElement("button", { "data-filter": true, onClick: () => setFilter("已筛选") }, filter));
+  }
   const root = createRoot(document.getElementById("root"));
   return {
-    client, counts, prefetches, modules, mounts, unmounts, rsc, workbenchSection, serviceState,
+    client, counts, prefetches, modules, mounts, unmounts, rsc, workbenchSection, serviceState, feedback,
     async render(nextPath, state = "page") {
       pathname = nextPath;
+      window.location = new URL(nextPath, "https://workbench.example");
       const active = workbenchSection(nextPath);
       const child = state === "loading" ? React.createElement(RouteLoading)
         : state === "error" ? React.createElement(ErrorPage, { error: new Error("private diagnostics"), reset: () => {} })
-        : active ? React.createElement(AppShell, { active, key: nextPath }, React.createElement(Probe, { name: `page:${nextPath}` }, React.createElement("p", null, nextPath)))
+        : active ? React.createElement(AppShell, { active, key: nextPath }, React.createElement(Probe, { name: `page:${nextPath}` }, React.createElement(PageContent, { url: nextPath })))
         : React.createElement("p", null, "Independent route");
       await act(async () => { root.render(React.createElement(Providers, null, child)); });
       // Query notifications use timers; flush those in a separate act after effects start reads.
@@ -104,6 +124,7 @@ function setup() {
       Object.assign(event, { button: 0, detail: type === "click" ? 0 : 1, ...properties });
       await act(async () => { document.querySelector(`a[href="${href}"]`).dispatchEvent(event); });
     },
+    async finish(id) { await act(async () => feedback.finish(id)); },
     async close() { await act(async () => root.unmount()); client.clear(); },
   };
 }
@@ -143,6 +164,86 @@ test("real React lifecycle preserves sidebar, global UI and health observers whi
     assert.ok(document.querySelector("aside") === null, "independent routes must not include a sidebar");
     assert.equal(view.client.getQueryCache().find({ queryKey: ["system", "health"] }).getObserversCount(), 0);
     for (const url of [null, "/", "/unknown", "/contents/unknown", "/tasks/1/unknown"]) assert.equal(view.workbenchSection(url), null);
+  } finally { await view.close(); }
+});
+
+test("pending navigation urgently replaces old content, handles rapid clicks and commits the final page", async () => {
+  const view = setup({ simulateNavigation: true });
+  try {
+    await view.render("/overview");
+    const sidebar = document.querySelector("aside");
+    await view.event("/contents", "click");
+    const firstId = view.feedback.getSnapshot().id;
+    assert.equal(document.querySelector('main').dataset.section, "contents");
+    assert.equal(document.querySelector('[aria-current="page"]').getAttribute("href"), "/contents");
+    assert.equal(document.querySelector("h1").textContent, "发布内容明细");
+    assert.ok(document.querySelector('[data-navigation-pending="contents"]'));
+    assert.doesNotMatch(document.querySelector("main").textContent, /\/overview/);
+    assert.equal(view.unmounts["page:/overview"], 1, "old page must unmount before the navigation response arrives");
+    assert.equal(document.querySelectorAll("main").length, 1);
+    assert.equal(document.querySelector("aside"), sidebar);
+
+    await view.event("/tasks", "click");
+    const secondId = view.feedback.getSnapshot().id;
+    await view.finish(firstId);
+    assert.equal(document.querySelector("h1").textContent, "日报、周报与自定义报告");
+    assert.ok(document.querySelector('[data-navigation-pending="tasks"]'));
+    await view.event("/overview", "click");
+    const returnId = view.feedback.getSnapshot().id;
+    assert.ok(returnId > secondId, "a click back to the still committed source is a new navigation");
+    await view.finish(secondId);
+    assert.ok(document.querySelector('[data-navigation-pending="overview"]'));
+    await view.render("/overview");
+    await view.finish(returnId);
+    assert.ok(!document.querySelector("[data-navigation-pending]"));
+    assert.match(document.querySelector("main").textContent, /\/overview/);
+
+    await view.event("/contents", "click");
+    const finalId = view.feedback.getSnapshot().id;
+    await view.render("/contents");
+    assert.ok(document.querySelector("[data-navigation-pending]"), "feedback remains until the router acknowledges its actual commit");
+    await view.finish(finalId);
+    assert.equal(document.querySelector("aside"), sidebar);
+    assert.match(document.querySelector("main").textContent, /\/contents/);
+    assert.ok(!document.querySelector("[data-navigation-pending]"));
+    assert.deepEqual(view.counts, { session: 1, health: 1 });
+  } finally { await view.close(); }
+});
+
+test("modified clicks leave the current page and permission changes cannot expose old content behind feedback", async () => {
+  const view = setup({ simulateNavigation: true });
+  try {
+    await view.render("/users");
+    for (const properties of [{ ctrlKey: true }, { metaKey: true }, { shiftKey: true }, { altKey: true }, { button: 1 }]) {
+      await view.event("/tasks", "click", properties);
+      assert.equal(view.feedback.getSnapshot(), null);
+      assert.match(document.querySelector("main").textContent, /\/users/);
+    }
+    await view.event("/accounts", "click");
+    assert.ok(document.querySelector('[data-navigation-pending="accounts"]'));
+    await act(async () => view.client.setQueryData(["auth", "session"], { username: "different-operator", role: "operator", authenticated: true }));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+    assert.equal(document.querySelector('a[href="/accounts"]'), null);
+    assert.equal(document.querySelector('a[href="/users"]'), null);
+    assert.doesNotMatch(document.querySelector("main").textContent, /\/users/);
+    assert.equal(view.unmounts["page:/users"], 1);
+    assert.ok(document.querySelector('[data-navigation-pending="accounts"]'), "only public route metadata remains while the gateway resolves access");
+  } finally { await view.close(); }
+});
+
+test("reselecting the settled current page preserves its real React filter state", async () => {
+  const view = setup({ simulateNavigation: true });
+  try {
+    await view.render("/contents");
+    const filter = document.querySelector("[data-filter]");
+    await act(async () => filter.dispatchEvent(new window.Event("click", { bubbles: true })));
+    assert.equal(filter.textContent, "已筛选");
+    await view.event("/contents", "click");
+    assert.equal(view.feedback.getSnapshot(), null);
+    assert.equal(document.querySelector("[data-filter]"), filter);
+    assert.equal(filter.textContent, "已筛选");
+    assert.equal(view.mounts["page:/contents"], 1);
+    assert.equal(view.unmounts["page:/contents"], undefined);
   } finally { await view.close(); }
 });
 
