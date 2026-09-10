@@ -1,3 +1,5 @@
+import type { AccountGroup, BusinessDirection } from "./accountClassification";
+
 export type Section = "overview" | "tasks" | "accounts" | "contents" | "selling-points" | "spu-audience" | "users";
 export type UserRole = "superadmin" | "admin" | "operator" | "new_user";
 export type UserStatus = "active" | "disabled";
@@ -170,6 +172,7 @@ export type ReportView = {
   task: { task_status: string; name: string };
   metadata?: {
     collection_cutoff_at?: string | null;
+    account_classification_version?: string;
   };
   data_quality: Record<string, unknown>;
   data_quality_details?: {
@@ -179,7 +182,10 @@ export type ReportView = {
   summary_metrics: Record<string, Metric>;
   channels?: Record<OverviewChannelKey, OverviewChannel> | null;
   platform_dimensions: Array<Record<string, string | number | null>>;
-  account_type_dimensions: Array<Record<string, string | number | null>>;
+  account_group_dimensions?: Array<Record<string, string | number | null>>;
+  business_direction_dimensions?: Array<Record<string, string | number | null>>;
+  /** Frozen legacy reports only; never relabel these as current account groups. */
+  account_type_dimensions?: Array<Record<string, string | number | null>>;
   content_direction_dimensions: Array<Record<string, string | number | null>>;
   content_details: Array<Record<string, string | number | boolean | null>>;
   capture_summary: Array<Record<string, string | number>>;
@@ -208,14 +214,21 @@ export type PlatformIdentity = {
 export type AccountStatus = "daily" | "weekly" | "paused" | "unmarked";
 
 export type Account = {
+  directory_row_id?: number;
+  directory_identity_status?: "existing_verified" | "uid_unverified" | "identity_missing";
   id: number;
   phone: string;
   operator_name: string;
-  account_type: string;
-  content_direction: string;
+  account_group: AccountGroup;
+  business_direction: BusinessDirection;
   account_status: AccountStatus;
   update_frequency: "daily" | "weekly" | null;
   enabled: boolean;
+  automatic_capture?: {
+    eligible: boolean;
+    reason_code: string;
+    reason_label: string;
+  };
   platforms: PlatformIdentity[];
 };
 
@@ -298,7 +311,8 @@ export type ContentItem = {
   content_type: string;
   raw_account_uid: string;
   raw_account_name: string;
-  account_type: string;
+  account_group: AccountGroup;
+  business_direction: BusinessDirection;
   content_direction: string;
   primary_selling_point_code: string | null;
   evidence_level: string | null;

@@ -347,6 +347,67 @@ class V8DuplicateDetectionTest(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertNotEqual(rows[-1]["source_sha256"], first["source_sha256"])
 
+    def test_new_source_preserves_registered_fingerprint_bytes(self) -> None:
+        content_id = self._content("F2BC3D")
+        first = fingerprint_content(content_id, db_path=self.db)
+        with connect(self.db) as connection:
+            original_title = connection.execute(
+                "SELECT title FROM content_items WHERE id=?", (content_id,)
+            ).fetchone()["title"]
+            old = dict(connection.execute(
+                "SELECT * FROM evidence_artifacts WHERE content_id=? "
+                "AND artifact_type='duplicate_fingerprint'", (content_id,)
+            ).fetchone())
+            connection.execute(
+                "UPDATE content_items SET title='different source text' WHERE id=?",
+                (content_id,),
+            )
+            connection.commit()
+        old_path = duplicates_module._resolved(old["local_path"])
+        old_body = old_path.read_bytes()
+
+        second = fingerprint_content(content_id, db_path=self.db)
+
+        self.assertNotEqual(first["source_sha256"], second["source_sha256"])
+        self.assertEqual(old_path.read_bytes(), old_body)
+        with connect(self.db) as connection:
+            registered = connection.execute(
+                "SELECT * FROM evidence_artifacts WHERE content_id=? "
+                "AND artifact_type='duplicate_fingerprint'", (content_id,)
+            ).fetchall()
+            self.assertEqual(len({row["local_path"] for row in registered}), 2)
+            for row in registered:
+                body = duplicates_module._resolved(row["local_path"]).read_bytes()
+                self.assertEqual(hashlib.sha256(body).hexdigest(), row["sha256"])
+                self.assertEqual(len(body), row["byte_size"])
+            connection.execute(
+                "UPDATE content_items SET title=? WHERE id=?",
+                (original_title, content_id),
+            )
+            connection.commit()
+        # Reusing an older source must still read its registered bytes.
+        self.assertEqual(fingerprint_content(content_id, db_path=self.db), first)
+
+    def test_existing_legacy_fingerprint_path_remains_cacheable(self) -> None:
+        content_id = self._content("L2BC3D")
+        first = fingerprint_content(content_id, db_path=self.db)
+        with connect(self.db) as connection:
+            row = connection.execute(
+                "SELECT * FROM evidence_artifacts WHERE content_id=? "
+                "AND artifact_type='duplicate_fingerprint'", (content_id,)
+            ).fetchone()
+            old_path = duplicates_module._resolved(row["local_path"])
+            legacy_path = duplicates_module._fingerprint_root_for_database(self.db) / "L2BC3D.json"
+            if old_path != legacy_path:
+                old_path.replace(legacy_path)
+                connection.execute(
+                    "UPDATE evidence_artifacts SET local_path=? WHERE id=?",
+                    (str(legacy_path), row["id"]),
+                )
+                connection.commit()
+        with patch.object(duplicates_module, "_media_fingerprints", side_effect=AssertionError("must reuse cache")):
+            self.assertEqual(fingerprint_content(content_id, db_path=self.db), first)
+
     def test_pending_fingerprint_limit_is_applied_after_source_hash_filtering(self) -> None:
         false_candidate = self._content("S2BC3D")
         true_candidate = self._content("T2BC3D")

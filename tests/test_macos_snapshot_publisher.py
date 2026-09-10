@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from tests.test_matrix_snapshot_publisher import DAY, ROOT, create_writer_fixture, load_publisher
+from tests import test_server_snapshot_deployment as snapshot_fixture
 from v8 import pipeline_cutover
 from v8.contracts import CURRENT_REPORT_RULE_VERSION, CURRENT_REPORT_VERSION
 from v8.release_management_v9 import TARGET_RELEASE_ID, TAXONOMY_VERSION
@@ -312,12 +313,14 @@ class MacOSSnapshotPublisherTest(unittest.TestCase):
         finally:
             source.close()
             destination.close()
+        frozen = snapshot_fixture.builder._FrozenArtifacts(output / publisher.FROZEN_ARTIFACT_DIRECTORY)
         files = []
         for root_name, root in (("cache", self.project / "data/cache"), ("reports", self.project / "reports")):
             for path in sorted(root.rglob("*")):
                 if path.is_file():
-                    files.append({"root": root_name, "path": path.relative_to(root).as_posix(),
-                        "project_path": path.relative_to(self.project).as_posix(), "sha256": sha(path), "byte_size": path.stat().st_size})
+                    snapshot_fixture.builder._add_artifact(frozen, [], project_root=self.project,
+                        relative_path=path.relative_to(self.project).as_posix())
+                    files.append(frozen[(root_name, path.relative_to(root).as_posix())])
             (output / f"{root_name}-files-from0").write_bytes(b"".join(
                 row["path"].encode() + b"\0" for row in files if row["root"] == root_name))
         database_sha = sha(database)
@@ -329,6 +332,8 @@ class MacOSSnapshotPublisherTest(unittest.TestCase):
             "databases": [{"name": "dcar_insight.sqlite3", "bundle_path": "databases/dcar_insight.sqlite3",
                 "byte_size": database.stat().st_size, "sha256": database_sha, "user_version": SCHEMA_VERSION}],
             "files": files, "file_count": len(files), "file_byte_size": sum(row["byte_size"] for row in files),
+            "local_artifact_source": {"contract": publisher.FROZEN_ARTIFACT_CONTRACT,
+                                      "directory": publisher.FROZEN_ARTIFACT_DIRECTORY},
             "optional_reuse_files": [], "optional_reuse_byte_size": 0,
         }
         self.write_manifest(output, manifest)
@@ -345,7 +350,9 @@ class MacOSSnapshotPublisherTest(unittest.TestCase):
         runner = runner or self.runner()
         self.last_runner = runner
         function = publisher.publish_snapshot_automatically if automatic else publisher.publish_snapshot
-        with patch.object(publisher.Path, "home", return_value=self.fake_home):
+        with patch.object(publisher.Path, "home", return_value=self.fake_home), patch.object(
+            publisher, "_utc_now", return_value=(now or self.now).astimezone(timezone.utc).isoformat()
+        ):
             return function(project_root=self.project,
                 database=(None if resume_staged_snapshot_id is not None else self.database),
                 legacy_database=None,
@@ -947,7 +954,7 @@ class MacOSSnapshotPublisherTest(unittest.TestCase):
         self.assertNotEqual(first["snapshot_id"], later["snapshot_id"])
         self.assertGreater(later["publication_evidence"]["current_observation"]["content"]["row_count"], 0)
         count = len(runner.commands)
-        unchanged = self.publish(runner=runner, automatic=True, fetch=fetch, now=self.now + timedelta(hours=2),
+        unchanged = self.publish(runner=runner, automatic=True, fetch=fetch, now=self.now + timedelta(hours=1, minutes=15),
                                  builder=lambda **_: self.fail("unchanged forward observations must not rebuild"))
         self.assertEqual(unchanged["status"], "already-published-current-evidence")
         self.assertEqual(len(runner.commands), count)
@@ -1043,10 +1050,67 @@ class MacOSSnapshotPublisherTest(unittest.TestCase):
         self.assertEqual(state["beijing_date"], DAY.isoformat())
         self.assertEqual(state["publication_evidence_sha256"], receipt["publication_evidence_sha256"])
         count = len(runner.commands)
-        result = self.publish(runner=runner, automatic=True, now=self.now + timedelta(hours=9),
+        result = self.publish(runner=runner, automatic=True, now=self.now + timedelta(minutes=15),
             builder=lambda **_: self.fail("unchanged evidence must not rebuild"))
         self.assertEqual(result["status"], "already-published-current-evidence")
         self.assertEqual(len(runner.commands), count)
+
+    def test_unchanged_evidence_renews_through_full_publish_at_dedup_expiry(self):
+        runner = self.runner()
+        receipt = self.publish(runner=runner, automatic=True)
+        count = len(runner.commands)
+        def build_new_snapshot_identity(**arguments):
+            manifest = self.builder(**arguments)
+            manifest["snapshot_id"] = "20260829T013000Z-" + manifest["databases"][0]["sha256"][:12]
+            self.write_manifest(arguments["output"], manifest)
+            return manifest
+        result = self.publish(runner=runner, automatic=True,
+            now=self.now + timedelta(seconds=publisher.AUTOMATIC_DEDUP_SECONDS),
+            builder=build_new_snapshot_identity)
+        self.assertGreater(len(runner.commands), count)
+        self.assertTrue(any(" install --bundle " in " " + " ".join(command) + " "
+            for command in runner.commands[count:]))
+        self.assertGreater(publisher._parse_iso(result["published_at"], label="renewal"),
+            publisher._parse_iso(receipt["published_at"], label="previous"))
+        self.assertNotIn("no_ssh_attempted", result)
+
+    def test_failed_hourly_renewal_does_not_refresh_success_time(self):
+        self.publish(automatic=True)
+        state_path = self.snapshot_root / publisher.AUTOMATIC_STATE_FILENAME
+        before = state_path.read_bytes()
+        receipt_path = self.snapshot_root / json.loads(before)["output_name"] / "publisher-receipt.json"
+        receipt_before = receipt_path.read_bytes()
+        with self.assertRaises(publisher.SnapshotPublishError):
+            self.publish(automatic=True, now=self.now + timedelta(hours=1), runner=self.runner(fail_install=True))
+        self.assertEqual(state_path.read_bytes(), before)
+        self.assertEqual(receipt_path.read_bytes(), receipt_before)
+
+    def test_malformed_success_time_cannot_refresh_or_shortcut_publication(self):
+        self.publish(automatic=True)
+        state_path = self.snapshot_root / publisher.AUTOMATIC_STATE_FILENAME
+        before = state_path.read_bytes()
+        receipt_path = self.snapshot_root / json.loads(before)["output_name"] / "publisher-receipt.json"
+        receipt = json.loads(receipt_path.read_text())
+        for malformed in ("not-a-time", "2026-08-29T01:00:00", None):
+            with self.subTest(published_at=malformed):
+                receipt["published_at"] = malformed
+                publisher._write_json_atomic(receipt_path, receipt)
+                runner = self.runner()
+                with self.assertRaises(publisher.SnapshotPublishError):
+                    self.publish(automatic=True, runner=runner,
+                        builder=lambda **_: self.fail("bad timestamp rebuilt"))
+                self.assertEqual(runner.commands, [])
+                self.assertEqual(state_path.read_bytes(), before)
+
+    def test_future_success_time_refuses_deduplication_and_publish(self):
+        self.publish(automatic=True, now=self.now + timedelta(minutes=30))
+        state_path = self.snapshot_root / publisher.AUTOMATIC_STATE_FILENAME
+        before = state_path.read_bytes()
+        runner = self.runner()
+        with self.assertRaisesRegex(publisher.SnapshotPublishError, "in the future"):
+            self.publish(automatic=True, runner=runner, builder=lambda **_: self.fail("future receipt rebuilt"))
+        self.assertEqual(runner.commands, [])
+        self.assertEqual(state_path.read_bytes(), before)
 
     def test_automatic_publish_recovers_state_from_success_receipt(self):
         runner = self.runner()
@@ -1164,6 +1228,91 @@ class MacOSSnapshotPublisherTest(unittest.TestCase):
         with self.assertRaises(publisher.SnapshotPublishError):
             self.publish(runner=self.runner(fail_install=True), automatic=True)
         self.assertLessEqual(len(list(self.snapshot_root.glob("snapshot-*"))), 3)
+
+    def test_repeated_failed_rebuilds_preserve_the_automatic_success_receipt(self):
+        self.publish(automatic=True)
+        state_path = self.snapshot_root / publisher.AUTOMATIC_STATE_FILENAME
+        original_state = state_path.read_bytes()
+        state = json.loads(original_state)
+        receipt_path = self.snapshot_root / state["output_name"] / "publisher-receipt.json"
+        original_receipt = receipt_path.read_bytes()
+
+        def fail_after_creating_bundle(**arguments):
+            Path(arguments["output"]).mkdir()
+            raise publisher.SnapshotPublishError("fixture transfer/build interrupted")
+
+        for hour in range(1, 5):
+            with patch.object(publisher, "_publication_fingerprint", side_effect=lambda _: object()):
+                with self.assertRaisesRegex(publisher.SnapshotPublishError, "fixture transfer/build"):
+                    self.publish(automatic=True, now=self.now + timedelta(hours=hour),
+                        builder=fail_after_creating_bundle)
+            self.assertEqual(receipt_path.read_bytes(), original_receipt)
+            self.assertEqual(state_path.read_bytes(), original_state)
+            self.assertLessEqual(len(list(self.snapshot_root.glob("snapshot-*"))), 3)
+
+        self.assertEqual(publisher._daily_automatic_success(self.snapshot_root, beijing_date=DAY), state)
+        self.publish(automatic=True, now=self.now + timedelta(hours=5))
+        self.assertTrue(self.last_runner.install_attempted)
+
+    def test_retention_preserves_both_success_and_pending_within_limit(self):
+        self.publish(automatic=True)
+        success = json.loads((self.snapshot_root / publisher.AUTOMATIC_STATE_FILENAME).read_text())
+        with patch.object(publisher, "_publication_fingerprint", side_effect=lambda _: object()):
+            with self.assertRaisesRegex(publisher.SnapshotPublishError, "temporarily unavailable"):
+                self.publish(automatic=True, now=self.now + timedelta(hours=1),
+                    runner=self.runner(fail_probe_after_install=True))
+        pending = publisher._read_pending_state(self.snapshot_root)
+        later = [f"snapshot-20260829T1{hour}0000Z" for hour in range(3)]
+        for name in later:
+            (self.snapshot_root / name).mkdir()
+
+        publisher._prune_local_snapshots(self.snapshot_root, retain_count=2)
+        self.assertEqual({path.name for path in self.snapshot_root.glob("snapshot-*") if path.is_dir()},
+            {success["output_name"], pending["output_name"]})
+        self.assertEqual(publisher._read_pending_state(self.snapshot_root), pending)
+        self.assertEqual(publisher._daily_automatic_success(self.snapshot_root, beijing_date=DAY), success)
+        before = sorted(path.name for path in self.snapshot_root.iterdir())
+        with self.assertRaisesRegex(publisher.SnapshotPublishError, "exceed the retention limit"):
+            publisher._prune_local_snapshots(self.snapshot_root, retain_count=1)
+        self.assertEqual(sorted(path.name for path in self.snapshot_root.iterdir()), before)
+
+    def test_finishing_older_resume_preserves_receipt_without_automatic_state(self):
+        receipt = self.publish(automatic=True)
+        state_path = self.snapshot_root / publisher.AUTOMATIC_STATE_FILENAME
+        state = json.loads(state_path.read_text())
+        state_path.unlink()
+        for hour in range(4):
+            (self.snapshot_root / f"snapshot-20260829T1{hour}0000Z").mkdir()
+        pending = {"output_name": state["output_name"], "receipt": receipt, "beijing_date": None}
+        result = publisher._finish_pending_publish(self.config(), pending)
+        self.assertEqual(result, receipt)
+        self.assertEqual(json.loads((self.snapshot_root / state["output_name"] / "publisher-receipt.json").read_text()), receipt)
+        self.assertEqual(len(list(self.snapshot_root.glob("snapshot-*"))), 3)
+
+    def test_retention_preserves_old_release_reference_without_authorizing_it(self):
+        self.publish(automatic=True)
+        state_path = self.snapshot_root / publisher.AUTOMATIC_STATE_FILENAME
+        state = json.loads(state_path.read_text())
+        state["runtime_identity"]["report_version"] = "previous-release-report"
+        publisher._write_json_atomic(state_path, state)
+        for hour in range(4):
+            (self.snapshot_root / f"snapshot-20260829T1{hour}0000Z").mkdir()
+        publisher._prune_local_snapshots(self.snapshot_root, retain_count=2)
+        self.assertTrue((self.snapshot_root / state["output_name"] / "publisher-receipt.json").is_file())
+        self.assertEqual(len(list(self.snapshot_root.glob("snapshot-*"))), 2)
+        with self.assertRaises(publisher.SnapshotPublishError):
+            publisher._daily_automatic_success(self.snapshot_root, beijing_date=DAY)
+
+    def test_unsafe_retention_reference_blocks_before_deleting_snapshots(self):
+        self.snapshot_root.mkdir()
+        names = [f"snapshot-2026081{day}T010000Z" for day in range(1, 6)]
+        for name in names:
+            (self.snapshot_root / name).mkdir()
+        publisher._write_json_atomic(self.snapshot_root / publisher.AUTOMATIC_STATE_FILENAME,
+            {"schema": publisher.AUTOMATIC_STATE_SCHEMA, "output_name": "../outside"})
+        with self.assertRaisesRegex(publisher.SnapshotPublishError, "retention reference is invalid"):
+            publisher._prune_local_snapshots(self.snapshot_root)
+        self.assertEqual(sorted(path.name for path in self.snapshot_root.glob("snapshot-*")), names)
 
     def test_resume_staged_snapshot_reuses_transport_and_seals_original_day(self):
         output, manifest, runner = self.staged_resume()
@@ -1540,6 +1689,71 @@ class MacOSSnapshotPublisherTest(unittest.TestCase):
         with self.assertRaisesRegex(publisher.SnapshotPublishError, "omits a hash-bound publication evidence"):
             self.publish(builder=bad, runner=runner)
         self.assertFalse(any(command[0] == "rsync" or "install -d" in " ".join(command) for command in runner.commands))
+
+    def _unchanged_artifact_capacity_runner(self, *, staging_headroom_bytes):
+        artifact = self.project / "data/cache/v8/capacity/unchanged.json"
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_bytes(b'{"payload":"' + b"x" * (8 * 1024 * 1024) + b'"}\n')
+        runner = self.runner()
+
+        def unchanged_remote(arguments, **kwargs):
+            if "statvfs" in " ".join(arguments):
+                output = next(self.snapshot_root.glob("snapshot-*"))
+                bundle_bytes = publisher._bundle_byte_size(output)
+                runner.free_bytes = (
+                    self.config().minimum_remote_free_bytes
+                    + 2 * bundle_bytes  # Independent staging and activation copies.
+                    + runner.database_backup_bytes
+                    + staging_headroom_bytes
+                )
+            result = runner(arguments, **kwargs)
+            if arguments[0] == "rsync" and "--dry-run" in arguments:
+                # No content changes or activation paths: unchanged files can
+                # still be materialized as independent incoming copies.
+                return subprocess.CompletedProcess(
+                    arguments, 0,
+                    stdout="Total transferred file size: 0 bytes\n", stderr="",
+                )
+            return result
+
+        return runner, unchanged_remote
+
+    def test_unchanged_artifacts_need_full_staging_space_before_transfer(self):
+        runner, boundary = self._unchanged_artifact_capacity_runner(
+            staging_headroom_bytes=4 * 1024 * 1024
+        )
+        with self.assertRaisesRegex(
+            publisher.SnapshotPublishError, "after rsync dry-run"
+        ):
+            self.publish(runner=boundary)
+        self.assertGreater(self.last_manifest["file_byte_size"], 8 * 1024 * 1024)
+        rsyncs = [command for command in runner.commands if command[0] == "rsync"]
+        self.assertEqual(len(rsyncs), 3)
+        self.assertTrue(all("--dry-run" in command for command in rsyncs))
+        self.assertFalse(runner.install_attempted)
+        self.assertFalse(any(" verify --bundle " in " ".join(command) for command in runner.commands))
+        self.assertFalse((self.snapshot_root / publisher.PENDING_STATE_FILENAME).exists())
+        self.assertFalse(list(self.snapshot_root.glob("snapshot-*/publisher-receipt.json")))
+
+    def test_unchanged_artifacts_publish_with_full_staging_space_and_zero_delta(self):
+        runner, boundary = self._unchanged_artifact_capacity_runner(
+            staging_headroom_bytes=16 * 1024 * 1024
+        )
+        receipt = self.publish(runner=boundary)
+        self.assertGreater(receipt["artifact_manifest_bytes"], 8 * 1024 * 1024)
+        self.assertEqual(
+            receipt["staging_bytes"],
+            receipt["artifact_manifest_bytes"] + receipt["bundle_bytes"],
+        )
+        self.assertEqual(receipt["install_headroom"]["artifact_activation_bytes"], 0)
+        for name in ("cache", "reports", "bundle", "transfer"):
+            self.assertEqual(receipt[f"rsync_dry_run_{name}_bytes"], 0)
+        self.assertEqual(sum(
+            command[0] == "rsync" and "--dry-run" not in command
+            for command in runner.commands
+        ), 3)
+        self.assertTrue(runner.install_attempted)
+        self.assertEqual(runner.active_snapshot_id, receipt["snapshot_id"])
 
     def test_manifest_space_gate_keeps_empty_staging_but_stops_before_real_rsync(self):
         runner = self.runner(free_bytes=self.config().minimum_remote_free_bytes)

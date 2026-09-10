@@ -72,6 +72,8 @@ def _fault_marker(state: Mapping[str, Any] | None) -> dict[str, Any] | None:
         "state_fingerprint": state.get("state_fingerprint"),
         "fault_class": state.get("fault_class"),
         "reason": state.get("reason"),
+        "cooldown": state.get("cooldown"),
+        "half_open": state.get("half_open"),
     }
 
 
@@ -216,9 +218,9 @@ class WorkReadinessPass:
             ),
         }
 
-    def _base_assessment(self, operation: str, category: str) -> dict[str, Any]:
+    def _base_assessment(self, operation: str, category: str, *, manual_scope: PaidScope | None = None) -> dict[str, Any]:
         key = (operation, category)
-        existing = self._base.get(key)
+        existing = self._base.get(key) if manual_scope is None else None
         if existing is not None:
             return existing
         unit_price = Decimal(PRICES_MICROUSD[operation]) / Decimal(1_000_000)
@@ -226,7 +228,7 @@ class WorkReadinessPass:
         try:
             reservation = check_reservation(
                 self.connection,
-                scope=PaidScope(category=category),
+                scope=manual_scope if manual_scope is not None else PaidScope(category=category),
                 operation=operation,
                 unit_price=unit_price,
                 currency="USD",
@@ -294,7 +296,8 @@ class WorkReadinessPass:
                     time_boundary=self.budget_day,
                 ),
             }
-        self._base[key] = result
+        if manual_scope is None:
+            self._base[key] = result
         return result
 
     def _unresolved_usage(self) -> dict[int, list[dict[str, Any]]]:
@@ -319,6 +322,14 @@ class WorkReadinessPass:
                     "paid_scope_identity": details.get("paid_scope_identity"),
                 }
             )
+        from .account_cleanup import archived_slot_holds
+
+        for slot_id, states in archived_slot_holds(self.connection).items():
+            for state, count in states.items():
+                values.setdefault(slot_id, []).append({
+                    "state": state, "archived_usage_count": count,
+                    "evidence_source": "account_cleanup_budget_daily",
+                })
         self._unresolved_by_slot = values
         return values
 
@@ -402,6 +413,7 @@ class WorkReadinessPass:
         identity_id: int | None = None,
         stage: str | None = None,
         window_key: str | None = None,
+        manual_command_run_id: int | None = None,
     ) -> dict[str, Any]:
         if operation not in PRICES_MICROUSD:
             raise ValueError("operation has no verified price")
@@ -444,7 +456,17 @@ class WorkReadinessPass:
                 window_key=window_key,
             )
             if selected is None:
-                base = self._base_assessment(operation, category)
+                manual_scope = None
+                if manual_command_run_id is not None:
+                    from .capture_manual import validate_command
+                    specification = validate_command(self.connection, manual_command_run_id,
+                        content_id=content_id, operation=operation, stage=stage)
+                    proof = specification.get("transport_retry") or {}
+                    manual_scope = PaidScope(category=category, content_id=content_id,
+                        account_id=resolved["account_id"], identity_id=resolved["identity_id"],
+                        manual_command_run_id=manual_command_run_id,
+                        paid_scope_identity=proof.get("paid_scope_identity"))
+                base = self._base_assessment(operation, category, manual_scope=manual_scope)
                 if not base["runnable"] and base["reason"] in _EARLY_BASE_BLOCKS:
                     selected = base
                 else:

@@ -14,7 +14,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Literal, Mapping, Optional
 from zoneinfo import ZoneInfo
 
-from . import capture_singletons, paid_drain, raw_archive, usage_settlements
+from . import capture_singletons, operation_recovery, paid_drain, raw_archive, usage_settlements
+from .capture_evidence_preflight import evidence_boundary, prepare_installed_evidence
 from .paid_dispatch import (
     TERMINAL_EVENTS,
     close_dispatch_not_sent_in_transaction,
@@ -72,7 +73,7 @@ BILLING_UNKNOWN_SLOT_MESSAGE = (
 
 
 def _schema20(connection: sqlite3.Connection) -> bool:
-    return connection.execute("PRAGMA user_version").fetchone()[0] == 20
+    return connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}
 
 
 class CaptureError(RuntimeError):
@@ -670,6 +671,9 @@ def clear_billing_unknown_slot_guard_if_resolved(
             (slot_id,),
         ).fetchone()[0]
     )
+    from .account_cleanup import archived_slot_holds
+
+    remaining += archived_slot_holds(connection).get(slot_id, {}).get("billing_unknown", 0)
     if remaining:
         return False, remaining
     paid_identities = {
@@ -1937,9 +1941,9 @@ def _claim_paid_tikhub(
     diagnostic_binding = current_diagnostic_request_binding()
     if budget_id is None:
         raise BudgetBlocked("TikHub network execution requires a verified budget")
-    with transaction_metrics_context(
+    with prepare_installed_evidence(db_path, enabled=diagnostic_binding is None), transaction_metrics_context(
         job_id="tikhub_paid_claim", operation=operation
-    ), connect(db_path) as connection, transaction(connection):
+    ), connect(db_path) as connection, transaction(connection), evidence_boundary(connection):
         claimed_at = now_utc()
         if diagnostic_binding is None:
             paid_drain.require_paid_dispatch_open(
@@ -2287,12 +2291,12 @@ def _mark_paid_sent(
 ) -> SlotClaim:
     try:
         scope = claim.dispatch_scope
-        with transaction_metrics_context(
+        with prepare_installed_evidence(db_path, enabled=claim.diagnostic_binding is None), transaction_metrics_context(
             job_id="tikhub_paid_send",
             scheduler_run_id=(scope.scheduler_run_id if scope else None),
             attempt_id=(scope.scheduler_attempt_id if scope else None),
             operation=operation,
-        ), connect(db_path) as connection, transaction(connection):
+        ), connect(db_path) as connection, transaction(connection), evidence_boundary(connection):
             sent_at = now_utc()
             diagnostic_dispatch = None
             if claim.diagnostic_binding is None:
@@ -2495,6 +2499,22 @@ def _mark_paid_sent(
                             identity=member_hash, sequence=claim.paid_sequence)
                 except usage_settlements.SettlementError as error:
                     raise PaidSendClaimHeld(str(error)) from error
+            operation_recovery.require_operation_lock(connection, operation=operation)
+            if claim.diagnostic_binding is None:
+                from .capture_manual import permits_transport_retry
+
+                # Explicit content retries retain the operation fault. Recheck
+                # their frozen command at B, under the same send lock, without
+                # taking the ordinary recovery owner that may close the fault.
+                # Once healthy, an unsent command needs no transport exception.
+                operation_fault = fault_state(connection, scope_kind="operation", operation=operation)
+                explicit_retry = (scope.category == "metrics" and (operation_fault or {}).get("open") is True
+                    and permits_transport_retry(connection, scope=scope, operation=operation, at=sent_at))
+                if not explicit_retry:
+                    assert claim.reserved_usage_id is not None and claim.paid_scope_identity is not None
+                    operation_recovery.claim_operation_probe(connection, operation=operation,
+                        usage_id=claim.reserved_usage_id, identity=claim.paid_scope_identity,
+                        sequence=claim.paid_sequence, at=sent_at)
             send_claim = claim_paid_send(
                 db_path.parent / "paid_send_claims",
                 paid_scope_identity=claim.paid_scope_identity,
@@ -2644,7 +2664,10 @@ def _execute_claimed_fetch(
         raise BudgetBlocked("TikHub network calls require a frozen paid claim")
     # Waiting owns no SQLite connection/transaction. All live checks in
     # _mark_paid_sent run after the shared network permit has been obtained.
-    with TIKHUB_NETWORK_SLOTS if paid else nullcontext():
+    with (TIKHUB_NETWORK_SLOTS if paid else nullcontext()), (
+        operation_recovery.operation_probe_lock(db_path=db_path, operation=operation)
+        if paid else nullcontext()
+    ):
         if local_result is not None:
             def local_call() -> ProviderResult:
                 assert local_result is not None
@@ -2827,6 +2850,9 @@ def _execute_claimed_fetch_in_slot(
                     raw_response_id=raw_id,
                     reason=None if owns_slot else "attempt_owner_lost",
                 )
+            if claim.dispatch_scope is not None and usage_id is not None:
+                operation_recovery.finish_operation_probe(connection, operation=operation,
+                    usage_id=usage_id, succeeded=owns_slot, at=finished_at, raw_response_id=raw_id)
             connection.execute(
                 """
                 UPDATE fetch_attempts
@@ -3079,6 +3105,7 @@ def _execute_claimed_fetch_in_slot(
                         connection,
                         operation=operation,
                         at=finished_at,
+                        actual_failure_usage_id=usage_id,
                     )
             if (
                 claim.dispatch_scope is not None
@@ -3089,6 +3116,9 @@ def _execute_claimed_fetch_in_slot(
                     connection, usage_id=usage_id, succeeded=False, at=finished_at,
                     reason=failure.error_code,
                 )
+            if claim.dispatch_scope is not None and usage_id is not None:
+                operation_recovery.finish_operation_probe(connection, operation=operation,
+                    usage_id=usage_id, succeeded=False, at=finished_at)
             next_status = "retryable_failed" if failure.retryable else "terminal_failed"
             connection.execute(
                 """

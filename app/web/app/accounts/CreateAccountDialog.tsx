@@ -2,6 +2,7 @@
 
 import { useRef, useState, type FormEvent } from "react";
 import { jsonRequest, readJson } from "../lib/api";
+import { accountGroupOptions, businessDirectionOptions } from "../lib/accountClassification";
 import styles from "./accounts.module.css";
 
 type CreateAccountStatus = "daily" | "weekly" | "paused";
@@ -24,6 +25,8 @@ export default function CreateAccountDialog({ accountManagementVersion, onClose,
   const [profileUrl, setProfileUrl] = useState("");
   const [phone, setPhone] = useState("");
   const [operatorName, setOperatorName] = useState("");
+  const [accountGroup, setAccountGroup] = useState("unknown");
+  const [businessDirection, setBusinessDirection] = useState("unknown");
   const [accountStatus, setAccountStatus] = useState<CreateAccountStatus | "">("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
@@ -47,6 +50,7 @@ export default function CreateAccountDialog({ accountManagementVersion, onClose,
     const body = {
       profile_url: profileUrl.trim(), phone: phone.trim(),
       operator_name: operatorName.trim(), account_status: accountStatus,
+      account_group: accountGroup, business_direction: businessDirection,
     };
     const intent = JSON.stringify(body);
     if (request.current?.intent !== intent) request.current = { intent, id: crypto.randomUUID() };
@@ -75,10 +79,12 @@ export default function CreateAccountDialog({ accountManagementVersion, onClose,
           <label>主页链接（必填）<input type="url" name="profile_url" required autoFocus value={profileUrl} disabled={saving} placeholder="粘贴抖音或小红书主页链接" aria-describedby="create-account-platforms" onChange={(event) => setProfileUrl(event.target.value)} /><span id="create-account-platforms" className={styles.statusHelp}>支持抖音、小红书；视频号、快手暂不支持采集。</span></label>
           <label>手机号（可留空）<input type="tel" name="phone" value={phone} disabled={saving} onChange={(event) => setPhone(event.target.value)} /></label>
           <label>运营人员（可留空）<input name="operator_name" value={operatorName} disabled={saving} onChange={(event) => setOperatorName(event.target.value)} /></label>
-          <label>账号状态（必选）<select name="account_status" required value={accountStatus} disabled={saving} aria-describedby="create-account-status-help" onChange={(event) => setAccountStatus(event.target.value as CreateAccountStatus | "")}><option value="" disabled>请选择账号状态</option><option value="daily">日更</option><option value="weekly">周更</option><option value="paused">暂停</option></select><span id="create-account-status-help" className={styles.statusHelp}>日更、周更只标注作品更新频率，采集规则不变。</span></label>
+          <label>账号分组<select name="account_group" value={accountGroup} disabled={saving} onChange={(event) => setAccountGroup(event.target.value)}>{accountGroupOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+          <label>业务方向<select name="business_direction" value={businessDirection} disabled={saving} onChange={(event) => setBusinessDirection(event.target.value)}>{businessDirectionOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+          <label>账号状态（必选）<select name="account_status" required value={accountStatus} disabled={saving} aria-describedby="create-account-status-help" onChange={(event) => setAccountStatus(event.target.value as CreateAccountStatus | "")}><option value="" disabled>请选择账号状态</option><option value="daily">日更</option><option value="weekly">周更</option><option value="paused">暂停</option></select><span id="create-account-status-help" className={styles.statusHelp}>日更、周更只标注作品更新频率。</span></label>
         </div>
         <p className={styles.statusHelp}>已有账号的手机号、运营人员留空时保留原信息。</p>
-        {accountStatus === "paused" && <p role="status">账号将保存为暂停，不加入当前生效名单，不采集，也不进入统计。</p>}
+        {accountStatus === "paused" && <p role="status">账号将保存为暂停，只停止自动采集，历史内容和数据保留。</p>}
         {!available && <p role="status">{unavailableMessage}</p>}
         {error && <p role="alert">{error}</p>}
         <div className="modal-actions"><button className="secondary" type="button" disabled={saving} onClick={onClose}>取消</button><button className="primary" type="submit" disabled={saving || !available}>{saving ? "正在识别账号…" : "添加账号"}</button></div>

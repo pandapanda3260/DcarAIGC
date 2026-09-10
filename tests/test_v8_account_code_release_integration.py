@@ -17,7 +17,7 @@ from v8 import capture_release as release
 
 ROOT = Path(__file__).resolve().parents[1]
 SEALER = original.sealer
-ACCOUNT_CRITICAL = tuple(SEALER.V20_ACCOUNT_CRITICAL_FILES)
+ACCOUNT_CRITICAL = tuple(SEALER.V20_CRITICAL_FILES)
 
 
 def file_sha(path):
@@ -114,7 +114,6 @@ class AccountReleaseIntegrationTest(unittest.TestCase):
             )
             with (
                 patch.object(account, "PARENT_BUILD_SHA256", file_sha(runtime_build)),
-                patch.object(account, "HISTORICAL_MODULE_SHA256", hashlib.sha256(account._LOADED_SOURCE).hexdigest()),
                 patch.object(
                     account,
                     "SOURCE_TRANSITIONS",

@@ -7,8 +7,10 @@ import hashlib
 import html
 import json
 import os
+import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import tempfile
 import unicodedata
@@ -18,7 +20,9 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
+from xml.etree import ElementTree
 
+from .account_classification import ACCOUNT_GROUPS, BUSINESS_DIRECTIONS
 from .audience_classifier import EVIDENCE_WINDOW_DAYS
 from .audience_rate import active_classifier_state, build_channel_audience_rates
 from .contracts import (
@@ -64,7 +68,7 @@ TASK_TYPES = {"daily", "weekly", "custom"}
 RUNNABLE_STATUSES = {"queued", "partial", "failed", "interrupted"}
 IMPLICIT_RUN_STATUSES = {"queued", "failed", "interrupted"}
 _REPORT_ID_BATCH_SIZE = 500
-_REPORT_SCHEMA_VERSIONS = frozenset({19, 20})
+_REPORT_SCHEMA_VERSIONS = frozenset({19, 20, 21})
 
 _QUALITY_GATE_LABELS = {
     "discovery_coverage": "账号采集完成率",
@@ -1223,6 +1227,15 @@ def _report_scan_coverage(
     )
 
 
+def _frozen_content_direction(content: Mapping[str, Any], evaluation: Mapping[str, Any] | None,
+                              *, new_classification: bool) -> str:
+    """Preserve only the old account fallback already sealed inside an old scope."""
+    direction = effective_direction({**content, "evaluation_content_direction": None}, evaluation)
+    if not new_classification and direction == "unknown":
+        return effective_direction({"manual_content_direction": content.get("account_content_direction")}, None)
+    return direction
+
+
 def _assemble_report_data(connection, task: Mapping[str, Any], *, release: Mapping[str, Any], revision: int,
                           generated_at: str, files: List[Dict[str, Any]]) -> Dict[str, Any]:
     taxonomy = connection.execute(
@@ -1236,6 +1249,8 @@ def _assemble_report_data(connection, task: Mapping[str, Any], *, release: Mappi
         raise ReportTaskError("report scope must be frozen before assembly")
     content_rows = scope_event["payload"]["contents"]
     contents = [dict(row) for row in content_rows]
+    new_classification = (scope_event["payload"].get("account_classification_version")
+                          == report_inputs.ACCOUNT_CLASSIFICATION_VERSION)
     ids = [int(row["id"]) for row in content_rows]
     collection_cutoff_at = _collection_cutoff_at(task, generated_at=generated_at)
     snapshots = _latest_metric_observations_at(
@@ -1281,9 +1296,8 @@ def _assemble_report_data(connection, task: Mapping[str, Any], *, release: Mappi
     }
     for content in contents:
         content_id = int(content["id"])
-        formal_content = {**content, "evaluation_content_direction": None}
-        content["resolved_direction"] = effective_direction(
-            formal_content, eligible_evaluations.get(content_id)
+        content["resolved_direction"] = _frozen_content_direction(
+            content, eligible_evaluations.get(content_id), new_classification=new_classification
         )
     total = len(contents)
     eval_ready = len(eligible_evaluations)
@@ -1630,10 +1644,11 @@ def _assemble_report_data(connection, task: Mapping[str, Any], *, release: Mappi
                 "title": content["title"],
                 "account_uid": content["raw_account_uid"],
                 "account_name": content["raw_account_name"],
-                "account_type": content["account_type"],
-                "content_direction": evaluation["content_direction"]
-                if evaluation
-                else content["resolved_direction"],
+                **({"account_group": content["account_group"],
+                    "business_direction": content["business_direction"]}
+                   if new_classification else {"account_type": content["account_type"]}),
+                "content_direction": (evaluation["content_direction"]
+                                      if evaluation and not new_classification else content["resolved_direction"]),
                 "evidence_level": evaluation["evidence_level"] if evaluation else None,
                 "primary_selling_point_code": evaluation["primary_selling_point_code"]
                 if evaluation
@@ -1669,6 +1684,8 @@ def _assemble_report_data(connection, task: Mapping[str, Any], *, release: Mappi
             "revision": revision,
             "generated_at": generated_at,
             "collection_cutoff_at": collection_cutoff_at,
+            **({"account_classification_version": report_inputs.ACCOUNT_CLASSIFICATION_VERSION}
+               if new_classification else {}),
         },
         "scope": {
             "period_start": f"{task['period_start']}T00:00:00+08:00",
@@ -1756,9 +1773,15 @@ def _assemble_report_data(connection, task: Mapping[str, Any], *, release: Mappi
         "platform_dimensions": _dimension(
             (str(row["platform"]) for row in contents), total
         ),
-        "account_type_dimensions": _dimension(
-            (str(row["account_type"]) for row in contents), total
-        ),
+        **({
+            "account_group_dimensions": _dimension(
+                (str(row["account_group"]) for row in contents), total),
+            "business_direction_dimensions": _dimension(
+                (str(row["business_direction"]) for row in contents), total),
+        } if new_classification else {
+            "account_type_dimensions": _dimension(
+                (str(row["account_type"]) for row in contents), total),
+        }),
         "content_direction_dimensions": _dimension(
             (str(row["resolved_direction"]) for row in contents),
             total,
@@ -2210,11 +2233,17 @@ def render_summary_svg(report: Mapping[str, Any]) -> str:
     major_percentage = _svg_percentage(major["percentage"])
     minor_percentage = _svg_percentage(minor["percentage"])
 
-    account_types = _svg_dimensions(report, "account_type_dimensions")
-    account_order = ("mixed_edit", "original", "boutique_ip", "unknown")
+    new_classification = metadata.get("account_classification_version") == report_inputs.ACCOUNT_CLASSIFICATION_VERSION
+    account_types = _svg_dimensions(report, "account_group_dimensions" if new_classification else "account_type_dimensions")
+    account_order = ("mixed_edit", "innovation", "image_text", "boutique_ip", "unknown") if new_classification else ("mixed_edit", "original", "boutique_ip", "unknown")
+    account_labels = ACCOUNT_GROUPS if new_classification else _SVG_ACCOUNT_TYPE_LABELS
+    account_heading = "账号分组构成" if new_classification else "账号类型构成"
+    account_footnote = "按发布内容统计账号分组占比" if new_classification else "按发布内容统计账号类型占比"
     account_colors = {
         "mixed_edit": "#2db8ad",
         "original": "#ffcd32",
+        "innovation": "#ffcd32",
+        "image_text": "#66aee9",
         "boutique_ip": "#8ddcd5",
         "unknown": "#84969b",
     }
@@ -2231,11 +2260,11 @@ def render_summary_svg(report: Mapping[str, Any]) -> str:
                 f'height="42" fill="{account_colors[key]}"/>'
             )
             segment_x += width
-        y = 326 + index * 56
+        y = 326 + index * (43 if new_classification else 56)
         account_legend.append(
             f'<circle cx="428" cy="{y - 6}" r="7" fill="{account_colors[key]}"/>'
             f'<text class="t" x="446" y="{y}" font-size="17">'
-            f'{_SVG_ACCOUNT_TYPE_LABELS[key]}</text>'
+            f'{account_labels[key]}</text>'
             f'<text class="num" x="738" y="{y}" font-size="19" '
             f'text-anchor="end" fill="{account_colors[key]}">{percentage:.2f}%</text>'
         )
@@ -2403,8 +2432,30 @@ def render_summary_svg(report: Mapping[str, Any]) -> str:
         active_accounts, large=29, medium=24, small=19
     )
 
-    return f"""<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="675" viewBox="0 0 1200 675">
-<rect width="1200" height="675" fill="#102c35"/>
+    business_panel = ""
+    if new_classification:
+        business_dimensions = _svg_dimensions(report, "business_direction_dimensions")
+        business_cards: List[str] = []
+        for index, key in enumerate(("new_car", "used_car_c1", "used_car_c2", "ai_xiaodong", "unknown")):
+            x = 40 + index * 226
+            value = business_dimensions.get(key, {"count": 0, "percentage": 0})
+            percentage = _svg_percentage(value["percentage"])
+            business_cards.append(
+                f'<rect x="{x}" y="661" width="208" height="75" rx="10" fill="#173b45"/>'
+                f'<text class="t" x="{x + 15}" y="686" font-size="15">{BUSINESS_DIRECTIONS[key]}</text>'
+                f'<text class="num" x="{x + 15}" y="718" font-size="21" fill="#2db8ad">{percentage:.2f}%</text>'
+                f'<text class="m" x="{x + 192}" y="717" font-size="13" text-anchor="end">{value["count"]:,} 条</text>'
+            )
+        business_panel = ('<line x1="40" y1="620" x2="1160" y2="620" stroke="#31505a"/>'
+                          '<text class="t" x="40" y="647" font-size="18" font-weight="700">业务方向</text>'
+                          '<text class="m" x="1160" y="647" font-size="12" text-anchor="end">按发布账号的业务归属统计内容</text>'
+                          + ''.join(business_cards))
+    canvas_height = 815 if new_classification else 675
+    footer_line_y = 760 if new_classification else 620
+    footer_text_y = 791 if new_classification else 651
+    content_direction_heading = "作品内容方向" if new_classification else "内容方向"
+    return f"""<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="{canvas_height}" viewBox="0 0 1200 {canvas_height}">
+<rect width="1200" height="{canvas_height}" fill="#102c35"/>
 <style>
 .font{{font-family:Arial,'PingFang SC','Microsoft YaHei',sans-serif}}
 .t{{font-family:Arial,'PingFang SC','Microsoft YaHei',sans-serif;fill:#f7f8f5}}
@@ -2441,15 +2492,15 @@ def render_summary_svg(report: Mapping[str, Any]) -> str:
 <text class="m" x="40" y="552" font-size="12">结构分布仅描述本报告已纳入内容</text>
 
 <line x1="390" y1="190" x2="390" y2="594" stroke="#31505a"/>
-<text class="t" x="415" y="204" font-size="18" font-weight="700">账号类型构成</text>
+<text class="t" x="415" y="204" font-size="18" font-weight="700">{account_heading}</text>
 <rect x="415" y="236" width="330" height="42" rx="8" fill="#294a53"/>
 <clipPath id="account-stack"><rect x="415" y="236" width="330" height="42" rx="8"/></clipPath>
 <g clip-path="url(#account-stack)">{''.join(account_segments)}</g>
 {''.join(account_legend)}
-<text class="m" x="415" y="552" font-size="12">按发布内容统计账号类型占比</text>
+<text class="m" x="415" y="552" font-size="12">{account_footnote}</text>
 
 <line x1="765" y1="190" x2="765" y2="594" stroke="#31505a"/>
-<text class="t" x="790" y="204" font-size="18" font-weight="700">内容方向</text>
+<text class="t" x="790" y="204" font-size="18" font-weight="700">{content_direction_heading}</text>
 {''.join(direction_rows)}
 <line x1="790" y1="458" x2="1160" y2="458" stroke="#31505a"/>
 <text class="t" x="790" y="480" font-size="17" font-weight="700">数据完整度 · {threshold_label}</text>
@@ -2458,14 +2509,16 @@ def render_summary_svg(report: Mapping[str, Any]) -> str:
 {''.join(quality_cells)}
 <text class="m" x="975" y="610" font-size="11" text-anchor="middle">{effect_boundary}</text>
 
-<line x1="40" y1="620" x2="1160" y2="620" stroke="#31505a"/>
-<text class="m" x="40" y="651" font-size="13">报告周期 {period_days} 天 · {period_label}</text>
-<text class="m" x="1160" y="651" font-size="13" text-anchor="end">数据统计至 {cutoff_label} · {timezone_label}</text>
+{business_panel}
+<line x1="40" y1="{footer_line_y}" x2="1160" y2="{footer_line_y}" stroke="#31505a"/>
+<text class="m" x="40" y="{footer_text_y}" font-size="13">报告周期 {period_days} 天 · {period_label}</text>
+<text class="m" x="1160" y="{footer_text_y}" font-size="13" text-anchor="end">数据统计至 {cutoff_label} · {timezone_label}</text>
 </svg>
 """
 
 
-def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]], *,
+               new_classification: bool = False) -> None:
     fields = [
         "content_id",
         "platform_content_id",
@@ -2477,7 +2530,7 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         "title",
         "account_uid",
         "account_name",
-        "account_type",
+        *(["account_group", "business_direction"] if new_classification else ["account_type"]),
         "content_direction",
         "evidence_level",
         "primary_selling_point_code",
@@ -2632,8 +2685,8 @@ def _write_channel_csv(path: Path, channels: Mapping[str, Any]) -> None:
         writer.writerows(rows)
 
 
-def _valid_summary_png(path: Path) -> bool:
-    """Reject square Quick Look thumbnails that crop the 1200x675 report SVG."""
+def _valid_summary_png(path: Path, *, expected_height: int = 675) -> bool:
+    """Reject thumbnails that crop either supported report layout."""
 
     try:
         payload = path.read_bytes()
@@ -2644,7 +2697,7 @@ def _valid_summary_png(path: Path) -> bool:
         len(header) == 24
         and header[:8] == b"\x89PNG\r\n\x1a\n"
         and int.from_bytes(header[16:20], "big") == 1200
-        and int.from_bytes(header[20:24], "big") == 675
+        and int.from_bytes(header[20:24], "big") == expected_height
         and len(payload) > 1024
     )
 
@@ -2657,6 +2710,13 @@ def render_summary_png(svg_path: Path, png_path: Path) -> bool:
     the lossless image artifact instead of publishing a malformed PNG.
     """
 
+    try:
+        svg = ElementTree.fromstring(svg_path.read_text(encoding="utf-8"))
+        expected_height = int(svg.attrib["height"])
+        if int(svg.attrib["width"]) != 1200 or expected_height not in {675, 815}:
+            return False
+    except (OSError, KeyError, ValueError, ElementTree.ParseError):
+        return False
     commands = []
     if renderer := shutil.which("sips"):
         commands.append(
@@ -2680,7 +2740,7 @@ def render_summary_png(svg_path: Path, png_path: Path) -> bool:
             )
         except (OSError, subprocess.TimeoutExpired):
             continue
-        if result.returncode == 0 and _valid_summary_png(png_path):
+        if result.returncode == 0 and _valid_summary_png(png_path, expected_height=expected_height):
             return True
     png_path.unlink(missing_ok=True)
     return False
@@ -2715,6 +2775,76 @@ def _resolve_reports_root(reports_root: Path) -> Path:
     if not relative.parts:
         raise ReportTaskError("reports_root must be a directory below PROJECT_ROOT")
     return candidate
+
+
+def _report_directory_identity(path: Path) -> tuple[int, int]:
+    metadata = path.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or path.resolve() != path:
+        raise ReportTaskError(f"unsafe report directory or symlink: {path}")
+    return metadata.st_dev, metadata.st_ino
+
+
+def _reserve_report_revision(
+    reports_root: Path, task_id: str, minimum_revision: int
+) -> tuple[int, Path, Path, tuple[int, int]]:
+    """Preserve disk-only evidence and atomically reserve an unused revision."""
+    root = _resolve_reports_root(reports_root)
+    if not task_id or Path(task_id).name != task_id or task_id in {".", ".."}:
+        raise ReportTaskError(f"task report path must stay within reports_root: {task_id}")
+    parent = root / task_id
+    if parent.is_symlink():
+        raise ReportTaskError(f"unsafe report task directory symlink: {parent}")
+    parent.mkdir(parents=True, exist_ok=True)
+    _report_directory_identity(parent)
+    revision = minimum_revision
+    for entry in parent.iterdir():
+        match = re.fullmatch(r"(?:revision_(\d{3,})|\.revision_(\d{3,})\.reserved)", entry.name)
+        if match:
+            _report_directory_identity(entry)
+            revision = max(revision, int(match.group(1) or match.group(2)) + 1)
+    while True:
+        if revision > 2**63 - 1:
+            raise ReportTaskError("report revision number exceeds SQLite integer range")
+        target = parent / f"revision_{revision:03d}"
+        reservation = parent / f".revision_{revision:03d}.reserved"
+        try:
+            reservation.mkdir(mode=0o700)
+        except FileExistsError:
+            _report_directory_identity(reservation)
+            revision += 1
+            continue
+        return revision, target, reservation, _report_directory_identity(reservation)
+
+
+def _publish_report_directory(temporary: Path, target: Path) -> tuple[int, int]:
+    """Install the complete revision in one rename, never replacing a collision."""
+    from .media import _ResponseTargetCollisionError, _rename_exclusive_at
+
+    if temporary.parent != target.parent:
+        raise ReportTaskError("report staging and target parents differ")
+    parent_identity = _report_directory_identity(target.parent)
+    source_identity = _report_directory_identity(temporary)
+    descriptor = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != parent_identity:
+            raise ReportTaskError("report parent directory changed before publication")
+        try:
+            _rename_exclusive_at(descriptor, temporary.name, target.name)
+        except _ResponseTargetCollisionError as exc:
+            raise ReportTaskError(f"immutable revision directory already exists: {target}") from exc
+        if _report_directory_identity(target) != source_identity:
+            raise ReportTaskError("report directory identity changed during publication")
+    finally:
+        os.close(descriptor)
+    return source_identity
+
+
+def _owned_report_directory(path: Path, identity: Optional[tuple[int, int]]) -> bool:
+    try:
+        return identity is not None and _report_directory_identity(path) == identity
+    except (OSError, ReportTaskError):
+        return False
 
 
 def _record_task_failure(
@@ -2794,6 +2924,9 @@ def run_task(
         release_value = assert_report_runtime_ready(connection)
     temporary: Optional[Path] = None
     target: Optional[Path] = None
+    target_identity: Optional[tuple[int, int]] = None
+    reservation: Optional[Path] = None
+    reservation_identity: Optional[tuple[int, int]] = None
     target_created_by_run = False
     owns_run = False
     try:
@@ -2815,6 +2948,9 @@ def run_task(
                     (task_id,),
                 ).fetchone()[0]
             )
+            revision, target, reservation, reservation_identity = _reserve_report_revision(
+                reports_root, task_id, revision
+            )
             started_at = now_utc()
             connection.execute(
                 """
@@ -2833,21 +2969,6 @@ def run_task(
             )
             task_value = dict(task)
 
-        resolved_reports_root = _resolve_reports_root(reports_root)
-        target = (
-            resolved_reports_root / task_id / f"revision_{revision:03d}"
-        ).resolve()
-        try:
-            target.relative_to(resolved_reports_root)
-        except ValueError as exc:
-            raise ReportTaskError(
-                f"task report path must stay within reports_root: {task_id}"
-            ) from exc
-        if target.exists():
-            raise ReportTaskError(
-                f"immutable revision directory already exists: {target}"
-            )
-        target.parent.mkdir(parents=True, exist_ok=True)
         temporary = Path(tempfile.mkdtemp(prefix=f".{target.name}-", dir=target.parent))
         final_paths = {
             "report-json": target / "report.json",
@@ -2945,7 +3066,11 @@ def run_task(
         temp_paths = {kind: temporary / path.name for kind, path in final_paths.items()}
         temp_paths["report-markdown"].write_text(_markdown(report), encoding="utf-8")
         temp_paths["content-csv"].parent.mkdir(parents=True, exist_ok=True)
-        _write_csv(temp_paths["content-csv"], report["content_details"])
+        _write_csv(
+            temp_paths["content-csv"], report["content_details"],
+            new_classification=(report["metadata"].get("account_classification_version")
+                                == report_inputs.ACCOUNT_CLASSIFICATION_VERSION),
+        )
         _write_channel_csv(temp_paths["channel-csv"], report["channels"])
         temp_paths["summary-svg"].write_text(
             render_summary_svg(report), encoding="utf-8"
@@ -2979,11 +3104,7 @@ def run_task(
         )
         if _acknowledge_cancel(task_id, db_path=db_path):
             raise TaskCancelled("任务已在写入 revision 前取消")
-        if target.exists():
-            raise ReportTaskError(
-                f"immutable revision directory already exists: {target}"
-            )
-        os.replace(temporary, target)
+        target_identity = _publish_report_directory(temporary, target)
         target_created_by_run = True
         available_paths = {
             kind: path for kind, path in final_paths.items() if path.is_file()
@@ -3068,14 +3189,14 @@ def run_task(
     except TaskCancelled:
         if temporary is not None and temporary.exists():
             shutil.rmtree(temporary)
-        if target_created_by_run and target is not None and target.exists():
+        if target_created_by_run and target is not None and _owned_report_directory(target, target_identity):
             shutil.rmtree(target)
         _acknowledge_cancel(task_id, db_path=db_path)
         raise
     except Exception as exc:
         if temporary is not None and temporary.exists():
             shutil.rmtree(temporary)
-        if target_created_by_run and target is not None and target.exists():
+        if target_created_by_run and target is not None and _owned_report_directory(target, target_identity):
             revision_registered = True
             try:
                 with connect(db_path) as connection:
@@ -3097,6 +3218,13 @@ def run_task(
         if owns_run:
             _record_task_failure(task_id, exc, db_path=db_path)
         raise
+    finally:
+        if reservation is not None and _owned_report_directory(reservation, reservation_identity):
+            try:
+                reservation.rmdir()
+            except OSError:
+                # Leave changed/nonempty reservations as evidence for the next attempt.
+                pass
 
 
 def create_and_run_task(

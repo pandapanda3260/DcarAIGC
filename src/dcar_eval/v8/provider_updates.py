@@ -7,6 +7,7 @@ text/media or rerunning analysis. Each route has a separate cycle-scoped slot.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable, Collection, Mapping
 from zoneinfo import ZoneInfo
@@ -47,9 +48,37 @@ def refresh_content_metrics(
     task_max_amount: float | None = None,
     call_override: Callable[[str, Mapping[str, Any]], ProviderResult] | None = None,
     allowed_groups: Collection[str] | None = None,
+    manual_command_run_id: int | None = None,
 ) -> dict[str, Any]:
-    """Reuse all fresh fields; buy at most one success per fixed route/cycle."""
+    """Reuse fresh fields; an explicit command grants only its frozen targets."""
     timestamp = at or now_utc()
+    if manual_command_run_id is not None:
+        from . import capture_manual
+
+        with connect(db_path) as connection:
+            specification = capture_manual.validate_command(
+                connection, manual_command_run_id, content_id=content_id,
+            )
+        if (specification.get("kind") != "metrics_update"
+                or not isinstance(specification.get("cycle_key"), str)
+                or not specification["cycle_key"].strip()):
+            raise providers.ProviderConfigurationError(
+                "direct metric refresh requires a metrics_update command with a frozen cycle"
+            )
+        for name, supplied in (("task_id", task_id), ("task_max_amount", task_max_amount),
+                               ("cycle_key", cycle_key)):
+            frozen = specification.get(name)
+            if supplied is not None and frozen is not None and supplied != frozen:
+                raise providers.ProviderConfigurationError("manual command " + name + " conflicts with frozen scope")
+        task_id = specification["task_id"]
+        task_max_amount = specification["task_max_amount"]
+        cycle_key = specification.get("cycle_key") or cycle_key
+        command_groups = set(specification["allowed_groups"])
+        if allowed_groups is not None:
+            if isinstance(allowed_groups, (str, bytes)) or not set(allowed_groups) <= command_groups:
+                raise providers.ProviderConfigurationError("metric groups exceed manual command scope")
+        else:
+            allowed_groups = command_groups
     if task_id is None and task_max_amount is None:
         task_id = "matrix-metrics:" + parse_time(timestamp).astimezone(BEIJING).date().isoformat()
         task_max_amount = DEFAULT_TASK_MAX_AMOUNT_USD
@@ -96,6 +125,10 @@ def refresh_content_metrics(
             continue
         provider, adapter, operation, price = providers.STAGE_CONFIG[(platform, source_stage)]
         window = f"{cycle}:{group}"
+        if manual_command_run_id is not None:
+            with connect(db_path) as connection:
+                capture_manual.validate_command(connection, manual_command_run_id,
+                    content_id=content_id, operation=operation, stage="metrics")
 
         def parse(raw: Any, http_status: int) -> ProviderResult:
             parsed = (providers._parse_douyin_stage_payload(source_stage, content["platform_content_id"], raw, status=http_status)
@@ -156,10 +189,19 @@ def refresh_content_metrics(
             outcome = providers.CaptureOutcome(stored.slot_id, 0, stored.raw_response_id, parsed.data, False, 0.0, "USD")
             replayed = True
         except SlotUnavailable:
+            route_context = nullcontext()
+            if manual_command_run_id is not None:
+                from . import capture_planning
+
+                with connect(db_path) as connection, transaction(connection):
+                    assignment = capture_manual.assignment_for_command(connection,
+                        manual_command_run_id, content_id=content_id, operation=operation,
+                        at=timestamp, create=True)
+                route_context = capture_planning.execution_route_context(assignment["id"])
             budget_id = providers._budget_for_call(provider=provider, operation=operation, price=price,
                                                   task_id=task_id, task_max_amount=task_max_amount, db_path=db_path)
             # A surrounding history scope is retained by paid_scope.
-            with paid_scope("metrics"):
+            with route_context, paid_scope("metrics", manual_command_run_id=manual_command_run_id):
                 platform_content_id = str(content["platform_content_id"])
                 if platform == "douyin":
                     _, request_params = providers._douyin_request(
@@ -240,9 +282,14 @@ def refresh_account_profile(
                     "roster_activation_required",
                     "Account profile refresh requires an effective activation",
                 )
-        member = require_active_member(
-            connection, identity_id, activation=activation
-        )
+        from .provider_budget import _SCOPE
+        current_scope = _SCOPE.get()
+        if current_scope.catalog_plan_id is not None:
+            from .account_catalog_capture import validate_plan_member
+            member = validate_plan_member(connection, current_scope.catalog_plan_id, identity_id,
+                at=timestamp, use_planning_cache=False)
+        else:
+            member = require_active_member(connection, identity_id, activation=activation)
         current = select_account_metrics(connection, [identity_id], cutoff_at=timestamp)[identity_id]
     if member["platform"] != "douyin":
         return {"identity_id": identity_id, "status": "skipped", "reason": "profile_contract_not_enabled", "provider_cost": 0.0}

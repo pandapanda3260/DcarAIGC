@@ -817,7 +817,7 @@ def _prepare(
     from .profile_control import CONTROL_CONTRACT, _next_midnight
 
     _require(
-        connection.execute("PRAGMA user_version").fetchone()[0] == 20,
+        connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21},
         "当前数据库不支持名单资格继承",
     )
     evidence = release._installed_evidence(connection, at=timestamp)

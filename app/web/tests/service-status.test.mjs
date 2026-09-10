@@ -14,15 +14,32 @@ const snapshot = {
 };
 
 test("service status does not claim healthy before the first response", () => {
-  assert.equal(dataServiceStatus(undefined, false).kind, "checking");
+  assert.deepEqual(dataServiceStatus(undefined, false), { kind: null, label: "", description: "" });
+});
+
+test("operational conditions share exactly three public labels while keeping their reasons", () => {
+  const conditions = [
+    healthy,
+    { ...healthy, read_only: true, snapshot_sync: snapshot },
+    { ...healthy, read_only: true, snapshot_sync: { ...snapshot, status: "delayed" } },
+    { ...healthy, read_only: true, snapshot_sync: null },
+    { ...healthy, data_freshness: { status: "stale" } },
+    { status: "unavailable", read_only: false },
+    ...["paused", "stopped", undefined].map((scheduler_state) => ({ ...healthy, automation: { ...healthy.automation, scheduler_state } })),
+    ...["draining", "sealed", "invalid", undefined].map((paid_dispatch_state) => ({ ...healthy, automation: { ...healthy.automation, paid_dispatch_state } })),
+  ];
+  const states = conditions.map((health) => dataServiceStatus(health, false));
+  assert.deepEqual(new Set(states.map((state) => state.label)), new Set(["系统正常", "数据待更新", "服务异常"]));
+  assert.deepEqual(new Set(states.map((state) => state.kind)), new Set(["normal", "pending", "error"]));
+  assert.ok(states.every((state) => state.description.length > 0));
 });
 
 test("verified current replica sync is healthy and shows install time, independent of writer evidence", () => {
   for (const scheduler_state of ["running", "paused", "stopped", "read_only"]) {
     const state = dataServiceStatus({ ...healthy, read_only: true, snapshot_sync: snapshot,
       automation: { scheduler_state, paid_dispatch_state: "invalid" }, data_freshness: { status: "stale" } }, false);
-    assert.equal(state.kind, "online");
-    assert.equal(state.label, "快照同步正常");
+    assert.equal(state.kind, "normal");
+    assert.equal(state.label, "系统正常");
     assert.match(state.description, /最近同步：2026\/09\/07 11:15（北京时间）/);
     assert.match(state.description, /同步成功不代表采集完整/);
     assert.doesNotMatch(state.description, /最近成功采集|2026\/09\/06/);
@@ -33,48 +50,51 @@ test("replica sync delay persists outside the publishing window without implying
   const state = dataServiceStatus({ ...healthy, read_only: true, snapshot_sync: {
     ...snapshot, status: "delayed", window_state: "inactive", next_scheduled_at: "2026-09-08T09:00:00+08:00",
   } }, false);
-  assert.equal(state.kind, "stale");
-  assert.equal(state.label, "快照同步延迟");
+  assert.equal(state.kind, "pending");
+  assert.equal(state.label, "数据待更新");
+  assert.match(state.description, /快照同步延迟/);
   assert.match(state.description, /00:00–09:00（北京时间）不累计同步延迟/);
   assert.match(state.description, /下次计划发布：2026\/09\/08 09:00（北京时间）/);
   assert.doesNotMatch(state.description, /自动抓取异常|最近成功采集/);
 });
 
-test("night window does not downgrade an on-time replica and absent or malformed evidence stays unknown", () => {
-  assert.equal(dataServiceStatus({ ...healthy, read_only: true, snapshot_sync: { ...snapshot, window_state: "inactive" } }, false).kind, "online");
+test("night window does not downgrade an on-time replica and absent or malformed evidence stays pending", () => {
+  assert.equal(dataServiceStatus({ ...healthy, read_only: true, snapshot_sync: { ...snapshot, window_state: "inactive" } }, false).kind, "normal");
   for (const snapshot_sync of [undefined, null, { ...snapshot, status: "unknown" }, { ...snapshot, status: "unexpected" }]) {
     const state = dataServiceStatus({ ...healthy, read_only: true, snapshot_sync }, false);
-    assert.equal(state.kind, "unknown");
-    assert.equal(state.label, "同步状态待确认");
+    assert.equal(state.kind, "pending");
+    assert.equal(state.label, "数据待更新");
   }
   for (const status of ["current", "delayed"]) {
     for (const last_verified_install_at of [null, "", "0", "2026-09-07", "2026-09-07T03:15:00", "2026-02-30T03:15:00Z", "invalid"]) {
       const state = dataServiceStatus({ ...healthy, read_only: true, snapshot_sync: { ...snapshot, status, last_verified_install_at } }, false);
-      assert.equal(state.kind, "unknown");
+      assert.equal(state.kind, "pending");
       assert.doesNotMatch(state.description, /最近同步：/);
     }
   }
 });
 
-test("green status claims a running scheduler with an open gate, nothing more", () => {
-  assert.equal(dataServiceStatus(healthy, false).kind, "online");
-  assert.equal(dataServiceStatus({ status: "ok", read_only: false }, false).kind, "unknown");
-  assert.equal(dataServiceStatus({ status: "unavailable", read_only: false }, false).kind, "offline");
-  assert.equal(dataServiceStatus({ status: "ok" }, false).kind, "offline");
+test("normal status describes system operation without claiming complete capture", () => {
+  assert.equal(dataServiceStatus(healthy, false).kind, "normal");
+  assert.equal(dataServiceStatus(healthy, false).label, "系统正常");
+  assert.match(dataServiceStatus(healthy, false).description, /不代表所有数据已采集完整/);
+  assert.equal(dataServiceStatus({ status: "ok", read_only: false }, false).kind, "pending");
+  assert.equal(dataServiceStatus({ status: "unavailable", read_only: false }, false).kind, "error");
+  assert.equal(dataServiceStatus({ status: "ok" }, false).kind, "error");
   for (const scheduler_state of ["paused", "stopped"]) {
     const state = dataServiceStatus({ ...healthy, automation: { ...healthy.automation, scheduler_state } }, false);
-    assert.equal(state.kind, scheduler_state);
+    assert.equal(state.kind, "pending");
     assert.match(state.description, /自动抓取和自动报告/);
   }
-  assert.equal(dataServiceStatus({ ...healthy, automation: { scheduler_state: "read_only" } }, false).kind, "unknown");
-  assert.equal(dataServiceStatus({ ...healthy, snapshot_sync: snapshot, automation: { scheduler_state: "read_only" } }, false).kind, "online");
-  assert.equal(dataServiceStatus({ ...healthy, automation: { ...healthy.automation, paid_dispatch_state: "draining" } }, false).label, "自动抓取已暂停");
+  assert.equal(dataServiceStatus({ ...healthy, automation: { scheduler_state: "read_only" } }, false).kind, "pending");
+  assert.equal(dataServiceStatus({ ...healthy, snapshot_sync: snapshot, automation: { scheduler_state: "read_only" } }, false).kind, "normal");
+  assert.equal(dataServiceStatus({ ...healthy, automation: { ...healthy.automation, paid_dispatch_state: "draining" } }, false).label, "数据待更新");
   // A sealed coverage receipt is no longer a precondition for green: an unsealed profile day is a
-  // normal daily window, and a genuinely outdated day is reported as "stale" instead.
-  assert.equal(dataServiceStatus({ ...healthy, automation: { scheduler_state: "running" } }, false).kind, "unknown");
-  assert.equal(dataServiceStatus({ ...healthy, data_freshness: { status: "stale" } }, false).kind, "stale");
+  // normal daily window, and a genuinely outdated day remains pending.
+  assert.equal(dataServiceStatus({ ...healthy, automation: { scheduler_state: "running" } }, false).kind, "pending");
+  assert.equal(dataServiceStatus({ ...healthy, data_freshness: { status: "stale" } }, false).kind, "pending");
   for (const data_freshness of [undefined, { status: "unknown" }, { status: "current" }, { status: "current", last_successful_capture_at: "bad date" }]) {
-    assert.equal(dataServiceStatus({ ...healthy, data_freshness }, false).kind, "online");
+    assert.equal(dataServiceStatus({ ...healthy, data_freshness }, false).kind, "normal");
   }
 });
 
@@ -97,21 +117,21 @@ test("no state states an unknown freshness or an unknown capture time", () => {
 
 test("a corrupt paid-dispatch chain is a fault, not a planned pause", () => {
   const invalid = dataServiceStatus({ ...healthy, automation: { ...healthy.automation, paid_dispatch_state: "invalid" } }, false);
-  // Only the fault family is painted red; calm "paused" copy would bury a chain that never self-heals.
-  assert.equal(invalid.kind, "offline");
-  assert.equal(invalid.label, "自动抓取异常");
+  // A fault stays distinct from an intentional pause, even with only three public states.
+  assert.equal(invalid.kind, "error");
+  assert.equal(invalid.label, "服务异常");
   assert.match(invalid.description, /联系技术/);
   assert.doesNotMatch(invalid.description, /暂停/);
   for (const paid_dispatch_state of ["draining", "sealed"]) {
     const planned = dataServiceStatus({ ...healthy, automation: { ...healthy.automation, paid_dispatch_state } }, false);
-    assert.equal(planned.kind, "paused");
-    assert.equal(planned.label, "自动抓取已暂停");
+    assert.equal(planned.kind, "pending");
+    assert.equal(planned.label, "数据待更新");
   }
 });
 
 test("failed refresh overrides cached healthy or read-only status", () => {
   for (const cached of [undefined, healthy, { ...healthy, read_only: true, snapshot_sync: snapshot }]) {
-    assert.equal(dataServiceStatus(cached, true).kind, "offline");
+    assert.equal(dataServiceStatus(cached, true).kind, "error");
   }
 });
 
@@ -124,12 +144,12 @@ test("persistent chrome reads health and shares the derived status with page she
   assert.match(shell, /refetchOnWindowFocus: "always"/);
   assert.match(shell, /dataServiceStatus\(serviceHealth.data, serviceHealth.isError\)/);
   // User-selected display policy: failures in the header; all other states stay in the sidebar.
-  assert.match(shell, /\{serviceState\.kind === "offline" && <div/);
-  assert.doesNotMatch(shell, /serviceState\.kind !== "online"/);
+  assert.match(shell, /\{serviceState\.kind === "error" && <div/);
+  assert.doesNotMatch(shell, /serviceState\.kind !== "normal"/);
   assert.match(shell, /serviceStyles\.offline/);
   assert.doesNotMatch(shell, /<strong>数据服务正常<\/strong>/);
   assert.match(shell, /title=\{serviceState\.description \|\| undefined\}/);
-  assert.match(shell, /aria-label=\{\[serviceState\.label, serviceState\.description\]\.filter\(Boolean\)\.join\("。"\)\}/);
+  assert.match(shell, /aria-label=\{\[serviceState\.label, serviceState\.description\]\.filter\(Boolean\)\.join\("。"\) \|\| "正在读取系统状态"\}/);
 });
 
 test("report gap starts with the first enabled business day and only after 08:00 Shanghai next day", () => {
@@ -172,17 +192,17 @@ test("idle task lists continue refreshing and refetch on focus while active repo
 test("invalid capture gate wins over writer scheduler states but never over a read-only replica", () => {
   for (const scheduler_state of ["running", "paused", "stopped", undefined]) {
     const health = { ...healthy, automation: { scheduler_state, paid_dispatch_state: "invalid" } };
-    assert.equal(dataServiceStatus(health, false).label, "自动抓取异常");
-    assert.equal(dataServiceStatus({ ...health, read_only: true }, false).kind, "unknown");
-    assert.equal(dataServiceStatus({ ...health, read_only: true, snapshot_sync: snapshot }, false).kind, "online");
+    assert.equal(dataServiceStatus(health, false).label, "服务异常");
+    assert.equal(dataServiceStatus({ ...health, read_only: true }, false).kind, "pending");
+    assert.equal(dataServiceStatus({ ...health, read_only: true, snapshot_sync: snapshot }, false).kind, "normal");
   }
 });
 
 test("an absent or unrecognized gate never becomes a green light or a planned pause", () => {
   for (const paid_dispatch_state of [undefined, null, "", "unexpected"]) {
     const state = dataServiceStatus({ ...healthy, automation: { ...healthy.automation, paid_dispatch_state } }, false);
-    assert.equal(state.kind, "unknown");
-    assert.equal(state.label, "自动抓取状态待确认");
+    assert.equal(state.kind, "pending");
+    assert.equal(state.label, "数据待更新");
     assert.doesNotMatch(state.description, /新鲜度|已暂停/);
   }
 });
@@ -190,7 +210,7 @@ test("an absent or unrecognized gate never becomes a green light or a planned pa
 test("capture timestamps must be real timezone-qualified timestamps, never numeric placeholders", () => {
   for (const last_successful_capture_at of [null, "", "0", "1", "2026-09-06", "bad date", "2026-09-06T00:00:00"]) {
     const health = { ...healthy, data_freshness: { status: "unknown", last_successful_capture_at } };
-    assert.equal(dataServiceStatus(health, false).description, "");
+    assert.doesNotMatch(dataServiceStatus(health, false).description, /最近成功采集/);
     assert.doesNotMatch(dataServiceStatus({ ...health, read_only: true }, false).description, /最近成功采集/);
   }
   assert.match(dataServiceStatus({ ...healthy, data_freshness: { status: "current", last_successful_capture_at: "2026-09-06T00:00:00+00:00" } }, false).description, /2026\/09\/06 08:00/);

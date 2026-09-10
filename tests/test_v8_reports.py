@@ -1977,6 +1977,180 @@ class V8ReportTaskTest(unittest.TestCase):
         self.assertEqual(state["events"][-1]["event_type"], "failed")
         self.assertFalse(outside.exists())
 
+    def test_orphan_report_directory_is_preserved_and_retry_uses_new_revision(self) -> None:
+        task = create_task(
+            task_type="custom", period_start="2026-07-01", period_end="2026-07-01",
+            creation_source="manual", db_path=self.db,
+        )
+        orphan = self.reports_root / task["id"] / "revision_001"
+        orphan.mkdir(parents=True)
+        evidence = orphan / "report.json"
+        evidence.write_bytes(b'{"orphaned_before_database_registration":true}\n')
+        old_bytes = evidence.read_bytes()
+
+        first = run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
+        self.assertEqual(first["metadata"]["revision"], 2)
+        first_path = orphan.parent / "revision_002" / "report.json"
+        first_bytes = first_path.read_bytes()
+        retry_task(task["id"], db_path=self.db)
+        second = run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
+
+        self.assertEqual(second["metadata"]["revision"], 3)
+        self.assertEqual(evidence.read_bytes(), old_bytes)
+        self.assertEqual(first_path.read_bytes(), first_bytes)
+        state = get_task(task["id"], db_path=self.db)
+        self.assertEqual([row["revision"] for row in state["revisions"]], [3, 2])
+        self.assertEqual(list(orphan.parent.glob(".revision_*")), [])
+
+    def test_orphan_survives_repeated_render_and_registration_failures(self) -> None:
+        task = create_task(
+            task_type="custom", period_start="2026-07-01", period_end="2026-07-01",
+            creation_source="manual", db_path=self.db,
+        )
+        orphan = self.reports_root / task["id"] / "revision_001"
+        orphan.mkdir(parents=True)
+        evidence = orphan / "saved-evidence.txt"
+        evidence.write_bytes(b"preserve prior attempt")
+        for function in ("_write_csv", "uuid.uuid4", "uuid.uuid4"):
+            with (
+                patch(f"v8.reports.{function}", side_effect=RuntimeError("injected failure")),
+                self.assertRaisesRegex(RuntimeError, "injected failure"),
+            ):
+                run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
+            self.assertEqual(evidence.read_bytes(), b"preserve prior attempt")
+            self.assertEqual(get_task(task["id"], db_path=self.db)["revisions"], [])
+            self.assertEqual(list(orphan.parent.iterdir()), [orphan])
+
+        report = run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
+        self.assertEqual(report["metadata"]["revision"], 2)
+        self.assertTrue((orphan.parent / "revision_002" / "report.json").is_file())
+
+    def test_revision_paths_reject_existing_and_dangling_symlinks(self) -> None:
+        for location, dangling in (("task", False), ("revision", False), ("revision", True), ("reservation", True)):
+            with self.subTest(location=location, dangling=dangling):
+                task = create_task(
+                    task_type="custom", period_start="2026-07-01", period_end="2026-07-01",
+                    creation_source="manual", db_path=self.db,
+                )
+                outside = self.root / (task["id"] + "-outside")
+                if not dangling:
+                    outside.mkdir()
+                parent = self.reports_root / task["id"]
+                self.reports_root.mkdir(exist_ok=True)
+                if location == "task":
+                    alias = parent
+                else:
+                    parent.mkdir()
+                    alias = parent / ("revision_001" if location == "revision" else ".revision_001.reserved")
+                alias.symlink_to(outside, target_is_directory=True)
+                with self.assertRaisesRegex(ReportTaskError, "symlink|unsafe"):
+                    run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
+                self.assertTrue(alias.is_symlink())
+                self.assertEqual(list(outside.iterdir()) if outside.exists() else [], [])
+                self.assertEqual(get_task(task["id"], db_path=self.db)["revisions"], [])
+
+    def test_report_publish_collision_never_replaces_an_empty_directory(self) -> None:
+        task = create_task(
+            task_type="custom", period_start="2026-07-01", period_end="2026-07-01",
+            creation_source="manual", db_path=self.db,
+        )
+        target = self.reports_root / task["id"] / "revision_001"
+        original_publish = reports_module._publish_report_directory
+        collision_inode = []
+
+        def collide(temporary, destination):
+            target.mkdir()
+            collision_inode.append(target.stat().st_ino)
+            return original_publish(temporary, destination)
+
+        with (
+            patch.object(reports_module, "_publish_report_directory", side_effect=collide),
+            self.assertRaisesRegex(ReportTaskError, "already exists"),
+        ):
+            run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
+        self.assertEqual(target.stat().st_ino, collision_inode[0])
+        self.assertEqual(list(target.iterdir()), [])
+        self.assertEqual(get_task(task["id"], db_path=self.db)["revisions"], [])
+        report = run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
+        self.assertEqual(report["metadata"]["revision"], 2)
+
+    def test_abandoned_reservation_is_preserved_and_skipped(self) -> None:
+        task = create_task(
+            task_type="custom", period_start="2026-07-01", period_end="2026-07-01",
+            creation_source="manual", db_path=self.db,
+        )
+        reservation = self.reports_root / task["id"] / ".revision_004.reserved"
+        reservation.mkdir(parents=True)
+        old_inode = reservation.stat().st_ino
+        report = run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
+        self.assertEqual(report["metadata"]["revision"], 5)
+        self.assertEqual(reservation.stat().st_ino, old_inode)
+
+    def test_concurrent_revision_reservations_allocate_distinct_numbers(self) -> None:
+        reserved = []
+        failures = []
+        start = threading.Barrier(4)
+
+        def reserve():
+            try:
+                start.wait(timeout=5)
+                reserved.append(reports_module._reserve_report_revision(self.reports_root, "same-task", 7))
+            except Exception as error:
+                failures.append(error)
+
+        workers = [threading.Thread(target=reserve) for _ in range(4)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=5)
+            self.assertFalse(worker.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(sorted(item[0] for item in reserved), [7, 8, 9, 10])
+        for _, target, reservation, identity in reserved:
+            self.assertFalse(target.exists())
+            self.assertEqual(reports_module._report_directory_identity(reservation), identity)
+
+    def test_cleanup_never_removes_a_replaced_revision_directory(self) -> None:
+        task = create_task(
+            task_type="custom", period_start="2026-07-01", period_end="2026-07-01",
+            creation_source="manual", db_path=self.db,
+        )
+        target = self.reports_root / task["id"] / "revision_001"
+        moved = target.parent / "preserved-original-output"
+
+        def replace_then_fail():
+            target.rename(moved)
+            target.mkdir()
+            (target / "foreign.txt").write_bytes(b"must not delete")
+            raise RuntimeError("registration failed after directory replacement")
+
+        with (
+            patch("v8.reports.uuid.uuid4", side_effect=replace_then_fail),
+            self.assertRaisesRegex(RuntimeError, "registration failed"),
+        ):
+            run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
+        self.assertEqual((target / "foreign.txt").read_bytes(), b"must not delete")
+        self.assertTrue((moved / "report.json").is_file())
+        self.assertEqual(get_task(task["id"], db_path=self.db)["revisions"], [])
+        self.assertEqual(list(target.parent.glob(".revision_*")), [])
+
+    def test_exclusive_rename_failure_has_no_overwriting_fallback(self) -> None:
+        task = create_task(
+            task_type="custom", period_start="2026-07-01", period_end="2026-07-01",
+            creation_source="manual", db_path=self.db,
+        )
+        target = self.reports_root / task["id"] / "revision_001"
+        with (
+            patch("v8.media._rename_exclusive_at", side_effect=OSError("exclusive rename unavailable")),
+            self.assertRaisesRegex(OSError, "exclusive rename unavailable"),
+        ):
+            run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
+        self.assertFalse(target.exists())
+        self.assertEqual(list(target.parent.iterdir()), [])
+        self.assertEqual(get_task(task["id"], db_path=self.db)["revisions"], [])
+        report = run_task(task["id"], db_path=self.db, reports_root=self.reports_root)
+        self.assertEqual(report["metadata"]["revision"], 1)
+
     def test_task_id_cannot_escape_resolved_reports_root(self) -> None:
         task_id = "../escaped-report-task"
         captured_at = now_utc()

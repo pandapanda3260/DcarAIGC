@@ -220,9 +220,12 @@ digest = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, 
 if (not isinstance(payload, dict) or envelope.get("contract_version") != "sealed-build-receipt-v1"
         or envelope.get("payload_sha256") != digest or payload.get("status") != "succeeded"):
     reject("build envelope differs")
+cleanup = isinstance(payload.get("account_cleanup_generation"), dict)
 plan = reference(payload["code_successor_plan"])
-if (plan.get("contract") != "writer-source-isolation-successor-plan-v1"
-        or plan.get("transition") != "writer-source-isolation-20260907-v1"
+expected_contract = "account-cleanup-source-plan-v1" if cleanup else "writer-source-isolation-successor-plan-v1"
+expected_transition = "account-cleanup-0907-v1" if cleanup else "writer-source-isolation-20260907-v1"
+if (plan.get("contract") != expected_contract
+        or plan.get("transition") != expected_transition
         or plan.get("project_root") != str(data) or plan.get("source_root") != str(source)
         or plan.get("git") != payload.get("git")):
     reject("source plan differs")

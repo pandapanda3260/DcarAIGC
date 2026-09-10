@@ -179,7 +179,11 @@ class DeltaPublicationTests(unittest.TestCase):
             return runner(args, **kwargs)
         receipt = self.resume_local(manifest, no_bundle_transfer)
         self.assertEqual(receipt["rsync_dry_run_bundle_bytes"], 0)
-        self.assertEqual(receipt["staging_bytes"], receipt["rsync_dry_run_transfer_bytes"] + receipt["bundle_bytes"])
+        self.assertEqual(
+            receipt["staging_bytes"],
+            max(receipt["artifact_manifest_bytes"], receipt["rsync_dry_run_transfer_bytes"])
+            + receipt["bundle_bytes"],
+        )
         self.assertEqual(receipt["required_remote_bytes"], receipt["staging_bytes"]
                          + receipt["install_headroom"]["total_bytes"] + self.config().minimum_remote_free_bytes)
 

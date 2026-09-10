@@ -129,7 +129,6 @@ from .operations import (
     export_accounts_xlsx,
     export_contents_csv,
     import_contents,
-    update_account,
     update_content,
     upsert_content,
 )
@@ -398,6 +397,10 @@ def _connect_for_request(request: Request) -> sqlite3.Connection:
     return connect(config.db_path, read_only=config.read_only)
 
 
+AccountGroup = Literal["unknown", "mixed_edit", "innovation", "image_text", "boutique_ip"]
+BusinessDirection = Literal["unknown", "new_car", "used_car_c1", "used_car_c2", "ai_xiaodong"]
+
+
 class InputValidationRequest(BaseModel):
     channel: str = Field(max_length=32)
     text: str = Field(max_length=2_000_000)
@@ -407,12 +410,19 @@ class AccountSearchRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     query: str = Field(default="", max_length=100)
-    account_type: Optional[str] = Field(default=None, max_length=32)
-    content_direction: Optional[str] = Field(default=None, max_length=32)
+    account_group: Optional[AccountGroup] = None
+    business_direction: Optional[BusinessDirection] = None
     platform: Optional[str] = Field(default=None, max_length=32)
     account_status: Optional[Literal["daily", "weekly", "paused", "unmarked"]] = None
     page: int = Field(default=1, ge=1)
     page_size: int = Field(default=50, ge=1, le=100)
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_obsolete_classification(cls, value: Any) -> Any:
+        if isinstance(value, dict) and {"account_type", "content_direction"} & value.keys():
+            raise ValueError("账号分类已更新，请刷新页面后重新筛选。")
+        return value
 
 
 class DouyinAuthorizationTarget(BaseModel):
@@ -426,6 +436,11 @@ class DouyinAuthorizationTarget(BaseModel):
 class AccountExportRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     account_status: Optional[Literal["daily", "weekly", "paused", "unmarked"]] = None
+
+    query: str = Field(default="", max_length=100)
+    platform: Optional[str] = Field(default=None, max_length=32)
+    account_group: Optional[AccountGroup] = None
+    business_direction: Optional[BusinessDirection] = None
 
     # None means the control-plane status request failed.  An empty list means
     # it succeeded and no exact account/UID pair currently has an active grant.
@@ -445,9 +460,12 @@ SELLING_POINT_NONE = "__none__"
 
 
 class ContentSearchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     query: str = Field(default="", max_length=200)
     platform: Optional[str] = Field(default=None, max_length=32)
-    account_type: Optional[str] = Field(default=None, max_length=32)
+    account_group: Optional[AccountGroup] = None
+    business_direction: Optional[BusinessDirection] = None
     content_direction: Optional[str] = Field(default=None, max_length=32)
     selling_point: Optional[str] = Field(default=None, max_length=8)
     spu_series: Optional[str] = Field(default=None, max_length=120)
@@ -510,8 +528,8 @@ class AccountMutationRequest(BaseModel):
 
     phone: Optional[str] = Field(default="", max_length=50)
     operator_name: str = Field(default="", max_length=100)
-    account_type: str = Field(default="unknown", max_length=32)
-    content_direction: str = Field(default="unknown", max_length=32)
+    account_group: AccountGroup = "unknown"
+    business_direction: BusinessDirection = "unknown"
     account_status: Optional[Literal["daily", "weekly", "paused"]] = None
     status_request_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
 
@@ -519,6 +537,8 @@ class AccountMutationRequest(BaseModel):
 class ProfileAccountCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    account_group: AccountGroup = "unknown"
+    business_direction: BusinessDirection = "unknown"
     profile_url: str = Field(min_length=1, max_length=3000)
     phone: Optional[str] = Field(default=None, max_length=50)
     operator_name: Optional[str] = Field(default=None, max_length=100)
@@ -545,6 +565,8 @@ class RosterUploadRequest(BaseModel):
 
 
 class ContentMutationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     platform: str = Field(max_length=32)
     platform_content_id: Optional[str] = Field(default=None, max_length=128)
     canonical_url: str = Field(min_length=1, max_length=3000)
@@ -554,7 +576,6 @@ class ContentMutationRequest(BaseModel):
     content_type: str = Field(default="unknown", max_length=32)
     account_uid: str = Field(default="", max_length=128)
     account_name: str = Field(default="", max_length=200)
-    account_type: str = Field(default="unknown", max_length=32)
     content_direction: str = Field(default="unknown", max_length=32)
 
 
@@ -570,7 +591,6 @@ class ContentPatchRequest(BaseModel):
     content_type: Optional[str] = Field(default=None, max_length=32)
     account_uid: Optional[str] = Field(default=None, max_length=128)
     account_name: Optional[str] = Field(default=None, max_length=200)
-    account_type: Optional[str] = Field(default=None, max_length=32)
     content_direction: Optional[str] = Field(default=None, max_length=32)
 
 
@@ -582,6 +602,15 @@ class BulkImportRequest(BaseModel):
 class MediaRetryRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     allow_paid_refresh: bool = False
+
+
+class MetricsRefreshRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    allowed_groups: Optional[List[str]] = Field(default=None, max_length=10)
+    task_id: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    task_max_amount: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
+    cycle_key: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    retry_transport_fault: bool = Field(default=False, strict=True)
 
 
 class MediaRestoreRequest(BaseModel):
@@ -799,11 +828,11 @@ def _window_content_rows(
     return connection.execute(
         f"""
         SELECT c.id, c.account_id, c.platform, c.manual_content_direction,
-               c.evaluation_content_direction, a.content_direction account_content_direction
+               c.evaluation_content_direction
         FROM content_items c
         LEFT JOIN accounts a ON a.id=c.account_id
         WHERE c.published_at >= ? AND c.published_at < ?
-          AND {content_statistics_scope_sql("c")}
+          AND {content_statistics_scope_sql("c", connection=connection)}
           AND {canonical_content_predicate(connection, knowledge_at=knowledge_at)}
         """,
         (_utc_text(start), _utc_text(end)),
@@ -1225,7 +1254,7 @@ def _data_freshness(
     stage_data = {name: connection.execute(sql, (timestamp, timestamp)).fetchone()[0] for name, sql in stage_queries.items()}
     latest_published = connection.execute(
         f"SELECT MAX(c.published_at) FROM content_items c "
-        f"WHERE c.platform IN ('douyin','xiaohongshu') AND {content_statistics_scope_sql('c')} "
+        f"WHERE c.platform IN ('douyin','xiaohongshu') AND {content_statistics_scope_sql('c', connection=connection)} "
         f"AND {canonical_content_predicate(connection)}"
     ).fetchone()[0]
     return {
@@ -1508,7 +1537,7 @@ def v8_overview(
             "missing_published_at": int(
                 connection.execute(
                     "SELECT COUNT(*) FROM content_items c WHERE published_at IS NULL "
-                    f"AND {canonical_content_predicate(connection)} AND {content_statistics_scope_sql('c')}"
+                    f"AND {canonical_content_predicate(connection)} AND {content_statistics_scope_sql('c', connection=connection)}"
                 ).fetchone()[0]
             ),
             "duplicate_fingerprint_coverage": round(
@@ -1516,7 +1545,7 @@ def v8_overview(
                     connection.execute(
                         "SELECT COUNT(DISTINCT f.content_id) FROM duplicate_fingerprints f "
                         "JOIN content_items c ON c.id=f.content_id WHERE fingerprint_version=? "
-                        f"AND {canonical_content_predicate(connection)} AND {content_statistics_scope_sql('c')}",
+                        f"AND {canonical_content_predicate(connection)} AND {content_statistics_scope_sql('c', connection=connection)}",
                         (FINGERPRINT_VERSION,),
                     ).fetchone()[0]
                 )
@@ -1526,7 +1555,7 @@ def v8_overview(
                     int(
                         connection.execute(
                             f"SELECT COUNT(*) FROM content_items c WHERE {canonical_content_predicate(connection)} "
-                            f"AND {content_statistics_scope_sql('c')}"
+                            f"AND {content_statistics_scope_sql('c', connection=connection)}"
                         ).fetchone()[0]
                     ),
                 ),
@@ -1552,7 +1581,7 @@ def v8_overview(
                 connection.execute(
                     "SELECT COUNT(DISTINCT d.duplicate_content_id) FROM duplicate_relations d "
                     "JOIN content_items c ON c.id=d.duplicate_content_id WHERE d.status='confirmed' "
-                    f"AND {canonical_content_predicate(connection)} AND {content_statistics_scope_sql('c')}"
+                    f"AND {canonical_content_predicate(connection)} AND {content_statistics_scope_sql('c', connection=connection)}"
                 ).fetchone()[0]
             ),
         }
@@ -1596,12 +1625,12 @@ def _account_search(
         parameters.extend([pattern, normalized_pattern, pattern, pattern, pattern, pattern, pattern, pattern])
         admission_query_index = len(parameters)
         parameters.extend(["[]", pattern, pattern])
-    if payload.account_type:
-        where.append("a.account_type=?")
-        parameters.append(payload.account_type)
-    if payload.content_direction:
-        where.append("a.content_direction=?")
-        parameters.append(payload.content_direction)
+    if payload.account_group:
+        where.append("'unknown'=?")
+        parameters.append(payload.account_group)
+    if payload.business_direction:
+        where.append("'unknown'=?")
+        parameters.append(payload.business_direction)
     if payload.platform:
         where.append(
             "EXISTS (SELECT 1 FROM account_platform_identities i "
@@ -1618,6 +1647,18 @@ def _account_search(
             admissions = load_admission_members(connection)
         except AccountOperatingStatusError as exc:
             raise HTTPException(status_code=503, detail="账号状态记录校验失败，暂时无法读取。") from exc
+        from .account_directory import has_account_directory, directory_account_items
+        if has_account_directory(connection):
+            directory_items = directory_account_items(
+                connection, roster=roster, update_frequencies=frequencies, admission_members=admissions,
+                query=payload.query, platform=payload.platform, account_status=payload.account_status,
+                account_group=payload.account_group, business_direction=payload.business_direction,
+            )
+            from .account_catalog_capture import annotate_accounts
+            annotate_accounts(connection, directory_items)
+            return {"items": directory_items[offset:offset + payload.page_size], "total": len(directory_items),
+                    "page": payload.page, "page_size": payload.page_size, "account_management_version": 2,
+                    "account_directory_version": 2, "roster": roster}
         if admission_query_index is not None:
             parameters[admission_query_index] = json.dumps([
                 {
@@ -1745,7 +1786,7 @@ def _content_local_media_flags(
 def _content_search(
     payload: ContentSearchRequest, *, db_path: Path, read_only: bool = False
 ) -> Dict[str, Any]:
-    where: List[str] = [content_statistics_scope_sql("c")]
+    where: List[str] = []
     parameters: List[Any] = []
     direction_sql = effective_direction_sql()
     if payload.query:
@@ -1758,9 +1799,6 @@ def _content_search(
     if payload.platform:
         where.append("c.platform=?")
         parameters.append(payload.platform)
-    if payload.account_type:
-        where.append("COALESCE(a.account_type, c.legacy_account_type, 'unknown')=?")
-        parameters.append(payload.account_type)
     if payload.content_direction:
         where.append(f"{direction_sql}=?")
         parameters.append(payload.content_direction)
@@ -1819,7 +1857,7 @@ def _content_search(
         LEFT JOIN content_items original ON original.id=duplicate.original_content_id
     """
     count_from_parts = ["FROM content_items c"]
-    if payload.account_type or payload.content_direction:
+    if payload.account_group or payload.business_direction:
         count_from_parts.append("LEFT JOIN accounts a ON a.id=c.account_id")
     if payload.selling_point or payload.content_direction:
         count_from_parts.append(
@@ -1833,8 +1871,16 @@ def _content_search(
     )
     offset = (payload.page - 1) * payload.page_size
     with connect(db_path, read_only=read_only) as connection:
+        from .account_classification import classification_sql
+        group_sql = classification_sql(connection, "account_group")
+        business_sql = classification_sql(connection, "business_direction")
+        for field, sql in (("account_group", group_sql), ("business_direction", business_sql)):
+            if getattr(payload, field):
+                where.append(f"{sql}=?")
+                parameters.append(getattr(payload, field))
         labels_ready = spu_domain_ready(connection)
         where.append(canonical_content_predicate(connection))
+        where.append(content_statistics_scope_sql("c", connection=connection))
         if labels_ready and spu_filters:
             where.extend(spu_filters)
             parameters.extend(spu_parameters)
@@ -1849,7 +1895,7 @@ def _content_search(
             SELECT c.id, c.link_id, c.platform, c.platform_content_id,
                    c.canonical_url, c.published_at, c.title, c.body, c.content_type,
                    c.raw_account_uid, c.raw_account_name,
-                   COALESCE(a.account_type, c.legacy_account_type, 'unknown') account_type,
+                   {group_sql} account_group, {business_sql} business_direction,
                    {direction_sql} content_direction,
                    ev.primary_selling_point_code, ev.evidence_level,
                    ev.content_automotive_score,
@@ -1984,7 +2030,7 @@ def _selling_point_window_stats(
             )
             WHERE c.published_at >= ? AND c.published_at < ?
               AND {canonical_content_predicate(connection)}
-              AND {content_statistics_scope_sql("c")}
+              AND {content_statistics_scope_sql("c", connection=connection)}
             """,
             (start_utc, end_utc),
         ).fetchall()
@@ -2022,7 +2068,7 @@ def _selling_point_window_stats(
                 JOIN content_items c ON c.id=ev.content_id
                 WHERE c.published_at >= ? AND c.published_at < ?
                   AND {canonical_content_predicate(connection)}
-                  AND {content_statistics_scope_sql("c")}
+                  AND {content_statistics_scope_sql("c", connection=connection)}
             )
             SELECT m.code, m.scene, m.platform, m.match_role, m.content_id
             FROM matched m
@@ -2094,7 +2140,7 @@ def _selling_point_list(*, db_path: Path, read_only: bool = False) -> Dict[str, 
                 FROM formal_current_evaluations ev
                 JOIN evaluation_matches em ON em.evaluation_id=ev.id
                 JOIN content_items c ON c.id=ev.content_id
-                WHERE {content_statistics_scope_sql("c")}
+                WHERE {content_statistics_scope_sql("c", connection=connection)}
             )
             SELECT sp.*,
                    COUNT(DISTINCT CASE WHEN rm.match_role='primary' THEN rm.content_id END) primary_hits,
@@ -2648,7 +2694,7 @@ async def _lifespan_runtime(app: FastAPI):
             )
         with connect(config.db_path, read_only=True) as connection:
             require_schema_compatibility(
-                connection, supported_versions=frozenset({19, 20})
+                connection, supported_versions=frozenset({19, 20, 21})
             )
             connection.execute("SELECT 1 FROM content_items LIMIT 1").fetchone()
         app.state.database_sha256 = _file_sha256(config.db_path)
@@ -2694,7 +2740,7 @@ async def _lifespan_runtime(app: FastAPI):
                 try:
                     require_schema_compatibility(
                         connection,
-                        supported_versions=frozenset({19, 20}),
+                        supported_versions=frozenset({19, 20, 21}),
                     )
                 except RuntimeError as exc:
                     raise RuntimeError(
@@ -2715,7 +2761,7 @@ async def _lifespan_runtime(app: FastAPI):
                         try:
                             require_schema_compatibility(
                                 connection,
-                                supported_versions=frozenset({19, 20}),
+                                supported_versions=frozenset({19, 20, 21}),
                             )
                         except RuntimeError as exc:
                             raise RuntimeError(
@@ -4157,7 +4203,7 @@ def _schedule_writer_roster_activation(
     ):
         return value
     try:
-        if int(connection.execute("PRAGMA user_version").fetchone()[0]) == 20:
+        if int(connection.execute("PRAGMA user_version").fetchone()[0]) in {20, 21}:
             from .account_roster_capture import (
                 AccountRosterCaptureError,
                 schedule_account_roster_capture_in_transaction,
@@ -4382,7 +4428,12 @@ def _require_system_account_creation(runtime: Mapping[str, Any]) -> None:
 
 def _validate_active_account_capture(connection: sqlite3.Connection, account_id: int) -> None:
     """A restored existing member must also have a usable current capture route."""
-    if int(connection.execute("PRAGMA user_version").fetchone()[0]) != 20:
+    if int(connection.execute("PRAGMA user_version").fetchone()[0]) not in {20, 21}:
+        return
+    from .account_catalog_capture import installed_policy
+    if installed_policy(connection, at=now_utc()) is not None:
+        # Saving a directory state never waits for an old roster or provider
+        # route. The planner and each automatic send enforce current eligibility.
         return
     from .account_roster_capture import AccountRosterCaptureError, validate_current_account_capture
 
@@ -4432,6 +4483,14 @@ def create_v8_account(
                 )
                 if result.get("activation_status") == "active":
                     _validate_active_account_capture(connection, int(result["account_id"]))
+                from .account_directory import admit_directory_account
+                admit_directory_account(connection, account_id=int(result["account_id"]), member=member,
+                                        account_status=parsed["account_status"], request_id=parsed["request_id"], at=now_utc())
+                from .account_classification import has_classification_columns, update_classification_in_transaction
+                if has_classification_columns(connection):
+                    result.update(update_classification_in_transaction(connection, int(result["account_id"]), parsed))
+                elif parsed["account_group"] != "unknown" or parsed["business_direction"] != "unknown":
+                    raise HTTPException(status_code=409, detail="账号分类尚未完成升级，请稍后重试。")
                 return result
     except AccountOperatingStatusError as error:
         raise HTTPException(status_code=409, detail=str(error),
@@ -4451,6 +4510,36 @@ def patch_v8_account(
 ) -> Dict[str, Any]:
     try:
         values = payload.model_dump(exclude_unset=True)
+        from .account_classification import CLASSIFICATION_FIELDS, update_classification_in_transaction
+        classification_values = {field: values.pop(field) for field in CLASSIFICATION_FIELDS if field in values}
+        from .account_directory import has_account_directory, update_directory_operating_fields
+        if "account_status" not in values and classification_values:
+            if "status_request_id" in values:
+                raise HTTPException(status_code=422, detail="账号状态请求编号需要同时提交账号状态。")
+            from .operations import update_account_in_transaction
+            with _connect_for_request(request) as connection, transaction(connection):
+                # Classification edits never invoke the status or roster flow.
+                result = update_classification_in_transaction(connection, account_id, classification_values)
+                if values:
+                    if account_id < 0:
+                        raise HTTPException(status_code=422, detail="身份待完善账号请单独修改分类。")
+                    update_account_in_transaction(connection, account_id, values)
+                    update_directory_operating_fields(connection, account_id, values)
+                return result
+        from .account_directory_status import update_directory_only_status_in_transaction
+        with _connect_for_request(request) as connection, transaction(connection):
+            directory_result = update_directory_only_status_in_transaction(
+                connection, account_id, values, actor="api-operator", reason="manual account status update",
+            )
+            if directory_result is not None:
+                if classification_values and not directory_result.get("status_replayed"):
+                    directory_result.update(update_classification_in_transaction(connection, account_id, classification_values))
+                return directory_result
+        with _connect_for_request(request) as connection:
+            if has_account_directory(connection) and connection.execute(
+                "SELECT 1 FROM account_directory_rows WHERE account_id=?", (account_id,)
+            ).fetchone() is None:
+                raise HTTPException(status_code=409, detail="该账号不在当前账号清单中，不能恢复采集或修改运营信息。")
         if "status_request_id" in values and "account_status" not in values:
             raise HTTPException(status_code=422, detail="账号状态请求编号需要同时提交账号状态。")
         if "account_status" in values:
@@ -4475,19 +4564,23 @@ def patch_v8_account(
                         request, conn, roster_result, reason="activate account status roster change"
                     ),
                 )
-                if before is not None and not before["enabled"] and result["enabled"] and not result.get("roster_change"):
+                if (not result.get("status_replayed") and before is not None and not before["enabled"]
+                        and result["enabled"] and not result.get("roster_change")):
                     _validate_active_account_capture(connection, account_id)
+                if not result.get("status_replayed"):
+                    update_directory_operating_fields(connection, account_id, values)
+                if classification_values and not result.get("status_replayed"):
+                    result.update(update_classification_in_transaction(connection, account_id, classification_values))
             return result
-        with _connect_for_request(request) as connection:
+        from .operations import update_account_in_transaction
+        with _connect_for_request(request) as connection, transaction(connection):
             activation_id = runtime_account_summary(connection).get("activation_id")
-        return update_account(
-            account_id,
-            values,
-            db_path=_request_config(request).db_path,
-            actor="api-operator",
-            reason="account operations update",
-            activation_id=(int(activation_id) if activation_id is not None else None),
-        )
+            result = update_account_in_transaction(
+                connection, account_id, values, actor="api-operator", reason="account operations update",
+                activation_id=(int(activation_id) if activation_id is not None else None),
+            )
+            update_directory_operating_fields(connection, account_id, values)
+        return result
     except AccountOperatingStatusError as exc:
         raise HTTPException(
             status_code=409,
@@ -4495,6 +4588,8 @@ def patch_v8_account(
         ) from exc
     except RosterError as exc:
         raise _roster_http_error(exc) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except OperationError as exc:
         raise _user_facing_http_error(
             exc,
@@ -4522,6 +4617,8 @@ def remove_v8_account(account_id: int) -> Dict[str, Any]:
 @router.post("/api/v8/accounts/export")
 def export_v8_accounts(request: Request, payload: AccountExportRequest) -> Response:
     workbook = export_accounts_xlsx(
+        query=payload.query, platform=payload.platform,
+        account_group=payload.account_group, business_direction=payload.business_direction,
         account_status=payload.account_status,
         read_only=_request_config(request).read_only,
         douyin_authorization_targets=(
@@ -4637,7 +4734,7 @@ def import_v8_contents(request: Request, payload: BulkImportRequest) -> Dict[str
 def update_v8_content_data(request: Request, content_id: int) -> Any:
     db_path = _request_config(request).db_path
     with _connect_for_request(request) as connection:
-        schema20 = connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        schema20 = connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}
     if schema20:
         return _submit_capture_command(request, content_id=content_id, kind="manual_update")
     try:
@@ -4661,18 +4758,32 @@ def update_v8_content_data(request: Request, content_id: int) -> Any:
     return result
 
 
-def _submit_capture_command(request: Request, *, content_id: int, kind: str) -> JSONResponse:
+@router.post("/api/v8/contents/{content_id}/metrics/refresh")
+def refresh_v8_content_metrics(request: Request, content_id: int,
+                               payload: MetricsRefreshRequest | None = None) -> JSONResponse:
+    """Persist an explicit metrics-only command; POST never calls providers."""
+    with _connect_for_request(request) as connection:
+        if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
+            raise HTTPException(status_code=409, detail="manual_metrics_requires_schema20")
+    return _submit_capture_command(request, content_id=content_id, kind="metrics_update",
+        options=payload.model_dump(exclude_none=True) if payload is not None else {})
+
+
+def _submit_capture_command(request: Request, *, content_id: int, kind: str,
+                            options: Mapping[str, Any] | None = None) -> JSONResponse:
     from .capture_commands import submit_command
 
     config = _request_config(request)
     if config.read_only or not bool(getattr(request.app.state, "writer_lock_held", False)):
         raise HTTPException(status_code=503, detail="writer_lock_not_held")
     try:
-        result = submit_command(db_path=config.db_path, content_id=content_id, kind=kind)
+        result = submit_command(db_path=config.db_path, content_id=content_id, kind=kind, **dict(options or {}))
     except LifecycleError as error:
         return media_api.error_response(error)
     except LookupError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
+    except (BudgetBlocked, SlotUnavailable, CaptureError) as error:
+        raise HTTPException(status_code=409, detail=str(getattr(error, "error_code", error))) from error
     except (OSError, sqlite3.Error, RuntimeError) as error:
         raise HTTPException(status_code=503, detail="durable_command_persist_failed") from error
     except ValueError as error:
@@ -4681,6 +4792,7 @@ def _submit_capture_command(request: Request, *, content_id: int, kind: str) -> 
 
 
 @router.get("/api/v8/contents/{content_id}/update-data/commands/{run_id}")
+@router.get("/api/v8/contents/{content_id}/metrics/commands/{run_id}")
 def get_v8_content_update_command(request: Request, content_id: int, run_id: int) -> Any:
     from .capture_commands import read_command
     from .storage import live_wal_read_only_connections
@@ -4776,7 +4888,7 @@ def retry_v8_content_media(
 ) -> Any:
     if payload.allow_paid_refresh:
         with _connect_for_request(request) as connection:
-            schema20 = connection.execute("PRAGMA user_version").fetchone()[0] == 20
+            schema20 = connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}
         if schema20:
             return _submit_capture_command(request, content_id=content_id, kind="media_retry")
     try:

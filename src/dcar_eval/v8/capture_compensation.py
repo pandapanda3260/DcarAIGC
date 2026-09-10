@@ -70,8 +70,21 @@ def _validate_proof(connection: sqlite3.Connection, work_id: int, *, at: str,
     _require(_page_window(envelope) == proof["request_document"]["due_bucket"], "Compensation logical due/cursor changed")
     bindings = auth.current_runtime_bindings(connection, work["operation"], at)
     _require(dict(bindings) == proof["runtime_bindings"], "Compensation build/profile/roster changed")
-    assignment = planning.resolve_route(connection, account_id=work["account_id"], content_id=work["content_id"],
-                                        operation=work["operation"], at=at)
+    command_id = envelope.get("manual_command_run_id")
+    if command_id is not None:
+        from . import capture_manual
+
+        specification = capture_manual.validate_command(connection, command_id,
+            content_id=work["content_id"], operation=work["operation"],
+            stage=envelope.get("capture_stage", envelope["stage"]))
+        _require(all(envelope.get(key) == specification[key]
+                     for key in ("task_id", "task_max_amount")),
+                 "Compensation manual task budget changed")
+        assignment = capture_manual.assignment_for_command(connection, command_id,
+            content_id=work["content_id"], operation=work["operation"], at=at)
+    else:
+        assignment = planning.resolve_route(connection, account_id=work["account_id"], content_id=work["content_id"],
+                                            operation=work["operation"], at=at)
     _require(assignment is not None and assignment["id"] == work["assignment_id"]
              and assignment["route"] == "integrated" and assignment["mode"] == "active",
              "Compensation cannot change or bypass the assigned route")
@@ -101,7 +114,7 @@ def enqueue_authorized_compensation(connection: sqlite3.Connection, *, work_id: 
     The caller first issues grants through usage_settlements.authorize_compensation
     with concrete gap/raw-replay evidence. No automatic grant is created here.
     """
-    _require(connection.in_transaction and connection.execute("PRAGMA user_version").fetchone()[0] == 20,
+    _require(connection.in_transaction and connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21},
              "Compensation enqueue requires a schema20 writer transaction")
     require_current_process_writer_lock(connection)
     work, envelope = _work(connection, work_id)
@@ -110,15 +123,35 @@ def enqueue_authorized_compensation(connection: sqlite3.Connection, *, work_id: 
         if set(old["issuance_ids"].values()) == {request_issuance_id, member_issuance_id}:
             return {"work_id": work_id, "proof_sha256": old["proof_sha256"], "idempotent": True, "provider_calls": 0}
         _require(work["state"] == "paid_identity_hold", "Only a held prior compensation may receive a new issuance")
-    _require(work["state"] in {"paid_identity_hold", "provider_blocked", "budget_deferred"},
+    _require(work["state"] in {"paid_identity_hold", "provider_blocked", "budget_deferred", "runnable"},
              "Only explicit incomplete/held work may be compensated")
     request_grant, member_grant = _grant(connection, request_issuance_id), _grant(connection, member_issuance_id)
     _require(request_grant["scope_kind"] == "request" and member_grant["scope_kind"] == "member"
              and request_grant["original_settlement_id"] == member_grant["original_settlement_id"]
              and request_grant["next_sequence"] == member_grant["next_sequence"],
              "Compensation requires paired request/member grants for the same settled request")
-    original = connection.execute("SELECT details_json FROM provider_usage WHERE id=?", (request_grant["provider_usage_id"],)).fetchone()
-    details = json.loads(original[0])
+    original = connection.execute("SELECT * FROM provider_usage WHERE id=?", (request_grant["provider_usage_id"],)).fetchone()
+    details = json.loads(original["details_json"])
+    if work["state"] == "runnable":
+        # A metrics command may have just reconstructed its original due work
+        # after a direct call. Only a complete failed statistics response with
+        # known billing may enter here; leases and unknown sends retain a hold.
+        transport = details.get("transport", {})
+        _require(envelope.get("manual_command_run_id") is not None and not work["owner_token"]
+                 and details.get("state") == "failed" and original["request_attempts"] == 1
+                 and original["operation"] == "douyin_video_statistics"
+                 and original["billed_requests"] in {0, 1} and original["amount"] is not None
+                 and ((original["billed_requests"] == 0 and original["amount"] == 0 and transport.get("http_status") == 400)
+                      or (original["billed_requests"] == 1 and original["amount"] > 0 and transport.get("http_status") == 200))
+                 and details.get("error_code") in {"provider_retry_requested", "invalid_response", "upstream_error"}
+                 and transport.get("clean_eof") is True
+                 and transport.get("json_parse_ok") is True and transport.get("length_match") is not False
+                 and transport.get("gzip_crc_ok") is not False
+                 and transport.get("status") == "succeeded" and type(transport.get("raw_response_id")) is int,
+                 "Runnable compensation requires an unowned manual work and complete known-billing failure")
+        from .raw_archive import read_response_entity
+
+        read_response_entity(connection, transport["raw_response_id"])
     document = details.get("paid_identity")
     _require(isinstance(document, dict), "Original request document is absent; identity cannot be invented")
     document = dict(document)

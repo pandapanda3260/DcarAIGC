@@ -60,7 +60,17 @@ def replay_account_creation(
     if current is None:
         raise AccountOperatingStatusError("account_not_found", "原请求对应的账号不存在")
     frequency = load_update_frequencies(connection, [account_id])[account_id]
-    result["current_account_status"] = account_operating_status({**dict(current), "update_frequency": frequency})
+    from .account_catalog_capture import installed_policy
+    from .storage import now_utc
+    catalog_policy = installed_policy(connection, at=now_utc())
+    directory = (connection.execute("SELECT account_status FROM account_directory_rows WHERE account_id=?", (account_id,)).fetchone()
+                 if catalog_policy is not None else None)
+    result["current_account_status"] = (
+        directory["account_status"] if directory is not None else
+        account_operating_status({**dict(current), "update_frequency": frequency})
+    )
+    if directory is not None and directory["account_status"] in {"daily", "weekly", "unmarked"}:
+        frequency = directory["account_status"] if directory["account_status"] != "unmarked" else None
     result["current_enabled"] = bool(current["enabled"])
     result["original_account_status"] = result["account_status"]
     result["original_enabled"] = result["enabled"]
@@ -72,8 +82,11 @@ def replay_account_creation(
         result["original_activation_status"] = result.get("activation_status")
         for key in ("activation_status", "scheduled_effective_at", "scheduled_activation_id", "roster_change"):
             result.pop(key, None)
-    if not result["enabled"]:
+    if result["account_status"] == "paused" or (catalog_policy is None and not result["enabled"]):
         result["activation_status"] = "disabled"
+    elif catalog_policy is not None and not result["enabled"]:
+        result["activation_status"] = "pending_verification"
+        result["automatic_capture"] = {"eligible": False, "reason_code": "pending_verification", "reason_label": "等待系统核验"}
     return result
 
 
@@ -165,6 +178,9 @@ def create_managed_account_in_transaction(
     replay = replay_account_creation(connection, request_id=request_id, request_context=context)
     if replay is not None:
         return replay
+    from .account_catalog_capture import installed_policy
+    from .storage import now_utc
+    catalog_policy = installed_policy(connection, at=now_utc())
     connection.execute("SAVEPOINT account_creation")
     try:
         existing = connection.execute(
@@ -172,14 +188,22 @@ def create_managed_account_in_transaction(
                FROM account_platform_identities i JOIN accounts a ON a.id=i.account_id
                WHERE i.platform=? AND i.uid=?""", (normalized["platform"], normalized["uid"]),
         ).fetchone()
-        in_latest = any(row["platform"] == normalized["platform"] and row["uid"] == normalized["uid"]
-                        for row in current_system_members(connection))
-        in_active = existing is not None and active_snapshot_id is not None and connection.execute(
+        in_latest = catalog_policy is None and any(
+            row["platform"] == normalized["platform"] and row["uid"] == normalized["uid"]
+            for row in current_system_members(connection))
+        in_active = catalog_policy is None and existing is not None and active_snapshot_id is not None and connection.execute(
             "SELECT 1 FROM account_roster_members WHERE snapshot_id=? AND account_identity_id=?",
             (active_snapshot_id, existing["identity_id"]),
         ).fetchone() is not None
         if existing is not None and existing["enabled"] and (in_latest or in_active):
             raise RosterError("system_member_exists", "System roster member already exists")
+        if catalog_policy is not None and existing is not None:
+            directory = connection.execute(
+                "SELECT identity_status,account_status FROM account_directory_rows WHERE account_id=?",
+                (existing["account_id"],),
+            ).fetchone()
+            if directory is not None and directory["identity_status"] == "existing_verified" and directory["account_status"] in {"daily", "weekly"}:
+                raise RosterError("system_member_exists", "账号已存在，请在账号页修改状态。")
         _check_profile_identity(connection, normalized, int(existing["identity_id"]) if existing else None)
         if existing is None:
             account_id = int(create_account_in_transaction(connection, normalized)["id"])
@@ -187,6 +211,12 @@ def create_managed_account_in_transaction(
         else:
             account_id = int(existing["account_id"])
             action = "restored" if account_status != "paused" else "saved_paused"
+        if catalog_policy is not None:
+            from .account_directory import admit_directory_account
+            # The enclosing savepoint rolls this provisional directory entry
+            # back unless the identity-bound operating receipt also succeeds.
+            admit_directory_account(connection, account_id=account_id, member=normalized,
+                                    account_status=account_status, request_id=request_id, at=now_utc())
         result = update_account_operating_status_in_transaction(
             connection, account_id,
             {"account_status": account_status, "status_request_id": request_id, **fields},
@@ -195,6 +225,12 @@ def create_managed_account_in_transaction(
             admission={"member": normalized, "input": context, "action": action,
                        "active_snapshot_id": active_snapshot_id},
         )
+        if catalog_policy is not None and account_status != "paused":
+            from .account_capture_eligibility import derive_capture_eligibility
+            from .account_catalog_capture import materialize_proven_locators
+            members = [row for row in derive_capture_eligibility(connection)["eligible_members"]
+                       if row["account_id"] == account_id]
+            materialize_proven_locators(connection, members, at=now_utc())
     except Exception:
         connection.execute("ROLLBACK TO account_creation")
         connection.execute("RELEASE account_creation")

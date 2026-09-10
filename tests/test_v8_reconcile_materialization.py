@@ -138,6 +138,8 @@ class ReconcileMaterializationIntegrationTest(unittest.TestCase):
             side_effect=observe_rounds,
         ), patch(
             "v8.capture.RAW_ROOT", self.raw_root / "pipeline-derived"
+        ), patch(
+            "v8.media.MEDIA_ROOT", self.fixture.root / "media"
         ):
             reconciled = pipeline._dispatch(
                 "pipeline_reconcile",

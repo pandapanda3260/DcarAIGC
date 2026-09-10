@@ -190,7 +190,7 @@ def _insert_observation(
     provenance_columns = ""
     provenance_placeholders = ""
     provenance_values: tuple[Any, ...] = ()
-    if connection.execute("PRAGMA user_version").fetchone()[0] == 20:
+    if connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}:
         from .metric_field_facts import observation_provenance
         provenance = observation_provenance(
             connection, content_id=content_id, source=source,
@@ -406,7 +406,7 @@ def persist_metric_observation(
                 "content_id": content_id, "account_id": content["account_id"],
                 "metadata_json": metadata_json,
             })
-            if connection.execute("PRAGMA user_version").fetchone()[0] == 20:
+            if connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}:
                 from .metric_field_facts import observation_provenance
                 fact_source = str(observation_provenance(
                     connection, content_id=content_id, source=provider or source or projection_platform,
@@ -455,9 +455,9 @@ def persist_metric_observation(
         )
     else:
         observation_id, observation_created = int(existing["id"]), False
-    if connection.execute("PRAGMA user_version").fetchone()[0] == 20:
+    if connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}:
         from .metric_field_facts import ingest_observation, project_content
-        ingest_observation(connection, observation_id)
+        ingest_observation(connection, observation_id, record_anomalies=observation_created)
         physical_projection = project_content(connection, content_id, cutoff_at=mutation_at,
                                               window_key=window_key, resolve_aliases=False)
         project_content(connection, content_id, cutoff_at=mutation_at)
@@ -507,7 +507,7 @@ def rebuild_metric_snapshots(
     changed = 0
     at = cutoff_at or now_utc()
     for window, ids in windows.items():
-        if connection.execute("PRAGMA user_version").fetchone()[0] == 20:
+        if connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}:
             from .metric_field_facts import project_content
             rows = {}
             for content_id in ids:

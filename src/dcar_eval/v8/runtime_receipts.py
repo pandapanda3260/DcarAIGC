@@ -35,6 +35,11 @@ PROFILE_DAY_CONTRACT = "profile-day-coverage-v1"
 PROFILE_DAY_SCOPE_CONTRACT = "profile-day-scope-v4"
 SCAN_SCOPE_CONTRACT = "scan-verification-receipt-v2"
 PERIOD_RECEIPT_CONTRACT = "profile-day-coverage-period-v1"
+_CLEANUP_CONTROL_CONTRACT = "account-cleanup-release-control-v1"
+_DAY_RELEASE_CONTRACTS = frozenset({
+    "current_activation_hold_v1", "current_activation_forward_release_v1",
+    _CLEANUP_CONTROL_CONTRACT,
+})
 
 
 class RuntimeReceiptError(RuntimeError):
@@ -804,6 +809,25 @@ def _compact_coverage_source_revision(
     frozen_binding: Mapping[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     day = _coverage_day(coverage, business_day=business_day)
+    if day.get("coverage_contract") == "catalog-day-coverage-v1":
+        from .capture_day_coverage import validate_source_binding
+
+        try:
+            binding = dict(day["source_binding"])
+            verified = validate_source_binding(connection, binding, at=cutoff_at)
+            if verified.get("valid") is not True:
+                raise ValueError("catalog source validation did not succeed")
+        except (KeyError, TypeError, ValueError, OSError, sqlite3.Error, RuntimeError) as error:
+            raise RuntimeReceiptError("catalog profile-day source evidence is invalid") from error
+        if (binding.get("date") != business_day
+                or any(day.get(key) != value for key, value in active.items())
+                or any(binding.get(key) != active[key] for key in
+                       ("activation_id", "activation_sha256", "profile_id"))):
+            raise RuntimeReceiptError("catalog profile-day activation binding mismatch")
+        projection = {"activation": dict(active), "business_day": business_day, "catalog": binding}
+        if frozen_binding is not None and projection != dict(frozen_binding):
+            raise RuntimeReceiptError("catalog profile-day frozen source binding mismatch")
+        return _sha(projection), projection
     anchor = _anchor_binding(
         connection, day=day, active=active, business_day=business_day,
         frozen_anchor=frozen_binding.get("anchor") if frozen_binding is not None else None,
@@ -949,7 +973,7 @@ def _latest_complete_current_day_row(
             and isinstance(scope.get("released_at"), str)
             and isinstance(scope.get("drain_id"), str)
             and scope.get("control_contract_version")
-            in {"current_activation_hold_v1", "current_activation_forward_release_v1"}
+            in _DAY_RELEASE_CONTRACTS
         ):
             return row
     return None
@@ -960,8 +984,9 @@ def _day_release_binding(
     *,
     activation_id: int,
     business_day: str,
+    at: str | None = None,
 ) -> dict[str, Any]:
-    """Bind a day to its full-day permit or an earlier explicit forward release."""
+    """Bind a day to its actual release, without asserting completed coverage."""
 
     day_start = datetime.combine(
         date.fromisoformat(business_day), time.min, BEIJING
@@ -993,6 +1018,23 @@ def _day_release_binding(
             and day_start <= parse_time(str(row["created_at"])) < day_start + timedelta(minutes=5)
         ):
             matches.append((row, control))
+        elif isinstance(control, dict) and control.get("contract") == _CLEANUP_CONTROL_CONTRACT:
+            # Verify the currently installed inheritance, not whether a later
+            # source successor was already installed at the historical day start.
+            from .capture_release import _native_control
+            from .profile_activations import activation_by_id
+
+            try:
+                timestamp = _time(at)
+                evidence = _cleanup_release_evidence(
+                    connection, active=activation_by_id(connection, activation_id),
+                    release_control=control, at=timestamp,
+                )
+                if (parse_time(str(row["created_at"])) <= parse_time(timestamp)
+                        and _native_control(connection, evidence, at=timestamp) == int(row["id"])):
+                    matches.append((row, control))
+            except (KeyError, TypeError, ValueError, OSError, sqlite3.Error, RuntimeError):
+                continue
         elif isinstance(control, dict):
             from .forward_recovery import forward_release_matches
             from .profile_activations import activation_by_id
@@ -1004,7 +1046,10 @@ def _day_release_binding(
                 start=start, released_at=str(row["created_at"]),
             ) and str(control["scope_start"]) <= business_day):
                 matches.append((row, control))
-    if matches and matches[-1][1].get("contract_version") == "current_activation_forward_release_v1":
+    if matches and (
+        matches[-1][1].get("contract_version") == "current_activation_forward_release_v1"
+        or matches[-1][1].get("contract") == _CLEANUP_CONTROL_CONTRACT
+    ):
         matches = matches[-1:]
     if len(matches) != 1:
         return {
@@ -1020,7 +1065,7 @@ def _day_release_binding(
         "release_event_id": int(row["id"]),
         "release_event_hash": str(row["event_hash"]),
         "released_at": str(row["created_at"]),
-        "control_contract_version": str(control["contract_version"]),
+        "control_contract_version": str(control.get("contract_version") or control["contract"]),
     }
 
 
@@ -1255,6 +1300,7 @@ def record_profile_day_coverage_receipt(
                     connection,
                     activation_id=int(active["activation_id"]),
                     business_day=business_day,
+                    at=timestamp,
                 )
                 if native
                 else {}
@@ -1604,6 +1650,7 @@ def _current_hold_control_valid(
     *,
     active: Mapping[str, Any],
     drain_state: Any,
+    at: str,
 ) -> bool:
     if drain_state.state == "open":
         event_id = drain_state.permit_event_id
@@ -1614,7 +1661,8 @@ def _current_hold_control_valid(
     if type(event_id) is not int:
         return False
     row = connection.execute(
-        "SELECT target_activation_id,payload_json FROM pipeline_paid_drain_events WHERE id=?",
+        "SELECT target_activation_id,payload_json,event_type,contract_version "
+        "FROM pipeline_paid_drain_events WHERE id=?",
         (event_id,),
     ).fetchone()
     if row is None or int(row["target_activation_id"]) != int(active["activation_id"]):
@@ -1624,6 +1672,40 @@ def _current_hold_control_valid(
     except (TypeError, ValueError):
         return False
     control = payload.get("control") if isinstance(payload, dict) else None
+    if (
+        active.get("profile_id") == "integrated_route_v1"
+        and isinstance(payload, dict)
+        and "control" not in payload
+    ):
+        # dispatch_state has already validated the native chain and selected
+        # this activation's RELEASE. This is control readiness only: it does
+        # not qualify a provider, grant paid authority or assert data coverage.
+        from .paid_drain import PROFILE_CONTRACT_VERSION
+
+        return bool(
+            drain_state.state == "open"
+            and drain_state.activation_id == int(active["activation_id"])
+            and row["event_type"] == "release"
+            and row["contract_version"] == PROFILE_CONTRACT_VERSION
+        )
+    if isinstance(control, dict) and control.get("contract") == "account-cleanup-release-control-v1":
+        # Cleanup releases inherit a sealed operator decision. Their control
+        # has a nested activation binding, not the older flat hold contract.
+        # Revalidate that inheritance; an open drain alone proves no authority.
+        if not drain_state.paid_dispatch_open:
+            return False
+        try:
+            from . import account_cleanup_runtime as cleanup
+            from .capture_release import _installed_evidence
+
+            evidence = _installed_evidence(connection, at=at, maintenance_only=True)
+            if any(evidence["active"].get(key) != active.get(key) for key in cleanup.ACTIVE_KEYS):
+                return False
+            cleanup.validate_control(connection, evidence, control, at=at)
+            decision = cleanup.validate_decision(evidence, "douyin_user_posts", at)
+            return decision is not None
+        except (KeyError, TypeError, ValueError, OSError, sqlite3.Error, RuntimeError):
+            return False
     return bool(
         isinstance(control, dict)
         and control.get("contract_version") in {"current_activation_hold_v1", "current_activation_forward_release_v1"}
@@ -1633,6 +1715,24 @@ def _current_hold_control_valid(
         and control.get("control_purpose")
         in {"hold_begin", "hold_seal", "full_day_release", "forward_only_seal", "forward_only_release"}
     )
+
+
+def _cleanup_release_evidence(
+    connection: sqlite3.Connection, *, active: Mapping[str, Any],
+    release_control: Mapping[str, Any], at: str,
+) -> dict[str, Any]:
+    from . import account_cleanup_runtime as cleanup
+    from .capture_release import _installed_evidence
+
+    evidence = _installed_evidence(connection, at=at, maintenance_only=True)
+    cleanup.require(
+        all(evidence["active"].get(key) == active.get(key) for key in cleanup.ACTIVE_KEYS),
+        "Cleanup day release activation differs from the installed generation",
+    )
+    cleanup.validate_control(connection, evidence, release_control, at=at)
+    cleanup.require(cleanup.validate_decision(evidence, "douyin_user_posts", at) is not None,
+                    "Cleanup day release lacks its inherited operator decision")
+    return evidence
 
 
 def _required_operations_qualified(
@@ -1652,7 +1752,40 @@ def _required_operations_qualified(
 
         from .forward_recovery import is_forward_release, validate_forward_release
 
-        if is_forward_release(release_control):
+        if release_control.get("contract") == _CLEANUP_CONTROL_CONTRACT:
+            from . import account_cleanup_runtime as cleanup, capture_operator_release as operator, provider_budget
+
+            evidence = _cleanup_release_evidence(
+                connection, active=active, release_control=release_control, at=at,
+            )
+            # A transient fault may allow renewal or a bounded half-open probe.
+            # Neither makes the operation healthy for a complete-day claim.
+            if any((provider_budget.fault_state(connection, scope_kind="operation", operation=operation)
+                    or {}).get("open") is True for operation in cleanup.OPERATIONS):
+                return False, "required_operation_unqualified"
+            for operation in sorted(cleanup.OPERATIONS):
+                value = operator.authority(connection, evidence=evidence, operation=operation, at=at)
+                cleanup.require(value is not None, "Cleanup operation lacks current operator authority")
+                gate = connection.execute(
+                    "SELECT * FROM capture_paid_send_gate_events WHERE provider='tikhub' "
+                    "AND operation=? AND julianday(recorded_at)<=julianday(?) ORDER BY id DESC LIMIT 1",
+                    (operation, at),
+                ).fetchone()
+                cleanup.require(gate is not None, "Cleanup operation has no issued gate")
+                proof = operator._gate_evidence(
+                    connection, gate, value=value, evidence=evidence, operation=operation,
+                )
+                newest = connection.execute(
+                    "SELECT id FROM provider_readiness_receipts WHERE provider='tikhub' "
+                    "AND operation=? AND julianday(created_at)<=julianday(?) ORDER BY id DESC LIMIT 1",
+                    (operation, at),
+                ).fetchone()
+                cleanup.require(
+                    newest is not None and newest[0] == proof["readiness"]["id"]
+                    and parse_time(gate["recorded_at"]) <= parse_time(at) < parse_time(proof["expires_at"]),
+                    "Cleanup operation gate expired or readiness was superseded",
+                )
+        elif is_forward_release(release_control):
             validate_forward_release(connection, active=active, release_control=release_control, at=at, check_runtime=False)
         else:
             validate_current_hold_release_prerequisites(
@@ -1664,6 +1797,8 @@ def _required_operations_qualified(
             if exc.code == "provider_blocked"
             else "required_operation_unqualified"
         )
+    except (KeyError, TypeError, ValueError, OSError, sqlite3.Error, RuntimeError):
+        return False, "required_operation_unqualified"
     return True, None
 
 
@@ -1689,7 +1824,7 @@ def current_activation_readiness(
         }
     drain = dispatch_state(connection, at=timestamp)
     control_ready = _current_hold_control_valid(
-        connection, active=active, drain_state=drain
+        connection, active=active, drain_state=drain, at=timestamp
     )
     base = {
         "control_readiness": control_ready,
@@ -1767,7 +1902,7 @@ def current_activation_readiness(
         or scope.get("drain_id") != release["drain_id"]
         or scope.get("release_event_hash") != release["event_hash"]
         or scope.get("released_at") != release["created_at"]
-        or scope.get("control_contract_version") not in {"current_activation_hold_v1", "current_activation_forward_release_v1"}
+        or scope.get("control_contract_version") not in _DAY_RELEASE_CONTRACTS
         or int(release["target_activation_id"]) != int(active["activation_id"])
         or drain.permit_event_id != int(release["id"])
     ):
@@ -1787,6 +1922,9 @@ def current_activation_readiness(
         (release_control.get("control_purpose") == "full_day_release"
          and release_control.get("release_business_day") == business_day)
         or (is_forward_release(release_control) and str(release_control.get("scope_start", "9999")) <= business_day)
+        or (release_control.get("contract") == _CLEANUP_CONTROL_CONTRACT
+            and scope.get("control_contract_version") == _CLEANUP_CONTROL_CONTRACT
+            and parse_time(str(release["created_at"])) < day_start + timedelta(days=1))
     ):
         return {**base, "reason": "current_activation_release_scope_mismatch"}
     release_ready, readiness_reason = _required_operations_qualified(

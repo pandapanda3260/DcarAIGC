@@ -407,6 +407,8 @@ class PaidSourceRefreshCanaryTest(unittest.TestCase):
                 "scheduler_scan_id": None,
                 "recovery_probe_id": None,
                 "incident_authorization_id": None,
+                "manual_command_run_id": None,
+                "catalog_plan_id": None,
                 "compensation_authorization_id": self.compensation["authorization"]["id"],
                 "paid_scope_identity": self.compensation["original_identity"].scope_identity,
                 "paid_sequence": 1,

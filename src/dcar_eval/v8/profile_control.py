@@ -139,7 +139,7 @@ def _target_snapshot(
 ) -> dict[str, Any]:
     if profile_id not in PROFILE_FAMILIES:
         raise ProfileControlError("profile_control_profile_invalid", "Unknown acquisition profile")
-    if profile_id == INTEGRATED_PROFILE and int(connection.execute("PRAGMA user_version").fetchone()[0]) != 20:
+    if profile_id == INTEGRATED_PROFILE and int(connection.execute("PRAGMA user_version").fetchone()[0]) not in {20, 21}:
         raise ProfileControlError("profile_control_schema_invalid", "Integrated acquisition requires schema 20")
     try:
         snapshot = snapshot_by_id(connection, roster_snapshot_id)
@@ -155,7 +155,7 @@ def _target_snapshot(
 
 
 def _require_schema19(connection: sqlite3.Connection) -> None:
-    if int(connection.execute("PRAGMA user_version").fetchone()[0]) not in {19, 20}:
+    if int(connection.execute("PRAGMA user_version").fetchone()[0]) not in {19, 20, 21}:
         raise ProfileControlError(
             "profile_control_schema_invalid", "Profile control requires schema 19 or 20"
         )
@@ -1791,7 +1791,7 @@ def enqueue_current_activation_hold_command(
         _require_schema19(connection)
         if command == "capture_release":
             require_current_process_writer_lock(connection)
-            if connection.execute("PRAGMA user_version").fetchone()[0] != 20:
+            if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
                 raise ProfileControlError("capture_release_schema_required", "Capture release actions require schema20")
         if command == "hold_begin":
             binding = {
@@ -2095,7 +2095,7 @@ CROSS_PROFILE_ABORT_CONTRACT = "cross-profile-abort-restore-v1"
 
 
 def _abort_require_writer(connection: sqlite3.Connection) -> None:
-    if not connection.in_transaction or connection.execute("PRAGMA user_version").fetchone()[0] != 20:
+    if not connection.in_transaction or connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
         raise ProfileControlError("profile_abort_transaction_required", "Abort requires schema20 and a caller transaction")
     require_current_process_writer_lock(connection)
 
@@ -2355,14 +2355,14 @@ def begin_cross_profile_switch_in_transaction(
             "profile_control_transaction_required", "BEGIN requires a caller transaction"
         )
     _require_schema19(connection)
-    if effective_now and connection.execute("PRAGMA user_version").fetchone()[0] == 20:
+    if effective_now and connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}:
         raise ProfileControlError("profile_control_effective_now_forbidden", "Schema20 cross-profile switches require a future business-day boundary")
     timestamp = _utc(now)
     local = parse_time(timestamp).astimezone(BEIJING)
     # This untrusted shape only postpones the clock check. The full source
     # validator below must prove the actual user decision before any write.
     approved_future_shape = (
-        connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}
         and target_profile_id == INTEGRATED_PROFILE
         and isinstance(capture_source_operations, Mapping)
         and isinstance(capture_source_operations.get("operations"), Mapping)
@@ -2483,7 +2483,7 @@ def begin_cross_profile_switch_in_transaction(
         "effective_mode": "approved_future_boundary" if approved_future_shape else "immediate" if effective_now else "next_midnight",
         "superseded_activation_ids": superseded_activation_ids,
     }
-    if connection.execute("PRAGMA user_version").fetchone()[0] == 20:
+    if connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}:
         metadata["eligibility_contract"] = ELIGIBILITY_CONTRACT
     if frozen_capture_source is not None:
         metadata["capture_operation_source"] = frozen_capture_source
@@ -3008,7 +3008,7 @@ def complete_cross_profile_switch(
         initial_target = activation_by_id(
             connection, int(initial_start["target_activation_id"])
         )
-        if (connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        if (connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}
                 and parse_time(timestamp) >= parse_time(initial_target["effective_at"])):
             raise ProfileControlError("profile_control_eligibility_window_closed", "Late COMPLETE cannot backdate target eligibility; use explicit abort")
         if initial_target.get("cancellation") is not None:

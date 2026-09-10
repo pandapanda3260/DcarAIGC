@@ -32,7 +32,7 @@ export default function AppShell({ active, actions, header, children }: { active
           <div className="page-header-copy"><span className="page-header-eyebrow">{copy.eyebrow}</span><h1 className="page-header-title">{copy.title}</h1>{copy.description && <p className="page-header-description">{copy.description}</p>}</div>
           {actions && <div className="page-header-actions">{actions}</div>}
         </header>)}
-        {serviceState.kind === "offline" && <div className={`${serviceStyles.banner} ${serviceStyles.offline}`} role="status">
+        {serviceState.kind === "error" && <div className={`${serviceStyles.banner} ${serviceStyles.offline}`} role="status">
           <strong>{serviceState.label}</strong>
           <span>{serviceState.description}</span>
         </div>}

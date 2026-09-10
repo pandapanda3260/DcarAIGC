@@ -323,14 +323,13 @@ def audit_evaluations(
 def effective_direction(
     content: Mapping[str, Any], evaluation: Mapping[str, Any] | None
 ) -> str:
-    """Resolve direction while treating the legacy ``unknown`` token as absent."""
+    """Resolve the work's own direction; account classifications never infer it."""
 
     evaluation = evaluation or {}
     for value in (
         content.get("manual_content_direction"),
         evaluation.get("content_direction"),
         content.get("evaluation_content_direction"),
-        content.get("account_content_direction"),
     ):
         direction = str(value or "")
         if direction in {"new_car", "used_car", "media", "other"}:
@@ -349,6 +348,5 @@ def effective_direction_sql(
     return (
         f"COALESCE(NULLIF({content_alias}.manual_content_direction,'unknown'),"
         f"NULLIF({evaluation_alias}.content_direction,'unknown'),"
-        f"NULLIF({content_alias}.evaluation_content_direction,'unknown'),"
-        f"NULLIF({account_alias}.content_direction,'unknown'),'unknown')"
+        f"NULLIF({content_alias}.evaluation_content_direction,'unknown'),'unknown')"
     )

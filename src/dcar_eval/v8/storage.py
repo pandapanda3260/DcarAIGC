@@ -55,7 +55,7 @@ DEFAULT_DB = configured_default_database()
 SCHEMA_VERSION = 19
 # Keep the historical fixture/bootstrap schema stable. Production schema20 is
 # installed only through the explicit offline migration and paired release.
-LATEST_SCHEMA_VERSION = 20
+LATEST_SCHEMA_VERSION = 21
 CURRENT_SCHEMA_MIGRATION_NAME = "dual-acquisition-profile-roster-v1"
 SCHEMA_MIGRATION_NAMES = {
     11: "interaction-user-v1-fallback-keys",
@@ -68,6 +68,7 @@ SCHEMA_MIGRATION_NAMES = {
     18: "matrix-roster-source-routing",
     19: "dual-acquisition-profile-roster-v1",
     20: "integrated-video-capture-v25",
+    21: "account-classification-v1",
 }
 RUNTIME_COMPATIBLE_SCHEMA_VERSIONS = frozenset(SCHEMA_MIGRATION_NAMES)
 _LIVE_WAL_READ_ONLY = ContextVar("dcar_live_wal_read_only", default=False)
@@ -529,7 +530,7 @@ def connect(
         if formal_database:
             _require_connection_database_identity(connection, path)
             require_schema_compatibility(
-                connection, supported_versions=frozenset({19, 20})
+                connection, supported_versions=frozenset({19, 20, 21})
             )
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA busy_timeout = 10000")
@@ -1772,7 +1773,13 @@ def schema_compatibility_state(
         and actual_name == expected_name
         and max_migration_version == user_version
     )
-    if compatible and user_version == 20:
+    if compatible and user_version == 21:
+        try:
+            from .schema_v21 import validate_structure
+            validate_structure(connection)
+        except (ValueError, sqlite3.DatabaseError):
+            compatible = False
+    elif compatible and user_version == 20:
         try:
             from .schema_v20 import validate_structure
 
@@ -4380,6 +4387,12 @@ def _migrate_v19_to_v20(connection: sqlite3.Connection) -> dict[str, object]:
     return migrate(connection)
 
 
+def _migrate_v20_to_v21(connection: sqlite3.Connection) -> dict[str, object]:
+    from .schema_v21 import migrate
+
+    return migrate(connection)
+
+
 def validate_v17_v18_lineage(
     source_connection: sqlite3.Connection, candidate_connection: sqlite3.Connection
 ) -> dict[str, object]:
@@ -4437,6 +4450,7 @@ def migrate_database(
         18: _migrate_v17_to_v18,
         19: _migrate_v18_to_v19,
         20: _migrate_v19_to_v20,
+        21: _migrate_v20_to_v21,
     }
     if (
         from_version < 8
@@ -4474,7 +4488,7 @@ def initialize_database(
 
     _require_initialization_safety(connection)
     requested_version = target_version or SCHEMA_VERSION
-    if requested_version not in {SCHEMA_VERSION, LATEST_SCHEMA_VERSION}:
+    if requested_version not in {SCHEMA_VERSION, 20, LATEST_SCHEMA_VERSION}:
         raise SchemaMigrationError("unsupported initialization target")
     if not _table_names(connection):
         if int(connection.execute("PRAGMA user_version").fetchone()[0]) != 0:

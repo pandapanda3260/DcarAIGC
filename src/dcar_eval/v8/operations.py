@@ -17,6 +17,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from .account_operating_status import account_operating_status
 from .account_operating_receipts import load_admission_members, load_update_frequencies
+from .account_classification import classification_for_account, classification_sql
 from .account_states import (
     AccountStateError,
     set_account_enabled_in_transaction,
@@ -66,7 +67,6 @@ CONTENT_PATCH_FIELDS = frozenset(
         "content_type",
         "account_uid",
         "account_name",
-        "account_type",
         "content_direction",
     }
 )
@@ -342,22 +342,17 @@ def _save_account(
 
         merged = dict(account) if account is not None else {}
         for field in (
-            "phone", "operator_name", "account_type", "content_direction", "enabled"
+            "phone", "operator_name", "enabled"
         ):
             if field not in supplied:
                 continue
             # Provider/internal retries must not erase local operating properties
             # with empty metadata. Explicit ID edits may intentionally clear them.
             if account is not None and target_account_id is None:
-                if supplied[field] in (None, "") or (
-                    field in {"account_type", "content_direction"}
-                    and supplied[field] == "unknown"
-                ):
+                if supplied[field] in (None, ""):
                     continue
             merged[field] = supplied[field]
         phone, normalized = normalize_phone(merged.get("phone"))
-        account_type = _enum(merged.get("account_type"), ACCOUNT_TYPES, "account_type")
-        direction = _enum(merged.get("content_direction"), DIRECTIONS, "content_direction")
         enabled = bool(merged.get("enabled", True))
         state_event_identity_id: int | None = None
         persisted_enabled = enabled
@@ -376,17 +371,14 @@ def _save_account(
             phone,
             normalized,
             str(merged.get("operator_name") or "").strip(),
-            account_type,
-            direction,
             int(persisted_enabled),
         )
         if account is None:
             cursor = connection.execute(
                 """
                 INSERT INTO accounts(
-                    phone, phone_normalized, operator_name, account_type,
-                    content_direction, enabled, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    phone, phone_normalized, operator_name, enabled, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (*local_values, captured_at, captured_at),
             )
@@ -399,7 +391,7 @@ def _save_account(
             connection.execute(
                 """
                 UPDATE accounts SET phone=?, phone_normalized=?, operator_name=?,
-                    account_type=?, content_direction=?, enabled=?, updated_at=?
+                    enabled=?, updated_at=?
                 WHERE id=?
                 """,
                 (*local_values, captured_at, account_id),
@@ -509,7 +501,7 @@ def update_account(
     reason: str = "local account enabled-state update",
     activation_id: int | None = None,
 ) -> Dict[str, Any]:
-    allowed = {"phone", "operator_name", "account_type", "content_direction", "enabled"}
+    allowed = {"phone", "operator_name", "enabled"}
     if set(value) - allowed:
         raise OperationError("本地只能编辑手机号、运营信息和采集开关；身份请在矩阵通维护")
     return _save_account(
@@ -533,7 +525,7 @@ def update_account_in_transaction(
 ) -> Dict[str, Any]:
     """Apply ordinary local edits using the caller's account/roster transaction."""
 
-    allowed = {"phone", "operator_name", "account_type", "content_direction", "enabled"}
+    allowed = {"phone", "operator_name", "enabled"}
     if set(value) - allowed:
         raise OperationError("本地只能编辑手机号、运营信息和采集开关；身份请在矩阵通维护")
     return _save_account(
@@ -762,7 +754,7 @@ def _raise_identity_conflict(
 
 
 def merge_content_records(connection, first_id: int, second_id: int) -> int:
-    schema20 = connection.execute("PRAGMA user_version").fetchone()[0] == 20
+    schema20 = connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}
     if schema20:
         from .metric_field_facts import resolve_metric_content_id
         first_id = resolve_metric_content_id(connection, first_id)
@@ -1103,7 +1095,7 @@ def upsert_content(
             "SELECT * FROM content_items WHERE platform=? AND normalized_url_hash=?",
             (platform, identity["normalized_url_hash"]),
         ).fetchone()
-        if connection.execute("PRAGMA user_version").fetchone()[0] == 20:
+        if connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}:
             from .metric_field_facts import resolve_metric_content_id
             identity_match = connection.execute(
                 "SELECT content_id FROM content_identities WHERE platform_identity_key=?", (identity["identity_key"],),
@@ -1379,7 +1371,7 @@ def update_content(
     original_content_id = content_id
     captured_at = now_utc()
     with _content_write_transaction(db_path) as connection:
-        if connection.execute("PRAGMA user_version").fetchone()[0] == 20:
+        if connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}:
             from .metric_field_facts import resolve_metric_content_id
             content_id = resolve_metric_content_id(connection, content_id)
         row = connection.execute(
@@ -1512,10 +1504,6 @@ def update_content(
         if "content_type" in updates:
             columns["content_type"] = (
                 str(updates["content_type"] or "unknown").strip() or "unknown"
-            )
-        if "account_type" in updates:
-            columns["legacy_account_type"] = _enum(
-                updates["account_type"], ACCOUNT_TYPES, "account_type"
             )
         if "content_direction" in updates:
             direction = _enum(
@@ -1764,8 +1752,8 @@ def account_read_model(
             identity["unique_id"] = statistic_metadata["display_account_id"]
     return {
         "id": account["id"], "phone": account["phone"],
-        "operator_name": account["operator_name"], "account_type": account["account_type"],
-        "content_direction": account["content_direction"], "enabled": bool(account["enabled"]),
+        "operator_name": account["operator_name"], **classification_for_account(connection, int(account["id"])),
+        "enabled": bool(account["enabled"]),
         "platforms": identities, "updated_at": account["updated_at"],
         "account_status": account_operating_status({**dict(account), "update_frequency": frequency}),
         "update_frequency": frequency,
@@ -1776,6 +1764,8 @@ def export_accounts_xlsx(
     *,
     douyin_authorization_targets: Optional[Sequence[tuple[int, str, str]]] = None,
     account_status: str | None = None,
+    account_group: str | None = None, business_direction: str | None = None,
+    query: str = "", platform: str | None = None,
     read_only: bool = False,
     db_path: Path = DEFAULT_DB,
 ) -> bytes:
@@ -1809,6 +1799,13 @@ def export_accounts_xlsx(
         roster = runtime_account_summary(connection)
         frequencies = load_update_frequencies(connection)
         admissions = load_admission_members(connection)
+        from .account_directory import has_account_directory, directory_account_items
+        if has_account_directory(connection):
+            accounts = directory_account_items(connection, roster=roster, update_frequencies=frequencies,
+                                               admission_members=admissions, account_status=account_status, query=query, platform=platform,
+                                               account_group=account_group, business_direction=business_direction)
+            return build_accounts_workbook(accounts, douyin_authorization_targets=authorization_targets,
+                                           exported_at=now_utc())
         predicate, parameters = account_status_predicate(account_status, frequencies)
         account_rows = connection.execute(
             f"SELECT a.* FROM accounts a WHERE {predicate} ORDER BY a.updated_at DESC, a.id DESC",
@@ -1837,7 +1834,8 @@ def export_contents_csv(*, db_path: Path = DEFAULT_DB) -> bytes:
         "title",
         "account_uid",
         "account_name",
-        "account_type",
+        "account_group",
+        "business_direction",
         "content_direction",
         "primary_selling_point_code",
         "content_automotive_score",
@@ -1854,7 +1852,8 @@ def export_contents_csv(*, db_path: Path = DEFAULT_DB) -> bytes:
         rows = connection.execute(
             f"""
             WITH {DISPLAY_EFFECTIVE_EVALUATIONS_CTE}
-            SELECT c.*, COALESCE(a.account_type,c.legacy_account_type,'unknown') account_type,
+            SELECT c.*, {classification_sql(connection, "account_group")} account_group,
+                {classification_sql(connection, "business_direction")} business_direction,
                    {direction_sql} direction,
                    ev.primary_selling_point_code, ev.content_automotive_score,
                    COALESCE(ev.evaluation_freshness,'missing') evaluation_freshness,
@@ -1864,7 +1863,7 @@ def export_contents_csv(*, db_path: Path = DEFAULT_DB) -> bytes:
             LEFT JOIN duplicate_relations d ON d.id=(SELECT id FROM duplicate_relations WHERE duplicate_content_id=c.id AND status='confirmed' ORDER BY id LIMIT 1)
             LEFT JOIN content_items original ON original.id=d.original_content_id
             WHERE {canonical_content_predicate(connection)}
-              AND {content_statistics_scope_sql("c")}
+              AND {content_statistics_scope_sql("c", connection=connection)}
             ORDER BY c.id
             """
         ).fetchall()
@@ -1882,7 +1881,8 @@ def export_contents_csv(*, db_path: Path = DEFAULT_DB) -> bytes:
                         "title": item["title"],
                         "account_uid": item["raw_account_uid"],
                         "account_name": item["raw_account_name"],
-                        "account_type": item["account_type"],
+                        "account_group": item["account_group"],
+                        "business_direction": item["business_direction"],
                         "content_direction": item["direction"],
                         "primary_selling_point_code": item[
                             "primary_selling_point_code"

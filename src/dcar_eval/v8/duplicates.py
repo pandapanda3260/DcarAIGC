@@ -330,7 +330,10 @@ def _fingerprint_content(
         inputs, source_sha256 = _current_source_state(connection, content_id)
     content = inputs["content"]
     output_root = _fingerprint_root_for_database(db_path)
-    target = output_root / f"{content['link_id']}.json"
+    # A source change must not replace bytes referenced by an older slot or
+    # an in-flight snapshot. Existing legacy paths remain readable via the
+    # registered artifact when the processing slot is reused.
+    target = output_root / str(content["link_id"]) / f"{source_sha256}.json"
     bundle = inputs["bundle"]
     metadata: Dict[str, Any] = {}
     slot_source = source_sha256

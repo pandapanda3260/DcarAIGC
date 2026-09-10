@@ -39,7 +39,7 @@ def _batch(connection: sqlite3.Connection, batch_id: int) -> dict[str, Any]:
 
 def freeze_batch(connection: sqlite3.Connection, *, work_ids: Sequence[int], at: str) -> dict[str, Any]:
     """Freeze a pair or odd final singleton; never rewrite an existing batch."""
-    if connection.execute("PRAGMA user_version").fetchone()[0] != 20 or not connection.in_transaction:
+    if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21} or not connection.in_transaction:
         raise ValueError("batch freeze requires a schema20 writer transaction")
     if not 1 <= len(work_ids) <= MAX_MEMBERS or len(set(work_ids)) != len(work_ids):
         raise ValueError("statistics batches contain one or two unique members")
@@ -50,6 +50,10 @@ def freeze_batch(connection: sqlite3.Connection, *, work_ids: Sequence[int], at:
         if row is None or row["operation"] != OPERATION or row["platform"] != "douyin":
             raise ValueError("statistics work identity or platform mismatch")
         envelope = json.loads(row["envelope_json"])
+        catalog_plan_id = envelope.get("catalog_plan_id")
+        if catalog_plan_id is not None and (type(catalog_plan_id) is not int or catalog_plan_id <= 0
+                or row["source_plan_id"] != catalog_plan_id or envelope.get("manual_command_run_id") is not None):
+            raise ValueError("statistics catalog member must retain one exclusive source plan")
         if envelope.get("stage") != "metrics" or envelope.get("source_stage", "metrics") != "metrics":
             raise ValueError("statistics batch cannot contain other request stages")
         member_identity = _identity([str(row["platform_content_id"])], envelope["logical_due"])
@@ -57,9 +61,11 @@ def freeze_batch(connection: sqlite3.Connection, *, work_ids: Sequence[int], at:
                         "member_scope_identity": usage_settlements.member_identity(member_identity.document)})
     members.sort(key=lambda value: value["work"]["platform_content_id"])
     first = members[0]["envelope"]
+    if len(members) != 1 and any(m["envelope"].get("manual_command_run_id") is not None for m in members):
+        raise ValueError("single-content manual commands cannot authorize other batch members")
     for member in members:
         if any(member["envelope"].get(key) != first.get(key) for key in
-               ("logical_due", "activation_id", "profile_id", "roster_snapshot_id", "roster_members_sha256")):
+               ("logical_due", "activation_id", "profile_id", "roster_snapshot_id", "roster_members_sha256", "catalog_plan_id")):
             raise ValueError("statistics batch cannot mix logical due or roster activation")
     request = _identity([m["work"]["platform_content_id"] for m in members], first["logical_due"])
     previous = connection.execute("SELECT id FROM fetch_request_batches WHERE request_scope_identity=? AND sequence=0", (request.scope_identity,)).fetchone()
@@ -207,14 +213,16 @@ def execute_batch(frozen: dict[str, Any], *, db_path: Path, at: str,
     if raw is None:
         ids = [m["work"]["platform_content_id"] for m in frozen["members"]]
         from .capture_runtime import _business_day
-        task_id = "capture-v25:" + _business_day(at)
+        envelope = frozen["members"][0]["envelope"]
+        task_id = envelope.get("task_id", "capture-v25:" + _business_day(at))
+        task_cap = envelope.get("task_max_amount", 50.0)
         budget = providers._budget_for_call(provider="TikHub", operation=OPERATION, price=providers.TIKHUB_PRICE,
-            task_id=task_id, task_max_amount=50.0, db_path=db_path)
+            task_id=task_id, task_max_amount=task_cap, db_path=db_path)
         key = providers._load_key(providers.TIKHUB_KEY_FILE, "TIKHUB_API_KEY")
         outcome = capture.execute_request_batch(batch_id=batch_id, paid_request_identity=frozen["request_identity"],
             member_request_identities=frozen["member_identities"], member_assignment_ids=frozen["assignment_ids"],
             call=partial(_statistics_call, ids, key), request_transport=providers._freeze_tikhub_transport(),
-            budget_id=budget, task_id=task_id, task_max_amount=50.0, db_path=db_path)
+            budget_id=budget, task_id=task_id, task_max_amount=task_cap, db_path=db_path)
         raw_response_id, cost = outcome.raw_response_id, outcome.amount
     else:
         raw_response_id = int(raw[0])
@@ -249,9 +257,11 @@ def run_one(db_path: Path = DEFAULT_DB, at: str | None = None) -> dict[str, Any]
         selected: list[int] = []
         first: dict[str, Any] | None = None
         for row in candidates:
-            if not runtime.execution_work_allowed(int(row["id"])):
-                continue
             envelope = json.loads(row["envelope_json"])
+            # Explicit one-content commands share the single-content capture
+            # path with direct metric refreshes, including free raw replay.
+            if envelope.get("manual_command_run_id") is not None:
+                continue
             state, reason = runtime._readiness(connection, envelope, at=at)
             if state != "runnable":
                 connection.execute("UPDATE capture_work_items SET state=?,reason=?,updated_at=? WHERE id=?",
@@ -260,7 +270,7 @@ def run_one(db_path: Path = DEFAULT_DB, at: str | None = None) -> dict[str, Any]
             if first is None:
                 first = envelope
             if any(envelope.get(key) != first.get(key) for key in
-                   ("logical_due", "activation_id", "roster_snapshot_id", "roster_members_sha256", "request_batch_id")):
+                   ("logical_due", "activation_id", "roster_snapshot_id", "roster_members_sha256", "request_batch_id", "catalog_plan_id")):
                 continue
             selected.append(int(row["id"]))
             if len(selected) == MAX_MEMBERS:
@@ -289,7 +299,8 @@ def run_one(db_path: Path = DEFAULT_DB, at: str | None = None) -> dict[str, Any]
         try:
             with paid_scope("metrics", activation_id=first["activation_id"], roster_snapshot_id=first["roster_snapshot_id"],
                     roster_snapshot_hash=first["roster_members_sha256"], scheduler_run_id=claim.scheduler_run_id,
-                    scheduler_attempt_id=claim.attempt_id, business_day=runtime._business_day(claim_at)):
+                    scheduler_attempt_id=claim.attempt_id, business_day=runtime._business_day(claim_at),
+                    manual_command_run_id=first.get("manual_command_run_id"), catalog_plan_id=first.get("catalog_plan_id")):
                 check_lease()
                 result = execute_batch(frozen, db_path=db_path, at=claim_at, lease_claim=claim)
         except Exception as error:

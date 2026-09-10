@@ -245,7 +245,8 @@ def deployment_context(connection: sqlite3.Connection, *, project_root: Path) ->
         yield False
         return
     from .storage import now_utc
-    at = now_utc()
+    from .capture_evidence_preflight import evidence_time
+    at = evidence_time(now_utc())
     with account.runtime_context(connection, build=build, build_ref=_ref(path), at=at), using_plan(
         connection, reference, project_root=project_root, at=at
     ):

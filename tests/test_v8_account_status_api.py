@@ -186,6 +186,9 @@ class AccountStatusApiTest(unittest.TestCase):
             self.account_id = connection.execute("SELECT id FROM accounts").fetchone()[0]
             self.identity_id = connection.execute("SELECT id FROM account_platform_identities").fetchone()[0]
             connection.execute("UPDATE account_platform_identities SET uid='123456789'")
+            # Publishing-status tests use the work's own scene. Account business
+            # labels no longer provide a fallback for content classification.
+            connection.execute("UPDATE content_items SET manual_content_direction='new_car'")
             connection.commit()
             roster = seal_system_members(connection, [{"platform": "douyin", "uid": "123456789"}],
                                          raw_root=self.root / "rosters", actor="test", reason="fixture")

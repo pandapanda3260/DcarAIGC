@@ -172,7 +172,7 @@ def _validate_chain(connection: sqlite3.Connection) -> list[dict[str, Any]]:
             or value["previous_activation_sha256"] != expected_sha
             or value["activation_sha256"] != activation_digest(value)
             or value["profile_id"] not in PROFILE_FAMILIES
-            or (value["profile_id"] == INTEGRATED_PROFILE and schema_version != 20)
+            or (value["profile_id"] == INTEGRATED_PROFILE and schema_version not in {20, 21})
             or value["contract_version"] != CONTRACT_VERSION
         ):
             raise ProfileActivationError(
@@ -183,7 +183,7 @@ def _validate_chain(connection: sqlite3.Connection) -> list[dict[str, Any]]:
         value = _cancellation_row(row)
         if (
             value["contract_version"] not in ({CANCELLATION_CONTRACT_VERSION, CANCELLATION_V2}
-                                               if schema_version == 20 else {CANCELLATION_CONTRACT_VERSION})
+                                               if schema_version in {20, 21} else {CANCELLATION_CONTRACT_VERSION})
             or value["cancellation_sha256"] != cancellation_digest(value)
         ):
             raise ProfileActivationError(
@@ -202,7 +202,7 @@ def activation_eligibility(connection: sqlite3.Connection, activation: Mapping[s
     from . import account_roster_capture
     if metadata.get("eligibility_contract") == account_roster_capture.ELIGIBILITY_CONTRACT:
         return account_roster_capture.activation_eligibility(connection, activation)
-    required = (connection.execute("PRAGMA user_version").fetchone()[0] == 20
+    required = (connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}
                 and metadata.get("eligibility_contract") == ELIGIBILITY_CONTRACT)
     result: dict[str, Any] = {"contract_version": ELIGIBILITY_CONTRACT, "required": required,
                              "eligible": not required, "activation_id": activation["activation_id"]}
@@ -304,7 +304,7 @@ def append_activation(
         raise ProfileActivationError(
             "activation_profile_invalid", "Unknown acquisition profile"
         )
-    if profile_id == INTEGRATED_PROFILE and int(connection.execute("PRAGMA user_version").fetchone()[0]) != 20:
+    if profile_id == INTEGRATED_PROFILE and int(connection.execute("PRAGMA user_version").fetchone()[0]) not in {20, 21}:
         raise ProfileActivationError("activation_schema_invalid", "Integrated acquisition requires schema 20")
     if not _SHA256.fullmatch(str(roster_members_sha256)):
         raise ProfileActivationError(
@@ -422,7 +422,7 @@ def cancel_activation(
         )
     timestamp = _timestamp(cancelled_at)
     metadata_value = _metadata(metadata)
-    schema20 = connection.execute("PRAGMA user_version").fetchone()[0] == 20
+    schema20 = connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}
     if cancellation_kind not in {"pre_effective", "never_eligible_cleanup"} or (not schema20 and cancellation_kind != "pre_effective"):
         raise ProfileActivationError("activation_cancellation_invalid", "Unsupported cancellation kind")
     with _atomic(connection):

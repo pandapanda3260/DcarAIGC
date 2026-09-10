@@ -139,7 +139,7 @@ test("the three shell headers share the same markup and retain their original co
 test("the three custom shell headers keep their title, description and existing actions", async () => {
   for (const [path, eyebrow, title, description, actions] of [
     ["contents/ContentsPage.tsx", "内容资料库", "发布内容明细", "更新数据时会同步更新详情、指标以及已保存的视频和图片；重复提醒会指向最早发布的内容。", ["下载内容表格"]],
-    ["accounts/AccountsPage.tsx", ["系统托管名单", "矩阵通名册"], "账号信息", "一个平台账号一行，手机号仅作运营信息；未采集的粉丝和平台作品总量显示“—”。", ["新增系统账号", "批量上传账号", "下载账号表格"]],
+    ["accounts/AccountsPage.tsx", ["系统账号", "矩阵通名册"], "账号信息", "一个平台账号一行，手机号仅作运营信息；未采集的粉丝和平台作品总量显示“—”。", ["新增系统账号", "批量上传账号", "下载账号表格"]],
     ["tasks/TasksPage.tsx", "每次生成都会保留", "日报、周报与自定义报告", "报告包含开始和结束当天；重新生成会新增一个版本，旧版本仍会保留。", ["新建任务", "generatingCount"]],
   ]) {
     const source = await sourceFile(path);

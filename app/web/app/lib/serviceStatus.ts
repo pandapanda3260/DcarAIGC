@@ -17,12 +17,22 @@ export type ServiceHealth = {
     next_scheduled_at?: string | null;
   } | null;
 };
+const serviceLabels = {
+  normal: "系统正常",
+  pending: "数据待更新",
+  error: "服务异常",
+} as const;
+
 export type ServiceState = {
-  // AppShell renders faults in red and other non-running conditions in amber.
-  kind: "checking" | "offline" | "read-only" | "online" | "paused" | "stopped" | "unknown" | "stale";
-  label: string;
+  // Loading has no business status. Operational reasons stay in the description.
+  kind: keyof typeof serviceLabels | null;
+  label: (typeof serviceLabels)[keyof typeof serviceLabels] | "";
   description: string;
 };
+
+function serviceState(kind: keyof typeof serviceLabels, description: string): ServiceState {
+  return { kind, label: serviceLabels[kind], description };
+}
 
 function captureTime(health: ServiceHealth): string {
   const value = health.data_freshness?.last_successful_capture_at;
@@ -54,20 +64,20 @@ function snapshotStatus(health: ServiceHealth): ServiceState {
     ? `当前不在自动发布时段，00:00–09:00（北京时间）不累计同步延迟。${next ? `下次计划发布：${next}（北京时间）。` : ""}`
     : "";
   if (sync?.status === "current" && installed) {
-    return { kind: "online", label: "快照同步正常", description: `${lastSync}线上展示已发布的只读数据，同步成功不代表采集完整。${schedule}` };
+    return serviceState("normal", `快照同步正常。${lastSync}线上展示已发布的只读数据，同步成功不代表采集完整。${schedule}`);
   }
   if (sync?.status === "delayed" && installed) {
-    return { kind: "stale", label: "快照同步延迟", description: `${lastSync}已超过计划发布时段内的同步等待时间，请检查自动发布任务。${schedule}` };
+    return serviceState("pending", `快照同步延迟。${lastSync}已超过计划发布时段内的同步等待时间，请检查自动发布任务。${schedule}`);
   }
-  return { kind: "unknown", label: "同步状态待确认", description: `${lastSync}暂时无法确认最近的快照同步状态。${schedule}` };
+  return serviceState("pending", `${lastSync}暂时无法确认最近的快照同步状态。${schedule}`);
 }
 
 export function dataServiceStatus(health: ServiceHealth | undefined, failed: boolean): ServiceState {
   // A failed refresh must not keep claiming that stale cached health is good.
   if (failed || (health && (health.status !== "ok" || typeof health.read_only !== "boolean"))) {
-    return { kind: "offline", label: "数据服务不可用", description: "暂时无法读取业务数据，请稍后刷新页面。登录与用户权限管理不受影响。" };
+    return serviceState("error", "数据服务不可用，暂时无法读取业务数据，请稍后刷新页面。登录与用户权限管理不受影响。");
   }
-  if (!health) return { kind: "checking", label: "正在检查数据服务", description: "" };
+  if (!health) return { kind: null, label: "", description: "" };
   const lastCapture = captureTime(health);
   const automation = health.automation;
   if (health.read_only || automation?.scheduler_state === "read_only") {
@@ -76,30 +86,30 @@ export function dataServiceStatus(health: ServiceHealth | undefined, failed: boo
   // A read-only replica has no local capture duty. On the writer, a broken gate must not be
   // disguised as a planned scheduler pause or stop.
   if (automation?.paid_dispatch_state === "invalid") {
-    return { kind: "offline", label: "自动抓取异常", description: "采集通道校验未通过，自动抓取无法更新数据，请联系技术处理。" };
+    return serviceState("error", "自动抓取异常：采集通道校验未通过，自动抓取无法更新数据，请联系技术处理。");
   }
   if (automation?.scheduler_state === "paused") {
-    return { kind: "paused", label: "自动任务已暂停", description: `自动抓取和自动报告暂未运行。${lastCapture}` };
+    return serviceState("pending", `自动任务已暂停，自动抓取和自动报告暂未运行。${lastCapture}`);
   }
   if (automation?.scheduler_state === "stopped") {
-    return { kind: "stopped", label: "自动任务未运行", description: `当前可以查看已有数据，自动抓取和自动报告尚未启动。${lastCapture}` };
+    return serviceState("pending", `当前可以查看已有数据，自动抓取和自动报告尚未启动。${lastCapture}`);
   }
   if (automation?.scheduler_state !== "running") {
-    return { kind: "unknown", label: "自动任务状态未知", description: `暂时无法确认自动抓取和自动报告是否运行。${lastCapture}` };
+    return serviceState("pending", `暂时无法确认自动抓取和自动报告是否运行。${lastCapture}`);
   }
   if (["draining", "sealed"].includes(automation.paid_dispatch_state ?? "")) {
-    return { kind: "paused", label: "自动抓取已暂停", description: `采集尚未恢复，自动报告仅使用已有数据。${lastCapture}` };
+    return serviceState("pending", `自动抓取已暂停，采集尚未恢复，自动报告仅使用已有数据。${lastCapture}`);
   }
   if (automation.paid_dispatch_state !== "open") {
-    return { kind: "unknown", label: "自动抓取状态待确认", description: "暂时无法确认自动抓取是否可用，请稍后刷新页面。" };
+    return serviceState("pending", "暂时无法确认自动抓取是否可用，请稍后刷新页面。");
   }
   if (health.data_freshness?.status === "stale") {
-    return { kind: "stale", label: "数据更新延迟", description: "自动任务已运行，数据仍未更新至预期时间。" };
+    return serviceState("pending", `自动任务已运行，数据仍未更新至预期时间。${lastCapture}`);
   }
   // Green only claims the scheduler is running and the paid gate is open. Freshness that is not
   // yet sealed into a coverage receipt is a normal daily window, not an operator-actionable fault;
   // a genuinely outdated day still surfaces through the "stale" branch above.
-  return { kind: "online", label: "自动任务运行中", description: lastCapture };
+  return serviceState("normal", `自动任务运行中，采集通道可用；不代表所有数据已采集完整。${lastCapture}`);
 }
 
 type ReportTask = { task_type: string; period_start: string; period_end: string; task_status: string };

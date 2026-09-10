@@ -256,12 +256,21 @@ def resolve_route(connection: sqlite3.Connection, *, account_id: int | None,
 
 def require_send_route(connection: sqlite3.Connection, *, scope: Any, operation: str, at: str) -> dict[str, Any] | None:
     """Both admission and the final send transaction re-read the same fence."""
-    if connection.execute("PRAGMA user_version").fetchone()[0] != 20:
+    if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
         return None
     from .provider_budget import PaidScopeBlocked
 
-    assignment = resolve_route(connection, account_id=scope.account_id, content_id=scope.content_id,
-                               operation=operation, at=at)
+    if getattr(scope, "manual_command_run_id", None) is not None:
+        from .capture_manual import assignment_for_command
+        assignment = assignment_for_command(connection, scope.manual_command_run_id,
+            content_id=scope.content_id, operation=operation, at=at)
+    elif getattr(scope, "catalog_plan_id", None) is not None:
+        from .account_catalog_capture import assignment_for_plan
+        assignment = assignment_for_plan(connection, scope.catalog_plan_id, identity_id=scope.identity_id,
+            operation=operation, at=at, use_planning_cache=False)
+    else:
+        assignment = resolve_route(connection, account_id=scope.account_id, content_id=scope.content_id,
+                                   operation=operation, at=at)
     if assignment is None or assignment["mode"] != "active" or assignment["provider"] != "tikhub":
         raise PaidScopeBlocked("route_not_active", "Scope has no active TikHub route assignment")
     expected = _EXECUTION_ASSIGNMENT.get()
@@ -279,7 +288,7 @@ def require_send_route(connection: sqlite3.Connection, *, scope: Any, operation:
 
 def legacy_queue_allowed(connection: sqlite3.Connection, *, account_id: int, content_id: int | None,
                          operations: list[str], at: str) -> bool:
-    if connection.execute("PRAGMA user_version").fetchone()[0] != 20:
+    if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
         return True
     for operation in operations:
         assignment = resolve_route(connection, account_id=account_id, content_id=content_id, operation=operation, at=at)
@@ -408,14 +417,17 @@ def adaptive_cohorts(accounts: list[Mapping[str, Any]], *, business_day: str) ->
     return sorted(result, key=lambda item: (item["platform"], str(item["uid"])))
 
 
-def discovery_window(*, at: str, complete_through: str | None) -> tuple[str, str]:
+def discovery_window(*, at: str, complete_through: str | None,
+                     forward_only: bool = False) -> tuple[str, str]:
+    """New automatic scans never widen their window to fill a historical gap."""
     end = datetime.fromisoformat(timestamp(at).replace("Z", "+00:00"))
     start = end - timedelta(hours=72)
     if complete_through:
         watermark = datetime.fromisoformat(timestamp(complete_through).replace("Z", "+00:00"))
         if watermark > end:
             raise ValueError("watermark lies after query end")
-        start = max(end - timedelta(days=30), watermark - timedelta(hours=72))
+        if not forward_only:
+            start = max(end - timedelta(days=30), watermark - timedelta(hours=72))
     return timestamp(start.isoformat()), timestamp(end.isoformat())
 
 

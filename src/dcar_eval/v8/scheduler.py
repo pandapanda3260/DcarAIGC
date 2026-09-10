@@ -2475,42 +2475,6 @@ def _live_job(
     )
 
 
-def _daily_capture_guard_job(
-    *,
-    effective_from: date,
-    db_path: Path,
-    reports_root: Path,
-    capture_call_override: Optional[
-        Callable[[str, Mapping[str, Any]], ProviderResult]
-    ],
-) -> None:
-    current_day_daily_capture_guard(
-        now=datetime.now(SHANGHAI),
-        effective_from=effective_from,
-        db_path=db_path,
-        reports_root=reports_root,
-        capture_call_override=capture_call_override,
-    )
-
-
-def _current_day_pipeline_guard_job(
-    *,
-    effective_from: date,
-    db_path: Path,
-    reports_root: Path,
-    capture_call_override: Optional[
-        Callable[[str, Mapping[str, Any]], ProviderResult]
-    ],
-) -> None:
-    current_day_pipeline_guard(
-        now=datetime.now(SHANGHAI),
-        effective_from=effective_from,
-        db_path=db_path,
-        reports_root=reports_root,
-        capture_call_override=capture_call_override,
-    )
-
-
 def _has_authorization_health_run(*, db_path: Path) -> bool:
     from .douyin_openapi_sync import AUTHORIZATION_CONTRACT_VERSION
 

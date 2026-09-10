@@ -43,6 +43,46 @@ def account_operating_status(account: Mapping[str, Any]) -> str:
     return str(frequency) if frequency in {"daily", "weekly"} else "unmarked"
 
 
+def _uses_fixed_cleanup_scope(
+    connection: sqlite3.Connection, identity: Mapping[str, Any], *,
+    activation_id: int | None, status: str, at: str,
+) -> bool:
+    """A status toggle cannot rebuild the cleanup's already authorized roster.
+
+    The installed evidence validates the exact frozen member intersection and
+    permits recorded operator pauses. Resuming still passes the ordinary API
+    gate/route validation after enabled is changed inside the same transaction.
+    """
+    if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
+        return False
+    from . import account_cleanup_runtime as cleanup
+    from .capture_authorizations import AuthorizationError
+    from .profile_activations import activation_at
+
+    active = activation_at(connection, at)
+    if active is None or "account_cleanup" not in active.get("metadata", {}):
+        return False
+    try:
+        evidence = cleanup.installed_evidence(connection, at=at, maintenance_only=True)
+        if activation_id != evidence["active"]["activation_id"]:
+            raise AccountOperatingStatusError("account_cleanup_activation_changed", "当前账号名单已变更，请刷新后重试。")
+        capsule = cleanup.private_object(evidence["account_cleanup_generation"]["source_authority"])
+        target = {"account_identity_id": identity["id"], "account_id": identity["account_id"],
+                  "platform": identity["platform"], "uid": identity["uid"]}
+        directory = connection.execute(
+            "SELECT identity_status FROM account_directory_rows WHERE account_id=? AND platform=? AND uid=?",
+            (identity["account_id"], identity["platform"], identity["uid"]),
+        ).fetchone()
+        if status != "paused" and (target not in capsule["eligible_members"]
+                or directory is None or directory["identity_status"] != "existing_verified"):
+            raise AccountOperatingStatusError("account_cleanup_scope_not_admitted", "此账号尚未加入当前采集名单，暂不能恢复采集。")
+        # Pausing can only narrow live eligibility, including an account outside
+        # this approved set. Never mutate a roster or add a new paid scope.
+        return True
+    except AuthorizationError as error:
+        raise AccountOperatingStatusError("account_cleanup_status_unavailable", "当前账号名单校验未通过，请稍后重试。") from error
+
+
 def _resume_member(
     connection: sqlite3.Connection, identity: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -153,6 +193,7 @@ def update_account_operating_status_in_transaction(
             activation_id=activation_id,
         )
         roster_change: Mapping[str, Any] | None = None
+        catalog_policy: Mapping[str, Any] | None = None
         if status is not None:
             identity = connection.execute(
                 "SELECT * FROM account_platform_identities WHERE account_id=?", (account_id,)
@@ -162,6 +203,24 @@ def update_account_operating_status_in_transaction(
                     "account_identity_not_found", "账号缺少平台身份，不能更新账号状态"
                 )
             timestamp = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+            from .account_catalog_capture import installed_policy
+            catalog_policy = installed_policy(connection, at=timestamp)
+            if catalog_policy is not None:
+                from .account_directory import update_directory_operating_fields
+                directory = connection.execute(
+                    "SELECT * FROM account_directory_rows WHERE account_id=?", (account_id,),
+                ).fetchone()
+                if (directory is None or directory["identity_status"] != "existing_verified"
+                        or directory["platform"] != identity["platform"] or directory["uid"] != identity["uid"]):
+                    raise AccountOperatingStatusError(
+                        "account_directory_identity_changed", "账号身份尚未核验，请先完善主页信息。"
+                    )
+                # Saving an operating label does not require a ready locator,
+                # a provider gate or membership in the historical roster.
+                update_directory_operating_fields(connection, account_id, {**supplied, "account_status": status})
+            fixed_cleanup_scope = catalog_policy is None and _uses_fixed_cleanup_scope(
+                connection, identity, activation_id=activation_id, status=status, at=timestamp,
+            )
             set_account_enabled_in_transaction(
                 connection, int(identity["id"]), enabled=status != "paused",
                 effective_at=timestamp, created_at=timestamp, actor=actor, reason=reason,
@@ -174,7 +233,7 @@ def update_account_operating_status_in_transaction(
             # Changing daily <-> weekly on an enabled account only changes its
             # manual label. It must not silently repair/rebuild a roster.
             label_only = admission is None and bool(before["enabled"]) and previous_frequency in {"daily", "weekly"} and status != "paused"
-            if not label_only:
+            if not label_only and not fixed_cleanup_scope and catalog_policy is None:
                 members = current_system_members(connection)
                 is_member = any(
                     member["platform"] == identity["platform"] and member["uid"] == identity["uid"]
@@ -284,7 +343,7 @@ def update_account_operating_status_in_transaction(
                 "action": admission["action"],
             })
             active_snapshot_id = admission.get("active_snapshot_id")
-            active_member = active_snapshot_id is not None and connection.execute(
+            active_member = catalog_policy is None and active_snapshot_id is not None and connection.execute(
                 "SELECT 1 FROM account_roster_members WHERE snapshot_id=? AND account_identity_id=?",
                 (active_snapshot_id, identity["id"]),
             ).fetchone() is not None
@@ -308,6 +367,17 @@ def update_account_operating_status_in_transaction(
                 result["message"] = f"账号已保存为{label}；已安排于北京时间 {beijing_time} 激活名单，激活后开始采集。"
             else:
                 result["message"] = "账号和运营状态已保存，加入待激活系统名单；名单激活后才开始采集。"
+        if catalog_policy is not None:
+            result["directory_row_id"] = int(directory["id"])
+            result["activation_status"] = "disabled" if status == "paused" else "pending_verification"
+            result["message"] = (
+                "账号已暂停自动更新，历史内容和数据保留。" if status == "paused" else
+                "账号状态已保存，系统会自动核验并更新采集状态，无需另行加入名单。"
+            )
+            result["automatic_capture"] = {
+                "eligible": False, "reason_code": "account_paused" if status == "paused" else "pending_verification",
+                "reason_label": "账号已暂停" if status == "paused" else "等待系统核验",
+            }
         if status is not None:
             result["status_request_id"] = request_id
             record_status_receipt(

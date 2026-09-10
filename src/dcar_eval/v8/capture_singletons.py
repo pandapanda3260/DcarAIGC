@@ -17,7 +17,7 @@ def attempt_slot_sql(connection: sqlite3.Connection, alias: str = "fa") -> str:
     """Only one actual send marker may carry a batch attempt's legacy slot."""
     if alias not in {"fa", "a"}:
         raise ValueError("unsupported attempt alias")
-    if connection.execute("PRAGMA user_version").fetchone()[0] != 20:
+    if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
         return f"{alias}.slot_id"
     return (f"COALESCE({alias}.slot_id,(SELECT CASE WHEN count(*)=1 THEN min(d.fetch_slot_id) END "
             f"FROM paid_provider_dispatch_events d WHERE d.fetch_attempt_id={alias}.id "
@@ -26,7 +26,7 @@ def attempt_slot_sql(connection: sqlite3.Connection, alias: str = "fa") -> str:
 
 def freeze(connection: sqlite3.Connection, *, request: PaidRequestIdentity,
            scope: PaidScope, at: str) -> tuple[int, int]:
-    if not connection.in_transaction or connection.execute("PRAGMA user_version").fetchone()[0] != 20:
+    if not connection.in_transaction or connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
         raise ValueError("singleton freeze requires schema20 writer transaction")
     route = planning.require_send_route(connection, scope=scope,
                                         operation=request.document["operation"], at=at)

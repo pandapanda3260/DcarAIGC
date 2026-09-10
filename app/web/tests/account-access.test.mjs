@@ -17,7 +17,7 @@ const accountData = {
   roster: { active_profile_id: "tikhub_managed_v1" },
   items: [phone, ""].map((number, index) => ({
     id: index + 1, phone: number, operator_name: "测试运营人员",
-    account_type: "original", content_direction: "new_car", enabled: true,
+    account_group: "innovation", business_direction: "new_car", enabled: true,
     account_status: "daily", roster_state: "current", content_count: 3,
     platforms: [{ platform: "xiaohongshu", uid: `test-platform-uid-${index}`,
       nickname: `${protectedName}${index}`, unique_id: "", data_status: "not_collected" }],

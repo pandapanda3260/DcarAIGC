@@ -315,6 +315,60 @@ class CaptureActivationReleaseTest(unittest.TestCase):
             self.assertEqual(connection.total_changes, before)
         self._assert_no_new_capture()
 
+    def test_schema20_and_legacy_admission_share_fixed_budget_boundaries(self):
+        self._begin()
+        self._complete()
+        self._publish()
+        amount = provider_budget.PRICES_MICROUSD[OPERATION]
+        with storage.connect(self.db) as connection, storage.transaction(connection):
+            bindings = successor.current_runtime_bindings(connection, OPERATION, AFTER)
+            values = {"runtime_bindings": bindings, "operation": OPERATION,
+                      "request_identity": "f" * 64, "at": AFTER, "amount_microusd": amount}
+            initial = auth.validate_authorization(connection, **values)
+            for total, metrics, allowed in (
+                (15_000_000 - amount, 15_000_000 - amount, True),
+                (15_000_000, 15_000_000, False),
+                (50_000_000 - amount, 0, True),
+                (50_000_000, 0, False),
+                (100_000_000, 0, False),
+            ):
+                summary = {"budget_day": provider_budget.budget_day(AFTER), "total_microusd": total,
+                           "buckets_microusd": {"discovery": 0, "metrics": metrics, "repair": 0}}
+                with self.subTest(total=total, metrics=metrics), patch.object(
+                        provider_budget, "budget_summary", return_value=summary):
+                    calls = (
+                        lambda: provider_budget.check_reservation(connection,
+                            scope=provider_budget.PaidScope(category="metrics"), operation=OPERATION,
+                            unit_price=amount / 1_000_000, currency="USD", at=AFTER),
+                        lambda: auth.validate_authorization(connection, **values),
+                        lambda: auth.validate_authorization(connection,
+                            expected_authority_sha256=initial["authority_sha256"], **values),
+                    )
+                    for call in calls:
+                        if allowed:
+                            self.assertEqual(call()["budget_bucket"], "metrics")
+                        else:
+                            with self.assertRaises(provider_budget.PaidScopeBlocked):
+                                call()
+        self._assert_no_new_capture()
+
+    def test_shared_budget_policy_preserves_narrower_immutable_envelopes(self):
+        summary = {"total_microusd": 1_000, "buckets_microusd": {"metrics": 1_000}}
+        budget = {"total_microusd": 50_000_000, "bucket": "metrics", "bucket_microusd": 2_000}
+        bucket, blocker = provider_budget.assess_budget_capacity(summary, operation=OPERATION,
+            amount_microusd=1_000, authorization_budget=budget)
+        self.assertEqual(bucket, "metrics")
+        self.assertIsNone(blocker)
+        _, blocker = provider_budget.assess_budget_capacity(summary, operation=OPERATION,
+            amount_microusd=1_001, authorization_budget=budget)
+        self.assertEqual(blocker.error_code, "metrics_budget_exhausted")
+        for changed in ({"total_microusd": 50_000_001}, {"bucket_microusd": 15_000_001},
+                        {"bucket": "discovery"}, {"total_microusd": True}, {"bucket_microusd": 0}):
+            with self.subTest(changed=changed):
+                _, blocker = provider_budget.assess_budget_capacity(summary, operation=OPERATION,
+                    amount_microusd=1_000, authorization_budget={**budget, **changed})
+                self.assertEqual(blocker.error_code, "authorization_budget_invalid")
+
     def test_no_snapshot_generic_legal_activation_has_no_paid_gate(self):
         self._begin(snapshot=False)
         self._complete()

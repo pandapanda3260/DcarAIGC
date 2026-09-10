@@ -106,9 +106,12 @@ def verify_source_before_import(*, data: Path, source: Path, build_receipt: Path
     if (envelope.get("contract_version") != "sealed-build-receipt-v1"
             or envelope.get("payload_sha256") != digest or not isinstance(payload, dict)):
         raise ValueError("bootstrap build envelope differs")
+    cleanup = isinstance(payload.get("account_cleanup_generation"), dict)
     plan = _reference(payload["code_successor_plan"])
-    if (plan.get("contract") != "writer-source-isolation-successor-plan-v1"
-            or plan.get("transition") != "writer-source-isolation-20260907-v1"
+    expected_contract = "account-cleanup-source-plan-v1" if cleanup else "writer-source-isolation-successor-plan-v1"
+    expected_transition = "account-cleanup-0907-v1" if cleanup else "writer-source-isolation-20260907-v1"
+    if (plan.get("contract") != expected_contract
+            or plan.get("transition") != expected_transition
             or plan.get("project_root") != str(data) or plan.get("source_root") != str(source)
             or plan.get("git") != payload.get("git") or payload.get("status") != "succeeded"):
         raise ValueError("bootstrap source plan differs")
@@ -154,7 +157,29 @@ def verify_source_before_import(*, data: Path, source: Path, build_receipt: Path
                     raise ValueError("unlisted bootstrap executable or configuration")
     if git("status", "--porcelain=v1", "--untracked-files=all") != status:
         raise ValueError("bootstrap Git changed during verification")
-    return {"source_tree_sha256": plan["source_tree"]["sha256"], "files": len(names)}
+    if cleanup:
+        install_path = Path(environment.get("DCAR_ACCOUNT_CLEANUP_INSTALL_RECEIPT", ""))
+        install = _json_object(_raw_file(install_path, private=True))
+        database = Path(environment.get("DCAR_V8_DB", ""))
+        identity = database.stat()
+        if payload.get("account_classification_successor") is not None:
+            import importlib.util
+            module_path = source / "src/dcar_eval/v8/account_classification_release.py"
+            spec = importlib.util.spec_from_file_location("verified_classification_release", module_path)
+            if spec is None or spec.loader is None:
+                raise ValueError("verified classification release cannot be loaded")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            module.verify_inheritance(build=payload, build_ref=module.reference(selected),
+                install_path=install_path, database=database, source=source)
+        elif (install.get("contract") != "account-cleanup-install-v1" or install.get("status") != "installed"
+                or install.get("formal_database") != str(database)
+                or install.get("build_receipt", {}).get("path") != str(selected)
+                or install.get("build_receipt", {}).get("sha256") != hashlib.sha256(_raw_file(selected, private=True)).hexdigest()
+                or install.get("installed", {}).get("device") != identity.st_dev
+                or install.get("installed", {}).get("inode") != identity.st_ino):
+            raise ValueError("cleanup bootstrap installation differs")
+    return {"source_tree_sha256": plan["source_tree"]["sha256"], "files": len(names), "account_cleanup": cleanup}
 
 
 def _absolute_directory(value: str, label: str) -> Path:
@@ -202,7 +227,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     source = _absolute_directory(str(args.source_root), "writer source root")
     if _roots() != (data, source) or Path(__file__).resolve().parents[3] != source:
         parser.error("source verifier does not match the selected installed runtime")
-    verify_source_before_import(data=data, source=source, build_receipt=args.build_receipt)
+    verified = verify_source_before_import(data=data, source=source, build_receipt=args.build_receipt)
+    if verified["account_cleanup"]:
+        print(json.dumps(verified, ensure_ascii=False, sort_keys=True))
+        return 0
     sys.path[:0] = [str(source / "src/dcar_eval"), str(source / "scripts")]
     from v8.runtime_source_successor import verify_bootstrap
     result = verify_bootstrap(project_root=data, source_root=source,

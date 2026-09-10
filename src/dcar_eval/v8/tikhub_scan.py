@@ -617,7 +617,10 @@ def _reference(
 
 
 def _page(raw: StoredRawResponse, platform: str) -> tuple[list[Any], bool, Any, int | None]:
-    payload = raw.value
+    return _page_payload(raw.value, platform)
+
+
+def _page_payload(payload: Any, platform: str) -> tuple[list[Any], bool, Any, int | None]:
     if platform == "douyin":
         data = (payload.get("data") if isinstance(payload, dict) and "code" not in payload
                 else providers._tikhub_douyin_data(payload))

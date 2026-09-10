@@ -92,7 +92,7 @@ def local_retention_tick(*, db_path: Path = DEFAULT_DB, at: str | None = None) -
     bucket = current.replace(minute=current.minute // 5 * 5, second=0, microsecond=0)
     scope = "capture-local-retention-v1:" + planning.timestamp(bucket.isoformat())
     with connect(db_path) as connection:
-        if connection.execute("PRAGMA user_version").fetchone()[0] != 20:
+        if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
             return {"status": "skipped", "reason": "schema19_legacy", "provider_calls": 0}
         require_current_process_writer_lock(connection)
         prior = connection.execute("SELECT id FROM data_quality_receipts WHERE scope_key=? LIMIT 1", (scope,)).fetchone()
@@ -128,6 +128,94 @@ def _alert(connection: Any, *, key: str, severity: str, active: bool,
                            (at, row[0]))
 
 
+def current_plan_progress(connection: Any, *, at: str) -> dict[str, Any]:
+    """Current-day frozen platform/account scopes, not a historical census.
+
+    Only the latest discovery work in the latest active plan determines each
+    scope's state. A terminal work is successful only with its complete-scan
+    watermark. No raw is read and no older day's progress is reconstructed.
+    """
+    stamp = planning.timestamp(at)
+    instant = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    day = instant.astimezone(planning.BEIJING).date().isoformat()
+    fields = ("queued_or_running", "succeeded", "partial", "blocked", "failed", "not_planned")
+    unknown = {"status": "unknown", "business_day": day, "plan_id": None,
+        "denominator_kind": "frozen_platform_account_scopes", "expected": None,
+        **{key: None for key in fields}, "last_success_at": None, "oldest_wait_seconds": None}
+    plan = connection.execute("""SELECT * FROM capture_source_plans
+        WHERE business_day=? AND mode='active' AND julianday(created_at)<=julianday(?)
+        ORDER BY julianday(created_at) DESC,id DESC LIMIT 1""", (day, stamp)).fetchone()
+    if plan is None:
+        return {**unknown, "reason": "current_day_active_plan_missing"}
+    payload = json.loads(plan["payload_json"])
+    members: dict[tuple[str, int], dict[str, Any]] = {}
+    try:
+        if not isinstance(payload, dict) or planning.digest(payload) != plan["plan_sha256"]:
+            raise ValueError("invalid plan payload")
+        for member in payload["cohort"]:
+            if (not isinstance(member, dict) or member["platform"] not in {"douyin", "xiaohongshu"}
+                    or type(member["account_id"]) is not int or member["account_id"] <= 0
+                    or type(member["identity_id"]) is not int or member["identity_id"] <= 0):
+                raise ValueError("invalid frozen scope")
+            key = (member["platform"], member["account_id"])
+            if key in members:
+                raise ValueError("ambiguous frozen scope")
+            members[key] = member
+    except (KeyError, TypeError, ValueError):
+        return {**unknown, "plan_id": plan["id"], "reason": "current_plan_cohort_invalid"}
+    rows = connection.execute("""SELECT w.*,m.evidence_json watermark_evidence,
+        m.recorded_at watermark_at FROM capture_work_items w
+        LEFT JOIN capture_watermarks m ON m.work_id=w.id
+          AND m.provider=w.provider AND m.operation=w.operation
+          AND julianday(m.recorded_at)<=julianday(?)
+        WHERE w.source_plan_id=? AND w.data_business_day=? AND w.provider='tikhub'
+          AND w.content_id IS NULL AND json_extract(w.envelope_json,'$.stage')='discovery'
+          AND julianday(w.created_at)<=julianday(?) AND julianday(w.updated_at)<=julianday(?)
+        ORDER BY julianday(w.created_at) DESC,w.id DESC""", (stamp, plan["id"], day, stamp, stamp)).fetchall()
+    latest: dict[tuple[str, int], Any] = {}
+    successes: set[int] = set()
+    success_times: list[str] = []
+    for row in rows:
+        envelope = json.loads(row["envelope_json"])
+        key = (envelope.get("platform"), row["account_id"])
+        if (key not in members or envelope.get("identity_id") != members[key]["identity_id"]
+                or row["operation"] != key[0] + "_user_posts"):
+            continue
+        latest.setdefault(key, row)
+        if row["state"] != "terminal" or not row["watermark_evidence"]:
+            continue
+        proof = json.loads(row["watermark_evidence"])
+        counts = [proof.get(name) for name in ("seen", "valid", "missing", "invalid", "unavailable")]
+        if (all(proof.get(name) is True for name in ("complete", "terminal_cursor", "all_raw_verified"))
+                and proof.get("cap_hit") is False and proof.get("cursor_loop") is False
+                and all(type(value) is int and value >= 0 for value in counts)
+                and counts[0] == sum(counts[1:])):
+            successes.add(row["id"])
+            success_times.append(planning.timestamp(row["watermark_at"]))
+    totals = {key: 0 for key in fields}
+    waits: list[float] = []
+    for key in members:
+        row = latest.get(key)
+        if row is None:
+            state = "not_planned"
+        elif row["state"] in {"runnable", "leased", "running"}:
+            state = "queued_or_running"
+        elif row["state"] in {"provider_blocked", "budget_deferred", "paid_identity_hold"}:
+            state = "blocked"
+        elif row["reason"] in {"page_cap_hit", "cursor_loop"}:
+            state = "partial"
+        else:
+            state = "succeeded" if row["id"] in successes else "failed"
+        totals[state] += 1
+        if row is not None and state in {"queued_or_running", "blocked"}:
+            due = datetime.fromisoformat(planning.timestamp(row["due_at"]).replace("Z", "+00:00"))
+            waits.append(max(0.0, (instant - due).total_seconds()))
+    return {"status": "measured", "business_day": day, "plan_id": plan["id"],
+        "denominator_kind": "frozen_platform_account_scopes", "expected": len(members), **totals,
+        "last_success_at": max(success_times) if success_times else None,
+        "oldest_wait_seconds": max(waits) if waits else 0.0}
+
+
 def measure(connection: Any, *, at: str) -> dict[str, Any]:
     """Return distinct work debt and raw/transport/accounting counters."""
     stamp = planning.timestamp(at)
@@ -153,6 +241,7 @@ def measure(connection: Any, *, at: str) -> dict[str, Any]:
     return {"contract_version": CONTRACT, "business_day": day.isoformat(), "cutoff_at": stamp,
             "debt": debt, "operations": [dict(row) for row in starts],
             "settled_conservative_amounts": [dict(row) for row in amounts],
+            "current_plan_progress": current_plan_progress(connection, at=stamp),
             "coverage_complete": False, "video_completeness": None, "field_accuracy": None,
             "unknown_denominators": ["independent_expected_video_inventory", "simultaneous_platform_gold"],
             "blocked_in_sla_denominator": True, "blocked_in_runnable_backlog": False,
@@ -165,7 +254,7 @@ def maintenance_tick(*, db_path: Path = DEFAULT_DB, at: str | None = None) -> di
     bucket = instant.replace(minute=instant.minute // 5 * 5, second=0, microsecond=0)
     scope_key = "capture-maintenance:" + planning.timestamp(bucket.isoformat())
     with connect(db_path) as connection, transaction(connection):
-        if connection.execute("PRAGMA user_version").fetchone()[0] != 20:
+        if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
             return {"status": "skipped", "reason": "schema19_legacy", "provider_calls": 0}
         existing = connection.execute(
             "SELECT id,payload_json FROM data_quality_receipts WHERE scope_key=? ORDER BY id DESC LIMIT 1", (scope_key,),
@@ -204,7 +293,7 @@ def reconcile_day(*, business_day: str, db_path: Path = DEFAULT_DB, at: str | No
         raise ValueError("daily reconciliation requires a closed Beijing business day")
     scope_key = "capture-day:" + business_day
     with connect(db_path) as connection, transaction(connection):
-        if connection.execute("PRAGMA user_version").fetchone()[0] != 20:
+        if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
             return {"status": "skipped", "reason": "schema19_legacy"}
         rows = connection.execute("SELECT state,count(*) n FROM capture_work_items WHERE data_business_day=? GROUP BY state",
                                   (business_day,)).fetchall()

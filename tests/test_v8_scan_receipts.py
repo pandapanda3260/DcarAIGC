@@ -108,6 +108,10 @@ class ScanReceiptsTest(unittest.TestCase):
             raw_root = patch(target, self.raw_root)
             raw_root.start()
             self.addCleanup(raw_root.stop)
+        # Discovery materialization also persists media-source manifests.
+        media_root = patch("v8.media.MEDIA_ROOT", self.root / "media")
+        media_root.start()
+        self.addCleanup(media_root.stop)
         no_network = patch("urllib.request.urlopen", side_effect=AssertionError("Network forbidden in receipt tests"))
         self.network = no_network.start()
         self.addCleanup(no_network.stop)

@@ -3,7 +3,8 @@ import type { AccountStatus, SpuAssociationRun, SpuAudienceAssets } from "./type
 export type ContentSearchFilters = {
   query: string;
   platform: string;
-  accountType: string;
+  accountGroup: string;
+  businessDirection: string;
   direction: string;
   sellingPoint: string;
   spuSeries: string;
@@ -18,7 +19,8 @@ export type ContentSearchRequest = {
   page_size: number;
   query: string;
   platform: string | null;
-  account_type: string | null;
+  account_group: string | null;
+  business_direction: string | null;
   content_direction: string | null;
   selling_point: string | null;
   spu_series: string | null;
@@ -31,8 +33,8 @@ export type ContentSearchRequest = {
 export type AccountSearchFilters = {
   query: string;
   platform: string;
-  accountType: string;
-  direction: string;
+  accountGroup: string;
+  businessDirection: string;
   accountStatus?: AccountStatus | "";
 };
 
@@ -41,8 +43,8 @@ export type AccountSearchRequest = {
   page_size: number;
   query: string;
   platform: string | null;
-  account_type: string | null;
-  content_direction: string | null;
+  account_group: string | null;
+  business_direction: string | null;
   account_status: AccountStatus | null;
 };
 
@@ -60,7 +62,8 @@ export function buildContentSearchRequest(
     page_size: positiveInteger(pageSize),
     query: filters.query,
     platform: filters.platform || null,
-    account_type: filters.accountType || null,
+    account_group: filters.accountGroup || null,
+    business_direction: filters.businessDirection || null,
     content_direction: filters.direction || null,
     selling_point: filters.sellingPoint || null,
     spu_series: filters.spuSeries || null,
@@ -81,8 +84,8 @@ export function buildAccountSearchRequest(
     page_size: positiveInteger(pageSize),
     query: filters.query,
     platform: filters.platform || null,
-    account_type: filters.accountType || null,
-    content_direction: filters.direction || null,
+    account_group: filters.accountGroup || null,
+    business_direction: filters.businessDirection || null,
     account_status: filters.accountStatus || null,
   };
 }

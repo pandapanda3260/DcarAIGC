@@ -74,6 +74,8 @@ def verified_reference(value: Any, *, project_root: Path | None = None) -> dict[
     if not isinstance(value, dict) or not isinstance(value.get("path"), str) or not _HASH.fullmatch(str(value.get("sha256"))):
         raise ReleaseContractError("evidence requires an exact path and SHA-256")
     path = Path(value["path"])
+    from v8.capture_evidence_preflight import observe_file
+    observe_file(path)
     if not path.is_absolute() or path.is_symlink() or path.resolve(strict=True) != path:
         raise ReleaseContractError("release evidence path must be canonical")
     if project_root is not None and path.is_relative_to(project_root.resolve()):
@@ -446,8 +448,18 @@ def validate_deployment_receipt(
     Writer's maintenance-only path verifies every identity but does not confer
     admission while freeing space. A full business day is not an acceptance condition.
     """
-    if int(connection.execute("PRAGMA user_version").fetchone()[0]) != 20:
-        raise ReleaseContractError("deployment receipt requires exact schema20")
+    version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    if version not in {20, 21}:
+        raise ReleaseContractError("deployment receipt requires schema20 or its verified classification successor")
+    from v8 import account_cleanup_snapshot
+    if account_cleanup_snapshot.is_cleanup(connection, deployment_id):
+        try:
+            return account_cleanup_snapshot.validate(connection, deployment_id=deployment_id,
+                project_root=project_root, expected_bindings=expected_bindings, require_accepted=require_accepted)
+        except (ValueError, KeyError, TypeError, OSError, sqlite3.Error) as exc:
+            raise ReleaseContractError("cleanup read-only deployment proof is invalid") from exc
+    if version == 21:
+        raise ReleaseContractError("schema21 requires the preserved cleanup and classification migration proof")
     if project_root is not None:
         from v8.capture_code_successor import deployment_context
         with deployment_context(connection, project_root=project_root) as inherited:

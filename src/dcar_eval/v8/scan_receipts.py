@@ -514,6 +514,15 @@ def coverage(connection: sqlite3.Connection, *, period_start: str, period_end: s
     current = start
     while current <= end:
         following = current + timedelta(days=1)
+        from .capture_day_coverage import catalog_day_coverage
+        catalog_day = catalog_day_coverage(connection, day=current.isoformat(), cutoff_at=cutoff_at)
+        if catalog_day is not None:
+            days.append(catalog_day)
+            errors.update({"catalog:"+key:value for key,value in catalog_day["scan_errors"].items()})
+            for proof in catalog_day["scan_references"]:
+                cache[proof["run_id"]] = proof
+            current = following
+            continue
         anchor_at = datetime.combine(following, time(3), BEIJING)
         candidates = []
         for value in rounds.get(following.isoformat(), []):

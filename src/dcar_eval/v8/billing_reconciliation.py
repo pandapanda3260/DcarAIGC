@@ -169,7 +169,7 @@ def open_live_read_only(path: Path) -> Iterator[sqlite3.Connection]:
         connection.execute("PRAGMA recursive_triggers=ON")
         connection.execute("PRAGMA foreign_keys=ON")
         try:
-            require_schema_compatibility(connection, supported_versions=frozenset({19, 20}))
+            require_schema_compatibility(connection, supported_versions=frozenset({19, 20, 21}))
         except SchemaMigrationError as exc:
             raise BillingReconciliationError(
                 "schema_mismatch", "Billing reconciliation requires a complete schema 19 or 20"

@@ -12,6 +12,7 @@ from unittest.mock import patch
 from xml.etree import ElementTree
 
 from v8.report_export import (
+    build_accounts_workbook,
     build_report_detail_workbook,
     build_report_download_bundle,
     report_bundle_filename,
@@ -504,6 +505,73 @@ class ReportExportTest(unittest.TestCase):
             report_file_filename(
                 task_name="报告", task_id=task_id, revision=1, extension="pdf"
             )
+
+    def test_new_report_and_account_exports_use_the_same_two_account_dimensions(self) -> None:
+        from v8.reports import _write_csv
+        row = {"content_id": 1, "platform_content_id": "123", "link_id": "L1",
+               "platform": "douyin", "content_type": "video", "published_at": "2026-09-01T00:00:00Z",
+               "canonical_url": "https://www.douyin.com/video/123", "title": "分类验证",
+               "account_uid": "456", "account_name": "测试账号", "account_group": "image_text",
+               "business_direction": "used_car_c2", "content_direction": "unknown"}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "content.csv"
+            _write_csv(path, [row], new_classification=True)
+            payload = path.read_bytes()
+        self.assertIn(b"account_group,business_direction,content_direction", payload)
+        self.assertNotIn(b"account_type", payload)
+        workbook = build_report_detail_workbook(task={"id": "TEST", "period_start": "2026-09-01", "period_end": "2026-09-01"},
+            revision=1, content_csv=payload, channel_csv=b"platform,metric,value\n")
+        with zipfile.ZipFile(io.BytesIO(workbook)) as archive:
+            values = _sheet_values(archive.read("xl/worksheets/sheet2.xml"))
+        self.assertEqual(values[0][11:14], ["账号分组", "业务方向", "作品内容方向"])
+        self.assertEqual(values[1][11:14], ["图文号", "二手车C2", "未知"])
+        self.assertNotIn("账号类型", values[0])
+        workbook = build_accounts_workbook([{**row, "id": 2, "enabled": True, "platforms": [{"platform": "douyin", "uid": "456"}]}],
+            douyin_authorization_targets={}, exported_at="2026-09-01T00:00:00Z")
+        with zipfile.ZipFile(io.BytesIO(workbook)) as archive:
+            values = _sheet_values(archive.read("xl/worksheets/sheet1.xml"))
+        self.assertEqual(values[0][12:14], ["账号分组", "业务方向"])
+        self.assertEqual(values[1][12:14], ["图文号", "二手车C2"])
+
+    def test_account_export_has_no_capture_switch_and_filter_covers_remaining_columns(self) -> None:
+        workbook = build_accounts_workbook([
+            {"id": 1, "account_status": "paused", "enabled": False,
+             "platforms": [{"platform": "douyin", "uid": "123456789", "content_count": 9}]},
+        ], douyin_authorization_targets={}, exported_at="2026-09-10T00:00:00Z")
+        with zipfile.ZipFile(io.BytesIO(workbook)) as archive:
+            payload = archive.read("xl/worksheets/sheet1.xml")
+        values = _sheet_values(payload)
+        self.assertNotIn("采集开关", values[0])
+        self.assertEqual(values[0][-2:], ["账号状态", "抖音开平授权"])
+        self.assertEqual(values[1][-2:], ["暂停", "未授权"])
+        self.assertEqual(values[1][9], "9")
+        self.assertEqual([len(row) for row in values], [17, 17])
+        root = ElementTree.fromstring(payload)
+        self.assertEqual(root.find("x:dimension", _SHEET_NAMESPACE).attrib["ref"], "A1:Q2")
+        self.assertEqual(root.find("x:autoFilter", _SHEET_NAMESPACE).attrib["ref"], "A1:Q2")
+        self.assertEqual(len(root.findall("x:cols/x:col", _SHEET_NAMESPACE)), 17)
+
+    def test_new_summary_image_displays_account_groups_business_and_work_directions(self) -> None:
+        report = {"report_version": "dcar-content-operations-report-v8.9",
+                  "metadata": {"account_classification_version": "account-classification-v2"},
+                  "account_group_dimensions": [{"key": "image_text", "count": 1, "percentage": 100}],
+                  "business_direction_dimensions": [{"key": "used_car_c2", "count": 1, "percentage": 100}],
+                  "content_direction_dimensions": [{"key": "unknown", "count": 1, "percentage": 100}]}
+        svg = render_summary_svg(report)
+        root = ElementTree.fromstring(svg)
+        self.assertEqual(root.attrib["height"], "815")
+        for text in ("账号分组构成", "业务方向", "作品内容方向", "图文号", "二手车C2"):
+            self.assertIn(text, svg)
+        self.assertNotIn("账号类型", svg)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            svg_path, png_path = path / "report.svg", path / "report.png"
+            svg_path.write_text(svg, encoding="utf-8")
+            def fake_run(command, **_kwargs):
+                png_path.write_bytes(_png_header(1200, 815))
+                return SimpleNamespace(returncode=0)
+            with patch("v8.reports.shutil.which", side_effect=lambda name: "/usr/bin/sips" if name == "sips" else None), patch("v8.reports.subprocess.run", side_effect=fake_run):
+                self.assertTrue(render_summary_png(svg_path, png_path))
 
     def test_summary_png_renderer_uses_aspect_ratio_preserving_renderer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

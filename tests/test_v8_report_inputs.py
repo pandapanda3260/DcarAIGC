@@ -95,6 +95,25 @@ class CurrentReportContractTest(unittest.TestCase):
         )
         self.assertEqual(contracts.load_contract(report_version="dcar-content-operations-report-v8.7")["report_version"], "dcar-content-operations-report-v8.7")
 
+    def test_legacy_scope_retains_only_its_frozen_account_direction_fallback(self):
+        legacy_content = {"manual_content_direction": "unknown", "evaluation_content_direction": "new_car",
+                          "account_content_direction": "media"}
+        self.assertEqual(reports._frozen_content_direction(legacy_content, None, new_classification=False), "media")
+        self.assertEqual(reports._frozen_content_direction(legacy_content, None, new_classification=True), "unknown")
+        self.assertEqual(reports._frozen_content_direction(legacy_content, {"content_direction": "used_car"}, new_classification=False), "used_car")
+
+    def test_current_account_classification_requires_two_dimensions_without_relabeling_legacy(self):
+        report = current_report()
+        report["metadata"]["account_classification_version"] = "account-classification-v2"
+        report.pop("account_type_dimensions")
+        report["account_group_dimensions"] = []
+        report["business_direction_dimensions"] = []
+        contracts.validate_report(seal(report))
+        report.pop("business_direction_dimensions")
+        with self.assertRaisesRegex(contracts.V8ContractViolation, "business_direction_dimensions"):
+            contracts.validate_report(seal(report))
+        contracts.validate_report(current_report())
+
     def test_freeze_hash_detects_fact_change_but_allows_new_revision_paths(self):
         report = current_report()
         report["metadata"].update(revision=2, generated_at="2026-08-03T00:00:00Z")
@@ -483,10 +502,64 @@ class FrozenReportIntegrationTest(unittest.TestCase):
         reports.retry_task(task["id"], db_path=self.db)
         second = self.run_report(task, at=T1)
         self.assertEqual(first["frozen_inputs"], second["frozen_inputs"])
-        for key in ("input_references", "summary_metrics", "content_details", "data_quality", "account_type_dimensions", "content_direction_dimensions"):
+        for key in ("input_references", "summary_metrics", "content_details", "data_quality", "account_group_dimensions", "business_direction_dimensions", "content_direction_dimensions"):
             self.assertEqual(first[key], second[key], key)
         self.assertEqual(second["metadata"]["revision"], 2)
         self.assertEqual(second["metadata"]["collection_cutoff_at"], T0)
+
+    def test_new_account_dimensions_freeze_directory_values_and_remain_stable(self):
+        from v8.account_directory import ensure_account_directory_schema
+        from v8.schema_v21 import migrate
+        from v8.storage import initialize_database
+        with connect(self.db) as connection:
+            initialize_database(connection, target_version=20)
+        with connect(self.db) as connection, transaction(connection):
+            ensure_account_directory_schema(connection)
+            connection.execute("INSERT INTO accounts(id,phone,created_at,updated_at) VALUES (10,'',?,?)", (FIXTURE_AT, FIXTURE_AT))
+            connection.execute("UPDATE content_items SET account_id=10 WHERE id=1")
+            connection.execute("INSERT INTO account_directory_rows(source_sha256,source_name,source_sheet,source_row,account_id,platform,account_group,business_direction,account_status,identity_status,raw_json,imported_at,updated_at) "
+                "VALUES (?,'fixture','sheet',1,10,'douyin','image_text','used_car_c2','daily','existing_verified',?, ?,?)",
+                ("a" * 64, json.dumps({"质量标签": "图文号", "业务标签": "二手车C2"}), FIXTURE_AT, FIXTURE_AT))
+        with connect(self.db) as connection:
+            migrate(connection)
+        task = self.task()
+        first = self.run_report(task)
+        self.assertEqual(first["metadata"]["account_classification_version"], "account-classification-v2")
+        self.assertNotIn("account_type_dimensions", first)
+        self.assertEqual(first["account_group_dimensions"], [{"key": "image_text", "count": 1, "percentage": 100.0}])
+        self.assertEqual(first["business_direction_dimensions"], [{"key": "used_car_c2", "count": 1, "percentage": 100.0}])
+        detail = first["content_details"][0]
+        self.assertEqual((detail["account_group"], detail["business_direction"]), ("image_text", "used_car_c2"))
+        self.assertNotIn("account_type", detail)
+        with connect(self.db) as connection, transaction(connection):
+            connection.execute("UPDATE account_directory_rows SET account_group='innovation',business_direction='new_car',updated_at=?", (T1,))
+        reports.retry_task(task["id"], db_path=self.db)
+        second = self.run_report(task, at=T1)
+        self.assertEqual(first["frozen_inputs"], second["frozen_inputs"])
+        for key in ("account_group_dimensions", "business_direction_dimensions", "content_details"):
+            self.assertEqual(first[key], second[key])
+        # A first generation at the original cutoff must not borrow a later
+        # directory edit, even when the linked accounts row stayed unchanged.
+        delayed = self.run_report(self.task())
+        self.assertEqual(delayed["account_group_dimensions"][0]["key"], "unknown")
+        self.assertEqual(delayed["business_direction_dimensions"][0]["key"], "unknown")
+        self.assertIn("account_dimension_unreconstructable", delayed["data_quality_details"]["unknown_dimensions"]["1"])
+
+    def test_historical_frozen_inputs_keep_old_dimensions_without_relabeling(self):
+        task = self.task()
+        historical = current_report()
+        historical["account_type_dimensions"] = [{"key": "original", "count": 10, "percentage": 100.0}]
+        historical["metadata"]["task_id"] = task["id"]
+        with connect(self.db) as connection, transaction(connection):
+            event = report_inputs.store_report(connection, task["id"], historical)
+        with connect(self.db) as connection:
+            stored = report_inputs.frozen_report(connection, task["id"])
+        rendered = report_inputs.render_frozen(stored, revision=2, generated_at=T1, files=[])
+        self.assertEqual(rendered["account_type_dimensions"], historical["account_type_dimensions"])
+        self.assertNotIn("account_group_dimensions", rendered)
+        self.assertNotIn("business_direction_dimensions", rendered)
+        self.assertEqual(rendered["frozen_inputs"]["sha256"], event["sha256"])
+        self.assertEqual(rendered["metadata"]["collection_cutoff_at"], historical["metadata"]["collection_cutoff_at"])
 
     def test_automatic_empty_scope_is_frozen_and_does_not_expand(self):
         task = self.task(automatic=True)
@@ -504,11 +577,12 @@ class FrozenReportIntegrationTest(unittest.TestCase):
 
     def test_delayed_first_report_does_not_backfill_current_account_dimensions(self):
         with connect(self.db) as connection, transaction(connection):
-            connection.execute("INSERT INTO accounts(id,phone,account_type,content_direction,created_at,updated_at) VALUES (10,'','boutique_ip','new_car',?,?)", (T0, T1))
+            connection.execute("INSERT INTO accounts(id,phone,created_at,updated_at) VALUES (10,'',?,?)", (T0, T1))
             connection.execute("UPDATE content_items SET account_id=10 WHERE id=1")
         report = self.run_report(self.task())
         self.assertFalse(report["data_quality"]["scope_reconstructable"])
-        self.assertEqual(report["account_type_dimensions"][0]["key"], "unknown")
+        self.assertEqual(report["account_group_dimensions"][0]["key"], "unknown")
+        self.assertEqual(report["business_direction_dimensions"][0]["key"], "unknown")
         self.assertIn("account_dimension_unreconstructable", report["data_quality_details"]["unknown_dimensions"]["1"])
 
     def test_late_evaluation_is_excluded_then_new_cutoff_correction_includes_it(self):

@@ -22,15 +22,14 @@ from v8.provider_budget import (
     AUTOMATIC_MICROUSD, BUDGET_BUCKET_MICROUSD, CATEGORY_MICROUSD,
     DEFAULT_TASK_MAX_AMOUNT_USD, GLOBAL_MICROUSD, PaidScope, _SCOPE,
     assert_paid_scope_owner,
-    authorize_compensation, authorize_incident_budget, authorize_recovery_probe,
+    authorize_compensation, authorize_recovery_probe,
     budget_summary, check_reservation, consume_compensation_authorization,
     circuit_recovery_probe, circuit_state, paid_scope,
     evaluate_transport_operation_fault, fault_state, record_circuit,
-    record_closeout, record_compensation_gap, record_fault_state,
+    record_compensation_gap, record_fault_state,
     resolve_fault_state, resolve_operation_fault, resolve_storage_fault,
-    record_queue_inventory, required_closeout_rounds, task_budget_id,
-    transport_circuit_decision, transport_healthy_p95_rate,
-    work_state_fingerprint,
+    task_budget_id,
+    transport_circuit_decision,
 )
 from v8.storage import connect, initialize_database, transaction
 
@@ -570,52 +569,47 @@ class ProviderBudgetTest(unittest.TestCase):
         self.assertEqual(caught.exception.error_code, "global_budget_exhausted")
         self.assertEqual(self.calls, 0)
 
-    def test_explicit_incident_authorization_extends_only_its_day_and_bucket(self):
-        self.prefill(
-            50,
-            category="legacy",
-            operation="legacy_unclassified",
-        )
+    def test_historical_incident_cannot_raise_current_budget_limits(self):
+        proof = {
+            "contract_version": "provider-budget-incident-v1", "approval_ref": "historical-incident",
+            "owner": "budget-owner", "provider": "tikhub", "business_day": "2026-08-29",
+            "bucket": "metrics", "approved_total_microusd": 60_000_000,
+            "approved_bucket_microusd": 16_000_000, "authorized_at": AT,
+            "expires_at": "2026-08-29T15:59:59Z",
+        }
         with connect(self.db) as connection, transaction(connection):
-            authorization = authorize_incident_budget(
-                connection,
-                approval_ref="INC-2026-08-29-001",
-                owner="budget-owner",
-                business_day="2026-08-29",
-                bucket="metrics",
-                approved_total_usd=60,
-                approved_bucket_usd=16,
-                expires_at="2026-08-29T15:59:59Z",
-                at=AT,
-            )
+            authorization_id = connection.execute(
+                """INSERT INTO scheduler_runs(job_id,scheduled_for,status,started_at,completed_at,details_json)
+                   VALUES ('provider_budget_incident:tikhub',?,'succeeded',?,?,?)""",
+                (AT, AT, AT, json.dumps(proof)),
+            ).lastrowid
+        # Old frozen proofs remain readable, but the ID is neither transmitted
+        # by new scopes nor consulted by the current capacity decision.
+        scope = PaidScope(category="metrics", incident_authorization_id=authorization_id)
+        token = _SCOPE.set(scope)
+        try:
+            with paid_scope("metrics") as current:
+                self.assertIsNone(current.incident_authorization_id)
+        finally:
+            _SCOPE.reset(token)
         with connect(self.db) as connection:
-            approved = check_reservation(
-                connection,
-                scope=PaidScope(
-                    category="metrics",
-                    incident_authorization_id=authorization["id"],
-                ),
-                operation="douyin_video_statistics",
-                unit_price=.001,
-                currency="USD",
-                at=AT,
-            )
-            with self.assertRaises(BudgetBlocked) as wrong_bucket:
-                check_reservation(
-                    connection,
-                    scope=PaidScope(
-                        category="reconcile",
-                        incident_authorization_id=authorization["id"],
-                    ),
-                    operation="douyin_user_posts",
-                    unit_price=.001,
-                    currency="USD",
-                    at=AT,
-                )
-        self.assertEqual(approved["budget_bucket"], "metrics")
-        self.assertEqual(
-            wrong_bucket.exception.error_code, "incident_authorization_invalid"
-        )
+            approved = check_reservation(connection, scope=scope,
+                operation="douyin_video_statistics", unit_price=.001, currency="USD", at=AT)
+        self.assertIsNone(approved["scope"]["incident_authorization_id"])
+        for total, category, operation, code in (
+            (15, "metrics", "douyin_video_statistics", "metrics_budget_exhausted"),
+            (50, "legacy", "legacy_unclassified", "automatic_budget_exhausted"),
+            (100, "legacy", "legacy_unclassified", "global_budget_exhausted"),
+        ):
+            with self.subTest(code=code):
+                with connect(self.db) as connection, transaction(connection):
+                    connection.execute("DELETE FROM provider_usage")
+                self.prefill(total, category=category, operation=operation)
+                with connect(self.db) as connection, self.assertRaises(BudgetBlocked) as caught:
+                    check_reservation(connection, scope=scope,
+                        operation="douyin_video_statistics", unit_price=.001, currency="USD", at=AT)
+                self.assertEqual(caught.exception.error_code, code)
+        self.assertEqual(self.calls, 0)
 
     def test_discovery_and_metrics_aggregate_buckets_are_hard_gates(self):
         self.prefill(
@@ -760,47 +754,6 @@ class ProviderBudgetTest(unittest.TestCase):
         self.assertFalse(repeated["consecutive_candidate"])
         self.assertTrue(second["consecutive_candidate"])
         self.assertIsNotNone(second["fault"])
-
-    def test_transport_baseline_requires_seven_complete_days_and_caps_at_two_percent(self):
-        with connect(self.db) as connection:
-            self.assertEqual(
-                transport_healthy_p95_rate(
-                    connection, operation="douyin_video_detail", at=AT
-                ),
-                0.01,
-            )
-        with connect(self.db) as connection, transaction(connection):
-            connection.execute(
-                """INSERT INTO scheduler_runs(
-                       job_id,scheduled_for,status,started_at,completed_at,details_json)
-                   VALUES (?,?,?,?,?,?)""",
-                (
-                    "provider_transport_baseline:tikhub:douyin_video_detail",
-                    "baseline-1",
-                    "succeeded",
-                    AT,
-                    AT,
-                    json.dumps(
-                        {
-                            "contract_version": "transport-healthy-baseline-v1",
-                            "provider": "tikhub",
-                            "operation": "douyin_video_detail",
-                            "complete_business_days": [
-                                f"2026-08-{day:02d}" for day in range(22, 29)
-                            ],
-                            "p95_transport_uncertain_rate": 0.031,
-                            "valid_through": "2026-08-29T15:59:59Z",
-                        }
-                    ),
-                ),
-            )
-        with connect(self.db) as connection:
-            self.assertEqual(
-                transport_healthy_p95_rate(
-                    connection, operation="douyin_video_detail", at=AT
-                ),
-                0.02,
-            )
 
     def test_provider_hard_fingerprint_is_idempotent_and_probe_is_domain_bound(self):
         with connect(self.db) as connection, transaction(connection):
@@ -2042,35 +1995,6 @@ class ProviderBudgetTest(unittest.TestCase):
 
 
 
-    def completed_rounds(self, category, *, at="2026-08-29T10:35:00Z"):
-        with connect(self.db) as connection:
-            snapshot = dict(connection.execute(
-                "SELECT * FROM account_roster_snapshots ORDER BY id DESC LIMIT 1"
-            ).fetchone())
-        ids = []
-        for registration, local_time in sorted(required_closeout_rounds(category, at=at)):
-            stamp = f"2026-08-29T{local_time}:00+08:00"
-            run = durable_runs.claim_run(
-                "pipeline_round:" + registration,
-                {"beijing_day": "2026-08-29", "round_id": registration + ":" + local_time,
-                 "scheduled_at": stamp, "roster_snapshot_id": snapshot["id"],
-                 "roster_snapshot_hash": snapshot["members_sha256"]},
-                db_path=self.db, now=stamp,
-            )
-            self.assertIsNotNone(run)
-            with connect(self.db) as connection, transaction(connection):
-                durable_runs.checkpoint(connection, run, {"complete": True, "child_run_ids": []}, now=stamp)
-            durable_runs.finish_run(run, status="succeeded", db_path=self.db, now=stamp)
-            ids.append(run.scheduler_run_id)
-        return ids
-
-    def closeout(self, category="history", *, at="2026-08-29T10:35:00Z"):
-        rounds = self.completed_rounds(category, at=at)
-        with connect(self.db) as connection, transaction(connection):
-            inventory = record_queue_inventory(connection, category=category, due_candidate_ids=[], at=at)
-            return record_closeout(connection, category=category,
-                                   inventory_ids=[inventory["id"]], round_run_ids=rounds, at=at)
-
     def history_catalog_debt(self, *, at="2026-08-29T10:40:00Z"):
         claim = durable_runs.claim_run(
             "history_scan_catalog",
@@ -2108,60 +2032,68 @@ class ProviderBudgetTest(unittest.TestCase):
             return self.execute(budget, content_id=content_id, operation="douyin_video_statistics",
                                 stage="metrics", call=self.call)
 
-    def test_verified_closeout_does_not_enable_cross_bucket_borrowing(self):
+    @patch.dict(CATEGORY_MICROUSD, {"history": 2_000_000})
+    def test_historical_closeout_does_not_enable_cross_bucket_borrowing(self):
         budget = self.metric_borrower()
-        self.closeout()
+        self.prefill(6.999, category="metrics")
+        at = "2026-08-29T10:35:00Z"
+        fingerprint = hashlib.sha256(b"archived-work-state").hexdigest()
         with connect(self.db) as connection, transaction(connection):
-            before = work_state_fingerprint(connection)
-        borrower = durable_runs.claim_run(
-            "metrics_backfill", {"candidate_ids": [1, 2]}, db_path=self.db,
-            initial_checkpoint={"pending_ids": [1, 2]}, now="2026-08-29T10:35:00Z",
-        )
-        with connect(self.db) as connection, transaction(connection):
-            self.assertNotEqual(before, work_state_fingerprint(connection))
-        with paid_scope("metrics", scheduler_run_id=borrower.scheduler_run_id,
-                        scheduler_attempt_id=borrower.attempt_id):
-            with patch("v8.capture.now_utc", return_value="2026-08-29T10:35:00Z"):
-                self.execute_metrics(budget)
+            round_ids = []
+            for registration in ("matrix_account_metrics", "matrix_works_refresh"):
+                scheduled = "2026-08-29T10:00:00Z"
+                details = {"contract_version": "durable-run-v1", "complete": True,
+                           "identity": {"beijing_day": "2026-08-29", "scheduled_at": scheduled,
+                                        "round_id": registration + ":18:00"},
+                           "checkpoint": {"complete": True, "child_run_ids": []}}
+                cursor = connection.execute(
+                    """INSERT INTO scheduler_runs(job_id,scheduled_for,status,started_at,completed_at,details_json)
+                       VALUES (?,?,'succeeded',?,?,?)""",
+                    ("pipeline_round:" + registration, scheduled, scheduled, scheduled, json.dumps(details)),
+                )
+                round_ids.append(cursor.lastrowid)
+            inventory = {"contract_version": "budget-queue-inventory-v1", "category": "history",
+                         "budget_day": "2026-08-29", "checked_at": at, "due_candidate_ids": [],
+                         "due_count": 0, "candidate_sha256": hashlib.sha256(b"[]").hexdigest(),
+                         "work_state_fingerprint": fingerprint}
+            cursor = connection.execute(
+                """INSERT INTO scheduler_runs(job_id,scheduled_for,status,started_at,completed_at,details_json)
+                   VALUES ('provider_queue_inventory:tikhub:history',?,'succeeded',?,?,?)""",
+                (at, at, at, json.dumps(inventory)),
+            )
+            closeout = {"contract_version": "budget-closeout-v1", "category": "history",
+                        "budget_day": "2026-08-29", "closed_at": at, "inventory_ids": [cursor.lastrowid],
+                        "round_run_ids": round_ids, "work_state_fingerprint": fingerprint}
+            connection.execute(
+                """INSERT INTO scheduler_runs(job_id,scheduled_for,status,started_at,completed_at,details_json)
+                   VALUES ('provider_budget_closeout:tikhub:history',?,'succeeded',?,?,?)""",
+                (at, at, at, json.dumps(closeout)),
+            )
+        with patch("v8.capture.now_utc", return_value=at):
+            self.execute_metrics(budget)
+            with self.assertRaises(BudgetBlocked) as caught:
                 self.execute_metrics(budget, content_id=2)
-        charged = self.usage()[1:]
-        self.assertEqual(len(charged), 2)
-        self.assertEqual(self.calls, 2)
-        for row in charged:
-            details = json.loads(row["details_json"])
-            self.assertEqual(details["borrowed_from"], {})
-            self.assertEqual(details["borrowing_proofs"], {})
+        self.assertEqual(caught.exception.error_code, "metrics_budget_exhausted")
+        self.assertEqual(self.calls, 1)
+        charged = self.usage()[2:]
+        self.assertEqual(len(charged), 1)
+        details = json.loads(charged[0]["details_json"])
+        self.assertEqual(details["borrowed_from"], {})
+        self.assertEqual(details["borrowing_proofs"], {})
         with connect(self.db) as connection:
-            self.assertEqual(budget_summary(connection, at="2026-08-29T10:35:00Z")["total_microusd"], 8_002_000)
+            self.assertEqual(budget_summary(connection, at=at)["total_microusd"], 15_000_000)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM fetch_attempts").fetchone()[0], 1)
 
     def test_donor_debt_does_not_change_independent_metrics_bucket(self):
         budget = self.metric_borrower()
-        self.closeout()
         self.history_catalog_debt()
         with patch("v8.capture.now_utc", return_value="2026-08-29T10:40:00Z"):
             self.execute_metrics(budget)
         self.assertEqual(self.calls, 1)
         self.assertEqual(len(self.usage()), 2)
 
-    @patch.dict(
-        CATEGORY_MICROUSD,
-        {"metrics": 8_000_000, "history": 2_000_000},
-    )
-    def test_lending_requires_current_fixed_rounds_and_1835(self):
-        self.metric_borrower()
-        with connect(self.db) as connection, transaction(connection):
-            inventory = record_queue_inventory(connection, category="history", due_candidate_ids=[],
-                                               at="2026-08-29T10:35:00Z")
-            with self.assertRaises(BudgetBlocked):
-                record_closeout(connection, category="history", inventory_ids=[inventory["id"]],
-                                round_run_ids=[], at="2026-08-29T10:35:00Z")
-            with self.assertRaises(BudgetBlocked):
-                record_closeout(connection, category="history", inventory_ids=[inventory["id"]],
-                                round_run_ids=[], at="2026-08-29T10:34:59Z")
-
-    def test_donor_inflight_reservation_does_not_enable_or_block_borrowing(self):
+    def test_detail_reservation_does_not_require_lending_to_metrics(self):
         budget = self.metric_borrower()
-        self.closeout()
         detail_budget = self.budget()
         with paid_scope("detail"), patch("v8.capture.now_utc", return_value="2026-08-29T10:36:00Z"):
             self.claim_only(detail_budget, content_id=2)
@@ -2335,7 +2267,6 @@ class ProviderBudgetTest(unittest.TestCase):
 
     def test_donor_debt_arriving_during_wait_does_not_affect_fixed_bucket(self):
         budget = self.metric_borrower()
-        self.closeout()
         test = self
 
         class DonorChangedWhileWaiting:

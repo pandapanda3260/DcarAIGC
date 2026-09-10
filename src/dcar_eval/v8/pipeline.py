@@ -9,12 +9,12 @@ from __future__ import annotations
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import copy_context
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from threading import RLock
-from time import sleep
+from threading import Event, RLock, Thread
+from time import monotonic, sleep
 from typing import Any, Callable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
@@ -41,6 +41,7 @@ from .paid_drain import (
 )
 from .provider_budget import (
     DEFAULT_TASK_MAX_AMOUNT_USD,
+    TIKHUB_NETWORK_CONCURRENCY,
     budget_summary,
     evaluate_transport_faults,
     micro_usd,
@@ -71,6 +72,7 @@ RETIRED_JOB_IDS = frozenset({
 QUEUE_KINDS = {"content_pipeline", "metrics_backfill", "comments_refresh", "history_recovery"}
 HISTORY_START = "2026-08-02T16:00:00Z"
 LOCAL_PROCESSING_LOCK = RLock()
+LOCAL_ANALYSIS_JOB = "local_content_analysis"
 QUEUE_RESERVATION_LOCKS = {kind: RLock() for kind in QUEUE_KINDS}
 MEDIA_BLOCKED_REASONS = frozenset({"restore_required", "expired_non_replayable", "original_unavailable"})
 CRON_ROUNDS = {
@@ -310,7 +312,7 @@ def _require_job_dispatch_open(
     diagnostic cohort; treating that job name as an operation prevents either
     path from ever obtaining its natural owner.
     """
-    if connection.execute("PRAGMA user_version").fetchone()[0] != 20:
+    if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
         require_paid_dispatch_open(connection, provider=provider, operation=job_id, at=at)
         return
     if not connection.in_transaction:
@@ -1558,6 +1560,256 @@ def _run_local_batch(content_ids: Sequence[int], *, db_path: Path) -> dict[str, 
             "pending_ids": [cid for cid in ids if cid not in complete]}
 
 
+def _local_analysis_scope(*, db_path: Path, at: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Reuse the runtime roster without making local evidence a paid route claim."""
+    from importlib import import_module
+    from .content_scope import canonical_content_predicate
+
+    directory_scope = None
+    try:
+        catalog = import_module(".account_catalog_capture", __package__)
+    except ModuleNotFoundError as error:
+        if error.name != f"{__package__}.account_catalog_capture":
+            raise
+    else:
+        with connect(db_path) as connection:
+            if catalog.installed_policy(connection, at=at) is not None:
+                from .account_capture_eligibility import derive_capture_eligibility
+
+                directory_scope = derive_capture_eligibility(connection)
+    if directory_scope is None:
+        snapshot, members = _scope(db_path, at=at)
+    else:
+        # A verified successor policy owns local business eligibility too.
+        # Do not intersect it with the legacy roster or accounts.enabled bit.
+        members = directory_scope["eligible_members"]
+        snapshot = {"id": None, "members_sha256": directory_scope["selection_sha256"],
+                    "scope_kind": "account_directory"}
+    eligible = {int(item["identity_id"]) for item in members if item["enabled"] and item["uid"]}
+    with connect(db_path) as connection:
+        rows = connection.execute(
+            "SELECT c.*,i.id identity_id FROM content_items c "
+            "JOIN accounts a ON a.id=c.account_id "
+            "JOIN account_platform_identities i ON i.account_id=c.account_id AND i.platform=c.platform "
+            "WHERE " + ("a.enabled=1" if directory_scope is None else "1=1") +
+            " AND c.platform IN ('douyin','xiaohongshu') "
+            "AND c.content_type IN ('video','image') "
+            "AND COALESCE(c.source_group,'') NOT IN ('history-backfill','history-archive') "
+            "AND julianday(c.published_at)<=julianday(?) "
+            "AND julianday(c.published_at)>=julianday(?)-30 AND "
+            + canonical_content_predicate(connection, "c") +
+            " AND (EXISTS (SELECT 1 FROM fetch_slots f WHERE f.content_id=c.id "
+            "AND f.stage='detail' AND f.status='succeeded') OR EXISTS ("
+            "SELECT 1 FROM evidence_artifacts e WHERE e.content_id=c.id AND e.status='available' "
+            "AND e.artifact_type IN ('media_source','media','media_manifest','media_lifecycle_manifest'))) "
+            "ORDER BY c.published_at,c.id", (at, at),
+        ).fetchall()
+    return snapshot, [dict(row) for row in rows if row["identity_id"] in eligible
+                      and within_automatic_scope(row["published_at"])]
+
+
+def _local_analysis_identity(connection, content: Mapping[str, Any], release_id: str) -> dict[str, Any]:
+    from .media import processor_versions
+
+    source = connection.execute(
+        "SELECT id,sha256 FROM evidence_artifacts WHERE content_id=? AND artifact_type='media_source' "
+        "AND status='available' ORDER BY id DESC LIMIT 1", (content["id"],),
+    ).fetchone()
+    original = None if source else connection.execute(
+        "SELECT id,sha256 FROM evidence_artifacts WHERE content_id=? AND artifact_type IN ('media','media_manifest') "
+        "AND status='available' ORDER BY id DESC LIMIT 1", (content["id"],),
+    ).fetchone()
+    # A source/release change gets a new scope; day rollover and restart do not.
+    # A managed bundle created by downloading this source is an OUTPUT, not a
+    # new input identity: otherwise normal completion/restart strands its run.
+    identity = {"contract_version": "local-content-analysis-v1", "content_id": int(content["id"]),
+            "release_id": release_id, "source": dict(source) if source else None,
+            "original": dict(original) if original else None,
+            "processors": processor_versions(), "fingerprint_version": FINGERPRINT_VERSION}
+    return {**identity, "input_sha256": durable_runs.scan_identity(LOCAL_ANALYSIS_JOB, identity)}
+
+
+def _local_analysis_current(connection, content_id: int, *, snapshot: Mapping[str, Any],
+                            active: Mapping[str, Any], at: str):
+    """Recheck one identity/content without rescanning the entire directory."""
+    from .content_scope import canonical_content_predicate
+
+    row = connection.execute(
+        "SELECT c.*,i.id identity_id FROM content_items c JOIN account_platform_identities i "
+        "ON i.account_id=c.account_id AND i.platform=c.platform WHERE c.id=? AND "
+        + canonical_content_predicate(connection, "c"), (content_id,),
+    ).fetchone()
+    if (row is None or not within_automatic_scope(row["published_at"])
+            or row["source_group"] in {"history-backfill", "history-archive"}
+            or row["content_type"] not in {"video", "image"}
+            or not timedelta(0) <= parse_time(at) - parse_time(row["published_at"]) <= timedelta(days=30)):
+        return None, snapshot
+    try:
+        if snapshot.get("scope_kind") == "account_directory":
+            from .account_capture_eligibility import require_directory_capture_member
+
+            require_directory_capture_member(connection, int(row["identity_id"]))
+            current_scope = snapshot
+        else:
+            member = require_active_member(connection, int(row["identity_id"]), activation=active)
+            current_scope = {"id": member["roster_snapshot_id"], "members_sha256": member["roster_snapshot_hash"]}
+    except ValueError:
+        return None, snapshot
+    return dict(row), current_scope
+
+
+@contextmanager
+def _local_analysis_lease(claim: durable_runs.DurableClaim, *, db_path: Path):
+    """ASR may exceed the ordinary durable lease; renew until processing yields."""
+    stopped = Event()
+    failures: list[Exception] = []
+
+    def renew():
+        while not stopped.wait(durable_runs.HEARTBEAT_SECONDS):
+            try:
+                with connect(db_path) as connection, transaction(connection, priority="heartbeat"):
+                    if not stopped.is_set():
+                        durable_runs.heartbeat(connection, claim, now=now_utc())
+            except Exception as error:
+                failures.append(error)
+                return
+
+    worker = Thread(target=renew, name=f"local-analysis-lease-{claim.scheduler_run_id}", daemon=True)
+    worker.start()
+    try:
+        yield
+        if failures:
+            raise durable_runs.LostOwnership("local analysis lease could not be renewed") from failures[0]
+    finally:
+        stopped.set()
+        worker.join(timeout=1)
+
+
+def run_local_content_analysis(*, db_path: Path = DEFAULT_DB, at: str | None = None,
+                               automatic_from: date | None = None, limit: int = 20,
+                               time_limit_seconds: float = 60) -> dict[str, Any]:
+    """Resume integrated local media/evaluation debt without any provider dispatch.
+
+    Download uses only stored source URLs. Missing/expired sources stay explicit;
+    this worker never calls update_content_data, retry_content_media or paid_scope.
+    """
+    from .runtime_database import require_current_process_writer_lock
+
+    if not 1 <= limit <= 500 or time_limit_seconds <= 0:
+        raise ValueError("local analysis requires limit 1..500 and positive time limit")
+    timestamp = at or now_utc()
+    deadline = monotonic() + time_limit_seconds
+    with automatic_scope(automatic_from), LOCAL_PROCESSING_LOCK:
+        with connect(db_path) as connection:
+            if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
+                return {"status": "skipped", "reason": "schema19_legacy", "provider_calls": 0}
+            require_current_process_writer_lock(connection)
+            active = activation(connection, at=timestamp)
+        if active is None or active.get("mode") != "active" or active.get("profile_id") != "integrated_route_v1":
+            return {"status": "skipped", "reason": "integrated_profile_required", "provider_calls": 0}
+        if not within_automatic_scope(timestamp):
+            return {"status": "skipped", "reason": "automatic_before_start", "provider_calls": 0}
+        snapshot, rows = _local_analysis_scope(db_path=db_path, at=timestamp)
+        with connect(db_path) as connection, transaction(connection):
+            running = [int(row[0]) for row in connection.execute(
+                "SELECT id FROM scheduler_runs WHERE job_id=? AND status='running'", (LOCAL_ANALYSIS_JOB,),
+            )]
+            recovered = durable_runs.recover_expired_leases(connection, now=timestamp, owned_run_ids=running)
+            release = connection.execute("SELECT id FROM evaluation_releases WHERE status='active'").fetchone()
+            if release is None:
+                raise RuntimeError("local analysis requires an active evaluation release")
+            release_id = str(release["id"])
+            states = media_terminal_state_details(connection, release_id, [int(row["id"]) for row in rows])
+            candidates = [row for row in rows if states[int(row["id"])].state != "complete"
+                          or not _fingerprint_ready(connection, int(row["id"]))]
+        results: list[dict[str, Any]] = []
+        for row in candidates:
+            if len(results) >= limit or monotonic() >= deadline:
+                break
+            # Pause/removal and source changes are re-read before each item,
+            # including previously interrupted work from an earlier day.
+            item_at = timestamp if at is not None else now_utc()
+            with connect(db_path) as connection:
+                current_active = activation(connection, at=item_at)
+                current_release = connection.execute("SELECT id FROM evaluation_releases WHERE status='active'").fetchone()
+                if (current_active is None or current_active.get("profile_id") != "integrated_route_v1"
+                        or current_active.get("mode") != "active" or current_release is None
+                        or current_release["id"] != release_id):
+                    break
+                current, current_snapshot_value = _local_analysis_current(
+                    connection, int(row["id"]), snapshot=snapshot, active=current_active, at=item_at)
+                if current is None:
+                    continue
+                cid = int(current["id"])
+                identity = _local_analysis_identity(connection, current, release_id)
+                failed = connection.execute(
+                    "SELECT id FROM scheduler_runs WHERE job_id=? AND status='failed' "
+                    "AND json_extract(details_json,'$.identity.input_sha256')=? ORDER BY id DESC LIMIT 1",
+                    (LOCAL_ANALYSIS_JOB, identity["input_sha256"]),
+                ).fetchone()
+                current_state = media_terminal_state_details(connection, release_id, [cid])[cid]
+                # A separately repaired original or reset stage can become
+                # runnable without changing its source URL/release identity.
+                claim_identity = {**identity, **({"recovery_after_run_id": int(failed["id"])}
+                    if failed is not None and current_state.state != "terminal_failed" else {})}
+            claim = durable_runs.claim_run(LOCAL_ANALYSIS_JOB, claim_identity, db_path=db_path, now=item_at,
+                initial_checkpoint={"complete": False, "content_id": cid})
+            if claim is None:
+                continue
+            previous = durable_runs.get_run(claim.scheduler_run_id, db_path=db_path)["details"]["checkpoint"]
+            local: dict[str, Any] = {}
+            error_reason: str | None = None
+            try:
+                with _local_analysis_lease(claim, db_path=db_path):
+                    with connect(db_path) as connection:
+                        before = media_terminal_state_details(connection, release_id, [cid])
+                        blocked = _media_work_blockers(connection, [cid], states=before)
+                    if blocked or before[cid].reason == "source_missing":
+                        local = {"blocked_media": blocked}
+                    else:
+                        local = run_local_batch([cid], db_path=db_path)
+                    _request_local_restores(local.get("blocked_media", {}), db_path=db_path)
+            except durable_runs.LostOwnership:
+                raise
+            except Exception as error:
+                error_reason = _error_reason(error)
+            finished_at = item_at if at is not None else now_utc()
+            with connect(db_path) as connection, transaction(connection):
+                state = media_terminal_state_details(connection, release_id, [cid])[cid]
+                source_changed = _local_analysis_identity(connection, current, release_id) != identity
+                terminal_failed = state.state == "terminal_failed" and not source_changed
+                complete = (state.state in {"complete", "terminal_insufficient"}
+                            and _fingerprint_ready(connection, cid) and not source_changed and error_reason is None)
+                reason = ("media_source_changed" if source_changed else error_reason or state.reason)
+                failures = 0 if complete else int(previous.get("consecutive_failures", 0)) + 1
+                stage_errors = [item for key in ("downloads", "processing", "fingerprints")
+                                for item in local.get(key, {}).get("results", []) if item.get("error")]
+                receipt = {"content_id": cid, "state": state.state, "reason": reason,
+                           "complete": complete, "consecutive_failures": failures,
+                           "roster_snapshot_id": current_snapshot_value["id"],
+                           "roster_snapshot_hash": current_snapshot_value["members_sha256"],
+                           "scope_kind": current_snapshot_value.get("scope_kind", "runtime_roster"),
+                           "provider_calls": 0, "errors": local.get("errors", []) + stage_errors,
+                           "next_action": "media_source_refresh_required" if reason in {"source_missing", "download_terminal_failed"}
+                                          else "original_media_required" if reason in MEDIA_BLOCKED_REASONS else None}
+                durable_runs.checkpoint(connection, claim, receipt, now=finished_at)
+                if failures >= LOCAL_BATCH_ALERT_FAILURES:
+                    _open_local_batch_alert(connection, claim=claim, kind=LOCAL_ANALYSIS_JOB,
+                                          reason=reason, failures=failures, at=finished_at)
+                status = "succeeded" if complete else "failed" if terminal_failed or source_changed else "partial"
+                durable_runs.finish_run_in_transaction(connection, claim, status=status, now=finished_at,
+                    summary={"content_id": cid, "state": state.state, "reason": reason, "provider_calls": 0},
+                    next_resume_at=_iso(parse_time(finished_at) + timedelta(
+                        seconds=min(300 * 2 ** min(max(failures - 1, 0), 7), 21600))) if status == "partial" else None)
+            results.append({**receipt, "scheduler_run_id": claim.scheduler_run_id, "status": status})
+        complete = not candidates or len(results) == len(candidates) and all(item["complete"] for item in results)
+        return {"status": "succeeded" if complete else "partial", "complete": complete,
+                "reason": "queue_empty_not_discovery_complete" if not candidates else None,
+                "eligible": len(rows), "candidates": len(candidates), "processed": len(results),
+                "recovered": recovered, "provider_calls": 0, "results": results,
+                "roster_snapshot_id": snapshot["id"]}
+
+
 def run_content_batch(
     kind: str, *, db_path: Path = DEFAULT_DB, at: str | None = None, limit: int = 100,
     call_override: Callable[[str, Mapping[str, Any]], ProviderResult] | None = None,
@@ -1956,88 +2208,6 @@ def _day_windows(start: datetime, end: datetime) -> list[tuple[str, str]]:
     return windows
 
 
-def budget_due_inventory(connection, *, at: str) -> dict[str, list[str]]:
-    """Enumerate paid debt under the caller's single-writer transaction.
-
-    Local analysis debt is not a claim on an API category. The same enumerator
-    is used by monitoring and lending, so a cached empty queue cannot lend over
-    newly-arrived donor work. No network, account creation or file walk occurs.
-    """
-    if not connection.in_transaction:
-        raise RuntimeError("budget inventory requires a locked write transaction")
-    categories: dict[str, set[str]] = {key: set() for key in ("reconcile", "detail", "metrics", "comments", "history")}
-    active = activation(connection, at=at)
-    snapshot = (
-        runtime_snapshot(connection, active)
-        if active is not None and "activation_id" in active
-        else current_snapshot(connection)
-    )
-    if snapshot is None:
-        return {key: ["roster_not_ready"] for key in categories}
-    db_path = Path(connection.execute("PRAGMA database_list").fetchone()[2])
-    members = [item for item in get_current_members(connection, enabled_only=True) if item["uid"]]
-    member_ids = {int(item["identity_id"]) for item in members}
-    for item in _queue_candidates("content_pipeline", at=at, db_path=db_path, include_claimed=True):
-        if not item.get("raw_account_uid") and not connection.execute("SELECT uid FROM account_platform_identities WHERE id=? AND uid IS NOT NULL AND uid<>''", (item["identity_id"],)).fetchone():
-            continue
-        slot = connection.execute("SELECT status FROM fetch_slots WHERE content_id=? AND stage='detail' AND window_key='lifetime'", (item["id"],)).fetchone()
-        refresh = connection.execute("SELECT 1 FROM fetch_slots WHERE content_id=? AND stage='media_source_refresh' AND status IN ('pending','retryable_failed','running')", (item["id"],)).fetchone()
-        if slot is None or slot["status"] not in {"succeeded", "terminal_failed"} or refresh:
-            categories["history" if item["historical"] else "detail"].add(f"content:{item['id']}")
-    for kind, category in (("metrics_backfill", "metrics"), ("comments_refresh", "comments")):
-        for item in _queue_candidates(kind, at=at, db_path=db_path, include_claimed=True):
-            categories["history" if item["historical"] else category].add(f"content:{item['id']}")
-    from .account_metrics import select_account_metrics
-    profiles = select_account_metrics(connection, [item["identity_id"] for item in members], cutoff_at=at)
-    profile_day = parse_time(at).astimezone(BEIJING).date().isoformat()
-    for member in members:
-        if member["platform"] != "douyin" or profiles[member["identity_id"]]["metric_fields"]["follower_count"].get("freshness") == "fresh":
-            continue
-        if not connection.execute("SELECT 1 FROM fetch_slots WHERE account_id=? AND stage='discovery' AND window_key=? AND status='succeeded'",
-                                  (member["account_id"], "matrix-first:profile:" + profile_day)).fetchone():
-            categories["metrics"].add(f"profile:{member['identity_id']}")
-    day_end = datetime.combine(parse_time(at).astimezone(BEIJING).date(), time.min, BEIJING)
-    covered = set()
-    for row in connection.execute("SELECT id,status,details_json FROM scheduler_runs WHERE job_id IN ('tikhub_reconcile','history_recovery','history_scan_catalog')"):
-        details = json.loads(row["details_json"])
-        if details.get("contract_version") != durable_runs.CONTRACT_VERSION:
-            continue
-        identity, cp = details.get("identity", {}), details.get("checkpoint", {})
-        if identity.get("identity_id") in member_ids and str(identity.get("provider", "")).lower() == "tikhub":
-            if details.get("complete") and identity.get("purpose") == "reconcile" and parse_time(identity["window_end"]) == day_end and parse_time(identity["window_start"]) == day_end - timedelta(days=7):
-                covered.add(identity["identity_id"])
-            elif not details.get("complete"):
-                categories["history" if identity.get("purpose") == "history" else "reconcile"].add(f"scan:{row['id']}")
-        for index in cp.get("pending_indices", []):
-            spec = cp["items"][index]
-            if spec.get("provider") == "tikhub" and spec.get("identity_id") in member_ids:
-                categories["history" if spec["purpose"] == "history" else "reconcile"].add(f"catalog:{row['id']}:{index}")
-    categories["reconcile"].update(f"identity:{identity_id}" for identity_id in member_ids - covered)
-    return {key: sorted(values) for key, values in categories.items()}
-
-
-def maintain_budget_closeout(*, db_path: Path, at: str) -> dict[str, Any]:
-    from .provider_budget import BudgetBlocked, record_closeout, record_queue_inventory
-
-    if parse_time(at).astimezone(BEIJING).hour < 18:
-        return {"status": "not_due"}
-    with connect(db_path) as connection, transaction(connection):
-        inventories = {key: record_queue_inventory(connection, category=key, due_candidate_ids=values, at=at)
-                       for key, values in budget_due_inventory(connection, at=at).items()}
-        rounds = [int(row[0]) for row in connection.execute(
-            "SELECT id FROM scheduler_runs WHERE job_id LIKE 'pipeline_round:%' AND status='succeeded' "
-            "AND json_extract(details_json,'$.identity.beijing_day')=?", (parse_time(at).astimezone(BEIJING).date().isoformat(),))]
-        closed, blocked = {}, {}
-        for category, inventory in inventories.items():
-            if inventory["due_count"]:
-                continue
-            try:
-                closed[category] = record_closeout(connection, category=category, inventory_ids=[inventory["id"]], round_run_ids=rounds, at=at)["id"]
-            except BudgetBlocked as error:
-                blocked[category] = str(error)
-        return {"inventories": {key: value["id"] for key, value in inventories.items()}, "closed": closed, "blocked": blocked}
-
-
 def seed_history_work(*, db_path: Path, at: str) -> list[int]:
     """Create durable initial/new-member and outage scopes, without network.
 
@@ -2302,7 +2472,7 @@ def resume_due_work(*, at: str, db_path: Path, limit: int = 20,
 
     with connect(db_path) as connection:
         rows = connection.execute("SELECT id,job_id,status,details_json FROM scheduler_runs WHERE status IN ('partial','interrupted') ORDER BY COALESCE(completed_at,started_at),id").fetchall()
-        schema20 = connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        schema20 = connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}
         effective_activation = activation(connection, at=at)
         effective_activation_id = (
             int(effective_activation["activation_id"])
@@ -2585,7 +2755,7 @@ def _run_tikhub_account_profiles(
     """Refresh account-only TikHub facts without invoking Matrix."""
     _snapshot_value, members = _scope(db_path, frozen_roster, at=at)
     with connect(db_path) as connection:
-        if connection.execute("PRAGMA user_version").fetchone()[0] == 20:
+        if connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}:
             members = [member for member in members if member["platform"] == "douyin" and legacy_queue_allowed(
                 connection, account_id=int(member["account_id"]), content_id=None,
                 operations=["douyin_uid_profile"], at=at)]
@@ -2648,7 +2818,7 @@ def _run_tikhub_discovery_round(
         return {"status": "skipped", "complete": True, "reason": "automatic_before_start", "scans": []}
     window_start, window_end = _iso(start), _iso(end)
     with connect(db_path) as connection:
-        if connection.execute("PRAGMA user_version").fetchone()[0] == 20:
+        if connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}:
             members = [member for member in members if legacy_queue_allowed(
                 connection, account_id=int(member["account_id"]), content_id=None,
                 operations=[str(member["platform"]) + "_user_posts"], at=at)]
@@ -3061,7 +3231,7 @@ def _legacy_runtime_authority(db_path: Path) -> AbstractContextManager[None]:
     revalidates the installed evidence; schema19 retains its existing contract.
     """
     with connect(db_path) as connection:
-        if connection.execute("PRAGMA user_version").fetchone()[0] != 20:
+        if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
             return nullcontext()
     from . import capture_authorizations, capture_release
     return capture_authorizations.runtime_authority(capture_release.current_runtime_bindings)
@@ -3172,7 +3342,6 @@ def _dispatch_locked(job_id: str, *, db_path: Path, reports_root: Path, at: str 
         if job_id == "content_pipeline":
             interval_result["resumed"] = resume_due_work(at=timestamp, db_path=db_path, reports_root=reports_root, limit=5,
                                                 call_override=call_override, matrix_client=matrix_client)
-            interval_result["budget_closeout"] = maintain_budget_closeout(db_path=db_path, at=timestamp)
         return interval_result
     if resume_round_id is None:
         snapshot, round_members = _scope(db_path, at=due_slot)
@@ -3335,7 +3504,7 @@ def _capture_v25_job(*, kind: str, db_path: Path,
 
     timestamp = at or now_utc()
     with connect(db_path) as connection:
-        if connection.execute("PRAGMA user_version").fetchone()[0] != 20:
+        if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
             return {"status": "skipped", "reason": "schema19_legacy", "provider_calls": 0}
         require_current_process_writer_lock(connection)
     with automatic_scope(automatic_from), capture_authorizations.runtime_authority(capture_release.current_runtime_bindings):
@@ -3348,14 +3517,15 @@ def _capture_v25_job(*, kind: str, db_path: Path,
         if kind == "execute":
             from .capture_commands import process_commands
             process_commands(db_path=db_path, at=timestamp)
-            return capture_runtime.run_ready(db_path, timestamp, max_items=4)
+            return capture_runtime.run_ready(db_path, timestamp, max_items=TIKHUB_NETWORK_CONCURRENCY)
         if kind == "maintenance":
+            from .capture_evidence_preflight import evidence_boundary, prepare_installed_evidence
             result = capture_quality.maintenance_tick(db_path=db_path, at=timestamp)
             # Qualification renewal is a separate, evidence-bound control
             # action. Quality measurement itself never opens paid gates.
-            with connect(db_path) as connection, transaction(connection):
+            with prepare_installed_evidence(db_path), connect(db_path) as connection, transaction(connection), evidence_boundary(connection):
                 qualification = capture_release.maintain_operation_qualifications(
-                    connection, at=timestamp,
+                    connection, at=at or now_utc(),
                     mirror_root=db_path.resolve().parent / "current-hold-control")
             return {**result, "qualification_maintenance": qualification}
         if kind == "archive":
@@ -3411,8 +3581,13 @@ def install_pipeline_jobs(scheduler, *, db_path: Path, reports_root: Path, call_
                       next_run_time=datetime.now(BEIJING))
     install_lifecycle_jobs(scheduler, db_path=db_path)
     with connect(db_path) as connection:
-        integrated_schema = connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        integrated_schema = connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}
     if integrated_schema:
+        scheduler.add_job(run_local_content_analysis, IntervalTrigger(minutes=5, timezone=BEIJING),
+            id=LOCAL_ANALYSIS_JOB, replace_existing=True,
+            kwargs={"db_path": db_path, "automatic_from": authorization_effective_date},
+            coalesce=True, max_instances=1, misfire_grace_time=None, executor="default",
+            next_run_time=datetime.now(BEIJING))
         for kind, seconds, executor in (
             ("plan", 300, SCHEDULER_CONTROL_EXECUTOR),
             ("execute", 10, "default"),

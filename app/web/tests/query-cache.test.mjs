@@ -20,7 +20,8 @@ import {
 const emptyContentFilters = {
   query: "",
   platform: "",
-  accountType: "",
+  accountGroup: "",
+  businessDirection: "",
   direction: "",
   sellingPoint: "",
   spuSeries: "",
@@ -34,7 +35,8 @@ test("search request builders produce one canonical key payload", () => {
     page_size: 50,
     query: "",
     platform: null,
-    account_type: null,
+    account_group: null,
+    business_direction: null,
     content_direction: null,
     selling_point: null,
     spu_series: null,
@@ -45,7 +47,8 @@ test("search request builders produce one canonical key payload", () => {
     ...emptyContentFilters,
     query: "问界",
     platform: "douyin",
-    accountType: "original",
+    accountGroup: "innovation",
+    businessDirection: "used_car_c2",
     direction: "used_car",
     sellingPoint: "SP01",
     spuSeries: "aito-m7",
@@ -56,7 +59,8 @@ test("search request builders produce one canonical key payload", () => {
     page_size: 20,
     query: "问界",
     platform: "douyin",
-    account_type: "original",
+    account_group: "innovation",
+    business_direction: "used_car_c2",
     content_direction: "used_car",
     selling_point: "SP01",
     spu_series: "aito-m7",
@@ -66,26 +70,26 @@ test("search request builders produce one canonical key payload", () => {
   assert.deepEqual(buildAccountSearchRequest({
     query: "账号",
     platform: "xiaohongshu",
-    accountType: "boutique_ip",
-    direction: "new_car",
+    accountGroup: "boutique_ip",
+    businessDirection: "new_car",
   }, 2, 100), {
     page: 2,
     page_size: 100,
     query: "账号",
     platform: "xiaohongshu",
-    account_type: "boutique_ip",
-    content_direction: "new_car",
+    account_group: "boutique_ip",
+    business_direction: "new_car",
     account_status: null,
   });
   assert.deepEqual(buildAccountSearchRequest({
-    query: "", platform: "", accountType: "", direction: "",
+    query: "", platform: "", accountGroup: "", businessDirection: "",
   }, 1, 50), {
     page: 1,
     page_size: 50,
     query: "",
     platform: null,
-    account_type: null,
-    content_direction: null,
+    account_group: null,
+    business_direction: null,
     account_status: null,
   });
 });
@@ -93,13 +97,13 @@ test("search request builders produce one canonical key payload", () => {
 test("account status is the only account lifecycle filter", () => {
   for (const accountStatus of ["daily", "weekly", "paused", "unmarked"]) {
     const request = buildAccountSearchRequest({
-      query: "", platform: "", accountType: "", direction: "", accountStatus,
+      query: "", platform: "", accountGroup: "", businessDirection: "", accountStatus,
     }, 1, 50);
     assert.equal(request.account_status, accountStatus);
     assert.equal("scope" in request, false);
   }
   const request = buildAccountSearchRequest({
-    query: "", platform: "", accountType: "", direction: "", accountStatus: "",
+    query: "", platform: "", accountGroup: "", businessDirection: "", accountStatus: "",
   }, 1, 50);
   assert.equal(request.account_status, null);
   assert.equal("scope" in request, false);

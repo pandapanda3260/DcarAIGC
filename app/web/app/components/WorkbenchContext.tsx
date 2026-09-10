@@ -2,12 +2,12 @@
 
 import { createContext, useContext } from "react";
 import type { Section } from "../lib/types";
-import type { ServiceState } from "../lib/serviceStatus";
+import { dataServiceStatus, type ServiceState } from "../lib/serviceStatus";
 
 type WorkbenchState = { activeSection: Section | null; serviceState: ServiceState };
 const defaultState: WorkbenchState = {
   activeSection: null,
-  serviceState: { kind: "checking", label: "正在检查数据服务", description: "" },
+  serviceState: dataServiceStatus(undefined, false),
 };
 
 export const WorkbenchContext = createContext<WorkbenchState>(defaultState);

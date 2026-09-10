@@ -44,6 +44,8 @@ RUNTIME_IDENTITY_SCHEMA = "dcar-runtime-identity-v1"
 EXPECTED_REPORT_VERSION = "dcar-content-operations-report-v8.9"
 EXPECTED_DATABASE_SCHEMA_VERSION = 19
 EXPECTED_DATABASE_SCHEMA_MIGRATION = "dual-acquisition-profile-roster-v1"
+CLASSIFICATION_SCHEMA_VERSION = 21
+CLASSIFICATION_SCHEMA_MIGRATION = "account-classification-v1"
 EXPECTED_ACTIVE_RELEASE_ID = "evaluation-v9__selling-points-v5.2"
 EXPECTED_ACTIVE_RELEASE_STATUS = "active"
 EXPECTED_RULE_VERSION = "evaluation-v9"
@@ -74,8 +76,10 @@ LEGACY_SCHEMA_SEAL_CONTRACT = "dcar-schema17-to18-release-seal-v1"
 SCHEMA_SEAL_CONTRACT = "dcar-schema18-to19-release-seal-v1"
 INTEGRATED_SCHEMA_TRANSITION_CONTRACT = "dcar-schema19-to20-server-transition-v1"
 INTEGRATED_SCHEMA_SEAL_CONTRACT = "dcar-schema19-to20-release-seal-v1"
-SUPPORTED_SCHEMA_VERSIONS = frozenset({17, 18, 19, 20})
-SUPPORTED_SCHEMA_TRANSITIONS = frozenset({(17, 18), (18, 19), (19, 20)})
+CLASSIFICATION_SCHEMA_TRANSITION_CONTRACT = "dcar-schema20-to21-server-transition-v1"
+CLASSIFICATION_SCHEMA_SEAL_CONTRACT = "dcar-schema20-to21-release-seal-v1"
+SUPPORTED_SCHEMA_VERSIONS = frozenset({17, 18, 19, 20, 21})
+SUPPORTED_SCHEMA_TRANSITIONS = frozenset({(17, 18), (18, 19), (19, 20), (20, 21)})
 RELEASE_CONTRACTS = {
     17: ("dcar-content-operations-report-v8.7", "optional-account-phone"),
     18: ("dcar-content-operations-report-v8.8", "matrix-roster-source-routing"),
@@ -84,11 +88,13 @@ RELEASE_CONTRACTS = {
         "dual-acquisition-profile-roster-v1",
     ),
     20: ("dcar-content-operations-report-v8.9", "integrated-video-capture-v25"),
+    21: ("dcar-content-operations-report-v8.9", "account-classification-v1"),
 }
 TRANSITION_CONTRACTS = {
     (17, 18): (LEGACY_SCHEMA_TRANSITION_CONTRACT, LEGACY_SCHEMA_SEAL_CONTRACT),
     (18, 19): (SCHEMA_TRANSITION_CONTRACT, SCHEMA_SEAL_CONTRACT),
     (19, 20): (INTEGRATED_SCHEMA_TRANSITION_CONTRACT, INTEGRATED_SCHEMA_SEAL_CONTRACT),
+    (20, 21): (CLASSIFICATION_SCHEMA_TRANSITION_CONTRACT, CLASSIFICATION_SCHEMA_SEAL_CONTRACT),
 }
 SCHEMA_SERVICES = ("dcar-auth.service", "dcar-douyin-control.service", "dcar-web.service", "dcar-api.service")
 SETTLED_TRANSITIONS = frozenset({"succeeded", "rolled_back"})
@@ -165,7 +171,7 @@ def _transition_contract(
         return TRANSITION_CONTRACTS[(from_schema, to_schema)]
     except KeyError as exc:
         raise SnapshotInstallError(
-            "schema-upgrade supports only sealed 17-to-18, 18-to-19 or 19-to-20"
+            "schema-upgrade supports only sealed 17-to-18, 18-to-19, 19-to-20 or 20-to-21"
         ) from exc
 
 
@@ -284,6 +290,9 @@ def _strict_schema(path: Path, version: int) -> None:
         elif version == 20:
             from v8.schema_v20 import validate_structure
             validate_structure(connection)
+        elif version == 21:
+            from v8.schema_v21 import validate_structure
+            validate_structure(connection)
         else:
             raise SnapshotInstallError("unsupported schema transition version")
     except (ValueError, RuntimeError, sqlite3.Error) as exc:
@@ -383,23 +392,35 @@ def _literal(path: Path, name: str) -> Any:
 
 def _verify_release_contract(release: Path, version: int) -> None:
     expected_report, expected_migration = _release_contract(version)
-    # Schema20 is deliberately explicit; bootstrap remains19. Verify its real
+    # Schema20/21 are deliberately explicit; bootstrap remains19. Verify its real
     # migration/read-support closure instead of changing global fixture defaults.
-    bootstrap = 19 if version == 20 else version
+    bootstrap = 19 if version in {20, 21} else version
     checks: tuple[tuple[str, str, Any], ...] = (("src/dcar_eval/v8/storage.py", "SCHEMA_VERSION", bootstrap),
               ("src/dcar_eval/v8/storage.py", "CURRENT_SCHEMA_MIGRATION_NAME", _release_contract(bootstrap)[1]),
               ("src/dcar_eval/v8/contracts.py", "CURRENT_REPORT_VERSION", expected_report))
-    if version == 20:
-        checks += (("src/dcar_eval/v8/storage.py", "LATEST_SCHEMA_VERSION", 20),
-                   ("src/dcar_eval/v8/schema_v20.py", "SCHEMA_VERSION", 20),
-                   ("src/dcar_eval/v8/schema_v20.py", "MIGRATION_NAME", expected_migration))
+    if version in {20, 21}:
+        schema_module = f"src/dcar_eval/v8/schema_v{version}.py"
+        checks += (("src/dcar_eval/v8/storage.py", "LATEST_SCHEMA_VERSION", version),
+                   (schema_module, "SCHEMA_VERSION", version),
+                   (schema_module, "MIGRATION_NAME", expected_migration))
         migrations = _literal(release / "src/dcar_eval/v8/storage.py", "SCHEMA_MIGRATION_NAMES")
-        if not isinstance(migrations, dict) or migrations.get(20) != expected_migration:
-            raise SnapshotInstallError("sealed release does not explicitly support schema20 reads")
-        definitions = {node.name for node in ast.parse((release / "src/dcar_eval/v8/schema_v20.py").read_text()).body
+        if not isinstance(migrations, dict) or migrations.get(version) != expected_migration:
+            raise SnapshotInstallError(f"sealed release does not explicitly support schema{version} reads")
+        definitions = {node.name for node in ast.parse((release / schema_module).read_text()).body
                        if isinstance(node, ast.FunctionDef)}
         if not {"migrate", "validate_structure", "validate_lineage"} <= definitions:
-            raise SnapshotInstallError("sealed release has no complete schema20 migration contract")
+            raise SnapshotInstallError(f"sealed release has no complete schema{version} migration contract")
+        if version == 21:
+            if migrations.get(20) != RELEASE_CONTRACTS[20][1]:
+                raise SnapshotInstallError("schema21 release lost its schema20 parent contract")
+            checks += tuple((name, constant, expected) for name in (
+                "deploy/server/install_snapshot.py", "deploy/macos/publish_snapshot.py", "scripts/build_server_snapshot.py"
+            ) for constant, expected in (
+                ("CLASSIFICATION_SCHEMA_VERSION", 21), ("CLASSIFICATION_SCHEMA_MIGRATION", expected_migration),
+                ("EXPECTED_REPORT_VERSION", expected_report),
+            ))
+            checks += (("deploy/server/install_snapshot.py", "CLASSIFICATION_SCHEMA_TRANSITION_CONTRACT", CLASSIFICATION_SCHEMA_TRANSITION_CONTRACT),
+                       ("deploy/server/install_snapshot.py", "CLASSIFICATION_SCHEMA_SEAL_CONTRACT", CLASSIFICATION_SCHEMA_SEAL_CONTRACT))
     if version in {18, 19}:
         checks += tuple((name, constant, expected) for name in (
             "deploy/server/install_snapshot.py", "deploy/macos/publish_snapshot.py", "scripts/build_server_snapshot.py"
@@ -899,8 +920,8 @@ def verify_bundle(
                 raise SnapshotInstallError(
                     "snapshot database runtime identity does not match the manifest"
                 )
-            if expected_schema == 20:
-                _strict_schema(source, 20)
+            if expected_schema in {20, 21}:
+                _strict_schema(source, expected_schema)
                 _verify_schema20_deployment(source, manifest, bundle=bundle)
     if "dcar_insight.sqlite3" not in seen_names:
         raise SnapshotInstallError("snapshot omits dcar_insight.sqlite3")
@@ -1091,6 +1112,32 @@ def _verify_schema20_deployment(database: Path, manifest: Mapping[str, Any], *, 
     connection = sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
     try:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA query_only=ON")
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if version not in {20, 21}:
+            raise ValueError("portable deployment proof requires schema20 or schema21")
+        from v8.account_cleanup_snapshot import CONTRACT as CLEANUP_CONTRACT, validate as validate_cleanup
+        if proof.get("contract_version") == CLEANUP_CONTRACT:
+            checked = validate_cleanup(connection, deployment_id=proof.get("deployment_id"), verify_files=False)
+            if version == 21 and (proof.get("schema_version") != 21
+                    or proof.get("schema_migration") != CLASSIFICATION_SCHEMA_MIGRATION
+                    or not isinstance(proof.get("account_classification_migration"), dict)):
+                raise ValueError("schema21 classification migration proof is missing")
+            if checked != proof or manifest.get("code_successor") is not None:
+                raise ValueError("Cleanup portable proof differs from the frozen receipt")
+            receipt_path = bundle / "snapshot-source-receipt.json"
+            source_receipt = None
+            if receipt_path.exists() or receipt_path.is_symlink():
+                if receipt_path.is_symlink() or not receipt_path.is_file():
+                    raise ValueError("snapshot source receipt is unsafe")
+                source_receipt = _read_object(receipt_path)
+                if source_receipt.get("manifest_sha256") != _sha256(bundle / "manifest.json"):
+                    raise ValueError("snapshot source receipt manifest differs")
+            _verify_schema20_activation(connection, proof, manifest, source_receipt=source_receipt)
+            return
+        if version == 21:
+            raise ValueError("schema21 requires inherited cleanup proof")
         row = connection.execute("SELECT * FROM deployment_readiness_receipts WHERE deployment_id=?",
                                  (proof.get("deployment_id"),)).fetchone()
         if row is None:
@@ -1232,8 +1279,9 @@ def _private_deployment_reference_index(manifest: Mapping[str, Any]) -> dict[str
                 or directory["deployment_receipt_sha256"] != deployment["receipt_sha256"]
                 or not isinstance(directory["references"], list)):
             raise ValueError("private deployment directory binding differs")
-        expected = {"deployment." + key: value for key, value in deployment["evidence"].items()
-                    if key in {"source_archive", "migration", "rollback", "full_checks", "install", "bounded_e2e", "release_decision"}}
+        from v8.account_cleanup_snapshot import CONTRACT as CLEANUP_CONTRACT, EVIDENCE_ROLES
+        roles = set(EVIDENCE_ROLES) if deployment.get("contract_version") == CLEANUP_CONTRACT else {"source_archive", "migration", "rollback", "full_checks", "install", "bounded_e2e", "release_decision"}
+        expected = {"deployment." + key: value for key, value in deployment["evidence"].items() if key in roles}
         decision = deployment.get("release_decision")
         if decision is not None:
             expected.update({"decision." + key: decision["runtime_evidence"][key] for key in ("build", "runtime")})
@@ -2082,9 +2130,9 @@ def install_bundle(
                 f"normal install requires an existing schema{expected_schema} database"
             )
         _database_runtime_identity(active, expected_schema=expected_schema)
-        if expected_schema == 20:
-            _verify_release_contract(_current_release(config), 20)
-            _strict_schema(active, 20)
+        if expected_schema in {20, 21}:
+            _verify_release_contract(_current_release(config), expected_schema)
+            _strict_schema(active, expected_schema)
         return _install_bundle_locked(bundle, config, service_action=service_action, smoke_check=smoke_check,
                                       expected_schema=expected_schema)
 
@@ -2702,6 +2750,7 @@ def schema_upgrade(
     predecessor_pair, predecessor_contract = (
         ((16, 17), PREDECESSOR_SCHEMA_TRANSITION_CONTRACT)
         if (from_schema, to_schema) == (17, 18)
+        else ((19, 20), INTEGRATED_SCHEMA_TRANSITION_CONTRACT) if (from_schema, to_schema) == (20, 21)
         else ((18, 19), SCHEMA_TRANSITION_CONTRACT) if (from_schema, to_schema) == (19, 20)
         else ((17, 18), LEGACY_SCHEMA_TRANSITION_CONTRACT)
     )
@@ -3086,9 +3135,9 @@ def rollback_snapshot(
         # Only the sealed transition owns paired cross-version recovery.
         _database_runtime_identity(config.database_root / "dcar_insight.sqlite3", expected_schema=expected_schema)
         _database_runtime_identity(source / "dcar_insight.sqlite3", expected_schema=expected_schema)
-        if expected_schema == 20:
-            _verify_release_contract(_current_release(config), 20)
-            _strict_schema(source / "dcar_insight.sqlite3", 20)
+        if expected_schema in {20, 21}:
+            _verify_release_contract(_current_release(config), expected_schema)
+            _strict_schema(source / "dcar_insight.sqlite3", expected_schema)
         if snapshot_id is None:
             source_receipt = _read_object(source / "install-receipt.json")
             if source_receipt.get("artifact_policy") != ARTIFACT_POLICY:
@@ -3226,7 +3275,7 @@ def _parser() -> argparse.ArgumentParser:
     rollback.add_argument("--snapshot-id")
     _common_arguments(rollback)
     for explicit in (verify, install, rollback):
-        explicit.add_argument("--expected-schema", type=int, choices=(19, 20), default=19)
+        explicit.add_argument("--expected-schema", type=int, choices=(19, 20, 21), default=19)
     prune = commands.add_parser(
         "prune", help="Prune inactive snapshot staging and rollback history."
     )

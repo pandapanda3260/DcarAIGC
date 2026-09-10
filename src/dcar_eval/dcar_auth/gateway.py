@@ -6,11 +6,9 @@ import json
 import logging
 import os
 import posixpath
-import re
 import sqlite3
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from functools import lru_cache
 from html import escape
 from pathlib import Path
 from typing import AsyncIterator, Callable, Mapping, Optional, TypeVar, Union
@@ -186,8 +184,6 @@ class AuthGatewayConfig:
     # Append-only security change log next to the account store (outside of
     # it, so restoring a backup never rewinds it).
     change_log_path: Optional[Path] = None
-    # Trusted build output; missing configuration keeps every response no-store.
-    static_asset_manifest_path: Optional[Path] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "base_path", _normalized_base_path(self.base_path))
@@ -327,11 +323,6 @@ class AuthGatewayConfig:
                 if os.environ.get("DCAR_AUTH_CHANGE_LOG", "").strip()
                 else None
             ),
-            static_asset_manifest_path=(
-                Path(os.environ["DCAR_AUTH_STATIC_MANIFEST"])
-                if os.environ.get("DCAR_AUTH_STATIC_MANIFEST", "").strip()
-                else None
-            ),
         )
 
     @property
@@ -434,64 +425,6 @@ def _web_upstream_path(
             return None
         return stripped_path
     return path
-
-
-_HASHED_CODE_ASSET = re.compile(r"assets/[A-Za-z0-9_.-]+-[A-Za-z0-9_-]{8,64}\.(?:js|css)\Z")
-
-
-@lru_cache(maxsize=4)
-def _manifest_code_assets(
-    path: Path, identity: tuple[int, int, int, int],
-) -> frozenset[str]:
-    """Read only published JS/CSS entries, never infer permission from a suffix."""
-    del identity  # Cache key changes on atomic build/manifest replacement.
-    try:
-        manifest = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(manifest, dict):
-            return frozenset()
-        client_root = path.parent.parent
-        assets: set[str] = set()
-        for entry in manifest.values():
-            if not isinstance(entry, dict):
-                continue
-            candidates = [entry.get("file")]
-            css = entry.get("css")
-            if isinstance(css, list):
-                candidates.extend(css)
-            for asset in candidates:
-                if (isinstance(asset, str) and _HASHED_CODE_ASSET.fullmatch(asset)
-                        and (client_root / asset).is_file()
-                        and not (client_root / asset).is_symlink()):
-                    assets.add("/" + asset)
-        return frozenset(assets)
-    except (OSError, ValueError):
-        return frozenset()
-
-
-def _is_revalidatable_code_asset(
-    request: Request, upstream: httpx.Response, upstream_path: str,
-    manifest_path: Optional[Path],
-) -> bool:
-    """Authentication already ran; only the browser's stored code body is reused."""
-    if (manifest_path is None or request.method not in {"GET", "HEAD"}
-            or request.url.query or "range" in request.headers
-            or upstream.status_code not in {200, 304}
-            or not upstream.headers.get("etag") or "set-cookie" in upstream.headers):
-        return False
-    if upstream.status_code == 200:
-        expected = {"text/css"} if upstream_path.endswith(".css") else {
-            "application/javascript", "text/javascript", "application/x-javascript",
-        }
-        if upstream.headers.get("content-type", "").split(";", 1)[0].strip().lower() not in expected:
-            return False
-    try:
-        state = manifest_path.stat()
-        if not 0 < state.st_size <= 1024 * 1024:
-            return False
-        identity = (state.st_dev, state.st_ino, state.st_mtime_ns, state.st_size)
-        return upstream_path in _manifest_code_assets(manifest_path, identity)
-    except OSError:
-        return False
 
 
 def _safe_return_to(value: str, config: AuthGatewayConfig) -> str:
@@ -1361,14 +1294,6 @@ def create_app(
             # Upstream public caching policies cannot override authorization.
             _no_store(response)
             response.headers["Cache-Control"] = "private, no-store"
-            if (upstream_base == resolved.web_upstream
-                    and _is_revalidatable_code_asset(
-                        request, upstream, upstream_path, resolved.static_asset_manifest_path,
-                    )):
-                # no-cache requires authentication and validator checks on every
-                # reuse. ETag/If-None-Match remain end-to-end; a revoked session
-                # is denied before this proxy can return a 304.
-                response.headers["Cache-Control"] = "private, no-cache"
         return response
 
     def unauthenticated(request: Request, stripped: str) -> Response:

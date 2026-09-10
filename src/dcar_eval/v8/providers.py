@@ -4231,6 +4231,14 @@ def update_content_data_manual(
     call_override: Optional[Callable[[str, Mapping[str, Any]], ProviderResult]] = None,
 ) -> Dict[str, Any]:
     """An explicit UI update uses the same field routes, cycles and budgets."""
+    with connect(db_path) as connection:
+        command_runtime = int(connection.execute("PRAGMA user_version").fetchone()[0]) >= 20
+    if command_runtime:
+        # Schema20 has a durable Writer command executor. Do not also execute
+        # the legacy synchronous pipeline with a second scope or due bucket.
+        from .capture_commands import submit_command
+
+        return submit_command(db_path=db_path, content_id=content_id, kind="manual_update")
     from .account_roster import require_active_member
     from .media import MediaProcessingError, _has_managed_history, _managed_bundle
     from .media_lifecycle import LifecycleError

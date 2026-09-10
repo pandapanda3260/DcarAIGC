@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, Collection
 
 from . import capture_runtime, durable_runs
 from .runtime_database import require_current_process_writer_lock
@@ -35,7 +35,7 @@ def read_command(connection: sqlite3.Connection, *, run_id: int, content_id: int
     if result is not None:
         reason = result.get("reason", "")
         work = [dict(item) for item in connection.execute(
-            "SELECT id,state,reason,completed_at FROM capture_work_items WHERE id IN (" +
+            "SELECT id,operation,state,reason,completed_at FROM capture_work_items WHERE id IN (" +
             ",".join("?" for _ in result["work_ids"]) + ") ORDER BY id", result["work_ids"]).fetchall()] if result["work_ids"] else []
         if result["status"] == "blocked":
             status = "blocked"
@@ -46,21 +46,31 @@ def read_command(connection: sqlite3.Connection, *, run_id: int, content_id: int
             status, reason = "failed", "linked_capture_work_missing"
         elif work and all(item["state"] == "terminal" for item in work):
             status = "partial" if reason else "succeeded"
-        elif any(item["state"] == "paid_identity_hold" for item in work):
-            status = "blocked"
         elif any(item["state"] in {"running", "leased"} for item in work):
             status = "running"
+        else:
+            blockers = [item for item in work if item["state"] in
+                        {"paid_identity_hold", "provider_blocked", "budget_deferred"}]
+            if blockers:
+                reason = ";".join(dict.fromkeys([value for value in [reason, *[
+                    item["operation"] + ":" + (item["reason"] or item["state"]) for item in blockers]] if value]))
+                if all(item["state"] == "terminal" or item in blockers for item in work):
+                    status = "partial" if any(item["state"] == "terminal" for item in work) else "blocked"
     return {"run_id": run_id, "content_id": content_id, "kind": specification["kind"],
         "status": status, "reason": reason, "work": work, "provider_calls": 0}
 
 
 def submit_command(*, db_path: Path, content_id: int, kind: str = "manual_update",
-                   at: str | None = None) -> dict[str, Any]:
+                   at: str | None = None, allowed_groups: Collection[str] | None = None,
+                   task_id: str | None = None, task_max_amount: float | None = None,
+                   cycle_key: str | None = None, retry_transport_fault: bool = False) -> dict[str, Any]:
     """Persist once by content, command kind and existing logical due buckets."""
     at = at or now_utc()
     with connect(db_path) as connection, transaction(connection):
         require_current_process_writer_lock(connection)
-        spec = capture_runtime.manual_work_spec(connection, content_id=content_id, kind=kind, at=at)
+        spec = capture_runtime.manual_work_spec(connection, content_id=content_id, kind=kind, at=at,
+            allowed_groups=allowed_groups, task_id=task_id, task_max_amount=task_max_amount,
+            cycle_key=cycle_key, retry_transport_fault=retry_transport_fault)
         identity = {"contract_version": CONTRACT, "specification": spec}
         scan_id = durable_runs.scan_identity(JOB, identity)
         scheduled = "scan:" + scan_id

@@ -24,6 +24,9 @@ from urllib.parse import unquote, urlsplit
 from xml.sax.saxutils import escape, quoteattr
 
 
+from .account_classification import ACCOUNT_GROUPS, BUSINESS_DIRECTIONS
+
+
 EXCEL_MAX_ROWS = 1_048_576
 EXCEL_MAX_CELL_CHARS = 32_767
 _INVALID_FILENAME_CHARS = re.compile(r'[\x00-\x1f\x7f<>:"/\\|?*]+')
@@ -37,7 +40,7 @@ _WINDOWS_RESERVED_FILENAMES = {
     *(f"LPT{index}" for index in range(1, 10)),
 }
 
-_CONTENT_EXPORT_COLUMNS = (
+_LEGACY_CONTENT_EXPORT_COLUMNS = (
     ("report_period", "周期"),
     ("report_task", "报告任务"),
     ("platform_content_id", "平台作品编号"),
@@ -58,6 +61,16 @@ _CONTENT_EXPORT_COLUMNS = (
     ("content_automotive_score", "内容垂直度"),
     ("view_count", "播放/阅读数"),
     ("comment_count", "评论数"),
+)
+_CONTENT_EXPORT_COLUMNS = tuple(
+    entry
+    for column in _LEGACY_CONTENT_EXPORT_COLUMNS
+    for entry in (
+        (("account_group", "账号分组"), ("business_direction", "业务方向"))
+        if column[0] == "account_type"
+        else (("content_direction", "作品内容方向"),) if column[0] == "content_direction"
+        else (column,)
+    )
 )
 
 
@@ -83,7 +96,6 @@ _CONTENT_REQUIRED_HEADERS = {
     "title",
     "account_uid",
     "account_name",
-    "account_type",
     "content_direction",
     "evidence_level",
     "primary_selling_point_code",
@@ -231,6 +243,8 @@ _COLUMN_WIDTHS = {
     "account_uid": 24,
     "account_name": 22,
     "account_type": 16,
+    "account_group": 16,
+    "business_direction": 16,
     "content_direction": 16,
     "v3_status": 18,
     "primary_selling_point_code": 16,
@@ -525,7 +539,10 @@ def _content_sheet(
     selling_point_labels: Mapping[str, str],
 ) -> tuple[_Worksheet, int]:
     headers, raw_rows = _csv_rows(payload)
-    missing_headers = sorted(_CONTENT_REQUIRED_HEADERS - set(headers))
+    new_classification = "account_group" in headers or "business_direction" in headers
+    classification_headers = {"account_group", "business_direction"} if new_classification else {"account_type"}
+    missing_headers = sorted((_CONTENT_REQUIRED_HEADERS | classification_headers) - set(headers))
+    export_columns = _CONTENT_EXPORT_COLUMNS if new_classification else _LEGACY_CONTENT_EXPORT_COLUMNS
     if missing_headers:
         raise ValueError(
             "content detail CSV is missing required headers: "
@@ -536,7 +553,7 @@ def _content_sheet(
         f"{_clean_text(task.get('period_end') or '')}"
     )
     task_reference = _clean_text(task.get("id") or task.get("name") or "")
-    output_headers = [label for _, label in _CONTENT_EXPORT_COLUMNS]
+    output_headers = [label for _, label in export_columns]
     rows: list[list[Any]] = [output_headers]
     styles: list[list[int]] = [[1] * len(output_headers)]
     for raw_row in raw_rows:
@@ -593,9 +610,12 @@ def _content_sheet(
             source.get("title", ""),
             source.get("account_uid", ""),
             source.get("account_name", ""),
-            _ACCOUNT_TYPE_LABELS.get(
-                source.get("account_type", ""), source.get("account_type", "")
-            ),
+            *([
+                _enum_or_dash(ACCOUNT_GROUPS, source.get("account_group")),
+                _enum_or_dash(BUSINESS_DIRECTIONS, source.get("business_direction")),
+            ] if new_classification else [
+                _ACCOUNT_TYPE_LABELS.get(source.get("account_type", ""), source.get("account_type", "")),
+            ]),
             _CONTENT_DIRECTION_LABELS.get(
                 source.get("content_direction", ""),
                 source.get("content_direction", ""),
@@ -611,7 +631,7 @@ def _content_sheet(
             _typed_value("view_count", source.get("view_count", "")),
             _typed_value("comment_count", source.get("comment_count", "")),
         ]
-        style_headers = [key for key, _ in _CONTENT_EXPORT_COLUMNS]
+        style_headers = [key for key, _ in export_columns]
         rows.append(values)
         styles.append(
             [_style_for(header, value) for header, value in zip(style_headers, values)]
@@ -624,7 +644,7 @@ def _content_sheet(
             styles=styles,
             widths=[
                 float(_COLUMN_WIDTHS.get(key, max(12, _display_width(label) + 3)))
-                for key, label in _CONTENT_EXPORT_COLUMNS
+                for key, label in export_columns
             ],
             auto_filter=f"A1:{last_column}{len(rows)}",
             frozen_rows=1,
@@ -822,7 +842,7 @@ def build_accounts_workbook(
     headers = [
         "平台", "昵称", "头像", "平台 UID", "短号", "矩阵监测", "矩阵授权",
         "总粉丝", "平台作品总量", "本地收录量", "手机号", "运营人员",
-        "账号类型", "内容方向", "数据日期", "账号状态", "抖音开平授权", "采集开关",
+        "账号分组", "业务方向", "数据日期", "账号状态", "抖音开平授权",
     ]
     rows: list[list[Any]] = [headers]
     styles: list[list[int]] = [[1] * len(headers)]
@@ -860,21 +880,20 @@ def build_accounts_workbook(
             int(identity.get("content_count") or 0),
             _clean_text(account.get("phone") or ""),
             _clean_text(account.get("operator_name") or "").strip() or "未填写",
-            _enum_or_dash(_ACCOUNT_TYPE_LABELS, account.get("account_type")),
-            _enum_or_dash(_CONTENT_DIRECTION_LABELS, account.get("content_direction")),
+            _enum_or_dash(ACCOUNT_GROUPS, account.get("account_group")),
+            _enum_or_dash(BUSINESS_DIRECTIONS, account.get("business_direction")),
             _clean_text(identity.get("data_date") or "—"),
             operating_status_labels.get(str(account.get("account_status") or ""),
                                         "待标记" if account.get("enabled") else "暂停"),
             authorization,
-            "运营中" if account.get("enabled") else "停用",
         ])
-        styles.append([10, 10, 12, 12, 12, 10, 10, 5, 5, 19, 12, 10, 10, 10, 12, 10, 10, 10])
+        styles.append([10, 10, 12, 12, 12, 10, 10, 5, 5, 19, 12, 10, 10, 10, 12, 10, 10])
     sheet = _Worksheet(
         name="账号信息",
         rows=rows,
         styles=styles,
-        widths=[12, 22, 36, 28, 22, 12, 12, 14, 16, 16, 18, 16, 12, 12, 22, 16, 16, 12],
-        auto_filter=f"A1:R{len(rows)}",
+        widths=[12, 22, 36, 28, 22, 12, 12, 14, 16, 16, 18, 16, 12, 12, 22, 16, 16],
+        auto_filter=f"A1:{_column_name(len(headers))}{len(rows)}",
         frozen_rows=1,
         frozen_columns=2,
         row_heights={1: 28},

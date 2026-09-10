@@ -14,7 +14,7 @@ DETAIL_OPERATIONS = {"douyin_video_detail", "xiaohongshu_note_detail"}
 
 def record_detail_result(connection: sqlite3.Connection, *, content_id: int,
                          raw_response_id: int, available: bool, recorded_at: str) -> int:
-    if not connection.in_transaction or connection.execute("PRAGMA user_version").fetchone()[0] != 20:
+    if not connection.in_transaction or connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
         raise ValueError("availability requires schema20 writer transaction")
     raw = connection.execute("""SELECT r.*,t.clean_eof,t.json_parse_ok FROM provider_raw_responses r
         JOIN fetch_transport_receipts t ON t.id=r.transport_receipt_id AND t.fetch_attempt_id=r.fetch_attempt_id

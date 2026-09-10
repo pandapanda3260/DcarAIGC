@@ -4,6 +4,7 @@ import json
 import unittest
 
 from tests import test_v8_diagnostic_capture_boundary as capture_fixture
+from v8 import operation_recovery
 from v8.provider_budget import PaidScopeBlocked, check_reservation, fault_state, record_fault_state
 from v8.storage import connect, transaction
 
@@ -197,6 +198,45 @@ class DiagnosticBudgetBoundaryTest(unittest.TestCase):
                     operation="douyin_user_posts", unit_price=.001, currency="USD", at=AT,
                 )
             self.assertEqual(caught.exception.error_code, "operation_blocked")
+
+    def test_diagnostic_contender_refunds_and_same_unsent_member_can_retry(self):
+        self._fault()
+        with connect(self.db) as connection:
+            opened = fault_state(connection, scope_kind="operation", operation="douyin_user_posts")
+        with operation_recovery.operation_probe_lock(db_path=self.db, operation="douyin_user_posts"):
+            with self.fixture._context(), self.assertRaises(PaidScopeBlocked) as caught:
+                self.fixture._fetch()
+        self.assertEqual(caught.exception.error_code, "operation_blocked")
+        self.fixture._assert_not_sent()
+        with connect(self.db) as connection:
+            self.assertEqual(fault_state(connection, scope_kind="operation", operation="douyin_user_posts"), opened)
+        # The diagnostic authorization remains valid before ordinary cooldown;
+        # contention created no paid-send file or consumed member start.
+        with self.fixture._context():
+            self.fixture._fetch()
+        self.assertEqual(self.fixture.calls, 1)
+        with connect(self.db) as connection:
+            self.assertEqual(fault_state(connection, scope_kind="operation", operation="douyin_user_posts"), opened)
+            usage = connection.execute("SELECT request_attempts,amount FROM provider_usage ORDER BY id").fetchall()
+            self.assertEqual([tuple(row) for row in usage], [(0, 0), (1, .001)])
+
+    def test_diagnostic_success_keeps_operation_lock_through_response(self):
+        self._fault()
+        original = self.fixture._response
+        observed = []
+        def response():
+            with connect(self.db) as connection:
+                operation_recovery.require_operation_lock(connection, operation="douyin_user_posts")
+            with operation_recovery.operation_probe_lock(db_path=self.db, operation="douyin_user_posts"):
+                with connect(self.db) as connection, self.assertRaises(PaidScopeBlocked) as caught:
+                    operation_recovery.require_operation_lock(connection, operation="douyin_user_posts")
+                observed.append(caught.exception.error_code)
+            return original()
+        self.fixture._response = response
+        with self.fixture._context():
+            self.fixture._fetch()
+        self.assertEqual(observed, ["operation_blocked"])
+        self.assertEqual(self.fixture.calls, 1)
 
     def test_older_field_fault_cannot_be_hidden_by_newer_transport(self):
         self._fault(fault_class="field_contract")

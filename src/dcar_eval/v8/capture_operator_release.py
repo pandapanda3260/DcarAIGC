@@ -34,6 +34,9 @@ def _decision(evidence: Mapping[str, Any], operation: str, at: str) -> dict[str,
     decision = evidence["deployment"].get("release_decision")
     if decision is None:
         return None
+    if isinstance(decision, dict) and decision.get("contract_version") == "account-cleanup-operator-decision-v1":
+        from .account_cleanup_runtime import validate_decision
+        return validate_decision(evidence, operation, at)
     _require(isinstance(decision, dict)
              and decision.get("contract_version") == DECISION_CONTRACT
              and decision.get("production_rollout") == "approved_by_user"
@@ -135,8 +138,9 @@ def authority(connection: sqlite3.Connection, *, evidence: Mapping[str, Any],
     release_id = release._native_control(connection, evidence, at=at)
     _require((provider_budget.circuit_state(connection) or {}).get("open") is not True,
              "Provider circuit blocks operator release")
-    _require((provider_budget.fault_state(connection, scope_kind="operation", operation=operation) or {}).get("open") is not True,
-             "Operation circuit blocks operator release")
+    # A retained production decision may be renewed while its operation is
+    # unhealthy. This is business authority, not fault recovery: readiness and
+    # every reservation/send still enforce the operation circuit separately.
     result = {"decision": decision, "bindings": _bindings(evidence, decision, operation, release_id),
               "release_event_id": release_id}
     from .account_roster_capture import METADATA_KEY

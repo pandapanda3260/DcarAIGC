@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, NoReturn
 
 from . import capture, capture_release as release, transport_execution
+from .capture_evidence_preflight import evidence_boundary, prepare_installed_evidence
 from .runtime_database import require_current_process_writer_lock
 from .storage import connect, now_utc, transaction
 
@@ -95,7 +96,7 @@ def _current_command(connection: sqlite3.Connection, command_claim: Mapping[str,
     from . import profile_control
 
     require_current_process_writer_lock(connection)
-    if connection.execute("PRAGMA user_version").fetchone()[0] != 20:
+    if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
         raise profile_control.ProfileControlError("capture_release_schema_required", "Capture release actions require schema20")
     row = connection.execute("SELECT * FROM scheduler_runs WHERE id=?", (command_claim["run_id"],)).fetchone()
     attempt = connection.execute("SELECT * FROM scheduler_run_attempts WHERE id=? AND scheduler_run_id=?",
@@ -139,7 +140,10 @@ def run_command(*, db_path: Path, mirror_root: Path | None, command_claim: Mappi
 
         return complete_cross_profile_switch(db_path=db_path, drain_id=arguments["drain_id"],
             now=at, mirror_root=root, command_claim=command_claim)
-    with connect(db_path) as connection, transaction(connection):
+    with prepare_installed_evidence(db_path, enabled=action in {
+        "operation_publish", "operation_renew", "integrated_publish",
+    }), connect(db_path) as connection, transaction(connection), evidence_boundary(connection):
+        at = now_utc()
         _current_command(connection, command_claim, parameters)
         if action == "continuity_freeze":
             return release.freeze_continuity_permit(connection, at=at, **arguments)

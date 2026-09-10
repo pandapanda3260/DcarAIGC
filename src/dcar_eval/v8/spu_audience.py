@@ -1814,7 +1814,7 @@ def build_stats(
             return {"ready": False}
         assets = _load_assets(connection)
         bounds = _window_bounds(window)
-        where = ["c.published_at IS NOT NULL", content_statistics_scope_sql()]
+        where = ["c.published_at IS NOT NULL", content_statistics_scope_sql(connection=connection)]
         parameters: List[Any] = []
         if bounds is not None:
             where.append("c.published_at >= ? AND c.published_at < ?")

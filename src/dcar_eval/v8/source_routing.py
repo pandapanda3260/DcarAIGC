@@ -589,7 +589,7 @@ def select_content_metrics(
     parse_time(cutoff)
     knowledge = knowledge_at or cutoff
     parse_time(knowledge)
-    if connection.execute("PRAGMA user_version").fetchone()[0] == 20:
+    if connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}:
         from .metric_field_facts import select_metric_projections
         return select_metric_projections(
             connection, sorted({int(value) for value in content_ids}),

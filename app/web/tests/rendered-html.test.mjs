@@ -292,7 +292,7 @@ test("douyin authorization management locks every scan to the selected business 
   assert.match(source, /const rawAccountId = params\.get\("account_id"\) \?\? ""/);
   assert.match(source, /const platformUid = params\.get\("platform_uid"\) \?\? ""/);
   assert.match(source, /const targetIsValid = Number\.isSafeInteger\(accountId\) && accountId > 0 && \/\^\\d\{6,24\}\$\/\.test\(platformUid\)/);
-  assert.match(source, /buildAccountSearchRequest\(\{ query: platformUid, accountType: "", direction: "", platform: "douyin" \}, 1, 100\)/);
+  assert.match(source, /buildAccountSearchRequest\(\{ query: platformUid, accountGroup: "", businessDirection: "", platform: "douyin" \}, 1, 100\)/);
   assert.match(source, /accountSearchQueryOptions\(targetRequest\), enabled: canUseControl && targetIsValid/);
   assert.match(source, /targetAccountQuery\.data\?\.items\.find\(\(item\) => item\.id === accountId\)/);
   assert.match(source, /identity\.platform === "douyin" && identity\.uid === uid/);
@@ -642,7 +642,8 @@ test("spu audience page keeps rule assets, association and 3D stats together", a
   assert.match(contentCells[2], /contentMetric\(item\.view_count\)/);
   assert.match(contentCells[3], /contentMetric\(item\.comment_count\)/);
   assert.match(contentCells[4], /contentMetric\(item\.like_count\)/);
-  assert.match(contentCells[5], /账号类型[\s\S]*内容方向/);
+  assert.match(contentCells[5], /账号分组[\s\S]*业务方向/);
+  assert.doesNotMatch(contentCells[5], /作品内容方向|item\.content_direction/);
   assert.match(contentCells[6], /setDetailSelection\(item\)/);
   // 编号和原有标签不能因首屏精简而丢失；在详情中仍可核对。
   const details = contents.slice(contents.indexOf("function ContentDetails"), contents.indexOf("export default function ContentsPage"));
@@ -813,7 +814,7 @@ test("routes preserve operations and expose read-only evidence workbench", async
   assert.match(contents, /<Pagination page=\{appliedRequest\.page\} pageSize=\{appliedRequest\.page_size\} total=\{total\} busy=\{contentsQuery\.isFetching \|\| saving\}/);
   assert.match(contents, /if \(!contentsQuery\.data \|\| contentsQuery\.isPlaceholderData\) return;[\s\S]*lastPageFor\(contentsQuery\.data\.total, appliedRequest\.page_size\)[\s\S]*\{ \.\.\.current, page: lastPage \}/);
   assert.doesNotMatch(contents, /function pageWindow/);
-  assert.match(accounts, /managedMode \? "系统托管账号名单" : "矩阵通账号名单"/);
+  assert.match(accounts, /managedMode \? "系统账号" : "矩阵通账号名单"/);
   for (const action of ["批量上传账号", "下载账号表格"]) assert.match(accounts, new RegExp(action));
   assert.doesNotMatch(accounts, /去矩阵通管理|上传官方导出|立即同步|准备系统名单|同步差异|抖音授权管理|roster\?\.message|全部本地档案/);
   assert.doesNotMatch(accounts, /新增账号<\/button>|parseCsv|\/api\/v8\/accounts\/import|platform-editor/);
@@ -821,7 +822,7 @@ test("routes preserve operations and expose read-only evidence workbench", async
   // 授权状态列已删除：列表不再读取抖音开平授权状态，仅在行菜单保留锁定 account_id+platform_uid 的授权入口
   assert.doesNotMatch(accounts, /useQuery\(douyinAuthorizationStatusesQueryOptions\(\)\)|AccountAuthorizationStatus|authorizationStatusesReady|BroadcastChannel|data-authorization-state/);
   assert.doesNotMatch(accounts, /查询中|状态异常|不可授权/);
-  assert.match(accounts, /const douyinAuthorizationHref = identity\?\.platform === "douyin" && identity\.uid \? `\/accounts\/douyin-authorization\?account_id=\$\{encodeURIComponent\(String\(item\.id\)\)\}&platform_uid=\$\{encodeURIComponent\(identity\.uid\)\}` : ""/);
+  assert.match(accounts, /identity\.uid && !identityPending[\s\S]*account_id=\$\{encodeURIComponent\(String\(item\.id\)\)\}&platform_uid=\$\{encodeURIComponent\(identity\.uid\)\}/);
   assert.match(accounts, /<th scope="col" rowSpan=\{2\} className=\{styles\.accountHeading\}>账号<\/th>/);
   assert.match(accounts, /<th scope="colgroup" colSpan=\{3\}>数据规模<\/th>/);
   const accountRow = accounts.match(/<tr key=\{item\.id\} data-account-id=\{item\.id\}>([\s\S]*?)<\/tr>/)?.[1];
@@ -844,17 +845,16 @@ test("routes preserve operations and expose read-only evidence workbench", async
   assert.equal((accountRow.match(/title=\{metricTitle\}/g) ?? []).length, 2, "fans and platform work counts carry the data-date tooltip");
   assert.match(accountRow, /title=\{`平台 UID：[\s\S]*短号：/);
   assert.match(accountRow, /aria-label=\{`复制\$\{identity\.nickname \|\| "账号"\}的平台 UID`\}[\s\S]*copyUid\(identity\.uid\)/);
-  for (const field of ["item.operator_name", "item.account_type", "item.content_direction", "item.phone"]) assert.ok(accountRow.includes(field), `${field} remains accessible in the grouped account row`);
+  for (const field of ["item.operator_name", "item.account_group", "item.business_direction", "item.phone"]) assert.ok(accountRow.includes(field), `${field} remains accessible in the grouped account row`);
   for (const field of ["identity?.data_date", "identity?.data_status"]) assert.ok(accounts.includes(field), `${field} still feeds the account row tooltip`);
-  assert.match(accountRow, /title=\{`账号类型：\$\{label\(item\.account_type\)\}；内容方向：\$\{label\(item\.content_direction\)\}`\}/);
+  assert.match(accountRow, /title=\{`账号分组：\$\{accountGroupLabel\(item\.account_group\)\}；业务方向：\$\{businessDirectionLabel\(item\.business_direction\)\}`\}/);
   assert.match(accountRow, /aria-label=\{`修改\$\{identity\?\.nickname \|\| "账号"\}的运营信息`\} onClick=\{\(\) => edit\(item\)\}/);
-  assert.match(accountRow, /pauseManagedAccount\(item\)/);
-  assert.match(accounts, /const canPause = managedMode && rowStatus !== "paused"/);
-  assert.match(accounts, /readJson<\{ message: string \}>\(`\/api\/v8\/accounts\/\$\{account\.id\}`, jsonRequest\(\{\s*account_status: "paused", status_request_id: statusRequests\.current\.get\(requestKey\),\s*\}, "PATCH"\)\)/);
-  assert.match(accounts, /暂停后将停止采集、退出当前生效名单，相关数据不进入统计；历史数据保留/);
+  assert.match(accountRow, /changeAccountStatus\(item, action\.status\)/);
+  assert.match(accounts, /const body = \{ account_status: status \};[\s\S]*statusRequestId\(account\.id, body\)/);
+  assert.match(accounts, /暂停后只停止自动采集，历史内容和数据保留/);
   assert.doesNotMatch(accounts, /removeManagedAccount|移出名单|method: "DELETE"/);
-  assert.match(accountRow, /\(douyinAuthorizationHref \|\| canPause\) && <details className=\{styles\.rowMenu\}/);
-  assert.match(accountRow, /<DotsThreeVerticalIcon weight="bold" aria-hidden="true" \/><\/summary><div className=\{styles\.menuPanel\}>\{douyinAuthorizationHref && <Link href=\{douyinAuthorizationHref\}>抖音授权<\/Link>\}\{canPause && <button/);
+  assert.match(accountRow, /<details data-account-menu className=\{styles\.rowMenu\}/);
+  assert.match(accountRow, /data-account-menu-panel className=\{styles\.menuPanel\}/);
   assert.doesNotMatch(accounts, /DotsThreeIcon\b/);
   assert.doesNotMatch(accounts, /form\.enabled|主动采集启用/);
   assert.match(accounts, /form\.accountStatus && form\.accountStatus !== form\.originalAccountStatus \? \{ account_status: form\.accountStatus \} : \{\}/);
@@ -873,8 +873,8 @@ test("routes preserve operations and expose read-only evidence workbench", async
   }
   assert.match(editForm, /<option value="" disabled>待标记<\/option>/);
   assert.doesNotMatch(editForm, /<option value="unmarked"/);
-  assert.match(editForm, /日更、周更仅标注作品更新频率，采集规则不变/);
-  assert.match(editForm, /暂停将停止采集、退出当前生效名单，相关数据不进入统计；历史数据保留/);
+  assert.match(editForm, /日更、周更仅标注作品更新频率。暂停只停止自动采集，历史内容和数据保留。/);
+  assert.match(editForm, /暂停只停止自动采集，历史内容和数据保留/);
   assert.match(accounts, /formatIdentityCount\(identity\?\.follower_count\)/);
   assert.match(accounts, /formatIdentityCount\(identity\?\.platform_work_count\)/);
   assert.match(accounts, /formatIdentityCount\(identity\?\.content_count \?\? 0\)/);
@@ -1108,7 +1108,6 @@ test("content editing sends only changed fields and preserves Shanghai timestamp
     contentType: "video",
     accountUid: "account-uid",
     accountName: "账号昵称",
-    accountType: "original",
     contentDirection: "new_car",
   };
   assert.equal(toShanghaiDateTimeLocal("2026-08-03T08:00:00Z"), "2026-08-03T16:00");

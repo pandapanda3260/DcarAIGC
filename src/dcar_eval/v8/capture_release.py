@@ -99,8 +99,20 @@ def _release_tools() -> Any:
 
 def _installed_evidence(connection: sqlite3.Connection, *, at: str,
                         maintenance_only: bool = False) -> dict[str, Any]:
+    from .capture_evidence_preflight import installed_evidence
+    prepared = installed_evidence(connection, at=at, maintenance_only=maintenance_only)
+    if prepared is not None:
+        return prepared
+    return _installed_evidence_uncached(connection, at=at, maintenance_only=maintenance_only)
+
+
+def _installed_evidence_uncached(connection: sqlite3.Connection, *, at: str,
+                                 maintenance_only: bool = False) -> dict[str, Any]:
+    if os.environ.get("DCAR_ACCOUNT_CLEANUP_INSTALL_RECEIPT"):
+        from .account_cleanup_runtime import installed_evidence
+        return installed_evidence(connection, at=at, maintenance_only=maintenance_only)
     require_current_process_writer_lock(connection)
-    _require(connection.execute("PRAGMA user_version").fetchone()[0] == 20, "Release requires exact schema20")
+    _require(connection.execute("PRAGMA user_version").fetchone()[0] == 20, "Non-classification release requires exact schema20")
     installed = load_installed_writer_contract(required=True)
     _require(installed is not None and installed.project_root.resolve() == PROJECT_ROOT.resolve(),
              "Installed writer checkout differs")
@@ -237,7 +249,7 @@ def _source_samples(connection: sqlite3.Connection, *, operation: str, high_wate
         raw = connection.execute("SELECT * FROM provider_raw_responses WHERE id=?", (terminal.raw_response_id,)).fetchone()
         _require(raw is not None and raw["fetch_attempt_id"] == sent.fetch_attempt_id
                  and raw["operation"] == operation and raw["provider"].lower() == "tikhub", "Source raw lineage differs")
-        if connection.execute("PRAGMA user_version").fetchone()[0] == 20:
+        if connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}:
             entity = raw_archive.read_response_entity(connection, raw["id"])
         else:
             path = Path(raw["local_path"])
@@ -258,7 +270,7 @@ def freeze_operation_cohort(connection: sqlite3.Connection, *, operation: str, a
     _require(connection.in_transaction, "Cohort freeze requires a writer transaction")
     require_current_process_writer_lock(connection)
     version = connection.execute("PRAGMA user_version").fetchone()[0]
-    if version == 20:
+    if version in {20, 21}:
         return _freeze_native_cohort(connection, operation=operation, at=at,
             mirror_root=mirror_root, after_qualification_id=after_qualification_id)
     _require(version == 19 and operation in provider_budget.PRICES_MICROUSD,
@@ -475,7 +487,7 @@ def _native_control(connection: sqlite3.Connection, evidence: Mapping[str, Any],
     """Validate the unchanged RELEASE without recursing through an expired gate."""
     profile = evidence["active"]["profile_id"]
     _require(profile in {"tikhub_managed_v1", "integrated_route_v1"}, "Native qualification requires an installed TikHub profile")
-    if profile == "integrated_route_v1":
+    if profile == "integrated_route_v1" and not evidence.get("account_cleanup_generation"):
         _require(evidence.get("activation_successor") is not None, "Integrated native qualification requires its legal installed successor")
     state = paid_drain.dispatch_state(connection, at=at)
     _require(state.paid_dispatch_open and state.activation_id == evidence["active"]["activation_id"]
@@ -484,7 +496,10 @@ def _native_control(connection: sqlite3.Connection, evidence: Mapping[str, Any],
                              (state.permit_event_id,)).fetchone()
     _require(row is not None, "Native collection has no current RELEASE")
     control = _object(row[0]).get("control", {})
-    if forward_recovery.is_forward_release(control):
+    if evidence.get("account_cleanup_generation"):
+        from .account_cleanup_runtime import validate_control
+        validate_control(connection, evidence, control, at=at)
+    elif forward_recovery.is_forward_release(control):
         forward_recovery.validate_forward_release(connection, active=evidence["active"], release_control=control,
                                                    at=at, check_runtime=False)
         _require(control["route_control"]["selected_route"] == evidence["manifest"], "Current RELEASE transport differs")
@@ -1129,7 +1144,10 @@ def _previously_enabled_operation(connection: sqlite3.Connection, *, operation: 
 
 def maintain_operation_qualifications(connection: sqlite3.Connection, *, at: str,
                                       mirror_root: Path) -> dict[str, Any]:
-    """Existing maintenance tick: no HTTP, first enablement, new work or retries.
+    """Existing maintenance tick: no HTTP or new work/retries.
+
+    An installed cleanup generation may initialize its inherited operator gates
+    exactly once. Explicitly closed gates remain closed.
 
     Six hours before expiry (or after downtime), an already enabled operation
     may collect the fixed next 200 through its normal A transactions. The same
@@ -1148,13 +1166,20 @@ def maintain_operation_qualifications(connection: sqlite3.Connection, *, at: str
         return {**result, "status": "blocked", "reason": str(error)}
     for operation in sorted(CONTINUITY_OPERATIONS):
         latest = connection.execute("SELECT * FROM capture_paid_send_gate_events WHERE provider='tikhub' AND operation=? ORDER BY id DESC LIMIT 1", (operation,)).fetchone()
-        if latest is None or latest["state"] not in {"open", "diagnostic_only"}:
+        from .account_cleanup_runtime import OPERATIONS as cleanup_operations
+        initialize_cleanup = latest is None and bool(evidence.get("account_cleanup_generation")) and operation in cleanup_operations
+        if not initialize_cleanup and (latest is None or latest["state"] not in {"open", "diagnostic_only"}):
             result["operations"][operation] = {"status": "not_enabled"}
             continue
         connection.execute("SAVEPOINT native_qualification_maintenance")
         try:
-            _require((provider_budget.fault_state(connection, scope_kind="operation", operation=operation) or {}).get("open") is not True,
-                     "Operation circuit blocks automatic qualification")
+            from .operation_recovery import operation_faults_allow_authority
+            _require(operation_faults_allow_authority(connection, operation=operation),
+                     "Operation contract fault blocks automatic qualification")
+            if initialize_cleanup:
+                from .account_cleanup_runtime import bootstrap_operator
+                result["operations"][operation] = bootstrap_operator(connection, evidence=evidence, operation=operation, at=at)
+                continue
             from .capture_operator_release import maintain as maintain_operator_release
             approved = maintain_operator_release(connection, evidence=evidence, operation=operation, latest=latest, at=at)
             if approved is not None:

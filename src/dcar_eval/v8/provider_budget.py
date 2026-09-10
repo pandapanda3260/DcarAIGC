@@ -14,10 +14,10 @@ from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping
+from typing import Any, Iterator, Mapping
 from zoneinfo import ZoneInfo
 
-from .account_roster import RosterError, current_snapshot, require_active_member
+from .account_roster import RosterError, require_active_member
 from .storage import connect, now_utc, transaction
 
 POLICY_VERSION = "tikhub-global-budget-v3"
@@ -46,19 +46,15 @@ PRICES_MICROUSD = {
     "xiaohongshu_note_statistics": 10000, "xiaohongshu_note_comments": 10000,
 }
 SHANGHAI = ZoneInfo("Asia/Shanghai")
-TIKHUB_NETWORK_SLOTS = threading.BoundedSemaphore(4)
-BORROW_PRIORITY = ("metrics", "reconcile", "detail", "comments", "history")
-INVENTORY_JOB = "provider_queue_inventory:tikhub:"
-CLOSEOUT_JOB = "provider_budget_closeout:tikhub:"
+TIKHUB_NETWORK_CONCURRENCY = 4
+TIKHUB_NETWORK_SLOTS = threading.BoundedSemaphore(TIKHUB_NETWORK_CONCURRENCY)
 PROBE_JOB = "provider_circuit_probe:tikhub"
-INCIDENT_AUTH_JOB = "provider_budget_incident:tikhub"
 COMPENSATION_AUTH_JOB = "provider_compensation_authorization:tikhub"
 COMPENSATION_USE_JOB = "provider_compensation_consumption:tikhub:"
 COMPENSATION_GAP_JOB = "provider_compensation_gap:tikhub"
 SETTLEMENT_TERMINAL_JOB = "provider_settlement_terminal:tikhub"
 FAULT_JOB_PREFIX = "provider_fault_v2"
 TRANSPORT_CANDIDATE_JOB = "provider_transport_candidate:tikhub:"
-TRANSPORT_BASELINE_JOB = "provider_transport_baseline:tikhub:"
 OPERATION_RECOVERY_JOB = "provider_operation_recovery:tikhub:"
 STORAGE_RECOVERY_JOB = "provider_storage_recovery:all"
 FAULT_SCOPE_KINDS = frozenset(
@@ -105,11 +101,14 @@ class PaidScope:
     scheduler_owner_token: str | None = None
     scheduler_scan_id: str | None = None
     recovery_probe_id: int | None = None
+    # Historical proof payloads still deserialize this retired field. It grants no budget.
     incident_authorization_id: int | None = None
     compensation_authorization_id: int | None = None
     paid_scope_identity: str | None = None
     paid_sequence: int = 0
     business_day: str | None = None
+    manual_command_run_id: int | None = None
+    catalog_plan_id: int | None = None
 
 
 _SCOPE: ContextVar[PaidScope] = ContextVar("tikhub_paid_scope", default=PaidScope())
@@ -128,12 +127,22 @@ def paid_scope(
     scheduler_run_id: int | None = None,
     scheduler_attempt_id: int | None = None,
     business_day: str | None = None,
-    incident_authorization_id: int | None = None,
     compensation_authorization_id: int | None = None,
+    manual_command_run_id: int | None = None,
+    catalog_plan_id: int | None = None,
 ) -> Iterator[PaidScope]:
     if purpose not in CATEGORY_MICROUSD:
         raise PaidScopeBlocked("unknown_paid_purpose", "Paid purpose is not in the fixed policy")
     parent = _SCOPE.get()
+    if catalog_plan_id is not None and (type(catalog_plan_id) is not int or catalog_plan_id <= 0
+            or parent.catalog_plan_id not in (None, catalog_plan_id)):
+        raise PaidScopeBlocked("catalog_plan_invalid", "Nested capture cannot change its catalog plan")
+    if (catalog_plan_id or parent.catalog_plan_id) and (manual_command_run_id or parent.manual_command_run_id):
+        raise PaidScopeBlocked("paid_scope_mismatch", "Manual and automatic catalog scopes cannot be combined")
+    if manual_command_run_id is not None and (
+            type(manual_command_run_id) is not int or manual_command_run_id <= 0
+            or parent.manual_command_run_id not in (None, manual_command_run_id)):
+        raise PaidScopeBlocked("manual_command_invalid", "Nested capture cannot change its manual command")
     if business_day is not None:
         try:
             if date.fromisoformat(business_day).isoformat() != business_day:
@@ -160,17 +169,16 @@ def paid_scope(
         scheduler_run_id=run_id, scheduler_attempt_id=attempt_id,
         scheduler_owner_token=parent.scheduler_owner_token if same_owner else None,
         scheduler_scan_id=parent.scheduler_scan_id if same_owner else None,
-        incident_authorization_id=(
-            incident_authorization_id
-            if incident_authorization_id is not None
-            else parent.incident_authorization_id
-        ),
+        incident_authorization_id=None,
         compensation_authorization_id=(
             compensation_authorization_id
             if compensation_authorization_id is not None
             else parent.compensation_authorization_id
         ),
         business_day=parent.business_day or business_day,
+        manual_command_run_id=(manual_command_run_id if manual_command_run_id is not None
+                               else parent.manual_command_run_id),
+        catalog_plan_id=catalog_plan_id if catalog_plan_id is not None else parent.catalog_plan_id,
     )
     token = _SCOPE.set(value)
     try:
@@ -257,6 +265,10 @@ def paid_dispatch_owner(
                 "roster_snapshot_id": int(active["roster_snapshot_id"]),
                 "roster_snapshot_hash": str(active["roster_members_sha256"]),
             }
+            if current.manual_command_run_id is not None:
+                frozen_identity["manual_command_run_id"] = current.manual_command_run_id
+            if current.catalog_plan_id is not None:
+                frozen_identity["catalog_plan_id"] = current.catalog_plan_id
             claim = durable_runs.claim_run_in_transaction(
                 connection,
                 job_id,
@@ -389,7 +401,7 @@ def _write_receipt(
 
 
 def transport_circuit_decision(
-    *, starts: int, uncertain: int, healthy_p95_rate: float = 0.01
+    *, starts: int, uncertain: int
 ) -> str | None:
     """Classify a ten-minute operation sample without opening a circuit.
 
@@ -404,7 +416,6 @@ def transport_circuit_decision(
         or starts < 0
         or uncertain < 0
         or uncertain > starts
-        or not 0 <= healthy_p95_rate <= 1
     ):
         raise ValueError("invalid transport circuit sample")
     if starts == 0:
@@ -412,50 +423,9 @@ def transport_circuit_decision(
     rate = uncertain / starts
     if starts >= 20 and rate >= 0.20:
         return "immediate"
-    adaptive_threshold = max(0.05, 3 * min(healthy_p95_rate, 0.02))
-    if starts >= 50 and rate >= adaptive_threshold:
+    if starts >= 50 and rate >= 0.05:
         return "candidate"
     return None
-
-
-def transport_healthy_p95_rate(
-    connection: sqlite3.Connection, *, operation: str, at: str
-) -> float:
-    """Load a seven-complete-day baseline, capped at 2%; otherwise use 1%."""
-
-    row = connection.execute(
-        """SELECT status,details_json FROM scheduler_runs WHERE job_id=?
-           ORDER BY id DESC LIMIT 1""",
-        (f"{TRANSPORT_BASELINE_JOB}{operation}",),
-    ).fetchone()
-    proof = _details(row["details_json"]) if row is not None else {}
-    days = proof.get("complete_business_days")
-    value = proof.get("p95_transport_uncertain_rate")
-    if (
-        row is None
-        or row["status"] != "succeeded"
-        or proof.get("contract_version") != "transport-healthy-baseline-v1"
-        or proof.get("provider") != "tikhub"
-        or proof.get("operation") != operation
-        or not isinstance(days, list)
-        or len(days) != 7
-        or any(not isinstance(day, str) for day in days)
-        or len(set(days)) != 7
-        or not isinstance(value, (int, float))
-        or isinstance(value, bool)
-        or not math.isfinite(float(value))
-        or not 0 <= float(value) <= 1
-        or proof.get("valid_through") is None
-    ):
-        return 0.01
-    try:
-        today = date.fromisoformat(budget_day(at))
-        expected_days = {(today - timedelta(days=offset)).isoformat() for offset in range(1, 8)}
-        if set(days) != expected_days or _time(str(proof["valid_through"])) < _time(at):
-            return 0.01
-    except (BudgetBlocked, TypeError, ValueError):
-        return 0.01
-    return min(float(value), 0.02)
 
 
 def _transport_window_counts(
@@ -463,6 +433,9 @@ def _transport_window_counts(
 ) -> tuple[int, int]:
     end = _time(at)
     start = end - timedelta(minutes=10)
+    previous = fault_state(connection, scope_kind="operation", operation=operation, fault_class="transport")
+    if previous and previous.get("open") is False and previous.get("recovered_at"):
+        start = max(start, _time(previous["recovered_at"]))
     starts = uncertain = 0
     for row in connection.execute(
         """SELECT request_attempts,recorded_at,details_json FROM provider_usage
@@ -505,26 +478,17 @@ def evaluate_transport_operation_fault(
     operation: str,
     at: str,
     planner_tick_id: str | None = None,
-    healthy_p95_rate: float | None = None,
+    actual_failure_usage_id: int | None = None,
 ) -> dict[str, Any]:
-    """Evaluate one production operation and persist the two-tick arm."""
+    """Evaluate samples, retaining the identity of an actual late failure."""
 
     _require_transaction(connection)
     starts, uncertain = _transport_window_counts(
         connection, operation=operation, at=at
     )
-    baseline = (
-        transport_healthy_p95_rate(connection, operation=operation, at=at)
-        if healthy_p95_rate is None
-        else healthy_p95_rate
-    )
-    decision_value = transport_circuit_decision(
-        starts=starts,
-        uncertain=uncertain,
-        healthy_p95_rate=baseline,
-    )
+    decision_value = transport_circuit_decision(starts=starts, uncertain=uncertain)
     rate = uncertain / starts if starts else 0.0
-    threshold = max(0.05, 3 * min(baseline, 0.02))
+    threshold = 0.05
     candidate_job = f"{TRANSPORT_CANDIDATE_JOB}{operation}"
     previous_row = connection.execute(
         """SELECT details_json FROM scheduler_runs WHERE job_id=?
@@ -560,29 +524,32 @@ def evaluate_transport_operation_fault(
                     "starts": starts,
                     "uncertain": uncertain,
                     "uncertain_rate": rate,
-                    "healthy_p95_rate": baseline,
+                    "healthy_p95_rate": 0.01,
                     "threshold": threshold,
                     "decision": decision_value,
                 },
                 at,
             )
     fault = None
-    if decision_value == "immediate" or consecutive_candidate:
+    current_fault = (fault_state(connection, scope_kind="operation", operation=operation,
+                                fault_class="transport") if actual_failure_usage_id is not None else None)
+    threshold_reached = decision_value == "immediate" or consecutive_candidate
+    if threshold_reached or (current_fault and current_fault.get("open") is True):
         arm = "immediate" if decision_value == "immediate" else "two_tick"
         fault = record_fault_state(
             connection,
             scope_kind="operation",
             operation=operation,
             fault_class="transport",
-            reason=f"transport_ratio_{arm}",
-            usage_id=None,
+            reason=f"transport_ratio_{arm}" if threshold_reached else str(current_fault["reason"]),
+            usage_id=actual_failure_usage_id,
             at=at,
             state_evidence={
                 "contract_version": "transport-ratio-v1",
                 "arm": arm,
-                "healthy_p95_rate": baseline,
+                "healthy_p95_rate": 0.01,
                 "threshold": 0.20 if arm == "immediate" else threshold,
-            },
+            } if threshold_reached else current_fault["state_evidence"],
         )
     return {
         "operation": operation,
@@ -834,11 +801,33 @@ def record_fault_state(
         ).encode("utf-8")
     ).hexdigest()
     previous = fault_state(connection, **scope, fault_class=fault_class) or {}
+    new_temporary_failure = False
+    next_cooldown = None
+    if (scope_kind == "operation" and fault_class in {"transport", "rate_limit"}
+            and previous.get("open") is True):
+        half_open_usage = previous.get("half_open", {}).get("usage_id")
+        if (usage_id is None or usage_id == half_open_usage
+                or (half_open_usage is None and usage_id == previous.get("usage_id"))):
+            # Samples do not reset cooldowns. The probe's own failure is handled
+            # by finish_operation_probe so its ownership survives until backoff.
+            return previous
+        from .operation_recovery import _provider_retry_after, _utc
+        deadlines = [_time(at) + timedelta(minutes=5),
+                     _time(previous.get("cooldown", {}).get("retry_after") or
+                           _utc(_time(previous["last_failure_at"]) + timedelta(minutes=5)))]
+        for source_usage, failed_at in ((previous.get("usage_id"), previous["last_failure_at"]),
+                                       (usage_id, at)):
+            provider_deadline = _provider_retry_after(connection, source_usage, failed_at)
+            if provider_deadline is not None:
+                deadlines.append(provider_deadline)
+        next_cooldown = {"failures": previous.get("cooldown", {}).get("failures", 0),
+                         "retry_after": _utc(max(deadlines))}
+        new_temporary_failure = True
     same_open_fault = (
         previous.get("open") is True
         and previous.get("state_fingerprint") == fingerprint
     )
-    if same_open_fault and previous.get("contract_version") == "provider-fault-v2":
+    if same_open_fault and not new_temporary_failure and previous.get("contract_version") == "provider-fault-v2":
         return previous
     details = {
         "contract_version": "provider-fault-v2",
@@ -861,6 +850,8 @@ def record_fault_state(
             else "domain_specific_evidence"
         ),
     }
+    if next_cooldown is not None:
+        details["cooldown"] = next_cooldown
     return _write_receipt(connection, job_id, details, at, status="partial")
 
 
@@ -1203,241 +1194,6 @@ def require_storage_ready(connection: sqlite3.Connection) -> None:
         )
 
 
-def work_state_fingerprint(connection: sqlite3.Connection) -> str:
-    """Hash only source work/identity state, never monetary or proof receipts."""
-    _require_transaction(connection)
-    snapshot = current_snapshot(connection)
-    facts: dict[str, Any] = {
-        "roster": None if snapshot is None else [snapshot["id"], snapshot["members_sha256"]],
-    }
-    queries = {
-        "accounts": "SELECT id,enabled,updated_at FROM accounts ORDER BY id",
-        "identities": "SELECT id,account_id,platform,uid,updated_at FROM account_platform_identities ORDER BY id",
-        "contents": "SELECT id,account_id,updated_at FROM content_items ORDER BY id",
-        "slots": "SELECT id,status,attempt_count,updated_at FROM fetch_slots ORDER BY id",
-        "runs": """SELECT id,status,details_json FROM scheduler_runs
-                   WHERE json_extract(details_json,'$.contract_version')='durable-run-v1' ORDER BY id""",
-    }
-    for name, query in queries.items():
-        facts[name] = [tuple(row) for row in connection.execute(query)]
-    return hashlib.sha256(json.dumps(facts, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
-def record_queue_inventory(
-    connection: sqlite3.Connection, *, category: str,
-    due_candidate_ids: Iterable[int | str], at: str,
-) -> dict[str, Any]:
-    """Record a complete caller-enumerated queue while that read view is locked."""
-    _require_transaction(connection)
-    if category not in CATEGORY_MICROUSD:
-        raise BudgetBlocked("Unknown queue category")
-    candidates = list(due_candidate_ids)
-    if any(type(item) not in (int, str) or not str(item) for item in candidates):
-        raise BudgetBlocked("Inventory needs stable candidate identifiers")
-    normalized = sorted({str(item) for item in candidates})
-    details = {
-        "contract_version": "budget-queue-inventory-v1", "category": category,
-        "budget_day": budget_day(at), "checked_at": at,
-        "due_candidate_ids": normalized, "due_count": len(normalized),
-        "candidate_sha256": hashlib.sha256(json.dumps(normalized).encode()).hexdigest(),
-        "work_state_fingerprint": work_state_fingerprint(connection),
-    }
-    return _write_receipt(connection, INVENTORY_JOB + category, details, at)
-
-
-def required_closeout_rounds(category: str, *, at: str) -> set[tuple[str, str]]:
-    """Registration IDs and exact Beijing times, including the 18:00 Matrix round."""
-    if category not in CATEGORY_MICROUSD:
-        raise BudgetBlocked("Unknown closeout category")
-    required = {("matrix_account_metrics", "18:00"), ("matrix_works_refresh", "18:00")}
-    if category in {"metrics", "reconcile", "detail", "comments"}:
-        required |= {("matrix_works_scan", "02:10")}
-        required |= {("matrix_works_refresh", stamp) for stamp in ("06:00", "12:00")}
-    if category in {"metrics", "reconcile"}:
-        required |= {("matrix_account_metrics", stamp) for stamp in ("02:00", "06:00", "12:00")}
-    if category == "reconcile":
-        required.add(("tikhub_reconcile", "03:00"))
-    if category == "metrics":
-        required |= {
-            ("metrics_backfill", "06:10"), ("metrics_backfill_close", "07:00"),
-            ("metrics_backfill_established", "08:35"),
-            ("daily_pipeline_summary", "07:30"), ("daily_report", "08:00"),
-        }
-        if _time(at).weekday() == 0:
-            required.add(("weekly_report", "08:30"))
-    return required
-
-
-def _finished_rounds(
-    connection: sqlite3.Connection, category: str, run_ids: Iterable[int], *, at: str,
-) -> list[int]:
-    day = budget_day(at)
-    supplied = set(run_ids)
-    found: dict[tuple[str, str], sqlite3.Row] = {}
-    for row in connection.execute(
-            "SELECT * FROM scheduler_runs WHERE job_id LIKE 'pipeline_round:%' ORDER BY id"):
-        details = _details(row["details_json"])
-        identity = details.get("identity", {})
-        if identity.get("beijing_day") != day or not identity.get("scheduled_at"):
-            continue
-        scheduled = _time(identity["scheduled_at"])
-        if scheduled.date().isoformat() != day:
-            continue
-        found[(str(row["job_id"]).removeprefix("pipeline_round:"), scheduled.strftime("%H:%M"))] = row
-    verified: list[int] = []
-    for key in sorted(required_closeout_rounds(category, at=at)):
-        row = found.get(key)
-        if row is None or row["id"] not in supplied:
-            raise BudgetBlocked("A required fixed round has no current receipt")
-        details = _details(row["details_json"])
-        checkpoint = details.get("checkpoint", {})
-        if (row["status"] != "succeeded" or details.get("complete") is not True
-                or details.get("contract_version") != "durable-run-v1"
-                or checkpoint.get("complete") is not True
-                or not details.get("identity", {}).get("round_id")
-                or not isinstance(checkpoint.get("child_run_ids"), list)
-                or not row["completed_at"] or _time(row["completed_at"]) > _time(at)):
-            raise BudgetBlocked("A required fixed round is incomplete")
-        for child_id in checkpoint["child_run_ids"]:
-            child = connection.execute("SELECT * FROM scheduler_runs WHERE id=?", (child_id,)).fetchone()
-            child_details = _details(child["details_json"]) if child is not None else {}
-            if (child is None or child["status"] != "succeeded"
-                    or child_details.get("complete") is not True
-                    or child_details.get("checkpoint", {}).get("complete") is not True):
-                raise BudgetBlocked("A fixed round still has incomplete child work")
-        verified.append(int(row["id"]))
-    return verified
-
-
-def _no_pending_reservations(connection: sqlite3.Connection, category: str) -> bool:
-    return connection.execute(
-        """SELECT 1 FROM provider_usage WHERE lower(provider)='tikhub'
-           AND json_extract(details_json,'$.category')=?
-           AND json_extract(details_json,'$.state') IN ('reserved','sent','billing_unknown') LIMIT 1""",
-        (category,),
-    ).fetchone() is None
-
-
-def _due_inventory(connection: sqlite3.Connection, *, at: str) -> dict[str, list[str]]:
-    _require_transaction(connection)
-    # Import only at the decision boundary; pipeline imports this shared ledger.
-    from .pipeline import budget_due_inventory
-
-    inventory = budget_due_inventory(connection, at=at)
-    if not isinstance(inventory, dict) or set(inventory) != set(CATEGORY_MICROUSD):
-        raise BudgetBlocked("Live queue inventory must cover every protected category")
-    if any(not isinstance(values, list) or any(not isinstance(value, str) or not value for value in values)
-           for values in inventory.values()):
-        raise BudgetBlocked("Live queue inventory has invalid candidate identifiers")
-    return inventory
-
-
-def record_closeout(
-    connection: sqlite3.Connection, *, category: str, inventory_ids: Iterable[int],
-    round_run_ids: Iterable[int], at: str,
-) -> dict[str, Any]:
-    _require_transaction(connection)
-    if _time(at).strftime("%H:%M") < "18:35":
-        raise BudgetBlocked("Quota cannot be lent before Beijing 18:35")
-    ids = list(inventory_ids)
-    if not ids:
-        raise BudgetBlocked("A current atomic inventory receipt is required")
-    inventories: list[tuple[int, dict[str, Any]]] = []
-    for inventory_id in ids:
-        row = connection.execute(
-            "SELECT details_json FROM scheduler_runs WHERE id=? AND job_id=? AND status='succeeded'",
-            (inventory_id, INVENTORY_JOB + category),
-        ).fetchone()
-        value = _details(row["details_json"]) if row is not None else {}
-        if (value.get("contract_version") != "budget-queue-inventory-v1"
-                or value.get("budget_day") != budget_day(at) or value.get("due_count") != 0
-                or value.get("due_candidate_ids") != []):
-            raise BudgetBlocked("Lending inventory is missing, nonempty or from another day")
-        inventories.append((inventory_id, value))
-    latest_id, latest = max(inventories, key=lambda item: _time(item[1]["checked_at"]))
-    if _time(latest["checked_at"]) != _time(at):
-        raise BudgetBlocked("Closeout needs an inventory checked in this decision")
-    if _due_inventory(connection, at=at)[category]:
-        raise BudgetBlocked("Lender has current due work")
-    rounds = _finished_rounds(connection, category, round_run_ids, at=at)
-    if not _no_pending_reservations(connection, category):
-        raise BudgetBlocked("Lender still has sent, reserved or billing-unknown requests")
-    return _write_receipt(connection, CLOSEOUT_JOB + category, {
-        "contract_version": "budget-closeout-v1", "category": category,
-        "budget_day": budget_day(at), "closed_at": at, "inventory_ids": [latest_id],
-        "round_run_ids": rounds, "work_state_fingerprint": work_state_fingerprint(connection),
-    }, at)
-
-
-def _lending_proof(
-    connection: sqlite3.Connection, category: str, *, at: str,
-) -> dict[str, Any] | None:
-    row = connection.execute(
-        "SELECT id,details_json FROM scheduler_runs WHERE job_id=? ORDER BY id DESC LIMIT 1",
-        (CLOSEOUT_JOB + category,),
-    ).fetchone()
-    if row is None:
-        return None
-    proof = _details(row["details_json"])
-    if (proof.get("contract_version") != "budget-closeout-v1"
-            or proof.get("budget_day") != budget_day(at) or _time(proof["closed_at"]) > _time(at)
-            or not _no_pending_reservations(connection, category)):
-        return None
-    try:
-        _finished_rounds(connection, category, proof["round_run_ids"], at=at)
-    except BudgetBlocked:
-        return None
-    return {**proof, "id": row["id"]}
-
-
-def _borrowing(
-    connection: sqlite3.Connection, *, category: str, amount: int, at: str,
-    summary: Mapping[str, Any], exclude_usage_id: int | None,
-) -> tuple[dict[str, int], dict[str, int], str | None]:
-    lent = {name: 0 for name in CATEGORY_MICROUSD}
-    received = dict(lent)
-    for row in connection.execute("SELECT * FROM provider_usage WHERE lower(provider)='tikhub' AND currency='USD'"):
-        if row["id"] == exclude_usage_id or not row["amount"]:
-            continue
-        details = _details(row["details_json"])
-        if details.get("budget_day") != budget_day(at):
-            continue
-        for lender, value in details.get("borrowed_from", {}).items():
-            if lender not in lent or type(value) is not int or value < 0:
-                raise BudgetBlocked("Corrupt lending allocation")
-            lent[lender] += value
-            received[details["category"]] += value
-    balances = {
-        name: max(0, CATEGORY_MICROUSD[name] - summary["categories_microusd"][name] + received[name] - lent[name])
-        for name in CATEGORY_MICROUSD
-    }
-    need = max(0, amount - balances[category])
-    if not need:
-        return {}, {}, None
-    if _time(at).strftime("%H:%M") < "18:35":
-        raise PaidScopeBlocked("category_budget_exhausted", "Protected category quota reached before closeout")
-    inventory = _due_inventory(connection, at=at)
-    if not inventory[category] and exclude_usage_id is None:
-        raise PaidScopeBlocked("category_budget_exhausted", "Borrower has no current due candidate")
-    for higher in BORROW_PRIORITY[:BORROW_PRIORITY.index(category)]:
-        if inventory[higher]:
-            raise PaidScopeBlocked("category_budget_exhausted", "Higher-priority due work takes precedence")
-    allocation: dict[str, int] = {}
-    proofs: dict[str, int] = {}
-    for lender in reversed(BORROW_PRIORITY):
-        if lender == category or balances[lender] <= 0 or inventory[lender]:
-            continue
-        proof = _lending_proof(connection, lender, at=at)
-        if proof is None:
-            continue
-        take = min(need, balances[lender])
-        allocation[lender], proofs[lender] = take, int(proof["id"])
-        need -= take
-        if not need:
-            return allocation, proofs, None
-    raise PaidScopeBlocked("category_budget_exhausted", "No verified lending closeout covers the shortfall")
-
-
 def _assert_scheduler_owner(connection: sqlite3.Connection, scope: PaidScope) -> PaidScope:
     if scope.scheduler_run_id is None and scope.scheduler_attempt_id is None:
         return scope
@@ -1476,10 +1232,12 @@ def _assert_scheduler_owner(connection: sqlite3.Connection, scope: PaidScope) ->
         "roster_snapshot_id",
         "roster_snapshot_hash",
         "business_day",
+        "manual_command_run_id",
+        "catalog_plan_id",
     ):
         frozen = identity.get(field)
         if frozen is not None and getattr(scope, field) not in (None, frozen):
-            raise PaidScopeBlocked("paid_scope_mismatch", "Paid roster differs from the frozen run")
+            raise PaidScopeBlocked("paid_scope_mismatch", "Paid scope differs from the frozen run")
     for field in ("uid", "platform", "account_id", "identity_id", "content_id"):
         frozen = identity.get(field)
         if frozen is not None and getattr(scope, field) not in (None, frozen):
@@ -1495,7 +1253,7 @@ def assert_paid_scope_owner(connection: sqlite3.Connection) -> None:
 
 def renew_paid_owner_lease(connection: sqlite3.Connection, scope: PaidScope, *, at: str) -> None:
     """Schema20 network admission cannot renew an expired or replaced owner."""
-    if connection.execute("PRAGMA user_version").fetchone()[0] != 20:
+    if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
         return
     if scope.scheduler_run_id is None and scope.scheduler_attempt_id is None:
         return  # Existing manual/member guard remains independently authoritative.
@@ -1548,6 +1306,12 @@ def freeze_scope(
     if (value.uid is not None and value.uid != row["uid"]) or (
             value.platform is not None and value.platform != row["platform"]):
         raise PaidScopeBlocked("identity_conflict", "Paid target UID/platform changed after claim")
+    manual = value.manual_command_run_id is not None
+    if manual:
+        from .capture_manual import validate_command
+        if content_id is None:
+            raise PaidScopeBlocked("manual_target_invalid", "A content command cannot authorize account discovery")
+        validate_command(connection, value.manual_command_run_id, content_id=content_id, stage=stage)
     try:
         activation = value.activation_id
         if "source_family" in {
@@ -1573,14 +1337,28 @@ def freeze_scope(
                         "Paid work requires an effective acquisition activation",
                     )
                 activation = int(active_activation["activation_id"])
-            member = require_active_member(
-                connection,
-                int(row["identity_id"]),
-                value.roster_snapshot_id,
-                value.roster_snapshot_hash,
-                require_uid=content_id is None,
-                activation=activation,
-            )
+            if manual:
+                from .profile_activations import activation_at
+                active_activation = activation_at(connection, now_utc())
+                if active_activation is None or active_activation["activation_id"] != activation:
+                    raise PaidScopeBlocked("profile_superseded", "Manual capture runtime activation changed")
+                # This is the installed runtime binding, not a claim that the
+                # explicitly requested content belongs to the automatic roster.
+                member = {"roster_snapshot_id": active_activation["roster_snapshot_id"],
+                          "roster_snapshot_hash": active_activation["roster_members_sha256"]}
+            elif value.catalog_plan_id is not None:
+                from .account_catalog_capture import validate_paid_target
+                member = validate_paid_target(connection, value, identity_id=int(row["identity_id"]),
+                    content_id=content_id, at=now_utc())
+            else:
+                member = require_active_member(
+                    connection,
+                    int(row["identity_id"]),
+                    value.roster_snapshot_id,
+                    value.roster_snapshot_hash,
+                    require_uid=content_id is None,
+                    activation=activation,
+                )
         else:
             member = require_active_member(
                 connection, int(row["identity_id"]), value.roster_snapshot_id,
@@ -1598,7 +1376,7 @@ def freeze_scope(
         category = value.purpose
     frozen = replace(
         value, purpose=value.purpose or category, category=category,
-        activation_id=activation,
+        activation_id=activation, incident_authorization_id=None,
         roster_snapshot_id=int(member["roster_snapshot_id"]),
         roster_snapshot_hash=str(member["roster_snapshot_hash"]),
         identity_id=int(row["identity_id"]), account_id=int(row["account_id"]),
@@ -1611,14 +1389,17 @@ def budget_summary(
     connection: sqlite3.Connection, *, at: str | None = None,
     exclude_usage_id: int | None = None,
 ) -> dict[str, Any]:
+    from .account_cleanup import budget_carry
+
     day = budget_day(at or now_utc())
-    categories = {key: 0 for key in CATEGORY_MICROUSD}
-    buckets = {key: 0 for key in BUDGET_BUCKET_MICROUSD}
-    total = pending = unclassified = 0
-    unknown_count = unknown_amount = 0
-    unknown_day_count = unknown_day_amount = 0
-    unverified_count = unverified_amount = 0
-    unverified_day_count = unverified_day_amount = 0
+    carry = budget_carry(connection, day)
+    categories = {key: carry.get("categories", {}).get(key, 0) for key in CATEGORY_MICROUSD}
+    buckets = {key: carry.get("buckets", {}).get(key, 0) for key in BUDGET_BUCKET_MICROUSD}
+    total, pending, unclassified = (carry.get(key, 0) for key in ("total", "pending", "unclassified"))
+    unknown_count, unknown_amount = carry["lifetime_unknown_count"], carry["lifetime_unknown_amount"]
+    unknown_day_count, unknown_day_amount = carry.get("unknown_count", 0), carry.get("unknown_amount", 0)
+    unverified_count, unverified_amount = carry["lifetime_unverified_count"], carry["lifetime_unverified_amount"]
+    unverified_day_count, unverified_day_amount = carry.get("unverified_count", 0), carry.get("unverified_amount", 0)
     for row in connection.execute(
         "SELECT * FROM provider_usage WHERE lower(provider)='tikhub' AND currency='USD'"
     ):
@@ -1899,113 +1680,6 @@ def finish_recovery_probe(
             evidence_id=probe_id,
             fault_class=str(proof["fault_class"]),
         )
-
-
-def authorize_incident_budget(
-    connection: sqlite3.Connection,
-    *,
-    approval_ref: str,
-    owner: str,
-    business_day: str,
-    bucket: str,
-    approved_total_usd: Any,
-    approved_bucket_usd: Any,
-    expires_at: str,
-    at: str,
-) -> dict[str, Any]:
-    """Persist one explicit Beijing-day authorization above automatic caps."""
-
-    _require_transaction(connection)
-    if not approval_ref.strip() or not owner.strip():
-        raise PaidScopeBlocked(
-            "incident_authorization_invalid", "Incident approval and owner are required"
-        )
-    if bucket not in {"discovery", "metrics"}:
-        raise PaidScopeBlocked(
-            "incident_authorization_invalid", "Incident approval has an invalid bucket"
-        )
-    total_limit = micro_usd(approved_total_usd)
-    bucket_limit = micro_usd(approved_bucket_usd)
-    if (
-        budget_day(at) != business_day
-        or _time(expires_at) <= _time(at)
-        or budget_day(expires_at) != business_day
-        or not AUTOMATIC_MICROUSD < total_limit <= GLOBAL_MICROUSD
-        or not BUDGET_BUCKET_MICROUSD[bucket] < bucket_limit <= GLOBAL_MICROUSD
-    ):
-        raise PaidScopeBlocked(
-            "incident_authorization_invalid",
-            "Incident approval must bind the current day and explicit 50-100 dollar limits",
-        )
-    return _write_receipt(
-        connection,
-        INCIDENT_AUTH_JOB,
-        {
-            "contract_version": "provider-budget-incident-v1",
-            "approval_ref": approval_ref,
-            "owner": owner,
-            "provider": "tikhub",
-            "business_day": business_day,
-            "bucket": bucket,
-            "approved_total_microusd": total_limit,
-            "approved_bucket_microusd": bucket_limit,
-            "authorized_at": at,
-            "expires_at": expires_at,
-        },
-        at,
-    )
-
-
-def _incident_limits(
-    connection: sqlite3.Connection,
-    *,
-    scope: PaidScope,
-    bucket: str,
-    at: str,
-) -> tuple[int, int]:
-    authorization_id = scope.incident_authorization_id
-    if authorization_id is None:
-        raise PaidScopeBlocked(
-            "incident_authorization_required",
-            "An explicit incident authorization is required above automatic caps",
-        )
-    row = connection.execute(
-        """SELECT status,details_json FROM scheduler_runs
-           WHERE id=? AND job_id=?""",
-        (authorization_id, INCIDENT_AUTH_JOB),
-    ).fetchone()
-    proof = _details(row["details_json"]) if row is not None else {}
-    authorized_at = proof.get("authorized_at")
-    expires_at = proof.get("expires_at")
-    try:
-        time_valid = (
-            isinstance(authorized_at, str)
-            and isinstance(expires_at, str)
-            and _time(authorized_at) <= _time(at) < _time(expires_at)
-        )
-    except (BudgetBlocked, TypeError, ValueError):
-        time_valid = False
-    if (
-        row is None
-        or row["status"] != "succeeded"
-        or proof.get("contract_version") != "provider-budget-incident-v1"
-        or proof.get("provider") != "tikhub"
-        or proof.get("business_day") != budget_day(at)
-        or proof.get("bucket") != bucket
-        or not proof.get("approval_ref")
-        or not proof.get("owner")
-        or not time_valid
-        or type(proof.get("approved_total_microusd")) is not int
-        or type(proof.get("approved_bucket_microusd")) is not int
-    ):
-        raise PaidScopeBlocked(
-            "incident_authorization_invalid",
-            "Incident authorization is missing, expired or for another scope",
-        )
-    return (
-        int(proof["approved_total_microusd"]),
-        int(proof["approved_bucket_microusd"]),
-    )
 
 
 def record_compensation_gap(
@@ -2478,6 +2152,37 @@ def _legacy_transport_diagnostic_allowed(
     )
 
 
+def assess_budget_capacity(
+    summary: Mapping[str, Any], *, operation: str, amount_microusd: int,
+    authorization_budget: Mapping[str, Any] | None = None,
+) -> tuple[str, PaidScopeBlocked | None]:
+    """One capacity decision for reservation and schema20 A/B admission.
+
+    Immutable authorization envelopes may narrow the fixed limits. Historical
+    incident receipts cannot widen them. The caller supplies a snapshot that
+    includes other reservations and unknown charges; B excludes only its own.
+    Returning the blocker preserves the legacy global/history error ordering.
+    """
+    bucket = "discovery" if operation in DISCOVERY_OPERATIONS else "metrics"
+    total_cap, bucket_cap = AUTOMATIC_MICROUSD, BUDGET_BUCKET_MICROUSD[bucket]
+    if authorization_budget is not None:
+        total_cap = authorization_budget.get("total_microusd")
+        bucket_cap = authorization_budget.get("bucket_microusd")
+        if (type(total_cap) is not int or not 0 < total_cap <= AUTOMATIC_MICROUSD
+                or type(bucket_cap) is not int or not 0 < bucket_cap <= BUDGET_BUCKET_MICROUSD[bucket]
+                or authorization_budget.get("bucket") != bucket):
+            return bucket, PaidScopeBlocked(
+                "authorization_budget_invalid", "Authorization exceeds fixed budget envelope")
+    next_total = int(summary["total_microusd"]) + amount_microusd
+    if next_total > GLOBAL_MICROUSD:
+        return bucket, PaidScopeBlocked("global_budget_exhausted", "TikHub Beijing-day $100 ceiling reached")
+    if next_total > total_cap:
+        return bucket, PaidScopeBlocked("automatic_budget_exhausted", "TikHub automatic daily ceiling reached")
+    if int(summary["buckets_microusd"][bucket]) + amount_microusd > bucket_cap:
+        return bucket, PaidScopeBlocked(f"{bucket}_budget_exhausted", "TikHub fixed operation bucket ceiling reached")
+    return bucket, None
+
+
 def check_reservation(
     connection: sqlite3.Connection, *, scope: PaidScope, operation: str,
     unit_price: Any, currency: str, at: str, exclude_usage_id: int | None = None,
@@ -2507,10 +2212,12 @@ def check_reservation(
         raise PaidScopeBlocked("provider_circuit_open", "TikHub circuit requires authorized verified recovery")
     if operation_fault and operation_fault.get("open"):
         from .transport_authority import authorize_transport_fault_diagnostic
+        from .capture_manual import permits_transport_retry
 
         # fault_state returns the latest open class, not all open classes. A
         # newer transport event must never hide an older rate/field-contract
-        # fault. The only exception is one fully revalidated diagnostic member.
+        # fault. Explicit manual/diagnostic exceptions require transport-only
+        # faults; bounded ordinary recovery checks every open fault separately.
         operation_states = _v2_fault_states(connection, {
             "scope_kind": "operation", "provider": "tikhub", "operation": operation,
         })
@@ -2518,9 +2225,15 @@ def check_reservation(
             fault.get("fault_class") == "transport"
             for fault in operation_states if fault.get("open") is True
         ) and operation_fault.get("fault_class") == "transport"
-        if not transport_only or not authorize_transport_fault_diagnostic(
-            connection, scope=scope, operation=operation, at=at,
-        ):
+        from .operation_recovery import operation_recovery_due
+        explicit_retry_allowed = transport_only and (
+            (scope.category == "metrics" and permits_transport_retry(
+                connection, scope=scope, operation=operation, at=at))
+            or authorize_transport_fault_diagnostic(
+                connection, scope=scope, operation=operation, at=at,
+            )
+        )
+        if not explicit_retry_allowed and not operation_recovery_due(connection, operation=operation, at=at):
             raise PaidScopeBlocked(
                 "operation_blocked", "TikHub operation requires domain-specific recovery"
             )
@@ -2529,9 +2242,9 @@ def check_reservation(
             "authorization_hard", "TikHub account authorization requires recovery"
         )
     summary = budget_summary(connection, at=at, exclude_usage_id=exclude_usage_id)
-    next_total = int(summary["total_microusd"]) + amount
-    if next_total > GLOBAL_MICROUSD:
-        raise PaidScopeBlocked("global_budget_exhausted", "TikHub Beijing-day $100 ceiling reached")
+    budget_bucket, budget_blocker = assess_budget_capacity(summary, operation=operation, amount_microusd=amount)
+    if budget_blocker is not None and budget_blocker.error_code == "global_budget_exhausted":
+        raise budget_blocker
     category = str(scope.category)
     if category not in CATEGORY_MICROUSD:
         raise PaidScopeBlocked("unknown_paid_purpose", "Missing fixed budget category")
@@ -2558,34 +2271,9 @@ def check_reservation(
                 "repair_budget_exhausted",
                 "Historical spend requires a consumed sequence-1 authorization",
             )
-    budget_bucket = "discovery" if operation in DISCOVERY_OPERATIONS else "metrics"
-    bucket_limit = BUDGET_BUCKET_MICROUSD[budget_bucket]
-    next_bucket = int(summary["buckets_microusd"][budget_bucket]) + amount
-    if next_total > AUTOMATIC_MICROUSD or next_bucket > bucket_limit:
-        try:
-            incident_total, incident_bucket = _incident_limits(
-                connection, scope=scope, bucket=budget_bucket, at=at
-            )
-        except PaidScopeBlocked as error:
-            if error.error_code == "incident_authorization_required":
-                code = (
-                    "automatic_budget_exhausted"
-                    if next_total > AUTOMATIC_MICROUSD
-                    else f"{budget_bucket}_budget_exhausted"
-                )
-                raise PaidScopeBlocked(code, str(error)) from error
-            raise
-        if next_total > incident_total:
-            raise PaidScopeBlocked(
-                "incident_total_budget_exhausted",
-                "TikHub incident total authorization ceiling reached",
-            )
-        if next_bucket > incident_bucket:
-            raise PaidScopeBlocked(
-                "incident_bucket_budget_exhausted",
-                "TikHub incident bucket authorization ceiling reached",
-            )
-    scope_payload = asdict(scope)
+    if budget_blocker is not None:
+        raise budget_blocker
+    scope_payload = asdict(replace(scope, incident_authorization_id=None))
     # These fields were added with the schema-19 dispatch fence.  Keep the
     # frozen schema-18 reservation shape byte-for-byte compatible while every
     # schema-19 paid scope still carries concrete values.

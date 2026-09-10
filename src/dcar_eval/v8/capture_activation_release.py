@@ -318,7 +318,7 @@ def validate_installed_activation_successor(
     migration/install/source/archive/inode check after this returns.
     """
     _require(
-        connection.execute("PRAGMA user_version").fetchone()[0] == 20,
+        connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21},
         "Activation successor requires exact schema20",
     )
     active = activation_at(connection, at)

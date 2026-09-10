@@ -13,6 +13,7 @@ import sqlite3
 from datetime import date, timedelta
 from typing import Any, Mapping
 
+from .account_classification import classification_sql, classification_updated_at_sql
 from .content_scope import canonical_content_predicate
 from .source_routing import parse_time
 from .statistics_scope import content_statistics_scope_sql
@@ -21,6 +22,7 @@ from .storage import now_utc
 SCOPE_EVENT = "report_scope_v1"
 INPUT_EVENT = "report_inputs_v1"
 CONTRACT_VERSION = "report-inputs-v1"
+ACCOUNT_CLASSIFICATION_VERSION = "account-classification-v2"
 PROFILE_DAY_SCAN_INPUT_CONTRACT = "report-profile-day-scan-inputs-v1"
 PROFILE_DAY_PERIOD_COVERAGE_CONTRACT = "profile-day-coverage-period-v1"
 
@@ -202,13 +204,15 @@ def freeze_scope(connection: sqlite3.Connection, task: Mapping[str, Any], *, sta
             raise FrozenInputError("report scope cutoff changed")
         return existing
     rows = connection.execute(
-        "SELECT c.*,a.account_type frozen_account_type,a.content_direction account_content_direction,"
+        f"SELECT c.*,{classification_sql(connection, 'account_group')} account_group,"
+        f"{classification_sql(connection, 'business_direction')} business_direction,"
+        f"{classification_updated_at_sql(connection)} classification_updated_at,"
         "a.created_at account_created_at,a.updated_at account_updated_at "
         "FROM content_items c LEFT JOIN accounts a ON a.id=c.account_id "
         "WHERE julianday(c.published_at)>=julianday(?) AND julianday(c.published_at)<julianday(?) "
         "AND julianday(c.imported_at)<=julianday(?) AND julianday(c.created_at)<=julianday(?) "
         f"AND {canonical_content_predicate(connection, knowledge_at=cutoff_at)} "
-        f"AND {content_statistics_scope_sql()} "
+        f"AND {content_statistics_scope_sql(connection=connection)} "
         "ORDER BY c.published_at,c.id", (start_at, end_at, cutoff_at, cutoff_at),
     ).fetchall()
     contents = []
@@ -223,13 +227,17 @@ def freeze_scope(connection: sqlite3.Connection, task: Mapping[str, Any], *, sta
             value.update(title="", body="", manual_content_direction=None, evaluation_content_direction=None)
         if value["account_id"] is not None and (not value["account_created_at"]
                 or parse_time(value["account_created_at"]) > parse_time(cutoff_at)
-                or parse_time(value["account_updated_at"]) > parse_time(cutoff_at)):
+                or parse_time(value["account_updated_at"]) > parse_time(cutoff_at)
+                or (value["classification_updated_at"] and
+                    parse_time(value["classification_updated_at"]) > parse_time(cutoff_at))):
             reasons.append("account_dimension_unreconstructable")
-            value.update(account_id=None, frozen_account_type=None, account_content_direction=None)
-        value["account_type"] = value.pop("frozen_account_type") or value["legacy_account_type"] or "unknown"
+            value.update(account_id=None, account_group="unknown", business_direction="unknown")
+        # Content imports may still carry legacy source metadata; new snapshots
+        # never turn that historical label into the current account taxonomy.
+        value.pop("legacy_account_type", None)
         if reasons:
             unknown[str(value["id"])] = reasons
-            value["account_type"] = "unknown"
+            value.update(account_group="unknown", business_direction="unknown")
         contents.append(value)
     for value in contents:
         connection.execute("INSERT INTO task_contents(task_id,content_id,inclusion_status,reason) "
@@ -241,12 +249,13 @@ def freeze_scope(connection: sqlite3.Connection, task: Mapping[str, Any], *, sta
                        "WHERE c.published_at IS NULL AND julianday(c.imported_at)<=julianday(?) "
                        "AND julianday(c.created_at)<=julianday(?) "
                        f"AND {canonical_content_predicate(connection, knowledge_at=cutoff_at)} "
-                       f"AND {content_statistics_scope_sql()} "
+                       f"AND {content_statistics_scope_sql(connection=connection)} "
                        "ON CONFLICT(task_id,content_id) DO NOTHING", (task["id"], cutoff_at, cutoff_at))
     return _store(connection, str(task["id"]), SCOPE_EVENT, {
         "task_id": task["id"], "cutoff_at": cutoff_at, "period_start_at": start_at,
         "period_end_at": end_at, "content_ids": [row["id"] for row in contents],
         "contents": contents, "unknown_dimensions": unknown,
+        "account_classification_version": ACCOUNT_CLASSIFICATION_VERSION,
     })
 
 

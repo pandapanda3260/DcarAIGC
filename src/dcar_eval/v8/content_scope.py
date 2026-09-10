@@ -20,7 +20,7 @@ def canonical_content_predicate(
     """
     if re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", alias) is None:
         raise ValueError("Invalid content table alias")
-    if int(connection.execute("PRAGMA user_version").fetchone()[0]) != 20:
+    if int(connection.execute("PRAGMA user_version").fetchone()[0]) not in {20, 21}:
         return "1=1"
     cutoff = ""
     if knowledge_at is not None:

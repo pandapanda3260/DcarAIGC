@@ -56,7 +56,7 @@ def root_run_predicate(connection: sqlite3.Connection, alias: str = "") -> str:
     """Preserve legacy exact-slot readers when continuation children exist."""
     if alias and not alias.replace("_", "").isalnum():
         raise ValueError("invalid SQL alias")
-    if connection.execute("PRAGMA user_version").fetchone()[0] == 20:
+    if connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}:
         return f" AND {alias + '.' if alias else ''}root_run_id IS NULL"
     return ""
 
@@ -66,7 +66,7 @@ def _lease_time(value: str) -> str:
 
 
 def heartbeat(connection: sqlite3.Connection, claim: DurableClaim, *, now: str | None = None) -> None:
-    if connection.execute("PRAGMA user_version").fetchone()[0] != 20:
+    if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
         return
     timestamp = _lease_time(now or now_utc())
     expires = _lease_time((parse_time(timestamp) + timedelta(seconds=LEASE_SECONDS)).isoformat())
@@ -190,7 +190,7 @@ def claim_run_in_transaction(
     token = uuid.uuid4().hex
     details["owner"] = {"token": token, "attempt_number": attempt_number}
     details["claimed_at"] = timestamp
-    if connection.execute("PRAGMA user_version").fetchone()[0] == 20:
+    if connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}:
         lease_start = _lease_time(timestamp)
         lease_end = _lease_time((parse_time(timestamp) + timedelta(seconds=LEASE_SECONDS)).isoformat())
         attempt = connection.execute(
@@ -265,7 +265,7 @@ def recover_expired_leases(connection: sqlite3.Connection, *, now: str | None = 
     """Reconcile fenced running attempts without reissuing any paid identity."""
     if not connection.in_transaction:
         raise DurableRunError("lease recovery requires a caller transaction")
-    if connection.execute("PRAGMA user_version").fetchone()[0] != 20:
+    if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
         return 0
     owned_clause = ""
     owned_ids: tuple[int, ...] = ()
@@ -301,7 +301,7 @@ def recover_expired_leases(connection: sqlite3.Connection, *, now: str | None = 
 def claim_child(connection: sqlite3.Connection, *, root_run_id: int, continuation_sequence: int,
                 charge_business_day: str, now: str | None = None) -> DurableClaim | None:
     """Claim a charge-day continuation. Frozen data scope and paid keys survive."""
-    if not connection.in_transaction or connection.execute("PRAGMA user_version").fetchone()[0] != 20:
+    if not connection.in_transaction or connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
         raise DurableRunError("child claim requires schema20 caller transaction")
     from datetime import date
 

@@ -226,7 +226,13 @@ function ActiveWorkbenchChrome({ active, pathname, children }: { active: Section
             </Link>
           </>}
         </nav>
-        <div className="sidebar-foot"><i className={`live-dot${serviceState.kind === "online" ? " online" : ""}`} aria-hidden="true" /><div role="status" aria-live="polite" title={serviceState.description || undefined} aria-label={[serviceState.label, serviceState.description].filter(Boolean).join("。")}><strong className={serviceStyles.footerLabel}>{serviceState.label}</strong></div><LogoutButton /></div>
+        <div className="sidebar-foot">
+          <i className={serviceStyles.indicator} data-state={serviceState.kind ?? undefined} aria-hidden="true" />
+          <div role="status" aria-live="polite" aria-busy={serviceState.kind === null} title={serviceState.description || undefined} aria-label={[serviceState.label, serviceState.description].filter(Boolean).join("。") || "正在读取系统状态"}>
+            <strong className={serviceStyles.footerLabel}>{serviceState.label || <span className={serviceStyles.loadingLabel} aria-hidden="true" />}</strong>
+          </div>
+          <LogoutButton />
+        </div>
       </aside>
       {pending ? <RouteLoading section={pending.section} /> : children}
       <BackToTop pageKey={pending?.href ?? pathname} />

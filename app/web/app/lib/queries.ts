@@ -26,6 +26,7 @@ import type {
 
 export type ContentSearchResult = { items: ContentItem[]; total: number };
 export type AccountSearchResult = {
+  account_directory_version?: number;
   items: Account[];
   total: number;
   account_management_version?: number;
@@ -35,12 +36,12 @@ export type DouyinAuthorizationsResult = { items: DouyinAuthorization[] };
 export type DouyinAuthorizationStatusesResult = { items: DouyinAuthorizationStatus[]; unavailable?: boolean };
 
 export const defaultContentSearchRequest = buildContentSearchRequest({
-  query: "", platform: "", accountType: "", direction: "", sellingPoint: "",
+  query: "", platform: "", accountGroup: "", businessDirection: "", direction: "", sellingPoint: "",
   spuSeries: "", audience: "", scene: "",
 }, 1, 50);
 
 export const defaultAccountSearchRequest = buildAccountSearchRequest({
-  query: "", platform: "", accountType: "", direction: "", accountStatus: "",
+  query: "", platform: "", accountGroup: "", businessDirection: "", accountStatus: "",
 }, 1, 50);
 
 function readDouyinAuthorizations() {

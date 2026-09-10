@@ -49,7 +49,7 @@ function DouyinAuthorizationWorkspace() {
   const accountId = /^\d+$/.test(rawAccountId) ? Number(rawAccountId) : 0;
   const targetWasRequested = Boolean(rawAccountId || platformUid);
   const targetIsValid = Number.isSafeInteger(accountId) && accountId > 0 && /^\d{6,24}$/.test(platformUid);
-  const targetRequest = buildAccountSearchRequest({ query: platformUid, accountType: "", direction: "", platform: "douyin" }, 1, 100);
+  const targetRequest = buildAccountSearchRequest({ query: platformUid, accountGroup: "", businessDirection: "", platform: "douyin" }, 1, 100);
 
   const sessionQuery = useQuery(sessionQueryOptions());
   const isBypassMode = sessionQuery.data?.username === "temporary-bypass";

@@ -1182,7 +1182,18 @@ def validate_report(
         report_version=str(report_version) if report_version is not None else None,
     )
     errors: List[str] = []
-    missing = [key for key in contract["required_top_level_keys"] if key not in report]
+    metadata = report.get("metadata")
+    classification_version = metadata.get("account_classification_version") if isinstance(metadata, Mapping) else None
+    new_classification = classification_version == "account-classification-v2"
+    if classification_version is not None and not new_classification:
+        errors.append("$.metadata.account_classification_version is unsupported")
+    required_keys = list(contract["required_top_level_keys"])
+    if new_classification:
+        required_keys = [key for key in required_keys if key != "account_type_dimensions"]
+        required_keys.extend(["account_group_dimensions", "business_direction_dimensions"])
+        if "account_type_dimensions" in report:
+            errors.append("$.account_type_dimensions is only valid for historical classification")
+    missing = [key for key in required_keys if key not in report]
     if missing:
         errors.append(f"$ missing {missing}")
     for key in ("report_version", "rule_version", "evidence_version"):
@@ -1408,6 +1419,8 @@ def validate_report(
     for key in (
         "platform_dimensions",
         "account_type_dimensions",
+        "account_group_dimensions",
+        "business_direction_dimensions",
         "content_direction_dimensions",
         "selling_point_dimensions",
         "duplicates",

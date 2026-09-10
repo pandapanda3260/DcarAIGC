@@ -23,7 +23,7 @@ import urllib.request
 from contextlib import closing, contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import ModuleType
 from typing import Any, Callable, Iterator, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
@@ -50,9 +50,13 @@ RUNTIME_IDENTITY_SCHEMA = "dcar-runtime-identity-v1"
 EXPECTED_REPORT_VERSION = "dcar-content-operations-report-v8.9"
 EXPECTED_DATABASE_SCHEMA_VERSION = 19
 EXPECTED_DATABASE_SCHEMA_MIGRATION = "dual-acquisition-profile-roster-v1"
+CLASSIFICATION_SCHEMA_VERSION = 21
+CLASSIFICATION_SCHEMA_MIGRATION = "account-classification-v1"
+CLASSIFICATION_PUBLICATION_CONTRACT = "account-classification-publication-v1"
 SUPPORTED_SCHEMA_MIGRATIONS = {
     19: EXPECTED_DATABASE_SCHEMA_MIGRATION,
     20: "integrated-video-capture-v25",
+    21: "account-classification-v1",
 }
 EXPECTED_ACTIVE_RELEASE_ID = "evaluation-v9__selling-points-v5.2"
 EXPECTED_ACTIVE_RELEASE_STATUS = "active"
@@ -81,11 +85,15 @@ PENDING_STATE_SCHEMA = "dcar-snapshot-publisher-pending-v2"
 PENDING_STATE_FILENAME = "snapshot-publisher-pending.json"
 SOURCE_RECEIPT_CONTRACT = "snapshot-source-receipt-v1"
 SOURCE_RECEIPT_FILENAME = "snapshot-source-receipt.json"
+FROZEN_ARTIFACT_DIRECTORY = "frozen-artifacts"
+FROZEN_ARTIFACT_CONTRACT = "snapshot-frozen-artifacts-v1"
 REMOTE_PROBE_SCHEMA = "dcar-remote-publisher-probe-v1"
 LEGACY_TRANSITION_SCHEMA = "dcar-schema17-to18-server-transition-v1"
 TRANSITION_SCHEMA = "dcar-schema18-to19-server-transition-v1"
 INTEGRATED_TRANSITION_SCHEMA = "dcar-schema19-to20-server-transition-v1"
+CLASSIFICATION_TRANSITION_SCHEMA = "dcar-schema20-to21-server-transition-v1"
 AUTOMATIC_START_HOUR = 9
+AUTOMATIC_DEDUP_SECONDS = 1800
 WRITER_ENDPOINT_TIMEOUT_SECONDS = 120
 REMOTE_ENDPOINT_TIMEOUT_SECONDS = 120
 REMOTE_PROBE_COMMAND_TIMEOUT_SECONDS = 420
@@ -220,7 +228,7 @@ def _validate_runtime_identity(value: object, *, label: str,
         raise SnapshotPublishError(f"{label} runtime identity has an invalid shape")
     version = value.get("database_schema_version") if expected_schema is None else expected_schema
     if type(version) is not int or version not in SUPPORTED_SCHEMA_MIGRATIONS:
-        raise SnapshotPublishError(f"{label} requires explicit schema 19 or 20")
+        raise SnapshotPublishError(f"{label} requires explicit schema 19, 20 or 21")
     expected = {
         "schema": RUNTIME_IDENTITY_SCHEMA,
         "report_version": EXPECTED_REPORT_VERSION,
@@ -319,7 +327,7 @@ def _validate_snapshot_contract(value: object, *, label: str) -> dict[str, str]:
 def _require_current_config(config: PublishConfig) -> None:
     if config.expected_user_version not in SUPPORTED_SCHEMA_MIGRATIONS:
         raise SnapshotPublishError(
-            "normal publisher requires explicit schema 19 or 20; "
+            "normal publisher requires explicit schema 19, 20 or 21; "
             "the first version transition must use schema-upgrade"
         )
 
@@ -492,7 +500,7 @@ def _observed_publication_evidence(
         "SELECT id,task_status,progress,message,updated_at FROM report_tasks WHERE period_start>=? ORDER BY id",
         (boundary.isoformat(),),
     )]
-    return {
+    evidence = {
         "schema": FRESHNESS_SCHEMA, "beijing_date": current.date().isoformat(), "verified_at": at,
         "mode": "observed", "reconcile_from": boundary.isoformat(), "cutover": None,
         "discovery": discovery, "preparation": None, "reports": reports,
@@ -503,11 +511,53 @@ def _observed_publication_evidence(
                                 "tasks_sha256": pipeline_cutover.digest(tasks)},
         "status": "partial" if reasons else "succeeded", "reasons": sorted(set(reasons)),
     }
+    classification = _account_classification_publication_evidence(connection)
+    if classification is not None:
+        evidence["account_classification"] = classification
+    return evidence
 
 
-def _validate_publication_evidence(value: object) -> dict[str, Any]:
+def _account_classification_publication_evidence(connection: sqlite3.Connection) -> dict[str, Any] | None:
+    """Bind mutable directory labels without timestamp-only publication churn."""
+    if connection.execute("PRAGMA user_version").fetchone()[0] != CLASSIFICATION_SCHEMA_VERSION:
+        return None
+    from v8.schema_v21 import migration_proof
+
+    proof = migration_proof(connection)
+    rows = [dict(row) for row in connection.execute(
+        "SELECT id,account_id,account_group,business_direction FROM account_directory_rows ORDER BY id"
+    )]
+    return {
+        "contract_version": CLASSIFICATION_PUBLICATION_CONTRACT,
+        "schema_version": CLASSIFICATION_SCHEMA_VERSION,
+        "schema_migration": CLASSIFICATION_SCHEMA_MIGRATION,
+        "migration_receipt_sha256": proof["receipt_sha256"],
+        "row_count": len(rows),
+        "unlinked_row_count": sum(row["account_id"] is None for row in rows),
+        "rows_sha256": pipeline_cutover.digest(rows),
+    }
+
+
+def _validate_publication_evidence(value: object, *, expected_schema: int | None = None) -> dict[str, Any]:
     if not isinstance(value, dict) or value.get("schema") != FRESHNESS_SCHEMA:
         raise SnapshotPublishError("publication freshness receipt contract is invalid")
+    classification = value.get("account_classification")
+    if expected_schema == CLASSIFICATION_SCHEMA_VERSION and not isinstance(classification, dict):
+        raise SnapshotPublishError("schema21 publication is missing account classification evidence")
+    if classification is not None:
+        if (expected_schema not in {None, CLASSIFICATION_SCHEMA_VERSION}
+                or not isinstance(classification, dict)
+                or set(classification) != {"contract_version", "schema_version", "schema_migration",
+                                            "migration_receipt_sha256", "row_count", "unlinked_row_count", "rows_sha256"}
+                or classification.get("contract_version") != CLASSIFICATION_PUBLICATION_CONTRACT
+                or classification.get("schema_version") != CLASSIFICATION_SCHEMA_VERSION
+                or classification.get("schema_migration") != CLASSIFICATION_SCHEMA_MIGRATION
+                or any(not isinstance(classification.get(key), str) or SHA256_RE.fullmatch(classification[key]) is None
+                       for key in ("migration_receipt_sha256", "rows_sha256"))
+                or type(classification.get("row_count")) is not int or classification["row_count"] < 0
+                or type(classification.get("unlinked_row_count")) is not int
+                or not 0 <= classification["unlinked_row_count"] <= classification["row_count"]):
+            raise SnapshotPublishError("account classification publication evidence is invalid")
     verified = _parse_iso(value.get("verified_at"), label="publication verified_at")
     if (verified.astimezone(SHANGHAI).date().isoformat() != value.get("beijing_date")
             or value.get("status") not in TERMINAL_REPORT_STATUSES
@@ -558,8 +608,16 @@ def _validate_publication_evidence(value: object) -> dict[str, Any]:
 
 
 def _schema20_deployment(connection: sqlite3.Connection, *, project_root: Path) -> dict[str, Any]:
+    if connection.execute("PRAGMA user_version").fetchone()[0] == 21:
+        from v8.account_cleanup_snapshot import is_cleanup, validate
+        if not is_cleanup(connection):
+            raise SnapshotPublishError("schema21 requires inherited cleanup and classification migration proof")
+        proof = dict(validate(connection, project_root=project_root))
+        if (proof.get("schema_version") != 21 or proof.get("schema_migration") != CLASSIFICATION_SCHEMA_MIGRATION
+                or not isinstance(proof.get("account_classification_migration"), dict)):
+            raise SnapshotPublishError("schema21 classification migration proof is missing")
+        return proof
     from v8.capture_release import _release_tools
-
     return dict(_release_tools().validate_deployment_receipt(connection, project_root=project_root))
 
 
@@ -618,8 +676,10 @@ def _schema20_publication_evidence(connection: sqlite3.Connection, *, current: d
     from v8.capture_code_successor import current_proof
     from v8.profile_activations import activation_at
 
-    code_successor = current_proof(connection, project_root=project_root, at=at)
+    from v8.account_cleanup_snapshot import CONTRACT as CLEANUP_CONTRACT
     deployment = _schema20_deployment(connection, project_root=project_root)
+    cleanup = deployment.get("contract_version") == CLEANUP_CONTRACT
+    code_successor = None if cleanup else current_proof(connection, project_root=project_root, at=at)
     active = activation_at(connection, at)
     if active is None:
         raise SnapshotPublishError("schema20 current activation is missing")
@@ -627,7 +687,7 @@ def _schema20_publication_evidence(connection: sqlite3.Connection, *, current: d
     if any(deployment["bindings"].get(key) != active[key] for key in (
         "activation_id", "profile_id", "roster_snapshot_id", "roster_members_sha256", "activation_sha256",
     )):
-        if active["profile_id"] != "integrated_route_v1":
+        if cleanup or active["profile_id"] != "integrated_route_v1":
             raise SnapshotPublishError("schema20 deployment does not bind the current activation")
         from v8.capture_activation_release import validate_installed_activation_successor
         if code_successor is None:
@@ -697,9 +757,9 @@ def _verify_snapshot_dependencies(output: Path, manifest: Mapping[str, Any], fre
             version = freshness.runtime_identity["database_schema_version"]
             if _database_runtime_identity(connection, expected_schema=version) != freshness.runtime_identity:
                 raise SnapshotPublishError("snapshot database runtime identity drifted")
-            evidence = freshness.evidence
+            evidence = _validate_publication_evidence(freshness.evidence, expected_schema=version)
             at = evidence["verified_at"]
-            if version == 20:
+            if version in {20, 21}:
                 if _schema20_deployment(connection, project_root=project_root) != manifest.get("deployment_readiness"):
                     raise SnapshotPublishError("snapshot schema20 deployment/migration evidence drifted")
                 if _schema20_publication_evidence(connection,
@@ -755,7 +815,7 @@ def _verify_snapshot_dependencies(output: Path, manifest: Mapping[str, Any], fre
             # This exact proof was revalidated above and is bound independently
             # in the manifest. Its private files are never business artifacts.
             business_evidence = dict(freshness.evidence)
-            if version == 20:
+            if version in {20, 21}:
                 business_evidence.pop("code_successor", None)
             require_references(business_evidence)
         finally:
@@ -1055,15 +1115,16 @@ def _validate_source_receipt(
         or value.get("artifact_selection") != _artifact_selection(manifest)
     ):
         raise SnapshotPublishError("snapshot source receipt does not bind the manifest")
-    evidence = _validate_publication_evidence(value.get("publication_evidence"))
+    runtime_identity = _validate_runtime_identity(
+        value.get("runtime_identity"), label="snapshot source receipt"
+    )
+    evidence = _validate_publication_evidence(value.get("publication_evidence"),
+                                              expected_schema=runtime_identity["database_schema_version"])
     if (
         value.get("publication_evidence_sha256")
         != pipeline_cutover.digest(evidence)
     ):
         raise SnapshotPublishError("snapshot source receipt evidence SHA-256 mismatch")
-    runtime_identity = _validate_runtime_identity(
-        value.get("runtime_identity"), label="snapshot source receipt"
-    )
     snapshot_contract = _validate_snapshot_contract(
         value.get("snapshot_contract"), label="snapshot source receipt"
     )
@@ -1274,7 +1335,7 @@ def _verify_local_snapshot(
             configure_connection_safety(connection)
             connection.execute("PRAGMA query_only=ON")
             at = observed_at.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-            if config.expected_user_version == 20:
+            if config.expected_user_version in {20, 21}:
                 evidence = _schema20_publication_evidence(connection, current=observed_at,
                     at=at, project_root=project_root)
             else:
@@ -1448,7 +1509,7 @@ def _read_external_env(path: Path, *, project_root: Path) -> PublishConfig:
         raise SnapshotPublishError("remote free-space reserve must be at least 1 GiB")
     if expected_user_version not in SUPPORTED_SCHEMA_MIGRATIONS:
         raise SnapshotPublishError(
-            "publisher environment must pin schema 19 or 20 explicitly; "
+            "publisher environment must pin schema 19, 20 or 21 explicitly; "
             "the first version transition uses schema-upgrade"
         )
     if not 0 <= maximum_content_lag_days <= 7:
@@ -1577,7 +1638,7 @@ def check_writer_freshness(
         runtime_identity = _database_runtime_identity(connection, expected_schema=expected_user_version)
         if runtime_identity != health_runtime_identity:
             raise SnapshotPublishError("writer health runtime identity does not match the formal database")
-        if expected_user_version == 20:
+        if expected_user_version in {20, 21}:
             evidence = _schema20_publication_evidence(connection, current=current, at=timestamp, project_root=project_root)
             content = connection.execute("SELECT COUNT(*) content_count,MAX(published_at) latest_published_at FROM content_items").fetchone()
             return WriterFreshness(evidence=evidence, content_count=int(content["content_count"]),
@@ -1942,11 +2003,11 @@ python_path = Path(sys.argv[3])
 installer = Path(sys.argv[4])
 expected_schema = int(sys.argv[5])
 installer_schema_support = None
-if expected_schema == 20:
+if expected_schema in {20, 21}:
     import importlib.util
     spec = importlib.util.spec_from_file_location("dcar_remote_installer_probe", installer)
     if spec is None or spec.loader is None:
-        raise RuntimeError("installed schema20 receiver cannot be loaded")
+        raise RuntimeError(f"installed schema{expected_schema} receiver cannot be loaded")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -2056,23 +2117,36 @@ def _validate_remote_probe(
     if "schema_transition" not in value:
         raise SnapshotPublishError("remote probe omitted the schema transition barrier")
     transition = value["schema_transition"]
-    if config.expected_user_version == 20:
+    version = config.expected_user_version
+    if version in {20, 21}:
         support = value.get("installer_schema_support")
+        pair = [version - 1, version]
         if (not isinstance(support, dict) or not isinstance(support.get("versions"), list)
-                or 20 not in support["versions"] or not isinstance(support.get("transitions"), list)
-                or [19, 20] not in support["transitions"]):
-            raise SnapshotPublishError("remote installed receiver has no verified schema20 support")
-        if (not isinstance(transition, dict) or transition.get("schema") != INTEGRATED_TRANSITION_SCHEMA
-                or transition.get("from_schema") != 19 or transition.get("to_schema") != 20
-                or transition.get("status") != "succeeded"):
-            raise SnapshotPublishError("remote 19-to-20 pairing is unsettled; use explicit schema-upgrade first")
+                or version not in support["versions"] or not isinstance(support.get("transitions"), list)
+                or pair not in support["transitions"]):
+            raise SnapshotPublishError(f"remote installed receiver has no verified schema{version} support")
+        expected_transition = CLASSIFICATION_TRANSITION_SCHEMA if version == 21 else INTEGRATED_TRANSITION_SCHEMA
+        paired = (isinstance(transition, dict) and transition.get("schema") == expected_transition
+                  and [transition.get("from_schema"), transition.get("to_schema")] == pair
+                  and transition.get("status") == "succeeded")
+        restored20 = (version == 20 and isinstance(transition, dict)
+                      and transition.get("schema") == CLASSIFICATION_TRANSITION_SCHEMA
+                      and transition.get("from_schema") == 20 and transition.get("to_schema") == 21
+                      and transition.get("status") == "rolled_back")
+        if not (paired or restored20):
+            raise SnapshotPublishError(f"remote {version - 1}-to-{version} pairing is unsettled; use explicit schema-upgrade first")
     if transition is not None:
-        legacy_settled = (isinstance(transition, dict) and config.expected_user_version == 19
+        legacy_settled = (isinstance(transition, dict) and version == 19
             and transition.get("schema") == TRANSITION_SCHEMA and transition.get("status") in {"succeeded", "rolled_back"})
         integrated_settled = (isinstance(transition, dict) and transition.get("schema") == INTEGRATED_TRANSITION_SCHEMA
             and transition.get("from_schema") == 19 and transition.get("to_schema") == 20
-            and transition.get("status") == ("succeeded" if config.expected_user_version == 20 else "rolled_back"))
-        if not (legacy_settled or integrated_settled):
+            and version in {19, 20}
+            and transition.get("status") == ("succeeded" if version == 20 else "rolled_back"))
+        classification_settled = (isinstance(transition, dict) and transition.get("schema") == CLASSIFICATION_TRANSITION_SCHEMA
+            and transition.get("from_schema") == 20 and transition.get("to_schema") == 21
+            and version in {20, 21}
+            and transition.get("status") == ("succeeded" if version == 21 else "rolled_back"))
+        if not (legacy_settled or integrated_settled or classification_settled):
             raise SnapshotPublishError("remote schema-upgrade transition is unsettled; normal publishing is blocked")
         _parse_iso(transition.get("completed_at"), label="schema transition completed_at")
     current_release = value.get("current_release")
@@ -2217,11 +2291,68 @@ def _remote_command(ssh: Sequence[str], command: str) -> list[str]:
 
 
 def _bundle_byte_size(path: Path) -> int:
+    # Required artifacts are transferred by their own from0 lists, never twice.
     return sum(
         candidate.stat().st_size
-        for candidate in path.rglob("*")
+        for child in path.iterdir() if child.name != FROZEN_ARTIFACT_DIRECTORY
+        for candidate in ([child] if child.is_file() else child.rglob("*"))
         if candidate.is_file() and not candidate.is_symlink()
     )
+
+
+def _verify_frozen_artifacts(output: Path, manifest: Mapping[str, Any]) -> Path:
+    """Local sends require sealed independent bytes, including local resume.
+
+    Older staged-only resumes need no local artifacts: remote verification is
+    still authoritative for them. Missing local copies never permit live reads.
+    """
+    if manifest.get("local_artifact_source") != {
+        "contract": FROZEN_ARTIFACT_CONTRACT, "directory": FROZEN_ARTIFACT_DIRECTORY,
+    }:
+        raise SnapshotPublishError("snapshot has no frozen artifact source; build a new snapshot")
+    root = output / FROZEN_ARTIFACT_DIRECTORY
+    try:
+        if root.is_symlink() or not root.is_dir() or root != root.resolve():
+            raise SnapshotPublishError("frozen artifact directory is missing or unsafe")
+        grouped: dict[str, list[bytes]] = {"cache": [], "reports": []}
+        identities = set()
+        for item in manifest["files"]:
+            name, relative = item["root"], item["path"]
+            if (name not in grouped or not isinstance(relative, str) or not relative
+                    or any(c in relative for c in ("\0", "\n", "\r", "\\"))
+                    or relative != PurePosixPath(relative).as_posix()
+                    or PurePosixPath(relative).is_absolute() or ".." in PurePosixPath(relative).parts
+                    or (name, relative) in identities):
+                raise SnapshotPublishError("frozen artifact path is invalid")
+            identities.add((name, relative))
+            grouped[name].append(relative.encode("utf-8") + b"\0")
+            path = root / name / relative
+            if path.is_symlink() or path != path.resolve():
+                raise SnapshotPublishError("frozen artifact path is unsafe")
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as handle:
+                before = os.fstat(handle.fileno())
+                if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                        or before.st_uid != os.getuid() or stat.S_IMODE(before.st_mode) & 0o222
+                        or before.st_size != item["byte_size"]):
+                    raise SnapshotPublishError("frozen artifact identity/size is unsafe")
+                digest = hashlib.sha256()
+                for block in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(block)
+                after = os.fstat(handle.fileno())
+                if (digest.hexdigest() != item["sha256"] or any(getattr(before, key) != getattr(after, key)
+                        for key in ("st_dev", "st_ino", "st_size", "st_mtime_ns"))):
+                    raise SnapshotPublishError("frozen artifact bytes changed")
+        for name, members in grouped.items():
+            directory = root / name
+            if directory.is_symlink() or not directory.is_dir() or directory != directory.resolve():
+                raise SnapshotPublishError("frozen artifact directory is unsafe")
+            listing = output / f"{name}-files-from0"
+            if listing.is_symlink() or listing.read_bytes() != b"".join(members):
+                raise SnapshotPublishError("frozen artifact transfer list differs from manifest")
+    except (OSError, KeyError, TypeError, ValueError) as error:
+        raise SnapshotPublishError(f"frozen artifact source verification failed: {error}") from error
+    return root
 
 
 def _rsync_transfer_bytes(
@@ -2526,8 +2657,8 @@ def _remote_installer_operation(
         arguments.extend(["--bundle", bundle])
     if snapshot_id is not None:
         arguments.extend(["--snapshot-id", snapshot_id])
-    if config.expected_user_version == 20:
-        arguments.extend(["--expected-schema", "20"])
+    if config.expected_user_version in {20, 21}:
+        arguments.extend(["--expected-schema", str(config.expected_user_version)])
     output = _run_checked(
         runner,
         _remote_command(ssh, shlex.join(arguments)),
@@ -2779,7 +2910,8 @@ def _state_from_receipt(
     published_at = _parse_iso(value.get("published_at"), label="automatic publisher receipt published_at")
     identity = _validate_runtime_identity(value.get("runtime_identity"), label="automatic publisher receipt")
     snapshot_contract = _validate_snapshot_contract(value.get("snapshot_contract"), label="automatic publisher receipt")
-    evidence = _validate_publication_evidence(value.get("publication_evidence"))
+    evidence = _validate_publication_evidence(value.get("publication_evidence"),
+                                              expected_schema=identity["database_schema_version"])
     sha = pipeline_cutover.digest(evidence)
     if (value.get("publication_evidence_sha256") != sha or value.get("publication_status") != evidence["status"]
             or evidence["beijing_date"] != beijing_date.isoformat()
@@ -2896,13 +3028,50 @@ def _daily_automatic_success(
     return _recover_automatic_state(snapshot_root, beijing_date=beijing_date)
 
 
+def _retention_state_output(path: Path, *, schema: str) -> Optional[str]:
+    """Read only a retention reference, without treating it as publish proof.
+
+    The last success can predate the current schema/report release. Retention
+    must preserve its receipt without applying today's publication contract.
+    """
+    if path.is_symlink():
+        raise SnapshotPublishError("local snapshot retention state is unsafe")
+    if not path.exists():
+        return None
+    metadata = path.stat()
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) not in {0o400, 0o600}):
+        raise SnapshotPublishError("local snapshot retention state is unsafe")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SnapshotPublishError("local snapshot retention state is unreadable") from error
+    output_name = value.get("output_name") if isinstance(value, dict) else None
+    if (not isinstance(value, dict) or value.get("schema") != schema
+            or not isinstance(output_name, str)
+            or LOCAL_SNAPSHOT_DIR_RE.fullmatch(output_name) is None):
+        raise SnapshotPublishError("local snapshot retention reference is invalid")
+    return output_name
+
 def _prune_local_snapshots(
-    snapshot_root: Path, *, retain_count: int = LOCAL_SNAPSHOT_RETAIN_COUNT
+    snapshot_root: Path, *, retain_count: int = LOCAL_SNAPSHOT_RETAIN_COUNT,
+    protected_outputs: Sequence[str] = (),
 ) -> list[str]:
     if retain_count < 1:
         raise SnapshotPublishError("local snapshot retain count must be positive")
     if snapshot_root.is_symlink() or not snapshot_root.is_dir():
         raise SnapshotPublishError("snapshot root is unsafe")
+    protected = set(protected_outputs)
+    if any(not isinstance(name, str) or LOCAL_SNAPSHOT_DIR_RE.fullmatch(name) is None
+           for name in protected):
+        raise SnapshotPublishError("protected local snapshot name is invalid")
+    for filename, schema in (
+        (AUTOMATIC_STATE_FILENAME, AUTOMATIC_STATE_SCHEMA),
+        (PENDING_STATE_FILENAME, PENDING_STATE_SCHEMA),
+    ):
+        output_name = _retention_state_output(snapshot_root / filename, schema=schema)
+        if output_name is not None:
+            protected.add(output_name)
     candidates = sorted(
         (
             path
@@ -2914,8 +3083,12 @@ def _prune_local_snapshots(
         key=lambda path: path.name,
         reverse=True,
     )
+    protected.intersection_update(path.name for path in candidates)
+    if len(protected) > retain_count:
+        raise SnapshotPublishError("protected local snapshots exceed the retention limit")
+    unprotected = [path for path in candidates if path.name not in protected]
     deleted: list[str] = []
-    for path in candidates[retain_count:]:
+    for path in unprotected[retain_count - len(protected):]:
         if path.is_symlink() or not path.is_dir():
             raise SnapshotPublishError(
                 f"local snapshot changed while pruning: {path}"
@@ -2950,7 +3123,9 @@ def _finish_pending_publish(
         state = _state_from_receipt(receipt, beijing_date=beijing_date, output_name=output.name)
         _write_json_atomic(_automatic_state_path(config.snapshot_root), state)
     _clear_pending_state(config.snapshot_root)
-    _prune_local_snapshots(config.snapshot_root)
+    # A completed local/staged resume can be older than recent failed attempts
+    # and need not have an automatic state. Keep its newly sealed receipt too.
+    _prune_local_snapshots(config.snapshot_root, protected_outputs=(output.name,))
     return receipt
 
 
@@ -3187,6 +3362,7 @@ def publish_snapshot(
                 manifest_sha256=manifest_sha256,
             )
             bundle_byte_size = _bundle_byte_size(output)
+        frozen_artifacts = None if staged_only else _verify_frozen_artifacts(output, manifest)
         pending_before_ssh = _read_pending_state(config.snapshot_root)
         if pending_before_ssh is not None:
             _validate_pending_source_receipt(config, pending_before_ssh)
@@ -3266,20 +3442,21 @@ def publish_snapshot(
             *rsync_base,
             f"--compare-dest={config.remote_active_cache_root}",
             f"--files-from={output / 'cache-files-from0'}",
-            str(project_root / "data/cache") + "/",
+            str(frozen_artifacts / "cache") + "/" if frozen_artifacts is not None else "unused-staged-only/",
             f"{config.ssh_alias}:{incoming_cache}/",
         ]
         reports_rsync = [
             *rsync_base,
             f"--compare-dest={config.remote_active_reports_root}",
             f"--files-from={output / 'reports-files-from0'}",
-            str(project_root / "reports") + "/",
+            str(frozen_artifacts / "reports") + "/" if frozen_artifacts is not None else "unused-staged-only/",
             f"{config.ssh_alias}:{incoming_reports}/",
         ]
         bundle_rsync = [
             "rsync",
             "-a",
             "--delay-updates",
+            f"--exclude=/{FROZEN_ARTIFACT_DIRECTORY}/",
             "-e",
             _rsync_rsh(ssh),
             str(output) + "/",
@@ -3387,10 +3564,14 @@ def publish_snapshot(
             + reports_transfer_bytes
             + bundle_transfer_bytes
         )
-        # copy-dest may copy unchanged files locally without reporting transfer
-        # bytes. Reserve the entire independent bundle, including on resume.
-        staging_bytes = (0 if staged_only else cache_transfer_bytes + reports_transfer_bytes
-                         + max(bundle_byte_size, bundle_transfer_bytes))
+        # Independent incoming copies can materialize unchanged files without
+        # reporting transfer bytes. Reserve all required artifacts and the full
+        # bundle, including on local resume; keep larger dry-run bounds too.
+        staging_bytes = (
+            0 if staged_only else
+            max(int(manifest["file_byte_size"]), cache_transfer_bytes + reports_transfer_bytes)
+            + max(bundle_byte_size, bundle_transfer_bytes)
+        )
         required_bytes = (
             staging_bytes
             + install_headroom_total
@@ -3656,7 +3837,17 @@ def publish_snapshot_automatically(
         )
         if prior_success is not None:
             prior_receipt = json.loads((config.snapshot_root / prior_success["output_name"] / "publisher-receipt.json").read_text())
-            if _publication_fingerprint(observation.freshness.evidence) == _publication_fingerprint(prior_receipt["publication_evidence"]):
+            published_at = _parse_iso(prior_receipt.get("published_at"), label="automatic success published_at")
+            if published_at > current:
+                raise SnapshotPublishError("automatic success published_at is in the future")
+            # Identical Writer evidence cannot prove the remote replica stayed
+            # synchronized indefinitely. Renew through the full verified
+            # publication chain on the next hourly wakeup. A half-hour dedup
+            # window leaves time for building/transferring the prior snapshot.
+            # Never refresh a receipt here.
+            if (current - published_at < timedelta(seconds=AUTOMATIC_DEDUP_SECONDS)
+                    and _publication_fingerprint(observation.freshness.evidence)
+                    == _publication_fingerprint(prior_receipt["publication_evidence"])):
                 return {
                     "status": "already-published-current-evidence",
                     "beijing_date": current_day.isoformat(),

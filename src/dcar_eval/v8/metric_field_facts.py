@@ -431,7 +431,55 @@ def _ingest(connection: sqlite3.Connection, row: dict[str, Any]) -> dict[str, An
             "operation": operation, "correction": False, "fields": len(METRIC_FIELDS)}
 
 
-def ingest_observation(connection: sqlite3.Connection, observation_id: int) -> dict[str, Any]:
+def _record_incremental_anomalies(connection: sqlite3.Connection, observation_id: int) -> None:
+    """Compare new provider facts with one prior value in the same stream.
+
+    This is a diagnostic only. It does not change facts, select a maximum,
+    schedule a request or scan old observations for historical corrections.
+    """
+    for fact in connection.execute(
+        "SELECT * FROM content_metric_field_facts WHERE observation_id=? AND state='provided'",
+        (observation_id,),
+    ).fetchall():
+        previous = connection.execute(
+            "SELECT * FROM content_metric_field_facts WHERE content_id=? AND provider=? "
+            "AND operation=? AND field=? AND state='provided' AND id<>? "
+            "ORDER BY captured_at DESC,recorded_at DESC,id DESC LIMIT 1",
+            (fact["content_id"], fact["provider"], fact["operation"], fact["field"], fact["id"]),
+        ).fetchone()
+        if previous is None or (previous["captured_at"], previous["recorded_at"], previous["id"]) >= (
+            fact["captured_at"], fact["recorded_at"], fact["id"]
+        ):
+            continue  # First value or an out-of-order arrival is not a jump.
+        correction = connection.execute(
+            "SELECT action,value FROM content_metric_corrections WHERE target_fact_id=? "
+            "AND recorded_at<=? ORDER BY recorded_at DESC,id DESC LIMIT 1",
+            (previous["id"], fact["recorded_at"]),
+        ).fetchone()
+        if correction is not None and correction["action"] == "invalidate":
+            continue
+        old = int(correction["value"] if correction is not None else previous["value"])
+        new = int(fact["value"])
+        # Integer comparisons avoid float precision loss for large counters.
+        decline = old - new > 100 and (old - new) * 5 > old
+        increase = new - old > 1000 and new - old > old * 5
+        if not (decline or increase):
+            continue
+        scope = {key: fact[key] for key in ("content_id", "provider", "operation", "field")}
+        evidence = {"contract_version": "capture-new-metric-anomaly-v1",
+                    "previous_fact_id": previous["id"], "fact_id": fact["id"],
+                    "raw_response_id": fact["raw_response_id"], "previous_value": old, "value": new,
+                    "kind": "decline" if decline else "increase", "captured_at": fact["captured_at"],
+                    "automatic_correction": False, "provider_calls": 0}
+        connection.execute(
+            "INSERT OR IGNORE INTO operational_alerts(dedupe_key,severity,scope_json,evidence_json,owner,status,opened_at) "
+            "VALUES(?,'P2',?,?,'capture-data','open',?)",
+            ("capture:metric-jump:" + fact["fact_sha256"], _json(scope), _json(evidence), fact["recorded_at"]),
+        )
+
+
+def ingest_observation(connection: sqlite3.Connection, observation_id: int, *,
+                       record_anomalies: bool = False) -> dict[str, Any]:
     _require_transaction(connection)
     row = connection.execute(observation_query(connection) + " WHERE o.id=?", (observation_id,)).fetchone()
     if row is None:
@@ -439,7 +487,14 @@ def ingest_observation(connection: sqlite3.Connection, observation_id: int) -> d
     data = dict(row)
     if data["observation_origin"] == "provider_capture" and effective_provider(data) == "legacy_unknown":
         raise ValueError("new provider facts require proven raw/attempt/slot lineage")
-    return _ingest(connection, data)
+    existing = connection.execute(
+        "SELECT 1 FROM content_metric_field_facts WHERE observation_id=? LIMIT 1", (observation_id,),
+    ).fetchone()
+    result = _ingest(connection, data)
+    if (record_anomalies and existing is None and data["observation_origin"] == "provider_capture"
+            and data["raw_response_id"] is not None and effective_provider(data) in {"tikhub", "newrank_matrix"}):
+        _record_incremental_anomalies(connection, observation_id)
+    return result
 
 
 def migrate_legacy(connection: sqlite3.Connection) -> dict[str, Any]:
@@ -508,6 +563,35 @@ def _streams() -> list[tuple[str, str]]:
     stages = load_policy()["provider_operation_stages"]
     return [(provider, operation) for provider, operations in stages.items()
             for operation in operations] + [("legacy_unknown", "legacy_unknown")]
+
+
+def _fact_streams(
+    connection: sqlite3.Connection, content_ids: list[int],
+) -> list[tuple[str, str]]:
+    """Probe each configured stream once before its per-field selectors.
+
+    EXISTS uses the content/provider/operation index prefix and stops at one
+    fact, so the work does not grow with observation history. Time, window,
+    corrections and field eligibility remain the responsibility of the exact
+    selectors: this only removes streams with no facts at any time.
+    """
+    streams = _streams()
+    if not content_ids:
+        return []
+    rows = connection.execute(
+        f"""WITH configured(provider,operation) AS (
+            VALUES {','.join('(?,?)' for _ in streams)}
+        )
+        SELECT provider,operation FROM configured
+        WHERE EXISTS (
+            SELECT 1 FROM content_metric_field_facts f
+            WHERE f.content_id IN ({','.join('?' for _ in content_ids)})
+              AND f.provider=configured.provider AND f.operation=configured.operation
+        )""",
+        [value for stream in streams for value in stream] + content_ids,
+    )
+    present = {(str(row[0]), str(row[1])) for row in rows}
+    return [stream for stream in streams if stream in present]
 
 
 def _latest_fact(
@@ -582,7 +666,7 @@ def select_field_facts(
     ).fetchone()
     if future_policy is not None and future_policy[0] is not None:
         transitions.append(str(future_policy[0]))
-    streams = _streams()
+    streams = _fact_streams(connection, scope_ids)
     for field in METRIC_FIELDS:
         inputs: list[dict[str, Any]] = []
         candidates: list[dict[str, Any]] = []
@@ -950,11 +1034,12 @@ def select_metric_projections(
             if payload is None:
                 payload = select_field_facts(connection, content_id, cutoff_at=cutoff_at,
                                              knowledge_at=knowledge_at, window_key=window_key)
-                projection = business_projection(connection, payload)
-            else:
-                projection = payload.get("business_projection")
-                if projection is None:
-                    projection = business_projection(connection, payload)
+            projection = (
+                payload.get("business_projection")
+                if len(metric_fields) == len(METRIC_FIELDS) else None
+            )
+            if projection is None:
+                projection = business_projection(connection, payload, metric_fields=metric_fields)
             if projection is None:
                 if current_read:
                     parameters: list[Any] = [content_id, cutoff_at]
@@ -980,10 +1065,6 @@ def select_metric_projections(
                         if projection is not None:
                             result[requested_id] = projection
                 continue
-            if len(metric_fields) != len(METRIC_FIELDS):
-                projection = business_projection(connection, payload, metric_fields=metric_fields)
-                if projection is None:
-                    continue
             result[requested_id] = projection
         return result
     finally:

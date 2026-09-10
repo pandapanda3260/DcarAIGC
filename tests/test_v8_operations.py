@@ -611,8 +611,8 @@ class V8OperationsTest(unittest.TestCase):
             "小红书",
             "手机号",
             "运营人员",
-            "账号类型",
-            "内容方向",
+            "账号分组",
+            "业务方向",
             "平台 UID",
             "短号",
             "矩阵监测",
@@ -627,9 +627,10 @@ class V8OperationsTest(unittest.TestCase):
         ):
             self.assertIn(f">{header}</t>", sheet)
         # 单元格取值与页面展示口径一致：中文枚举、未填写/未绑定/「—」兜底。
-        self.assertIn(">混剪</t>", sheet)
-        self.assertIn(">二手车</t>", sheet)
-        self.assertIn(">精品 IP</t>", sheet)
+        # Legacy import categories never invent a new operating classification.
+        self.assertNotIn(">账号类型</t>", sheet)
+        self.assertNotIn(">内容方向</t>", sheet)
+        self.assertNotIn(">精品 IP</t>", sheet)
         self.assertIn(">已授权</t>", sheet)
         self.assertNotIn(">未绑定</t>", sheet)
         self.assertNotIn(">名单状态</t>", sheet)
@@ -1285,11 +1286,15 @@ class V8OperationsTest(unittest.TestCase):
         self.assertEqual(initial["legacy_account_type"], "unknown")
         self.assertEqual(initial["content_type"], "unknown")
 
+        # Historical import values remain archived but cannot be edited as
+        # a current operating classification through the content mutation API.
+        upsert_content({**identity, "account_type": "original"}, db_path=self.db)
+        with self.assertRaises(OperationError):
+            update_content(int(created["id"]), {"account_type": "mixed_edit"}, db_path=self.db)
         update_content(
             int(created["id"]),
             {
                 "content_direction": "media",
-                "account_type": "original",
                 "content_type": "video",
             },
             db_path=self.db,

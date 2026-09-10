@@ -41,7 +41,7 @@ def _object(value: Any) -> dict[str, Any]:
 
 
 def _active(connection: sqlite3.Connection, at: str) -> dict[str, Any]:
-    _require(connection.execute("PRAGMA user_version").fetchone()[0] == 20, "Natural integrated work requires schema20")
+    _require(connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}, "Natural integrated work requires schema20")
     active = activation_at(connection, at)
     _require(active is not None and active["profile_id"] == "integrated_route_v1", "Current activation is not integrated")
     assert active is not None

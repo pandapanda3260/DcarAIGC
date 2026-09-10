@@ -9,7 +9,6 @@ export type ContentForm = {
   contentType: string;
   accountUid: string;
   accountName: string;
-  accountType: string;
   contentDirection: string;
 };
 
@@ -23,7 +22,6 @@ const formFields = [
   ["contentType", "content_type"],
   ["accountUid", "account_uid"],
   ["accountName", "account_name"],
-  ["accountType", "account_type"],
   ["contentDirection", "content_direction"],
 ] as const satisfies ReadonlyArray<readonly [keyof ContentForm, string]>;
 

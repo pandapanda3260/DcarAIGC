@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -333,6 +334,27 @@ class EvaluationSelectorsTest(unittest.TestCase):
 
         self.assertEqual(set(eligible_v8), {3})
         self.assertEqual(set(eligible_v6), {2})
+
+    def test_work_direction_never_uses_account_classification(self) -> None:
+        content = {"manual_content_direction": None, "evaluation_content_direction": "unknown",
+                   "account_content_direction": "new_car", "business_direction": "new_car"}
+        self.assertEqual(effective_direction(content, None), "unknown")
+        sql = effective_direction_sql()
+        self.assertNotIn("a.content_direction", sql)
+        with sqlite3.connect(":memory:") as connection:
+            for manual, formal, ai, expected in (
+                ("media", "new_car", "used_car", "media"),
+                ("unknown", "new_car", "used_car", "new_car"),
+                (None, "unknown", "used_car", "used_car"),
+                (None, None, "unknown", "unknown"),
+            ):
+                with self.subTest(manual=manual, formal=formal, ai=ai):
+                    actual = connection.execute(
+                        f"SELECT {sql} FROM (SELECT ? manual_content_direction,? evaluation_content_direction) c "
+                        "CROSS JOIN (SELECT ? content_direction) ev", (manual, ai, formal)).fetchone()[0]
+                    self.assertEqual(actual, expected)
+                    self.assertEqual(effective_direction({**content, "manual_content_direction": manual,
+                        "evaluation_content_direction": ai}, {"content_direction": formal}), expected)
 
     def test_effective_direction_skips_unknown_and_sql_matches_python_order(
         self,

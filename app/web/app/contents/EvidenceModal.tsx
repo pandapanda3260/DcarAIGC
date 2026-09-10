@@ -25,6 +25,7 @@ const processingStatusLabels: Record<string, string> = {
   queued: "等待处理",
   pending: "等待处理",
   running: "处理中",
+  success: "已完成",
   succeeded: "已完成",
   available: "已完成",
   evidence_ready: "已完成",

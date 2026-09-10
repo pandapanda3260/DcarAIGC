@@ -587,7 +587,7 @@ def _validated_profile_chain(
             or row["previous_event_hash"] != expected_previous_hash
             or row["event_type"] not in _PROFILE_EVENT_SEQUENCE
             or (row["event_type"] == "ABORT_RESTORE" and (
-                bridge_run_id is not None or connection.execute("PRAGMA user_version").fetchone()[0] != 20))
+                bridge_run_id is not None or connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}))
             or int(row["sequence"]) != _PROFILE_EVENT_SEQUENCE[str(row["event_type"])]
             or _time(str(row["created_at"])) != row["created_at"]
         )
@@ -689,7 +689,7 @@ def _profile_dispatch_state(
             reason="no acquisition profile is active",
         )
 
-    if last is not None and connection.execute("PRAGMA user_version").fetchone()[0] == 20:
+    if last is not None and connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}:
         from .profile_control import _abort_source_release, read_cross_profile_abort
 
         try:
@@ -922,7 +922,7 @@ def require_paid_dispatch_open(
             from .profile_control import ProfileControlError
 
             try:
-                if connection.execute("PRAGMA user_version").fetchone()[0] == 20:
+                if connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}:
                     from .capture_release import validate_current_dispatch_control
                     from .capture_authorizations import AuthorizationError
                     try:
@@ -1225,7 +1225,7 @@ def start_profile_drain_in_transaction(
         return matches[0]
     if events and events[-1].event_type not in {"release", "ABORT_RESTORE"}:
         raise PaidDrainError("another paid drain is already active")
-    if events and connection.execute("PRAGMA user_version").fetchone()[0] == 20:
+    if events and connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}:
         from .profile_control import read_cross_profile_abort
 
         if read_cross_profile_abort(connection, events[-1].drain_id) is not None and events[-1].event_type != "ABORT_RESTORE":

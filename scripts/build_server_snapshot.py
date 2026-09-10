@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Build a fail-closed read-replica bundle from live SQLite databases.
 
-The database files are created with SQLite's online backup API.  Artifact files
-are not copied into the bundle: the bundle contains hash-checked rsync file
-lists and a manifest which the server-side installer verifies before changing
-the active database.
+The database files use SQLite's online backup API. Required artifacts are
+independent local copies captured while collecting the manifest. Publisher
+transfers those copies separately; optional reuse and managed originals are
+never copied. The server verifies the manifest before changing active data.
 """
 
 from __future__ import annotations
@@ -15,10 +15,13 @@ import json
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import stat
 import sys
 import tempfile
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, Optional
@@ -41,6 +44,9 @@ BUNDLE_SCHEMA = "dcar-read-replica-snapshot-v2"
 DATABASE_NAMES = frozenset({"dcar_insight.sqlite3", "web_mvp.sqlite3"})
 ARTIFACT_POLICY_NAME = "thin-server-v2"
 OPTIONAL_REUSE_EVIDENCE_TYPES = ("media",)
+FROZEN_ARTIFACT_DIRECTORY = "frozen-artifacts"
+FROZEN_ARTIFACT_CONTRACT = "snapshot-frozen-artifacts-v1"
+ARTIFACT_FREE_SPACE_RESERVE = 256 * 1024 * 1024
 TEXT_SUFFIXES = frozenset({".json", ".jsonl", ".txt", ".md", ".csv", ".srt", ".vtt"})
 LEGACY_LARGE_BINARY_SUFFIXES = frozenset({
     ".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".mp3", ".wav", ".m4a",
@@ -55,6 +61,8 @@ RUNTIME_IDENTITY_SCHEMA = "dcar-runtime-identity-v1"
 EXPECTED_REPORT_VERSION = "dcar-content-operations-report-v8.9"
 EXPECTED_DATABASE_SCHEMA_VERSION = 19
 EXPECTED_DATABASE_SCHEMA_MIGRATION = "dual-acquisition-profile-roster-v1"
+CLASSIFICATION_SCHEMA_VERSION = 21
+CLASSIFICATION_SCHEMA_MIGRATION = "account-classification-v1"
 EXPECTED_ACTIVE_RELEASE_ID = "evaluation-v9__selling-points-v5.2"
 EXPECTED_ACTIVE_RELEASE_STATUS = "active"
 EXPECTED_RULE_VERSION = "evaluation-v9"
@@ -64,6 +72,74 @@ EXPECTED_TAXONOMY_STATUS = "published"
 
 class SnapshotBuildError(RuntimeError):
     """The requested bundle could not be proved internally consistent."""
+
+
+class _FrozenArtifacts(dict):
+    """Only required files enter this map; optional media has a plain dict."""
+
+    def __init__(self, root: Path):
+        super().__init__()
+        self.root = root
+        root.mkdir(mode=0o700)
+        for name in ("cache", "reports"):
+            (root / name).mkdir(mode=0o700)
+        self.remaining_bytes = shutil.disk_usage(root).free - ARTIFACT_FREE_SPACE_RESERVE
+        self.source_paths: dict[Path, Path] = {}
+
+    def capture(self, project_root: Path, canonical: str, root_name: str,
+                relative: str) -> tuple[Path, int, str]:
+        """Pin the source with no-follow openat, copy bytes, then hash the copy.
+
+        Source replacement after opening is safe. In-place modification during
+        copying is rejected. No hardlink can share a writable source inode.
+        """
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        directory = os.open(project_root, directory_flags)
+        source = None
+        target = self.root / root_name / relative
+        owned = False
+        try:
+            parts = PurePosixPath(canonical).parts
+            for part in parts[:-1]:
+                child = os.open(part, directory_flags, dir_fd=directory)
+                os.close(directory)
+                directory = child
+            source = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+            before = os.fstat(source)
+            if not stat.S_ISREG(before.st_mode):
+                raise SnapshotBuildError(f"artifact source is not a regular file: {canonical}")
+            if before.st_size > self.remaining_bytes:
+                raise SnapshotBuildError("insufficient local space to freeze snapshot artifacts")
+            target.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+            digest = hashlib.sha256()
+            copied = 0
+            with target.open("xb") as destination:
+                owned = True
+                while block := os.read(source, 1024 * 1024):
+                    copied += len(block)
+                    if copied > before.st_size:
+                        raise SnapshotBuildError(f"artifact changed while freezing: {canonical}")
+                    destination.write(block)
+                    digest.update(block)
+                after = os.fstat(source)
+                if (copied != before.st_size or any(getattr(before, key) != getattr(after, key)
+                        for key in ("st_dev", "st_ino", "st_size", "st_mtime_ns"))):
+                    raise SnapshotBuildError(f"artifact changed while freezing: {canonical}")
+                destination.flush()
+                os.fsync(destination.fileno())
+                os.fchmod(destination.fileno(), 0o400)
+            self.remaining_bytes -= copied
+            self.source_paths[target] = project_root / canonical
+            return target, copied, digest.hexdigest()
+        except Exception:
+            # This unpublished tree belongs only to the current build.
+            if owned:
+                target.unlink(missing_ok=True)
+            raise
+        finally:
+            if source is not None:
+                os.close(source)
+            os.close(directory)
 
 
 def _utc_now() -> str:
@@ -96,6 +172,8 @@ def _fsync_directory(path: Path) -> None:
 def _connect_read_only(path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys=ON")
+    connection.execute("PRAGMA query_only=ON")
     return connection
 
 
@@ -158,9 +236,9 @@ def _runtime_identity(snapshot_db: Path, *, expected_user_version: int = EXPECTE
         "taxonomy_status": str(release["taxonomy_status"]),
         "matcher_rule_sha256": matcher_rule_sha256,
     }
-    versions = {19: EXPECTED_DATABASE_SCHEMA_MIGRATION, 20: "integrated-video-capture-v25"}
+    versions = {19: EXPECTED_DATABASE_SCHEMA_MIGRATION, 20: "integrated-video-capture-v25", 21: "account-classification-v1"}
     if expected_user_version not in versions:
-        raise SnapshotBuildError("snapshot requires explicit schema19 or schema20")
+        raise SnapshotBuildError("snapshot requires explicit schema19, schema20 or schema21")
     expected = {
         "schema": RUNTIME_IDENTITY_SCHEMA,
         "report_version": EXPECTED_REPORT_VERSION,
@@ -395,7 +473,9 @@ def _private_deployment_directory(deployment: Mapping[str, Any] | None, *, proje
         if parent_sha256 is not None:
             entry["parent_sha256"] = parent_sha256
         references.append(entry)
-    for key in ("source_archive", "migration", "rollback", "full_checks", "install", "bounded_e2e", "release_decision"):
+    from v8.account_cleanup_snapshot import CONTRACT as CLEANUP_CONTRACT, EVIDENCE_ROLES
+    roles = EVIDENCE_ROLES if deployment.get("contract_version") == CLEANUP_CONTRACT else ("source_archive", "migration", "rollback", "full_checks", "install", "bounded_e2e", "release_decision")
+    for key in roles:
         if key in deployment["evidence"]:
             register("deployment." + key, deployment["evidence"][key])
     decision = deployment.get("release_decision")
@@ -482,6 +562,22 @@ def _add_artifact(
 ) -> None:
     root_name, root_relative, canonical = _normalize_project_relative(relative_path)
     _forbid_managed_original_transfer(canonical)
+    if expected_sha256 is not None and (
+        not isinstance(expected_sha256, str) or not SHA256_RE.fullmatch(expected_sha256)
+    ):
+        raise SnapshotBuildError(f"artifact lacks a registered SHA-256: {canonical}")
+    if expected_byte_size is not None and (
+        type(expected_byte_size) is not int or expected_byte_size < 0
+    ):
+        raise SnapshotBuildError(f"artifact byte size drifted: {canonical}")
+    key = (root_name, root_relative)
+    existing = files.get(key)
+    if isinstance(files, _FrozenArtifacts) and existing is not None:
+        if ((expected_sha256 is not None and expected_sha256 != existing["sha256"])
+                or (expected_byte_size is not None and expected_byte_size != existing["byte_size"])
+                or disposition_reason != existing.get("reason")):
+            raise SnapshotBuildError(f"artifact identity conflict: {canonical}")
+        return
     candidate = project_root / canonical
     if (
         candidate.is_symlink()
@@ -491,18 +587,17 @@ def _add_artifact(
         raise SnapshotBuildError(
             f"referenced artifact is missing or unsafe: {canonical}"
         )
-    byte_size = candidate.stat().st_size
-    sha256 = _sha256(candidate)
+    if isinstance(files, _FrozenArtifacts):
+        candidate, byte_size, sha256 = files.capture(project_root, canonical, root_name, root_relative)
+    else:
+        byte_size = candidate.stat().st_size
+        sha256 = _sha256(candidate)
     if expected_sha256 is not None:
-        if not isinstance(expected_sha256, str) or not SHA256_RE.fullmatch(expected_sha256):
-            raise SnapshotBuildError(f"artifact lacks a registered SHA-256: {canonical}")
         if sha256 != expected_sha256:
             raise SnapshotBuildError(f"artifact SHA-256 drifted: {canonical}")
     if expected_byte_size is not None:
-        if type(expected_byte_size) is not int or expected_byte_size < 0 or byte_size != expected_byte_size:
+        if byte_size != expected_byte_size:
             raise SnapshotBuildError(f"artifact byte size drifted: {canonical}")
-    key = (root_name, root_relative)
-    existing = files.get(key)
     item = {
         "root": root_name,
         "path": root_relative,
@@ -754,9 +849,10 @@ def _managed_originals(
 def _collect_artifacts(
     snapshot_db: Path, *, project_root: Path, aliases: dict[str, dict[str, Any]] | None = None,
     private_references: Mapping[str, Mapping[str, Any]] | None = None,
+    frozen_root: Path | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     aliases = aliases if aliases is not None else {}
-    files: dict[tuple[str, str], dict[str, Any]] = {}
+    files: dict[tuple[str, str], dict[str, Any]] = _FrozenArtifacts(frozen_root) if frozen_root else {}
     optional_reuse: dict[tuple[str, str], dict[str, Any]] = {}
     pending_json: list[Path] = []
     legacy_download_manifests: set[str] = set()
@@ -948,7 +1044,8 @@ def _collect_artifacts(
             suffix = PurePosixPath(referenced).suffix.lower()
             legacy_binary = (
                 suffix in LEGACY_LARGE_BINARY_SUFFIXES
-                or (artifact.relative_to(project_root).as_posix() in legacy_download_manifests
+                or ((files.source_paths.get(artifact, artifact) if isinstance(files, _FrozenArtifacts)
+                     else artifact).relative_to(project_root).as_posix() in legacy_download_manifests
                     and suffix not in TEXT_SUFFIXES)
             )
             if (root_name == "reports" or not legacy_binary
@@ -1038,6 +1135,25 @@ def _write_from0_lists(bundle_root: Path, files: Iterable[Mapping[str, Any]]) ->
         _fsync_file(target)
 
 
+@contextmanager
+def _cleanup_on_termination():
+    """launchctl SIGTERM must unwind this build's private temporary tree."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = signal.getsignal(signal.SIGTERM)
+
+    def terminate(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, terminate)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+@_cleanup_on_termination()
 def build_snapshot(
     *,
     project_root: Path,
@@ -1082,28 +1198,43 @@ def build_snapshot(
         )
         deployment_readiness = None
         code_successor = None
-        if runtime_identity["database_schema_version"] == 20:
+        if runtime_identity["database_schema_version"] in {20, 21}:
             from v20_release_contract import ReleaseContractError, validate_deployment_receipt
 
             try:
                 with _connect_read_only(database_dir / "dcar_insight.sqlite3") as connection:
                     from v8.capture_code_successor import current_proof
 
-                    code_successor = current_proof(connection, project_root=project_root, at=_utc_now())
-                    deployment_readiness = validate_deployment_receipt(
-                        connection, deployment_id=deployment_id, require_accepted=require_accepted_deployment,
-                        project_root=project_root,
-                    )
+                    from v8.account_cleanup_snapshot import is_cleanup, validate as validate_cleanup
+                    cleanup = is_cleanup(connection, deployment_id)
+                    if runtime_identity["database_schema_version"] == 21 and not cleanup:
+                        raise SnapshotBuildError("schema21 requires inherited cleanup and classification migration proof")
+                    if not cleanup:
+                        code_successor = current_proof(connection, project_root=project_root, at=_utc_now())
+                    if runtime_identity["database_schema_version"] == 21:
+                        deployment_readiness = validate_cleanup(connection, deployment_id=deployment_id, project_root=project_root)
+                        if (deployment_readiness.get("schema_version") != 21
+                                or deployment_readiness.get("schema_migration") != CLASSIFICATION_SCHEMA_MIGRATION
+                                or not isinstance(deployment_readiness.get("account_classification_migration"), dict)):
+                            raise SnapshotBuildError("schema21 classification migration proof is missing")
+                        if require_accepted_deployment and deployment_readiness.get("status") != "accepted":
+                            raise SnapshotBuildError("schema21 deployment has not been accepted")
+                    else:
+                        deployment_readiness = validate_deployment_receipt(
+                            connection, deployment_id=deployment_id, require_accepted=require_accepted_deployment,
+                            project_root=project_root,
+                        )
             except ReleaseContractError as exc:
                 raise SnapshotBuildError(str(exc)) from exc
         elif deployment_id is not None or require_accepted_deployment:
-            raise SnapshotBuildError("deployment readiness selection requires explicit schema20")
+            raise SnapshotBuildError("deployment readiness selection requires explicit schema20 or schema21")
         aliases: dict[str, dict[str, Any]] = {}
         private_directory = _private_deployment_directory(deployment_readiness, project_root=project_root,
             code_successor=code_successor)
         files, optional_reuse_files, managed_originals = _collect_artifacts(
             database_dir / "dcar_insight.sqlite3", project_root=project_root, aliases=aliases,
             private_references=_private_reference_index(private_directory),
+            frozen_root=temporary / FROZEN_ARTIFACT_DIRECTORY,
         )
         _write_from0_lists(temporary, files)
         main_database = databases[0]
@@ -1127,6 +1258,8 @@ def build_snapshot(
             "file_count": len(files),
             "file_byte_size": sum(int(item["byte_size"]) for item in files),
             "file_set_sha256": _artifact_set_sha256(files),
+            "local_artifact_source": {"contract": FROZEN_ARTIFACT_CONTRACT,
+                                      "directory": FROZEN_ARTIFACT_DIRECTORY},
             "optional_reuse_files": optional_reuse_files,
             "optional_reuse_file_count": len(optional_reuse_files),
             "optional_reuse_byte_size": sum(
@@ -1164,7 +1297,7 @@ def build_snapshot(
         os.replace(temporary, output)
         _fsync_directory(output.parent)
         return manifest
-    except Exception:
+    except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
 

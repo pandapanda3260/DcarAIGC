@@ -152,7 +152,7 @@ def validate_authorization(
     """
     _require(connection.in_transaction, "Authorization requires a writer transaction")
     require_current_process_writer_lock(connection)
-    _require(connection.execute("PRAGMA user_version").fetchone()[0] == 20, "Authorization requires schema20")
+    _require(connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}, "Authorization requires schema20")
     at = usage_settlements._utc(at)
     _require_binding(connection, runtime_bindings, at=at)
     _require(provider == "tikhub" and operation in provider_budget.PRICES_MICROUSD,
@@ -239,16 +239,15 @@ def validate_authorization(
                  and str(details.get("budget_day")) == provider_budget.budget_day(at),
                  "Budget exclusion does not identify this current reserved/sent request")
     summary = provider_budget.budget_summary(connection, at=at, exclude_usage_id=exclude_usage_id)
-    bucket = "discovery" if operation in provider_budget.DISCOVERY_OPERATIONS else "metrics"
     budget = payload.get("budget", {})
     _require(isinstance(budget, dict), "Authorization budget is missing")
-    total_cap, bucket_cap = budget.get("total_microusd"), budget.get("bucket_microusd")
-    _require(type(total_cap) is int and 0 < total_cap <= provider_budget.AUTOMATIC_MICROUSD
-             and type(bucket_cap) is int and 0 < bucket_cap <= provider_budget.BUDGET_BUCKET_MICROUSD[bucket]
-             and budget.get("bucket") == bucket, "Authorization exceeds fixed budget envelope")
-    _require(summary["total_microusd"] + amount_microusd <= total_cap
-             and summary["buckets_microusd"][bucket] + amount_microusd <= bucket_cap,
-             "Budget including reservations and unknown charges is exhausted")
+    bucket, budget_blocker = provider_budget.assess_budget_capacity(
+        summary, operation=operation, amount_microusd=amount_microusd,
+        authorization_budget=budget)
+    if budget_blocker is not None:
+        raise AuthorizationError(
+            str(budget_blocker) if budget_blocker.error_code == "authorization_budget_invalid"
+            else "Budget including reservations and unknown charges is exhausted") from budget_blocker
     identities = (request_identity, *member_identities)
     _require(len(set(identities)) == len(identities), "Duplicate request/member identity")
     issuances = dict(issuance_ids or {})
