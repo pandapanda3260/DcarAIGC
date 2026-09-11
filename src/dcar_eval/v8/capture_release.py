@@ -1164,11 +1164,14 @@ def maintain_operation_qualifications(connection: sqlite3.Connection, *, at: str
         _require((provider_budget.circuit_state(connection) or {}).get("open") is not True, "Provider circuit blocks automatic qualification")
     except (RuntimeError, ValueError, OSError, sqlite3.Error) as error:
         return {**result, "status": "blocked", "reason": str(error)}
-    for operation in sorted(CONTINUITY_OPERATIONS):
+    from .account_profile_authority import OPERATIONS as PROFILE_OPERATIONS
+    for operation in sorted(CONTINUITY_OPERATIONS | PROFILE_OPERATIONS):
         latest = connection.execute("SELECT * FROM capture_paid_send_gate_events WHERE provider='tikhub' AND operation=? ORDER BY id DESC LIMIT 1", (operation,)).fetchone()
         from .account_cleanup_runtime import OPERATIONS as cleanup_operations
         initialize_cleanup = latest is None and bool(evidence.get("account_cleanup_generation")) and operation in cleanup_operations
-        if not initialize_cleanup and (latest is None or latest["state"] not in {"open", "diagnostic_only"}):
+        initialize_profile = (latest is None and operation in PROFILE_OPERATIONS
+                              and bool(evidence.get("profile_operation_authority")))
+        if not (initialize_cleanup or initialize_profile) and (latest is None or latest["state"] not in {"open", "diagnostic_only"}):
             result["operations"][operation] = {"status": "not_enabled"}
             continue
         connection.execute("SAVEPOINT native_qualification_maintenance")
@@ -1180,11 +1183,18 @@ def maintain_operation_qualifications(connection: sqlite3.Connection, *, at: str
                 from .account_cleanup_runtime import bootstrap_operator
                 result["operations"][operation] = bootstrap_operator(connection, evidence=evidence, operation=operation, at=at)
                 continue
+            if initialize_profile:
+                from .capture_operator_release import publish
+                result["operations"][operation] = {"status": "initialized", **publish(
+                    connection, evidence=evidence, operation=operation, at=at)}
+                continue
             from .capture_operator_release import maintain as maintain_operator_release
             approved = maintain_operator_release(connection, evidence=evidence, operation=operation, latest=latest, at=at)
             if approved is not None:
                 result["operations"][operation] = approved
                 continue
+            _require(operation not in PROFILE_OPERATIONS,
+                     "Account profile operation requires its installed operator authority")
             enabled = _previously_enabled_operation(connection, operation=operation, evidence=evidence, at=at)
             cohort = _latest_native(connection, operation=operation, kind="cohort", activation_id=evidence["active"]["activation_id"])
             qualification = _latest_native_qualification(connection, operation=operation, activation_id=evidence["active"]["activation_id"])

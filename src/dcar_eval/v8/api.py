@@ -2697,6 +2697,8 @@ async def _lifespan_runtime(app: FastAPI):
                 connection, supported_versions=frozenset({19, 20, 21})
             )
             connection.execute("SELECT 1 FROM content_items LIMIT 1").fetchone()
+        from .reader_readiness import database_version
+        reader_database_version = database_version(config.db_path)
         app.state.database_sha256 = _file_sha256(config.db_path)
         from .artifact_paths import installed_snapshot
         installed = installed_snapshot()
@@ -2707,6 +2709,10 @@ async def _lifespan_runtime(app: FastAPI):
             if (receipt.get("database_sha256", {}).get("dcar_insight.sqlite3") != app.state.database_sha256
                     or receipt.get("runtime_identity") != identity):
                 raise RuntimeError("installed snapshot does not bind the read-only database")
+            if database_version(config.db_path) != reader_database_version:
+                raise RuntimeError("read-only database changed during startup verification")
+            app.state.reader_database_version = reader_database_version
+            app.state.reader_runtime_identity = identity
         app.state.recovered_fetch_slots = {
             "stale_candidates": 0,
             "recovered": 0,
@@ -3357,6 +3363,23 @@ def v8_readyz(request: Request):
     with connect(config.db_path, read_only=config.read_only) as connection:
         connection.execute("SELECT 1").fetchone()
         compatibility = schema_compatibility_state(connection)
+        if config.read_only:
+            from .reader_readiness import snapshot_readiness
+            snapshot = snapshot_readiness(config=config, state=request.app.state,
+                                          compatibility=compatibility)
+            if snapshot is not None:
+                ready = bool(snapshot["ready"])
+                payload = {
+                    "status": "ready" if ready else "not_ready", "role": "reader",
+                    "reason": snapshot["reason"], "checked_at": timestamp,
+                    "conditions": {"database": bool(compatibility["compatible"]),
+                                   "verified_snapshot": ready},
+                    "snapshot_readiness": snapshot,
+                    # These are Writer/data qualification claims, not the
+                    # readiness of a server to serve its verified snapshot.
+                    "control_readiness": None, "data_readiness": None,
+                }
+                return payload if ready else JSONResponse(status_code=503, content=payload)
         if connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' "
             "AND name='acquisition_profile_activations'"

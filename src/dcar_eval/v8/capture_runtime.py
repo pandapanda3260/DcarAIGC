@@ -605,6 +605,9 @@ def _account_request(envelope: dict[str, Any], *, db_path: Path, at: str) -> dic
             value = json.loads(raw_archive.read_response_entity(connection, raw_id))
             captured_at = connection.execute("SELECT captured_at FROM provider_raw_responses WHERE id=?", (raw_id,)).fetchone()[0]
     normalized = account_metrics.parse_tikhub_profile(value, platform="douyin", uid=envelope["uid"])
+    follower_status = normalized["field_status"]["follower_count"]["status"]
+    if follower_status != "provided":
+        raise account_metrics.AccountMetricError("profile_follower_count_" + follower_status)
     reference = providers._parse_douyin_reference_payload(value, status=200).data.get("reference")
     with connect(db_path) as connection, transaction(connection):
         account_metrics.persist_account_metric_observation(connection, account_identity_id=envelope["identity_id"],

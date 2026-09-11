@@ -23,6 +23,7 @@ import { publicAssetPath } from "../lib/paths";
 import { canAccessAccounts } from "../lib/accountAccess";
 import { readQueryJson } from "../lib/api";
 import { dataServiceStatus, type ServiceHealth } from "../lib/serviceStatus";
+import { createServiceRecovery } from "../lib/serviceRecovery";
 import { WorkbenchContext, workbenchSection } from "./WorkbenchContext";
 import { ToastViewport } from "./Feedback";
 import LogoutButton from "./LogoutButton";
@@ -99,6 +100,13 @@ function ActiveWorkbenchChrome({ active, pathname, children }: { active: Section
     retry: false,
   });
   const serviceState = useMemo(() => dataServiceStatus(serviceHealth.data, serviceHealth.isError), [serviceHealth.data, serviceHealth.isError]);
+  const recoverServiceQueries = useMemo(() => createServiceRecovery(queryClient), [queryClient]);
+  useEffect(() => {
+    const health = serviceHealth.data;
+    void recoverServiceQueries(serviceHealth.isError ? false : health
+      ? health.status === "ok" && typeof health.read_only === "boolean"
+      : null);
+  }, [recoverServiceQueries, serviceHealth.data, serviceHealth.isError]);
   const context = useMemo(() => ({ activeSection: displayedSection, serviceState }), [displayedSection, serviceState]);
   const showUserManagement = canManageUsers(session.data?.role);
   const showAccounts = canAccessAccounts(session.data?.role);

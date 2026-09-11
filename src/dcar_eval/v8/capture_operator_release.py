@@ -30,6 +30,10 @@ def _require(condition: bool, message: str) -> None:
 
 def _decision(evidence: Mapping[str, Any], operation: str, at: str) -> dict[str, Any] | None:
     from . import capture_release as release
+    from .account_profile_authority import OPERATIONS as PROFILE_OPERATIONS, decision as profile_decision
+
+    if operation in PROFILE_OPERATIONS:
+        return profile_decision(evidence, operation, at)
 
     decision = evidence["deployment"].get("release_decision")
     if decision is None:
@@ -153,7 +157,7 @@ def authority(connection: sqlite3.Connection, *, evidence: Mapping[str, Any],
 def _proof(value: Mapping[str, Any]) -> dict[str, Any]:
     result = {"release_decision_sha256": value["decision"]["decision_sha256"],
             "release_event_id": value["release_event_id"],
-            "business_e2e": "deferred_by_user", "transport_qualification": "not_verified"}
+            "business_e2e": value["decision"]["business_e2e"], "transport_qualification": "not_verified"}
     if "account_roster_snapshot_sha256" in value:
         result["account_roster_snapshot_sha256"] = value["account_roster_snapshot_sha256"]
     return result

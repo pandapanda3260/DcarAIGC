@@ -34,6 +34,7 @@ _FIELDS = {
     "integrated_begin": {"drain_id", "roster_snapshot_id", "operations", "actor", "reason"},
     "integrated_complete": {"drain_id"},
     "integrated_publish": {"operation"},
+    "profile_compensate": {"work_id"},
 }
 
 
@@ -145,6 +146,10 @@ def run_command(*, db_path: Path, mirror_root: Path | None, command_claim: Mappi
     }), connect(db_path) as connection, transaction(connection), evidence_boundary(connection):
         at = now_utc()
         _current_command(connection, command_claim, parameters)
+        if action == "profile_compensate":
+            from .account_profile_recovery import enqueue_profile_compensation
+
+            return enqueue_profile_compensation(connection, at=at, **arguments)
         if action == "continuity_freeze":
             return release.freeze_continuity_permit(connection, at=at, **arguments)
         if action == "continuity_publish":

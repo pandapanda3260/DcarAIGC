@@ -623,7 +623,6 @@ class V8OperationsTest(unittest.TestCase):
             "平台作品总量",
             "本地收录量",
             "账号状态",
-            "采集开关",
         ):
             self.assertIn(f">{header}</t>", sheet)
         # 单元格取值与页面展示口径一致：中文枚举、未填写/未绑定/「—」兜底。
@@ -638,8 +637,9 @@ class V8OperationsTest(unittest.TestCase):
         self.assertIn(">待标记</t>", sheet)
         self.assertIn(">暂停</t>", sheet)
         self.assertIn(">未填写</t>", sheet)
-        self.assertIn(">运营中</t>", sheet)
-        self.assertIn(">停用</t>", sheet)
+        self.assertNotIn(">采集开关</t>", sheet)
+        self.assertNotIn(">运营中</t>", sheet)
+        self.assertNotIn(">停用</t>", sheet)
         self.assertIn(">—</t>", sheet)
         self.assertNotIn("mixed_edit", sheet)
         self.assertNotIn(">unknown</t>", sheet)
@@ -648,7 +648,7 @@ class V8OperationsTest(unittest.TestCase):
         self.assertIn(">7626610000000000000</t>", sheet)
         self.assertNotIn('<mergeCell', sheet)
         self.assertIn('xSplit="2" ySplit="1"', sheet)
-        self.assertIn('autoFilter ref="A1:R3"', sheet)
+        self.assertIn('autoFilter ref="A1:Q3"', sheet)
 
         wrong_uid = export_accounts_xlsx(
             douyin_authorization_targets=[

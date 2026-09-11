@@ -141,6 +141,24 @@ def verify_inheritance(*, build: Mapping[str, Any], build_ref: Mapping[str, Any]
     update activation, or claim a new business/transport qualification.
     The bootstrap calls this after verifying every actual source file.
     """
+    if build.get("account_profile_recovery_successor") is not None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("verified_account_profile_recovery_release",
+            source / "src/dcar_eval/v8/account_profile_recovery_release.py")
+        require(spec is not None and spec.loader is not None, "account profile recovery successor verifier is missing")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.verify_inheritance(build=build, build_ref=build_ref,
+            install_path=install_path, database=database, source=source, at=at)
+    if build.get("account_profile_successor") is not None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("verified_account_profile_release",
+            source / "src/dcar_eval/v8/account_profile_release.py")
+        require(spec is not None and spec.loader is not None, "account profile successor verifier is missing")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.verify_inheritance(build=build, build_ref=build_ref,
+            install_path=install_path, database=database, source=source, at=at)
     if build.get("publisher_capacity_successor") is not None:
         import importlib.util
         spec = importlib.util.spec_from_file_location("verified_publisher_capacity_release",

@@ -226,6 +226,8 @@ def installed_evidence(connection: sqlite3.Connection, *, at: str, maintenance_o
     classification_proof = None
     manual_scope_proof = None
     metric_gap_proof = None
+    profile_operation_authority = None
+    profile_compensation_authority = None
     catalog_policy_evidence = {}
     if schema_version == 21:
         from . import account_classification_release, schema_v21
@@ -240,6 +242,8 @@ def installed_evidence(connection: sqlite3.Connection, *, at: str, maintenance_o
         classification_proof = inherited["proof"]
         manual_scope_proof = inherited.get("manual_content_scope_proof")
         metric_gap_proof = inherited.get("metric_gap_proof")
+        profile_operation_authority = inherited.get("profile_operation_authority")
+        profile_compensation_authority = inherited.get("profile_compensation_authority")
         catalog_policy_evidence = {key: inherited[key] for key in (
             "catalog_capture_policy", "catalog_capture_policy_sha256", "catalog_capture_proof") if key in inherited}
         parent = inherited["parent_build"]
@@ -339,6 +343,10 @@ def installed_evidence(connection: sqlite3.Connection, *, at: str, maintenance_o
     if metric_gap_proof is not None:
         evidence["metric_gap_successor"] = metric_gap_proof
     evidence.update(catalog_policy_evidence)
+    if profile_operation_authority is not None:
+        evidence["profile_operation_authority"] = profile_operation_authority
+    if profile_compensation_authority is not None:
+        evidence["profile_compensation_authority"] = profile_compensation_authority
     decision = cleanup_decision(evidence)
     evidence["deployment"] = {"status": "accepted", "contract_version": GENERATION,
                               "release_decision": decision, "bindings": {**proof["active"],

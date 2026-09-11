@@ -913,7 +913,7 @@ class ApiStartupSafetyTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(
                 RuntimeError,
-                r"offline schema migration is required:.*supported=\[19, 20\]",
+                r"offline schema migration is required:.*supported=\[19, 20, 21\]",
             ):
                 with TestClient(api_module.create_app(config)):
                     pass

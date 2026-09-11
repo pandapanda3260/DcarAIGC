@@ -82,12 +82,25 @@ def _validate_proof(connection: sqlite3.Connection, work_id: int, *, at: str,
                  "Compensation manual task budget changed")
         assignment = capture_manual.assignment_for_command(connection, command_id,
             content_id=work["content_id"], operation=work["operation"], at=at)
+    elif envelope.get("catalog_plan_id") is not None:
+        from . import account_catalog_capture as catalog
+
+        _require(envelope["catalog_plan_id"] == work["source_plan_id"],
+                 "Compensation catalog plan changed")
+        assignment = catalog.assignment_for_plan(connection, envelope["catalog_plan_id"],
+            identity_id=envelope["identity_id"], operation=work["operation"], at=at,
+            use_planning_cache=False)
     else:
         assignment = planning.resolve_route(connection, account_id=work["account_id"], content_id=work["content_id"],
                                             operation=work["operation"], at=at)
     _require(assignment is not None and assignment["id"] == work["assignment_id"]
              and assignment["route"] == "integrated" and assignment["mode"] == "active",
              "Compensation cannot change or bypass the assigned route")
+    catalog_profile = work["operation"] == "douyin_uid_profile" and envelope.get("catalog_plan_id") is not None
+    if catalog_profile or proof.get("profile_compensation_authorization_sha256") is not None:
+        from .account_profile_recovery import validate_enqueued_authority
+
+        validate_enqueued_authority(connection, work_id=work_id, compensation_proof=proof, at=at)
     if require_running:
         _require(work["state"] == "running" and work["owner_token"], "Compensation work has no live worker lease")
         if scope is not None:
@@ -108,7 +121,7 @@ def _validate_proof(connection: sqlite3.Connection, work_id: int, *, at: str,
 
 def enqueue_authorized_compensation(connection: sqlite3.Connection, *, work_id: int,
                                     request_issuance_id: int, member_issuance_id: int,
-                                    at: str) -> dict[str, Any]:
+                                    at: str, profile_authorization_sha256: str | None = None) -> dict[str, Any]:
     """Explicit writer call; retain one work, original due/cursor, and paid scope.
 
     The caller first issues grants through usage_settlements.authorize_compensation
@@ -118,6 +131,9 @@ def enqueue_authorized_compensation(connection: sqlite3.Connection, *, work_id: 
              "Compensation enqueue requires a schema20 writer transaction")
     require_current_process_writer_lock(connection)
     work, envelope = _work(connection, work_id)
+    if work["operation"] == "douyin_uid_profile" and envelope.get("catalog_plan_id") is not None:
+        _require(isinstance(profile_authorization_sha256, str) and len(profile_authorization_sha256) == 64,
+                 "Catalog profile compensation requires its separately installed user authority")
     if envelope.get("compensation"):
         old = _validate_proof(connection, work_id, at=at, require_unused=False)
         if set(old["issuance_ids"].values()) == {request_issuance_id, member_issuance_id}:
@@ -177,6 +193,10 @@ def enqueue_authorized_compensation(connection: sqlite3.Connection, *, work_id: 
         "request_identity": request.scope_identity, "member_identity": member_hash, "sequence": request.sequence,
         "issuance_ids": issuances, "runtime_bindings": bindings, "issued_at": planning.timestamp(at),
         **{key: work[key] for key in ("account_id", "content_id", "operation", "assignment_id")}}
+    if profile_authorization_sha256 is not None:
+        _require(work["operation"] == "douyin_uid_profile" and envelope.get("catalog_plan_id") is not None,
+                 "Profile compensation authority cannot be attached to another work type")
+        proof["profile_compensation_authorization_sha256"] = profile_authorization_sha256
     digest = planning.digest(proof)
     connection.execute("SAVEPOINT enqueue_compensation")
     try:
