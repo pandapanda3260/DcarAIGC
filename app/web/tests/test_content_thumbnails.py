@@ -158,10 +158,34 @@ class ThumbnailTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(helper.ReadError):
                 helper.parse_ids(value)
         self.assertEqual(helper.parse_ids("1,2,1"), [1, 2])
+        for schema in (18, 22):
+            with self.subTest(schema=schema):
+                with sqlite3.connect(self.db) as c:
+                    c.execute(f"PRAGMA user_version={schema}")
+                with self.assertRaises(helper.ReadError):
+                    self.result()
+
+    def test_schema_20_and_21_exclude_merged_aliases_without_writes(self):
         with sqlite3.connect(self.db) as c:
-            c.execute("PRAGMA user_version=18")
-        with self.assertRaises(helper.ReadError):
-            self.result()
+            c.executescript("""
+                CREATE TABLE content_identity_merge_events(loser_content_id INTEGER);
+                INSERT INTO content_identity_merge_events VALUES(2);
+            """)
+        image, _, _ = self.file("images/1.jpg", b"\xff\xd8\xff" + b"a" * 50)
+        manifest, _, _ = self.file("images/manifest.json", json.dumps({"image_paths": [str(image)]}).encode())
+        self.artifact(1, 1, "media_manifest", manifest)
+        for schema in (20, 21):
+            with self.subTest(schema=schema):
+                with sqlite3.connect(self.db) as c:
+                    c.execute(f"PRAGMA user_version={schema}")
+                before = {str(p.relative_to(self.root)): p.read_bytes()
+                          for p in self.root.rglob("*") if p.is_file()}
+                result = self.result((1, 2, 4, 999))
+                self.assertEqual(set(result), {"1"})
+                self.assertEqual(result["1"]["local_url"], "/api/v8/contents/1/evidence/files/1/0")
+                after = {str(p.relative_to(self.root)): p.read_bytes()
+                         for p in self.root.rglob("*") if p.is_file()}
+                self.assertEqual(before, after)
 
     def test_exhausted_budget_stops_subsequent_file_reads(self):
         reader = helper.Reader(self.root)
