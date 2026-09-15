@@ -28,6 +28,9 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterator, Mapping, Optional, Sequence
 
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 
 BUNDLE_SCHEMA = "dcar-read-replica-snapshot-v2"
 ARTIFACT_POLICY = {
@@ -42,6 +45,7 @@ SNAPSHOT_ID_RE = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 RUNTIME_IDENTITY_SCHEMA = "dcar-runtime-identity-v1"
 EXPECTED_REPORT_VERSION = "dcar-content-operations-report-v8.9"
+FOUR_PLATFORM_REPORT_VERSION = "dcar-content-operations-report-v8.10"
 EXPECTED_DATABASE_SCHEMA_VERSION = 19
 EXPECTED_DATABASE_SCHEMA_MIGRATION = "dual-acquisition-profile-roster-v1"
 CLASSIFICATION_SCHEMA_VERSION = 21
@@ -102,8 +106,8 @@ RELEASE_CONTRACTS = {
     20: ("dcar-content-operations-report-v8.9", "integrated-video-capture-v25"),
     21: ("dcar-content-operations-report-v8.9", "account-classification-v1"),
     22: ("dcar-content-operations-report-v8.9", "unified-account-intake-v1"),
-    23: ("dcar-content-operations-report-v8.9", "four-platform-forward-flow-v1"),
-    24: ("dcar-content-operations-report-v8.9", "duplicate-fingerprint-index-v1"),
+    23: ("dcar-content-operations-report-v8.10", "four-platform-forward-flow-v1"),
+    24: ("dcar-content-operations-report-v8.10", "duplicate-fingerprint-index-v1"),
 }
 TRANSITION_CONTRACTS = {
     (17, 18): (LEGACY_SCHEMA_TRANSITION_CONTRACT, LEGACY_SCHEMA_SEAL_CONTRACT),
@@ -424,7 +428,7 @@ def _verify_release_contract(release: Path, version: int) -> None:
     bootstrap = 19 if version in {20, 21, 22, 23, 24} else version
     checks: tuple[tuple[str, str, Any], ...] = (("src/dcar_eval/v8/storage.py", "SCHEMA_VERSION", bootstrap),
               ("src/dcar_eval/v8/storage.py", "CURRENT_SCHEMA_MIGRATION_NAME", _release_contract(bootstrap)[1]),
-              ("src/dcar_eval/v8/contracts.py", "CURRENT_REPORT_VERSION", expected_report))
+              ("src/dcar_eval/v8/contracts.py", "FOUR_PLATFORM_REPORT_VERSION" if version >= FLOW_SCHEMA_VERSION else "CURRENT_REPORT_VERSION", expected_report))
     if version in {20, 21, 22, 23, 24}:
         schema_module = f"src/dcar_eval/v8/schema_v{version}.py"
         latest = _literal(release / "src/dcar_eval/v8/storage.py", "LATEST_SCHEMA_VERSION")
@@ -476,7 +480,7 @@ def _verify_release_contract(release: Path, version: int) -> None:
             checks += tuple((name, constant, expected) for name in (
                 "deploy/server/install_snapshot.py", "deploy/macos/publish_snapshot.py", "scripts/build_server_snapshot.py")
                 for constant, expected in ((prefix + "_SCHEMA_VERSION", version),
-                    (prefix + "_SCHEMA_MIGRATION", expected_migration), ("EXPECTED_REPORT_VERSION", expected_report)))
+                    (prefix + "_SCHEMA_MIGRATION", expected_migration), ("FOUR_PLATFORM_REPORT_VERSION", expected_report)))
             transition, seal = TRANSITION_CONTRACTS[(version - 1, version)]
             checks += (("deploy/server/install_snapshot.py", prefix + "_SCHEMA_TRANSITION_CONTRACT", transition),
                 ("deploy/server/install_snapshot.py", prefix + "_SCHEMA_SEAL_CONTRACT", seal))
@@ -632,6 +636,13 @@ def _assert_transition_settled(config: InstallConfig) -> None:
     if not path.exists() and not path.is_symlink():
         return
     value = _read_object(path)
+    from replica_schema_upgrade import settled as replica_chain_settled
+    if replica_chain_settled(value):
+        try:
+            datetime.fromisoformat(value["completed_at"].replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise SnapshotInstallError("replica transition completion time is invalid") from exc
+        return
     pair = (value.get("from_schema"), value.get("to_schema"))
     current_settled = all(type(item) is int for item in pair) and pair in SUPPORTED_SCHEMA_TRANSITIONS and (
         value.get("schema") == _transition_contract(value["from_schema"], value["to_schema"])[0]
@@ -1457,14 +1468,20 @@ def _verify_managed_originals(
     verify_artifacts: bool,
 ) -> None:
     contract, lifecycle = _snapshot_modules()
-    from v8.artifact_paths import ArtifactPathError, runtime_evidence_aliases
+    from v8.artifact_paths import (ArtifactPathError, runtime_evidence_aliases,
+        imported_evidence_aliases, REQUIRED_ORIGINALS)
     try:
         aliases = runtime_evidence_aliases(dict(manifest))
+        imported = imported_evidence_aliases(dict(manifest))
     except (ArtifactPathError, KeyError, TypeError) as exc:
         raise SnapshotInstallError("runtime evidence alias contract is invalid") from exc
     private_references = _private_deployment_reference_index(manifest)
     if set(private_references) & set(aliases):
         raise SnapshotInstallError("private deployment evidence must not be exported to business cache")
+    if set(imported) & (set(aliases) | set(private_references)):
+        raise SnapshotInstallError("import evidence overlaps runtime or private evidence")
+    if manifest.get("required_originals") not in (None, REQUIRED_ORIGINALS):
+        raise SnapshotInstallError("required originals policy is invalid")
 
     def verify_external_pointers(value: Any) -> None:
         if isinstance(value, dict):
@@ -1601,8 +1618,31 @@ def _verify_managed_originals(
             raise SnapshotInstallError("snapshot omits a registered managed bundle")
         # A namespace label alone never exempts a missing file. Only members
         # derived from the exact registered control manifest may be omitted.
-        for row in connection.execute("SELECT * FROM evidence_artifacts WHERE status='available'"):
-            name = _project_path(row["local_path"], writer_root)
+        seen_imports = set()
+        for row in connection.execute("SELECT e.*,c.published_at FROM evidence_artifacts e "
+                "JOIN content_items c ON c.id=e.content_id WHERE e.status='available'"):
+            alias = imported.get(row["local_path"])
+            if alias is not None:
+                if (alias["artifact_id"] != row["id"]
+                        or any(alias[k] != row[k] for k in ("content_id", "artifact_type", "sha256", "byte_size"))):
+                    raise SnapshotInstallError("import evidence alias differs from registered database row")
+                seen_imports.add(row["local_path"])
+                name = alias["project_path"]
+            else:
+                name = _project_path(row["local_path"], writer_root)
+            if (manifest.get("required_originals") == REQUIRED_ORIGINALS and row["artifact_type"] == "media"
+                    and row["published_at"] and row["published_at"] >= REQUIRED_ORIGINALS["published_from"]
+                    and name not in original_paths):
+                required(name, row["sha256"], row["byte_size"])
+            if (verify_artifacts and manifest.get("required_originals") == REQUIRED_ORIGINALS
+                    and row["artifact_type"] == "media_manifest" and row["published_at"]
+                    and row["published_at"] >= REQUIRED_ORIGINALS["published_from"]):
+                item = required(name, row["sha256"], row["byte_size"])
+                body = _read_object(_verified_artifact_source(bundle, item, config))
+                for path in body.get("image_paths", []):
+                    image_name = _project_path(path, writer_root)
+                    if image_name not in included and image_name not in original_paths:
+                        raise SnapshotInstallError("recent original image is not a required artifact")
             if row["artifact_type"] == "comments" and name not in included:
                 prefix = name + "/"
                 children = sorted(
@@ -1633,6 +1673,8 @@ def _verify_managed_originals(
             disposition = included.get(name) or optional.get(name) or original_paths.get(name)
             if disposition is None or disposition["sha256"] != row["sha256"] or disposition["byte_size"] != row["byte_size"]:
                 raise SnapshotInstallError("available artifact has no exact required/optional/managed disposition")
+        if seen_imports != set(imported):
+            raise SnapshotInstallError("import evidence alias is not a registered available artifact")
         for row in connection.execute("SELECT details_json FROM scheduler_runs"):
             verify_external_pointers(json.loads(row[0]))
     except (sqlite3.Error, ValueError, KeyError, TypeError) as exc:
@@ -3378,6 +3420,12 @@ def _parser() -> argparse.ArgumentParser:
     install = commands.add_parser("install", help="Install a staged bundle atomically.")
     install.add_argument("--bundle", type=Path, required=True)
     _common_arguments(install)
+    for name in ("seal-replica-upgrade", "replica-upgrade", "rollback-replica-upgrade"):
+        data_upgrade = commands.add_parser(name, help="Seal, apply or roll back a verified 21-to-24 read replica data upgrade.")
+        data_upgrade.add_argument("--bundle", type=Path, required=True)
+        if name != "seal-replica-upgrade":
+            data_upgrade.add_argument("--seal-sha256", required=True)
+        _common_arguments(data_upgrade)
     for name in ("seal-schema-upgrade", "schema-upgrade"):
         upgrade = commands.add_parser(
             name,
@@ -3452,6 +3500,15 @@ def main() -> int:
             }
         elif arguments.command == "install":
             result = install_bundle(arguments.bundle, config, expected_schema=arguments.expected_schema)
+        elif arguments.command in {"seal-replica-upgrade", "replica-upgrade", "rollback-replica-upgrade"}:
+            import replica_schema_upgrade
+            implementation = sys.modules[__name__]
+            if arguments.command == "seal-replica-upgrade":
+                result = replica_schema_upgrade.seal(arguments.bundle, config, implementation)
+            elif arguments.command == "replica-upgrade":
+                result = replica_schema_upgrade.execute(arguments.bundle, config, arguments.seal_sha256, implementation)
+            else:
+                result = replica_schema_upgrade.rollback(arguments.bundle, config, arguments.seal_sha256, implementation)
         elif arguments.command == "seal-schema-upgrade":
             result = seal_schema_upgrade(arguments.bundle, config, release_dir=arguments.release_dir,
                                          expected_current_release=arguments.expected_current_release,

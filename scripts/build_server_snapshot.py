@@ -35,6 +35,8 @@ from v8.artifact_paths import using_artifact_root  # noqa: E402
 from v8.artifact_paths import (  # noqa: E402
     ArtifactPathError, RUNTIME_EVIDENCE_ALIAS_CONTRACT, RUNTIME_EVIDENCE_DIRECTORY,
     runtime_evidence_aliases, runtime_evidence_source,
+    IMPORTED_EVIDENCE_CONTRACT, IMPORTED_EVIDENCE_DIRECTORY, IMPORTED_EVIDENCE_TYPES,
+    MAX_IMPORTED_EVIDENCE_BYTES, REQUIRED_ORIGINALS, imported_evidence_aliases,
 )
 from v8.media import MediaProcessingError  # noqa: E402
 from v8.snapshot_contract import (  # noqa: E402
@@ -50,6 +52,7 @@ OPTIONAL_REUSE_EVIDENCE_TYPES = ("media",)
 FROZEN_ARTIFACT_DIRECTORY = "frozen-artifacts"
 FROZEN_ARTIFACT_CONTRACT = "snapshot-frozen-artifacts-v1"
 ARTIFACT_FREE_SPACE_RESERVE = 256 * 1024 * 1024
+MAX_RUNTIME_EVIDENCE_BYTES = 16 * 1024 * 1024
 TEXT_SUFFIXES = frozenset({".json", ".jsonl", ".txt", ".md", ".csv", ".srt", ".vtt"})
 LEGACY_LARGE_BINARY_SUFFIXES = frozenset({
     ".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".mp3", ".wav", ".m4a",
@@ -62,6 +65,7 @@ FORMAL_STATE_ROOT = Path.home() / "Library/Application Support/DcarAIGC"
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 RUNTIME_IDENTITY_SCHEMA = "dcar-runtime-identity-v1"
 EXPECTED_REPORT_VERSION = "dcar-content-operations-report-v8.9"
+FOUR_PLATFORM_REPORT_VERSION = "dcar-content-operations-report-v8.10"
 EXPECTED_DATABASE_SCHEMA_VERSION = 19
 EXPECTED_DATABASE_SCHEMA_MIGRATION = "dual-acquisition-profile-roster-v1"
 CLASSIFICATION_SCHEMA_VERSION = 21
@@ -182,6 +186,7 @@ def _connect_read_only(path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
+    connection.execute("PRAGMA recursive_triggers=ON")
     connection.execute("PRAGMA query_only=ON")
     return connection
 
@@ -235,7 +240,7 @@ def _runtime_identity(snapshot_db: Path, *, expected_user_version: int = EXPECTE
     matcher_rule_sha256 = str(release["matcher_rule_sha256"])
     identity = {
         "schema": RUNTIME_IDENTITY_SCHEMA,
-        "report_version": EXPECTED_REPORT_VERSION,
+        "report_version": FOUR_PLATFORM_REPORT_VERSION if user_version >= FLOW_SCHEMA_VERSION else EXPECTED_REPORT_VERSION,
         "database_schema_version": user_version,
         "database_schema_migration": str(migration_rows[0]["name"]),
         "active_release_id": str(release["id"]),
@@ -253,7 +258,7 @@ def _runtime_identity(snapshot_db: Path, *, expected_user_version: int = EXPECTE
         raise SnapshotBuildError("snapshot requires explicit schema19, schema20, schema21, schema22, schema23 or schema24")
     expected = {
         "schema": RUNTIME_IDENTITY_SCHEMA,
-        "report_version": EXPECTED_REPORT_VERSION,
+        "report_version": FOUR_PLATFORM_REPORT_VERSION if expected_user_version >= FLOW_SCHEMA_VERSION else EXPECTED_REPORT_VERSION,
         "database_schema_version": expected_user_version,
         "database_schema_migration": versions[expected_user_version],
         "active_release_id": EXPECTED_ACTIVE_RELEASE_ID,
@@ -427,9 +432,9 @@ def _declared_project_reference(
         if (path != path.resolve(strict=True) or not stat.S_ISDIR(parent.st_mode)
                 or parent.st_uid != os.geteuid() or parent.st_mode & 0o077
                 or not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None
-                or type(size) is not int or not 0 <= size <= raw_evidence.MAX_SIDECAR_BYTES):
+                or type(size) is not int or not 0 <= size <= MAX_RUNTIME_EVIDENCE_BYTES):
             raise SnapshotBuildError("external runtime evidence identity is unsafe")
-        body = raw_evidence._read_single_regular(path, max_bytes=raw_evidence.MAX_SIDECAR_BYTES)
+        body = raw_evidence._read_single_regular(path, max_bytes=MAX_RUNTIME_EVIDENCE_BYTES)
         if len(body) != size or hashlib.sha256(body).hexdigest() != digest:
             raise SnapshotBuildError("external runtime evidence SHA-256 or size drifted")
         payload = json.loads(body)
@@ -454,9 +459,7 @@ def _declared_project_reference(
         destination = project_root / canonical
         if destination != destination.resolve(strict=False):
             raise SnapshotBuildError("runtime evidence mirror path is unsafe")
-        receipt = raw_evidence.write_immutable_json_receipt(destination, payload, evidence_root=destination.parent)
-        if receipt.sha256 != digest or receipt.byte_size != size:
-            raise SnapshotBuildError("runtime evidence mirror bytes changed")
+        _mirror_evidence_bytes(destination, body, maximum=MAX_RUNTIME_EVIDENCE_BYTES)
         alias = {"source_path": value, "project_path": canonical, "sha256": digest, "byte_size": size}
         if value in aliases and aliases[value] != alias:
             raise SnapshotBuildError("external runtime evidence alias identity conflict")
@@ -731,6 +734,7 @@ def _add_registered_optional(
 def _managed_originals(
     connection: sqlite3.Connection, *, project_root: Path,
     files: dict[tuple[str, str], dict[str, Any]], pending_json: list[Path],
+    imported_aliases: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]], set[str]]:
     """Verify ownership before any JSON can nominate an original for transfer."""
     bundles: list[dict[str, Any]] = []
@@ -740,7 +744,13 @@ def _managed_originals(
     by_path: dict[str, set[int]] = {}
     for row in artifact_rows:
         try:
-            canonical = _project_reference(row["local_path"], project_root=project_root)
+            source = Path(row["local_path"])
+            if (row["status"] == "available" and row["artifact_type"] in IMPORTED_EVIDENCE_TYPES
+                    and source.is_absolute() and not source.is_relative_to(project_root)):
+                canonical = _imported_evidence_reference(row, project_root,
+                    imported_aliases if imported_aliases is not None else {})
+            else:
+                canonical = _project_reference(row["local_path"], project_root=project_root)
         except SnapshotBuildError:
             if row["status"] == "available" or row["artifact_type"] == "media_lifecycle_manifest":
                 raise
@@ -858,16 +868,61 @@ def _managed_originals(
              "bundles": sorted(bundles, key=lambda item: item["bundle_id"])}, members, evidence_roots)
 
 
+def _mirror_evidence_bytes(target: Path, body: bytes, *, maximum: int) -> None:
+    if len(body) > maximum or target != target.resolve(strict=False):
+        raise SnapshotBuildError("evidence mirror path or size is unsafe")
+    target.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    if target.exists() or target.is_symlink():
+        if raw_evidence._read_single_regular(target, max_bytes=maximum, allow_legacy_read_mode=True) != body:
+            raise SnapshotBuildError("evidence mirror identity changed")
+    else:
+        raw_evidence._publish_no_replace(target, body, evidence_root=target.parent)
+
+
+def _imported_evidence_reference(row, project_root, aliases):
+    """Mirror the exact registered JSON bytes; no database or signed proof edits."""
+    path = Path(row["local_path"])
+    digest, size, kind = row["sha256"], row["byte_size"], row["artifact_type"]
+    try:
+        info = path.lstat()
+        if (kind not in IMPORTED_EVIDENCE_TYPES or path.suffix != ".json"
+                or path != path.resolve(strict=True) or not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid() or info.st_mode & 0o022
+                or not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None
+                or type(size) is not int or not 0 < size <= MAX_IMPORTED_EVIDENCE_BYTES):
+            raise SnapshotBuildError("external registered evidence identity is unsafe")
+        body = raw_evidence._read_regular_evidence(path, max_bytes=MAX_IMPORTED_EVIDENCE_BYTES, allow_legacy_read_mode=True)
+        if (path.lstat() != info or len(body) != size or hashlib.sha256(body).hexdigest() != digest
+                or json.loads(body).get("contract") != IMPORTED_EVIDENCE_TYPES[kind]):
+            raise SnapshotBuildError("external registered evidence bytes or contract changed")
+        canonical = IMPORTED_EVIDENCE_DIRECTORY + "/" + digest + ".json"
+        target = project_root / canonical
+        if target != target.resolve(strict=False):
+            raise SnapshotBuildError("external evidence mirror path is unsafe")
+        _mirror_evidence_bytes(target, body, maximum=MAX_IMPORTED_EVIDENCE_BYTES)
+        alias = {"artifact_id": row["id"], "content_id": row["content_id"], "artifact_type": kind,
+            "source_path": str(path), "project_path": canonical, "sha256": digest, "byte_size": size}
+        if str(path) in aliases and aliases[str(path)] != alias:
+            raise SnapshotBuildError("external registered evidence alias conflicts")
+        aliases[str(path)] = alias
+        return canonical
+    except (OSError, ValueError, AttributeError, RuntimeError) as exc:
+        raise SnapshotBuildError(f"registered external evidence invalid: {path}") from exc
+
+
 def _collect_artifacts(
     snapshot_db: Path, *, project_root: Path, aliases: dict[str, dict[str, Any]] | None = None,
+    imported_aliases: dict[str, dict[str, Any]] | None = None,
     private_references: Mapping[str, Mapping[str, Any]] | None = None,
     frozen_root: Path | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     aliases = aliases if aliases is not None else {}
+    imported_aliases = imported_aliases if imported_aliases is not None else {}
     files: dict[tuple[str, str], dict[str, Any]] = _FrozenArtifacts(frozen_root) if frozen_root else {}
     optional_reuse: dict[tuple[str, str], dict[str, Any]] = {}
     pending_json: list[Path] = []
     legacy_download_manifests: set[str] = set()
+    required_image_manifests: set[str] = set()
     for relative_path in REQUIRED_RUNTIME_ARTIFACTS:
         _add_artifact(
             files,
@@ -877,7 +932,8 @@ def _collect_artifacts(
         )
     with _connect_read_only(snapshot_db) as connection:
         managed, managed_members, evidence_roots = _managed_originals(
-            connection, project_root=project_root, files=files, pending_json=pending_json)
+            connection, project_root=project_root, files=files, pending_json=pending_json,
+            imported_aliases=imported_aliases)
         for row in connection.execute(
             "SELECT local_path,sha256,byte_size FROM provider_raw_responses"
         ):
@@ -962,13 +1018,19 @@ def _collect_artifacts(
         if _table_exists(connection, "evidence_artifacts"):
             for row in connection.execute(
                 """
-                SELECT artifact_type,local_path,sha256,byte_size
-                FROM evidence_artifacts
-                WHERE status='available' ORDER BY local_path
+                SELECT e.id,e.content_id,e.artifact_type,e.local_path,e.sha256,e.byte_size,c.published_at
+                FROM evidence_artifacts e JOIN content_items c ON c.id=e.content_id
+                WHERE e.status='available' ORDER BY e.local_path
                 """
             ):
                 artifact_type = str(row["artifact_type"])
-                canonical = _project_reference(row["local_path"], project_root=project_root)
+                source = Path(row["local_path"])
+                if source.is_absolute() and not source.is_relative_to(project_root):
+                    canonical = _imported_evidence_reference(row, project_root, imported_aliases)
+                else:
+                    canonical = _project_reference(row["local_path"], project_root=project_root)
+                required_original = (artifact_type == "media" and bool(row["published_at"])
+                    and row["published_at"] >= REQUIRED_ORIGINALS["published_from"])
                 if canonical in managed_members:
                     member = managed_members[canonical]
                     if row["sha256"] != member["sha256"] or row["byte_size"] != member["byte_size"]:
@@ -978,16 +1040,18 @@ def _collect_artifacts(
                 if artifact_type == "media_manifest" and not any(
                         canonical.startswith(root) for root in evidence_roots):
                     legacy_download_manifests.add(canonical)
+                    if row["published_at"] and row["published_at"] >= REQUIRED_ORIGINALS["published_from"]:
+                        required_image_manifests.add(canonical)
                 destination = (
                     optional_reuse
-                    if artifact_type in OPTIONAL_REUSE_EVIDENCE_TYPES
+                    if artifact_type in OPTIONAL_REUSE_EVIDENCE_TYPES and not required_original
                     else files
                 )
-                if (destination is files and suffix in LEGACY_LARGE_BINARY_SUFFIXES
+                if (destination is files and not required_original and suffix in LEGACY_LARGE_BINARY_SUFFIXES
                         and not any(canonical.startswith(root) for root in evidence_roots)
                         and not canonical.startswith("reports/")):
                     destination = optional_reuse
-                if artifact_type in OPTIONAL_REUSE_EVIDENCE_TYPES:
+                if artifact_type in OPTIONAL_REUSE_EVIDENCE_TYPES and not required_original:
                     _add_registered_optional(
                         optional_reuse,
                         relative_path=canonical,
@@ -1030,6 +1094,8 @@ def _collect_artifacts(
         if artifact in parsed_json:
             continue
         parsed_json.add(artifact)
+        original_image = ((files.source_paths.get(artifact, artifact) if isinstance(files, _FrozenArtifacts)
+            else artifact).relative_to(project_root).as_posix() in required_image_manifests)
         for referenced, digest, size in _json_references(artifact, project_root=project_root, aliases=aliases,
                                                        private_references=private_references):
             root_name, root_relative, _canonical = _normalize_project_relative(
@@ -1052,7 +1118,9 @@ def _collect_artifacts(
                 if (digest is not None and digest != existing["sha256"]
                         or size is not None and size != existing["byte_size"]):
                     raise SnapshotBuildError(f"optional artifact reference identity changed: {referenced}")
-                continue
+                if not original_image:
+                    continue
+                optional_reuse.pop((root_name, root_relative))
             suffix = PurePosixPath(referenced).suffix.lower()
             legacy_binary = (
                 suffix in LEGACY_LARGE_BINARY_SUFFIXES
@@ -1060,7 +1128,7 @@ def _collect_artifacts(
                      else artifact).relative_to(project_root).as_posix() in legacy_download_manifests
                     and suffix not in TEXT_SUFFIXES)
             )
-            if (root_name == "reports" or not legacy_binary
+            if (original_image or root_name == "reports" or not legacy_binary
                     or any(_canonical.startswith(root) for root in evidence_roots)):
                 _add_artifact(
                     files,
@@ -1249,10 +1317,12 @@ def build_snapshot(
         elif deployment_id is not None or require_accepted_deployment:
             raise SnapshotBuildError("deployment readiness selection requires explicit schema20, schema21, schema22, schema23 or schema24")
         aliases: dict[str, dict[str, Any]] = {}
+        imported_aliases: dict[str, dict[str, Any]] = {}
         private_directory = _private_deployment_directory(deployment_readiness, project_root=project_root,
             code_successor=code_successor)
         files, optional_reuse_files, managed_originals = _collect_artifacts(
             database_dir / "dcar_insight.sqlite3", project_root=project_root, aliases=aliases,
+            imported_aliases=imported_aliases,
             private_references=_private_reference_index(private_directory),
             frozen_root=temporary / FROZEN_ARTIFACT_DIRECTORY,
         )
@@ -1296,6 +1366,11 @@ def build_snapshot(
                 "files": sorted(aliases.values(), key=lambda row: row["source_path"]),
             }
             runtime_evidence_aliases(manifest)
+        manifest["required_originals"] = dict(REQUIRED_ORIGINALS)
+        if imported_aliases:
+            manifest["imported_evidence_aliases"] = {"contract_version": IMPORTED_EVIDENCE_CONTRACT,
+                "files": sorted(imported_aliases.values(), key=lambda row: row["source_path"])}
+            imported_evidence_aliases(manifest)
         if deployment_readiness is not None:
             manifest["deployment_readiness"] = deployment_readiness
             manifest["private_deployment_references"] = private_directory

@@ -30,6 +30,53 @@ MAX_SNAPSHOT_RECEIPT_BYTES = 1024 * 1024
 MAX_SNAPSHOT_MANIFEST_BYTES = 256 * 1024 * 1024
 RUNTIME_EVIDENCE_ALIAS_CONTRACT = "runtime-evidence-alias-v1"
 RUNTIME_EVIDENCE_DIRECTORY = "data/cache/v8/runtime_evidence"
+IMPORTED_EVIDENCE_CONTRACT = "registered-import-evidence-alias-v1"
+IMPORTED_EVIDENCE_DIRECTORY = "data/cache/v8/imported_evidence"
+IMPORTED_EVIDENCE_TYPES = {
+    "standalone_history_import": "standalone-douyin-history-import-v1",
+    "standalone_video_source_supplement": "standalone-video-source-supplement-v1",
+}
+MAX_IMPORTED_EVIDENCE_BYTES = 16 * 1024 * 1024
+REQUIRED_ORIGINALS = {"contract_version": "published-originals-required-v1",
+    "published_from": "2026-08-31T16:00:00Z", "timezone": "Asia/Shanghai"}
+
+
+def imported_evidence_aliases(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Only registered import JSON can be relocated into content-addressed cache.
+
+    The receiver additionally binds every ID, content, type and source to its
+    exact available database row. This list never grants access to another file.
+    """
+    value = manifest.get("imported_evidence_aliases")
+    if value is None:
+        return {}
+    if (not isinstance(value, dict) or set(value) != {"contract_version", "files"}
+            or value.get("contract_version") != IMPORTED_EVIDENCE_CONTRACT
+            or not isinstance(value.get("files"), list)):
+        raise ArtifactPathError("snapshot_import_evidence_contract_invalid")
+    required = {r["project_path"]: r for r in manifest["files"]}
+    aliases, ids = {}, set()
+    for row in value["files"]:
+        if (not isinstance(row, dict) or set(row) != {"artifact_id", "content_id", "artifact_type",
+                "source_path", "project_path", "sha256", "byte_size"}
+                or any(type(row.get(k)) is not int or row[k] <= 0 for k in ("artifact_id", "content_id"))
+                or row.get("artifact_type") not in IMPORTED_EVIDENCE_TYPES
+                or not isinstance(row.get("source_path"), str)
+                or not isinstance(row.get("sha256"), str) or _SHA.fullmatch(row["sha256"]) is None
+                or type(row.get("byte_size")) is not int or not 0 < row["byte_size"] <= MAX_IMPORTED_EVIDENCE_BYTES):
+            raise ArtifactPathError("snapshot_import_evidence_identity_invalid")
+        path = Path(row["source_path"])
+        expected = IMPORTED_EVIDENCE_DIRECTORY + "/" + row["sha256"] + ".json"
+        target = required.get(expected)
+        if (not path.is_absolute() or path.suffix != ".json" or ".." in path.parts
+                or any(c in row["source_path"] for c in ("\0", "\n", "\r", "\\"))
+                or row["project_path"] != expected or target is None
+                or any(target.get(k) != row[k] for k in ("sha256", "byte_size"))
+                or row["source_path"] in aliases or row["artifact_id"] in ids):
+            raise ArtifactPathError("snapshot_import_evidence_alias_unbound")
+        aliases[row["source_path"]] = row
+        ids.add(row["artifact_id"])
+    return aliases
 
 
 def runtime_evidence_source(value: str, state_root: str) -> str:
@@ -186,7 +233,8 @@ def _context(receipt_name: str, receipt_identity: tuple[int, int, int, int, int]
     directories = {str(parent) for name in files for parent in PurePosixPath(name).parents if str(parent) != "."}
     return {"receipt": receipt, "manifest": manifest, "writer_root": writer_root,
             "files": files, "members": members, "directories": directories,
-            "runtime_evidence_aliases": runtime_evidence_aliases(manifest)}
+            "runtime_evidence_aliases": runtime_evidence_aliases(manifest),
+            "imported_evidence_aliases": imported_evidence_aliases(manifest)}
 
 
 def installed_snapshot() -> dict[str, Any] | None:
@@ -219,7 +267,8 @@ def resolve(value: str | Path, *, fallback_root: Path | None = None) -> Path:
     root = _READ_ROOT.get() or fallback_root or PROJECT_ROOT
     context = installed_snapshot()
     if context is not None:
-        alias = context["runtime_evidence_aliases"].get(str(path))
+        alias = (context["runtime_evidence_aliases"].get(str(path))
+                 or context["imported_evidence_aliases"].get(str(path)))
         if alias is not None:
             return root / alias["project_path"]
         relative: str | None = None

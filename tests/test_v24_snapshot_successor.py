@@ -54,6 +54,34 @@ class SnapshotSuccessorPublicationTest(unittest.TestCase):
         self.c.commit()
         return generation["generation_id"]
 
+    def test_snapshot_identities_match_actual_reader_for_schema23_and24(self):
+        from v8 import api
+        self.c.execute("INSERT INTO taxonomy_versions(id,version,status,definition,created_at) "
+            "VALUES('identity-test','selling-points-v5.2','published','{}','2026-09-15T00:00:00Z')")
+        self.c.execute("INSERT INTO evaluation_releases(id,rule_version,taxonomy_version,matcher_rule_sha256,"
+            "status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)", (
+            'evaluation-v9__selling-points-v5.2', 'evaluation-v9', 'selling-points-v5.2',
+            'a' * 64, 'active', '2026-09-15T00:00:00Z', '2026-09-15T00:00:00Z'))
+        for version in (23, 24):
+            with self.subTest(version=version):
+                if version == 24:
+                    self.to24()
+                self.c.commit()
+                database = Path(self.c.execute("PRAGMA database_list").fetchone()[2])
+                actual = api._database_state(self.c)["runtime_identity"]
+                self.assertEqual(actual["report_version"], "dcar-content-operations-report-v8.10")
+                self.assertEqual(publisher._validate_runtime_identity(actual, label="actual reader",
+                    expected_schema=version), actual)
+                self.assertEqual(publisher._database_runtime_identity(self.c, expected_schema=version), actual)
+                self.assertEqual(builder._runtime_identity(database, expected_user_version=version), actual)
+                self.assertEqual(installer._database_runtime_identity(database, expected_schema=version), actual)
+                if version == 24:
+                    with builder._connect_read_only(database) as frozen:
+                        schema_v24.migration_proof(frozen)
+                stale = {**actual, "report_version": "dcar-content-operations-report-v8.9"}
+                with self.assertRaises(publisher.SnapshotPublishError):
+                    publisher._validate_runtime_identity(stale, label="stale", expected_schema=version)
+
     def test_real23_24_preserve_exact_ancestor_proofs_without_version_projection(self):
         legacy = successor.migration_chain(self.c)
         before = self.f.observe()
@@ -202,6 +230,27 @@ class SnapshotSuccessorBoundaryTest(unittest.TestCase):
         target.write_text(target.read_text().replace("def verify_publication(", "def missing_verification("))
         with self.assertRaisesRegex(installer.SnapshotInstallError, "complete portable"):
             installer._verify_release_contract(release, 24)
+
+    def test_publisher_accepts_only_completed_and_complete_replica_chain(self):
+        schema_v24.migrate(self.c)
+        identity=builder._runtime_identity(self.f.database,expected_user_version=24)
+        config=replace(self.f.config,expected_user_version=24)
+        value=FakeRunner(identity).probe()
+        value['health']['database_state']['user_version']=24
+        value['installer_schema_support']={'versions':list(installer.SUPPORTED_SCHEMA_VERSIONS),
+            'transitions':[list(p) for p in installer.SUPPORTED_SCHEMA_TRANSITIONS]}
+        value['schema_transition']={'schema':'dcar-replica-schema-chain-transition-v1',
+            'from_schema':21,'to_schema':24,'status':'succeeded','completed_at':'2026-09-15T00:00:00Z',
+            'sealed_manifest_sha256':'a'*64,'migration_chain':[{'from_schema':v,'to_schema':v+1,
+                'receipt_sha256':'b'*64} for v in (21,22,23)]}
+        publisher._validate_remote_probe(value,config=config)
+        for mutation in ('missing_receipt','in_progress','wrong_pair'):
+            bad=copy.deepcopy(value)
+            if mutation=='missing_receipt':bad['schema_transition']['migration_chain'].pop()
+            elif mutation=='in_progress':bad['schema_transition']['status']='in_progress'
+            else:bad['schema_transition']['migration_chain'][0]['from_schema']=20
+            with self.subTest(mutation=mutation),self.assertRaises(publisher.SnapshotPublishError):
+                publisher._validate_remote_probe(bad,config=config)
 
 
 class SnapshotSuccessorPairTest(unittest.TestCase):

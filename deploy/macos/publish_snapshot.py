@@ -48,6 +48,7 @@ SNAPSHOT_ID_RE = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 RUNTIME_IDENTITY_SCHEMA = "dcar-runtime-identity-v1"
 EXPECTED_REPORT_VERSION = "dcar-content-operations-report-v8.9"
+FOUR_PLATFORM_REPORT_VERSION = "dcar-content-operations-report-v8.10"
 EXPECTED_DATABASE_SCHEMA_VERSION = 19
 EXPECTED_DATABASE_SCHEMA_MIGRATION = "dual-acquisition-profile-roster-v1"
 CLASSIFICATION_SCHEMA_VERSION = 21
@@ -99,7 +100,7 @@ FROZEN_ARTIFACT_DIRECTORY = "frozen-artifacts"
 FROZEN_ARTIFACT_CONTRACT = "snapshot-frozen-artifacts-v1"
 REMOTE_PROBE_SCHEMA = "dcar-remote-publisher-probe-v1"
 RECEIVER_BINDING_PATH = Path(__file__).resolve().parents[2] / "config/snapshot_receiver.json"
-RECEIVER_SOURCE_ROOT = "/var/www/dcar-aigc/receiver-releases/20260911-daily-pipeline-v2/source"
+RECEIVER_SOURCE_ROOT = "/var/www/dcar-aigc/receiver-releases/20260915-data-media-sync-v1/source"
 RECEIVER_ENTRYPOINT = "deploy/server/install_snapshot.py"
 LEGACY_TRANSITION_SCHEMA = "dcar-schema17-to18-server-transition-v1"
 TRANSITION_SCHEMA = "dcar-schema18-to19-server-transition-v1"
@@ -247,7 +248,7 @@ def _validate_runtime_identity(value: object, *, label: str,
         raise SnapshotPublishError(f"{label} requires explicit schema 19, 20, 21, 22, 23 or 24")
     expected = {
         "schema": RUNTIME_IDENTITY_SCHEMA,
-        "report_version": EXPECTED_REPORT_VERSION,
+        "report_version": FOUR_PLATFORM_REPORT_VERSION if version >= FLOW_SCHEMA_VERSION else EXPECTED_REPORT_VERSION,
         "database_schema_version": version,
         "database_schema_migration": SUPPORTED_SCHEMA_MIGRATIONS[version],
         "active_release_id": EXPECTED_ACTIVE_RELEASE_ID,
@@ -307,7 +308,7 @@ def _database_runtime_identity(connection: sqlite3.Connection, *,
     return _validate_runtime_identity(
         {
             "schema": RUNTIME_IDENTITY_SCHEMA,
-            "report_version": EXPECTED_REPORT_VERSION,
+            "report_version": FOUR_PLATFORM_REPORT_VERSION if user_version >= FLOW_SCHEMA_VERSION else EXPECTED_REPORT_VERSION,
             "database_schema_version": user_version,
             "database_schema_migration": str(migration_rows[0]["name"]),
             "active_release_id": str(release["id"]),
@@ -2329,6 +2330,22 @@ def _active_snapshot_id(active_receipt: Mapping[str, Any]) -> Optional[str]:
     )
 
 
+def _replica_chain_settled(transition: object, version: int) -> bool:
+    return (isinstance(transition, dict)
+        and transition.get("schema") == "dcar-replica-schema-chain-transition-v1"
+        and transition.get("from_schema") == 21 and transition.get("to_schema") == 24
+        and version in {21, 24}
+        and transition.get("status") == ("succeeded" if version == 24 else "rolled_back")
+        and isinstance(transition.get("sealed_manifest_sha256"), str)
+        and SHA256_RE.fullmatch(transition["sealed_manifest_sha256"]) is not None
+        and isinstance(transition.get("migration_chain"), list) and len(transition["migration_chain"]) == 3
+        and all(isinstance(row, dict) and set(row) == {"from_schema", "to_schema", "receipt_sha256"}
+            and type(row["from_schema"]) is int and type(row["to_schema"]) is int
+            and (row["from_schema"], row["to_schema"]) == pair
+            and isinstance(row["receipt_sha256"], str) and SHA256_RE.fullmatch(row["receipt_sha256"]) is not None
+            for row, pair in zip(transition["migration_chain"], ((21,22),(22,23),(23,24)))))
+
+
 def _validate_remote_probe(
     value: object,
     *,
@@ -2369,7 +2386,7 @@ def _validate_remote_probe(
             and transition.get("schema") == {22: FLOW_TRANSITION_SCHEMA, 23: DUPLICATE_TRANSITION_SCHEMA}[version]
             and transition.get("from_schema") == version and transition.get("to_schema") == version + 1
             and transition.get("status") == "rolled_back")
-        if not (paired or restored20 or restored21 or restored_successor):
+        if not (paired or restored20 or restored21 or restored_successor or _replica_chain_settled(transition, version)):
             raise SnapshotPublishError(f"remote {version - 1}-to-{version} pairing is unsettled; use explicit schema-upgrade first")
     if transition is not None:
         legacy_settled = (isinstance(transition, dict) and version == 19
@@ -2390,7 +2407,8 @@ def _validate_remote_probe(
             and transition.get("from_schema") == before and transition.get("to_schema") == after
             and version in {before, after} and transition.get("status") == ("succeeded" if version == after else "rolled_back")
             for before, after, contract in ((22, 23, FLOW_TRANSITION_SCHEMA), (23, 24, DUPLICATE_TRANSITION_SCHEMA)))
-        if not (legacy_settled or integrated_settled or classification_settled or intake_settled or successor_settled):
+        replica_chain_settled = _replica_chain_settled(transition, version)
+        if not (legacy_settled or integrated_settled or classification_settled or intake_settled or successor_settled or replica_chain_settled):
             raise SnapshotPublishError("remote schema-upgrade transition is unsettled; normal publishing is blocked")
         _parse_iso(transition.get("completed_at"), label="schema transition completed_at")
     current_release = value.get("current_release")
@@ -2519,7 +2537,7 @@ def remote_check(
         "snapshot_id": result["snapshot_id"],
         "database_sha256": result["database_sha256"],
         "database_schema_version": config.expected_user_version,
-        "report_version": EXPECTED_REPORT_VERSION,
+        "report_version": FOUR_PLATFORM_REPORT_VERSION if config.expected_user_version >= FLOW_SCHEMA_VERSION else EXPECTED_REPORT_VERSION,
         "remote_free_bytes": result["free_bytes"],
         "services": ["dcar-api.service", "dcar-web.service", "dcar-auth.service", "dcar-douyin-control.service"],
         "snapshot_contract": descriptor(),
