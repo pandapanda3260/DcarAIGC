@@ -7,6 +7,6 @@
   "consumer_identity": {
     "contract_version": "media-consumer-runtime-v1",
     "code_sha256": "07115ea3f2ddaa5fef1b44e6c746afd629fc8815c5b83582071d9fc10b135316",
-    "project_root": "/var/www/dcar-aigc/api-sources/20260915-data-media-sync-v4d/source"
+    "project_root": "/var/www/dcar-aigc/releases/20260909-account-classification-v3"
   }
 }
