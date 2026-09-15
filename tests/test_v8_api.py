@@ -1260,6 +1260,35 @@ class V8ApiTest(unittest.TestCase):
         self.assertFalse(response.json()["lifecycle_jobs_enabled"])
         self.assertIsNone(response.json()["media_lifecycle"]["activation"])
 
+    def test_health_summary_keeps_browser_status_payload_small(self) -> None:
+        response = self.client.get("/api/v8/health?view=summary")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(
+            set(body),
+            {
+                "status",
+                "automation",
+                "mode",
+                "read_only",
+                "report_version",
+                "data_freshness",
+                "snapshot_sync",
+            },
+        )
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["report_version"], CURRENT_REPORT_VERSION)
+        self.assertIn("scheduler_state", body["automation"])
+        self.assertIn("paid_dispatch_state", body["automation"])
+        self.assertEqual(
+            set(body["data_freshness"]),
+            {"status", "last_successful_capture_at"},
+        )
+        self.assertNotIn("database_state", body)
+        self.assertNotIn("media_lifecycle", body)
+        self.assertNotIn("media_consumers", body)
+        self.assertLess(len(response.content), 5000)
+
     def test_livez_never_opens_sqlite_and_readyz_uses_only_db_receipts(self) -> None:
         with patch.object(
             api_module, "connect", side_effect=AssertionError("livez opened SQLite")

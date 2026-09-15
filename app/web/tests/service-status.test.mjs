@@ -183,7 +183,7 @@ test("persistent chrome reads health and shares the derived status with page she
   const shell = (await Promise.all(["AppShell", "WorkbenchChrome"].map((name) =>
     readFile(new URL(`../app/components/${name}.tsx`, import.meta.url), "utf8"),
   ))).join("\n");
-  assert.match(shell, /readQueryJson<ServiceHealth>\("\/api\/v8\/health", undefined, 5_000\)/);
+  assert.match(shell, /readQueryJson<ServiceHealth>\("\/api\/v8\/health\?view=summary", undefined, 5_000\)/);
   assert.match(shell, /refetchInterval: 30_000/);
   assert.match(shell, /refetchOnWindowFocus: "always"/);
   assert.match(shell, /dataServiceStatus\(serviceHealth.data, serviceHealth.isError\)/);
@@ -192,6 +192,8 @@ test("persistent chrome reads health and shares the derived status with page she
   assert.doesNotMatch(shell, /serviceState\.kind !== "normal"/);
   assert.match(shell, /serviceStyles\.offline/);
   assert.doesNotMatch(shell, /<strong>数据服务正常<\/strong>/);
+  const updates = await readFile(new URL("../app/components/ContentUpdateJobsProvider.tsx", import.meta.url), "utf8");
+  assert.match(updates, /readQueryJson<ServiceHealth>\("\/api\/v8\/health\?view=summary", undefined, 5_000\)/);
 });
 
 test("report gap starts with the first enabled business day and only after 08:00 Shanghai next day", () => {

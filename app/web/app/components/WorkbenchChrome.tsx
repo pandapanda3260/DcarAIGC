@@ -133,7 +133,7 @@ function ActiveWorkbenchChrome({ active, pathname, children }: { active: Section
   }
   const serviceHealth = useQuery({
     queryKey: ["system", "health"],
-    queryFn: () => readQueryJson<ServiceHealth>("/api/v8/health", undefined, 5_000),
+    queryFn: () => readQueryJson<ServiceHealth>("/api/v8/health?view=summary", undefined, 5_000),
     staleTime: 15_000,
     refetchInterval: 30_000,
     refetchOnWindowFocus: "always",

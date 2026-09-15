@@ -38,7 +38,7 @@ export default function ContentUpdateJobsProvider({ children }: { children: Reac
   const owner = activePage && session.data?.username ? session.data.username : "";
   const health = useQuery({
     queryKey: ["system", "health"], enabled: Boolean(owner),
-    queryFn: () => readQueryJson<ServiceHealth>("/api/v8/health", undefined, 5_000),
+    queryFn: () => readQueryJson<ServiceHealth>("/api/v8/health?view=summary", undefined, 5_000),
     staleTime: 15_000, refetchInterval: 30_000, refetchOnWindowFocus: "always", retry: false,
   });
   const availability = contentUpdateAvailability(health.data, health.isError);

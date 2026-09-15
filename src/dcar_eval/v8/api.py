@@ -1582,6 +1582,16 @@ def _database_state(connection: sqlite3.Connection) -> Dict[str, Any]:
     }
 
 
+def _data_freshness_status(value: Mapping[str, Any]) -> Dict[str, Any]:
+    """Project the freshness receipt to the fields used by browser status UI."""
+
+    status = value.get("status")
+    return {
+        "status": status if isinstance(status, str) else "unknown",
+        "last_successful_capture_at": value.get("last_successful_capture_at"),
+    }
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -3383,25 +3393,30 @@ def v8_health(request: Request) -> Dict[str, Any]:
     from .snapshot_contract import descriptor
     from .snapshot_sync import snapshot_sync_status
     config = _request_config(request)
+    summary = request.query_params.get("view") == "summary"
     with connect(config.db_path, read_only=config.read_only) as connection:
         database_state = _database_state(connection)
-        media_lifecycle = media_api.lifecycle_status(connection, read_only=config.read_only)
         drain = dispatch_state(connection)
         database_state["sha256"] = getattr(request.app.state, "database_sha256", None)
+        media_lifecycle = (
+            None if summary
+            else media_api.lifecycle_status(connection, read_only=config.read_only)
+        )
     data_freshness = _request_data_freshness(request)
     scheduler = getattr(request.app.state, "scheduler", None)
     scheduler_state = _scheduler_execution_state(config, scheduler)
     registered_job_ids = {
         str(job.id) for job in scheduler.get_jobs()
     } if scheduler is not None else set()
-    activation = media_lifecycle.get("activation") or {}
+    activation = media_lifecycle.get("activation") if media_lifecycle is not None else None
+    activation = activation or {}
     lifecycle_jobs_enabled = bool(
         not config.read_only
         and scheduler_state == "running"
         and activation.get("mode") == "active"
         and media_retention.LIFECYCLE_JOB_IDS <= registered_job_ids
     )
-    return {
+    common = {
         "status": "ok",
         "automation": {
             "scheduler_state": scheduler_state,
@@ -3411,6 +3426,16 @@ def v8_health(request: Request) -> Dict[str, Any]:
         "mode": "read_only_replica" if config.read_only else "local_v8",
         "read_only": config.read_only,
         "report_version": database_state["runtime_identity"]["report_version"],
+        "data_freshness": data_freshness,
+        "snapshot_sync": snapshot_sync_status(read_only=config.read_only),
+    }
+    if summary:
+        return {
+            **common,
+            "data_freshness": _data_freshness_status(data_freshness),
+        }
+    return {
+        **common,
         "database": config.db_path.name,
         "database_path": str(config.db_path.resolve()),
         "runtime_database_identity": getattr(
@@ -3427,8 +3452,6 @@ def v8_health(request: Request) -> Dict[str, Any]:
             },
         ),
         "database_state": database_state,
-        "data_freshness": data_freshness,
-        "snapshot_sync": snapshot_sync_status(read_only=config.read_only),
         "paid_dispatch_state": (
             "open"
             if drain.state == "open"
