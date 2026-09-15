@@ -85,13 +85,21 @@ class ThumbnailBlobTests(unittest.TestCase):
         self.assertEqual(self.result()["1"], {"local_url": None, "remote_url": None,
                                              "remote_urls": [], "reason": reason})
 
-    def test_schema21_keeps_canonical_and_enabled_content_only(self):
+    def test_schema21_through24_keep_canonical_and_enabled_content_only(self):
         blob = self.blob(1, {"data": [self.cover("111"), self.cover("444"), self.cover("555")]})
         for content_id in (1, 4, 5):
             self.response(content_id, content_id, blob)
-        result = self.result((1, 4, 5, 999))
-        self.assertEqual(set(result), {"1"})
-        self.assertEqual(result["1"]["remote_url"], "https://example.com/111.jpg")
+        for version in (21, 22, 23, 24):
+            with self.subTest(version=version):
+                self.change(f"PRAGMA user_version={version}")
+                before = self.db.read_bytes()
+                result = self.result((1, 4, 5, 999))
+                self.assertEqual(set(result), {"1"})
+                self.assertEqual(result["1"]["remote_url"], "https://example.com/111.jpg")
+                self.assertEqual(self.db.read_bytes(), before)
+        self.change("PRAGMA user_version=25")
+        with self.assertRaisesRegex(helper.ReadError, "unsupported content database schema"):
+            self.result()
 
     def test_cas_zstd_and_identity_need_no_json_sidecar(self):
         for codec, cid, identity in (("zstd", 1, "111"), ("identity", 2, "222")):

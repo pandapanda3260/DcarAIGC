@@ -643,7 +643,7 @@ def project(db_path: Path, ids: list[int], *, project_root: Path | None = None) 
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA query_only=ON")
         schema = connection.execute("PRAGMA user_version").fetchone()[0]
-        if schema not in (19, 20, 21, 22, 23):
+        if schema not in (19, 20, 21, 22, 23, 24):
             raise ReadError("unsupported content database schema")
         placeholders = ",".join("?" for _ in ids)
         canonical = ("AND NOT EXISTS (SELECT 1 FROM content_identity_merge_events m WHERE m.loser_content_id=c.id)"
