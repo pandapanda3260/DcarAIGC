@@ -105,7 +105,7 @@ class ContentEntityRecoveryTest(unittest.TestCase):
             self.assertNotIn('video',[r['artifact_type'] for r in artifacts])
 
     def test_replica_recovery_requires_registered_unchanged_original_bytes(self):
-        from v8 import artifact_paths
+        from v8 import artifact_paths, media_lifecycle
         result=self.recover()
         with storage.connect(self.db) as c:
             members=recovery.required_recovery_quarantines(c)
@@ -118,10 +118,15 @@ class ContentEntityRecoveryTest(unittest.TestCase):
             context={'writer_root':self.root,'runtime_evidence_aliases':{},'imported_evidence_aliases':{},
                      'files':{relative.as_posix():row},'members':{},'directories':set()}
             self.assertNotEqual(recovery._file_identity(target),recovery._file_identity(original))
-            with patch.object(artifact_paths,'PROJECT_ROOT',replica), patch.object(artifact_paths,'installed_snapshot',return_value=context):
+            target.chmod(0o640)
+            with patch.object(artifact_paths,'PROJECT_ROOT',replica), patch.object(media_lifecycle,'PROJECT_ROOT',replica), patch.object(artifact_paths,'installed_snapshot',return_value=context):
                 self.assertTrue(recovery.recovered_member(c,member_id=self.member,raw_response_id=result['raw_response_id']))
+                target.chmod(0o660)
+                with self.assertRaisesRegex(media_lifecycle.LifecycleError,'file_not_private'):
+                    recovery.recovered_member(c,member_id=self.member,raw_response_id=result['raw_response_id'])
+                target.chmod(0o640)
                 body=target.read_bytes();target.write_bytes(body[:-1]+bytes([body[-1]^1]))
-                with self.assertRaisesRegex(recovery.EntityRecoveryError,'bytes changed'):
+                with self.assertRaisesRegex(media_lifecycle.LifecycleError,'hash_mismatch'):
                     recovery.recovered_member(c,member_id=self.member,raw_response_id=result['raw_response_id'])
                 target.write_bytes(body);context['files'].clear()
                 with self.assertRaisesRegex(artifact_paths.ArtifactPathError,'unlisted'):

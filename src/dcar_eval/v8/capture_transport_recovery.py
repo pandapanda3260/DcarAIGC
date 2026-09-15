@@ -298,9 +298,15 @@ def _verified_pending(connection: sqlite3.Connection, raw_response_id: int) -> t
         _require(all(registered.get(k) == member[k] for k in ("sha256", "byte_size")),
                  "replica recovery quarantine is not hash-bound")
         before = _file_identity(path)
-        body = raw_archive._read_bytes(path, provider_transport.DEFAULT_MAX_ENCODED_BYTES)
-        _require(before == _file_identity(path) and len(body) == member["byte_size"]
-                 and hashlib.sha256(body).hexdigest() == member["sha256"],
+        _require(before[2] == member["byte_size"] <= provider_transport.DEFAULT_MAX_ENCODED_BYTES,
+                 "replica recovery quarantine bytes changed")
+        # The receiver installs root-owned files for the unprivileged reader.
+        # Reuse the manifest-bound replica verifier; the Writer-only raw reader
+        # intentionally requires current-user ownership and must stay strict.
+        from .media_lifecycle import _file as verify_replica_file
+        verified = verify_replica_file(path)
+        _require(before == _file_identity(path)
+                 and all(verified[k] == member[k] for k in ("sha256", "byte_size")),
                  "replica recovery quarantine bytes changed")
     return pending, source
 
