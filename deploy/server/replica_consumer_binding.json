@@ -1,0 +1,12 @@
+{
+  "schema": "dcar-replica-consumer-binding-v1",
+  "schema_version": 24,
+  "source_root": "/var/www/dcar-aigc/api-sources/20260915-data-media-sync-v4/source",
+  "manifest_path": "/var/www/dcar-aigc/api-sources/20260915-data-media-sync-v4/source-manifest.json",
+  "manifest_sha256": "pending-api-v4-manifest",
+  "consumer_identity": {
+    "contract_version": "media-consumer-runtime-v1",
+    "code_sha256": "pending-api-v4-code",
+    "project_root": "/var/www/dcar-aigc/api-sources/20260915-data-media-sync-v4/source"
+  }
+}

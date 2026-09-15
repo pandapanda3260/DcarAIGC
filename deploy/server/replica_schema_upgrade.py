@@ -14,6 +14,7 @@ import stat
 CONTRACT = "dcar-replica-schema-chain-transition-v1"
 SEAL_CONTRACT = "dcar-replica-schema-chain-seal-v1"
 PAIRS = ((21, 22), (22, 23), (23, 24))
+CONSUMER_BINDING = Path(__file__).with_name("replica_consumer_binding.json")
 
 
 def digest(value):
@@ -111,6 +112,50 @@ def verify_consumers(health, expected, impl):
     require(health.get("read_only") is True and health.get("lifecycle_jobs_enabled") is False
         and media.get("current_code_matches_loaded") is True
         and consumer_identity(health) == expected, "read-only consumer code or safety changed", impl)
+
+
+def verify_installed_consumer(config, version, impl, *, require_health=True):
+    """Verify the independent API release after a settled data-only transition.
+
+    The binding belongs to the hash-pinned receiver source. Normal same-schema
+    rollback checks the on-disk reader contract even if the API is unavailable.
+    """
+    state = impl._read_object(config.transition_path) if config.transition_path.exists() else None
+    if version != 24 or not settled(state, version):
+        return False
+    binding = impl._read_object(CONSUMER_BINDING)
+    require(binding.get("schema") == "dcar-replica-consumer-binding-v1"
+        and binding.get("schema_version") == version, "consumer release binding missing", impl)
+    root = impl._canonical_directory(Path(binding["source_root"]))
+    manifest_path = Path(binding["manifest_path"])
+    require(manifest_path == root.parent / "source-manifest.json"
+        and not manifest_path.is_symlink()
+        and impl._sha256(manifest_path) == binding["manifest_sha256"], "consumer source manifest changed", impl)
+    manifest = impl._read_object(manifest_path)
+    require(bool(manifest.get("files")), "consumer source manifest is empty", impl)
+    for row in manifest["files"]:
+        name = Path(row["path"])
+        require(not name.is_absolute() and ".." not in name.parts, "consumer source path is unsafe", impl)
+        path = root / name
+        before = path.lstat()
+        require(path == path.resolve(strict=True) and stat.S_ISREG(before.st_mode)
+            and before.st_nlink == 1 and not before.st_mode & 0o022
+            and before.st_uid in {0, __import__('os').getuid()}
+            and before.st_size == row["byte_size"] and impl._sha256(path) == row["sha256"],
+            "consumer source bytes or permissions changed", impl)
+        after = path.lstat()
+        require((before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns)
+            == (after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns),
+            "consumer source changed while checking", impl)
+    impl._verify_release_contract(root, version)
+    if require_health:
+        health = impl._read_json_url(config.health_url, config.request_timeout_seconds)
+        verify_consumers(health, binding["consumer_identity"], impl)
+        require(health.get("status") == "ok"
+            and health.get("database_state", {}).get("user_version") == version
+            and health["database_state"].get("sha256") == impl._sha256(config.database_root / "dcar_insight.sqlite3"),
+            "consumer is not reading the active database", impl)
+    return True
 
 
 def seal(bundle, config, impl):

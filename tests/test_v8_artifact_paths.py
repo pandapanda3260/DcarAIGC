@@ -97,6 +97,42 @@ class ArtifactRelocationTest(unittest.TestCase):
         self.receipt_path.write_text(json.dumps(self.receipt), encoding="utf-8")
         self.receipt_path.chmod(0o640)
 
+    def image_manifest(self):
+        names = ['data/cache/images/first.bin', 'data/cache/images/second.bin']
+        bodies = [b'\xff\xd8\xff\xe0first', b'\x89PNG\r\n\x1a\nsecond']
+        manifest_name = 'data/cache/images/manifest.json'
+        body = json.dumps({'image_paths': [str(self.writer / name) for name in names]}).encode()
+        for name, payload in [*zip(names, bodies), (manifest_name, body)]:
+            path = self.replica / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload); path.chmod(0o640)
+            self.manifest['files'].append({'project_path': name,
+                'sha256': hashlib.sha256(payload).hexdigest(), 'byte_size': len(payload)})
+        self.write_receipt()
+        return {'local_path': str(self.writer / manifest_name),
+            'sha256': hashlib.sha256(body).hexdigest(), 'byte_size': len(body)}, [self.replica / name for name in names]
+
+    def test_replica_image_manifest_requires_exact_manifest_and_child_bytes(self):
+        from v8.replica_media import manifest_paths
+        row, paths = self.image_manifest()
+        self.assertEqual(manifest_paths(row, project_root=self.replica), paths)
+        with patch.object(api, 'PROJECT_ROOT', self.replica):
+            self.assertEqual(api._artifact_media_paths(row, read_only=True), paths)
+        paths[0].write_bytes(b'same path but substituted image')
+        self.assertEqual(manifest_paths(row, project_root=self.replica), [None, paths[1]])
+        self.assertEqual(manifest_paths({**row, 'sha256': '0' * 64}, project_root=self.replica), [])
+
+    def test_replica_image_manifest_never_borrows_unlisted_or_writable_children(self):
+        from v8.replica_media import manifest_paths
+        row, paths = self.image_manifest()
+        self.manifest['files'] = [r for r in self.manifest['files'] if r['project_path'] != 'data/cache/images/first.bin']
+        self.write_receipt()
+        self.assertEqual(manifest_paths(row, project_root=self.replica), [None, paths[1]])
+        paths[1].chmod(0o660)
+        self.assertEqual(manifest_paths(row, project_root=self.replica), [None, None])
+        with patch.dict(os.environ, {'DCAR_READ_ONLY': '0'}):
+            self.assertEqual(manifest_paths(row, project_root=self.replica), [])
+
     def test_whole_retained_evidence_reads_on_other_root_without_original_bytes(self):
         original_hashes = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in self.originals}
         db_before = self.replica_db.read_bytes()

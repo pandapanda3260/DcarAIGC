@@ -2395,10 +2395,11 @@ def _artifact_media_paths(
             except OSError:
                 return []
         return [path]
-    # Legacy media manifests do not register per-child hashes in SQLite. The
-    # read replica must not serve a same-path but stale child file as evidence.
+    # A v2 snapshot binds the manifest and each child to exact transferred bytes.
+    # Legacy snapshots still cannot authenticate children from SQLite alone.
     if read_only:
-        return []
+        from .replica_media import manifest_paths
+        return manifest_paths(row, project_root=PROJECT_ROOT)
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):

@@ -2293,7 +2293,9 @@ def install_bundle(
             )
         _database_runtime_identity(active, expected_schema=expected_schema)
         if expected_schema in {20, 21, 22, 23, 24}:
-            _verify_release_contract(_current_release(config), expected_schema)
+            from replica_schema_upgrade import verify_installed_consumer
+            if not verify_installed_consumer(config, expected_schema, sys.modules[__name__]):
+                _verify_release_contract(_current_release(config), expected_schema)
             _strict_schema(active, expected_schema)
         return _install_bundle_locked(bundle, config, service_action=service_action, smoke_check=smoke_check,
                                       expected_schema=expected_schema)
@@ -3301,7 +3303,9 @@ def rollback_snapshot(
         _database_runtime_identity(config.database_root / "dcar_insight.sqlite3", expected_schema=expected_schema)
         _database_runtime_identity(source / "dcar_insight.sqlite3", expected_schema=expected_schema)
         if expected_schema in {20, 21, 22, 23, 24}:
-            _verify_release_contract(_current_release(config), expected_schema)
+            from replica_schema_upgrade import verify_installed_consumer
+            if not verify_installed_consumer(config, expected_schema, sys.modules[__name__], require_health=False):
+                _verify_release_contract(_current_release(config), expected_schema)
             _strict_schema(source / "dcar_insight.sqlite3", expected_schema)
         if snapshot_id is None:
             source_receipt = _read_object(source / "install-receipt.json")
