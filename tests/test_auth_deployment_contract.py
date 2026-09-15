@@ -196,22 +196,22 @@ class AuthDeploymentContractTestCase(unittest.TestCase):
             login.replace("验证码服务尚未就绪，请联系管理员更新登录服务。", ""),
         )
         self.assertNotIn("验证码已发送", login)
-        for message in ("账号为 4–32 位字母、数字或下划线", "密码长度需为 8–64 位", "验证码为 6 位数字", "手机号格式不正确"):
+        for message in ("请输入登录账号", "密码长度需为 8–64 位", "验证码为 6 位数字", "手机号格式不正确"):
             self.assertIn(message, login)
 
     def test_registration_copy_preserves_login_and_loading_labels(self) -> None:
         login = (ROOT / "deploy/server/nginx/login.html").read_text(encoding="utf-8")
-        self.assertIn('<label for="reg-username">账号名称</label>', login)
+        self.assertIn('<label for="reg-username">登录账号</label>', login)
         self.assertRegex(
             login,
-            r'<input id="reg-username"[^>]*placeholder="请输入账号名称"',
+            r'<textarea id="reg-username"[^>]*placeholder="请输入登录账号"',
         )
         self.assertIn(
-            'requireValue(inputs[0], "请输入账号名称", USERNAME_PATTERN,', login
+            'requireValue(inputs[0], "请输入登录账号")', login
         )
-        self.assertIn('<label for="username">账号</label>', login)
+        self.assertIn('<label for="username">登录账号</label>', login)
         self.assertRegex(
-            login, r'<input id="username"[^>]*placeholder="请输入账号"'
+            login, r'<textarea id="username"[^>]*placeholder="请输入账号"'
         )
         self.assertIn('<span class="submit-text">完成注册并登录</span>', login)
         self.assertIn(

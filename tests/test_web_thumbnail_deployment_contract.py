@@ -76,7 +76,9 @@ class WebThumbnailDeploymentContractTestCase(unittest.TestCase):
             result = subprocess.run([sys.executable, "-B", "-I", str(helper), "--db", str(database),
                                      "--project-root", str(project), "--ids", "1"],
                                     text=True, capture_output=True, check=True, timeout=8)
-            self.assertEqual(json.loads(result.stdout), {"items": {"1": {"local_url": None, "remote_url": cover}}})
+            self.assertEqual(json.loads(result.stdout), {"items": {"1": {
+                "local_url": None, "remote_url": cover, "remote_urls": [cover], "reason": None,
+            }}})
             self.assertEqual(database.read_bytes(), before)
             self.assertFalse(Path(str(database) + "-wal").exists())
             self.assertFalse(Path(str(database) + "-shm").exists())
@@ -200,6 +202,108 @@ class ReplicaThumbnailRelocationTestCase(unittest.TestCase):
         result = self.run_reader()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIsNone(json.loads(result.stdout)["items"]["1"]["local_url"])
+        self.assertEqual(self.database.read_bytes(), self.database_before)
+
+    def _seal_blob_snapshot(self, manifest: dict) -> None:
+        self.database_before = self.database.read_bytes()
+        digest = hashlib.sha256(self.database_before).hexdigest()
+        manifest["runtime_identity"]["database_schema_version"] = 21
+        manifest["databases"][0]["sha256"] = digest
+        self.manifest.write_text(json.dumps(manifest))
+        receipt = json.loads(self.receipt.read_text())
+        receipt["runtime_identity"] = manifest["runtime_identity"]
+        receipt["database_sha256"]["dcar_insight.sqlite3"] = digest
+        receipt["manifest_sha256"] = hashlib.sha256(self.manifest.read_bytes()).hexdigest()
+        self.receipt.write_text(json.dumps(receipt))
+
+    def _create_blob_ledger(self, connection: sqlite3.Connection) -> None:
+        connection.executescript("""
+            PRAGMA user_version=21;
+            ALTER TABLE provider_raw_responses ADD COLUMN raw_blob_id INTEGER;
+            CREATE TABLE provider_raw_blobs(
+                id INTEGER PRIMARY KEY,hot_path TEXT,hot_state TEXT,codec TEXT,codec_version TEXT,
+                stored_sha256 TEXT,stored_size INTEGER,entity_sha256 TEXT,entity_size INTEGER);
+        """)
+
+    def _cas_snapshot(self) -> dict:
+        import zstandard
+
+        entity = json.dumps({"aweme_id": "111", "video": {"cover": {"url_list": [self.cover]}}}).encode()
+        entity_sha = hashlib.sha256(entity).hexdigest()
+        stored = zstandard.ZstdCompressor().compress(entity)
+        stored_sha = hashlib.sha256(stored).hexdigest()
+        manifest = json.loads(self.manifest.read_text())
+        manifest["files"] = []
+        with sqlite3.connect(self.database) as connection:
+            self._create_blob_ledger(connection)
+            for content_id, listed, outside, damaged in (
+                (1, True, False, False), (2, False, False, False),
+                (3, False, True, False), (4, True, False, True),
+            ):
+                relative = f"data/cache/v8/raw_responses/blobs-v1/{content_id}/{entity_sha}.zstd-3-v1.zst"
+                physical = self.root / "outside.zst" if outside else self.project / relative
+                physical.parent.mkdir(parents=True, exist_ok=True)
+                physical.write_bytes(stored + b"damaged" if damaged else stored)
+                source = physical if outside else self.writer / relative
+                if listed:
+                    manifest["files"].append({"project_path": relative, "sha256": stored_sha, "byte_size": len(stored)})
+                connection.execute("INSERT INTO provider_raw_blobs VALUES(?,?,'present','zstd','zstd-3-v1',?,?,?,?)",
+                                   (content_id, str(source), stored_sha, len(stored), entity_sha, len(entity)))
+                connection.execute("UPDATE provider_raw_responses SET local_path=?,sha256=?,byte_size=?,raw_blob_id=? WHERE id=?",
+                                   (str(source), stored_sha, len(stored), content_id, content_id))
+        self._seal_blob_snapshot(manifest)
+        return manifest
+
+    def test_schema21_cas_requires_snapshot_membership_and_stored_file_receipt(self) -> None:
+        self._cas_snapshot()
+        result = self.run_reader()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        items = json.loads(result.stdout)["items"]
+        self.assertEqual(items["1"]["remote_url"], self.cover)
+        for content_id in ("2", "3", "4"):
+            self.assertIsNone(items[content_id]["remote_url"])
+        self.assertEqual(self.database.read_bytes(), self.database_before)
+        self.assertFalse(Path(str(self.database) + "-wal").exists())
+        self.assertFalse(Path(str(self.database) + "-shm").exists())
+
+    def test_schema21_cas_managed_original_member_does_not_authorize_file_read(self) -> None:
+        manifest = self._cas_snapshot()
+        member = manifest["files"].pop(0)
+        manifest["managed_originals"]["bundles"] = [{"members": [member]}]
+        self._seal_blob_snapshot(manifest)
+        result = self.run_reader()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNone(json.loads(result.stdout)["items"]["1"]["remote_url"])
+
+    def test_schema21_cas_optional_file_receipt_remains_usable(self) -> None:
+        manifest = self._cas_snapshot()
+        manifest["optional_reuse_files"] = [manifest["files"].pop(0)]
+        self._seal_blob_snapshot(manifest)
+        result = self.run_reader()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["items"]["1"]["remote_url"], self.cover)
+
+    def test_legacy_blob_uses_authorized_original_path_without_cache_or_retirement_bypass(self) -> None:
+        manifest = json.loads(self.manifest.read_text())
+        with sqlite3.connect(self.database) as connection:
+            self._create_blob_ledger(connection)
+            checksum, size = connection.execute("SELECT sha256,byte_size FROM provider_raw_responses WHERE id=1").fetchone()
+            connection.execute("INSERT INTO provider_raw_blobs VALUES(1,?,'present','identity','legacy-identity-copy-v1',?,?,?,?)",
+                               (str(self.root / "migration-copies" / "raw.json"), checksum, size, checksum, size))
+            connection.execute("UPDATE provider_raw_responses SET raw_blob_id=1 WHERE id IN (1,2)")
+        self._seal_blob_snapshot(manifest)
+        result = self.run_reader()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        items = json.loads(result.stdout)["items"]
+        self.assertEqual(items["1"]["remote_url"], self.cover)
+        # Both responses share a blob, but only the first original path is listed.
+        self.assertIsNone(items["2"]["remote_url"])
+        with sqlite3.connect(self.database) as connection:
+            connection.execute("UPDATE provider_raw_blobs SET hot_state='evicted' WHERE id=1")
+        self._seal_blob_snapshot(manifest)
+        result = self.run_reader()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNone(json.loads(result.stdout)["items"]["1"]["remote_url"])
         self.assertEqual(self.database.read_bytes(), self.database_before)
 
 

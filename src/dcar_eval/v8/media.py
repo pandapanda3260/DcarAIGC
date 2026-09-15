@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 import stat
 import subprocess
@@ -83,8 +84,28 @@ class _ResponseTargetCollisionError(MediaProcessingError):
     """A response path was occupied before this request could create it."""
 
 
+def _is_wechat_http_media_url(value: str, parsed: Any) -> bool:
+    """Allow only the exact HTTP download form observed in verified detail raw.
+
+    Keep it canonical already: encrypted media binds the original full URL to
+    the registered source, so normalizing a port, host or fragment would break
+    that identity. The signed query is deliberately neither parsed nor rebuilt.
+    """
+    return (
+        value.startswith("http://")
+        and parsed.scheme == "http"
+        and parsed.netloc == "wxapp.tc.qq.com"
+        and re.fullmatch(r"/[0-9]+/[0-9]+/stodownload", parsed.path) is not None
+        and not getattr(parsed, "params", "")
+        and not parsed.fragment
+        and value == value.strip() == parsed.geturl()
+        and not any(ord(char) <= 32 or ord(char) == 127 for char in value)
+        and "\\" not in value
+    )
+
+
 def is_supported_media_url(value: str) -> bool:
-    """Allow HTTPS sources and the HTTP-only Xiaohongshu media CDN."""
+    """Allow HTTPS and the specifically observed HTTP media CDN contracts."""
 
     try:
         parsed = urllib.parse.urlparse(value)
@@ -93,8 +114,9 @@ def is_supported_media_url(value: str) -> bool:
     if parsed.scheme == "https" and bool(parsed.hostname):
         return True
     hostname = (parsed.hostname or "").lower()
-    return parsed.scheme == "http" and hostname.endswith(
-        (".rednotecdn.com", ".xhscdn.com")
+    return parsed.scheme == "http" and (
+        hostname.endswith((".rednotecdn.com", ".xhscdn.com", ".kwaicdn.com"))
+        or _is_wechat_http_media_url(value, parsed)
     )
 
 
@@ -113,7 +135,10 @@ def _normalize_media_url(value: str) -> Optional[str]:
         return None
     if scheme == "https":
         pass
-    elif scheme == "http" and hostname.endswith((".rednotecdn.com", ".xhscdn.com")):
+    elif scheme == "http" and (
+        hostname.endswith((".rednotecdn.com", ".xhscdn.com", ".kwaicdn.com"))
+        or _is_wechat_http_media_url(value, parsed)
+    ):
         pass
     else:
         return None
@@ -1014,6 +1039,16 @@ def _atomic_json(path: Path, value: Any) -> None:
     temporary.replace(path)
 
 
+
+def _invalidate_duplicate_artifact(connection: sqlite3.Connection, content_id: int, artifact_type: str) -> None:
+    if artifact_type not in {"media_source", "media", "media_manifest", "media_lifecycle_manifest",
+                             "asr", "transcript", "media_transcript", "ocr", "media_ocr"}:
+        return
+    if int(connection.execute("PRAGMA user_version").fetchone()[0]) >= 24:
+        from .duplicate_index import active_generation, invalidate_content
+        if active_generation(connection) is not None:
+            invalidate_content(connection, content_id, reason=f"artifact_changed:{artifact_type}")
+
 def register_artifact(
     connection: sqlite3.Connection,
     *,
@@ -1064,6 +1099,8 @@ def register_artifact(
                 local_path=local_path, sha256=str(row["sha256"]),
                 processor_version=str(row["processor_version"]),
             )
+        if (row["sha256"] != sha256 or row["status"] != "available" or row["metadata_json"] != metadata_value):
+            _invalidate_duplicate_artifact(connection, content_id, artifact_type)
         connection.execute(
             """
             UPDATE evidence_artifacts
@@ -1081,6 +1118,7 @@ def register_artifact(
             ),
         )
     else:
+        _invalidate_duplicate_artifact(connection, content_id, artifact_type)
         cursor = connection.execute(
             """
             INSERT INTO evidence_artifacts(
@@ -1238,7 +1276,10 @@ def managed_bound_artifact(
     bundle = _managed_bundle(connection, content_id)
     if bundle is None:
         if _has_managed_history(connection, content_id):
-            raise LifecycleError("managed_source_pending")
+            from .media_source_refresh import authorized_source_request
+            source = connection.execute("SELECT id FROM evidence_artifacts WHERE content_id=? AND artifact_type='media_source' AND status='available' ORDER BY id DESC LIMIT 1", (content_id,)).fetchone()
+            if source is None or not authorized_source_request(connection, content_id, int(source[0])):
+                raise LifecycleError("managed_source_pending")
         return None, None
     types = tuple(artifact_types)
     manifest = bundle["manifest"]
@@ -1353,10 +1394,18 @@ def _download_intent(
         if active is not None and old is None:
             raise LifecycleError("managed_source_required")
         return None
+    reacquire_id = None
+    with connect(db_path) as connection:
+        if _has_managed_history(connection, content_id):
+            from .media_source_refresh import authorized_source_request
+            reacquire_id = authorized_source_request(connection, content_id, source_artifact_id)
+            if reacquire_id is None:
+                raise LifecycleError("explicit_reacquire_contract_not_bound")
     return prepare_download(
         content_id, source_artifact_id=source_artifact_id, media_root=media_root,
         db_path=db_path, preclaimed_slot_id=preclaimed_slot_id,
         download_source_sha256=source_sha256,
+        reacquire_request_id=reacquire_id,
     )
 
 
@@ -2317,6 +2366,8 @@ def _download_video(
     reuse_existing: bool = True,
     maximum_duration_seconds: Optional[float] = None,
     trusted_root: Optional[Path] = None,
+    decryption_material: Optional[Mapping[str, str]] = None,
+    decryption_receipt: Optional[Dict[str, Any]] = None,
 ) -> Path:
     if not reuse_existing and os.path.lexists(target):
         raise MediaProcessingError("video response target already exists")
@@ -2348,6 +2399,14 @@ def _download_video(
                     response,
                     maximum_bytes=maximum_bytes,
                 )
+            if decryption_material is not None:
+                from .wechat_video_crypto import decrypt_spool, WeChatDecryptionError
+                if url != decryption_material["url"]:
+                    raise WeChatDecryptionError("decryption_material_missing")
+                decoded = decrypt_spool(spool.handle, decryption_material["decode_key"])
+                spool.sha256, spool.header = decoded["sha256"], decoded["header"]
+                if decryption_receipt is not None:
+                    decryption_receipt.update({key: value for key, value in decoded.items() if key != "header"})
             _after_bounded_response_write(candidate)
             if os.path.lexists(candidate):
                 raise _ResponseTargetCollisionError(
@@ -2360,6 +2419,16 @@ def _download_video(
                 maximum_duration_seconds=maximum_duration_seconds,
                 inherited_descriptor=descriptor,
             ):
+                if decryption_material is not None:
+                    # A playable first frame does not prove a complete decrypt.
+                    validation = subprocess.run(
+                        ["ffmpeg", "-nostdin", "-v", "error", "-xerror", "-i", str(descriptor_path),
+                         "-map", "0:v:0", "-map", "0:a?", "-f", "null", "-"],
+                        check=False, capture_output=True, timeout=120, pass_fds=(descriptor,),
+                    )
+                    if validation.returncode:
+                        from .wechat_video_crypto import WeChatDecryptionError
+                        raise WeChatDecryptionError("decryption_failed")
                 if os.path.lexists(target):
                     raise _ResponseTargetCollisionError(
                         "video response target changed during download"
@@ -2448,16 +2517,43 @@ def download_video_sources(
         raise MediaProcessingError(f"unknown content {content_id}")
     if type(content["platform"]) is not str or content["content_type"] != "video":
         raise MediaProcessingError("video download content identity drifted")
+    decryption_material = None
+    decryption_receipt: Dict[str, Any] = {}
     source_artifact_id: Optional[int] = None
     if source_rows:
         source_urls, source_manifest_sha256 = _validated_video_media_source(
             source_rows[0]
         )
+        if content["platform"] == "wechat_channels":
+            source_metadata = json.loads(source_rows[0]["metadata_json"])
+            decryption_material = verified_wechat_media_material(
+                content_id, int(source_metadata["raw_response_id"]), db_path=db_path,
+            )
+            if source_urls != [decryption_material["url"]]:
+                raise MediaProcessingError("encrypted video URL differs from its source raw")
+            decryption_receipt.update({"source_raw_response_id": source_metadata["raw_response_id"],
+                                      "source_raw_sha256": decryption_material["raw_sha256"]})
+            # A replay validates the immutable plaintext artifact and its
+            # original decrypt receipt; it does not download/decrypt again.
+            with connect(db_path) as connection:
+                cached_rows = connection.execute("SELECT e.sha256,e.metadata_json FROM media_processing_slots s JOIN evidence_artifacts e ON e.id=s.output_artifact_id WHERE s.content_id=? AND s.processor_type='download' AND s.source_sha256=? AND s.status='succeeded' ORDER BY s.id DESC LIMIT 1",
+                    (content_id, source_rows[0]["sha256"])).fetchall()
+            for cached in cached_rows:
+                proof = json.loads(cached["metadata_json"]).get("decryption")
+                if (not isinstance(proof, dict) or proof.get("source_raw_response_id") != source_metadata["raw_response_id"]
+                        or proof.get("source_raw_sha256") != decryption_material["raw_sha256"]
+                        or proof.get("algorithm") != decryption_material["algorithm"] or proof.get("sha256") != cached["sha256"]
+                        or not _valid_sha256(proof.get("encrypted_sha256")) or type(proof.get("byte_size")) is not int):
+                    raise MediaProcessingError("encrypted media receipt differs from its source")
+                decryption_receipt.update(proof)
         if source_urls != values or source_manifest_sha256 != source_sha256:
             raise MediaProcessingError(
                 "video download URLs do not match current media_source"
             )
         source_artifact_id = int(source_rows[0]["id"])
+    elif content["platform"] == "wechat_channels":
+        from .wechat_video_crypto import WeChatDecryptionError
+        raise WeChatDecryptionError("decryption_material_missing")
     effective_media_root = media_root if media_root is not None else MEDIA_ROOT
     link_id = _validated_link_id(content["link_id"])
     target = (
@@ -2561,6 +2657,8 @@ def download_video_sources(
                     require_exact_response_url=require_exact_response_url,
                     reuse_existing=reuse_existing,
                     maximum_duration_seconds=maximum_duration_seconds,
+                    **({"decryption_material": decryption_material,
+                        "decryption_receipt": decryption_receipt} if decryption_material else {}),
                 )
         if (
             urlopen_fn is None
@@ -2569,6 +2667,7 @@ def download_video_sources(
             and download_urls is None
             and reuse_existing
             and maximum_duration_seconds is None
+            and decryption_material is None
         ):
             return _download_video(values, target)
         return _download_video(
@@ -2579,6 +2678,8 @@ def download_video_sources(
             require_exact_response_url=require_exact_response_url,
             reuse_existing=reuse_existing,
             maximum_duration_seconds=maximum_duration_seconds,
+            **({"decryption_material": decryption_material,
+                "decryption_receipt": decryption_receipt} if decryption_material else {}),
         )
 
     def registered(connection: sqlite3.Connection, artifact: Artifact, slot_id: int) -> None:
@@ -2595,7 +2696,8 @@ def download_video_sources(
         processor_version=VIDEO_DOWNLOAD_VERSION,
         artifact_type="media",
         produce=produce,
-        metadata={"source_count": len(values), "source_sha256": source_sha256},
+        metadata={"source_count": len(values), "source_sha256": source_sha256,
+                  **({"decryption": decryption_receipt} if decryption_material else {})},
         source_aliases=(
             (legacy_sha256,)
             if effective_slot_source_sha256 == source_sha256
@@ -2884,6 +2986,67 @@ def _stage_private_media_source_json(
     return published_evidence
 
 
+def verified_wechat_media_material(content_id: int, raw_response_id: int, *, db_path: Path) -> Dict[str, str]:
+    """Read key and URL from one integrity-checked raw, bound to this author/work."""
+    from . import capture, providers
+    from .wechat_video_crypto import media_material, WeChatDecryptionError
+    with connect(db_path) as connection:
+        content = connection.execute("SELECT * FROM content_items WHERE id=?", (content_id,)).fetchone()
+        raw = connection.execute("SELECT * FROM provider_raw_responses WHERE id=?", (raw_response_id,)).fetchone()
+        if (content is None or raw is None or content["platform"] != "wechat_channels"
+                or raw["content_id"] != content_id or raw["provider"] != "TikHub"
+                or not content["platform_content_id"] or not content["raw_account_uid"]):
+            raise WeChatDecryptionError("decryption_material_missing")
+        _, payload = capture._read_verified_raw_response(raw, connection=connection)
+        parsed = providers._parse_content_payload("wechat_channels", "detail", str(content["platform_content_id"]),
+            "video", payload, status=raw["http_status"] or 200,
+            expected_uid=str(content["raw_account_uid"])).data
+        result = media_material(parsed)
+        return {**result, "raw_sha256": str(raw["sha256"])}
+
+
+def _cached_wechat_decryption_proof(connection: sqlite3.Connection, source: Mapping[str, Any],
+                                   artifact: Mapping[str, Any]) -> Dict[str, Any]:
+    from .wechat_video_crypto import VERSION
+    source_metadata = json.loads(source["metadata_json"])
+    proof = json.loads(artifact["metadata_json"]).get("decryption")
+    raw = connection.execute("SELECT sha256 FROM provider_raw_responses WHERE id=?", (source_metadata.get("raw_response_id"),)).fetchone()
+    fields = {"algorithm", "encrypted_sha256", "sha256", "byte_size", "source_raw_response_id", "source_raw_sha256"}
+    if (not isinstance(proof, dict) or set(proof) != fields or raw is None
+            or proof["source_raw_response_id"] != source_metadata["raw_response_id"] or proof["source_raw_sha256"] != raw[0]
+            or proof["algorithm"] != VERSION or proof["sha256"] != artifact["sha256"]
+            or not _valid_sha256(proof["encrypted_sha256"]) or type(proof["byte_size"]) is not int
+            or proof["byte_size"] != artifact["byte_size"]):
+        raise MediaProcessingError("encrypted media receipt differs from its source")
+    return proof
+
+
+def store_media_source_from_detail(content_id: int, data: Mapping[str, Any], *, raw_response_id: int,
+                                   db_path: Path = DEFAULT_DB, media_root: Optional[Path] = None) -> Optional[Artifact]:
+    """Register ordinary and encrypted sources through the same manifest DAG."""
+    with connect(db_path) as connection:
+        content = connection.execute("SELECT platform,content_type FROM content_items WHERE id=?", (content_id,)).fetchone()
+    if content is None:
+        raise MediaProcessingError("unknown content")
+    from .media_work_queue import local_media_supported
+    if not local_media_supported(str(content["platform"]), str(content["content_type"])):
+        return None
+    urls = [value for value in data.get("media_urls", []) if isinstance(value, str)]
+    if content["platform"] == "wechat_channels":
+        # Do not turn a missing key into a second provider request or block the
+        # already validated detail/metrics facts. The pending view reports it.
+        from .wechat_video_crypto import WeChatDecryptionError
+        try:
+            material = verified_wechat_media_material(content_id, raw_response_id, db_path=db_path)
+        except WeChatDecryptionError as error:
+            if error.error_code != "decryption_material_missing":
+                raise
+            return None
+        urls = [material["url"]]
+    return store_media_source_manifest(content_id, media_kind=str(content["content_type"]),
+        urls=urls, raw_response_id=raw_response_id, db_path=db_path, media_root=media_root)
+
+
 def store_media_source_manifest(
     content_id: int,
     *,
@@ -2977,6 +3140,8 @@ def store_media_source_manifest(
     try:
         _before_media_source_manifest_commit(content_id)
         with connect(db_path) as connection, transaction(connection):
+            from .capture_transport_recovery import assert_local_recovery_owner
+            assert_local_recovery_owner(connection, content_id=content_id, raw_response_id=raw_response_id)
             current = connection.execute(
                 "SELECT link_id,content_type FROM content_items WHERE id=?",
                 (content_id,),
@@ -5891,6 +6056,10 @@ def process_content_media(
                 frozen_image_groups=effective_groups,
                 db_path=db_path,
             )
+            with connect(db_path) as connection:
+                from .media_source_refresh import authorized_source_request
+                if authorized_source_request(connection, content_id, int(source_artifact["id"])):
+                    reuse_legacy = False
             if media_kind == "video":
                 media = download_video_sources(
                     content_id,
@@ -6217,6 +6386,13 @@ def _current_recovery_download(
             return None
         effective_root = Path(bundle["instance_root"])
     if media_kind == "video":
+        expected_metadata: Dict[str, Any] = {"source_count": len(urls), "source_sha256": flat_source_sha256}
+        if platform == "wechat_channels":
+            saved = connection.execute("SELECT * FROM evidence_artifacts WHERE id=?", (output_artifact_id,)).fetchone()
+            try:
+                expected_metadata["decryption"] = _cached_wechat_decryption_proof(connection, source_row, saved)
+            except (TypeError, ValueError, MediaProcessingError):
+                return None
         artifact = _validated_recovery_artifact(
             connection,
             artifact_id=output_artifact_id,
@@ -6231,10 +6407,7 @@ def _current_recovery_download(
                 / "source.mp4"
             ),
             expected_root=effective_root,
-            expected_metadata={
-                "source_count": len(urls),
-                "source_sha256": flat_source_sha256,
-            },
+            expected_metadata=expected_metadata,
         )
     else:
         expected_manifest = (
@@ -6940,6 +7113,7 @@ def run_media_download_queue(
                 "content_id": content_id,
                 "status": status,
                 "error": f"{type(exc).__name__}: {exc}"[:500],
+                "error_code": str(getattr(exc, "error_code", type(exc).__name__)),
             }
 
     workers = max(1, min(max_workers, len(content_ids))) if content_ids else 1

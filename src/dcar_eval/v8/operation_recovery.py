@@ -109,8 +109,11 @@ def _usage_failure_deadline(connection: sqlite3.Connection, state: dict) -> date
         hard = error in {"storage_hard", "provider_auth_blocked", "provider_balance_blocked",
             "field_contract_invalid", "semantic_error", "recovery_response_contract_invalid",
             "authorization_token_invalid", "authorization_scope_missing", "authorization_refresh_failed"}
-        uncertain = error == "transport_error" or any(transport.get(key) is False
-            for key in ("clean_eof", "length_match", "gzip_crc_ok"))
+        from .provider_transport import CONTENT_ENTITY_OPERATIONS, usable_content_entity
+        content_completed = (state["operation"] in CONTENT_ENTITY_OPERATIONS and details.get("state") == "completed"
+            and not error and usable_content_entity(transport, state["operation"]))
+        uncertain = not content_completed and (error == "transport_error" or any(transport.get(key) is False
+            for key in ("clean_eof", "length_match", "gzip_crc_ok")))
         matches = not hard and (limited if state["fault_class"] == "rate_limit" else uncertain and not limited)
         if not matches:
             continue
@@ -240,13 +243,14 @@ def _verified_success(connection: sqlite3.Connection, usage_id: int, raw_respons
         return False
     details = budget._details(row["details_json"])
     transport = details.get("transport", {})
+    from .provider_transport import usable_content_entity
     if (details.get("state") != "completed" or details.get("raw_response_id") != raw_response_id
             or raw["provider"].lower() != "tikhub" or raw["operation"] != row["operation"]
-            or transport.get("clean_eof") is not True or transport.get("json_parse_ok") is not True
+            or not usable_content_entity(transport, row["operation"])
             or transport.get("length_match") is False or transport.get("gzip_crc_ok") is False
             or type(transport.get("http_status")) is not int or not 200 <= transport["http_status"] < 300):
         return False
-    if connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}:
+    if connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21, 22, 23, 24}:
         entity = raw_archive.read_response_entity(connection, raw_response_id)
     else:
         path = Path(raw["local_path"])

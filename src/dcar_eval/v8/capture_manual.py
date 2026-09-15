@@ -34,7 +34,10 @@ def _transport_history(connection: sqlite3.Connection, operation: str) -> tuple[
         details = json.loads(row["details_json"])
         in_flight |= details.get("state") in {"reserved", "sent"}
         transport = details.get("transport") or {}
-        if row["request_attempts"] == 1 and (details.get("error_code") == "transport_error" or any(
+        from .provider_transport import CONTENT_ENTITY_OPERATIONS, usable_content_entity
+        content_completed = (operation in CONTENT_ENTITY_OPERATIONS and details.get("state") == "completed"
+            and not details.get("error_code") and usable_content_entity(transport, operation))
+        if row["request_attempts"] == 1 and not content_completed and (details.get("error_code") == "transport_error" or any(
             transport.get(key) is False for key in ("clean_eof", "length_match", "gzip_crc_ok")
         )):
             uncertain.append((int(row["id"]), str(details.get("sent_at") or row["recorded_at"])))
@@ -69,11 +72,9 @@ def freeze_transport_retry(connection: sqlite3.Connection, specification: dict[s
     latest_failure = max([parse_time(fault["opened_at"]), *[parse_time(item[1]) for item in uncertain]])
     if in_flight or parse_time(at) - latest_failure < TRANSPORT_RETRY_COOLDOWN:
         raise _blocked("manual_transport_retry_cooldown", "Transport retry requires no in-flight request and five minutes since the latest uncertain send")
-    if content["platform"] == "douyin":
-        _, params = providers._douyin_request(target["source_stage"], content["platform_content_id"])
-    else:
-        row = connection.execute("SELECT content_type FROM content_items WHERE id=?", (content["content_id"],)).fetchone()
-        _, params = providers._xhs_request("metrics", content["platform_content_id"], row[0])
+    row = connection.execute("SELECT content_type FROM content_items WHERE id=?", (content["content_id"],)).fetchone()
+    params = providers._content_request_params(content["platform"], target["source_stage"],
+        content["platform_content_id"], row[0])
     identity = providers._paid_request_identity(operation=operation, platform=content["platform"],
         subject=content["platform_content_id"], params=params, cursor=None, due_bucket=target["logical_due"])
     return {"contract": TRANSPORT_RETRY_CONTRACT, "operation": operation,
@@ -142,7 +143,7 @@ def freeze_target(connection: sqlite3.Connection, content_id: int) -> dict[str, 
         "WHERE c.id=? AND " + canonical_content_predicate(connection, alias="c"),
         (content_id,),
     ).fetchone()
-    if row is None or row["platform"] not in {"douyin", "xiaohongshu"} or not row["platform_content_id"]:
+    if row is None or row["platform"] not in {"douyin", "xiaohongshu", "kuaishou", "wechat_channels"} or not row["platform_content_id"]:
         raise _blocked("identity_unresolved", "Manual content has no supported managed identity")
     if row["raw_account_uid"] and row["uid"] and str(row["raw_account_uid"]) != str(row["uid"]):
         raise _blocked("identity_conflict", "Content author conflicts with managed identity")
@@ -171,7 +172,7 @@ def validate_command(connection: sqlite3.Connection, command_run_id: int, *,
         if (details["contract_version"] != durable_runs.CONTRACT_VERSION
                 or identity["contract_version"] != CONTRACT
                 or details["scan_id"] != scan_id or row["scheduled_for"] != "scan:" + scan_id
-                or spec["kind"] not in {"manual_update", "media_retry", "metrics_update"}
+                or spec["kind"] not in {"manual_update", "media_retry", "metrics_update", "media_source_refresh"}
                 or not isinstance(spec["targets"], list) or not spec["targets"]
                 or spec["content_id"] != content_id
                 or not isinstance(spec["frozen_target"], dict)):
@@ -197,6 +198,9 @@ def validate_command(connection: sqlite3.Connection, command_run_id: int, *,
                and (stage is None or item.get("stage") == stage)]
     if not matches:
         raise _blocked("manual_operation_not_requested", "Operation is outside the requested content update")
+    if spec["kind"] == "media_source_refresh":
+        from .media_source_refresh import validate_command_proposal
+        validate_command_proposal(connection, spec, command_run_id)
     return spec
 
 

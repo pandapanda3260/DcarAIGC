@@ -43,8 +43,8 @@
   },
   "metric_supplement_groups": {
     "douyin": [
-      {"name": "detail_counts", "stage": "detail", "fields": ["comment_count", "collect_count"]},
-      {"name": "statistics", "stage": "metrics", "fields": ["view_count", "like_count", "share_count"]}
+      {"name": "detail_counts", "stage": "detail", "fields": ["comment_count", "share_count", "collect_count"]},
+      {"name": "statistics", "stage": "metrics", "fields": ["view_count", "like_count"]}
     ],
     "xiaohongshu": [
       {"name": "note_counts", "stage": "metrics", "fields": ["comment_count", "like_count", "share_count", "collect_count"]}

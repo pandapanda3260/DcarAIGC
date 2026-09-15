@@ -44,6 +44,16 @@ PRICES_MICROUSD = {
     "douyin_video_high_quality_play_url": 5000,
     "xiaohongshu_user_posts": 10000, "xiaohongshu_note_detail": 10000,
     "xiaohongshu_note_statistics": 10000, "xiaohongshu_note_comments": 10000,
+    "xiaohongshu_user_profile": 10000,
+    "xiaohongshu_user_search": 10000,
+    "douyin_sec_profile": 1000, "douyin_display_profile": 1000,
+    "kuaishou_user_profile": 10000, "kuaishou_user_posts": 10000,
+    "kuaishou_web_profile": 2000, "kuaishou_video_detail": 1000,
+    "kuaishou_video_statistics": 1000,
+    "wechat_channels_resolve": 10000, "wechat_channels_channel_info": 10000,
+    "wechat_channels_user_profile": 10000, "wechat_channels_user_posts": 10000,
+    "wechat_channels_video_detail": 10000, "wechat_channels_video_statistics": 10000,
+    "wechat_channels_video_comments": 10000,
 }
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 TIKHUB_NETWORK_CONCURRENCY = 4
@@ -70,7 +80,11 @@ PROBEABLE_PROVIDER_FAULTS = frozenset(
     {"balance", "application_auth", "provider_outage", "global_quota"}
 )
 DISCOVERY_OPERATIONS = frozenset(
-    {"douyin_uid_profile", "douyin_user_posts", "xiaohongshu_user_posts"}
+    {"douyin_uid_profile", "douyin_user_posts", "xiaohongshu_user_posts", "xiaohongshu_user_profile",
+     "douyin_sec_profile", "douyin_display_profile", "xiaohongshu_user_search",
+     "kuaishou_user_profile", "kuaishou_web_profile", "kuaishou_user_posts",
+     "wechat_channels_resolve", "wechat_channels_channel_info", "wechat_channels_user_profile",
+     "wechat_channels_user_posts"}
 )
 
 
@@ -109,6 +123,10 @@ class PaidScope:
     business_day: str | None = None
     manual_command_run_id: int | None = None
     catalog_plan_id: int | None = None
+    intake_request_id: int | None = None
+    preparation_plan_id: int | None = None
+    preparation_key: str | None = None
+    preparation_subject: str | None = None
 
 
 _SCOPE: ContextVar[PaidScope] = ContextVar("tikhub_paid_scope", default=PaidScope())
@@ -130,10 +148,23 @@ def paid_scope(
     compensation_authorization_id: int | None = None,
     manual_command_run_id: int | None = None,
     catalog_plan_id: int | None = None,
+    intake_request_id: int | None = None,
+    preparation_plan_id: int | None = None,
+    preparation_key: str | None = None,
+    preparation_subject: str | None = None,
 ) -> Iterator[PaidScope]:
     if purpose not in CATEGORY_MICROUSD:
         raise PaidScopeBlocked("unknown_paid_purpose", "Paid purpose is not in the fixed policy")
     parent = _SCOPE.get()
+    preparation_fields = {"intake_request_id": intake_request_id,
+        "preparation_plan_id": preparation_plan_id, "preparation_key": preparation_key,
+        "preparation_subject": preparation_subject}
+    for field, item in preparation_fields.items():
+        if item is not None and getattr(parent, field) not in (None, item):
+            raise PaidScopeBlocked("preparation_scope_changed", "Nested preparation target changed")
+    if (intake_request_id or parent.intake_request_id) and (catalog_plan_id or parent.catalog_plan_id
+            or manual_command_run_id or parent.manual_command_run_id):
+        raise PaidScopeBlocked("paid_scope_mismatch", "Preparation cannot borrow content authority")
     if catalog_plan_id is not None and (type(catalog_plan_id) is not int or catalog_plan_id <= 0
             or parent.catalog_plan_id not in (None, catalog_plan_id)):
         raise PaidScopeBlocked("catalog_plan_invalid", "Nested capture cannot change its catalog plan")
@@ -179,6 +210,8 @@ def paid_scope(
         manual_command_run_id=(manual_command_run_id if manual_command_run_id is not None
                                else parent.manual_command_run_id),
         catalog_plan_id=catalog_plan_id if catalog_plan_id is not None else parent.catalog_plan_id,
+        **{field: item if item is not None else getattr(parent, field)
+           for field, item in preparation_fields.items()},
     )
     token = _SCOPE.set(value)
     try:
@@ -622,16 +655,39 @@ def _fault_job_id(scope: Mapping[str, Any], fault_class: str) -> str:
     return f"{_fault_job_prefix(scope)}{class_digest}"
 
 
+def _scheduler_fault_rows(
+    connection: sqlite3.Connection, columns: str, predicate: str,
+    parameters: tuple[Any, ...] = (), *, suffix: str = "",
+):
+    """Read every root and child with the existing schema20 partial indexes.
+
+    All SQL fragments are fixed by the three callers below. Splitting on NULL
+    is exhaustive and disjoint; the original predicate, collation and final
+    ordering/limit apply unchanged. Each invocation reads the current ledger.
+    """
+    if connection.execute("PRAGMA user_version").fetchone()[0] == 24:
+        return connection.execute(
+            f"SELECT {columns} FROM scheduler_runs INDEXED BY uq_scheduler_root_slot "
+            f"WHERE root_run_id IS NULL AND ({predicate}) UNION ALL "
+            f"SELECT {columns} FROM scheduler_runs INDEXED BY uq_scheduler_child_slot "
+            f"WHERE root_run_id IS NOT NULL AND ({predicate}) {suffix}",
+            parameters + parameters,
+        )
+    return connection.execute(
+        f"SELECT {columns} FROM scheduler_runs WHERE {predicate} {suffix}", parameters,
+    )
+
+
 def _v2_fault_states(
     connection: sqlite3.Connection, scope: Mapping[str, Any]
 ) -> list[dict[str, Any]]:
     """Return the latest append-only event for each fault class in a scope."""
 
     latest: dict[str, dict[str, Any]] = {}
-    for row in connection.execute(
-        """SELECT id,details_json FROM scheduler_runs
-           WHERE job_id LIKE ? ORDER BY id DESC""",
+    for row in _scheduler_fault_rows(
+        connection, "id,details_json", "job_id LIKE ?",
         (f"{_fault_job_prefix(scope)}%",),
+        suffix="ORDER BY id DESC",
     ):
         details = _details(row["details_json"])
         fault_class = details.get("fault_class")
@@ -647,9 +703,9 @@ def _v2_fault_states(
 
 
 def _legacy_provider_circuit(connection: sqlite3.Connection) -> dict[str, Any] | None:
-    row = connection.execute(
-        """SELECT id,details_json FROM scheduler_runs
-           WHERE job_id='provider_circuit:tikhub' ORDER BY id DESC LIMIT 1"""
+    row = _scheduler_fault_rows(
+        connection, "id,details_json", "job_id='provider_circuit:tikhub'",
+        suffix="ORDER BY id DESC LIMIT 1",
     ).fetchone()
     if row is None:
         return None
@@ -728,13 +784,13 @@ def fault_state(
         legacy = _legacy_provider_circuit(connection)
         if legacy is not None and legacy.get("open") is True:
             legacy_id = int(legacy["receipt_id"])
-            legacy_bound = connection.execute(
-                """SELECT 1 FROM scheduler_runs WHERE job_id LIKE ?
+            legacy_bound = _scheduler_fault_rows(
+                connection, "1", """job_id LIKE ?
                      AND json_valid(details_json)
                      AND json_extract(details_json,'$.contract_version')='provider-fault-v2'
-                     AND json_extract(details_json,'$.state_evidence.legacy_circuit_receipt_id')=?
-                   LIMIT 1""",
+                     AND json_extract(details_json,'$.state_evidence.legacy_circuit_receipt_id')=?""",
                 (f"{_fault_job_prefix(scope)}%", legacy_id),
+                suffix="LIMIT 1",
             ).fetchone() is not None
             if not legacy_bound:
                 states.append(_legacy_provider_fault_projection(legacy))
@@ -1234,6 +1290,7 @@ def _assert_scheduler_owner(connection: sqlite3.Connection, scope: PaidScope) ->
         "business_day",
         "manual_command_run_id",
         "catalog_plan_id",
+        "intake_request_id", "preparation_plan_id", "preparation_key", "preparation_subject",
     ):
         frozen = identity.get(field)
         if frozen is not None and getattr(scope, field) not in (None, frozen):
@@ -1253,7 +1310,7 @@ def assert_paid_scope_owner(connection: sqlite3.Connection) -> None:
 
 def renew_paid_owner_lease(connection: sqlite3.Connection, scope: PaidScope, *, at: str) -> None:
     """Schema20 network admission cannot renew an expired or replaced owner."""
-    if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
+    if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21, 22, 23, 24}:
         return
     if scope.scheduler_run_id is None and scope.scheduler_attempt_id is None:
         return  # Existing manual/member guard remains independently authoritative.
@@ -1275,9 +1332,19 @@ def renew_paid_owner_lease(connection: sqlite3.Connection, scope: PaidScope, *, 
 def freeze_scope(
     connection: sqlite3.Connection, *, content_id: int | None,
     account_id: int | None, stage: str, scope: PaidScope | None = None,
+    intake_request_id: int | None = None,
 ) -> PaidScope:
     value = scope or _SCOPE.get()
     value = _assert_scheduler_owner(connection, value)
+    if intake_request_id is not None or value.intake_request_id is not None:
+        from .account_preparation import validate_paid_target
+        if (stage != "profile_prepare" or content_id is not None or account_id is not None
+                or intake_request_id != value.intake_request_id):
+            raise PaidScopeBlocked("preparation_target_invalid", "Preparation requires its exact intake target")
+        target = validate_paid_target(connection, value, at=now_utc(), for_payment=True)
+        return _assert_scheduler_owner(connection, replace(value, purpose="reconcile", category="reconcile",
+            account_id=None, content_id=None, identity_id=None, platform=target["platform"],
+            uid=None, preparation_subject=target["subject"]))
     active_scope = _SCOPE.get()
     if (active_scope.scheduler_run_id, active_scope.scheduler_attempt_id) == (
             value.scheduler_run_id, value.scheduler_attempt_id):
@@ -1400,13 +1467,42 @@ def budget_summary(
     unknown_day_count, unknown_day_amount = carry.get("unknown_count", 0), carry.get("unknown_amount", 0)
     unverified_count, unverified_amount = carry["lifetime_unverified_count"], carry["lifetime_unverified_amount"]
     unverified_day_count, unverified_day_amount = carry.get("unverified_count", 0), carry.get("unverified_amount", 0)
-    for row in connection.execute(
-        "SELECT * FROM provider_usage WHERE lower(provider)='tikhub' AND currency='USD'"
-    ):
+    projected = connection.execute("PRAGMA user_version").fetchone()[0] == 24
+    if projected:
+        from .runtime_budget_projection import rows as projected_rows
+        usage_rows = projected_rows(connection)
+    else:
+        usage_rows = connection.execute(
+            "SELECT * FROM provider_usage WHERE lower(provider)='tikhub' AND currency='USD'"
+        )
+    # Pure values only, local to this one summary call. Every ledger row is
+    # still read afresh, including old days and malformed/negative amounts.
+    # Bound the maps when imported metadata has unusually many distinct values.
+    parsed_details: dict[str, dict[str, Any]] = {}
+    parsed_amounts: dict[tuple[type, Any], int] = {}
+    for row in usage_rows:
         if row["id"] == exclude_usage_id:
             continue
-        details = _details(row["details_json"])
-        amount = micro_usd(row["amount"])
+        if projected and row["details_json"] is None:
+            raise BudgetBlocked("Corrupt or non-object provider usage metadata")
+        encoded, raw_amount = row["details_json"], row["amount"]
+        if projected:
+            if encoded in parsed_details:
+                details = parsed_details[encoded]
+            else:
+                details = _details(encoded)
+                if len(parsed_details) < 256:
+                    parsed_details[encoded] = details
+            amount_key = (type(raw_amount), raw_amount)
+            if amount_key in parsed_amounts:
+                amount = parsed_amounts[amount_key]
+            else:
+                amount = micro_usd(raw_amount)
+                if len(parsed_amounts) < 256:
+                    parsed_amounts[amount_key] = amount
+        else:
+            details = _details(encoded)
+            amount = micro_usd(raw_amount)
         usage_day = str(details.get("budget_day") or budget_day(str(row["recorded_at"])))
         if details.get("state") == "billing_unknown":
             unknown_count += 1

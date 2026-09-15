@@ -43,7 +43,9 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 from .storage import DEFAULT_DB, PROJECT_ROOT, connect, now_utc, transaction
-from .source_routing import select_content_metrics
+from .source_routing import (
+    LEGACY_POLICY_VERSION, select_content_metrics, select_current_content_metrics,
+)
 from .statistics_scope import content_statistics_scope_sql
 
 LOGGER = logging.getLogger(__name__)
@@ -1831,9 +1833,13 @@ def build_stats(
             parameters,
         ).fetchall()
         content_ids = [int(row["id"]) for row in contents]
-        metrics = select_content_metrics(
-            connection, content_ids, metric_fields=("view_count",)
-        )
+        if connection.execute("PRAGMA user_version").fetchone()[0] == 19:
+            # Archived schema19 keeps the same explicit v2 contract as the API.
+            metrics = select_content_metrics(
+                connection, content_ids, metric_fields=("view_count",), policy_version=LEGACY_POLICY_VERSION,
+            )
+        else:
+            metrics = select_current_content_metrics(connection, content_ids, metric_fields=("view_count",))
         labels = content_labels(connection, content_ids)
         catalog = assets["catalog"]
         audience_labels = {str(item["code"]): str(item["label"]) for item in assets["audiences"]}

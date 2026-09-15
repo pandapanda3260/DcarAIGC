@@ -65,7 +65,7 @@
       linear-gradient(130deg, var(--navy) 0%, #143540 52%, var(--navy-2) 100%);
     background-attachment: fixed;
   }
-  button, input { font: inherit; }
+  button, input, textarea { font: inherit; }
   button { cursor: pointer; -webkit-tap-highlight-color: transparent; }
 
   .visually-hidden { position: absolute !important; width: 1px !important; height: 1px !important; padding: 0 !important; margin: -1px !important; overflow: hidden !important; clip: rect(0,0,0,0) !important; white-space: nowrap !important; border: 0 !important; }
@@ -169,7 +169,7 @@
     color: #93a1a6;
     pointer-events: none;
   }
-  .control input {
+  .control input, .control textarea {
     width: 100%;
     height: 46px;
     padding: 0 44px 0 40px;
@@ -181,15 +181,16 @@
     font-size: 14px;
     transition: border-color .15s ease, box-shadow .15s ease, background .15s ease;
   }
-  .control input::placeholder { color: #9fadb2; }
-  .control input:hover { border-color: #adbcc0; }
-  .control input:focus {
+  .control textarea { display: block; min-height: 46px; max-height: 180px; padding-top: 12px; padding-bottom: 12px; line-height: 20px; resize: vertical; overflow-wrap: anywhere; }
+  .control input::placeholder, .control textarea::placeholder { color: #9fadb2; }
+  .control input:hover, .control textarea:hover { border-color: #adbcc0; }
+  .control input:focus, .control textarea:focus {
     border-color: var(--teal);
     background: #fff;
     box-shadow: var(--focus-ring);
   }
-  .field.invalid .control input { border-color: var(--red); background: #fffbfb; }
-  .field.invalid .control input:focus { box-shadow: 0 0 0 4px rgba(200, 76, 76, .13); }
+  .field.invalid .control input, .field.invalid .control textarea { border-color: var(--red); background: #fffbfb; }
+  .field.invalid .control input:focus, .field.invalid .control textarea:focus { box-shadow: 0 0 0 4px rgba(200, 76, 76, .13); }
   #username, #reg-username, #login-phone, #reg-phone, #reset-phone { padding-right: 14px; }
   .control input.has-action { padding-right: 118px; }
 
@@ -275,7 +276,26 @@
     font-size: 12px;
     line-height: 1.6;
   }
-  .banner svg { width: 16px; height: 16px; flex: 0 0 16px; margin-top: 1px; }
+  .banner > svg { width: 16px; height: 16px; flex: 0 0 16px; margin-top: 1px; }
+  .banner-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .banner-close {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 44px;
+    width: 44px;
+    height: 44px;
+    margin: -11px -13px -11px 0;
+    padding: 0;
+    border: 0;
+    border-radius: 9px;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+  }
+  .banner-close svg { width: 16px; height: 16px; }
+  .banner-close:hover { background: rgba(0, 0, 0, .06); }
+  .banner-close:focus-visible { outline: 2px solid currentColor; outline-offset: -4px; }
   .banner.error { background: var(--red-soft); border: 1px solid #f0cfcf; color: #a74343; }
   .banner.info  { background: #edf8f5; border: 1px solid #bfded7; color: #176e63; }
 
@@ -363,10 +383,10 @@
     <form id="login-form" method="post" novalidate data-view="login">
       <div id="pw-block">
         <div class="field">
-          <label for="username">账号</label>
+          <label for="username">登录账号</label>
           <div class="control">
             <svg class="lead-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10" cy="7" r="3"/><path d="M4.5 17c.6-3.1 2.6-4.8 5.5-4.8s4.9 1.7 5.5 4.8"/></svg>
-            <input id="username" name="username" type="text" autocomplete="username" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="请输入账号" aria-describedby="username-error">
+            <textarea id="username" name="username" rows="1" autocomplete="username" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="请输入账号" aria-describedby="username-error"></textarea>
           </div>
           <p class="field-msg error" id="username-error" hidden><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="10" cy="10" r="7.2"/><path d="M10 6.6v4.2M10 13.6h.01"/></svg><span></span></p>
         </div>
@@ -418,6 +438,7 @@
         <svg class="banner-icon-error" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="10" cy="10" r="7.5"/><path d="M10 6.4v4.4M10 13.9h.01"/></svg>
         <svg class="banner-icon-info" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true" hidden><circle cx="10" cy="10" r="7.5"/><path d="M10 9.2v4.4M10 6.4h.01"/></svg>
         <span class="banner-text"></span>
+        <button type="button" class="banner-close" aria-label="关闭提示" title="关闭提示"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15"/></svg></button>
       </div>
 
       <button type="submit" class="submit" id="submit-btn">
@@ -434,10 +455,10 @@
     <!-- ===================== 注册 ===================== -->
     <form id="register-form" method="post" novalidate data-view="register" hidden>
       <div class="field">
-        <label for="reg-username">账号名称</label>
+        <label for="reg-username">登录账号</label>
         <div class="control">
           <svg class="lead-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10" cy="7" r="3"/><path d="M4.5 17c.6-3.1 2.6-4.8 5.5-4.8s4.9 1.7 5.5 4.8"/></svg>
-          <input id="reg-username" name="username" type="text" autocomplete="username" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="32" placeholder="请输入账号名称" aria-describedby="reg-username-error">
+          <textarea id="reg-username" name="username" rows="1" autocomplete="username" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="请输入登录账号" aria-describedby="reg-username-error"></textarea>
         </div>
         <p class="field-msg error" id="reg-username-error" hidden><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="10" cy="10" r="7.2"/><path d="M10 6.6v4.2M10 13.6h.01"/></svg><span></span></p>
       </div>
@@ -475,6 +496,7 @@
         <svg class="banner-icon-error" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="10" cy="10" r="7.5"/><path d="M10 6.4v4.4M10 13.9h.01"/></svg>
         <svg class="banner-icon-info" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true" hidden><circle cx="10" cy="10" r="7.5"/><path d="M10 9.2v4.4M10 6.4h.01"/></svg>
         <span class="banner-text"></span>
+        <button type="button" class="banner-close" aria-label="关闭提示" title="关闭提示"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15"/></svg></button>
       </div>
 
       <button type="submit" class="submit">
@@ -527,6 +549,7 @@
         <svg class="banner-icon-error" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="10" cy="10" r="7.5"/><path d="M10 6.4v4.4M10 13.9h.01"/></svg>
         <svg class="banner-icon-info" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true" hidden><circle cx="10" cy="10" r="7.5"/><path d="M10 9.2v4.4M10 6.4h.01"/></svg>
         <span class="banner-text"></span>
+        <button type="button" class="banner-close" aria-label="关闭提示" title="关闭提示"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15"/></svg></button>
       </div>
 
       <button type="submit" class="submit">
@@ -568,7 +591,6 @@
   var COUNTDOWN_SECONDS = 60;
   var PHONE_PATTERN = /^1[3-9][0-9]{9}$/;
   var CODE_PATTERN = /^[0-9]{6}$/;
-  var USERNAME_PATTERN = /^[A-Za-z0-9_]{4,32}$/;
 
   var title = document.getElementById("login-title");
   var forms = {
@@ -647,11 +669,11 @@
     note.querySelector("span").textContent = message || "";
     note.hidden = !message;
   }
-  Array.prototype.forEach.call(document.querySelectorAll(".field input"), function (input) {
+  Array.prototype.forEach.call(document.querySelectorAll(".field input, .field textarea"), function (input) {
     input.addEventListener("input", function () { setFieldError(input, ""); });
   });
   function requireValue(input, emptyMessage, pattern, formatMessage) {
-    var value = input.type === "password" ? input.value : input.value.trim();
+    var value = input.type === "password" || input.name === "username" ? input.value : input.value.trim();
     if (!value) { setFieldError(input, emptyMessage); return false; }
     if (pattern && !pattern.test(value)) { setFieldError(input, formatMessage); return false; }
     setFieldError(input, "");
@@ -682,6 +704,9 @@
     banner.querySelector(".banner-text").textContent = text;
   }
   function hideBanner(form) { form.querySelector(".banner").hidden = true; }
+  Array.prototype.forEach.call(document.querySelectorAll(".banner-close"), function (button) {
+    button.addEventListener("click", function () { hideBanner(button.closest("form")); });
+  });
 
   try {
     var params = new URLSearchParams(window.location.search);
@@ -694,7 +719,7 @@
   /* ---- 视图切换 ---- */
   function clearForm(form) {
     hideBanner(form);
-    Array.prototype.forEach.call(form.querySelectorAll(".field input"), function (input) {
+    Array.prototype.forEach.call(form.querySelectorAll(".field input, .field textarea"), function (input) {
       setFieldError(input, "");
     });
   }
@@ -870,7 +895,7 @@
       var okUser = requireValue(usernameInput, "请输入账号");
       var okPassword = requireValue(passwordInput, "请输入密码");
       if (!okUser || !okPassword) { firstInvalid([usernameInput, passwordInput]).focus(); return; }
-      body.set("username", usernameInput.value.trim());
+      body.set("username", usernameInput.value);
       body.set("password", passwordInput.value);
     }
     if (IS_PREVIEW) { previewOnly(loginForm); return; }
@@ -914,14 +939,14 @@
     if (form.dataset.submitting) return;
     hideBanner(form);
     var inputs = [byId("reg-username"), byId("reg-phone"), byId("reg-password"), byId("reg-code")];
-    var ok = requireValue(inputs[0], "请输入账号名称", USERNAME_PATTERN, "账号为 4–32 位字母、数字或下划线");
+    var ok = requireValue(inputs[0], "请输入登录账号");
     ok = requireValue(inputs[1], "请输入手机号", PHONE_PATTERN, "手机号格式不正确") && ok;
     ok = requirePassword(inputs[2]) && ok;
     ok = requireValue(inputs[3], "请输入验证码", CODE_PATTERN, "验证码为 6 位数字") && ok;
     if (!ok) { firstInvalid(inputs).focus(); return; }
     if (IS_PREVIEW) { previewOnly(form); return; }
     var body = new URLSearchParams();
-    body.set("username", inputs[0].value.trim());
+    body.set("username", inputs[0].value);
     body.set("phone", inputs[1].value.trim());
     body.set("password", inputs[2].value);
     body.set("code", inputs[3].value.trim());

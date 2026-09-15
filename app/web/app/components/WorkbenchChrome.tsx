@@ -3,7 +3,7 @@
 import Link from "next/link";
 import Image from "next/image";
 import { usePathname, useRouter } from "next/navigation";
-import { useEffect, useMemo, useRef, useSyncExternalStore, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   accountSearchQueryOptions,
@@ -12,25 +12,35 @@ import {
   defaultAccountSearchRequest,
   defaultContentSearchRequest,
   overviewQueryOptions,
+  queryKeys,
   sessionQueryOptions,
   spuAssetsQueryOptions,
   spuStatsQueryOptions,
   tasksListQueryOptions,
   usersQueryOptions,
 } from "../lib/queries";
-import type { Section } from "../lib/types";
+import type { AuthSession, Section, UserRole } from "../lib/types";
 import { publicAssetPath } from "../lib/paths";
 import { canAccessAccounts } from "../lib/accountAccess";
 import { readQueryJson } from "../lib/api";
 import { dataServiceStatus, type ServiceHealth } from "../lib/serviceStatus";
 import { createServiceRecovery } from "../lib/serviceRecovery";
 import { WorkbenchContext, workbenchSection } from "./WorkbenchContext";
-import { ToastViewport } from "./Feedback";
+import { showToast, ToastViewport } from "./Feedback";
 import LogoutButton from "./LogoutButton";
 import BackToTop from "./BackToTop";
 import RouteLoading from "./RouteLoading";
+import InlineNicknameEditor from "./InlineNicknameEditor";
 import { navigationFeedbackStore } from "../../scripts/navigation-feedback.mjs";
-import serviceStyles from "./DataServiceStatus.module.css";
+import profileStyles from "./PersonalProfile.module.css";
+import tooltipStyles from "./QuickActionTooltip.module.css";
+
+const PROFILE_UPDATED_KEY = "dcar:profile-updated";
+const ROLE_LABELS: Record<UserRole, string> = { superadmin: "超级管理员", admin: "管理员", operator: "运营人员", new_user: "待开通权限" };
+
+function ProfileIcon() {
+  return <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" aria-hidden="true"><circle cx="10" cy="6.5" r="3" /><path d="M4.2 17c.4-3.6 2.4-5.4 5.8-5.4s5.4 1.8 5.8 5.4" /></svg>;
+}
 
 // Warm the destination's JS and CSS alongside its data, before RSC navigation
 // discovers them. Keep these imports lazy so the initial page stays small.
@@ -91,6 +101,36 @@ function ActiveWorkbenchChrome({ active, pathname, children }: { active: Section
   const router = useRouter();
   const queryClient = useQueryClient();
   const session = useQuery(sessionQueryOptions());
+  const [profileOpen, setProfileOpen] = useState(false);
+  const profileEditRef = useRef<HTMLButtonElement | null>(null);
+  const profileName = session.data?.display_name || session.data?.username || "";
+  const profileRole = session.data?.role ? ROLE_LABELS[session.data.role] : (session.data?.bypass ? "运营人员" : "");
+  const canEditProfile = Boolean(session.data?.username) && !session.data?.bypass;
+
+  useEffect(() => {
+    const refreshProfile = (event: StorageEvent) => {
+      if (event.key !== PROFILE_UPDATED_KEY || !event.newValue) return;
+      void queryClient.invalidateQueries({ queryKey: queryKeys.session, exact: true });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.users, exact: true });
+    };
+    window.addEventListener("storage", refreshProfile);
+    return () => window.removeEventListener("storage", refreshProfile);
+  }, [queryClient]);
+
+  function profileSaved(updated: AuthSession) {
+    // Cancel a prior session read before applying the saved name. The identity
+    // key remains username + role, so nickname edits preserve business caches.
+    void queryClient.cancelQueries({ queryKey: queryKeys.session, exact: true });
+    queryClient.setQueryData(queryKeys.session, updated);
+    void queryClient.invalidateQueries({ queryKey: queryKeys.users, exact: true });
+    try { localStorage.setItem(PROFILE_UPDATED_KEY, `${Date.now()}:${Math.random()}`); } catch { /* Polling and focus refresh still keep sessions current. */ }
+    closeProfileEditor();
+    showToast("success", "昵称已保存");
+  }
+  function closeProfileEditor() {
+    setProfileOpen(false);
+    window.requestAnimationFrame(() => profileEditRef.current?.focus());
+  }
   const serviceHealth = useQuery({
     queryKey: ["system", "health"],
     queryFn: () => readQueryJson<ServiceHealth>("/api/v8/health", undefined, 5_000),
@@ -178,8 +218,9 @@ function ActiveWorkbenchChrome({ active, pathname, children }: { active: Section
 
   return (
     <WorkbenchContext.Provider value={context}>
-    <div className="app-shell insight-shell">
+    <div className={`app-shell insight-shell ${profileStyles.layout}`}>
       <aside className="sidebar">
+        <div className={profileStyles.navigation}>
         <div className="brand"><Image className="brand-mark" src={publicAssetPath("/dongchedi-app-icon.svg")} alt="懂车帝 App" width={38} height={38} unoptimized /><div><strong>Dcar AIGC</strong><span>开心瓦瓦·运营工作台</span></div></div>
         <nav aria-label="主导航">
           <p>AIGC数据统计</p>
@@ -234,12 +275,22 @@ function ActiveWorkbenchChrome({ active, pathname, children }: { active: Section
             </Link>
           </>}
         </nav>
-        <div className="sidebar-foot">
-          <i className={serviceStyles.indicator} data-state={serviceState.kind ?? undefined} aria-hidden="true" />
-          <div role="status" aria-live="polite" aria-busy={serviceState.kind === null} title={serviceState.description || undefined} aria-label={[serviceState.label, serviceState.description].filter(Boolean).join("。") || "正在读取系统状态"}>
-            <strong className={serviceStyles.footerLabel}>{serviceState.label || <span className={serviceStyles.loadingLabel} aria-hidden="true" />}</strong>
+        </div>
+        <div className={profileStyles.footer}>
+          <div className={profileStyles.accountBlock}>
+          <div className={profileStyles.identity}>
+            <span className={profileStyles.avatar}><ProfileIcon /></span>
+            <div className={profileStyles.identityText}>
+              <div className={profileStyles.nameRow}>
+                <strong className={profileStyles.name}>{profileName || "正在读取…"}</strong>
+                <button ref={profileEditRef} type="button" className={`${profileStyles.iconButton} ${tooltipStyles.trigger}`} data-editing={profileOpen} onClick={() => setProfileOpen(true)} disabled={!canEditProfile || profileOpen} tabIndex={profileOpen ? -1 : undefined} aria-hidden={profileOpen || undefined} aria-label="编辑昵称"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="m12.8 3.5 3.7 3.7M4 12.3 12.7 3.6a1.7 1.7 0 0 1 2.4 0l1.3 1.3a1.7 1.7 0 0 1 0 2.4L7.7 16H4v-3.7Z" /></svg><span className={tooltipStyles.tip} aria-hidden="true">修改昵称</span></button>
+              </div>
+              <span className={profileStyles.role}>{profileRole}</span>
+            </div>
+            <LogoutButton />
           </div>
-          <LogoutButton />
+          {profileOpen && session.data && <InlineNicknameEditor key={session.data.username} session={session.data} onCancel={closeProfileEditor} onSaved={profileSaved} />}
+          </div>
         </div>
       </aside>
       {pending ? <RouteLoading section={pending.section} /> : children}

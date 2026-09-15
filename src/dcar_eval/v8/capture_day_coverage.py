@@ -18,6 +18,14 @@ from .source_routing import parse_time
 
 CONTRACT = "catalog-day-coverage-v1"
 SOURCE_CONTRACT = "catalog-day-coverage-source-v1"
+TYPED_SOURCE_CONTRACT = "catalog-day-coverage-source-v2"
+PREPARATION_CONTRACT = "account-preparation-plan-v1"
+# Fixed operation vocabulary of the preparation v1 contract, not paid authority.
+PREPARATION_OPERATIONS = frozenset({
+    "douyin_uid_profile", "douyin_sec_profile", "douyin_display_profile",
+    "xiaohongshu_user_profile", "xiaohongshu_user_search", "kuaishou_user_profile",
+    "wechat_channels_resolve", "wechat_channels_channel_info", "wechat_channels_user_profile",
+})
 SNAPSHOT_CONTRACT = "account-catalog-capture-snapshot-v1"
 BEIJING = ZoneInfo("Asia/Shanghai")
 EPOCH_KEYS = ("activation_id", "activation_sha256", "profile_id", "roster_snapshot_id", "roster_members_sha256")
@@ -29,6 +37,8 @@ SCOPE_KEYS = ("contract_version", "identity_id", "account_id", "platform", "uid"
               "capture_stage", "category", "source_stage", "operation", "logical_due", "assignment_id",
               "source_plan_id", "activation_id", "profile_id", "roster_snapshot_id", "roster_members_sha256",
               "catalog_plan_id", "window_start", "window_end")
+RECOVERY_SCOPE_KEYS = ("recovery_contract", "discovery_mode", "published_intervals",
+                      "scope_start", "scope_evidence", "bounded_out_gaps")
 
 
 def _require(value: bool, reason: str) -> None:
@@ -64,9 +74,11 @@ def _plan(connection: sqlite3.Connection, identity: int, cutoff: str) -> dict[st
     eligible = snap["eligibility"]["eligible_members"]
     _require(isinstance(eligible, list) and bool(eligible), "catalog_empty_scope")
     ids = [item["identity_id"] for item in eligible]
+    from .account_catalog_capture_release import ACCOUNT_CATALOG_POLICY_V3
+    platforms = set(ACCOUNT_CATALOG_POLICY_V3["platforms"]) if snap["policy_sha256"] == planning.digest(ACCOUNT_CATALOG_POLICY_V3) else {"douyin", "xiaohongshu"}
     _require(all(type(i) is int and i > 0 for i in ids) and len(ids) == len(set(ids)), "catalog_identity_ambiguous")
     _require(all(m.get("eligible") is True and m.get("reason_code") == "eligible"
-        and m.get("platform") in {"douyin", "xiaohongshu"}
+        and m.get("platform") in platforms
         and m.get("account_identity_id") == m.get("identity_id") and bool(m.get("uid")) for m in eligible),
         "catalog_member_invalid")
     selection = [{**{k: m[k] for k in ("account_identity_id", "account_id", "platform", "uid")},
@@ -85,12 +97,101 @@ def _scope(plan: Mapping[str, Any]) -> tuple[Any, ...]:
 
 
 def _business_scope_sha256(plan: Mapping[str, Any]) -> str:
+    from .account_catalog_capture_release import ACCOUNT_CATALOG_POLICY_V2, ACCOUNT_CATALOG_POLICY_V3
+
     snapshot = plan["payload"]["catalog_snapshot"]
-    # A refreshed locator receipt or excluded row's label does not change the
-    # collection obligation. Identity, locator value and cadence changes do.
+    keys = (*MEMBER_KEYS, "locator_sha256")
+    # Only the exact all-status policy treats operating labels as metadata.
+    # Keep the original algorithm for older/other hashes so frozen coverage
+    # receipts remain verifiable under the rule that created their scope.
+    if snapshot["policy_sha256"] not in {planning.digest(ACCOUNT_CATALOG_POLICY_V2), planning.digest(ACCOUNT_CATALOG_POLICY_V3)}:
+        keys = (*keys, "account_status")
     return planning.digest({"policy_sha256": snapshot["policy_sha256"], "members": [
-        {k: member.get(k) for k in (*MEMBER_KEYS, "locator_sha256", "account_status")}
+        {k: member.get(k) for k in keys}
         for member in snapshot["eligibility"]["eligible_members"]]})
+
+
+def _typed_plan_inputs(connection: sqlite3.Connection, rows: list[dict[str, Any]], cutoff: str):
+    """Separate only proven preparation-v1 plans; retain every other input.
+
+    These immutable lineage checks classify discovery obligations. They never
+    consult today's preparation state, grant readiness, or open provider raw.
+    """
+    selected, preparations = [], {}
+    for row in rows:
+        value = _object(row["payload_json"])
+        if value.get("contract") != PREPARATION_CONTRACT:
+            selected.append(row)
+            continue
+        members = value.get("members")
+        _require(planning.digest(value) == row["plan_sha256"]
+            and row["mode"] in {"active", "shadow"}
+            and type(value.get("shadow")) is bool and value["shadow"] == (row["mode"] == "shadow")
+            and not any(key in value for key in ("catalog_snapshot", "catalog_mode", "contract_version", "cohort"))
+            and isinstance(members, list) and bool(members), "catalog_preparation_plan_invalid")
+        indexed = {}
+        for member in members:
+            _require(isinstance(member, dict), "catalog_preparation_member_invalid")
+            ident, target = member.get("intake_request_id"), member.get("target")
+            _require(type(ident) is int and ident > 0 and ident not in indexed
+                and all(isinstance(member.get(k), str) and len(member[k]) == 64
+                        for k in ("input_sha256", "preparation_key"))
+                and isinstance(target, dict) and target.get("operation") in PREPARATION_OPERATIONS
+                and target.get("platform") in {"douyin", "xiaohongshu", "kuaishou", "wechat_channels"}
+                and target["operation"].startswith(target["platform"] + "_")
+                and target.get("method") in {"GET", "POST"} and isinstance(target.get("params"), dict)
+                and isinstance(target.get("path"), str) and target["path"].startswith("/api/")
+                and isinstance(target.get("subject"), str) and bool(target["subject"]),
+                "catalog_preparation_member_invalid")
+            indexed[ident] = member
+        from .profile_activations import activation_by_id
+        active = activation_by_id(connection, value["activation_id"])
+        _require(all(value.get(k) == active[k] for k in
+            ("activation_id", "profile_id", "roster_snapshot_id", "roster_members_sha256")),
+            "catalog_preparation_activation_changed")
+        preparations[row["id"]] = {"row": row, "value": value, "members": indexed, "works": []}
+    if preparations:
+        ids = tuple(preparations)
+        # One scan for every excluded plan, not one full work-table scan per plan.
+        works = connection.execute("SELECT w.*,a.id AS a_id,a.intake_request_id AS a_intake,"
+            "a.source_plan_id AS a_plan,a.operation AS a_operation,a.provider AS a_provider,"
+            "a.scope_type AS a_scope_type,a.scope_key AS a_scope_key,"
+            "i.input_sha256 AS intake_input_sha256,i.preparation_key AS intake_preparation_key "
+            "FROM capture_work_items w LEFT JOIN capture_route_assignments a ON a.id=w.assignment_id "
+            "LEFT JOIN account_intake_requests i ON i.id=w.intake_request_id WHERE w.source_plan_id IN ("
+            + ",".join("?" for _ in ids) + ") AND julianday(w.created_at)<=julianday(?) ORDER BY w.id", (*ids, cutoff))
+        for raw in works:
+            work = dict(raw); env = _object(work["envelope_json"])
+            prepared = preparations[work["source_plan_id"]]
+            member = prepared["members"].get(work.get("intake_request_id"))
+            _require(member is not None, "catalog_preparation_work_changed")
+            target = member["target"]
+            _require(env.get("contract_version") == PREPARATION_CONTRACT
+                and env.get("stage") == env.get("capture_stage") == "profile_prepare"
+                and env.get("category") == "reconcile" and work["provider"] == "tikhub"
+                and work["account_id"] is None and work["content_id"] is None
+                and env.get("account_id") is None and env.get("content_id") is None and env.get("identity_id") is None
+                and env.get("preparation_plan_id") == env.get("source_plan_id") == work["source_plan_id"]
+                and env.get("intake_request_id") == member["intake_request_id"]
+                and env.get("assignment_id") == work["assignment_id"] == work["a_id"]
+                and work["a_intake"] == member["intake_request_id"]
+                and work["a_plan"] == work["source_plan_id"]
+                and work["a_operation"] == target["operation"] and work["a_provider"] == "tikhub"
+                and work["a_scope_type"] == "intake" and work["a_scope_key"] == str(member["intake_request_id"])
+                and work["intake_input_sha256"] == member["input_sha256"]
+                and work["intake_preparation_key"] == member["preparation_key"]
+                and env.get("preparation_key") == member["preparation_key"]
+                and env.get("preparation_subject") == target["subject"]
+                and env.get("request") == target and env.get("platform") == target["platform"]
+                and env.get("operation") == work["operation"] == target["operation"]
+                and all(env.get(k) == prepared["value"][k] for k in
+                    ("activation_id", "profile_id", "roster_snapshot_id", "roster_members_sha256")),
+                "catalog_preparation_work_changed")
+            prepared["works"].append({"work_scope": _work_scope(work),
+                "intake_request_id": member["intake_request_id"], "preparation_key": member["preparation_key"],
+                "request_sha256": planning.digest(target)})
+    return selected, [{"plan": _input_ref(p["row"]), "work_bindings": p["works"]}
+                      for p in preparations.values()]
 
 
 def _day_plans(connection: sqlite3.Connection, rows: list[dict[str, Any]], day: str,
@@ -119,10 +220,11 @@ def _input_ref(row: Mapping[str, Any]) -> dict[str, Any]:
 
 def _work_scope(row: Mapping[str, Any]) -> dict[str, Any]:
     env = _object(row["envelope_json"])
+    keys = SCOPE_KEYS + (RECOVERY_SCOPE_KEYS if env.get("recovery_contract") else ())
     return {"id": row["id"], "work_identity": row["work_identity"], "account_id": row["account_id"],
             "operation": row["operation"], "source_plan_id": row["source_plan_id"],
             "assignment_id": row["assignment_id"], "data_business_day": row["data_business_day"],
-            "created_at": row["created_at"], "envelope_scope": {k: env.get(k) for k in SCOPE_KEYS}}
+            "created_at": row["created_at"], "envelope_scope": {k: env.get(k) for k in keys}}
 
 
 def _raw_ref(connection: sqlite3.Connection, raw_id: int) -> dict[str, Any]:
@@ -206,6 +308,10 @@ def verify_work(connection: sqlite3.Connection, work: Mapping[str, Any], *, plan
         and evidence.get("disposition", "complete") == "complete", "catalog_scan_partial")
     _require(all(evidence.get(k) == env[k] for k in ("identity_id", "account_id", "platform", "operation", "window_start", "window_end")),
         "catalog_quality_scope_mismatch")
+    if env.get("recovery_contract"):
+        _require(env["recovery_contract"] == "discovery-recovery-v1" and
+            all(k in env and evidence.get(k) == env[k] for k in RECOVERY_SCOPE_KEYS),
+            "catalog_recovery_scope_mismatch")
     receipts = connection.execute("SELECT * FROM data_quality_receipts WHERE scope_key=? "
         "AND julianday(recorded_at)<=julianday(?) AND julianday(cutoff_at)<=julianday(?) ORDER BY id",
         (f"capture-scan:{work['id']}", cutoff_at, cutoff_at)).fetchall()
@@ -244,7 +350,7 @@ def verify_work(connection: sqlite3.Connection, work: Mapping[str, Any], *, plan
             and slot["stage"] == "discovery" and slot["window_key"] == expected_window,
             "catalog_raw_cursor_binding_mismatch")
         value = json.loads(raw_archive.read_response_entity(connection, raw_id))
-        items, more, cursor, _ = tikhub_scan._page(SimpleNamespace(value=value), env["platform"])
+        items, more, cursor, _ = tikhub_scan._page(SimpleNamespace(value=value), env["platform"], expected_uid=env["uid"])
         _require(more is (index < len(raw_ids) - 1), "catalog_pagination_not_closed")
         if more:
             _require(cursor not in (None, ""), "catalog_next_cursor_missing")
@@ -284,8 +390,11 @@ def catalog_day_coverage(connection: sqlite3.Connection, *, day: str, cutoff_at:
         "terminal_blockers":{},"matrix_expected_windows":0,"matrix_complete_windows":0,"matrix_forbidden_run_ids":[],
         "integrated_work_ids":[],"integrated_run_ids":[],"catalog_source_plan_ids":[],"scan_references":[],
         "scan_errors":{},"diagnostic_scan_errors":{}}
-    binding: dict[str, Any] = {"contract":SOURCE_CONTRACT,"date":day,"cutoff_at":cutoff_at,"plans":[],"works":[],
+    typed = connection.execute("PRAGMA user_version").fetchone()[0] in {23, 24}
+    binding: dict[str, Any] = {"contract":TYPED_SOURCE_CONTRACT if typed else SOURCE_CONTRACT,"date":day,"cutoff_at":cutoff_at,"plans":[],"works":[],
                              "plan_inputs":[_input_ref(r) for r in rows]}
+    if typed:
+        binding["preparation_inputs"] = []
     result["source_binding"] = binding
     # Preserve runtime authorization context even on a switch/unknown day.
     from .profile_activations import activation_at
@@ -299,7 +408,10 @@ def catalog_day_coverage(connection: sqlite3.Connection, *, day: str, cutoff_at:
     except (ValueError,TypeError,KeyError,sqlite3.Error):
         pass
     try:
-        plans = _day_plans(connection, rows, day, cutoff_at)
+        selected = rows
+        if typed:
+            selected, binding["preparation_inputs"] = _typed_plan_inputs(connection, rows, cutoff_at)
+        plans = _day_plans(connection, selected, day, cutoff_at)
         baseline = plans[0]
         p = baseline["payload"]
         binding.update({k:p[k] for k in EPOCH_KEYS})
@@ -322,6 +434,11 @@ def catalog_day_coverage(connection: sqlite3.Connection, *, day: str, cutoff_at:
             if env.get("identity_id") not in ids or parse_time(env["window_start"]) > lower or parse_time(env["window_end"]) < upper:
                 continue
             try:
+                # A complete provider scan only covers admitted publication
+                # intervals; excluded pause/pre-admission time is not a full day.
+                if env.get("recovery_contract"):
+                    _require(any(parse_time(start) <= lower and parse_time(end) >= upper
+                        for start, end in env["published_intervals"]), "catalog_day_outside_admitted_intervals")
                 work_plan = _plan(connection,env["catalog_plan_id"],cutoff_at)
                 _require(_scope(work_plan) == _scope(baseline), "catalog_scan_epoch_differs")
                 proof = verify_work(connection,dict(work),plan=work_plan,cutoff_at=cutoff_at)
@@ -349,25 +466,61 @@ def catalog_day_coverage(connection: sqlite3.Connection, *, day: str, cutoff_at:
     return result
 
 
-def validate_source_binding(connection: sqlite3.Connection, binding: Mapping[str, Any], at: str) -> dict[str, Any]:
+def validate_source_binding(connection: sqlite3.Connection, binding: Mapping[str, Any], at: str,
+                            *, allow_appended_inputs: bool = False) -> dict[str, Any]:
     """Verify frozen DB lineage without opening raw blobs or mutable run status.
 
     A later retry can change scheduler_runs; the successful frozen attempt,
     quality receipt and watermark remain the authority for this fixed cutoff.
     """
-    _require(binding.get("contract")==SOURCE_CONTRACT and parse_time(binding["cutoff_at"])<=parse_time(at)
+    _require(binding.get("contract") in {SOURCE_CONTRACT, TYPED_SOURCE_CONTRACT}
+        and (binding["contract"] == SOURCE_CONTRACT or connection.execute("PRAGMA user_version").fetchone()[0] in {23, 24})
+        and parse_time(binding["cutoff_at"])<=parse_time(at)
         and binding.get("binding_sha256")==planning.digest({k:v for k,v in binding.items() if k!="binding_sha256"}),
         "catalog_source_binding_invalid")
     rows=[dict(r) for r in connection.execute("SELECT * FROM capture_source_plans "
         "WHERE julianday(created_at)<=julianday(?) ORDER BY created_at,id",(binding["cutoff_at"],))]
     observed=[_input_ref(r) for r in rows]
-    _require(observed==binding["plan_inputs"],"catalog_source_plan_inputs_changed")
+    frozen = binding["plan_inputs"]
+    appended = observed != frozen
+    if appended and allow_appended_inputs:
+        # Display-only classification of a same-cutoff append after sealing.
+        # Never accept changed/removed/reordered old inputs as normal drift.
+        _require(isinstance(frozen,list) and len(observed)>len(frozen)
+            and observed[:len(frozen)]==frozen,"catalog_source_plan_inputs_changed")
+        previous_ids = [ref["id"] for ref in frozen]
+        for row, ref in zip(rows[len(frozen):],observed[len(frozen):]):
+            payload = _object(row["payload_json"])
+            if binding["contract"] == TYPED_SOURCE_CONTRACT and payload.get("contract") == PREPARATION_CONTRACT:
+                _require(type(ref["id"]) is int and ref["id"]>max(previous_ids,default=0), "catalog_appended_plan_invalid")
+                _typed_plan_inputs(connection, [row], binding["cutoff_at"])
+                continue
+            _require(type(ref["id"]) is int and ref["id"]>max(previous_ids,default=0)
+                and ref["payload_sha256"]==ref["plan_sha256"]
+                and payload.get("contract_version")=="capture-runtime-v1"
+                and payload.get("business_day")==row["business_day"]
+                and row["mode"] in {"active","shadow"}
+                and payload.get("catalog_mode")==row["mode"]
+                and isinstance(payload.get("shadow"),bool)
+                and payload["shadow"]==(row["mode"]=="shadow"),"catalog_appended_plan_invalid")
+            date.fromisoformat(row["business_day"])
+        # Continue every frozen scope/attempt/quality/watermark/raw-reference
+        # check against the original rows. An append must not mask corruption.
+        rows = rows[:len(frozen)]
+    else:
+        _require(not appended,"catalog_source_plan_inputs_changed")
     _require(binding.get("known") is True or binding.get("complete") is False,"catalog_unknown_cannot_complete")
+    preparations = []
     try:
-        day_plans = _day_plans(connection, rows, binding["date"], binding["cutoff_at"])
+        selected = rows
+        if binding["contract"] == TYPED_SOURCE_CONTRACT:
+            selected, preparations = _typed_plan_inputs(connection, rows, binding["cutoff_at"])
+        day_plans = _day_plans(connection, selected, binding["date"], binding["cutoff_at"])
         scope_reason = ""
     except (ValueError,TypeError,KeyError,OSError,RuntimeError,sqlite3.Error) as exc:
         day_plans, scope_reason = [], str(exc)
+    if binding["contract"] == TYPED_SOURCE_CONTRACT:
+        _require(binding.get("preparation_inputs") == preparations, "catalog_preparation_binding_changed")
     _require(binding["known"] == bool(day_plans), "catalog_bound_scope_state_changed")
     if not day_plans:
         _require(binding["reason"] == scope_reason and not binding["plans"] and not binding["works"],
@@ -424,9 +577,17 @@ def validate_source_binding(connection: sqlite3.Connection, binding: Mapping[str
                 for k in ("identity_id","window_start","window_end"))
             and parse_time(proof["window_start"])<=lower and parse_time(proof["window_end"])>=upper,
             "catalog_bound_coverage_scope_mismatch")
+        frozen_scope = proof["work_scope"]["envelope_scope"]
+        if frozen_scope.get("recovery_contract"):
+            _require(frozen_scope["recovery_contract"] == "discovery-recovery-v1"
+                and all(k in frozen_scope and evidence.get(k) == frozen_scope[k] for k in RECOVERY_SCOPE_KEYS)
+                and any(parse_time(start) <= lower and parse_time(end) >= upper
+                    for start, end in frozen_scope["published_intervals"]),
+                "catalog_bound_admitted_intervals_changed")
         succeeded.add(proof["identity_id"])
     _require(binding["complete"] == bool(binding["known"] and required and required==succeeded),
         "catalog_bound_complete_mismatch")
-    return {"contract":SOURCE_CONTRACT,"binding_sha256":binding["binding_sha256"],
+    return {"contract":binding["contract"],"binding_sha256":binding["binding_sha256"],
             "cutoff_at":binding["cutoff_at"],"known":binding["known"],"complete":binding["complete"],
-            "reason":binding["reason"],"valid":True}
+            "reason":binding["reason"],"valid":True,
+            **({"appended_inputs":True} if appended else {})}

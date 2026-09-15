@@ -602,33 +602,37 @@ def _reference(
     _record_received(claim, scope, receipt, db_path=db_path, now=now)
     with connect(db_path) as connection, transaction(connection):
         _owned_scope(connection, claim, scope)
-        connection.execute(
-            "INSERT INTO account_provider_references(account_identity_id,provider,reference_kind,"
-            "reference_value,source_raw_response_id,created_at,updated_at) "
-            "VALUES (?,'TikHub','sec_user_id',?,?,?,?) ON CONFLICT(account_identity_id,provider,reference_kind) "
-            "DO UPDATE SET reference_value=excluded.reference_value,source_raw_response_id=excluded.source_raw_response_id,"
-            "updated_at=excluded.updated_at",
-            (scope["identity_id"], value, raw.raw_response_id, now, now),
-        )
+        from .account_reference_storage import store_reference
+        store_reference(connection, account_identity_id=scope["identity_id"], platform=scope["platform"],
+            provider="TikHub", reference_kind="sec_user_id", reference_value=value,
+            source_raw_response_id=raw.raw_response_id, created_at=now, updated_at=now,
+            update_existing=True)
         connection.execute("UPDATE provider_raw_responses SET source='derived_applied' WHERE id=?",
                            (raw.raw_response_id,))
         checkpoint(connection, claim, {"reference": value, "pending_raw": None}, now=now)
     return value
 
 
-def _page(raw: StoredRawResponse, platform: str) -> tuple[list[Any], bool, Any, int | None]:
-    return _page_payload(raw.value, platform)
+def _page(raw: StoredRawResponse, platform: str, *, expected_uid: str | None = None) -> tuple[list[Any], bool, Any, int | None]:
+    return _page_payload(raw.value, platform, expected_uid=expected_uid)
 
 
-def _page_payload(payload: Any, platform: str) -> tuple[list[Any], bool, Any, int | None]:
+def _page_payload(payload: Any, platform: str, *, expected_uid: str | None = None) -> tuple[list[Any], bool, Any, int | None]:
+    if platform in {"kuaishou", "wechat_channels"}:
+        if not expected_uid:
+            raise TikHubScanError("identity_missing", "New platform pages require their frozen account UID")
+        page = providers._extra_adapter(platform).parse_discovery(payload, expected_uid)
+        return page["items"], page["has_more"], page["next_cursor"], None
     if platform == "douyin":
         data = (payload.get("data") if isinstance(payload, dict) and "code" not in payload
                 else providers._tikhub_douyin_data(payload))
         list_name = "aweme_list"
-    else:
+    elif platform == "xiaohongshu":
         data = (providers._tikhub_xhs_data(payload)
                 if isinstance(payload, dict) and "code" in payload and "data" in payload else payload)
         list_name = "notes"
+    else:
+        raise TikHubScanError("unsupported_platform", "No page contract for this platform")
     page = providers._find_list_page(data, list_name)
     if page is None:
         raise TikHubScanError("invalid_response", "The fixed route omitted its raw list")
@@ -650,6 +654,10 @@ def _page_payload(payload: Any, platform: str) -> tuple[list[Any], bool, Any, in
 def _item(platform: str, value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("Item is not an object")
+    if platform in {"kuaishou", "wechat_channels"}:
+        if value.get("platform") != platform or not value.get("platform_content_id") or not value.get("account_uid"):
+            raise ValueError("Normalized discovery item lacks exact platform identity")
+        return dict(value)
     if platform == "douyin":
         identifier = value.get("aweme_id")
         normalized = providers._parse_douyin_discovery_payload(
@@ -1674,7 +1682,9 @@ def _apply(
             disposition: dict[str, Any] = {"index": index, **evidence}
             try:
                 item = _item(str(scope["platform"]), value)
-                identity = content_identity(str(item["platform"]), str(item["canonical_url"]), item["platform_content_id"])
+                trusted_author = str(item.get("account_uid") or "") == str(scope["uid"]) and bool(scope["uid"])
+                identity = content_identity(str(item["platform"]), str(item["canonical_url"]), item["platform_content_id"],
+                    allow_missing_url=trusted_author, verified_provider_alias=trusted_author, connection=connection)
             except (ValueError, TypeError, KeyError, CaptureError, OperationError):
                 disposition.update(disposition="unparseable", reason="invalid_item")
                 counts["unparseable"] += 1
@@ -1720,6 +1730,7 @@ def _apply(
                     content = upsert_content(
                         {**item, "published_at": published, "_preserve_existing_content_fields": True},
                         db_path=db_path, connection=connection,
+                        verified_provider_identity=(str(scope["platform"]), str(scope["uid"])),
                         source_group_on_insert="history-backfill" if scope["purpose"] == "history" else "",
                     )
                 except (OperationError, ValueError):

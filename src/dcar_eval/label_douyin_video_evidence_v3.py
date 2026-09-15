@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Apply the unified v3 selling-point taxonomy to ASR/OCR-enriched content."""
+"""Replay the frozen 2026-08-01 sample using its v3 selling-point taxonomy.
+
+The standalone export preserves the historical sample's original quality
+labels. Reused evaluation helpers do not define current account classification;
+the current account directory uses v8.account_classification instead.
+"""
 
 from __future__ import annotations
 

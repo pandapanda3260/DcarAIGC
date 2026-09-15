@@ -1,0 +1,7 @@
+{
+  "schema": "dcar-snapshot-receiver-binding-v1",
+  "source_root": "/var/www/dcar-aigc/receiver-releases/20260911-daily-pipeline-v2/source",
+  "manifest_path": "/var/www/dcar-aigc/receiver-releases/20260911-daily-pipeline-v2/source-manifest.json",
+  "manifest_sha256": "e2bb48ad01a7f5ce6e00457327e7ee65992b87bcf6dbe52e3340f26d7457f7cd",
+  "entrypoint_sha256": "0eb06550e6aae762fff6b8ee08776683b1c041a9ba8d6e75a166aec505dbb93a"
+}

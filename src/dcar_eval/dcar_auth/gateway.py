@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -13,6 +15,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from html import escape
 from pathlib import Path
+from time import monotonic
 from typing import AsyncIterator, Callable, Mapping, Optional, TypeVar, Union
 from urllib.parse import parse_qs, parse_qsl, quote, unquote, urlencode, urlsplit
 
@@ -31,6 +34,7 @@ from dcar_auth.sms import (
     TencentSmsSender,
     load_sms_credentials,
 )
+from v8.read_contract import READ_KEY_HEADER, READ_SCOPE_HEADER, invalidation_domains, read_domain
 
 
 LOGGER = logging.getLogger("dcar-auth")
@@ -56,11 +60,10 @@ AUTH_MARKERS = {
 ERROR_COPY = {
     "invalid_phone": "手机号格式不正确",
     "invalid_purpose": "请求无效",
-    "invalid_username": "账号为 4–32 位字母、数字或下划线",
+    "invalid_username": "请输入登录账号",
     "invalid_password": "密码长度需为 8–64 位",
     "password_too_common": "密码过于常见，请换一个",
     "invalid_code": "验证码不正确或已失效",
-    "phone_not_allowed": "该手机号未获授权",
     "phone_not_registered": "该手机号未注册",
     "phone_registered": "该手机号已注册",
     "username_taken": "该账号已被使用",
@@ -188,6 +191,9 @@ class AuthGatewayConfig:
     change_log_path: Optional[Path] = None
     # Trusted build output; missing configuration keeps every response no-store.
     static_asset_manifest_path: Optional[Path] = None
+    # Opt-in reader; all unlisted routes and every mutation keep api_upstream.
+    read_api_upstream: Optional[str] = None
+    read_api_key_path: Optional[Path] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "base_path", _normalized_base_path(self.base_path))
@@ -217,6 +223,20 @@ class AuthGatewayConfig:
             parsed = urlsplit(value)
             if parsed.scheme not in {"http", "https"} or not parsed.netloc:
                 raise ValueError(f"{name} must be an absolute HTTP URL")
+        if self.read_api_upstream:
+            parsed = urlsplit(self.read_api_upstream)
+            try:
+                loopback = ipaddress.ip_address(parsed.hostname or "").is_loopback
+            except ValueError:
+                loopback = False
+            if (parsed.scheme != "http" or not loopback or parsed.username or parsed.password
+                    or parsed.path not in {"", "/"} or parsed.query or parsed.fragment):
+                raise ValueError("read_api_upstream must be a loopback HTTP origin")
+            if self.read_api_key_path is None:
+                raise ValueError("read_api_key_path is required for the isolated reader")
+            object.__setattr__(self, "read_api_upstream", self.read_api_upstream.rstrip("/"))
+        elif self.read_api_key_path is not None:
+            raise ValueError("read_api_key_path requires read_api_upstream")
         if self.douyin_upstream:
             normalized_douyin_upstream = self.douyin_upstream.rstrip("/")
             parsed = urlsplit(normalized_douyin_upstream)
@@ -271,6 +291,9 @@ class AuthGatewayConfig:
             api_upstream=os.environ.get(
                 "DCAR_AUTH_API_UPSTREAM", "http://127.0.0.1:8765"
             ).rstrip("/"),
+            read_api_upstream=os.environ.get("DCAR_AUTH_READ_API_UPSTREAM", "").strip() or None,
+            read_api_key_path=(Path(os.environ["DCAR_AUTH_READ_API_KEY_FILE"])
+                               if os.environ.get("DCAR_AUTH_READ_API_KEY_FILE") else None),
             session_db_path=Path(
                 os.environ.get(
                     "DCAR_AUTH_SESSION_DB",
@@ -551,7 +574,7 @@ def _is_page_navigation(request: Request, stripped: str) -> bool:
     return "text/html" in accept or fetch_dest == "document"
 
 
-def _new_user_workbench_html(base_path: str, page_path: str) -> str:
+def _new_user_workbench_html(base_path: str, page_path: str, principal: Principal) -> str:
     # A real navigation shell without React/Flight payloads or business queries.
     # Keep it self-contained in the gateway release, including the existing logo.
     icons = (
@@ -568,7 +591,7 @@ def _new_user_workbench_html(base_path: str, page_path: str) -> str:
         for (path, copy), icon in zip(NEW_USER_PAGES.items(), icons)
     )
     _, title, description = NEW_USER_PAGES[page_path]
-    return """<!doctype html>
+    template = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>__TITLE__ · DCar Insight</title>
@@ -585,48 +608,138 @@ a:focus-visible,button:focus-visible{outline:3px solid #c88700;outline-offset:4p
 nav a{display:flex;align-items:center;gap:12px;padding:12px 13px;margin-bottom:6px;border-radius:10px;color:#b5c7cc;text-decoration:none;font-size:14px;font-weight:600;transition:background .15s,color .15s}
 nav svg{width:20px;height:20px;flex:none;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 nav a:hover{background:#173b45;color:#fff}nav a.active{background:var(--brand);color:#1f2129}
-.sidebar-foot{margin-top:auto;border-top:1px solid #ffffff1a;padding:20px 8px 0;display:flex;align-items:center;gap:10px}
-.avatar{width:34px;height:34px;border-radius:50%;background:#26434b;color:#d4e1e4;display:grid;place-items:center;font-size:14px}
-.account{flex:1}.account strong{display:block;font-size:14px;font-weight:500}.account small{display:block;margin-top:4px;color:#a6bac0;font-size:12px}
-#logout{border:0;border-radius:8px;padding:8px;background:transparent;color:#a6bac0}#logout:hover{color:#fff;background:#173b45}#logout svg{display:block;width:19px;height:19px}
+.sidebar-foot{margin-top:auto;border-top:1px solid #ffffff1a;padding:18px 0 0;display:grid;grid-template-columns:minmax(0,1fr) 20px;align-items:center;gap:12px 10px}
+.avatar{width:30px;height:30px;border-radius:50%;background:#26434b;color:#d4e1e4;display:grid;place-items:center;font-size:14px}
+.account{flex:1}.account strong{display:block;font-size:14px;font-weight:500}.account small{display:block;margin-top:3px;color:#96adb4;font-size:11px;line-height:17px}
+.profile-identity{display:flex;align-items:center;gap:10px;min-width:0;color:inherit;text-align:left}.profile-identity .avatar{width:30px;height:30px;flex:none}.profile-identity .avatar svg{width:17px;height:17px}.profile-identity .account{min-width:0}.profile-name-row{display:flex;align-items:center;gap:4px;min-width:0;height:24px}.profile-name-row strong{font-size:14px;line-height:20px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;unicode-bidi:plaintext}.profile-icon{width:20px;height:20px;flex:0 0 20px;display:grid;place-items:center;padding:0;border:0;border-radius:3px;background:transparent;color:#8aa3ac}.profile-icon[hidden]{display:grid;visibility:hidden}.profile-icon:hover{background:#ffffff0a;color:#fff}.profile-icon svg{display:block;width:11px;height:11px;fill:none;stroke:currentColor;stroke-width:1.4;stroke-linecap:round;stroke-linejoin:round}.profile-form{grid-column:1 / -1;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:6px;min-width:0;margin:0;padding-top:6px;border-top:1px solid #29464f}.profile-form[hidden]{display:none}.profile-form textarea{display:block;width:100%;min-width:0;height:30px;max-height:80px;resize:none;padding:4px 7px;border:1px solid #56717b;border-radius:5px;background:#193740;color:#f4f8f9;font:inherit;font-size:13px;line-height:20px;unicode-bidi:plaintext}.profile-form textarea:focus{outline:none;border-color:#bacbd0}.profile-form textarea::placeholder{color:#91a9b0}.profile-actions{display:flex;align-items:center;gap:0;min-height:30px}.profile-actions svg{width:12px;height:12px;stroke-width:1.5}.profile-actions button[type=submit]{color:#d9c584}.profile-actions button[type=submit]:disabled{color:#8aa3ac;cursor:default}.profile-empty-hint{grid-column:1 / -1;margin:0;color:#96adb4;font-size:11px;line-height:17px}.profile-error{grid-column:1 / -1;margin:0;color:#ffc0b9;font-size:11px;line-height:17px;overflow-wrap:anywhere}.profile-form[aria-busy=true] .profile-actions{opacity:.6}
+@media(pointer:coarse){.profile-icon{width:36px;height:36px;flex-basis:36px}.profile-name-row{height:36px}.profile-actions .profile-icon{width:44px;height:44px;flex-basis:44px}.sidebar-foot{grid-template-columns:minmax(0,1fr) 44px}.sidebar-foot #logout{width:44px;height:44px}}
+
+
+#logout{display:grid;place-items:center;width:20px;height:24px;border:0;border-radius:4px;padding:0;background:transparent;color:#90a9b1}#logout:hover{color:#fff;background:#173b45}#logout svg{display:block;width:15px;height:15px}
+.quick-tooltip-trigger{position:relative}.quick-tooltip{position:absolute;right:0;bottom:calc(100% + 8px);z-index:30;width:max-content;padding:5px 8px;border:1px solid #dfe6e8;border-radius:6px;background:#fff;color:#263c44;font-size:12px;font-weight:400;line-height:18px;white-space:nowrap;pointer-events:none;opacity:0;visibility:hidden;box-shadow:0 3px 12px #102c3514;transition:opacity .1s,visibility 0s}.quick-tooltip-trigger:not(:disabled):hover .quick-tooltip{opacity:1;visibility:visible;transition-delay:.15s}.quick-tooltip-trigger:not(:disabled):focus-visible .quick-tooltip{opacity:1;visibility:visible;transition-delay:0s}@media(max-width:700px){.quick-tooltip{bottom:auto;top:calc(100% + 8px)}}@media(prefers-reduced-motion:reduce){.quick-tooltip{transition-duration:0s}}
 main{min-width:0;padding:0 32px 36px}.page-header{max-width:1600px;margin:auto;padding:28px 0 24px;display:flex;justify-content:space-between;align-items:center;gap:20px}
 .eyebrow{display:block;margin-bottom:8px;color:#60717a;font-size:12px}h1{margin:0;font-size:28px;line-height:36px;font-weight:600}
 .description{margin:8px 0 0;color:#60717a;font-size:14px;line-height:24px}.badge{flex:none;display:flex;align-items:center;gap:7px;padding:8px 12px;border:1px solid #e2e7e7;border-radius:8px;background:#fff;color:#68777d;font-size:13px}
 .badge i{width:6px;height:6px;border-radius:50%;background:#bd8722}
 .workspace{max-width:1600px;margin:auto}.welcome{display:flex;align-items:center;gap:12px;padding:15px 20px;border:1px solid #eee3bf;border-radius:12px;background:#fffbee;font-size:14px;line-height:24px}
 .welcome svg{width:20px;height:20px;flex:none;color:#967126}.welcome strong{font-weight:600}.welcome span{margin-left:12px;color:#766c51}
-.empty-panel{margin-top:20px;min-height:520px;min-height:clamp(420px,65vh,680px);padding:52px 24px 36px;border:1px solid var(--line);border-radius:16px;background:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;box-shadow:0 4px 18px #102c3503}
-.lock-icon{width:64px;height:64px;display:grid;place-items:center;background:#fff7d8;border:1px solid #f8e9ae;border-radius:18px;color:#967126;margin-bottom:24px}.lock-icon svg{width:28px;height:28px}
-h2{margin:0;font-size:24px;font-weight:600;line-height:1.5;letter-spacing:.2px}.empty-copy{max-width:420px;margin:12px 0 26px;color:var(--muted);font-size:16px;line-height:1.9}
-#refresh{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:44px;padding:10px 20px;border:1px solid var(--navy);border-radius:9px;background:var(--navy);color:#fff;font-size:14px;font-weight:600;transition:background .15s}#refresh:hover{background:#224650}#refresh svg{width:16px;height:16px}
-button:disabled{opacity:.6;cursor:wait}#status{min-height:24px;max-width:440px;margin:16px 0 0;color:#68777d;font-size:14px;line-height:24px}
-.auto-note{margin:28px 0 0;display:flex;gap:7px;align-items:center;color:#7c898e;font-size:13px}.auto-note svg{width:14px;height:14px}
+.welcome-copy{flex:1;min-width:0}.notice-close{display:grid;place-items:center;flex:none;width:28px;height:28px;margin:-2px -6px -2px 0;padding:5px;border:0;border-radius:6px;background:transparent;color:#8a7958;transition:background .15s,color .15s}.notice-close:hover{background:#96712612;color:#655229}.notice-close svg{width:16px;height:16px;color:inherit}.welcome[hidden]{display:none}.welcome[hidden]+.empty-panel{margin-top:0}
+@media(pointer:coarse){.notice-close{width:44px;height:44px;margin-block:-10px}}
+.empty-panel{margin-top:20px;min-height:520px;min-height:clamp(460px,65vh,680px);padding:40px 28px 32px;border:1px solid var(--line);border-radius:16px;background:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;box-shadow:0 4px 18px #102c3503}
+.registration-complete{display:flex;align-items:center;gap:7px;margin:0 0 14px;color:#937226;font-size:13px;line-height:20px}.registration-complete svg{width:16px;height:16px;flex:none}
+h2{margin:0;text-align:center;font-size:26px;font-weight:600;line-height:1.5;letter-spacing:-.4px}.empty-copy{width:100%;max-width:520px;text-align:center;margin:12px 0 32px;color:var(--muted);font-size:14px;line-height:1.9}
+.access-steps{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));width:100%;max-width:480px;padding:0;margin:0 0 32px;list-style:none}
+.access-step{position:relative;min-width:0;color:var(--muted);font-size:13px;line-height:20px}.access-step+.access-step:before{content:"";position:absolute;top:20px;left:-50%;right:50%;height:1px;background:#e5ebec}
+.step-icon{position:relative;z-index:1;width:40px;height:40px;margin:0 auto 12px;border:1px solid #e5ebec;border-radius:50%;background:#fff;display:grid;place-items:center;color:#7d8c92}.step-icon svg{width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+.access-step strong{display:block;font-weight:400}.access-step small{display:block;margin-top:4px;color:var(--muted);font-size:12px;line-height:18px}.access-step.complete .step-icon{background:var(--navy);border-color:var(--navy);color:#fff}.access-step[aria-current="step"] strong{color:var(--ink);font-weight:500}.access-step[aria-current="step"] .step-icon{background:#fbf7ec;border-color:#e6d392;color:#937226;box-shadow:0 0 0 5px #fff}
+#refresh{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:44px;padding:10px 20px;border:1px solid var(--navy);border-radius:9px;background:var(--navy);color:#fff;font-size:14px;font-weight:500;box-shadow:0 3px 6px #102c3510;transition:background .15s,box-shadow .15s}#refresh:hover{background:#224650;box-shadow:0 4px 10px #102c3525}#refresh svg{width:16px;height:16px}
+button:disabled{opacity:.6;cursor:wait}.permission-help,#status{min-height:24px;max-width:440px;margin:12px 0 0;color:#68777d;font-size:13px;line-height:24px}#status:empty{display:none}
+.auto-note{margin:8px 0 0;display:flex;gap:7px;align-items:center;color:#7c898e;font-size:12px;line-height:20px}.auto-note svg{width:14px;height:14px;flex:none}
 .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 @media(max-width:1000px){.shell{grid-template-columns:212px minmax(0,1fr)}.sidebar{padding-inline:12px}main{padding-inline:24px}.welcome span{display:block;margin-left:0}.page-header{align-items:flex-start}.badge{margin-top:22px}}
-@media(max-width:700px){.shell{display:block}.sidebar{position:static;height:auto;padding:20px 16px 12px}.brand{padding:0 4px 20px}.sidebar-foot{position:absolute;right:20px;top:23px;padding:0;border:0}.avatar,.account{display:none}.nav-label{display:none}nav{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}nav a{justify-content:center;gap:7px;margin:0;padding:11px 6px;font-size:14px}nav svg{width:18px;height:18px}main{padding:0 18px 24px}.page-header{padding:24px 0 20px}.badge{display:none}h1{font-size:25px}.description{font-size:14px}.welcome{padding:13px 15px;align-items:flex-start}.empty-panel{margin-top:16px;min-height:440px;padding:40px 20px 28px}h2{font-size:22px}.empty-copy{font-size:16px}.auto-note{font-size:12px}}
+@media(max-width:700px){.shell{display:block}.sidebar{position:static;height:auto;padding:20px 16px 12px}.brand{padding:0 4px 20px}.sidebar-foot{position:absolute;right:20px;top:23px;padding:0;border:0}.avatar,.account{display:none}.nav-label{display:none}nav{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}nav a{justify-content:center;gap:7px;margin:0;padding:11px 6px;font-size:14px}nav svg{width:18px;height:18px}main{padding:0 18px 24px}.page-header{padding:24px 0 20px}.badge{display:none}h1{font-size:25px}.description{font-size:14px}.welcome{padding:13px 15px;align-items:flex-start}.empty-panel{margin-top:16px;min-height:440px;padding:34px 16px 28px}h2{font-size:22px}.empty-copy{margin-bottom:28px;font-size:14px}.access-steps{margin-bottom:28px}.access-step{font-size:12px}.access-step small{font-size:11px}.auto-note{font-size:12px}}
 @media(prefers-reduced-motion:reduce){*{transition:none!important}}
+@media(max-width:700px){.sidebar{display:grid;grid-template-columns:48px minmax(0,1fr);gap:16px 12px}.brand{padding:0 4px;align-self:start}.brand>div{display:none}.sidebar nav{grid-column:1 / -1;grid-row:2}.sidebar-foot{position:static;grid-column:2;grid-row:1;justify-self:end;width:min(100%,300px);min-width:0;gap:10px;margin:0;align-self:start}.profile-identity .avatar{display:grid}.profile-identity .account{display:block}.profile-identity .account strong{font-size:13px}.profile-identity .account small{font-size:11px}}
+
 </style></head><body>
 <div class="shell"><aside class="sidebar">
 <div class="brand">__BRAND_LOGO__<div><strong>Dcar AIGC</strong><small>开心瓦瓦·运营工作台</small></div></div>
 <p class="nav-label">AIGC数据统计</p><nav aria-label="主导航">__NAVIGATION__</nav>
-<div class="sidebar-foot"><div class="avatar" aria-hidden="true">新</div><div class="account"><strong>新用户</strong><small>已登录</small></div>
-<button id="logout" type="button" title="退出登录" aria-label="退出登录"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 4H5a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h4M14 8l4 4-4 4M9 12h10"/></svg></button></div></aside>
+<div class="sidebar-foot"><div class="profile-identity"><span class="avatar" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="8" r="3.5"/><path d="M5 21v-2a7 7 0 0 1 14 0v2"/></svg></span><div class="account"><div class="profile-name-row" id="profile-display"><strong id="profile-name">__DISPLAY_NAME__</strong><button class="profile-icon quick-tooltip-trigger" id="open-profile" type="button" aria-label="修改昵称"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 4 5 5M4 20l4-1 12-12a2.8 2.8 0 0 0-4-4L4 15l-1 6Z"/></svg><span class="quick-tooltip" aria-hidden="true">修改昵称</span></button></div>
+<small id="profile-role">待开通权限</small></div></div>
+<button id="logout" class="quick-tooltip-trigger" type="button" aria-label="退出登录"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 4H5a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h4M14 8l4 4-4 4M9 12h10"/></svg><span class="quick-tooltip" aria-hidden="true">退出登录</span></button><form class="profile-form" id="profile-form" hidden><textarea id="profile-nickname" rows="1" wrap="off" autocomplete="nickname" aria-label="昵称" aria-describedby="profile-nickname-hint profile-empty-hint profile-error">__NICKNAME__</textarea><span class="sr-only" id="profile-nickname-hint">留空时显示登录账号。Enter 保存，Shift+Enter 换行，Esc 取消。</span><div class="profile-actions"><button class="profile-icon quick-tooltip-trigger" id="profile-save" type="submit" aria-label="保存昵称"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg><span class="quick-tooltip" aria-hidden="true">保存昵称</span></button><button class="profile-icon quick-tooltip-trigger" id="profile-cancel" type="button" aria-label="取消修改昵称"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg><span class="quick-tooltip" aria-hidden="true">取消修改昵称</span></button></div><p class="profile-empty-hint" id="profile-empty-hint" hidden>保存后将显示登录账号</p><p class="profile-error" id="profile-error" role="alert" hidden></p></form></div></aside>
 <main class="main-area" data-section="__SECTION__" data-access="pending">
 <header class="page-header"><div><span class="eyebrow">AIGC 数据统计</span><h1>__TITLE__</h1><p class="description">__DESCRIPTION__</p></div><span class="badge"><i aria-hidden="true"></i>待开通权限</span></header>
-<div class="workspace"><div class="welcome"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/></svg><div><strong>欢迎来到工作台</strong><span>账号已登录，可以先浏览各个功能页面。</span></div></div>
+<div class="workspace"><div class="welcome" id="welcome-notice"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/></svg><div class="welcome-copy"><strong>欢迎来到工作台</strong><span>账号已登录，可以先浏览各个功能页面。</span></div><button class="notice-close" id="dismiss-welcome" type="button" aria-label="关闭欢迎通知" title="关闭通知"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
 <section class="empty-panel" aria-labelledby="access-title">
-<div class="lock-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="10" width="14" height="11" rx="3"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3"/></svg></div>
-<h2 id="access-title">当前内容尚未开通</h2><p class="empty-copy">联系管理员开通权限后，<br>即可查看这里的__TITLE__。</p>
+<p class="registration-complete"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/></svg>注册已完成</p>
+<h2 id="access-title">下一步，开通业务权限</h2><p class="empty-copy">联系管理员授予权限，即可查看__TITLE__</p>
+<ol class="access-steps" role="list" aria-label="业务权限开通步骤">
+<li class="access-step complete"><div class="step-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg></div><strong>注册账号</strong><small>已完成</small></li>
+<li class="access-step" aria-current="step"><div class="step-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="15.5" cy="8.5" r="5"/><path d="m12 12-9 9H1v-4l8-8M5 17l2 2"/></svg></div><strong>管理员授权</strong><small>待开通</small></li>
+<li class="access-step"><div class="step-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/></svg></div><strong>查看业务内容</strong><small>授权后可用</small></li>
+</ol>
 <button id="refresh" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 7a7 7 0 0 1 11.6-1L20 9M4 15l2.3 3A7 7 0 0 0 18 17"/></svg><span>刷新权限</span></button>
-<p id="status" role="status" aria-live="polite"></p><p class="auto-note"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>权限开通后，本页会自动更新</p>
-</section></div></main></div><script>
+<p id="permission-help" class="permission-help">权限审核开通请飞书联系管理员@程鑫</p>
+<p id="status" role="status" aria-live="polite"></p><p class="auto-note"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/></svg>权限开通后，本页将自动更新</p>
+</section></div></main></div>
+<script type="application/json" id="profile-data">__PROFILE_JSON__</script><script>
 const basePath=__BASE_PATH_JSON__;
+const welcomeNotice=document.getElementById('welcome-notice');
+const dismissWelcome=document.getElementById('dismiss-welcome');
+if(welcomeNotice&&dismissWelcome){
+const welcomeDismissKey='dcar:notice:'+basePath+':new-user-welcome:v1';
+try{welcomeNotice.hidden=sessionStorage.getItem(welcomeDismissKey)==='dismissed';}catch{}
+dismissWelcome.onclick=()=>{
+welcomeNotice.hidden=true;
+try{sessionStorage.setItem(welcomeDismissKey,'dismissed');}catch{}
+};}
 const status=document.getElementById('status');
 const refresh=document.getElementById('refresh');
 let checking=false;
+let permissionCheckAgain=false;
 let leaving=false;
+let profileSaving=false;
+let profileEditing=false;
+let profileComposing=false;
+let profileInitialName='';
+let profileRevision=0;
+const profileForm=document.getElementById('profile-form');
+const profileNickname=document.getElementById('profile-nickname');
+const profileData=document.getElementById('profile-data');
+let currentProfile=profileData?JSON.parse(profileData.textContent):{username:'',display_name:'',role:'new_user'};
+function applyProfile(session){
+if(!profileForm)return;
+currentProfile=session;
+document.getElementById('profile-name').textContent=session.display_name||session.username;
+document.getElementById('profile-role').textContent=({new_user:'待开通权限',operator:'运营人员',admin:'管理员',superadmin:'超级管理员'})[session.role]||'已登录';
+}
+if(profileForm){
+applyProfile(currentProfile);
+const profileOpen=document.getElementById('open-profile');
+const profileError=document.getElementById('profile-error');
+const profileSave=document.getElementById('profile-save');
+const profileCancel=document.getElementById('profile-cancel');
+const profileEmptyHint=document.getElementById('profile-empty-hint');
+const resizeNickname=()=>{profileNickname.style.height='30px';profileNickname.style.height=Math.min(80,Math.max(30,profileNickname.scrollHeight+2))+'px';};
+const updateProfileDraft=()=>{profileSave.disabled=profileSaving||profileNickname.value===profileInitialName;profileEmptyHint.hidden=profileNickname.value!=='';};
+profileOpen.onclick=()=>{
+if(profileSaving||leaving)return;
+profileEditing=true;profileComposing=false;profileNickname.value=currentProfile.display_name||currentProfile.username;profileInitialName=profileNickname.value;profileNickname.placeholder='输入昵称';
+profileError.hidden=true;profileError.textContent='';profileOpen.hidden=true;profileForm.hidden=false;resizeNickname();updateProfileDraft();profileNickname.focus();profileNickname.setSelectionRange(profileNickname.value.length,profileNickname.value.length);
+};
+const finishProfile=()=>{profileEditing=false;profileComposing=false;profileForm.hidden=true;profileOpen.hidden=false;profileOpen.focus();};
+const cancelProfile=()=>{if(profileSaving)return;finishProfile();void checkPermission();};
+profileCancel.onclick=cancelProfile;
+profileNickname.addEventListener('input',()=>{resizeNickname();updateProfileDraft();});
+profileNickname.addEventListener('compositionstart',()=>{profileComposing=true;});
+profileNickname.addEventListener('compositionend',()=>{profileComposing=false;});
+profileNickname.addEventListener('keydown',event=>{
+if(profileComposing||event.isComposing||event.keyCode===229)return;
+if(event.key==='Escape'){event.preventDefault();cancelProfile();}
+else if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();if(!profileSaving)profileForm.requestSubmit();}
+});
+profileForm.onsubmit=async event=>{
+event.preventDefault();if(profileSaving||profileComposing||leaving||!profileEditing||profileNickname.value===profileInitialName)return;
+profileSaving=true;profileSave.disabled=true;profileCancel.disabled=true;profileNickname.disabled=true;
+profileForm.setAttribute('aria-busy','true');profileSave.setAttribute('aria-label','正在保存昵称');profileError.hidden=true;profileError.textContent='';
+const controller=new AbortController();const timeout=setTimeout(()=>controller.abort(),10000);
+let saved=false;
+try{
+const response=await fetch(basePath+'/auth/profile',{method:'POST',credentials:'same-origin',signal:controller.signal,headers:{'Content-Type':'application/json','X-Dcar-Request':'profile-update'},body:JSON.stringify({display_name:profileNickname.value})});
+if(response.status===401){leaving=true;location.replace(basePath+'/login?return_to='+encodeURIComponent(location.pathname+location.search));return;}
+const payload=await response.json();if(!response.ok)throw new Error(payload.detail||'保存失败，请稍后重试。');
+if(!payload.authenticated||payload.username!==currentProfile.username||typeof payload.display_name!=='string')throw new Error('昵称保存结果异常，请重试。');
+profileRevision++;applyProfile(payload);finishProfile();saved=true;
+try{localStorage.setItem('dcar:profile-updated',Date.now()+':'+Math.random());}catch{}
+if(['operator','admin','superadmin'].includes(payload.role)){leaving=true;location.reload();}
+}catch(error){profileError.textContent=error.name==='AbortError'?'保存超时，请稍后重试。':(error.message==='Failed to fetch'?'保存失败，请检查网络后重试。':error.message||'保存失败，请稍后重试。');profileError.hidden=false;}
+finally{clearTimeout(timeout);profileSaving=false;updateProfileDraft();profileCancel.disabled=false;profileNickname.disabled=false;profileForm.setAttribute('aria-busy','false');profileSave.setAttribute('aria-label','保存昵称');if(saved&&!leaving)void checkPermission();}
+};}
 async function checkPermission(manual=false){
-if(checking||leaving)return;checking=true;
+if(leaving||profileSaving||profileEditing)return;
+if(checking){permissionCheckAgain=true;return;}checking=true;
+const requestedProfileRevision=profileRevision;
 refresh.disabled=true;refresh.querySelector('span').textContent='正在检查…';
 if(manual)status.textContent='';
 const controller=new AbortController();const timeout=setTimeout(()=>controller.abort(),10000);
@@ -636,13 +749,17 @@ if(leaving)return;
 if(response.status===401){leaving=true;location.replace(basePath+'/login?return_to='+encodeURIComponent(location.pathname+location.search));return}
 if(!response.ok)throw new Error('session');const session=await response.json();
 if(leaving)return;
+if(profileEditing||profileSaving)return;
+if(requestedProfileRevision!==profileRevision)return;
+applyProfile(session);
 if(session.authenticated&&['operator','admin','superadmin'].includes(session.role)){leaving=true;location.reload();return}
-if(manual)status.textContent='权限还未开通，请联系管理员后再试。';
+status.textContent='';
 }catch(error){if(manual&&!leaving)status.textContent='暂时无法检查权限，请稍后重试。';}
-finally{clearTimeout(timeout);checking=false;refresh.disabled=false;refresh.querySelector('span').textContent='刷新权限';}}
+finally{clearTimeout(timeout);checking=false;refresh.disabled=false;refresh.querySelector('span').textContent='刷新权限';if(permissionCheckAgain){permissionCheckAgain=false;void checkPermission();}}}
 refresh.onclick=()=>checkPermission(true);
 setInterval(()=>{if(document.visibilityState==='visible')checkPermission();},30000);
 window.addEventListener('focus',()=>checkPermission());
+window.addEventListener('storage',event=>{if(event.key==='dcar:profile-updated')checkPermission();});
 document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')checkPermission();});
 document.getElementById('logout').onclick=async function(){
 if(leaving)return;leaving=true;this.disabled=true;status.textContent='';
@@ -656,6 +773,19 @@ finally{clearTimeout(timeout);}};
     ).replace("__NAVIGATION__", navigation).replace("__TITLE__", title).replace(
         "__DESCRIPTION__", description
     ).replace("__SECTION__", page_path[1:]).replace("__BRAND_LOGO__", '<svg class="brand-logo" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" role="img" aria-labelledby="title">\n  <title id="title">懂车帝 App</title>\n  <rect width="100" height="100" rx="23" fill="#FFCD32"/>\n  <path\n    fill="#1F2129"\n    transform="translate(13.474 18.823) scale(2)"\n    d="M18.2686593 14.6178535C14.4475074 14.6128432 10.6889837 15.0545804 7.03149996 15.9313744 8.11287927 10.7157025 12.746527 6.78641265 18.2774273 6.7935009H18.3262772C23.8342138 6.82357201 28.4340424 10.7557845 29.4991384 15.9580958 25.8449948 15.0729513 22.0889762 14.6224462 18.2686593 14.6178535M18.3638541.000444331963C18.3379678.0000133906399 18.3112465.0000133906399 18.2853602.0000133906399 8.21517191-.0120812971.0125549476 8.17049466.000014624874 18.2406829-.00623349602 23.2158628 1.98993426 27.7334397 5.22363416 31.0343605L10.2334683 26.4416298C9.21346455 25.439997 8.38134526 24.2483921 7.78971804 22.9273558 11.1854161 22.0338609 14.6900871 21.5825208 18.2598914 21.5871135 21.8296957 21.5912887 25.3322791 22.0509793 28.7250545 22.9528246 28.1167264 24.3022523 27.2566332 25.5155683 26.2023928 26.5284742L31.1633769 31.1775701C34.469308 27.8753968 36.5197535 23.3160678 36.5260298 18.2853577 36.5381244 8.24147322 28.3985531.0551395789 18.3638541.000444331963"\n  />\n</svg>')
+
+
+    profile_values = {
+        "__DISPLAY_NAME__": escape(principal.display_name or principal.username, quote=True),
+        "__NICKNAME__": escape(principal.display_name, quote=True),
+        "__USERNAME__": escape(principal.username, quote=True),
+        "__PROFILE_JSON__": json.dumps({
+            "username": principal.username, "display_name": principal.display_name,
+            "role": principal.role,
+        }).replace("<", "\\u003c"),
+    }
+    # Replace user content in one pass so placeholder-like names stay literal.
+    return re.sub(r"__(?:DISPLAY_NAME|NICKNAME|USERNAME|PROFILE_JSON)__", lambda match: profile_values[match[0]], template)
 
 
 def _same_origin_post(
@@ -758,7 +888,7 @@ class PasswordWork:
 
     @asynccontextmanager
     async def slot(self, username: str) -> AsyncIterator[None]:
-        keys = {"user:" + username.lower()}
+        keys = {"user:" + auth_store.username_key(username)}
         if self.active >= MAX_CONCURRENT_PASSWORD_WORK or self.keys.intersection(keys):
             raise auth_store.RateLimited(1)
         self.active += 1
@@ -833,6 +963,9 @@ def _proxy_headers(
             "cookie",
             "authorization",
             "x-dcar-authenticated-user",
+            "x-dcar-authenticated-user-encoding",
+            "x-dcar-read-key",
+            "x-dcar-read-scope",
             "x-forwarded-for",
             "x-forwarded-host",
             "x-forwarded-prefix",
@@ -917,6 +1050,7 @@ def create_app(
     *,
     web_transport: Optional[httpx.AsyncBaseTransport] = None,
     api_transport: Optional[httpx.AsyncBaseTransport] = None,
+    read_api_transport: Optional[httpx.AsyncBaseTransport] = None,
     douyin_transport: Optional[httpx.AsyncBaseTransport] = None,
     sms_transport: Optional[httpx.AsyncBaseTransport] = None,
 ) -> FastAPI:
@@ -972,6 +1106,14 @@ def create_app(
             follow_redirects=False,
             trust_env=False,
         )
+        application.state.read_api_key = (
+            _read_edge_key(resolved.read_api_key_path) if resolved.read_api_key_path else None
+        )
+        application.state.read_api_client = (
+            httpx.AsyncClient(transport=read_api_transport, timeout=httpx.Timeout(60, connect=2),
+                             follow_redirects=False, trust_env=False)
+            if resolved.read_api_upstream else None
+        )
         application.state.douyin_client = (
             httpx.AsyncClient(
                 transport=douyin_transport,
@@ -987,6 +1129,8 @@ def create_app(
         finally:
             await application.state.web_client.aclose()
             await application.state.api_client.aclose()
+            if application.state.read_api_client is not None:
+                await application.state.read_api_client.aclose()
             if application.state.douyin_client is not None:
                 await application.state.douyin_client.aclose()
             if application.state.sms_sender is not None:
@@ -1070,6 +1214,37 @@ def create_app(
         LOGGER.exception("account store failed during user management")
         return user_error("storage_unavailable")
 
+    async def update_profile(request: Request) -> Response:
+        if resolved.bypass_auth:
+            return Response(status_code=404)
+        if request.method != "POST":
+            return Response(status_code=405, headers={"Allow": "POST"})
+        if not _same_origin_post(request, "profile-update", trusted_proxy=trusted_proxy):
+            return user_error("origin_mismatch")
+        payload, failure = await bounded_json(request)
+        if failure is not None or payload is None:
+            return failure or user_error("invalid_payload")
+        if set(payload) != {"display_name"} or not isinstance(payload["display_name"], str):
+            return user_error("invalid_payload")
+        display_name = payload["display_name"]
+        try:
+            display_name.encode("utf-8")
+        except UnicodeEncodeError:
+            return user_error("invalid_payload")
+        principal = await principal_for(request)
+        if principal is None:
+            return unauthenticated(request, "/api/auth/profile")
+        try:
+            record = await asyncio.to_thread(
+                store.update_own_display_name, principal.token_sha256, display_name
+            )
+        except Exception as error:  # noqa: BLE001 - stable auth/storage error response
+            return user_store_error(error, deleting=False)
+        return _no_store(JSONResponse({
+            "authenticated": True, "username": record.username,
+            "display_name": record.display_name, "role": record.role, "bypass": False,
+        }))
+
     async def user_management(request: Request, stripped: str) -> Response:
         """``GET /auth/users``, ``POST /auth/users/update`` and ``/auth/users/delete``.
 
@@ -1087,7 +1262,7 @@ def create_app(
                 return unauthenticated(request, "/api/auth/users")
             if principal.role not in auth_store.USER_ADMIN_ROLES:
                 LOGGER.warning(
-                    "user management denied actor=%s role=%s path=%s",
+                    "user management denied actor=%r role=%s path=%s",
                     principal.username, principal.role, stripped,
                 )
                 return user_error("forbidden")
@@ -1119,8 +1294,8 @@ def create_app(
             not isinstance(payload[field], str) for field in expected_fields
         ):
             return user_error("invalid_payload")
-        target = str(payload["username"]).strip()
-        if not target or len(target) > 128:
+        target = str(payload["username"])
+        if not target:
             return user_error("invalid_payload")
 
         principal = await principal_for(request)
@@ -1128,7 +1303,7 @@ def create_app(
             return unauthenticated(request, "/api/auth/users")
         if principal.role not in auth_store.USER_ADMIN_ROLES:
             LOGGER.warning(
-                "user management denied actor=%s role=%s path=%s",
+                "user management denied actor=%r role=%s path=%s",
                 principal.username, principal.role, stripped,
             )
             return user_error("forbidden")
@@ -1137,7 +1312,7 @@ def create_app(
             if deleting:
                 await asyncio.to_thread(store.delete_user, principal.token_sha256, target)
                 LOGGER.info(
-                    "user management actor=%s action=delete target=%s",
+                    "user management actor=%r action=delete target=%r",
                     principal.username, target,
                 )
                 return _no_store(JSONResponse({}))
@@ -1154,7 +1329,7 @@ def create_app(
             password = str(payload["password"])
             password_hash: Optional[str] = None
             if password:
-                if target.lower() == principal.username.lower():
+                if auth_store.username_key(target) == auth_store.username_key(principal.username):
                     return user_error("self_password_change")
                 problem = auth_store.password_problem(
                     password, username=target, phone=phone or ""
@@ -1175,12 +1350,12 @@ def create_app(
             response = user_store_error(error, deleting=deleting)
             if response.status_code < 500:
                 LOGGER.warning(
-                    "user management rejected actor=%s path=%s target=%s reason=%s",
+                    "user management rejected actor=%r path=%s target=%r reason=%s",
                     principal.username, stripped, target, type(error).__name__,
                 )
             return response
         LOGGER.info(
-            "user management actor=%s action=update target=%s fields=%s",
+            "user management actor=%r action=update target=%r fields=%s",
             principal.username,
             record.username,
             [field for field in ("phone", "role", "password") if payload[field] != ""],
@@ -1242,8 +1417,6 @@ def create_app(
             )
         if isinstance(exc, auth_store.AccountDisabled):
             return _auth_error(403, "account_disabled")
-        if isinstance(exc, auth_store.PhoneNotAllowed):
-            return _auth_error(403, "phone_not_allowed")
         if isinstance(exc, auth_store.PhoneNotRegistered):
             return _auth_error(404, "phone_not_registered")
         if isinstance(exc, auth_store.PhoneRegistered):
@@ -1300,6 +1473,7 @@ def create_app(
         restore_base_path: bool = False,
         strip_set_cookie: bool = False,
     ) -> Response:
+        proxy_started = monotonic()
         url = f"{upstream_base}{upstream_path}"
         if request.url.query:
             url = f"{url}?{request.url.query}"
@@ -1311,7 +1485,17 @@ def create_app(
         headers = _proxy_headers(
             request, resolved.base_path, strip_all_dcar=strip_all_dcar
         )
-        headers["X-Dcar-Authenticated-User"] = username
+        if upstream_base == resolved.douyin_upstream:
+            # Control records the original account name after verifying the
+            # gateway and session binding, so transmit it losslessly in ASCII.
+            headers["X-Dcar-Authenticated-User"] = quote(username, safe="")
+            headers["X-Dcar-Authenticated-User-Encoding"] = "percent-utf8"
+        else:
+            # Web/API only need a trusted identity marker. Keep its size fixed
+            # so a long account name cannot exceed Node's HTTP header budget.
+            # User-visible names always come from /auth/session.
+            headers["X-Dcar-Authenticated-User"] = hashlib.sha256(username.encode("utf-8")).hexdigest()
+            headers["X-Dcar-Authenticated-User-Encoding"] = "sha256"
         if extra_headers:
             headers.update(extra_headers)
         try:
@@ -1354,6 +1538,10 @@ def create_app(
             public_base_path=resolved.base_path,
             restore_base_path=restore_base_path,
             strip_set_cookie=strip_set_cookie,
+        )
+        timing = response.headers.get("Server-Timing", "")
+        response.headers["Server-Timing"] = (
+            (timing + ", " if timing else "") + f"gateway_proxy;dur={(monotonic() - proxy_started) * 1000:.2f}"
         )
         if not resolved.bypass_auth:
             # A browser must ask the gateway again after a role change or
@@ -1466,10 +1654,10 @@ def create_app(
             payload = await guarded_form(request, "login", legacy=True)
             if isinstance(payload, Response):
                 return payload
-            username = payload.get("username", "").strip()
+            username = payload.get("username", "")
             password = payload.get("password", "")
             return_to = _safe_return_to(payload.get("return_to", ""), resolved)
-            if not username or len(username) > 128 or not password or len(password) > 4096:
+            if not username or not password or len(password) > 4096:
                 return _no_store(
                     JSONResponse({"detail": "账号或密码不正确"}, status_code=401)
                 )
@@ -1579,7 +1767,7 @@ def create_app(
                     )
 
                 if stripped == "/auth/register":
-                    username = payload.get("username", "").strip()
+                    username = payload.get("username", "")
                     password = payload.get("password", "")
                     if not auth_store.valid_username(username):
                         return _auth_error(400, "invalid_username")
@@ -1686,10 +1874,15 @@ def create_app(
             session_payload: dict[str, object] = {
                 "authenticated": True,
                 "username": principal.username,
+                "display_name": principal.display_name,
+                "bypass": resolved.bypass_auth,
             }
             if principal.role is not None:
                 session_payload["role"] = principal.role
             return _no_store(JSONResponse(session_payload))
+
+        if stripped == "/auth/profile":
+            return await update_profile(request)
 
         if stripped == USER_LIST_PATH or stripped in USER_POST_ACTIONS:
             return await user_management(request, stripped)
@@ -1709,7 +1902,7 @@ def create_app(
             ))
         if principal is not None and principal.role == auth_store.ROLE_NEW_USER:
             if stripped in NEW_USER_PAGES and _is_page_navigation(request, stripped):
-                pending_page_response = HTMLResponse(_new_user_workbench_html(resolved.base_path, stripped))
+                pending_page_response = HTMLResponse(_new_user_workbench_html(resolved.base_path, stripped, principal))
                 pending_page_response.headers.update(
                     {
                         "Content-Security-Policy": (
@@ -1748,7 +1941,7 @@ def create_app(
             # bypass has no role and lands on the overview like an operator.
             if principal.role not in auth_store.USER_ADMIN_ROLES:
                 LOGGER.warning(
-                    "user management page denied actor=%s role=%s path=%s",
+                    "user management page denied actor=%r role=%s path=%s",
                     principal.username, principal.role, stripped,
                 )
                 return _no_store(
@@ -1861,14 +2054,40 @@ def create_app(
                         status_code=403,
                     )
                 )
-            return await proxy_request(
+            domain = read_domain(request.method, stripped)
+            use_reader = bool(domain and resolved.read_api_upstream)
+            reader_client = request.app.state.read_api_client
+            response = await proxy_request(
                 request,
-                upstream_base=resolved.api_upstream,
+                upstream_base=resolved.read_api_upstream if use_reader else resolved.api_upstream,
                 upstream_path=stripped,
-                client=request.app.state.api_client,
+                client=reader_client if use_reader else request.app.state.api_client,
                 username=authenticated_username,
+                strip_all_dcar=use_reader,
+                extra_headers={
+                    READ_KEY_HEADER: request.app.state.read_api_key,
+                    READ_SCOPE_HEADER: hashlib.sha256(
+                        (authenticated_username + ":" + (principal.role or "bypass")).encode("utf-8")
+                    ).hexdigest(),
+                } if use_reader else None,
                 restore_base_path=True,
             )
+            domains = invalidation_domains(request.method, stripped)
+            if (not use_reader and domains and 200 <= response.status_code < 300
+                    and resolved.read_api_upstream and reader_client is not None):
+                try:
+                    notification = await reader_client.post(
+                        resolved.read_api_upstream + "/internal/read/invalidate",
+                        json={"domains": sorted(domains)},
+                        headers={READ_KEY_HEADER: request.app.state.read_api_key}, timeout=1.0,
+                    )
+                    notification.raise_for_status()
+                except httpx.HTTPError:
+                    # Preserve the acknowledged write; reader summaries and its
+                    # strict 30s TTL remain the fallback freshness boundary.
+                    LOGGER.warning("read cache invalidation unavailable domains=%s", ",".join(sorted(domains)))
+                    response.headers["X-Dcar-Read-Invalidation"] = "deferred"
+            return response
         web_upstream_path = _web_upstream_path(
             request.url.path,
             stripped,

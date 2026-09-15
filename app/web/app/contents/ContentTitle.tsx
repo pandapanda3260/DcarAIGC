@@ -1,6 +1,7 @@
 "use client";
 
 import { useId, useLayoutEffect, useRef, useState } from "react";
+import { originalPostUrl } from "../lib/contentMedia";
 
 type Props = { text: string; href: string };
 type TitleLayout = { prefix: string; truncated: boolean };
@@ -42,6 +43,7 @@ export default function ContentTitle(props: Props) {
 }
 
 function MeasuredTitle({ text, href }: Props) {
+  const originalUrl = originalPostUrl(href);
   const titleId = useId();
   const rootRef = useRef<HTMLSpanElement>(null);
   const [expanded, setExpanded] = useState(false);
@@ -81,7 +83,7 @@ function MeasuredTitle({ text, href }: Props) {
       probe.setAttribute("aria-hidden", "true");
       probe.inert = true;
       probe.style.width = `${width}px`;
-      const link = document.createElement("a");
+      const link = document.createElement(originalUrl ? "a" : "span");
       link.className = "content-title-text";
       const tail = document.createElement("span");
       tail.className = "content-title-tail";
@@ -147,11 +149,13 @@ function MeasuredTitle({ text, href }: Props) {
       document.fonts.removeEventListener("loadingerror", schedule);
       window.removeEventListener("resize", schedule);
     };
-  }, [text]);
+  }, [text, originalUrl]);
 
   return (
     <span className="content-title" ref={rootRef} data-measured={layout ? "true" : undefined} data-expanded={expanded ? "true" : undefined}>
-      <a id={titleId} className="content-title-text" href={href} target="_blank" rel="noreferrer" aria-label={text}>{expanded ? text : layout?.prefix ?? text}</a>
+      {originalUrl
+        ? <a id={titleId} className="content-title-text" href={originalUrl} target="_blank" rel="noreferrer" aria-label={text}>{expanded ? text : layout?.prefix ?? text}</a>
+        : <span id={titleId} className="content-title-text" aria-label={text}>{expanded ? text : layout?.prefix ?? text}</span>}
       {layout?.truncated && (
         <span className="content-title-tail">
           {!expanded && <span className="content-title-ellipsis" aria-hidden="true">…</span>}

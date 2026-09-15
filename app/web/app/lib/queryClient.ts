@@ -28,19 +28,29 @@ function clearNavigationCache() {
 // Observe the shared session query so role updates from any observer invalidate it.
 export function bindNavigationSession(client: QueryClient, clear = clearNavigationCache) {
   let identity: string | undefined;
+  const clearBusinessData = () => {
+    // Keep the newly authenticated session, but discard all data and in-flight
+    // responses read under the old permission scope. Removal cancels queries.
+    client.removeQueries({ predicate: (query) => !(query.queryKey.length === 2
+      && query.queryKey[0] === "auth" && query.queryKey[1] === "session") });
+  };
   return client.getQueryCache().subscribe((event) => {
     if (event.query.queryKey.length !== 2 || event.query.queryKey[0] !== "auth"
       || event.query.queryKey[1] !== "session") return;
     if (event.type === "removed") {
       identity = undefined;
       clear();
+      clearBusinessData();
       return;
     }
     if (event.type !== "updated" || event.action.type !== "success") return;
-    const session = event.query.state.data as { username?: string; role?: string } | undefined;
+    const session = event.query.state.data as { username?: string; role?: string; bypass?: boolean } | undefined;
     if (!session) return;
-    const next = JSON.stringify([session.username, session.role]);
-    if (identity !== undefined && identity !== next) clear();
+    const next = JSON.stringify([session.username, session.role, session.bypass === true]);
+    if (identity !== undefined && identity !== next) {
+      clear();
+      clearBusinessData();
+    }
     identity = next;
   });
 }

@@ -30,6 +30,12 @@ DEFAULT_CHUNK_SIZE = 64 * 1024
 DEFAULT_MAX_ENCODED_BYTES = 128 * 1024 * 1024
 DEFAULT_MAX_ENTITY_BYTES = 512 * 1024 * 1024
 ALLOWED_HTTP_STACKS = frozenset({"urllib-stream-v1", "urllib-legacy-v1"})
+CONTENT_ENTITY_OPERATIONS = frozenset(
+    f"{platform}_{suffix}"
+    for platform, subject in (("douyin", "video"), ("xiaohongshu", "note"),
+                              ("kuaishou", "video"), ("wechat_channels", "video"))
+    for suffix in (f"{subject}_detail", f"{subject}_statistics")
+)
 
 Clock = Callable[[], str]
 _REQUEST_TRANSPORT: ContextVar[dict[str, Any] | None] = ContextVar("frozen_request_transport", default=None)
@@ -210,6 +216,67 @@ def _strict_json(entity: bytes) -> Any:
     return json.loads(entity.decode("utf-8", "strict"), parse_constant=reject_constant)
 
 
+def _exception_details(error: BaseException, phase: str) -> dict[str, Any]:
+    """Persist diagnostic types/codes, never arbitrary exception URLs or secrets."""
+    reason = getattr(error, "reason", None)
+    root = reason if isinstance(reason, BaseException) else error
+    code = getattr(root, "errno", None)
+    ssl_reason = getattr(root, "reason", None) if isinstance(root, ssl.SSLError) else None
+    safe_ssl_reason = ssl_reason if isinstance(ssl_reason, str) and ssl_reason.replace("_", "").isalnum() else None
+    return {"failure_phase": phase, "exception_type": type(error).__name__,
+            "reason_type": type(root).__name__, "errno": code if type(code) is int else None,
+            "ssl_reason": safe_ssl_reason,
+            "safe_message": f"{phase}: {type(error).__name__}/{type(root).__name__}"
+                + (f" errno={code}" if type(code) is int else "")
+                + (f" {safe_ssl_reason}" if safe_ssl_reason else "")}
+
+
+def usable_content_entity(receipt: Mapping[str, Any], operation: str) -> bool:
+    """Business completeness only; transport qualification must remain strict."""
+    complete = (receipt.get("status") == "succeeded" and not receipt.get("error_code")
+        and receipt.get("json_parse_ok") is True and receipt.get("length_match") is not False
+        and (receipt.get("content_length") is None or receipt.get("length_match") is True)
+        and receipt.get("gzip_crc_ok") is not False)
+    if not complete:
+        return False
+    if receipt.get("clean_eof") is True:
+        return True
+    return (operation in CONTENT_ENTITY_OPERATIONS
+        and receipt.get("entity_validation_operation") == operation
+        and receipt.get("http_stack") == "urllib-stream-v1"
+        and receipt.get("content_encoding") == "gzip" and receipt.get("gzip_crc_ok") is True
+        and receipt.get("entity_complete") is True
+        and receipt.get("entity_integrity_basis") == "gzip_single_member_crc"
+        and receipt.get("framing_warning") == "transport_incomplete_read")
+
+
+def validate_saved_content_entity(encoded: bytes, receipt: Mapping[str, Any], *, operation: str) -> JsonTransportResult:
+    """Revalidate exact quarantined gzip bytes without changing their old receipt."""
+    if (operation not in CONTENT_ENTITY_OPERATIONS or receipt.get("http_stack") != "urllib-stream-v1"
+            or receipt.get("clean_eof") is not False or receipt.get("content_encoding") != "gzip"
+            or receipt.get("error_code") != "transport_incomplete_read"
+            or len(encoded) > DEFAULT_MAX_ENCODED_BYTES or not encoded
+            or receipt.get("http_encoded_bytes") != len(encoded)
+            or receipt.get("http_encoded_sha256") != hashlib.sha256(encoded).hexdigest()
+            or receipt.get("content_length") not in (None, len(encoded))):
+        raise ValueError("quarantine is not the exact eligible content gzip response")
+    entity, valid, too_large = _gzip_entity(encoded, chunk_size=DEFAULT_CHUNK_SIZE,
+                                           max_entity_bytes=DEFAULT_MAX_ENTITY_BYTES)
+    if not valid or too_large:
+        raise ValueError("quarantined gzip is incomplete, oversized or corrupt")
+    payload = _strict_json(entity)
+    status = receipt.get("http_status")
+    if type(status) is not int or not 200 <= status < 300:
+        raise ValueError("quarantine is not a successful HTTP content response")
+    effective = dict(receipt)
+    effective.update(status="succeeded", error_code=None, entity_complete=True,
+        entity_integrity_basis="gzip_single_member_crc", entity_validation_operation=operation,
+        framing_warning="transport_incomplete_read", entity_bytes=len(entity),
+        entity_sha256=hashlib.sha256(entity).hexdigest(), json_parse_ok=True,
+        json_parse_error=None, gzip_crc_ok=True, zero_body=False)
+    return JsonTransportResult(status, payload, encoded, entity, effective)
+
+
 def _gzip_entity(
     encoded: bytes,
     *,
@@ -290,6 +357,7 @@ def request_json(
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     max_encoded_bytes: int = DEFAULT_MAX_ENCODED_BYTES,
     max_entity_bytes: int = DEFAULT_MAX_ENTITY_BYTES,
+    content_operation: str | None = None,
 ) -> JsonTransportResult:
     """Open ``request`` and return JSON only after strict transport validation.
 
@@ -301,6 +369,8 @@ def request_json(
 
     if not route_id.strip() or not route_generation.strip() or http_stack not in ALLOWED_HTTP_STACKS:
         raise ValueError("route identity fields must be nonempty")
+    if content_operation is not None and content_operation not in CONTENT_ENTITY_OPERATIONS:
+        raise ValueError("content entity acceptance requires an exact supported operation")
     if (
         isinstance(timeout, bool)
         or not isinstance(timeout, (int, float))
@@ -382,6 +452,7 @@ def request_json(
         socket.gaierror,
         ssl.SSLError,
     ) as error:
+        receipt.update(_exception_details(error, "open"))
         try:
             _finish_failure(
                 receipt,
@@ -486,8 +557,14 @@ def request_json(
                 partial = error.partial if isinstance(error.partial, bytes) else b""
                 encoded = b"".join([*chunks, partial])
                 receipt["clean_eof"] = False
+                receipt.update(_exception_details(error, "read"))
                 if receipt["content_length"] is not None:
                     receipt["length_match"] = len(encoded) == receipt["content_length"]
+                if content_operation is not None and content_encoding == "gzip":
+                    chunks.append(partial)
+                    receipt.update(framing_warning="transport_incomplete_read",
+                                   entity_validation_operation=content_operation)
+                    break
                 try:
                     _finish_failure(
                         receipt,
@@ -509,6 +586,7 @@ def request_json(
             ) as error:
                 encoded = b"".join(chunks)
                 receipt["clean_eof"] = False
+                receipt.update(_exception_details(error, "read"))
                 try:
                     _finish_failure(
                         receipt,
@@ -607,6 +685,9 @@ def request_json(
             chunks.append(block)
 
         encoded = b"".join(chunks)
+        if len(encoded) > max_encoded_bytes:
+            _finish_failure(receipt, code="transport_encoded_too_large",
+                message="provider response exceeds the encoded byte limit", partial_bytes=encoded, clock=clock)
         encoded_sha256 = hashlib.sha256(encoded).hexdigest()
         content_length = receipt["content_length"]
         length_match = (
@@ -698,6 +779,8 @@ def request_json(
             json_parse_ok=True,
             zero_body=not entity,
         )
+        if receipt.get("framing_warning") == "transport_incomplete_read":
+            receipt.update(entity_complete=True, entity_integrity_basis="gzip_single_member_crc")
         return JsonTransportResult(
             status=status,
             payload=payload,

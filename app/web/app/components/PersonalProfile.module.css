@@ -1,0 +1,46 @@
+.navigation { display: contents; }
+.footer { margin-top: auto; padding: 14px 0 0; border-top: 1px solid rgba(255,255,255,.09); }
+.accountBlock { min-width: 0; }
+.identity { display: flex; align-items: center; gap: 9px; min-width: 0; padding: 4px 0; }
+.avatar { width: 30px; height: 30px; flex: 0 0 30px; display: grid; place-items: center; border-radius: 50%; background: #284650; color: #b7ccd2; }
+.avatar svg { width: 17px; height: 17px; }
+.identityText { min-width: 0; flex: 1; display: block; }
+.nameRow { display: flex; align-items: center; gap: 3px; min-width: 0; min-height: 20px; }
+.name { min-width: 0; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #f4f8f9; font-size: 14px; line-height: 20px; font-weight: 500; unicode-bidi: plaintext; }
+.iconButton { width: 20px; height: 20px; flex: 0 0 20px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 4px; background: transparent; color: #91adb5; }
+.iconButton svg { width: 11px; height: 11px; }
+.iconButton[data-editing="true"] { visibility: hidden; }
+.iconButton:not(:disabled):hover { background: #ffffff0c; color: #edf6f8; }
+.iconButton:focus-visible { outline: 1px solid #9fb4bc; outline-offset: 2px; }
+.role { display: block; margin-top: 2px; color: #94adb4; font-size: 11px; line-height: 17px; }
+.identity :global(.sidebar-logout) { width: 20px; height: 24px; flex-basis: 20px; border-radius: 4px; }
+.identity :global(.sidebar-logout) svg { width: 15px; height: 15px; }
+.identity :global(.sidebar-logout):focus-visible { outline: 1px solid #9fb4bc; outline-offset: 2px; }
+.editor { display: grid; grid-template-columns: minmax(0, 1fr) 40px; align-items: center; gap: 6px; width: 100%; min-width: 0; margin: 12px 0 0; padding-top: 6px; border-top: 1px solid #ffffff12; }
+.nicknameInput { display: block; width: 100%; min-width: 0; height: 30px; min-height: 30px; max-height: 80px; padding: 4px 7px; border: 1px solid #56717b; border-radius: 5px; outline: none; resize: none; overflow: auto; background: #193740; color: #fff; font: inherit; font-size: 13px; line-height: 20px; unicode-bidi: plaintext; }
+.nicknameInput::placeholder { color: #91a8ae; }
+.nicknameInput:focus { border-color: #9fb4bc; box-shadow: none; }
+.editActions { display: flex; align-items: center; gap: 0; }
+.editActions svg { width: 12px; height: 12px; }
+.editActions .iconButton[type="submit"]:not(:disabled) { color: #d9c584; }
+.editActions .iconButton:disabled { color: #6c858e; cursor: default; }
+.hint { grid-column: 1 / -1; margin: 0; color: #94adb4; font-size: 11px; line-height: 17px; }
+.error { grid-column: 1 / -1; margin: 6px 0 0; color: #ffbcbc; font-size: 11px; line-height: 17px; overflow-wrap: anywhere; }
+.saving { width: 12px; height: 12px; border: 1.5px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: profile-spin .8s linear infinite; }
+@keyframes profile-spin { to { transform: rotate(360deg); } }
+@media (max-width: 1050px) {
+  /* The compact navigation rail stays intact. These same user controls flow
+     above the page instead of squeezing an editor into the 78px rail. */
+  .layout:global(.app-shell) { grid-template-rows: auto minmax(0, 1fr); }
+  .layout > :global(.sidebar) { display: contents; }
+  .navigation { display: block; grid-column: 1; grid-row: 1 / span 2; position: sticky; top: 0; height: 100vh; padding: 24px 12px; background: var(--navy); z-index: 5; }
+  .layout > :global(.main-area) { grid-column: 2; grid-row: 2; }
+  .footer { grid-column: 2; grid-row: 1; margin: 0; padding: 12px 24px; border: 0; background: var(--navy); }
+  .accountBlock { max-width: 400px; }
+  .identity { padding: 0; }
+}
+@media (max-width: 720px) {
+  .navigation { position: fixed; inset: auto 0 0; width: 100%; height: 64px; padding: 7px 10px; }
+  .footer { padding: 12px 15px; }
+}
+@media (prefers-reduced-motion: reduce) { .saving { animation: none; } }

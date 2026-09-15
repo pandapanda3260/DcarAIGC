@@ -211,7 +211,11 @@ class NativeQualificationTest(unittest.TestCase):
             before = connection.execute("SELECT count(*) FROM scheduler_runs").fetchone()[0]
         self.assertEqual(self.maintenance()["status"], "blocked")
         self.evidence["deployment"]["status"] = "accepted"
-        self.assertTrue(all(value["status"] == "not_enabled" for value in self.maintenance()["operations"].values()))
+        unenabled = self.maintenance()["operations"]
+        self.assertTrue(all(value["status"] == "not_enabled" for value in unenabled.values()))
+        self.assertIn("xiaohongshu_user_profile", unenabled)
+        self.assertIn("wechat_channels_resolve", unenabled)
+        self.assertIn("douyin_sec_profile", unenabled)
         self.cohort = self.freeze()
         with connect(self.db) as connection:
             frozen_count = connection.execute("SELECT count(*) FROM scheduler_runs").fetchone()[0]

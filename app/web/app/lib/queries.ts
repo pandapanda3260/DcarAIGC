@@ -31,6 +31,9 @@ export type AccountSearchResult = {
   total: number;
   account_management_version?: number;
   roster: AccountRosterStatus;
+  list_contract_version?: number;
+  // Client-owned provenance survives placeholderData and cached page reuse.
+  sourceRequest?: AccountSearchRequest;
 };
 export type DouyinAuthorizationsResult = { items: DouyinAuthorization[] };
 export type DouyinAuthorizationStatusesResult = { items: DouyinAuthorizationStatus[]; unavailable?: boolean };
@@ -69,6 +72,7 @@ export const queryKeys = {
   contentSearch: (request: ContentSearchRequest) => ["contents", "search", request] as const,
   accounts: ["accounts"] as const,
   accountSearch: (request: AccountSearchRequest) => ["accounts", "search", request] as const,
+  accountDirectoryDetail: (directoryRowId: number) => ["accounts", "directory", directoryRowId] as const,
   douyinAuthorizations: ["douyin", "authorizations"] as const,
   authorizationStatuses: ["douyin", "authorization-statuses"] as const,
   sellingPoints: ["selling-points"] as const,
@@ -115,7 +119,7 @@ export function overviewQueryOptions() {
 export function contentSearchQueryOptions(request: ContentSearchRequest) {
   return queryOptions({
     queryKey: queryKeys.contentSearch(request),
-    queryFn: () => readQueryJson<ContentSearchResult>(CONTENT_SEARCH_PATH, jsonRequest(request)),
+    queryFn: ({ signal }) => readQueryJson<ContentSearchResult>(CONTENT_SEARCH_PATH, { ...jsonRequest(request), signal }),
     placeholderData: keepPreviousData,
   });
 }
@@ -123,25 +127,37 @@ export function contentSearchQueryOptions(request: ContentSearchRequest) {
 // Compatibility belongs to the HTTP adapter, never the visible account filters.
 // Older services default to the active roster unless explicitly asked for all.
 let accountManagementVersion = 1;
-async function readAccountSearch(request: AccountSearchRequest): Promise<AccountSearchResult> {
+async function readAccountSearch(request: AccountSearchRequest, signal: AbortSignal): Promise<AccountSearchResult> {
   const legacy = accountManagementVersion < 2;
-  let result = await readQueryJson<AccountSearchResult>("/api/v8/accounts/search", jsonRequest(
-    legacy ? { ...request, scope: "all" } : request,
-  ));
+  const payload = { ...request, compact: true };
+  let result = await readQueryJson<AccountSearchResult>("/api/v8/accounts/search", {
+    ...jsonRequest(legacy ? { ...payload, scope: "all" } : payload), signal,
+  });
   accountManagementVersion = result.account_management_version ?? 1;
   if (!legacy && accountManagementVersion < 2) {
     // A service rollback must not silently hide saved accounts on this read.
-    result = await readQueryJson<AccountSearchResult>("/api/v8/accounts/search", jsonRequest({ ...request, scope: "all" }));
+    result = await readQueryJson<AccountSearchResult>("/api/v8/accounts/search", {
+      ...jsonRequest({ ...payload, scope: "all" }), signal,
+    });
     accountManagementVersion = result.account_management_version ?? 1;
   }
-  return result;
+  return { ...result, sourceRequest: { ...request } };
 }
 
 export function accountSearchQueryOptions(request: AccountSearchRequest) {
   return queryOptions({
     queryKey: queryKeys.accountSearch(request),
-    queryFn: () => readAccountSearch(request),
+    queryFn: ({ signal }) => readAccountSearch(request, signal),
     placeholderData: keepPreviousData,
+  });
+}
+
+export function accountDirectoryDetailQueryOptions(directoryRowId: number) {
+  return queryOptions({
+    queryKey: queryKeys.accountDirectoryDetail(directoryRowId),
+    queryFn: ({ signal }) => readQueryJson<Account>(`/api/v8/accounts/directory/${directoryRowId}`, { signal }),
+    // Editing and identity repair must read the latest saved fields/locator.
+    staleTime: 0,
   });
 }
 

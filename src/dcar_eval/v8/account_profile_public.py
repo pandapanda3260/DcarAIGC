@@ -38,8 +38,9 @@ _HOST_PLATFORMS = {
     "douyin.com": "douyin", "www.douyin.com": "douyin", "v.douyin.com": "douyin",
     "xiaohongshu.com": "xiaohongshu", "www.xiaohongshu.com": "xiaohongshu",
     "xhslink.com": "xiaohongshu", "www.xhslink.com": "xiaohongshu",
+    "kuaishou.com": "kuaishou", "www.kuaishou.com": "kuaishou", "v.kuaishou.com": "kuaishou",
 }
-_SHORT_HOSTS = {"v.douyin.com", "xhslink.com", "www.xhslink.com"}
+_SHORT_HOSTS = {"v.douyin.com", "xhslink.com", "www.xhslink.com", "v.kuaishou.com"}
 _ALLOWED_HOSTS = {*_HOST_PLATFORMS, "ttwid.bytedance.com"}
 _UID = re.compile(r"[0-9]{6,24}")
 _SEC_UID = re.compile(r"MS4wLjAB[A-Za-z0-9_-]{32,120}")
@@ -216,6 +217,9 @@ def expand_public_profile_url(url: str) -> str:
             raise _error("profile_expansion_failed")
         seen.add(current)
         if host not in _SHORT_HOSTS:
+            if platform == "kuaishou":
+                from .platform_adapters import normalize_account_input
+                return normalize_account_input({"platform": platform, "profile_url": current})["profile_url"]
             return parse_profile_input(current).profile_url
         if hop == MAX_REDIRECTS:
             break
@@ -224,7 +228,7 @@ def expand_public_profile_url(url: str) -> str:
         if response.status not in _REDIRECTS or len(locations) != 1:
             break
         current = urljoin(current, locations[0])
-    raise ProfileInputError("profile_expansion_failed", "暂时无法解析分享链接，请粘贴抖音或小红书的完整账号主页链接。")
+    raise ProfileInputError("profile_expansion_failed", "暂时无法解析分享链接，请粘贴完整账号主页链接或填写平台 UID。")
 
 
 def _douyin_protocol() -> ModuleType:

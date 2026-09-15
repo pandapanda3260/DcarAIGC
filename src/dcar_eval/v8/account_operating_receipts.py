@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 ACCOUNT_STATUS_JOB = "operator_account_status"
 ACCOUNT_STATUS_JOB_ID = ACCOUNT_STATUS_JOB
 ACCOUNT_STATUS_RECEIPT_VERSION = "account-operating-status-v1"
+ACCOUNT_LABEL_RECEIPT_VERSION = "account-operating-label-v2"
 _FREQUENCIES = {"daily", "weekly"}
 _STATUSES = _FREQUENCIES | {"paused"}
 
@@ -96,7 +97,7 @@ def _read_receipt(rows: Sequence[sqlite3.Row]) -> dict[str, Any]:
             or row["receipt_attempt_completed_at"] != row["completed_at"]
             or row["receipt_attempt_details_json"] != row["details_json"]
             or _canonical(details) != row["details_json"]
-            or details.get("contract_version") != ACCOUNT_STATUS_RECEIPT_VERSION
+            or details.get("contract_version") not in {ACCOUNT_STATUS_RECEIPT_VERSION, ACCOUNT_LABEL_RECEIPT_VERSION}
             or details.get("job_id") != ACCOUNT_STATUS_JOB_ID
             or type(details.get("run_id")) is not int
             or details["run_id"] != row["id"]
@@ -115,7 +116,10 @@ def _read_receipt(rows: Sequence[sqlite3.Row]) -> dict[str, Any]:
             or type(before.get("enabled")) is not bool
             or before.get("update_frequency") not in (*_FREQUENCIES, None)
             or type(after.get("enabled")) is not bool
-            or after["enabled"] != (requested_status != "paused")
+            or after["enabled"] != (
+                before["enabled"] if details.get("contract_version") == ACCOUNT_LABEL_RECEIPT_VERSION
+                else requested_status != "paused"
+            )
             or after.get("update_frequency") != frequency
             or (requested_status == "paused" and before.get("update_frequency") != frequency)
             or request.get("account_status") != requested_status
@@ -251,6 +255,7 @@ def record_status_receipt(
     after: Mapping[str, Any],
     result: Mapping[str, Any],
     timestamp: str,
+    labels_only: bool = False,
 ) -> dict[str, Any]:
     """Seal one completed manual command inside the business transaction."""
     if not connection.in_transaction:
@@ -278,7 +283,7 @@ def record_status_receipt(
     )
     attempt_id = int(attempt_cursor.lastrowid or 0)
     details = {
-        "contract_version": ACCOUNT_STATUS_RECEIPT_VERSION,
+        "contract_version": ACCOUNT_LABEL_RECEIPT_VERSION if labels_only else ACCOUNT_STATUS_RECEIPT_VERSION,
         "job_id": ACCOUNT_STATUS_JOB_ID,
         "run_id": run_id, "attempt_id": attempt_id, "request_id": request_id,
         "recorded_at": timestamp, "payload": payload,

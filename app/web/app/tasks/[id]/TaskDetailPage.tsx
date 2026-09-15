@@ -1,9 +1,10 @@
 "use client";
 
 import Link from "next/link";
-import { accountGroupLabel, businessDirectionLabel } from "../../lib/accountClassification";
+import ReportDimensions from "./ReportDimensions";
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { duplicateReminder } from "../../lib/duplicateStatus";
 import AppShell from "../../components/AppShell";
 import { Feedback, Loading, Notice } from "../../components/Feedback";
 import { API_BASE, readDownload, readJson, saveDownload } from "../../lib/api";
@@ -50,6 +51,7 @@ const qualityCheckCopy: Record<string, { name: string; hint: string }> = {
   core_artifact_coverage: { name: "语音和画面文字识别完成率", hint: "视频语音和图片文字处理完成的比例" },
   media_terminal_coverage: { name: "视频和图片处理完成率", hint: "视频和图片已经处理完毕或给出失败结果的比例" },
   duplicate_fingerprint_coverage: { name: "重复内容识别完成率", hint: "完成重复内容识别的比例" },
+  duplicate_relation_coverage: { name: "重复比对完成率", hint: "所选内容已完成重复比对并确认结果的比例；未完成时报告不能发布" },
   duplicate_calibration_ready: { name: "重复内容规则校验", hint: "重复内容判断规则是否已经人工检查" },
   weekly_comment_coverage: { name: "评论采集完成率", hint: "周报内容近一周评论的采集比例" },
 };
@@ -283,8 +285,8 @@ export default function TaskDetailPage({ taskId }: { taskId: string }) {
           <h4>平台发布分布</h4>
           <div className="dimension-list">{report?.platform_dimensions.map((item) => <div key={String(item.key)}><strong>{label(String(item.key))}</strong><span>{item.count} 条 · {item.percentage ?? "—"}%</span></div>)}</div>
         </div>}
-        {tab === "dimensions" && <div className="task-tab-body">{report?.metadata?.account_classification_version === "account-classification-v2" ? <><h4>账号分组</h4><div className="dimension-list">{report.account_group_dimensions?.map((item) => <div key={String(item.key)}><strong>{accountGroupLabel(String(item.key))}</strong><span>{item.count} 条 · {item.percentage ?? "—"}%</span></div>)}</div><h4>业务方向</h4><div className="dimension-list">{report.business_direction_dimensions?.map((item) => <div key={String(item.key)}><strong>{businessDirectionLabel(String(item.key))}</strong><span>{item.count} 条 · {item.percentage ?? "—"}%</span></div>)}</div></> : <><h4>账号类型（历史口径）</h4><p>按生成报告时的旧账号类型展示，未转换为当前账号分组。</p><div className="dimension-list">{report?.account_type_dimensions?.map((item) => <div key={String(item.key)}><strong>{label(String(item.key))}</strong><span>{item.count} 条 · {item.percentage ?? "—"}%</span></div>)}</div></>}<h4>作品内容方向</h4><div className="dimension-list">{report?.content_direction_dimensions.map((item) => <div key={String(item.key)}><strong>{label(String(item.key))}</strong><span>{item.count} 条 · {item.percentage ?? "—"}%</span></div>)}</div></div>}
-        {tab === "contents" && <div className="task-tab-body table-scroll"><table><thead><tr><th>系统内容编号</th><th>平台</th><th>标题</th><th>资料完整度</th><th>汽车内容相关度</th><th>重复提醒</th></tr></thead><tbody>{report?.content_details.map((item) => <tr key={String(item.content_id)}><td>{item.link_id}</td><td>{label(String(item.platform))}</td><td>{item.title || "标题缺失"}</td><td>{item.evidence_level ? evidenceLevelLabels[String(item.evidence_level)] ?? "资料状态未知" : "—"}</td><td>{item.content_automotive_score == null ? "暂不可计算" : `${item.content_automotive_score}%`}</td><td>{item.duplicate_original_link_id ? `与内容 ${item.duplicate_original_link_id} 重复` : "未发现重复"}</td></tr>)}</tbody></table></div>}
+        {tab === "dimensions" && <ReportDimensions report={report} />}
+        {tab === "contents" && <div className="task-tab-body table-scroll"><table><thead><tr><th>系统内容编号</th><th>平台</th><th>标题</th><th>资料完整度</th><th>汽车内容相关度</th><th>重复提醒</th></tr></thead><tbody>{report?.content_details.map((item) => <tr key={String(item.content_id)}><td>{item.link_id}</td><td>{label(String(item.platform))}</td><td>{item.title || "标题缺失"}</td><td>{item.evidence_level ? evidenceLevelLabels[String(item.evidence_level)] ?? "资料状态未知" : "—"}</td><td>{item.content_automotive_score == null ? "暂不可计算" : `${item.content_automotive_score}%`}</td><td>{duplicateReminder(item.relation_status, item.duplicate_original_link_id)}</td></tr>)}</tbody></table></div>}
         {tab === "files" && <div className="task-tab-body"><h4>技术文件（供排查）</h4><p className="empty-explanation">日常查看请使用页面上方的“下载报告”；下面文件只在排查问题时使用。</p><div className="download-list">{detail.revisions.map((revision) => <article key={revision.revision} className={revision.invalidated_at ? "invalidated-revision" : ""}><strong>第 {revision.revision} 版{revision.invalidated_at ? "（已作废）" : revision.revision_state === "current" ? "（当前）" : revision.revision_state === "stale" ? "（使用旧规则）" : "（历史）"}</strong><span>{formatDateTime(revision.created_at)}</span><div>{revision.files.map((file) => { const fileLabel = fileKindLabels[file.file_kind] ?? "其他技术文件"; return <a key={file.file_kind} title={fileLabel} href={`${API_BASE}/api/v8/tasks/${detail.id}/revisions/${revision.revision}/files/${file.file_kind}`} target="_blank" rel="noreferrer">{fileLabel} · {formatBytes(file.byte_size)}</a>; })}</div></article>)}</div><h4>任务日志</h4><ol className="event-list">{detail.events.map((event) => <li key={event.id}><strong>{taskEventLabels[event.event_type] ?? "任务状态更新"}</strong><span>{humanizeTaskMessage(event.message)} · {formatDateTime(event.created_at)}</span></li>)}</ol></div>}
       </article>
     </section>}

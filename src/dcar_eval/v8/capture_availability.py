@@ -9,18 +9,20 @@ import sqlite3
 
 from . import metric_field_facts as facts
 
-DETAIL_OPERATIONS = {"douyin_video_detail", "xiaohongshu_note_detail"}
+DETAIL_OPERATIONS = {"douyin_video_detail", "xiaohongshu_note_detail", "kuaishou_video_detail", "wechat_channels_video_detail"}
 
 
 def record_detail_result(connection: sqlite3.Connection, *, content_id: int,
                          raw_response_id: int, available: bool, recorded_at: str) -> int:
-    if not connection.in_transaction or connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
+    if not connection.in_transaction or connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21, 22, 23, 24}:
         raise ValueError("availability requires schema20 writer transaction")
     raw = connection.execute("""SELECT r.*,t.clean_eof,t.json_parse_ok FROM provider_raw_responses r
         JOIN fetch_transport_receipts t ON t.id=r.transport_receipt_id AND t.fetch_attempt_id=r.fetch_attempt_id
         WHERE r.id=? AND r.content_id=?""", (raw_response_id, content_id)).fetchone()
-    if raw is None or raw["operation"] not in DETAIL_OPERATIONS or not raw["clean_eof"] or not raw["json_parse_ok"]:
+    if raw is None or raw["operation"] not in DETAIL_OPERATIONS:
         raise ValueError("availability requires a complete requested-content detail response")
+    from .raw_archive import response_entity_integrity
+    response_entity_integrity(connection, raw_response_id)
     existing = connection.execute("SELECT id FROM content_availability_observations WHERE content_id=? AND raw_response_id=? AND observation_id IS NULL",
                                   (content_id, raw_response_id)).fetchone()
     if existing is not None:

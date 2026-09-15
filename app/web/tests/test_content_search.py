@@ -90,6 +90,18 @@ class ContentSearchTest(unittest.TestCase):
     def search(self, **values):
         return helper.search(helper.validate_request(values, self.api), self.db, self.api, self.storage)
 
+    def test_schema21_and22_remain_readonly_and_see_committed_wal(self):
+        for version in (21, 22):
+            with self.subTest(schema=version):
+                self.storage.initialize_database(self.writer, target_version=version)
+                self.writer.commit()
+                before = {p.name: p.read_bytes() for p in self.db.parent.iterdir() if p.is_file()}
+                result = self.search()
+                self.assertEqual(result["total"], 6)
+                self.assertEqual(self.writer.execute("PRAGMA user_version").fetchone()[0], version)
+                after = {p.name: p.read_bytes() for p in self.db.parent.iterdir() if p.is_file()}
+                self.assertEqual(before, after)
+
     def test_committed_wal_rows_are_visible_without_checkpoint(self):
         self.assertGreater(self.db.with_name(self.db.name + "-wal").stat().st_size, 0)
         with self.storage.connect(self.db, read_only=True) as immutable:

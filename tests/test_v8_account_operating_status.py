@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from v8.account_operating_receipts import ACCOUNT_STATUS_JOB, load_update_frequencies, record_status_receipt
+from v8.account_operating_receipts import ACCOUNT_STATUS_JOB, find_status_request, load_update_frequencies, record_status_receipt
 from v8.account_operating_status import (
     AccountOperatingStatusError,
     account_operating_status,
@@ -81,6 +81,118 @@ class AccountOperatingStatusTest(unittest.TestCase):
                               "account_roster_members", "content_items", "account_state_events",
                               "scheduler_runs", "scheduler_run_attempts",
                               "acquisition_profile_activations", "pipeline_paid_drain_events")}
+
+    def catalog_directory(self, *, proven=False, identity_status="uid_unverified"):
+        from v8.account_directory import import_account_directory
+        with transaction(self.connection):
+            import_account_directory(self.connection, {
+                "sha256": "c" * 64, "source": "fixture.xlsx", "sheet": "accounts", "records": [
+                    {"sourceRow": 2, "raw": {"平台": "抖音", "UID": "123456789", "更新状态": "日更"}},
+                ],
+            }, imported_at="2026-09-08T00:00:00Z")
+            self.connection.execute("UPDATE account_directory_rows SET identity_status=?", (identity_status,))
+            self.connection.execute("DELETE FROM account_provider_references WHERE account_identity_id=?", (self.identity_id,))
+            if proven:
+                record_status_receipt(self.connection, request_id="proven-profile", account_id=self.account_id,
+                    account_identity_id=self.identity_id, requested_status="daily", update_frequency="daily",
+                    request={"account_status": "daily", "fields": {}, "admission": {"member": {
+                        "platform": "douyin", "uid": "123456789", "metadata": {"sec_user_id": "MS4wLjAB" + "D" * 64}}}},
+                    actor="test", reason="verified fixture profile", before={"enabled": True, "update_frequency": None},
+                    after={"enabled": True, "update_frequency": "daily"},
+                    result={"id": self.account_id, "status_request_id": "proven-profile", "account_status": "daily",
+                            "enabled": True, "update_frequency": "daily"}, timestamp="2026-09-08T01:00:00Z")
+
+    def test_proven_import_identity_can_pause_and_resume_without_changing_old_flag(self):
+        from v8.account_directory_status import update_directory_only_status_in_transaction
+        self.catalog_directory(proven=True)
+        original_history = self.business_rows()
+        with patch("v8.account_catalog_capture.installed_policy", return_value={"catalog": "fixture"}):
+            for status in ("weekly", "paused", "daily"):
+                with self.subTest(status=status), transaction(self.connection):
+                    values = {"account_status": status, "status_request_id": "proven-" + status}
+                    self.assertIsNone(update_directory_only_status_in_transaction(self.connection, self.account_id,
+                        values, actor="tester", reason="status"))
+                    result = update_account_operating_status_in_transaction(self.connection, self.account_id, values,
+                        raw_root=self.root / "raw", actor="tester", reason="status",
+                        schedule_activation=lambda *_: self.fail("catalog must not rebuild roster"))
+                    self.assertEqual(result["account_status"], status)
+                    self.assertTrue(result["enabled"])
+                    self.assertEqual(result["automatic_capture"]["reason_code"], "eligible")
+                    self.assertEqual(find_status_request(self.connection, request_id=values["status_request_id"])["payload"]["result"], result)
+        self.assertEqual(self.connection.execute("SELECT identity_status FROM account_directory_rows").fetchone()[0], "uid_unverified")
+        after = self.business_rows()
+        for table in ("account_platform_identities", "account_roster_snapshots", "account_roster_members", "content_items", "account_state_events", "acquisition_profile_activations"):
+            self.assertEqual(original_history[table], after[table], table)
+
+    def test_unproven_bound_identity_can_change_labels_without_changing_capture_projection(self):
+        from v8.account_directory_status import update_directory_only_status_in_transaction
+        self.catalog_directory()
+        with patch("v8.account_catalog_capture.installed_policy", return_value={"catalog": "fixture"}):
+            for enabled in (0, 1):
+                self.connection.execute("UPDATE accounts SET enabled=?", (enabled,))
+                self.connection.commit()
+                for status in ("paused", "daily", "weekly"):
+                    with self.subTest(enabled=enabled, status=status), transaction(self.connection):
+                        values = {"account_status": status, "status_request_id": f"no-proof-{enabled}-{status}"}
+                        self.assertIsNone(update_directory_only_status_in_transaction(self.connection, self.account_id,
+                            values, actor="tester", reason="status"))
+                        result = update_account_operating_status_in_transaction(self.connection, self.account_id, values,
+                            raw_root=self.root / "raw", actor="tester", reason="status")
+                        self.assertEqual(result["account_status"], status)
+                        self.assertEqual(result["enabled"], bool(enabled))
+                        self.assertFalse(result["automatic_capture"]["eligible"])
+                        self.assertEqual(result["automatic_capture"]["reason_code"], "reference_missing")
+                        self.assertEqual(self.account()["enabled"], enabled)
+
+    def test_catalog_status_receipt_reports_concrete_missing_evidence(self):
+        self.catalog_directory(identity_status="existing_verified")
+        with patch("v8.account_catalog_capture.installed_policy", return_value={"catalog": "fixture"}):
+            result = self.change("daily", status_request_id="missing-reference")
+        self.assertEqual(result["activation_status"], "catalog_managed")
+        self.assertEqual(result["automatic_capture"]["reason_code"], "reference_missing")
+        self.assertNotIn("等待", result["message"])
+        self.assertEqual(find_status_request(self.connection, request_id="missing-reference")["payload"]["result"], result)
+
+    def test_old_directory_label_replay_survives_new_catalog_routing(self):
+        from v8.account_directory_status import update_directory_only_status_in_transaction, find_directory_status_request
+        self.catalog_directory()
+        values = {"account_status": "paused", "status_request_id": "old-directory-label"}
+        with transaction(self.connection):
+            self.connection.execute("UPDATE accounts SET enabled=0")
+            original = update_directory_only_status_in_transaction(self.connection, self.account_id, values,
+                actor="tester", reason="status")
+        frozen = find_directory_status_request(self.connection, values["status_request_id"])
+        # Capture projection may have changed independently since this command.
+        self.connection.execute("UPDATE accounts SET enabled=1")
+        self.connection.commit()
+        before = self.business_rows()
+        with patch("v8.account_catalog_capture.installed_policy", return_value={"catalog": "fixture"}), transaction(self.connection):
+            replay = update_directory_only_status_in_transaction(self.connection, self.account_id, values,
+                actor="tester", reason="status")
+        self.assertEqual(replay, {**original, "status_replayed": True})
+        self.assertEqual(find_directory_status_request(self.connection, values["status_request_id"]), frozen)
+        self.assertEqual(self.business_rows(), before)
+
+    def test_legacy_pending_receipt_replay_projects_reason_without_rewriting_receipt(self):
+        self.catalog_directory(identity_status="existing_verified")
+        with transaction(self.connection):
+            record_status_receipt(self.connection, request_id="legacy-pending", account_id=self.account_id,
+                account_identity_id=self.identity_id, requested_status="daily", update_frequency="daily",
+                request={"account_status": "daily", "fields": {}}, actor="tester", reason="manual account status",
+                before={"enabled": True, "update_frequency": None}, after={"enabled": True, "update_frequency": "daily"},
+                result={"id": self.account_id, "status_request_id": "legacy-pending", "account_status": "daily",
+                    "enabled": True, "update_frequency": "daily", "activation_status": "pending_verification",
+                    "automatic_capture": {"eligible": False, "reason_code": "pending_verification", "reason_label": "等待系统核验"}},
+                timestamp="2026-09-08T01:00:00Z")
+        frozen = find_status_request(self.connection, request_id="legacy-pending")
+        before = self.business_rows()
+        with patch("v8.account_catalog_capture.installed_policy", return_value={"catalog": "fixture"}):
+            result = self.change("daily", status_request_id="legacy-pending")
+        self.assertTrue(result["status_replayed"])
+        self.assertEqual(result["activation_status"], "catalog_managed")
+        self.assertEqual(result["automatic_capture"]["reason_code"], "reference_missing")
+        self.assertEqual(find_status_request(self.connection, request_id="legacy-pending"), frozen)
+        self.assertEqual(self.business_rows(), before)
 
     def test_old_schema_reads_unmarked_and_paused_without_inventing_frequency(self) -> None:
         self.assertEqual(account_operating_status(self.account()), "unmarked")

@@ -703,7 +703,8 @@ class AuthReleaseHelperTestCase(unittest.TestCase):
                 status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','disabled')),
                 role TEXT NOT NULL DEFAULT 'operator' CHECK(role IN ('superadmin','admin','operator')),
                 created_at INTEGER NOT NULL, password_updated_at INTEGER NOT NULL)""")
-            connection.execute("INSERT INTO auth_users_v2 SELECT * FROM auth_users")
+            connection.execute("INSERT INTO auth_users_v2(username, phone, password_hash, status, role, created_at, password_updated_at) "
+                "SELECT username, phone, password_hash, status, role, created_at, password_updated_at FROM auth_users")
             connection.execute("DROP TABLE auth_users")
             connection.execute("ALTER TABLE auth_users_v2 RENAME TO auth_users")
             connection.execute("PRAGMA user_version=2")

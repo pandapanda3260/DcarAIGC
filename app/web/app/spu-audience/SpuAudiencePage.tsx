@@ -22,6 +22,7 @@ import {
   XIcon,
 } from "@phosphor-icons/react";
 import AppShell from "../components/AppShell";
+import DataFreshnessNote from "../components/DataFreshnessNote";
 import { Feedback, Loading, Notice } from "../components/Feedback";
 import { Pagination } from "../components/Pagination";
 import { jsonRequest, readJson } from "../lib/api";
@@ -492,6 +493,7 @@ export default function SpuAudiencePage() {
                 </select>
               </span>
             </header>
+            {stats && !statsQuery.isError && <DataFreshnessNote />}
             <div className="spu-summary-grid">
               {[
                 { key: "spu", tone: "catalog", icon: <CarIcon size={22} weight="regular" aria-hidden />, label: "车型识别", value: stats?.coverage?.spu_percentage, note: catalogBreakdown },

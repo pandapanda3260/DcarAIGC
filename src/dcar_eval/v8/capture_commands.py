@@ -18,7 +18,26 @@ JOB = "capture_manual_command"
 CONTRACT = "capture-manual-command-v1"
 
 
-def read_command(connection: sqlite3.Connection, *, run_id: int, content_id: int) -> dict[str, Any]:
+def persist_specification(connection: sqlite3.Connection, *, specification: dict[str, Any], at: str) -> dict[str, Any]:
+    """Persist a frozen command inside its caller's atomic authorization write."""
+    if not connection.in_transaction:
+        raise ValueError("manual command persistence requires a transaction")
+    require_current_process_writer_lock(connection)
+    identity = {"contract_version": CONTRACT, "specification": specification}
+    scan_id = durable_runs.scan_identity(JOB, identity)
+    scheduled = "scan:" + scan_id
+    existing = connection.execute("SELECT id FROM scheduler_runs WHERE job_id=? AND scheduled_for=? AND root_run_id IS NULL", (JOB, scheduled)).fetchone()
+    if existing is None:
+        details = {"contract_version": durable_runs.CONTRACT_VERSION, "scan_id": scan_id, "identity": identity,
+            "checkpoint": {"complete": False}, "complete": False}
+        run_id = int(connection.execute("INSERT INTO scheduler_runs(job_id,scheduled_for,status,started_at,completed_at,details_json) VALUES(?,?,'interrupted',?,?,?)", (JOB, scheduled, at, at, json.dumps(details, sort_keys=True))).lastrowid)
+    else:
+        run_id = int(existing[0])
+    return read_command(connection, run_id=run_id, content_id=specification["content_id"])
+
+
+def read_command(connection: sqlite3.Connection, *, run_id: int, content_id: int,
+                 at: str | None = None) -> dict[str, Any]:
     """Pure SELECT; caller may and API does use a query_only connection."""
     row = connection.execute("SELECT * FROM scheduler_runs WHERE id=? AND job_id=? AND root_run_id IS NULL",
                              (run_id, JOB)).fetchone()
@@ -45,6 +64,11 @@ def read_command(connection: sqlite3.Connection, *, run_id: int, content_id: int
         elif len(work) != len(result["work_ids"]):
             status, reason = "failed", "linked_capture_work_missing"
         elif work and all(item["state"] == "terminal" for item in work):
+            if connection.execute("PRAGMA user_version").fetchone()[0] >= 23:
+                # Request completion does not imply every requested field was
+                # returned. Preserve the linked consumers' terminal findings.
+                reason = ";".join(dict.fromkeys(value for value in
+                    [reason, *[item["reason"] for item in work]] if value))
             status = "partial" if reason else "succeeded"
         elif any(item["state"] in {"running", "leased"} for item in work):
             status = "running"
@@ -56,8 +80,31 @@ def read_command(connection: sqlite3.Connection, *, run_id: int, content_id: int
                     item["operation"] + ":" + (item["reason"] or item["state"]) for item in blockers]] if value]))
                 if all(item["state"] == "terminal" or item in blockers for item in work):
                     status = "partial" if any(item["state"] == "terminal" for item in work) else "blocked"
+    quote: dict[str, Any] = {}
+    if specification["kind"] == "media_source_refresh":
+        from .media_source_refresh import read_proposal
+        proposal = read_proposal(connection, task_id=specification["task_id"], at=at)
+        quote = {key: proposal[key] for key in ("task_id", "source_generation", "expires_at", "can_requote")}
+        if proposal["status"] == "expired":
+            status, reason = "expired", "media_source_refresh_expired"
+        elif work and all(item["state"] == "terminal" for item in work):
+            failures = [item["reason"] for item in work if item["reason"]]
+            if failures:
+                status, reason = "failed", ";".join(dict.fromkeys(failures))
+    limitations: dict[str, Any] = {}
+    limited_stages = specification.get("limited_stages", [])
+    if limited_stages:
+        # Older frozen commands have no limitations field and retain their
+        # original readback. Running/failure states still describe real work.
+        limitations = {"limited_stages": limited_stages,
+            "reason_label": "；".join(dict.fromkeys(item["reason_label"] for item in limited_stages))}
+        if status == "succeeded":
+            status = "partial"
+        if status == "partial":
+            reason = ";".join(dict.fromkeys(value for value in
+                [reason, *[item["reason"] for item in limited_stages]] if value))
     return {"run_id": run_id, "content_id": content_id, "kind": specification["kind"],
-        "status": status, "reason": reason, "work": work, "provider_calls": 0}
+        "status": status, "reason": reason, "work": work, "provider_calls": 0, **quote, **limitations}
 
 
 def submit_command(*, db_path: Path, content_id: int, kind: str = "manual_update",

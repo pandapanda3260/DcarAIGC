@@ -95,7 +95,6 @@ for username, phone, role, status in (
         status=status,
         actor="browser-smoke",
     )
-store.allow_phone("13800138108", "browser-smoke", actor="browser-smoke")
 PY
 
 "$python_bin" -m uvicorn auth_integration_smoke_upstream:app \

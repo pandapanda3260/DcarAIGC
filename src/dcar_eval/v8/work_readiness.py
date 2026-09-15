@@ -78,10 +78,10 @@ def _fault_marker(state: Mapping[str, Any] | None) -> dict[str, Any] | None:
 
 
 def _platform(operation: str) -> str:
-    if operation.startswith("douyin_"):
-        return "douyin"
-    if operation.startswith("xiaohongshu_"):
-        return "xiaohongshu"
+    if operation in PRICES_MICROUSD:
+        for platform in ("douyin", "xiaohongshu", "kuaishou", "wechat_channels"):
+            if operation.startswith(platform + "_"):
+                return platform
     raise ValueError("operation has no supported platform")
 
 

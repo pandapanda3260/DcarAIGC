@@ -75,6 +75,42 @@ class AccountOperatingReceiptsTest(unittest.TestCase):
         self.assertEqual(load_update_frequencies(self.connection), {first: "weekly", second: "daily"})
         self.assertEqual(load_update_frequencies(self.connection, []), {})
 
+    def test_label_receipts_keep_capture_projection_and_coexist_with_old_receipts(self) -> None:
+        account_id = self.accounts[0]
+        old = self.record(account_id, "daily", "old-daily")
+        identity_id = old["payload"]["account_identity_id"]
+        for enabled in (True, False):
+            for status in ("paused", "weekly"):
+                request_id = f"label-{enabled}-{status}"
+                previous = load_update_frequencies(self.connection, [account_id])[account_id]
+                frequency = previous if status == "paused" else status
+                with self.subTest(enabled=enabled, status=status), transaction(self.connection):
+                    receipt = record_status_receipt(
+                        self.connection, request_id=request_id, account_id=account_id,
+                        account_identity_id=identity_id, requested_status=status, update_frequency=frequency,
+                        request={"account_status": status, "fields": {}}, actor="tester", reason="manual label",
+                        before={"enabled": enabled, "update_frequency": previous},
+                        after={"enabled": enabled, "update_frequency": frequency},
+                        result={"id": account_id, "account_status": status, "update_frequency": frequency,
+                                "enabled": enabled, "status_request_id": request_id},
+                        timestamp="2026-09-11T10:00:00.000001Z", labels_only=True,
+                    )
+                self.assertEqual(receipt["contract_version"], "account-operating-label-v2")
+                self.assertEqual(find_status_request(self.connection, request_id=request_id), receipt)
+        self.assertEqual(find_status_request(self.connection, request_id="old-daily"), old)
+        self.assertEqual(load_update_frequencies(self.connection, [account_id])[account_id], "weekly")
+
+        def change_projection(value):
+            value["payload"]["after"]["enabled"] = True
+            value["payload"]["result"]["enabled"] = True
+            value.pop("self_sha256")
+            value["self_sha256"] = hashlib.sha256(canonical(value).encode()).hexdigest()
+            return canonical(value)
+        with transaction(self.connection):
+            self._forge_receipt(receipt, change_projection)
+            with self.assertRaises(AccountOperatingStatusError):
+                find_status_request(self.connection, request_id="forged")
+
     def test_latest_parent_corruption_errors_instead_of_falling_back(self) -> None:
         account_id = self.accounts[0]
         self.record(account_id, "daily", "first")

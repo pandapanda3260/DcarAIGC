@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import { dailyReportStatus, dataServiceStatus } from "../app/lib/serviceStatus.ts";
+import { dailyReportStatus, dataFreshnessNotice, dataServiceStatus } from "../app/lib/serviceStatus.ts";
 
 const healthy = {
   status: "ok", read_only: false,
@@ -135,6 +135,50 @@ test("failed refresh overrides cached healthy or read-only status", () => {
   }
 });
 
+test("data freshness notices stay silent without confirmed delays or when health fails", () => {
+  const writerDelayed = { ...healthy, data_freshness: { ...healthy.data_freshness, status: "stale" } };
+  const replicaDelayed = { ...healthy, read_only: true, snapshot_sync: { ...snapshot, status: "delayed" } };
+  for (const health of [
+    undefined, healthy, { status: "ok", read_only: false },
+    { ...healthy, data_freshness: { status: "unknown" } },
+    { ...healthy, read_only: true, snapshot_sync: snapshot },
+    { ...healthy, read_only: true, snapshot_sync: { ...snapshot, status: "unknown" } },
+    ...["paused", "stopped"].map((scheduler_state) => ({ ...healthy, automation: { ...healthy.automation, scheduler_state } })),
+    ...["draining", "sealed"].map((paid_dispatch_state) => ({ ...healthy, automation: { ...healthy.automation, paid_dispatch_state } })),
+    { ...writerDelayed, status: "unavailable" },
+    { ...writerDelayed, read_only: undefined },
+    { ...writerDelayed, automation: { ...healthy.automation, paid_dispatch_state: "invalid" } },
+  ]) assert.equal(dataFreshnessNotice(health, false), null);
+  for (const health of [undefined, healthy, writerDelayed, replicaDelayed]) {
+    assert.equal(dataFreshnessNotice(health, true), null);
+  }
+});
+
+test("writer delay notice explains existing data and formats its capture time in Shanghai", () => {
+  const delayed = { ...healthy, data_freshness: { status: "stale", last_successful_capture_at: "2026-09-06T23:30:00Z" } };
+  assert.equal(dataFreshnessNotice(delayed, false), "数据更新延迟，当前展示已有数据。最近成功采集：2026/09/07 07:30（北京时间）。");
+  // A real stale-data signal remains useful even when the scheduler is intentionally paused.
+  assert.equal(dataFreshnessNotice({ ...delayed, automation: { ...healthy.automation, scheduler_state: "paused" } }, false), dataFreshnessNotice(delayed, false));
+  assert.equal(dataFreshnessNotice({ ...healthy, snapshot_sync: { ...snapshot, status: "delayed" } }, false), null);
+});
+
+test("replica delay notice uses sync evidence independently of writer capture state", () => {
+  const delayed = { ...healthy, read_only: true, data_freshness: { status: "stale", last_successful_capture_at: "2026-09-06T00:00:00Z" },
+    snapshot_sync: { ...snapshot, status: "delayed", window_state: "inactive" } };
+  const expected = "数据同步延迟，当前展示上次同步的数据。最近同步：2026/09/07 11:15（北京时间）。";
+  assert.equal(dataFreshnessNotice(delayed, false), expected);
+  assert.equal(dataFreshnessNotice({ ...delayed, read_only: false, automation: { scheduler_state: "read_only" } }, false), expected);
+  assert.equal(dataFreshnessNotice({ ...delayed, snapshot_sync: snapshot }, false), null);
+  assert.equal(dataFreshnessNotice({ ...delayed, snapshot_sync: null }, false), null);
+});
+
+test("confirmed delays omit absent or invalid timestamps without inventing a time", () => {
+  for (const time of [undefined, null, "", "0", "2026-09-07", "2026-09-07T03:15:00", "2026-02-30T03:15:00Z", "invalid"]) {
+    assert.equal(dataFreshnessNotice({ ...healthy, data_freshness: { status: "stale", last_successful_capture_at: time } }, false), "数据更新延迟，当前展示已有数据。");
+    assert.equal(dataFreshnessNotice({ ...healthy, read_only: true, snapshot_sync: { ...snapshot, status: "delayed", last_verified_install_at: time } }, false), "数据同步延迟，当前展示上次同步的数据。");
+  }
+});
+
 test("persistent chrome reads health and shares the derived status with page shells", async () => {
   const shell = (await Promise.all(["AppShell", "WorkbenchChrome"].map((name) =>
     readFile(new URL(`../app/components/${name}.tsx`, import.meta.url), "utf8"),
@@ -143,13 +187,11 @@ test("persistent chrome reads health and shares the derived status with page she
   assert.match(shell, /refetchInterval: 30_000/);
   assert.match(shell, /refetchOnWindowFocus: "always"/);
   assert.match(shell, /dataServiceStatus\(serviceHealth.data, serviceHealth.isError\)/);
-  // User-selected display policy: failures in the header; all other states stay in the sidebar.
+  // Health polling and page-local failures remain after the sidebar status is removed.
   assert.match(shell, /\{serviceState\.kind === "error" && <div/);
   assert.doesNotMatch(shell, /serviceState\.kind !== "normal"/);
   assert.match(shell, /serviceStyles\.offline/);
   assert.doesNotMatch(shell, /<strong>数据服务正常<\/strong>/);
-  assert.match(shell, /title=\{serviceState\.description \|\| undefined\}/);
-  assert.match(shell, /aria-label=\{\[serviceState\.label, serviceState\.description\]\.filter\(Boolean\)\.join\("。"\) \|\| "正在读取系统状态"\}/);
 });
 
 test("report gap starts with the first enabled business day and only after 08:00 Shanghai next day", () => {

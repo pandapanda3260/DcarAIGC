@@ -1,0 +1,73 @@
+.backdrop:global(.modal-backdrop) { padding: 24px; background: rgba(15, 36, 42, .38); backdrop-filter: blur(3px); }
+.panel:global(.modal-panel) { display: flex; flex-direction: column; width: min(620px, 100%); max-height: calc(100dvh - 48px); padding: 0; overflow: hidden; border: 1px solid rgba(255, 255, 255, .8); border-radius: 20px; background: #fff; color: #173139; box-shadow: 0 20px 64px rgba(13, 36, 43, .18); }
+.panel.wide { width: min(720px, 100%); }
+.header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex: none; padding: 30px 32px 22px; }
+.header h3 { margin: 0; color: #173139; font-size: 22px; font-weight: 500; line-height: 30px; letter-spacing: -.3px; }
+.header p { margin: 7px 0 0; color: #728087; font-size: 12px; font-weight: 400; line-height: 19px; }
+.panel svg { width: 16px; height: 16px; flex: none; }
+.panel .iconButton { display: grid; place-items: center; flex: none; width: 30px; height: 30px; padding: 0; border: 0; border-radius: 7px; background: transparent; color: #728087; cursor: pointer; }
+.panel .iconButton:not(:disabled):hover { background: #f1f5f5; color: #173139; }
+.body { min-height: 0; padding: 0 32px 26px; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: #cdd8da transparent; }
+.identity { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 16px 18px; border-radius: 12px; background: #f5f8f8; }
+.avatar { display: grid; place-items: center; width: 40px; height: 40px; flex: 0 0 40px; border: 1px solid #e0e8e9; border-radius: 50%; background: #fff; color: #173d45; font-size: 17px; font-weight: 500; }
+.avatar img { object-fit: contain; }
+.identityText { flex: 1; min-width: 80px; }
+.identityLabel { display: block; margin-bottom: 3px; color: #728087; font-size: 11px; line-height: 17px; }
+.identityName { color: #173139; font-size: 16px; font-weight: 500; line-height: 23px; white-space: pre-wrap; overflow-wrap: anywhere; unicode-bidi: plaintext; }
+.identityUid { display: inline-flex; flex-wrap: wrap; gap: 5px; min-width: 0; max-width: 100%; color: #728087; font-size: 11px; line-height: 18px; }
+.identityUid span { overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.section { margin-top: 24px; }
+.section + .section { margin-top: 22px; padding-top: 22px; border-top: 1px solid #e9eeee; }
+.sectionTitle { margin: 0 0 16px; color: #173139; font-size: 13px; font-weight: 600; line-height: 20px; }
+.fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
+.field { display: grid; align-content: start; gap: 8px; min-width: 0; }
+.field > label { color: #173139; font-size: 12px; font-weight: 500; line-height: 18px; }
+.optional { margin-left: 7px; color: #849097; font-size: 11px; font-weight: 400; }
+.field .input { display: block; width: 100%; min-width: 0; height: 44px; padding: 0 12px; border: 1px solid #e0e8e9; border-radius: 8px; background: #fff; color: #173139; font-family: inherit; font-size: 14px; font-weight: 400; line-height: 20px; box-shadow: none; }
+.input::placeholder { color: #849097; font-size: 12px; }
+.field .input:focus-visible { outline: 2px solid #7da0a8; outline-offset: 2px; border-color: #91afb5; }
+.field .input:disabled { background: #f5f7f7; color: #728087; opacity: 1; cursor: not-allowed; }
+.input[type="tel"] { font-variant-numeric: tabular-nums; }
+.selectControl { position: relative; min-width: 0; }
+.selectControl select.input { padding-right: 44px; appearance: none; -webkit-appearance: none; background-image: none; }
+.adornment { position: absolute; top: 0; right: 0; display: grid; place-items: center; width: 44px; height: 44px; color: #728087; pointer-events: none; }
+.input:disabled + .adornment { opacity: .5; }
+.fullWidth { grid-column: 1 / -1; }
+.help { margin: 10px 0 0; color: #728087; font-size: 12px; line-height: 20px; }
+.field .help { margin: 0; }
+.notice { margin: 16px 0 0; padding: 12px 14px; border: 1px solid #e5ebec; border-radius: 10px; background: #f5f8f8; color: #54676e; font-size: 12px; line-height: 20px; }
+.footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex: none; padding: 18px 32px; border-top: 1px solid #e5ebec; background: #fff; }
+.footerHint { display: inline-flex; align-items: center; gap: 6px; color: #728087; font-size: 11px; line-height: 18px; }
+.footerHint svg { width: 13px; height: 13px; }
+.actions { display: flex; align-items: center; gap: 10px; margin-left: auto; }
+.panel .cancelButton, .panel .primaryButton { display: inline-flex; align-items: center; justify-content: center; min-height: 40px; padding: 0 18px; border: 1px solid transparent; border-radius: 7px; font-family: inherit; font-size: 13px; font-weight: 500; line-height: 20px; white-space: nowrap; cursor: pointer; box-shadow: none; }
+.panel .cancelButton { background: transparent; color: #728087; }
+.panel .cancelButton:not(:disabled):hover { background: #f1f5f5; }
+.panel .primaryButton { background: #173d45; color: #fff; }
+.panel .primaryButton:not(:disabled):hover { background: #244e57; }
+.panel button:focus-visible { outline: 2px solid #7da0a8; outline-offset: 2px; }
+.panel button:disabled { opacity: .5; cursor: not-allowed; }
+.error { margin: 18px 0 0; color: #b33d3d; font-size: 12px; line-height: 20px; overflow-wrap: anywhere; }
+
+@media (max-width: 600px) {
+  .backdrop:global(.modal-backdrop) { padding: 16px; }
+  .panel:global(.modal-panel) { max-height: calc(100dvh - 32px); border-radius: 16px; }
+  .header { padding: 24px 22px 20px; }
+  .body { padding: 0 22px 24px; }
+  .footer { padding: 16px 22px; }
+  .fields { grid-template-columns: minmax(0, 1fr); gap: 19px; }
+  .identityUid { width: 100%; padding-left: 52px; }
+}
+@media (max-width: 380px) {
+  .header { padding: 22px 18px 18px; }
+  .body { padding: 0 18px 22px; }
+  .identity { gap: 10px; padding: 15px 12px; }
+  .identityUid { padding-left: 50px; }
+  .footer { justify-content: flex-end; padding: 16px 18px; }
+  .footerHint { display: none; }
+}
+@media (pointer: coarse) {
+  .panel .input { font-size: 16px; }
+  .panel .iconButton, .panel .cancelButton, .panel .primaryButton { min-width: 44px; min-height: 44px; }
+  .header > .iconButton { margin: -7px -7px 0 0; }
+}

@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 from .capture import BudgetBlocked, ProviderResult
 from .account_roster import current_snapshot
 from .provider_budget import paid_scope
+from .duplicate_readiness import indexed_duplicates, relation_states, relation_coverage
 from .duplicates import (
     calibration_ready,
     fingerprint_content,
@@ -189,6 +190,8 @@ def _release_history_backfill_tag(
                 "媒体终态在清除 history-backfill 标记前发生漂移："
                 f"{reason}"
             )
+        if indexed_duplicates(connection) and relation_states(connection, [content_id])[content_id]["relation_status"] != "ready":
+            return False
         cleared = connection.execute(
             """
             UPDATE content_items SET source_group='', updated_at=?
@@ -1779,8 +1782,14 @@ def run_local_evidence_backfill(
             compact_results["status_counts"][item["status"]] = (
                 compact_results["status_counts"].get(item["status"], 0) + 1
             )
-    terminal_status = "partial" if failed else "succeeded"
-    output = {
+    with connect(db_path) as connection:
+        relation_quality = relation_coverage(connection, [int(item["id"]) for item in rows])
+        states = relation_states(connection, [int(item["content_id"]) for item in results])
+        if indexed_duplicates(connection):
+            for item in results:
+                item["relation_status"] = states[int(item["content_id"])]["relation_status"]
+    terminal_status = "partial" if failed or relation_quality.get("duplicate_relation_coverage", 100) < 100 else "succeeded"
+    output = {"duplicate_readiness": relation_quality,
         "task_id": task_id,
         "status": terminal_status,
         "candidates": len(rows),

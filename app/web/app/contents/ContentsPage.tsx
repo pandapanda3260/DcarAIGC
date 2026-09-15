@@ -4,11 +4,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowSquareOutIcon, CaretRightIcon } from "@phosphor-icons/react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRouter, useSearchParams } from "next/navigation";
+import { duplicateReminder } from "../lib/duplicateStatus";
 import AppShell from "../components/AppShell";
+import DataFreshnessNote from "../components/DataFreshnessNote";
 import { Feedback, Loading, Notice, ReadErrorState } from "../components/Feedback";
 import { Pagination } from "../components/Pagination";
-import { API_BASE, jsonRequest, readJson, readQueryJson } from "../lib/api";
-import { resolveMediaAction } from "../lib/contentMedia";
+import { jsonRequest, readJson, readQueryJson } from "../lib/api";
+import { originalPostUrl, ORIGINAL_POST_UNAVAILABLE, resolveMediaAction } from "../lib/contentMedia";
 import type { ContentThumbnails } from "../lib/contentThumbnails";
 import { formatDateTime, label, platformKeys } from "../lib/format";
 import { accountGroupOptions, businessDirectionOptions, accountGroupLabel, businessDirectionLabel } from "../lib/accountClassification";
@@ -21,7 +23,7 @@ import EvidenceModal from "./EvidenceModal";
 import ContentDialog from "./ContentDialog";
 import ContentTitle from "./ContentTitle";
 import ContentDateFilter from "./ContentDateFilter";
-import { CONTENT_DATE_FILTER_ENABLED } from "../lib/features";
+import ContentExportControl from "./ContentExportControl";
 import { useContentUpdateJobs } from "../components/ContentUpdateJobsProvider";
 import ContentUpdateRecords from "../components/ContentUpdateRecords";
 import { contentUpdateJobBlocksWrites } from "./contentUpdateJobs";
@@ -87,13 +89,14 @@ function ContentDetails({ item, sellingPoint, saving, status, updateLocked, upda
   onEdit: () => void;
   onUpdate: () => void;
 }) {
+  const originalUrl = originalPostUrl(item.canonical_url);
   return <ContentDialog title="内容详情" busy={saving} onClose={onClose} status={status} footer={<>
     <button type="button" className="primary" disabled={saving} onClick={onEvidence}>查看依据</button>
     {updateLocked && recordsAvailable && <button type="button" className="secondary" onClick={onTasks}>查看更新记录</button>}
     <button type="button" className="secondary" disabled={saving || updateLocked} onClick={onUpdate}>{updateLabel}</button>
     <button type="button" className="secondary" disabled={saving || updateLocked} title={updateLocked ? updateLabel : undefined} onClick={onEdit}>修改</button>
   </>}>
-        <a className={styles.detailTitle} href={item.canonical_url} target="_blank" rel="noreferrer">{item.title || "标题缺失"}<ArrowSquareOutIcon size={16} aria-label="打开原帖" /></a>
+        {originalUrl ? <a className={styles.detailTitle} href={originalUrl} target="_blank" rel="noreferrer">{item.title || "标题缺失"}<ArrowSquareOutIcon size={16} aria-label="打开原帖" /></a> : <><span className={styles.detailTitle}>{item.title || "标题缺失"}</span><p>{ORIGINAL_POST_UNAVAILABLE}</p></>}
         <div className={styles.metadata}><ContentMediaMark platform={item.platform} /><span>{item.raw_account_name || "昵称缺失"}</span><time dateTime={item.published_at ?? undefined}>{contentDateTime(item.published_at)}</time></div>
         <div className={styles.detailMetrics}><div>阅读 <strong>{contentMetric(item.view_count)}</strong></div><div>评论 <strong>{contentMetric(item.comment_count)}</strong></div><div>点赞 <strong>{contentMetric(item.like_count)}</strong></div></div>
         <section className={styles.detailSection}><h3>卖点</h3><p>{sellingPoint}</p>{Boolean(item.evaluation_is_stale) && <span className="status-badge stale-evaluation">结果需更新</span>}</section>
@@ -107,11 +110,11 @@ function ContentDetails({ item, sellingPoint, saving, status, updateLocked, upda
           <div><dt>资料完整度</dt><dd>{item.evidence_level ? <span className="evidence-level-tag" title={EVIDENCE_LEVEL_HINTS[item.evidence_level]}>{EVIDENCE_LEVEL_LABELS[item.evidence_level] ?? item.evidence_level}</span> : "—"}</dd></div>
           <div><dt>垂直度</dt><dd>{item.content_automotive_score == null ? "暂不可计算" : `${item.content_automotive_score}%`}</dd></div>
           <div><dt>拉新</dt><dd>暂不可计算</dd></div><div><dt>拉活</dt><dd>暂不可计算</dd></div><div><dt>线索</dt><dd>暂不可计算</dd></div>
-          <div><dt>重复提醒</dt><dd>{item.duplicate_original_link_id || "—"}</dd></div>
+          <div><dt>重复提醒</dt><dd>{duplicateReminder(item.relation_status, item.duplicate_original_link_id, "—")}</dd></div>
         </dl></section>
         <section className={styles.detailSection}><h3>内容资料</h3><dl className={styles.identityGrid}>
           <div><dt>内容编号</dt><dd>{item.link_id}</dd></div>
-          <div><dt>平台作品编号</dt><dd><a href={item.canonical_url} target="_blank" rel="noreferrer">{item.platform_content_id || "平台作品编号缺失"}</a></dd></div>
+          <div><dt>平台作品编号</dt><dd>{originalUrl ? <a href={originalUrl} target="_blank" rel="noreferrer">{item.platform_content_id || "平台作品编号缺失"}</a> : <span>{item.platform_content_id || "平台作品编号缺失"}</span>}</dd></div>
           <div><dt>平台账号编号</dt><dd>{item.raw_account_uid || "平台账号编号缺失"}</dd></div>
           <div><dt>发布时间</dt><dd>{contentDateTime(item.published_at)}</dd></div>
           <div><dt>指标更新时间</dt><dd>{contentDateTime(item.metrics_captured_at)}</dd></div>
@@ -125,7 +128,6 @@ export default function ContentsPage() {
   const [platform, setPlatform] = useState("");
   const [accountGroup, setAccountGroup] = useState("");
   const [businessDirection, setBusinessDirection] = useState("");
-  const [direction, setDirection] = useState("");
   const [sellingPoint, setSellingPoint] = useState("");
   const [appliedRequest, setAppliedRequest] = useState(() => ({ ...defaultContentSearchRequest }));
   const [form, setForm] = useState<ContentForm | null>(null);
@@ -204,8 +206,8 @@ export default function ContentsPage() {
     setRetrying(true);
     void contentsQuery.refetch().finally(() => setRetrying(false));
   }
-  function applySearch(overrides: Partial<{ query: string; platform: string; accountGroup: string; businessDirection: string; direction: string; sellingPoint: string; publishedFrom: string; publishedTo: string; page: number; pageSize: number }> = {}) {
-    const filters = { query, platform, accountGroup, businessDirection, direction, sellingPoint, spuSeries: "", audience: "", scene: "", publishedFrom: appliedRequest.published_from ?? "", publishedTo: appliedRequest.published_to ?? "", ...overrides };
+  function applySearch(overrides: Partial<{ query: string; platform: string; accountGroup: string; businessDirection: string; sellingPoint: string; publishedFrom: string; publishedTo: string; page: number; pageSize: number }> = {}) {
+    const filters = { query, platform, accountGroup, businessDirection, direction: "", sellingPoint, spuSeries: "", audience: "", scene: "", publishedFrom: appliedRequest.published_from ?? "", publishedTo: appliedRequest.published_to ?? "", ...overrides };
     const nextRequest = buildContentSearchRequest(
       filters,
       overrides.page ?? appliedRequest.page,
@@ -240,7 +242,7 @@ export default function ContentsPage() {
     ]).catch(() => {});
   }
   const sellingPointSelectRef = useRef<HTMLSelectElement | null>(null);
-  const sellingPointLabel = sellingPoint === "" ? "全部卖点" : sellingPoint === "__none__" ? "资料不足" : (() => { const point = sellingPoints.find((item) => item.code === sellingPoint); return point ? `${point.code} · ${point.label}` : sellingPoint; })();
+  const sellingPointLabel = sellingPoint === "" ? "卖点" : sellingPoint === "__none__" ? "资料不足" : (() => { const point = sellingPoints.find((item) => item.code === sellingPoint); return point ? `${point.code} · ${point.label}` : sellingPoint; })();
   useEffect(() => {
     const node = sellingPointSelectRef.current;
     if (!node) return;
@@ -286,9 +288,15 @@ export default function ContentsPage() {
     try {
       const operation = buildContentSaveOperation(form, originalForm);
       if (operation.unchanged) { setForm(null); setOriginalForm(null); operationFeedback("", "内容未发生修改"); return; }
-      const saved = await readJson<{ id: number }>(operation.path, jsonRequest(operation.body, operation.method));
+      const saved = await readJson<{ id?: number; status?: string; intake_id?: number; message?: string }>(operation.path, jsonRequest(operation.body, operation.method));
       setForm(null); setOriginalForm(null);
       await invalidateContentData();
+      if (saved.status === "pending_identity") {
+        setDetailSelection(null);
+        operationFeedback("", saved.message || "链接已保存到待解析清单，平台作品身份确认后再进入内容库。");
+        return;
+      }
+      if (!saved.id) throw new Error("保存结果尚未完成确认，请读取最新内容；不要重复保存。");
       if (detailSelection) {
         try {
           const result = await readQueryJson<{ items: ContentItem[] }>("/api/v8/contents/search", jsonRequest({ ...defaultContentSearchRequest, query: saved.id === detailSelection.id ? detailSelection.link_id : form.canonicalUrl }));
@@ -323,18 +331,19 @@ export default function ContentsPage() {
   const detailStatus = contentUpdates.readOnly ? { error: "", message: "当前为只读数据快照，内容更新和修改请在本地工作台完成。" } : detailJob || detailPending ? { error: "", message: detailJob?.error_code === "result_uncertain" ? "更新结果待确认，不会自动重试付费更新。请在更新记录中查看处理说明。" : `${detailJob?.stage_label || detailUpdateLabel}。关闭详情后仍会继续，可在更新记录中查看进度。` } : dialogStatus;
 
   return <AppShell active="contents" header={contentsQuery.isPending && !contentsQuery.data && !contentsReadFailed ? undefined :
-    <header className="page-header"><div className="page-header-copy"><span className="page-header-eyebrow">内容资料库</span><h1 className="page-header-title">发布内容明细</h1><p className="page-header-description">更新数据时会同步更新详情、指标以及已保存的视频和图片；重复提醒会指向最早发布的内容。</p></div><div className="page-header-actions"><a className="secondary button-link" href={`${API_BASE}/api/v8/contents/export`} title="导出内容库中的全部可见内容，不受当前筛选条件限制">{appliedRequest.published_from || appliedRequest.published_to ? "下载全部内容表格" : "下载内容表格"}</a></div></header>
+    <header className="page-header"><div className="page-header-copy"><span className="page-header-eyebrow">内容资料库</span><h1 className="page-header-title">发布内容明细</h1><p className="page-header-description">更新数据时会同步更新详情、指标以及已保存的视频和图片；重复提醒会指向最早发布的内容。</p></div><div className="page-header-actions"><ContentExportControl filters={appliedRequest} total={contentsQuery.data?.total ?? null} queryPending={contentsQuery.isPending || contentsQuery.isFetching || contentsQuery.isPlaceholderData || retrying} queryError={contentsQuery.isError} unappliedQuery={query !== appliedRequest.query} onApplyQuery={() => applySearch({ page: 1 })} onApplyDates={(start, end) => applySearch({ publishedFrom: start, publishedTo: end, page: 1 })} sellingPoints={sellingPoints} /></div></header>
   }>
     <Feedback error={error} message={message} onClose={() => feedback("")} />
     {selectedContentQuery.isError && <Notice tone="error">{selectedContentQuery.error instanceof Error ? selectedContentQuery.error.message : "内容详情读取失败。"}</Notice>}
     {contentsQuery.isError && <Notice tone="error">{contentsQuery.data ? `数据刷新失败，当前显示上次数据。${contentsQuery.error instanceof Error ? contentsQuery.error.message : ""}` : contentsQuery.error instanceof Error ? contentsQuery.error.message : "内容读取失败"}</Notice>}
     <section className="page-stack wide-stack">
-      <div className={`filter-bar ${styles.filters}`}><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="内容编号、标题、账号编号、昵称或链接" onKeyDown={(event) => { if (event.key === "Enter") applySearch({ page: 1 }); }} /><select value={platform} onChange={(event) => { setPlatform(event.target.value); applySearch({ platform: event.target.value, page: 1 }); }}><option value="">全部平台</option>{platformKeys.map((key) => <option key={key} value={key}>{label(key)}</option>)}</select><select aria-label="账号分组筛选" value={accountGroup} onChange={(event) => { setAccountGroup(event.target.value); applySearch({ accountGroup: event.target.value, page: 1 }); }}><option value="">全部账号分组</option>{accountGroupOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><select aria-label="业务方向筛选" value={businessDirection} onChange={(event) => { setBusinessDirection(event.target.value); applySearch({ businessDirection: event.target.value, page: 1 }); }}><option value="">全部业务方向</option>{businessDirectionOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><select value={direction} onChange={(event) => { setDirection(event.target.value); applySearch({ direction: event.target.value, page: 1 }); }}><option value="">全部作品内容方向</option><option value="new_car">新车</option><option value="used_car">二手车</option><option value="media">媒体</option><option value="other">其他</option><option value="unknown">未知</option></select><select className="selling-point-filter" ref={sellingPointSelectRef} value={sellingPoint} onChange={(event) => { setSellingPoint(event.target.value); applySearch({ sellingPoint: event.target.value, page: 1 }); }}><option value="">全部卖点</option><option value="__none__">资料不足</option>{sellingPoints.map((point) => <option key={point.code} value={point.code} title={point.label}>{point.code} · {point.label}</option>)}</select>{CONTENT_DATE_FILTER_ENABLED && <ContentDateFilter start={appliedRequest.published_from ?? ""} end={appliedRequest.published_to ?? ""} onChange={(start, end) => applySearch({ publishedFrom: start, publishedTo: end, page: 1 })} />}<button className="secondary" onClick={() => applySearch({ page: 1 })}>搜索</button><span role="status" aria-live="polite">{contentsReadFailed ? "读取失败" : listLoading ? "正在读取…" : contentsQuery.isFetching && contentsQuery.isPlaceholderData ? "正在筛选…" : `${total} 条内容`}</span></div>
+      <div className={`filter-bar ${styles.filters}`}><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="内容编号、标题、账号编号、昵称或链接" onKeyDown={(event) => { if (event.key === "Enter") applySearch({ page: 1 }); }} /><select value={platform} onChange={(event) => { setPlatform(event.target.value); applySearch({ platform: event.target.value, page: 1 }); }}><option value="">平台</option>{platformKeys.map((key) => <option key={key} value={key}>{label(key)}</option>)}</select><select aria-label="账号分组筛选" value={accountGroup} onChange={(event) => { setAccountGroup(event.target.value); applySearch({ accountGroup: event.target.value, page: 1 }); }}><option value="">账号分组</option>{accountGroupOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><select aria-label="业务方向筛选" value={businessDirection} onChange={(event) => { setBusinessDirection(event.target.value); applySearch({ businessDirection: event.target.value, page: 1 }); }}><option value="">业务方向</option>{businessDirectionOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><select className="selling-point-filter" ref={sellingPointSelectRef} value={sellingPoint} onChange={(event) => { setSellingPoint(event.target.value); applySearch({ sellingPoint: event.target.value, page: 1 }); }}><option value="">卖点</option><option value="__none__">资料不足</option>{sellingPoints.map((point) => <option key={point.code} value={point.code} title={point.label}>{point.code} · {point.label}</option>)}</select><ContentDateFilter start={appliedRequest.published_from ?? ""} end={appliedRequest.published_to ?? ""} onChange={(start, end) => applySearch({ publishedFrom: start, publishedTo: end, page: 1 })} /><button className="secondary" onClick={() => applySearch({ page: 1 })}>搜索</button><span role="status" aria-live="polite">{contentsReadFailed ? "读取失败" : listLoading ? "正在读取…" : contentsQuery.isFetching && contentsQuery.isPlaceholderData ? "正在筛选…" : `${total} 条内容`}</span></div>
       <article aria-busy={contentsQuery.isFetching} className={`panel table-panel ${styles.listPanel}${contentsReadFailed ? " has-read-error" : ""}`}>
         <header className={styles.listHeader}><h2>内容列表</h2>
           {contentUpdates.available && <button type="button" className={styles.recordsButton} aria-haspopup="dialog" onClick={openUpdateTasks}>更新记录{contentUpdates.activeCount > 0 && <span className={styles.activeUpdates}>更新中 {contentUpdates.activeCount}</span>}</button>}
         </header>
         {listLoading && <Loading label="正在读取内容库" />}
+        {contentsQuery.data && !contentsReadFailed && <DataFreshnessNote />}
         {!contentsReadFailed && !listLoading && <div className={styles.listBody}>
           {Array.from(contentGroups, ([day, group]) => <section className={styles.dateGroup} key={day} aria-label={day}>
             <h3 className={styles.dateHeading}>{day}</h3>
@@ -384,7 +393,11 @@ export default function ContentsPage() {
           {items.length > 0 && <p className={styles.legend}>— 暂无可用数据</p>}
         </div>}
       {contentsReadFailed && <ReadErrorState title="内容读取失败" retrying={retrying} onRetry={retryContentsRead} />}
-      {!contentsReadFailed && contentsQuery.data && <Pagination page={appliedRequest.page} pageSize={appliedRequest.page_size} total={total} busy={contentsQuery.isFetching || saving} ariaLabel="内容分页" onChange={(next) => applySearch({ page: next.page, pageSize: next.pageSize })} />}
+      {!contentsReadFailed && contentsQuery.data && <>
+        {contentsQuery.isFetching && <p role="status" aria-live="polite">{contentsQuery.isPlaceholderData ? `正在读取第 ${appliedRequest.page} 页，暂时显示上次结果。` : `正在更新第 ${appliedRequest.page} 页。`}</p>}
+        {contentsQuery.isRefetchError && <p role="status">更新未完成，当前显示上次成功读取的结果。<button type="button" className="secondary" onClick={() => void contentsQuery.refetch()}>重试</button></p>}
+        <Pagination page={appliedRequest.page} pageSize={appliedRequest.page_size} total={total} busy={saving} ariaLabel="内容分页" onChange={(next) => setAppliedRequest((current) => ({ ...current, page: next.page, page_size: next.pageSize ?? current.page_size }))} />
+      </>}
       </article>
     </section>
     {recordsVisible && <ContentUpdateRecords jobs={contentUpdates.jobs} pending={contentUpdates.pending} reading={contentUpdates.reading} readError={contentUpdates.readError} onRefresh={contentUpdates.refresh} onRetrySubmission={contentUpdates.retrySubmission} onClose={closeUpdateRecords} closeLabel={evidenceItem ? "返回依据" : detailItem ? "返回详情" : mediaItem ? "返回预览" : "关闭"} onViewContent={() => { setDetailSelection(null); setEvidenceItem(null); setMediaItem(null); detailTriggerRef.current = null; }} />}

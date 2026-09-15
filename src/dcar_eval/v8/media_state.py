@@ -633,10 +633,15 @@ def media_terminal_state_details(
                 slots_by_id=slots_by_id, versions=versions,
             )
             continue
+        approved_new_source = False
         if _has_managed_history(connection, content_id):
-            result[content_id] = MediaTerminalDetail("pending", "managed_source_pending")
-            continue
-        if _complete_evaluation_envelope_valid(
+            from .media_source_refresh import authorized_source_request
+            current_source = latest_sources.get(content_id)
+            approved_new_source = bool(current_source and authorized_source_request(connection, content_id, int(current_source["id"])))
+            if not approved_new_source:
+                result[content_id] = MediaTerminalDetail("pending", "managed_source_pending")
+                continue
+        if not approved_new_source and _complete_evaluation_envelope_valid(
             evaluation,
             content_id=content_id,
             content_type=str(content["content_type"]),

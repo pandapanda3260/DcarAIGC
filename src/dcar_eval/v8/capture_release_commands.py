@@ -14,9 +14,9 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, NoReturn
 
 from . import capture, capture_release as release, transport_execution
-from .capture_evidence_preflight import evidence_boundary, prepare_installed_evidence
 from .runtime_database import require_current_process_writer_lock
-from .storage import connect, now_utc, transaction
+from .runtime_evidence_context import inheritance_boundary, prepare_inheritance
+from .storage import connect, now_utc, transaction, transaction_metrics_context
 
 _FIELDS = {
     "continuity_freeze": {"operation", "qualification_receipt_id"},
@@ -52,8 +52,13 @@ def validate_parameters(parameters: Mapping[str, Any]) -> dict[str, Any]:
         if key.endswith("_id") and key not in {"drain_id", "deployment_id", "candidate_id"}:
             if type(item) is not int or item < 1:
                 invalid()
+    # New operations use only the installed operator decision. They must never
+    # enter legacy fixed-sample, continuity or integrated-switch commands.
+    from .four_platform_flow_authority import OPERATIONS as FLOW_OPERATIONS
+    permitted = (release.CONTINUITY_OPERATIONS | FLOW_OPERATIONS
+                 if action in {"operation_publish", "operation_renew"} else release.CONTINUITY_OPERATIONS)
     if "operation" in value and (not isinstance(value["operation"], str)
-                                 or value["operation"] not in release.CONTINUITY_OPERATIONS):
+                                 or value["operation"] not in permitted):
         invalid()
     if "rank" in value:
         cap = 200 if action.startswith("native_") else 20
@@ -97,7 +102,7 @@ def _current_command(connection: sqlite3.Connection, command_claim: Mapping[str,
     from . import profile_control
 
     require_current_process_writer_lock(connection)
-    if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
+    if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21, 22, 23, 24}:
         raise profile_control.ProfileControlError("capture_release_schema_required", "Capture release actions require schema20")
     row = connection.execute("SELECT * FROM scheduler_runs WHERE id=?", (command_claim["run_id"],)).fetchone()
     attempt = connection.execute("SELECT * FROM scheduler_run_attempts WHERE id=? AND scheduler_run_id=?",
@@ -141,10 +146,12 @@ def run_command(*, db_path: Path, mirror_root: Path | None, command_claim: Mappi
 
         return complete_cross_profile_switch(db_path=db_path, drain_id=arguments["drain_id"],
             now=at, mirror_root=root, command_claim=command_claim)
-    with prepare_installed_evidence(db_path, enabled=action in {
-        "operation_publish", "operation_renew", "integrated_publish",
-    }), connect(db_path) as connection, transaction(connection), evidence_boundary(connection):
-        at = now_utc()
+    with prepare_inheritance(db_path, enabled=action in {"operation_publish", "operation_renew"}) as prepared, \
+            transaction_metrics_context(job_id="capture_release_control", action=action,
+                                        operation=arguments.get("operation")), \
+            connect(db_path) as connection, transaction(connection), inheritance_boundary(connection):
+        if prepared is not None:
+            at = now_utc()
         _current_command(connection, command_claim, parameters)
         if action == "profile_compensate":
             from .account_profile_recovery import enqueue_profile_compensation

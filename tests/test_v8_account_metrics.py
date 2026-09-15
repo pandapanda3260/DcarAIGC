@@ -80,13 +80,13 @@ class AccountMetricsTest(unittest.TestCase):
         with self.assertRaises(AccountMetricError):
             parse_tikhub_profile(self.profile(), platform="douyin", uid=self.identity["uid"], http_status=500)
 
-    def test_profile_fans_only_zero_is_real_xhs_disabled(self) -> None:
+    def test_profile_fans_only_zero_is_real_wrong_platform_rejected(self) -> None:
         result = parse_tikhub_profile(self.profile(0), platform="douyin", uid=self.identity["uid"])
         self.assertEqual(result["metrics"]["follower_count"], 0)
         self.assertEqual(result["field_status"]["platform_work_count"]["status"], "not_requested")
         self.assertIsNone(result["metrics"]["total_likes"])
         self.assertIsNone(result["statistics_date"])
-        with self.assertRaisesRegex(AccountMetricError, "not enabled"):
+        with self.assertRaises(AccountMetricError):
             parse_tikhub_profile(self.profile(), platform="xiaohongshu", uid=self.identity["uid"])
 
     def test_invalid_profile_values_are_not_zero(self) -> None:

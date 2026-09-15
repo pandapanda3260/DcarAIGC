@@ -27,6 +27,11 @@ dev = [
 [tool.uv]
 package = false
 
+# Retain the pinned offline decoder when building an installable distribution.
+# The current writer still freezes and runs the source tree (uv package=false).
+[tool.setuptools.package-data]
+v8 = ["vendor/wechat_video_decode/wasm_video_decode.js", "vendor/wechat_video_decode/wasm_video_decode.wasm", "vendor/wechat_video_decode/keystream.cjs", "vendor/wechat_video_decode/LICENSE"]
+
 [tool.dcar]
 report-version = "dcar-content-operations-report-v8.9"
 web-mode = "local-cache-only"

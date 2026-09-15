@@ -12,7 +12,7 @@
 
 ## 账号库
 
-账号（含角色）、手机号绑定、运营人员准入名单、验证码 / 找回票据、失败限速记录、删除墓碑和 Session 全部存放在
+账号（含角色）、手机号绑定、验证码 / 找回票据、失败限速记录、删除历史和 Session 全部存放在
 `DCAR_AUTH_SESSION_DB`（服务器 `/var/lib/dcar-aigc/auth/sessions.sqlite3`，本地
 `runtime/auth/sessions.sqlite3`），`PRAGMA user_version=3`，固定 `journal_mode=DELETE`。网关启动时
 把 `user_version` 0/1/2 原地升到 3。schema 2→3 在单个事务中重建 `auth_users` 的角色约束，保留已有账号角色、密码、时间戳及其他表记录；新账号默认 `new_user`。正式切换仍必须先停止认证写入并创建验证通过的备份，不能靠网关启动绕过发布流程；更高版本拒绝启动。
@@ -29,26 +29,25 @@ htpasswd 文件不再被网关读取，只作为首次发布的一次性导入�
 - 发送限频：同手机号 60 秒 1 条、1 小时 5 条、24 小时 10 条；同 IP 1 小时 10 条、24 小时 30 条；全局 24 小时
   `DCAR_AUTH_SMS_DAILY_CAP`（默认 300）条。四种发送状态全部计入。
 - 失败限速：`auth_failures` 表按 `user:` / `phone:` / `ip:` 键计数（沿用 `DCAR_AUTH_THROTTLE_*` 配置，默认 10
-  分钟 8 次）；未注册 / 未授权 / 已停用 / 验证码错误都计入；成功只清账号键，IP 键永不因成功清除。
+  分钟 8 次）；未注册 / 已注册 / 已停用 / 验证码错误都计入；成功只清账号键，IP 键永不因成功清除。
 - 密码规则：8–64 位任意字符，拒绝内置常见密码表命中与包含用户名 / 手机号的密码。
-- 用户名 `^[A-Za-z0-9_]{4,32}$`，大小写不敏感唯一，`temporary-bypass` 保留；手机号 `^1[3-9][0-9]{9}$`。
+- 用户名只要求不是空字符串，没有字段字符集和长度限制，中文、邮箱、标点、emoji、空格均按原文保存；首尾空格不裁剪。重复账号继续按现有 SQLite `NOCASE` 判定（ASCII 字母大小写不敏感，其他字符按数据库原有规则比较）。`temporary-bypass` 可以作为普通账号名，绕过模式由独立状态标识。手机号仍为 `^1[3-9][0-9]{9}$`，注册必须完成短信验证；请求体继续保留统一的 16 KiB 技术上限。
 - 账号状态 `active / disabled`：停用账号的 Session 与验证码立即撤销，密码登录、验证码登录、发码、找回全部 403。
-- 注册门控是**手机号准入名单**（`allow-phone`）：准入只允许注册，不代表业务授权。页面注册出来的账号一律是新用户（`new_user`），须由管理员在用户权限页明确授权后才能访问业务；从名单移除不影响既有账号，撤权用角色降为新用户、`disable-user` 或页面删除；`set-phone` / 页面改手机号时旧手机号同事务退出名单。
+- 注册无需预先登记或授权手机号。通过短信验证后创建的账号一律是新用户（`new_user`），须由管理员在用户权限页明确授权后才能访问业务。撤权使用角色降为新用户、`disable-user` 或页面删除。历史 `auth_allowed_phones` 表与已废弃的 `allow-phone` 命令仅保留兼容，不影响发码、注册或授权。
 
 ### 角色与用户管理
 
 四级角色存在 `auth_users.role`：`superadmin`（超级管理员）、`admin`（管理员）、`operator`（运营人员）、`new_user`（新用户，最低等级）。
 每个请求都从库里重新读角色，网关是唯一的拦截点，角色不透传给上游。
 
-- 新用户登录或注册后只进入 `/pending-approval` 等待授权页，不加载业务导航或数据；业务页面跳转到该页，API、媒体、导出和 RSC 返回 `403 approval_required`，用户管理接口仍返回 `403 forbidden`。管理员授权后点击“刷新权限”即可进入；已登录用户被降为新用户后，下次业务请求被拒绝，前端清除缓存并跳到等待页。迁移不会自动改变任何已有账号角色。
+- 新用户登录或注册后进入无业务数据的工作台空壳（默认 `/overview`），可切换普通导航，但不能读取业务数据、操作账号管理或导出。API、媒体和 RSC 返回 `403 approval_required`，账号管理按管理员边界拒绝。管理员授权后刷新即可打开对应业务页面；已登录用户被降为新用户后，下次业务请求被拒绝，前端清除缓存并返回当前页面的无数据空壳。迁移不会自动改变任何已有账号角色。
 - 运营人员只能进 AIGC 数据统计各页与 API；`/users` 页面对其 303 到 `/overview`，`GET /auth/users` 与两个写接口 403
   `{"code":"forbidden"}`。管理员与超级管理员可进"用户管理 / 用户权限"页，看到全部账号的注册信息与权限等级。
 - 能授予的最高角色 = 自己的角色；只能修改 / 删除等级不高于自己的账号（管理员碰不到超级管理员）；不能改自己的
   角色、不能删自己、不能在本页改自己的密码（走登录页找回或 CLI `set-password`）；至少保留一个 active 超级管理员。
 - 首个超级管理员与"零超管"恢复只能走离线 CLI：`set-role`，或空库首次导入的 `import-htpasswd --bootstrap-superadmin`；已有超级管理员可以在页面授予他人超级管理员。
-- 页面删除 = 撤销访问资格：同一事务写墓碑（`auth_deleted_users`，用户名永久保留，不能再注册或导入）、把该手机号移出
-  准入名单、删除全部 Session、作废全部验证码与票据（`user_deleted`），再删账号行。
-- 页面改手机号：旧手机号退出准入名单并作废其注册验证码；页面重置密码：目标账号全部 Session 立即失效。
+- 页面删除 = 撤销当前账号的访问资格：同一事务写入 `auth_deleted_users` 最新删除记录、删除全部 Session、作废全部验证码与票据（`user_deleted`），再删账号行。用户名与手机号可以重新注册，新账号仍为 `new_user`，不继承原角色；注册时再次清理同名孤儿会话和旧找回票据，即使重用原用户名和密码，旧会话也不能恢复。
+- 页面改手机号：作废旧手机号的注册验证码以及该账号绑定的验证码与票据；页面重置密码：目标账号全部 Session 立即失效。
 - 写接口在事务内重新核验发起者的 Session（存在、未过期、指纹相符、账号 active、角色达标），不符返回 401
   `session_revoked` 并清 Cookie；库故障统一 503 `storage_unavailable`。
 - 安全变更日志 `auth-changes.log`（与库同目录、0600、拒绝符号/硬链接、追加写、fsync，不随备份恢复）使用
@@ -81,13 +80,13 @@ sudo -u dcar-aigc env PYTHONPATH=/var/www/dcar-aigc/current/src/dcar_eval \
 | 子命令 | 作用 |
 |---|---|
 | `migrate` | 建表 / 补列并把 `user_version` 升到 3（幂等；schema 2→3 保留账号和会话） |
-| `import-htpasswd --source PATH [--bootstrap-superadmin]` | 须先显式 `migrate`，仅 schema 3 空库可用；跳过 `#` 注释停用行，拒绝空行；严格校验用户名与完整 SHA-512 crypt 格式/轮数，无重复/保留名/墓碑；任一失败整体拒绝；默认全部为运营人员，显式 bootstrap 时在同一事务把首个有效账号设为超管 |
+| `import-htpasswd --source PATH [--bootstrap-superadmin]` | 须先显式 `migrate`，仅 schema 3 空库可用；跳过 `#` 注释停用行，拒绝空行；严格校验旧文件格式与完整 SHA-512 crypt 格式/轮数，无重复账号；任一失败整体拒绝；默认全部为运营人员，显式 bootstrap 时在同一事务把首个有效账号设为超管 |
 | `set-role USERNAME superadmin\|admin\|operator\|new_user` | 设置权限等级或恢复首个超管；最后一个 active 超级管理员不能降级 |
-| `delete-user USERNAME` | 删除账号（墓碑 + 撤准入 + 删 Session + 作废验证码）；最后一个超级管理员不能删 |
+| `delete-user USERNAME` | 删除账号并记录历史、删除 Session、作废验证码；可重新注册为新用户；最后一个超级管理员不能删 |
 | `changes [--since ISO]` | 按 JSON 行输出标准化变更；保守项始终输出且退出码 3，坏行或不安全日志拒绝读取 |
-| `export-htpasswd --output PATH` | 导出有业务权限的 active 账号（排除新用户，防止旧版回滚越权；原子写入，0640）；默认拒绝空导出；仅已切换的 schema-0 可信代码回滚使用 |
-| `allow-phone PHONE [--note] [--remove]` | 维护准入名单 |
-| `set-phone USERNAME PHONE` | 绑定 / 改绑手机号；同事务作废该账号全部验证码与票据，旧手机号退出准入名单 |
+| `export-htpasswd --output PATH` | 导出有业务权限的 active 账号（排除新用户，防止旧版回滚越权；原子写入，0640）；遇到旧格式无法表示的账号名会整体拒绝并保留原文件，不会截断或改名；默认拒绝空导出；仅已切换的 schema-0 可信代码回滚使用 |
+| `allow-phone PHONE [--note] [--remove]` | 已废弃，仅兼容历史记录；注册与授权无需此命令 |
+| `set-phone USERNAME PHONE` | 绑定 / 改绑手机号；同事务作废该账号全部验证码与票据 |
 | `set-password USERNAME` | 交互设置密码，同事务撤销该账号全部 Session 与验证码 |
 | `disable-user` / `enable-user USERNAME` | 停用 / 启用；停用同事务撤销 Session 与验证码 |
 | `revoke-sessions [--username]` / `revoke-challenges [--username]` | 撤销会话 / 作废验证码与票据（默认全部；记录保留供限频计数） |
@@ -96,7 +95,7 @@ sudo -u dcar-aigc env PYTHONPATH=/var/www/dcar-aigc/current/src/dcar_eval \
 
 除显式 `migrate` 外，普通账号 CLI 只校验数据库版本/健康，不隐式建库或迁移；旧版本或缺失的库会提示先迁移。
 `sms-test` 不打开账号库，可以在发布前执行。生产旧库的迁移、导入与首个超管设置统一交给 release helper；
-不要提前手工运行 `migrate` 来绕过发布检查。`set-phone dcar` 与 `allow-phone` 只在 `deploy` 成功后执行。
+不要提前手工运行 `migrate` 来绕过发布检查；如需为既有账号绑定手机号，只在 `deploy` 成功后执行 `set-phone`。
 
 ### 短信通道
 
@@ -161,7 +160,7 @@ scripts/start_web_mvp.sh
 `runtime/auth/users.htpasswd`（若存在且账号库为空）一次性导入
 `runtime/auth/sessions.sqlite3`，用 `import-htpasswd --bootstrap-superadmin` 在同一事务把首个有效账号设为超级管理员（中断或日志失败不会留下半完成导入；库里已有账号但没有超级管理员时启动脚本会
 打印 `set-role` 命令提示）。此后打开 `http://127.0.0.1:4173` 会先进入
-登录页；新账号用准入名单内的手机号在页面注册（本地验证码打印在终端），注册后默认为“新用户”，仅可见等待授权页；点击侧边栏退出按钮会撤销当前 Session 并返回 `/login`。
+登录页；新账号可直接完成手机号验证码注册（本地验证码打印在终端），注册后默认为“新用户”，仅可见无业务数据的工作台空壳；点击侧边栏退出按钮会撤销当前 Session 并返回 `/login`。
 
 本地端口分工：认证网关 4173、Web 上游 4174、正式 API/writer 8766；8765 仅在 operator freeze 下作为只读 viewer。服务器仍使用只读 API 8765。抖音控制面为 4175，受限出网代理为 4176；4176 只绑定服务器回环，不是通用正向代理。
 
@@ -198,7 +197,7 @@ sudo -u dcar-aigc test -r /etc/nginx/.htpasswd-dcar \
 ```
 
 `dcar-auth.service` 通过 `LoadCredential` 读取 `sms-tencent` 与 `auth-pepper`，不再引用 htpasswd；
-首次发布由 release helper 锁内执行 `migrate`、`import-htpasswd`、首个超级管理员设置；`set-phone`、`allow-phone` 放在
+首次发布由 release helper 锁内执行 `migrate`、`import-htpasswd`、首个超级管理员设置；如需为既有账号绑定手机号，`set-phone` 放在
 helper 成功后。发布前先跑独立的 `sms-test` 并确认真实收件，不使用账号 CLI 改旧正式库。
 临时端口 smoke（`systemd-run` + `LoadCredential`）、备份定时器安装与回滚前的 `export-htpasswd`
 都写在 `README.md`「Build and install a code release」。
@@ -233,7 +232,7 @@ sudo nginx -t && sudo systemctl reload nginx
 `DCAR_DOUYIN_PROXY_URL=http://127.0.0.1:4176` 使用代理；应用禁止读取 ambient
 proxy 环境变量，也禁止代理失败后退回直连。
 
-账号新增走登录页注册（准入名单门控），改密走登录页找回、用户权限页（管理员改他人）或 CLI `set-password`，
+账号新增走登录页短信验证注册，再由管理员授权，改密走登录页找回、用户权限页（管理员改他人）或 CLI `set-password`，
 角色与删除走用户权限页或 CLI `set-role` / `delete-user`；`htpasswd -5` 不再是账号变更途径。
 
 Compose 运行时账号库位于 `/var/lib/dcar-aigc/auth-compose-sessions/sessions.sqlite3`，
@@ -256,8 +255,8 @@ Compose 形态的迁移、停启、镜像回滚合同：`docker compose stop aut
 --db /var/lib/dcar-aigc/auth/sessions.sqlite3 migrate` → 首次 schema 0 来源再运行导入（`docker compose run --rm --no-deps
 -v <htpasswd 副本>:/tmp/users.htpasswd:ro auth python -m dcar_auth.admin --db
 /var/lib/dcar-aigc/auth/sessions.sqlite3 import-htpasswd --source /tmp/users.htpasswd --bootstrap-superadmin`；
-已有 schema 1/2 账号不可重新导入）→ 确认超管/账号 → `docker compose up -d` 并验收健康 → 再同法执行
-`set-phone` / `allow-phone` / `list`。回滚：停四个服务 → 以新镜像
+已有 schema 1/2 账号不可重新导入）→ 确认超管/账号 → `docker compose up -d` 并验收健康 → 再按需同法执行
+`set-phone` / `list`。回滚：停四个服务 → 以新镜像
 `export-htpasswd` → 把导出复制为 `${DCAR_AUTH_CREDENTIAL_ROOT}/users.htpasswd`（0600，10001:10001）→
 `prev` 标签打回 `local` → 恢复上一版 `compose.yml`（含 htpasswd bind）→ `docker compose up -d`。
 宿主机备份定时器用 drop-in 把 `--source` 与 `ReadOnlyPaths` 指向 compose 的库路径。
@@ -273,13 +272,13 @@ Compose 形态的迁移、停启、镜像回滚合同：`docker compose stop aut
 - 点击退出后 URL 为 `/dcar/login`；
 - 浏览器后退或手工重放退出前 Cookie，受保护页面仍要求登录；
 - 连续失败达到限制后返回 429；
-- 准入名单内的手机号可以注册并直接登录，名单外手机号发码返回 403 且腾讯云无发送记录；
+- 无历史准入记录的手机号也能获取验证码并注册；成功后只进入无业务数据的工作台空壳，管理员授权前不能访问业务数据；发送限频、验证码有效期和单次使用规则仍生效；
 - 验证码登录成功；同一验证码第二次使用 401；
 - 找回密码两步走完后直接登录，另一浏览器里该账号的旧会话被踢回登录页；
 - `disable-user` 后该账号所有入口 403，原会话立即失效；`export-htpasswd` 不含该账号；
 - 运营人员登录后侧栏没有"用户管理"分组，直接访问 `/dcar/users` 回到总览，`/dcar/auth/users` 403；管理员能改 / 删运营人员
   但看不到超级管理员的修改与删除按钮（接口层同样 403）；管理员的角色下拉里没有"超级管理员"；
-- 在用户权限页删除一个已登录的运营人员：其浏览器下一次请求跳回登录页，用同一手机号发注册验证码返回 403，用原用户名注册返回 409；
+- 在用户权限页删除一个已登录的运营人员：其浏览器下一次请求跳回登录页；限频窗口允许时可用同一手机号和原用户名重新注册，新账号只具有 `new_user` 权限，原 Cookie、验证码、找回票据始终失效；
 - 在用户权限页重置某人密码：其旧会话立即失效，新密码可登录；`set-role` 把最后一个超级管理员降级被拒绝；
 - 发布前已登录的浏览器无需重新登录，旧 htpasswd 账号的密码登录仍可用；
 - `dcar-auth-backup.service` 手工运行一次产出备份与 manifest，`--verify` 通过；

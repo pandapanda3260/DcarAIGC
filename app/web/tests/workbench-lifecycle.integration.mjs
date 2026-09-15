@@ -7,7 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import React, { act } from "react";
-import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, skipToken, useQuery, useQueryClient } from "@tanstack/react-query";
 import ts from "typescript";
 
 const require = createRequire(import.meta.url);
@@ -15,22 +15,34 @@ const domModule = process.env.DCAR_TEST_DOM_MODULE;
 assert.ok(domModule, "Set DCAR_TEST_DOM_MODULE to the installed linkedom module path");
 const { parseHTML } = require(domModule);
 const { window } = parseHTML("<!doctype html><html><body><div id=\"root\"></div></body></html>");
+// Linkedom has no native text-selection engine; retain the requested range so
+// the real nickname editor can run its focus effect in this DOM harness.
+window.HTMLTextAreaElement.prototype.setSelectionRange = function (start, end) {
+  this.selectionStart = start;
+  this.selectionEnd = end;
+};
 window.location = new URL("https://workbench.example/overview");
+window.requestAnimationFrame = (callback) => setTimeout(callback, 0);
+window.cancelAnimationFrame = clearTimeout;
 for (const [name, value] of Object.entries({ window, document: window.document, HTMLElement: window.HTMLElement, Node: window.Node, Event: window.Event, navigator: { userAgent: "node" }, IS_REACT_ACT_ENVIRONMENT: true })) {
   Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
 }
 const { createRoot } = require("react-dom/client");
 const appRoot = fileURLToPath(new URL("../app/", import.meta.url));
 
-function setup({ simulateNavigation = false } = {}) {
+function setup({ simulateNavigation = false, profileFailure = false, includeFreshness = false, initialHealth = { status: "ok", read_only: true } } = {}) {
   let pathname = "/overview";
   const counts = { session: 0, health: 0 };
   const prefetches = [], modules = [], mounts = {}, unmounts = {};
+  const profileRequests = [];
+  const workbenchStates = [];
   const client = new QueryClient({ defaultOptions: { queries: { staleTime: 60_000, retry: false, gcTime: Infinity } } });
-  const health = { status: "ok", read_only: true };
+  let health = initialHealth;
+  let healthFailure = false;
   const sessionOptions = { queryKey: ["auth", "session"], queryFn: async () => { counts.session++; return { username: "test-admin", role: "admin", authenticated: true }; } };
   const queries = {
     sessionQueryOptions: () => sessionOptions,
+    queryKeys: { session: ["auth", "session"], users: ["auth", "users"] },
     defaultAccountSearchRequest: {}, defaultContentSearchRequest: {},
   };
   for (const [name, key] of Object.entries({ overviewQueryOptions: "overview", contentSearchQueryOptions: "contents", accountSearchQueryOptions: "accounts", activeSellingPointsQueryOptions: "selling-points", spuAssetsQueryOptions: "spu-assets", spuStatsQueryOptions: "spu-stats", tasksListQueryOptions: "tasks", usersQueryOptions: "users" })) {
@@ -67,7 +79,7 @@ function setup({ simulateNavigation = false } = {}) {
     const output = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, esModuleInterop: true } }).outputText;
     function localRequire(specifier) {
       if (specifier === "react" || specifier === "react/jsx-runtime") return require(specifier);
-      if (specifier === "@tanstack/react-query") return { QueryClientProvider, useQuery, useQueryClient };
+      if (specifier === "@tanstack/react-query") return { QueryClientProvider, skipToken, useQuery, useQueryClient };
       if (specifier === "next/link") return Object.assign(Link, { useLinkStatus: () => ({ pending: false }) });
       if (specifier === "next/image") return Image;
       if (specifier === "next/navigation") return { usePathname: () => pathname, useRouter: () => router };
@@ -75,17 +87,33 @@ function setup({ simulateNavigation = false } = {}) {
       if (resolved.endsWith(".module.css")) return new Proxy({}, { get: (_, key) => key });
       if (resolved === path.join(appRoot, "lib/queries")) return queries;
       if (resolved === path.join(appRoot, "lib/queryClient")) return { getQueryClient: () => client };
-      if (resolved === path.join(appRoot, "lib/api")) return { readQueryJson: async () => { counts.health++; return health; } };
+      if (resolved === path.join(appRoot, "lib/api")) return {
+        isAbortError: (reason) => reason?.name === "AbortError",
+        requireApprovedSession: (session) => session,
+        markedJsonRequest: (body) => ({ body: JSON.stringify(body) }),
+        readQueryJson: async (url, options) => {
+          if (url === "/auth/profile") {
+            const body = JSON.parse(options.body);
+            profileRequests.push(body);
+            if (profileFailure) throw new Error("保存失败，请重试。");
+            return { authenticated: true, username: "test-admin", role: "admin", ...body };
+          }
+          counts.health++;
+          if (healthFailure) throw new Error("Health service unavailable");
+          return health;
+        },
+      };
       if (resolved === path.join(appRoot, "components/ContentUpdateJobsProvider")) return function JobsProvider({ children }) { return React.createElement(Probe, { name: "jobs" }, children); };
       if (resolved === path.join(appRoot, "components/BackToTop")) return function BackToTop() { return React.createElement(Probe, { name: "back-to-top" }); };
       if (resolved === path.join(appRoot, "components/LogoutButton")) return function LogoutButton() { return React.createElement("button", { type: "button" }, "退出登录"); };
       if (resolved === path.join(appRoot, "components/Feedback")) return {
+        showToast() {},
         ToastViewport: () => React.createElement(Probe, { name: "toasts" }),
         Loading: ({ label }) => React.createElement("div", { className: "loading-screen", role: "status" }, label),
         ReadErrorState: ({ title, description, onRetry }) => React.createElement("div", null, title, description, React.createElement("button", { onClick: onRetry }, "重新加载")),
       };
       if (/\/(overview|contents|accounts|selling-points|spu-audience|tasks|users)\/\w+Page$/.test(resolved)) { modules.push(specifier); return { default: () => null }; }
-      const extension = path.extname(resolved) ? "" : /WorkbenchContext|WorkbenchChrome|AppShell|Providers|RouteLoading$/.test(resolved) ? ".tsx" : ".ts";
+      const extension = path.extname(resolved) ? "" : /WorkbenchContext|WorkbenchChrome|AppShell|Providers|RouteLoading|InlineNicknameEditor|DataFreshnessNote$/.test(resolved) ? ".tsx" : ".ts";
       return load(resolved + extension);
     }
     new Function("require", "module", "exports", output)(localRequire, compiled, compiled.exports);
@@ -96,17 +124,20 @@ function setup({ simulateNavigation = false } = {}) {
   const AppShell = load(path.join(appRoot, "components/AppShell.tsx")).default;
   const RouteLoading = load(path.join(appRoot, "components/RouteLoading.tsx")).default;
   const ErrorPage = load(path.join(appRoot, "error.tsx")).default;
+  const DataFreshnessNote = load(path.join(appRoot, "components/DataFreshnessNote.tsx")).default;
   const serviceState = load(path.join(appRoot, "lib/serviceStatus.ts")).dataServiceStatus(health, false);
-  const { workbenchSection } = load(path.join(appRoot, "components/WorkbenchContext.tsx"));
+  const { workbenchSection, useWorkbench } = load(path.join(appRoot, "components/WorkbenchContext.tsx"));
   function PageContent({ url }) {
+    workbenchStates.push(useWorkbench());
     const [filter, setFilter] = React.useState("全部");
     return React.createElement(React.Fragment, null,
       React.createElement("p", null, url),
+      includeFreshness && React.createElement("section", { "data-loaded-data": true }, React.createElement(DataFreshnessNote)),
       React.createElement("button", { "data-filter": true, onClick: () => setFilter("已筛选") }, filter));
   }
   const root = createRoot(document.getElementById("root"));
   return {
-    client, counts, prefetches, modules, mounts, unmounts, rsc, workbenchSection, serviceState, feedback,
+    client, counts, prefetches, modules, mounts, unmounts, rsc, workbenchSection, serviceState, workbenchStates, feedback, profileRequests,
     async render(nextPath, state = "page") {
       pathname = nextPath;
       window.location = new URL(nextPath, "https://workbench.example");
@@ -124,6 +155,12 @@ function setup({ simulateNavigation = false } = {}) {
       Object.assign(event, { button: 0, detail: type === "click" ? 0 : 1, ...properties });
       await act(async () => { document.querySelector(`a[href="${href}"]`).dispatchEvent(event); });
     },
+    async refreshHealth(nextHealth, { fail = false } = {}) {
+      health = nextHealth;
+      healthFailure = fail;
+      await act(async () => { await client.refetchQueries({ queryKey: ["system", "health"], exact: true, type: "active" }); });
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+    },
     async finish(id) { await act(async () => feedback.finish(id)); },
     async close() { await act(async () => root.unmount()); client.clear(); },
   };
@@ -136,9 +173,9 @@ test("real React lifecycle preserves sidebar, global UI and health observers whi
     const sidebar = document.querySelector("aside");
     assert.ok(sidebar);
     assert.equal(document.querySelectorAll("main").length, 1);
-    assert.ok(sidebar.textContent.includes(view.serviceState.label));
-    assert.ok(sidebar.querySelector('[role="status"]').getAttribute("title"));
-    assert.equal(sidebar.querySelector('[role="status"]').getAttribute("aria-label"), [view.serviceState.label, view.serviceState.description].filter(Boolean).join("。"));
+    assert.equal(sidebar.textContent.includes(view.serviceState.label), false, "normal system status must not be permanently shown beside the account");
+    assert.equal(sidebar.querySelector('[role="status"]'), null);
+    assert.deepEqual(view.workbenchStates.at(-1).serviceState, view.serviceState, "health information remains available to page content");
     for (const url of ["/contents", "/tasks/task-1", "/accounts/douyin-authorization"]) {
       await view.render(url);
       assert.ok(document.querySelector("aside") === sidebar, "the existing sidebar DOM node must survive the route update");
@@ -164,6 +201,113 @@ test("real React lifecycle preserves sidebar, global UI and health observers whi
     assert.ok(document.querySelector("aside") === null, "independent routes must not include a sidebar");
     assert.equal(view.client.getQueryCache().find({ queryKey: ["system", "health"] }).getObserversCount(), 0);
     for (const url of [null, "/", "/unknown", "/contents/unknown", "/tasks/1/unknown"]) assert.equal(view.workbenchSection(url), null);
+  } finally { await view.close(); }
+});
+
+test("data freshness notes share health requests, remain dismissed during polling, reset after recovery and defer failed refreshes to the error banner", async () => {
+  const current = {
+    status: "ok", read_only: false,
+    automation: { scheduler_state: "running", paid_dispatch_state: "open" },
+    data_freshness: { status: "current", last_successful_capture_at: "2026-09-13T00:00:00Z" },
+  };
+  const stale = { ...current, data_freshness: { ...current.data_freshness, status: "stale" } };
+  const view = setup({ includeFreshness: true, initialHealth: current });
+  const note = () => document.querySelector("[data-freshness-note]");
+  const click = async (target) => {
+    await act(async () => { target.dispatchEvent(new window.Event("click", { bubbles: true })); });
+  };
+  try {
+    await view.render("/overview");
+    const query = view.client.getQueryCache().find({ queryKey: ["system", "health"] });
+    assert.equal(query.getObserversCount(), 2, "the data note observes the same health query as the shell");
+    assert.equal(view.counts.health, 1, "mounting the disabled note observer must not issue another request");
+    assert.equal(note(), null, "healthy data remains silent");
+    assert.equal(document.querySelector('main [role="status"]'), null);
+
+    await view.refreshHealth(stale);
+    assert.equal(view.counts.health, 2);
+    assert.ok(note().closest("[data-loaded-data]"), "the notice belongs beside loaded data");
+    assert.match(note().textContent, /数据更新延迟，当前展示已有数据/);
+    assert.match(note().textContent, /最近成功采集：2026\/09\/13 08:00（北京时间）/);
+    assert.equal(document.querySelector('aside [role="status"]'), null);
+    await click(note().querySelector('button[aria-label="关闭数据时效提示"]'));
+    assert.equal(note(), null);
+
+    await view.refreshHealth({ ...stale, automation: { ...stale.automation, report_from_date: "2026-09-01" } });
+    assert.equal(view.counts.health, 3);
+    assert.equal(note(), null, "polling with unchanged notice text preserves dismissal");
+    await view.refreshHealth(current);
+    assert.equal(note(), null);
+    await view.refreshHealth(stale);
+    assert.equal(view.counts.health, 5);
+    assert.ok(note(), "a confirmed recovery allows the same delay to be reported again");
+
+    await view.refreshHealth(stale, { fail: true });
+    assert.equal(view.counts.health, 6, "each explicit health refresh sends one request even with two observers");
+    assert.equal(query.state.data.data_freshness.status, "stale", "a failed request leaves stale data in cache");
+    assert.equal(query.state.status, "error");
+    assert.equal(note(), null, "cached stale health must not masquerade as a confirmed data delay after a failed request");
+    const banner = document.querySelector('main > [role="status"]');
+    assert.ok(banner, "the existing page-level service failure banner is preserved");
+    assert.match(banner.textContent, /服务异常/);
+    assert.match(banner.textContent, /数据服务不可用/);
+    assert.equal(banner.hidden, false);
+    await click(banner.querySelector('button[aria-label="关闭提示"]'));
+    assert.equal(banner.hidden, true, "the existing error notification remains dismissible");
+    assert.equal(view.counts.health, 6);
+  } finally { await view.close(); }
+});
+
+test("real inline editor retains a failed draft through session refresh and navigation, handles IME, and cancels in place", async () => {
+  const view = setup({ profileFailure: true });
+  const dispatch = async (target, type, properties = {}) => {
+    const event = new window.Event(type, { bubbles: true, cancelable: true });
+    Object.assign(event, properties);
+    await act(async () => target.dispatchEvent(event));
+    return event;
+  };
+  try {
+    await view.render("/overview");
+    const pencil = document.querySelector('button[aria-label="编辑昵称"]');
+    assert.ok(pencil);
+    assert.equal(pencil.closest("button"), pencil, "only the small edit control is a button");
+    assert.equal(pencil.previousElementSibling.hasAttribute("title"), false);
+    await dispatch(pencil, "click");
+    const field = document.querySelector('textarea[aria-label="昵称"]');
+    assert.ok(field);
+    assert.equal(document.querySelector('[role="dialog"]'), null);
+    assert.equal(document.querySelector('button[aria-label="编辑昵称"]'), pencil, "editing keeps the identity row and pencil's layout slot");
+    assert.equal(pencil.previousElementSibling.textContent, "test-admin");
+    assert.equal(pencil.getAttribute("aria-hidden"), "true");
+    // Linkedom has no browser input/composition engine. Drive React's handlers
+    // attached to the real textarea; its reconciler, state and effects stay real.
+    const fieldProps = () => field[Object.keys(field).find((key) => key.startsWith("__reactProps$"))];
+    const sendKey = async (key, properties = {}) => act(async () => fieldProps().onKeyDown({ key, shiftKey: false, nativeEvent: { keyCode: key === "Enter" ? 13 : 27 }, preventDefault() {}, ...properties }));
+    await act(async () => fieldProps().onChange({ target: { value: "草稿🚗\n第二行" } }));
+    await act(async () => fieldProps().onCompositionStart());
+    await sendKey("Enter");
+    await sendKey("Escape");
+    assert.equal(view.profileRequests.length, 0);
+    assert.equal(document.querySelector("textarea"), field);
+    await act(async () => fieldProps().onCompositionEnd());
+    await sendKey("Enter", { nativeEvent: { keyCode: 229 } });
+    await sendKey("Enter", { shiftKey: true });
+    assert.equal(view.profileRequests.length, 0);
+    await act(async () => fieldProps().onBlur?.({}));
+    await act(async () => view.client.setQueryData(["auth", "session"], { authenticated: true, username: "test-admin", role: "admin", display_name: "后台新昵称" }));
+    await view.render("/contents");
+    assert.equal(document.querySelector("textarea"), field);
+    assert.equal(field.value, "草稿🚗\n第二行");
+    await sendKey("Enter");
+    assert.deepEqual(view.profileRequests, [{ display_name: "草稿🚗\n第二行" }]);
+    assert.equal(field.value, "草稿🚗\n第二行");
+    assert.equal(field.disabled, false);
+    assert.match(document.querySelector('[role="alert"]').textContent, /保存失败/);
+    await sendKey("Escape");
+    assert.equal(document.querySelector("textarea"), null);
+    assert.equal(document.querySelector('button[aria-label="编辑昵称"]').previousElementSibling.textContent, "后台新昵称");
+    assert.equal(pencil.hasAttribute("aria-hidden"), false);
+    assert.equal(view.profileRequests.length, 1);
   } finally { await view.close(); }
 });
 

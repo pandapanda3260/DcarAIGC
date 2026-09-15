@@ -14,9 +14,12 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from .metric_source_policy import (CURRENT_METRIC_POLICY, OPERATION_FIELD_POLICY_VERSION,
+    OPERATION_FIELD_POLICY_VERSIONS, field_capability, field_eligibility, load_operation_field_policy)
 from .source_routing import (
     METRIC_FIELDS,
     POLICY_VERSION,
+    MATRIX_POLICY_VERSIONS,
     _field_evidence,
     _field_state,
     _observation_metadata,
@@ -229,14 +232,20 @@ def observation_query(connection: sqlite3.Connection) -> str:
         "SELECT 1 FROM sqlite_master WHERE name='fetch_request_batch_members'"
     ).fetchone() is None:
         return _OBSERVATION_SQL
+    from .capture_transport_recovery import recovered_member
+    connection.create_function("dcar_recovered_content_member", 2,
+        lambda member_id, raw_id: int(recovered_member(connection, member_id=member_id, raw_response_id=raw_id)))
     return _OBSERVATION_SQL.replace(
         "c.account_id,c.platform\nFROM", """c.account_id,c.platform,
  a.request_batch_id raw_attempt_batch_id,b.id raw_batch_id,b.provider raw_batch_provider,
  b.operation raw_batch_operation,(SELECT m.content_id FROM fetch_request_batch_members m
    JOIN fetch_request_member_dispositions d ON d.member_id=m.id
    JOIN fetch_request_executions x ON x.batch_id=m.batch_id AND x.fetch_attempt_id=a.id
-   WHERE m.batch_id=b.id AND m.content_id=o.content_id AND d.disposition='valid'
-     AND d.raw_response_id=r.id LIMIT 1) raw_batch_member_content_id,
+   WHERE m.batch_id=b.id AND m.content_id=o.content_id AND
+     CASE WHEN d.disposition='valid' AND d.raw_response_id=r.id THEN 1
+          WHEN d.disposition='unusable' AND r.transport_receipt_id IS NOT NULL
+          THEN dcar_recovered_content_member(m.id,r.id) ELSE 0 END=1
+     LIMIT 1) raw_batch_member_content_id,
  (SELECT m.account_id FROM fetch_request_batch_members m
    JOIN fetch_request_member_dispositions d ON d.member_id=m.id
    JOIN fetch_request_executions x ON x.batch_id=m.batch_id AND x.fetch_attempt_id=a.id
@@ -431,55 +440,7 @@ def _ingest(connection: sqlite3.Connection, row: dict[str, Any]) -> dict[str, An
             "operation": operation, "correction": False, "fields": len(METRIC_FIELDS)}
 
 
-def _record_incremental_anomalies(connection: sqlite3.Connection, observation_id: int) -> None:
-    """Compare new provider facts with one prior value in the same stream.
-
-    This is a diagnostic only. It does not change facts, select a maximum,
-    schedule a request or scan old observations for historical corrections.
-    """
-    for fact in connection.execute(
-        "SELECT * FROM content_metric_field_facts WHERE observation_id=? AND state='provided'",
-        (observation_id,),
-    ).fetchall():
-        previous = connection.execute(
-            "SELECT * FROM content_metric_field_facts WHERE content_id=? AND provider=? "
-            "AND operation=? AND field=? AND state='provided' AND id<>? "
-            "ORDER BY captured_at DESC,recorded_at DESC,id DESC LIMIT 1",
-            (fact["content_id"], fact["provider"], fact["operation"], fact["field"], fact["id"]),
-        ).fetchone()
-        if previous is None or (previous["captured_at"], previous["recorded_at"], previous["id"]) >= (
-            fact["captured_at"], fact["recorded_at"], fact["id"]
-        ):
-            continue  # First value or an out-of-order arrival is not a jump.
-        correction = connection.execute(
-            "SELECT action,value FROM content_metric_corrections WHERE target_fact_id=? "
-            "AND recorded_at<=? ORDER BY recorded_at DESC,id DESC LIMIT 1",
-            (previous["id"], fact["recorded_at"]),
-        ).fetchone()
-        if correction is not None and correction["action"] == "invalidate":
-            continue
-        old = int(correction["value"] if correction is not None else previous["value"])
-        new = int(fact["value"])
-        # Integer comparisons avoid float precision loss for large counters.
-        decline = old - new > 100 and (old - new) * 5 > old
-        increase = new - old > 1000 and new - old > old * 5
-        if not (decline or increase):
-            continue
-        scope = {key: fact[key] for key in ("content_id", "provider", "operation", "field")}
-        evidence = {"contract_version": "capture-new-metric-anomaly-v1",
-                    "previous_fact_id": previous["id"], "fact_id": fact["id"],
-                    "raw_response_id": fact["raw_response_id"], "previous_value": old, "value": new,
-                    "kind": "decline" if decline else "increase", "captured_at": fact["captured_at"],
-                    "automatic_correction": False, "provider_calls": 0}
-        connection.execute(
-            "INSERT OR IGNORE INTO operational_alerts(dedupe_key,severity,scope_json,evidence_json,owner,status,opened_at) "
-            "VALUES(?,'P2',?,?,'capture-data','open',?)",
-            ("capture:metric-jump:" + fact["fact_sha256"], _json(scope), _json(evidence), fact["recorded_at"]),
-        )
-
-
-def ingest_observation(connection: sqlite3.Connection, observation_id: int, *,
-                       record_anomalies: bool = False) -> dict[str, Any]:
+def ingest_observation(connection: sqlite3.Connection, observation_id: int) -> dict[str, Any]:
     _require_transaction(connection)
     row = connection.execute(observation_query(connection) + " WHERE o.id=?", (observation_id,)).fetchone()
     if row is None:
@@ -487,14 +448,7 @@ def ingest_observation(connection: sqlite3.Connection, observation_id: int, *,
     data = dict(row)
     if data["observation_origin"] == "provider_capture" and effective_provider(data) == "legacy_unknown":
         raise ValueError("new provider facts require proven raw/attempt/slot lineage")
-    existing = connection.execute(
-        "SELECT 1 FROM content_metric_field_facts WHERE observation_id=? LIMIT 1", (observation_id,),
-    ).fetchone()
-    result = _ingest(connection, data)
-    if (record_anomalies and existing is None and data["observation_origin"] == "provider_capture"
-            and data["raw_response_id"] is not None and effective_provider(data) in {"tikhub", "newrank_matrix"}):
-        _record_incremental_anomalies(connection, observation_id)
-    return result
+    return _ingest(connection, data)
 
 
 def migrate_legacy(connection: sqlite3.Connection) -> dict[str, Any]:
@@ -549,7 +503,7 @@ def record_policy_transition(
     ttl_seconds: int | None = None,
 ) -> int:
     _require_transaction(connection)
-    if policy_version != POLICY_VERSION and provider == "newrank_matrix" and eligibility == "active":
+    if policy_version not in MATRIX_POLICY_VERSIONS and provider == "newrank_matrix" and eligibility == "active":
         raise ValueError("retired Matrix may only participate in historical policy reads")
     values = dict(policy_version=policy_version, provider=provider, operation=operation,
                   field=field, eligibility=eligibility, priority=priority,
@@ -559,14 +513,19 @@ def record_policy_transition(
     return _insert(connection, "metric_policy_transitions", values, "transition_sha256")
 
 
-def _streams() -> list[tuple[str, str]]:
-    stages = load_policy()["provider_operation_stages"]
+def _streams(policy_version: str = POLICY_VERSION) -> list[tuple[str, str]]:
+    if policy_version in OPERATION_FIELD_POLICY_VERSIONS:
+        policy = load_operation_field_policy(policy_version=policy_version)
+        return list(dict.fromkeys((item["provider"], item["operation"])
+                    for item in [*policy["operation_rules"], *policy["historical_streams"]]))
+    stages = load_policy(policy_version=policy_version if policy_version in MATRIX_POLICY_VERSIONS else POLICY_VERSION)["provider_operation_stages"]
     return [(provider, operation) for provider, operations in stages.items()
             for operation in operations] + [("legacy_unknown", "legacy_unknown")]
 
 
 def _fact_streams(
     connection: sqlite3.Connection, content_ids: list[int],
+    *, policy_version: str = POLICY_VERSION,
 ) -> list[tuple[str, str]]:
     """Probe each configured stream once before its per-field selectors.
 
@@ -575,7 +534,7 @@ def _fact_streams(
     corrections and field eligibility remain the responsibility of the exact
     selectors: this only removes streams with no facts at any time.
     """
-    streams = _streams()
+    streams = _streams(policy_version)
     if not content_ids:
         return []
     rows = connection.execute(
@@ -656,7 +615,8 @@ def select_field_facts(
     ).fetchone()
     if content is None:
         raise ValueError("unknown content")
-    default_ttl = metric_freshness_seconds(content["published_at"], as_of=cutoff)
+    default_ttl = metric_freshness_seconds(content["published_at"], as_of=cutoff,
+        policy_version=policy_version if policy_version in MATRIX_POLICY_VERSIONS or policy_version in OPERATION_FIELD_POLICY_VERSIONS else POLICY_VERSION)
     selected: dict[str, Any] = {}
     transitions: list[str] = []
     future_policy = connection.execute(
@@ -666,7 +626,7 @@ def select_field_facts(
     ).fetchone()
     if future_policy is not None and future_policy[0] is not None:
         transitions.append(str(future_policy[0]))
-    streams = _fact_streams(connection, scope_ids)
+    streams = _fact_streams(connection, scope_ids, policy_version=policy_version)
     for field in METRIC_FIELDS:
         inputs: list[dict[str, Any]] = []
         candidates: list[dict[str, Any]] = []
@@ -681,8 +641,6 @@ def select_field_facts(
                                       cutoff, knowledge, provided=None, window_key=window_key)
                 if latest is None:
                     continue
-            if latest is not None:
-                latest_events.append(latest)
             policy = connection.execute(
                 """SELECT * FROM metric_policy_transitions WHERE policy_version=?
                 AND provider=? AND operation=? AND field=? AND effective_at<=? AND recorded_at<=?
@@ -690,12 +648,30 @@ def select_field_facts(
                 (policy_version, provider, operation, field, cutoff, knowledge),
             ).fetchone()
             eligibility = str(policy["eligibility"]) if policy is not None else (
-                "active" if policy_version == POLICY_VERSION
+                "active" if policy_version in MATRIX_POLICY_VERSIONS
                 and provider in {"newrank_matrix", "tikhub"} else "historical_only"
             )
             priority = int(policy["priority"]) if policy is not None else (
                 0 if provider == "newrank_matrix" else 1 if provider == "tikhub" else 2
             )
+            if policy_version in OPERATION_FIELD_POLICY_VERSIONS:
+                contract_eligibility, priority = field_eligibility(
+                    str(content["platform"]), provider, operation, field, policy_version=policy_version)
+                # The opt-in table supplies affirmative eligibility. A later
+                # transition may close it, but cannot promote an unqualified
+                # operation or retired provider into a fresh business source.
+                eligibility = (str(policy["eligibility"]) if policy is not None
+                               and contract_eligibility == "active"
+                               else contract_eligibility)
+                if eligibility == "audit_only" and latest is not None:
+                    # Qualify by operation/field even when its actual event is
+                    # missing/invalid. Keep the immutable fact in inputs.
+                    latest = dict(latest, state="audit_only", value=None,
+                                  reason="operation_field_audit_only")
+            if latest is not None:
+                if policy_version in OPERATION_FIELD_POLICY_VERSIONS:
+                    latest = dict(latest, eligibility=eligibility)
+                latest_events.append(latest)
             availability_rows = []
             for member_id in scope_ids:
                 availability_filter = ""
@@ -727,6 +703,8 @@ def select_field_facts(
                     latest.update(state=eligibility, value=None, reason="field_policy_ineligible")
                 continue
             ttl = int(policy["ttl_seconds"] or default_ttl) if policy else default_ttl
+            if policy_version in OPERATION_FIELD_POLICY_VERSIONS:
+                ttl = min(ttl, default_ttl)
             basis = value["provider_data_at"] or value["captured_at"]
             expires = utc((parse_time(basis) + timedelta(seconds=ttl)).isoformat())
             available = availability is None or availability["availability"] == "available"
@@ -743,7 +721,7 @@ def select_field_facts(
                 availability_id=availability["id"] if availability else None,
                 policy_transition_id=policy["id"] if policy else None,
             ))
-        if policy_version == POLICY_VERSION:
+        if policy_version in MATRIX_POLICY_VERSIONS:
             # Keep policy-v2's existing provider ranking and newest-requested
             # event semantics; policy-v3 qualifies operation/field separately.
             newest_by_provider: dict[str, dict[str, Any]] = {}
@@ -764,13 +742,24 @@ def select_field_facts(
                         candidate["freshness"] = "stale"
         fresh_candidates = [item for item in candidates if item["freshness"] == "fresh"]
         if fresh_candidates:
-            chosen = min(fresh_candidates, key=lambda x: (
-                x["priority"], -parse_time(x["captured_at"]).timestamp(), -x["id"],
-            ))
+            if policy_version in OPERATION_FIELD_POLICY_VERSIONS:
+                chosen = min(fresh_candidates, key=lambda x: (
+                    x["priority"], -parse_time(x["captured_at"]).timestamp(),
+                    -parse_time(x["recorded_at"]).timestamp(), -x["id"],
+                ))
+            else:
+                chosen = min(fresh_candidates, key=lambda x: (
+                    x["priority"], -parse_time(x["captured_at"]).timestamp(), -x["id"],
+                ))
         elif candidates:
             chosen = max(candidates, key=lambda x: (x["captured_at"], x["recorded_at"], x["id"]))
         elif latest_events:
-            chosen = dict(max(latest_events, key=lambda x: (x["captured_at"], x["recorded_at"], x["id"])),
+            relevant_events = latest_events
+            if policy_version in OPERATION_FIELD_POLICY_VERSIONS:
+                # Preserve a qualified operation's actual missing/invalid
+                # result instead of hiding it behind unrelated audit data.
+                relevant_events = [event for event in latest_events if event.get("eligibility") == "active"] or latest_events
+            chosen = dict(max(relevant_events, key=lambda x: (x["captured_at"], x["recorded_at"], x["id"])),
                           freshness="unknown", expires_at=None)
         else:
             chosen = {"id": None, "value": None, "state": "missing", "freshness": "unknown",
@@ -778,6 +767,10 @@ def select_field_facts(
         if content["platform"] == "xiaohongshu" and field == "view_count":
             chosen = {"id": None, "value": None, "state": "not_applicable", "freshness": "unknown",
                       "reason": "xiaohongshu_exposure_unsupported", "expires_at": None}
+        capability = field_capability(str(content["platform"]), field, policy_version=policy_version) if policy_version == CURRENT_METRIC_POLICY else None
+        if capability is not None and capability["status"] != "supported":
+            chosen = {"id": None, "value": None, "state": capability["status"], "freshness": "unknown",
+                      "reason": capability["reason"], "expires_at": None}
         if chosen["freshness"] == "fresh":
             transitions.append(chosen["expires_at"])
             reason = "preferred_fresh_source" if chosen["provider"] == "newrank_matrix" else "fixed_fallback_source"
@@ -801,6 +794,11 @@ def select_field_facts(
             observation_id=chosen.get("observation_id"), raw_response_id=chosen.get("raw_response_id"),
             latest_provider_status=chosen.get("latest_provider_status"), inputs=inputs,
         )
+        if policy_version in OPERATION_FIELD_POLICY_VERSIONS:
+            selected[field]["source_eligibility"] = chosen.get("eligibility", "historical_only")
+        if capability is not None:
+            selected[field]["capability"] = capability["status"]
+            selected[field]["auto_collectable"] = capability["auto_collectable"]
     return {"content_id": content_id, "policy_version": policy_version,
             "cutoff_at": cutoff, "knowledge_at": knowledge, "window_key": window_key, "fields": selected,
             "scope_content_ids": scope_ids,
@@ -914,6 +912,9 @@ def business_projection(
         latest_valid = bool(field["status"] == "provided" and field["latest_fact_id"] == field["selected_fact_id"]
                             and field["provider"] in {"newrank_matrix", "tikhub"}
                             and source_fact is not None and source_fact["observation_status"] != "stale")
+        if payload["policy_version"] in OPERATION_FIELD_POLICY_VERSIONS:
+            latest_valid = latest_valid and field.get("source_eligibility") == "active"
+            evidence.update(source_eligibility=field.get("source_eligibility"), expires_at=field["expires_at"])
         evidence.update(
             value=field["value"], status=field["status"], freshness=field["freshness"], reason=field["reason"],
             effective_provider=field["provider"], effective_operation=field["operation"],
@@ -927,6 +928,8 @@ def business_projection(
                               else "newer_source_missing_or_invalid" if field["latest_provider_status"] in {"missing", "invalid"}
                               else "not_current_valid_fact"),
         )
+        if payload["policy_version"] == CURRENT_METRIC_POLICY:
+            evidence.update(capability=field["capability"], auto_collectable=field["auto_collectable"])
         selected[name] = evidence
     provided = [field for field in selected.values() if field["status"] == "provided"]
     fresh = [field for field in provided if field["freshness"] == "fresh"]
@@ -997,6 +1000,23 @@ def read_projection(
                 (member_id, previous, upper, other_upper),
             ).fetchone() is not None:
                 return None
+    if policy_version in OPERATION_FIELD_POLICY_VERSIONS:
+        # Detail availability can arrive without a new metric observation.
+        # A cached fresh field must not hide a later confirmed unavailable
+        # event. Keep the legacy policy's cache contract unchanged.
+        sources = {(item["provider"], item["operation"])
+                   for field in saved["fields"].values() for item in field["inputs"]}
+        for member_id in scope_ids:
+            for provider, operation in sources:
+                if connection.execute(
+                    """SELECT 1 FROM content_availability_observations
+                    WHERE content_id=? AND provider=? AND operation=?
+                      AND captured_at<=? AND recorded_at<=?
+                      AND (captured_at>? OR recorded_at>?) LIMIT 1""",
+                    (member_id, provider, operation, cutoff, knowledge,
+                     row["cutoff_at"], row["knowledge_at"]),
+                ).fetchone() is not None:
+                    return None
     if connection.execute(
         f"""SELECT 1 FROM content_metric_corrections x JOIN content_metric_field_facts f ON f.id=x.target_fact_id
         WHERE x.recorded_at>? AND x.recorded_at<=? AND f.content_id IN ({','.join('?' for _ in scope_ids)})
@@ -1017,6 +1037,7 @@ def select_metric_projections(
     connection: sqlite3.Connection, content_ids: list[int], *, cutoff_at: str,
     knowledge_at: str, window_key: str | None, metric_fields: tuple[str, ...],
     current_read: bool = False,
+    policy_version: str = POLICY_VERSION,
 ) -> dict[int, dict[str, Any]]:
     """Schema20 read path; recomputation stays read-only, including expired TTL."""
     cutoff_at, knowledge_at = utc(cutoff_at), utc(knowledge_at)
@@ -1030,10 +1051,10 @@ def select_metric_projections(
             if connection.execute("SELECT 1 FROM content_items WHERE id=?", (content_id,)).fetchone() is None:
                 continue
             payload = read_projection(connection, content_id, knowledge_at=knowledge_at,
-                                      cutoff_at=cutoff_at, window_key=window_key)
+                                      cutoff_at=cutoff_at, window_key=window_key, policy_version=policy_version)
             if payload is None:
                 payload = select_field_facts(connection, content_id, cutoff_at=cutoff_at,
-                                             knowledge_at=knowledge_at, window_key=window_key)
+                                             knowledge_at=knowledge_at, window_key=window_key, policy_version=policy_version)
             projection = (
                 payload.get("business_projection")
                 if len(metric_fields) == len(METRIC_FIELDS) else None
@@ -1041,7 +1062,7 @@ def select_metric_projections(
             if projection is None:
                 projection = business_projection(connection, payload, metric_fields=metric_fields)
             if projection is None:
-                if current_read:
+                if current_read and policy_version in MATRIX_POLICY_VERSIONS:
                     parameters: list[Any] = [content_id, cutoff_at]
                     window_filter = ""
                     if window_key is not None:
@@ -1061,10 +1082,14 @@ def select_metric_projections(
                         content = dict(connection.execute(
                             "SELECT id,platform,published_at,account_id FROM content_items WHERE id=?", (content_id,),
                         ).fetchone())
-                        projection = _select_row(content, [fact], cutoff_at=cutoff_at, metric_fields=metric_fields)
+                        projection = _select_row(content, [fact], cutoff_at=cutoff_at, metric_fields=metric_fields, policy_version=policy_version)
                         if projection is not None:
                             result[requested_id] = projection
                 continue
+            if len(metric_fields) != len(METRIC_FIELDS):
+                projection = business_projection(connection, payload, metric_fields=metric_fields)
+                if projection is None:
+                    continue
             result[requested_id] = projection
         return result
     finally:

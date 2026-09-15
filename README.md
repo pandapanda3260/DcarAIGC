@@ -44,6 +44,8 @@ scripts/start_web_mvp.sh
 
 `scripts/start_web_mvp.sh` 只启动 Web 与认证网关，不启动第二个 API。正常模式会先验证 8766 正连接已安装 writer plist 指定的正式数据库、持有 scheduler lock、报告运行时就绪、真实注册了当天 `pipeline_reconcile`，且没有注册 `history_recovery`；任一条件不满足都失败式停止，不回退旧数据。8765 仅保留给 operator freeze 期间的只读快照 viewer。
 
+账号、内容和统计读取可通过鉴权网关分流到独立的 `8768` 活库只读服务；它以 WAL 只读连接运行，不进入 writer lifespan、不启动调度。该服务须单独启动并通过验证后再配置网关，`start_web_mvp.sh` 不代管它。启动、缓存时效与回滚见 [独立读服务说明](docs/read-service.md)。
+
 Web 默认先构建并运行 production 版本，避免日常访问承担开发态即时编译和 HMR 开销。只有前端开发时才使用 `DCAR_WEB_MODE=dev scripts/start_web_mvp.sh`。
 
 本地 4173 是可信操作台：页面上的显式新增、编辑、刷新和报告操作会写正式库；仅浏览或刷新卖点页不会触发供应商调用。每日调度仍只由 macOS 指定 writer 在 8766 运行。

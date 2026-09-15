@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, cast
 from unittest.mock import AsyncMock, patch
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 from cryptography.fernet import Fernet
 from fastapi import FastAPI, Request
@@ -345,6 +345,66 @@ class DouyinControlApiTestCase(unittest.TestCase):
         )
         return state, callback, callback_target
 
+    def test_encoded_usernames_round_trip_through_oauth_and_authorization(self) -> None:
+        names = (
+            "  中文🙂@mail.test:+/%\"'<>\\\r\n\t\x00  ",
+            "长" * 300,
+            "temporary-bypass",
+            " %E4%B8%AD+name ",
+        )
+        for index, username in enumerate(names):
+            with self.subTest(username=repr(username)), self._clients(
+                "/dcar", vault_namespace=f"encoded-name-{index}"
+            ) as (control, provider, _, _):
+                headers = self._headers("douyin-oauth-start", username=quote(username, safe=""))
+                headers["X-Dcar-Authenticated-User-Encoding"] = "percent-utf8"
+                started = control.post(
+                    "/api/douyin/oauth/start", headers=headers,
+                    json={"account_id": 7, "platform_uid": PLATFORM_UID},
+                )
+                self.assertEqual(started.status_code, 200, started.text)
+                authorized = provider.get(started.json()["authorize_url"])
+                self.assertEqual(authorized.status_code, 303, authorized.text)
+                callback = control.get(
+                    self._upstream_target(authorized.headers["location"], "/dcar"),
+                    headers=headers, follow_redirects=False,
+                )
+                self.assertEqual(callback.status_code, 303, callback.text)
+                self._assert_authorization_location(callback.headers["location"], "/dcar", "oauth-completed")
+                listed = control.get("/api/douyin/authorizations", headers=headers)
+                self.assertEqual(listed.status_code, 200, listed.text)
+                self.assertEqual(listed.json()["items"][0]["bound_username"], username)
+
+    def test_username_encoding_rejects_malformed_headers_and_preserves_legacy(self) -> None:
+        with self._clients("/dcar") as (control, _, _, _):
+            for value, encoding in (
+                ("%", "percent-utf8"),
+                ("%0", "percent-utf8"),
+                ("%GG", "percent-utf8"),
+                ("%FF", "percent-utf8"),
+                ("%ED%A0%80", "percent-utf8"),
+                ("operator", "base64"),
+                ("", "percent-utf8"),
+            ):
+                with self.subTest(value=value, encoding=encoding):
+                    headers = self._headers(username=value)
+                    headers["X-Dcar-Authenticated-User-Encoding"] = encoding
+                    rejected = control.get("/api/douyin/authorizations", headers=headers)
+                    self.assertEqual(rejected.status_code, 403, rejected.text)
+            legacy = control.get(
+                "/douyin", headers=self._headers(username="name%FF+literal"),
+                follow_redirects=False,
+            )
+            self.assertEqual(legacy.status_code, 303)
+            mixed = control.get(
+                "/internal/v1/health",
+                headers={
+                    "X-Dcar-Machine-Key": MACHINE_KEY,
+                    "X-Dcar-Authenticated-User-Encoding": "percent-utf8",
+                },
+            )
+            self.assertEqual(mixed.status_code, 403)
+
     def test_trust_boundary_pages_and_internal_health(self) -> None:
         for base_path in ("", "/dcar"):
             with (
@@ -359,9 +419,10 @@ class DouyinControlApiTestCase(unittest.TestCase):
                 self.assertEqual(control.get("/douyin").status_code, 403)
                 self.assertEqual(
                     control.get(
-                        "/douyin", headers=self._headers(username="temporary-bypass")
+                        "/douyin", headers=self._headers(username="temporary-bypass"),
+                        follow_redirects=False,
                     ).status_code,
-                    403,
+                    303,
                 )
                 page = control.get(
                     "/douyin", headers=self._headers(), follow_redirects=False
@@ -396,6 +457,17 @@ class DouyinControlApiTestCase(unittest.TestCase):
                 )
 
                 non_ascii_headers = [
+                    (
+                        "username",
+                        "/api/douyin/authorizations",
+                        "GET",
+                        [
+                            (b"x-dcar-edge-key", EDGE_KEY.encode()),
+                            (b"x-dcar-authenticated-user", b"\xff"),
+                            (b"x-dcar-authenticated-user-encoding", b"percent-utf8"),
+                            (b"x-dcar-session-binding", SESSION_BINDING.encode()),
+                        ],
+                    ),
                     (
                         "machine",
                         "/internal/v1/health",

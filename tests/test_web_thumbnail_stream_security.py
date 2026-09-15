@@ -37,7 +37,10 @@ class ThumbnailStreamSecurityTest(unittest.TestCase):
     def assert_authorized_cover(self) -> None:
         result = self.fixture.run_reader()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout)["items"]["1"]["remote_url"], self.fixture.cover)
+        self.assertEqual(json.loads(result.stdout)["items"]["1"], {
+            "local_url": None, "remote_url": self.fixture.cover,
+            "remote_urls": [self.fixture.cover], "reason": None,
+        })
 
     def load_helper(self):
         spec = importlib.util.spec_from_file_location(
@@ -112,7 +115,9 @@ class ThumbnailStreamSecurityTest(unittest.TestCase):
         self.seal()
         result = self.fixture.run_reader()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIsNone(json.loads(result.stdout)["items"]["1"]["remote_url"])
+        self.assertEqual(json.loads(result.stdout)["items"]["1"], {
+            "local_url": None, "remote_url": None, "remote_urls": [], "reason": "source_unavailable",
+        })
 
     def test_parent_directory_symlink_cannot_relocate_an_authorized_file(self) -> None:
         original = self.fixture.project / "data/cache/v8/raw_responses"
@@ -121,7 +126,9 @@ class ThumbnailStreamSecurityTest(unittest.TestCase):
         original.symlink_to(destination, target_is_directory=True)
         result = self.fixture.run_reader()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIsNone(json.loads(result.stdout)["items"]["1"]["remote_url"])
+        self.assertEqual(json.loads(result.stdout)["items"]["1"], {
+            "local_url": None, "remote_url": None, "remote_urls": [], "reason": "source_unavailable",
+        })
 
     def test_manifest_replacement_with_identical_bytes_during_read_is_rejected(self) -> None:
         from v8 import artifact_paths

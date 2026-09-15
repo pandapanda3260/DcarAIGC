@@ -211,3 +211,260 @@ test("an in-flight permission check cannot navigate ahead of logout", async () =
     assert.deepEqual(destinations, ["/login"]);
   }
 });
+
+async function inlineProfileRuntime(fetch, profileOverrides = {}) {
+  const source = await readFile(new URL("../../../src/dcar_eval/dcar_auth/gateway.py", import.meta.url), "utf8");
+  const script = source.match(/<script>\nconst basePath=__BASE_PATH_JSON__;([\s\S]*?)<\/script>/)?.[1];
+  assert.ok(script);
+  const profile = { authenticated: true, username: "new.person@example.com", display_name: "已保存的昵称", role: "new_user", ...profileOverrides };
+  const destinations = [];
+  function element(initial = {}) {
+    const events = new Map();
+    const attributes = new Map();
+    return {
+      hidden: false, disabled: false, value: "", textContent: "", title: "", style: {}, scrollHeight: 32,
+      focus() { this.focused = true; },
+      setSelectionRange(start, end) {
+        this.selectionStart = start;
+        this.selectionEnd = end;
+        this.selectionAfterFocus = this.focused;
+      },
+      setAttribute: (name, value) => attributes.set(name, value),
+      getAttribute: (name) => attributes.get(name),
+      addEventListener: (type, handler) => events.set(type, handler),
+      dispatch(type, event = {}) { return (this[`on${type}`] ?? events.get(type))?.(event); },
+      ...initial,
+    };
+  }
+  const label = element({ textContent: "刷新权限" });
+  const elements = {
+    status: element(),
+    refresh: element({ querySelector: () => label }),
+    logout: element(),
+    "profile-data": element({ textContent: JSON.stringify(profile) }),
+    "profile-display": element(),
+    "profile-nickname": element(),
+    "profile-name": element(),
+    "profile-role": element(),
+    "profile-error": element({ hidden: true }),
+    "profile-empty-hint": element({ hidden: true }),
+    "profile-save": element(),
+    "profile-cancel": element(),
+    "profile-form": element({ hidden: true }),
+    "open-profile": element(),
+  };
+  let submitted;
+  elements["profile-form"].requestSubmit = () => {
+    submitted = elements["profile-form"].onsubmit({ preventDefault() {} });
+  };
+  const runtime = {
+    document: { getElementById: (id) => elements[id], addEventListener() {}, visibilityState: "visible" },
+    window: { addEventListener() {} },
+    location: { reload: () => destinations.push("reload"), replace: (url) => destinations.push(url) },
+    fetch,
+    setInterval() {}, setTimeout, clearTimeout, AbortController,
+  };
+  vm.runInNewContext(`const basePath="";${script}`, runtime);
+  return { runtime, elements, profile, destinations, submitted: () => submitted };
+}
+
+test("inline nickname prefill is editable and only changed drafts can be saved", async () => {
+  for (const displayName of ["", "已保存的昵称 😀"]) {
+    const requests = [];
+    let savedProfile;
+    const state = await inlineProfileRuntime(async (url, options) => {
+      requests.push({ url, options });
+      if (url.endsWith("/profile")) savedProfile = { ...state.profile, ...JSON.parse(options.body) };
+      return Response.json(savedProfile ?? state.profile);
+    }, { username: "panyang", display_name: displayName });
+    const { elements } = state;
+    const nickname = elements["profile-nickname"];
+    elements["open-profile"].onclick();
+    const initialValue = displayName || "panyang";
+    assert.equal(nickname.value, initialValue);
+    assert.equal(nickname.placeholder, "输入昵称");
+    assert.equal(nickname.disabled, false);
+    assert.equal(nickname.selectionAfterFocus, true);
+    assert.equal(nickname.selectionStart, initialValue.length);
+    assert.equal(nickname.selectionEnd, initialValue.length);
+    assert.equal(elements["profile-save"].disabled, true);
+    assert.equal(elements["profile-empty-hint"].hidden, true);
+
+    nickname.dispatch("keydown", { key: "Enter", preventDefault() {} });
+    await state.submitted();
+    await elements["profile-form"].onsubmit({ preventDefault() {} });
+    assert.equal(requests.length, 0, "unchanged Enter and direct submit must not write the username as a nickname");
+
+    nickname.value += "-运营";
+    nickname.dispatch("input");
+    assert.equal(elements["profile-save"].disabled, false);
+    nickname.value = initialValue;
+    nickname.dispatch("input");
+    assert.equal(elements["profile-save"].disabled, true, "reverting the draft disables saving again");
+    await elements["profile-form"].onsubmit({ preventDefault() {} });
+    assert.equal(requests.length, 0);
+
+    nickname.value += "-运营";
+    nickname.dispatch("input");
+    nickname.dispatch("keydown", { key: "Enter", preventDefault() {} });
+    await state.submitted();
+    await new Promise((resolve) => setImmediate(resolve));
+    const saves = requests.filter(({ url }) => url.endsWith("/profile"));
+    assert.equal(saves.length, 1);
+    assert.deepEqual(JSON.parse(saves[0].options.body), { display_name: `${initialValue}-运营` });
+    assert.equal(elements["profile-form"].hidden, true);
+    assert.equal(elements["profile-name"].textContent, `${initialValue}-运营`);
+  }
+});
+
+test("editing an inline nickname defers in-flight approval until the edit is cancelled", async () => {
+  for (const delayedStage of ["response", "json"]) {
+    let releaseSession;
+    let requestCount = 0;
+    const pendingSession = new Promise((resolve) => { releaseSession = resolve; });
+    let approved;
+    const { runtime, elements, profile, destinations } = await inlineProfileRuntime(async () => {
+      requestCount += 1;
+      if (requestCount > 1) return Response.json(approved);
+      return delayedStage === "response" ? pendingSession : { ok: true, status: 200, json: () => pendingSession };
+    });
+    approved = { ...profile, display_name: "服务器中的旧昵称", role: "operator" };
+    const checking = runtime.checkPermission();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(requestCount, 1);
+    elements["open-profile"].onclick();
+    elements["profile-nickname"].value = "未保存的草稿 @ 😀";
+    elements["profile-nickname"].dispatch("input");
+    releaseSession(delayedStage === "response" ? Response.json(approved) : approved);
+    await checking;
+
+    assert.equal(elements["profile-form"].hidden, false, delayedStage);
+    assert.equal(elements["profile-display"].hidden, false, "the identity stays visible while editing");
+    assert.equal(elements["open-profile"].hidden, true, "only the edit button is hidden");
+    assert.deepEqual(destinations, [], delayedStage);
+    assert.equal(elements["profile-nickname"].value, "未保存的草稿 @ 😀", delayedStage);
+    assert.equal(elements["profile-name"].textContent, profile.display_name, delayedStage);
+    assert.equal(elements["profile-role"].textContent, "待开通权限", delayedStage);
+    await runtime.checkPermission();
+    await runtime.checkPermission(true);
+    assert.equal(requestCount, 1, "automatic and manual refresh remain paused during editing");
+
+    elements["profile-cancel"].onclick();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(elements["profile-form"].hidden, true, delayedStage);
+    assert.equal(elements["profile-display"].hidden, false, delayedStage);
+    assert.equal(elements["open-profile"].hidden, false, delayedStage);
+    assert.equal(requestCount, 2, delayedStage);
+    assert.equal(elements["profile-name"].textContent, approved.display_name, delayedStage);
+    assert.deepEqual(destinations, ["reload"], delayedStage);
+  }
+});
+
+test("inline nickname keyboard shortcuts protect IME input and preserve blurred drafts", async () => {
+  const requests = [];
+  let savedProfile;
+  const state = await inlineProfileRuntime(async (url, options) => {
+    requests.push({ url, options });
+    if (url.endsWith("/profile")) {
+      savedProfile = { ...state.profile, ...JSON.parse(options.body) };
+      return Response.json(savedProfile);
+    }
+    return Response.json(savedProfile ?? state.profile);
+  });
+  const { runtime, elements } = state;
+  const nickname = elements["profile-nickname"];
+  elements["open-profile"].onclick();
+  nickname.value = "  程鑫 @ / & 😀\n第二行  ";
+  nickname.dispatch("input");
+  nickname.dispatch("blur");
+  assert.equal(elements["profile-form"].hidden, false);
+  assert.equal(nickname.value, "  程鑫 @ / & 😀\n第二行  ");
+  for (const key of [
+    { key: "Enter", shiftKey: true },
+    { key: "Enter", isComposing: true },
+    { key: "Enter", keyCode: 229 },
+    { key: "Escape", isComposing: true },
+  ]) {
+    let prevented = false;
+    nickname.dispatch("keydown", { ...key, preventDefault() { prevented = true; } });
+    assert.equal(prevented, false, JSON.stringify(key));
+    assert.equal(requests.length, 0, JSON.stringify(key));
+    assert.equal(elements["profile-form"].hidden, false, JSON.stringify(key));
+  }
+  await runtime.checkPermission(true);
+  assert.equal(requests.length, 0);
+  let prevented = false;
+  nickname.dispatch("keydown", { key: "Enter", preventDefault() { prevented = true; } });
+  await state.submitted();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(prevented, true);
+  assert.equal(requests[0].url, "/auth/profile");
+  assert.deepEqual(JSON.parse(requests[0].options.body), { display_name: "  程鑫 @ / & 😀\n第二行  " });
+  assert.equal(elements["profile-name"].textContent, nickname.value);
+  assert.equal(elements["profile-form"].hidden, true);
+  assert.equal(elements["profile-display"].hidden, false);
+  assert.equal(elements["open-profile"].hidden, false);
+  assert.equal(requests.at(-1).url, "/auth/session", "successful save resumes a fresh permission check");
+
+  elements["open-profile"].onclick();
+  nickname.value = "取消这个草稿";
+  nickname.dispatch("input");
+  nickname.dispatch("keydown", { key: "Escape", preventDefault() {} });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(elements["profile-form"].hidden, true);
+  assert.equal(elements["profile-name"].textContent, savedProfile.display_name);
+  assert.equal(requests.filter(({ url }) => url.endsWith("/profile")).length, 1);
+});
+
+test("failed inline nickname saves retain the draft and permit an empty-name retry", async () => {
+  const requests = [];
+  let releaseSave;
+  const pendingSave = new Promise((resolve) => { releaseSave = resolve; });
+  let savedProfile;
+  const state = await inlineProfileRuntime(async (url, options) => {
+    requests.push({ url, options });
+    if (url.endsWith("/profile")) {
+      if (requests.length === 1) return pendingSave;
+      savedProfile = { ...state.profile, ...JSON.parse(options.body) };
+      return Response.json(savedProfile);
+    }
+    return Response.json(savedProfile ?? state.profile);
+  });
+  const { runtime, elements } = state;
+  elements["open-profile"].onclick();
+  elements["profile-nickname"].value = "未保存 @ 😀";
+  elements["profile-nickname"].dispatch("input");
+  const saving = elements["profile-form"].onsubmit({ preventDefault() {} });
+  assert.equal(elements["profile-save"].disabled, true);
+  assert.equal(elements["profile-cancel"].disabled, true);
+  await runtime.checkPermission();
+  await runtime.checkPermission(true);
+  assert.equal(requests.length, 1, "refresh stays paused while the save is in flight");
+  releaseSave(Response.json({ detail: "暂时无法处理，请稍后重试" }, { status: 503 }));
+  await saving;
+  assert.equal(elements["profile-form"].hidden, false);
+  assert.equal(elements["profile-nickname"].value, "未保存 @ 😀");
+  assert.equal(elements["profile-error"].hidden, false);
+  assert.equal(elements["profile-save"].disabled, false);
+  assert.equal(elements["profile-name"].textContent, state.profile.display_name);
+
+  elements["profile-nickname"].value = "";
+  elements["profile-nickname"].dispatch("input");
+  assert.equal(elements["profile-empty-hint"].hidden, false);
+  assert.equal(elements["profile-save"].disabled, false);
+  elements["profile-nickname"].value = "重新输入";
+  elements["profile-nickname"].dispatch("input");
+  assert.equal(elements["profile-empty-hint"].hidden, true);
+  elements["profile-nickname"].value = "";
+  elements["profile-nickname"].dispatch("input");
+  assert.equal(elements["profile-empty-hint"].hidden, false);
+  await elements["profile-form"].onsubmit({ preventDefault() {} });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(JSON.parse(requests[1].options.body), { display_name: "" });
+  assert.equal(elements["profile-name"].textContent, state.profile.username);
+  assert.equal(elements["profile-form"].hidden, true);
+  elements["open-profile"].onclick();
+  assert.equal(elements["profile-nickname"].value, state.profile.username);
+  assert.equal(elements["profile-empty-hint"].hidden, true);
+  assert.equal(elements["profile-save"].disabled, true);
+});

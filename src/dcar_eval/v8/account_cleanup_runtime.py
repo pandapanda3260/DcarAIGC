@@ -6,6 +6,8 @@ operator gate, Writer lease, paid-drain chain, budgets and paid-scope ledger.
 """
 from __future__ import annotations
 
+from .runtime_phase_timing import phase, measured, timed
+
 import hashlib
 import json
 import os
@@ -36,12 +38,16 @@ def require(value: bool, message: str) -> None:
         raise auth.AuthorizationError(message)
 
 
+@timed('installed.receipt')
 def private_object(reference: Mapping[str, Any]) -> dict[str, Any]:
     path = Path(reference["path"])
     require(not path.is_relative_to(PROJECT_ROOT.resolve()), "Cleanup receipt must be external")
-    body = _raw_file(path, private=True)
+    from .runtime_evidence_context import prepared_file_bytes
+    body = prepared_file_bytes(path, private=True)
+    if body is None:
+        body = _raw_file(path, private=True)
     require(hashlib.sha256(body).hexdigest() == reference["sha256"], "Cleanup receipt SHA differs")
-    value = json.loads(body)
+    value = measured("json.installed_receipt", json.loads, body)
     require(isinstance(value, dict), "Cleanup receipt must be an object")
     return value
 
@@ -62,6 +68,7 @@ def valid_sec(value: str) -> bool:
     return value.startswith("MS4wLjAB") and 40 <= len(value) <= 128
 
 
+@timed('installed.capsule_validate')
 def validate_source(value: Mapping[str, Any], *, at: str) -> None:
     require(value.get("contract") == SOURCE and value.get("snapshot_sha256") == auth.digest(
         {k: v for k, v in value.items() if k != "snapshot_sha256"}), "Cleanup source capsule changed")
@@ -179,12 +186,13 @@ def export_source_authority(connection: sqlite3.Connection, directory_document: 
     return result
 
 
+@timed('installed_evidence')
 def installed_evidence(connection: sqlite3.Connection, *, at: str, maintenance_only: bool = False) -> dict[str, Any]:
     from .runtime_database import load_installed_writer_contract, require_current_process_writer_lock
 
     require_current_process_writer_lock(connection)
     schema_version = connection.execute("PRAGMA user_version").fetchone()[0]
-    require(schema_version in {20, 21}, "Cleanup release requires schema20 or its verified classification successor")
+    require(schema_version in {20, 21, 22, 23, 24}, "Cleanup release requires schema20 or its verified successor")
     installed = load_installed_writer_contract(required=True)
     require(installed is not None and installed.project_root.resolve() == PROJECT_ROOT.resolve(),
             "Cleanup Writer installation belongs to another project")
@@ -222,14 +230,41 @@ def installed_evidence(connection: sqlite3.Connection, *, at: str, maintenance_o
     install_path = Path(os.environ["DCAR_ACCOUNT_CLEANUP_INSTALL_RECEIPT"])
     install_body = _raw_file(install_path, private=True)
     install_sha = hashlib.sha256(install_body).hexdigest()
-    install = json.loads(install_body)
+    install = measured("json.installed_install", json.loads, install_body)
     classification_proof = None
+    intake_proof = None
+    four_platform_flow_proof = None
     manual_scope_proof = None
     metric_gap_proof = None
     profile_operation_authority = None
     profile_compensation_authority = None
+    preparation_operation_authority = None
     catalog_policy_evidence = {}
-    if schema_version == 21:
+    if schema_version in {22, 23, 24}:
+        if schema_version == 24:
+            from . import duplicate_index_release as successor
+        elif schema_version == 23:
+            from . import four_platform_flow_release as successor
+        else:
+            from . import account_intake_release as successor
+        inherited = successor.verify_inheritance(
+            build=build, build_ref=successor.reference(build_path),
+            install_path=install_path, database=installed.database,
+            source=source_root(PROJECT_ROOT), at=at, connection=connection)
+        intake_proof = inherited["intake_proof"]
+        four_platform_flow_proof = inherited.get("four_platform_flow_proof")
+        preparation_operation_authority = inherited.get("preparation_operation_authority")
+        classification_proof = inherited["proof"]
+        manual_scope_proof = inherited.get("manual_content_scope_proof")
+        metric_gap_proof = inherited.get("metric_gap_proof")
+        catalog_policy_evidence = {key: inherited[key] for key in (
+            "catalog_capture_policy", "catalog_capture_policy_sha256", "catalog_capture_proof")}
+        parent = inherited["parent_build"]
+        build_sha = inherited["parent_build_ref"]["sha256"]
+        build_path = Path(inherited["parent_build_ref"]["path"])
+        runtime_sha = parent["runtime_root_receipt"]["sha256"]
+        generation = parent["account_cleanup_generation"]
+    elif schema_version == 21:
         from . import account_classification_release, schema_v21
         schema_v21.validate_structure(connection)
         inherited = account_classification_release.verify_inheritance(
@@ -259,98 +294,108 @@ def installed_evidence(connection: sqlite3.Connection, *, at: str, maintenance_o
             and all(install["installed"][k] == live["database_" + k] for k in ("device", "inode"))
             and install["build_receipt"] == {"path": str(build_path), "sha256": build_sha}
             and parse_time(install["installed_at"]) <= parse_time(at), "Cleanup installed proof or inode differs")
-    migration = private_object(generation["migration_receipt"])
-    require(migration.get("contract") == "account-cleanup-projection-v1"
-            and migration.get("receipt_sha256") == auth.digest({k: v for k, v in migration.items() if k != "receipt_sha256"})
-            and migration.get("status") == "candidate_verified"
-            and migration.get("verification") == {"foreign_key_check": "ok", "integrity_check": "ok",
-                                                  "projected_values_sha256_verified": True}
-            and migration["source_backup"]["sha256"] == generation["source_database_sha256"] == install["source_database_sha256"]
-            and install["expected_scope"]["migration_receipt_sha256"] == generation["migration_receipt"]["sha256"],
-            "Cleanup projection receipt or source binding differs")
-    capsule = private_object(generation["source_authority"])
-    validate_source(capsule, at=at)
-    require(capsule["source_database_sha256"] == generation["source_database_sha256"]
-            and capsule["source_directory_sha256"] == migration["source_attachment_sha256"]
-            and capsule["selection_sha256"] == generation["selection_sha256"] == install["expected_scope"]["selection_sha256"],
-            "Cleanup attachment, source authority or member selection differs")
-    active = activation_at(connection, at)
-    require(active is not None and {k: active[k] for k in ACTIVE_KEYS} == install["expected_scope"]["active"]
-            and active["build_receipt_sha256"] == build_sha and active["profile_id"] == "integrated_route_v1"
-            and active.get("metadata", {}).get("account_cleanup") == {
-                "contract": GENERATION, "generation_id": generation["generation_id"],
-                "selection_sha256": generation["selection_sha256"]}, "Cleanup activation is not the installed generation")
-    snapshot = account_roster.runtime_snapshot(connection, active)
-    if catalog_policy_evidence:
-        # The original snapshot remains historical runtime evidence. Resolve
-        # live identity/locator changes per catalog member, not as a global
-        # failure that would prevent all other accounts from being planned.
-        original = {m["account_identity_id"]: m for m in capsule["eligible_members"]}
-        members = [{**dict(row), "account_id": original.get(row["account_identity_id"], {}).get("account_id")}
-            for row in connection.execute("SELECT * FROM account_roster_members WHERE snapshot_id=?",
-                (snapshot["id"],))]
-    else:
-        members = account_roster.get_current_members(connection, snapshot["id"])
-    actual = sorted([{"account_identity_id": r["account_identity_id"], "account_id": r["account_id"],
-                      "platform": r["platform"], "uid": r.get("identity_uid") or r.get("uid")} for r in members],
-                    key=lambda r: r["account_identity_id"])
-    require(actual == capsule["eligible_members"],
-            "Cleanup active roster exceeds or changes the approved valid member intersection")
-    # An operator pause narrows live eligibility, not the immutable authorized
-    # identity set. Require its ordinary append-only state event; the per-member
-    # claim and pre-send gates still reject enabled=0 independently.
-    from .account_states import state_events
-    for member in ([] if catalog_policy_evidence else members):
-        if member["enabled"] == 1:
-            continue
-        events = state_events(connection, member["account_identity_id"])
-        latest = events[-1] if events else {}
-        require(member["enabled"] == 0 and latest.get("new_enabled") is False
-                and latest.get("activation_id") == active["activation_id"]
-                and parse_time(latest["effective_at"]) <= parse_time(at)
-                and parse_time(latest["created_at"]) <= parse_time(at),
-                "Cleanup disabled member lacks its recorded operator pause")
-    source_members = {r["account_identity_id"]: r for r in capsule["source_members"]}
-    # The new policy validates live identity/locator evidence per task. Keep
-    # the original capsule and its frozen roster intact as historical proof.
-    for row in ([] if catalog_policy_evidence else actual):
-        refs = {r[0] for r in connection.execute(
-            "SELECT reference_value FROM account_provider_references WHERE account_identity_id=? AND lower(provider)='tikhub' AND reference_kind='sec_user_id'",
-            (row["account_identity_id"],))}
-        sec = next(iter(refs)) if len(refs) == 1 else ""
-        require(valid_sec(sec) and hashlib.sha256(sec.encode()).hexdigest() == source_members[row["account_identity_id"]]["sec_user_id_sha256"],
-                "Cleanup account reference changed or is no longer valid")
-    manifest = forward_recovery._route()
-    require(manifest == generation["transport_manifest"] == capsule["transport_manifest"]
-            and all(json.loads(p["gate"]["evidence_json"])["bindings"]["config_receipt_sha256"] == generation["config_sha256"]
-                    for p in capsule["operations"].values()), "Cleanup transport or approved config changed")
-    guard = forward_recovery._live_guards(connection, at=at, check_capacity=not maintenance_only) if not maintenance_only else {}
-    proof = {"contract": GENERATION, "generation_id": generation["generation_id"],
-             "selection_sha256": generation["selection_sha256"], "source_authority": generation["source_authority"],
-             "install_receipt_sha256": install_sha, "active": {k: active[k] for k in ACTIVE_KEYS},
-             "build_sha256": build_sha, "runtime_sha256": runtime_sha, "config_sha256": generation["config_sha256"],
-             "transport_manifest": manifest, "actor": generation["actor"], "reason": generation["reason"],
-             "issued_at": generation["issued_at"]}
-    proof["proof_sha256"] = auth.digest(proof)
-    evidence = {"active": active, "build_sha256": build_sha, "runtime_sha256": runtime_sha,
-                "config_sha256": generation["config_sha256"], "manifest": manifest,
-                "migration": migration, "install": install, "storage_policy": guard.get("capacity", {}),
-                "activation_successor": None, "code_successor": None, "account_cleanup_generation": proof}
-    if classification_proof is not None:
-        evidence["account_classification_successor"] = classification_proof
-    if manual_scope_proof is not None:
-        evidence["manual_content_scope_successor"] = manual_scope_proof
-    if metric_gap_proof is not None:
-        evidence["metric_gap_successor"] = metric_gap_proof
-    evidence.update(catalog_policy_evidence)
-    if profile_operation_authority is not None:
-        evidence["profile_operation_authority"] = profile_operation_authority
-    if profile_compensation_authority is not None:
-        evidence["profile_compensation_authority"] = profile_compensation_authority
-    decision = cleanup_decision(evidence)
-    evidence["deployment"] = {"status": "accepted", "contract_version": GENERATION,
-                              "release_decision": decision, "bindings": {**proof["active"],
-                                  **{k: evidence[k] for k in ("build_sha256", "runtime_sha256", "config_sha256")}}}
+    with phase('installed.migration_capsule'):
+        migration = private_object(generation["migration_receipt"])
+        require(migration.get("contract") == "account-cleanup-projection-v1"
+                and migration.get("receipt_sha256") == auth.digest({k: v for k, v in migration.items() if k != "receipt_sha256"})
+                and migration.get("status") == "candidate_verified"
+                and migration.get("verification") == {"foreign_key_check": "ok", "integrity_check": "ok",
+                                                      "projected_values_sha256_verified": True}
+                and migration["source_backup"]["sha256"] == generation["source_database_sha256"] == install["source_database_sha256"]
+                and install["expected_scope"]["migration_receipt_sha256"] == generation["migration_receipt"]["sha256"],
+                "Cleanup projection receipt or source binding differs")
+        capsule = private_object(generation["source_authority"])
+        validate_source(capsule, at=at)
+        require(capsule["source_database_sha256"] == generation["source_database_sha256"]
+                and capsule["source_directory_sha256"] == migration["source_attachment_sha256"]
+                and capsule["selection_sha256"] == generation["selection_sha256"] == install["expected_scope"]["selection_sha256"],
+                "Cleanup attachment, source authority or member selection differs")
+    with phase('installed.activation_roster'):
+        active = activation_at(connection, at)
+        require(active is not None and {k: active[k] for k in ACTIVE_KEYS} == install["expected_scope"]["active"]
+                and active["build_receipt_sha256"] == build_sha and active["profile_id"] == "integrated_route_v1"
+                and active.get("metadata", {}).get("account_cleanup") == {
+                    "contract": GENERATION, "generation_id": generation["generation_id"],
+                    "selection_sha256": generation["selection_sha256"]}, "Cleanup activation is not the installed generation")
+        snapshot = account_roster.runtime_snapshot(connection, active)
+        if catalog_policy_evidence:
+            # The original snapshot remains historical runtime evidence. Resolve
+            # live identity/locator changes per catalog member, not as a global
+            # failure that would prevent all other accounts from being planned.
+            original = {m["account_identity_id"]: m for m in capsule["eligible_members"]}
+            members = [{**dict(row), "account_id": original.get(row["account_identity_id"], {}).get("account_id")}
+                for row in connection.execute("SELECT * FROM account_roster_members WHERE snapshot_id=?",
+                    (snapshot["id"],))]
+        else:
+            members = account_roster.get_current_members(connection, snapshot["id"])
+        actual = sorted([{"account_identity_id": r["account_identity_id"], "account_id": r["account_id"],
+                          "platform": r["platform"], "uid": r.get("identity_uid") or r.get("uid")} for r in members],
+                        key=lambda r: r["account_identity_id"])
+        require(actual == capsule["eligible_members"],
+                "Cleanup active roster exceeds or changes the approved valid member intersection")
+        # An operator pause narrows live eligibility, not the immutable authorized
+        # identity set. Require its ordinary append-only state event; the per-member
+        # claim and pre-send gates still reject enabled=0 independently.
+        from .account_states import state_events
+        for member in ([] if catalog_policy_evidence else members):
+            if member["enabled"] == 1:
+                continue
+            events = state_events(connection, member["account_identity_id"])
+            latest = events[-1] if events else {}
+            require(member["enabled"] == 0 and latest.get("new_enabled") is False
+                    and latest.get("activation_id") == active["activation_id"]
+                    and parse_time(latest["effective_at"]) <= parse_time(at)
+                    and parse_time(latest["created_at"]) <= parse_time(at),
+                    "Cleanup disabled member lacks its recorded operator pause")
+        source_members = {r["account_identity_id"]: r for r in capsule["source_members"]}
+        # The new policy validates live identity/locator evidence per task. Keep
+        # the original capsule and its frozen roster intact as historical proof.
+        for row in ([] if catalog_policy_evidence else actual):
+            refs = {r[0] for r in connection.execute(
+                "SELECT reference_value FROM account_provider_references WHERE account_identity_id=? AND lower(provider)='tikhub' AND reference_kind='sec_user_id'",
+                (row["account_identity_id"],))}
+            sec = next(iter(refs)) if len(refs) == 1 else ""
+            require(valid_sec(sec) and hashlib.sha256(sec.encode()).hexdigest() == source_members[row["account_identity_id"]]["sec_user_id_sha256"],
+                    "Cleanup account reference changed or is no longer valid")
+    with phase('installed.route_guards'):
+        manifest = forward_recovery._route()
+        require(manifest == generation["transport_manifest"] == capsule["transport_manifest"]
+                and all(json.loads(p["gate"]["evidence_json"])["bindings"]["config_receipt_sha256"] == generation["config_sha256"]
+                        for p in capsule["operations"].values()), "Cleanup transport or approved config changed")
+        guard = forward_recovery._live_guards(connection, at=at, check_capacity=not maintenance_only) if not maintenance_only else {}
+    with phase('installed.proof_materialize'):
+        proof = {"contract": GENERATION, "generation_id": generation["generation_id"],
+                 "selection_sha256": generation["selection_sha256"], "source_authority": generation["source_authority"],
+                 "install_receipt_sha256": install_sha, "active": {k: active[k] for k in ACTIVE_KEYS},
+                 "build_sha256": build_sha, "runtime_sha256": runtime_sha, "config_sha256": generation["config_sha256"],
+                 "transport_manifest": manifest, "actor": generation["actor"], "reason": generation["reason"],
+                 "issued_at": generation["issued_at"]}
+        proof["proof_sha256"] = auth.digest(proof)
+        evidence = {"active": active, "build_sha256": build_sha, "runtime_sha256": runtime_sha,
+                    "config_sha256": generation["config_sha256"], "manifest": manifest,
+                    "migration": migration, "install": install, "storage_policy": guard.get("capacity", {}),
+                    "activation_successor": None, "code_successor": None, "account_cleanup_generation": proof}
+        if classification_proof is not None:
+            evidence["account_classification_successor"] = classification_proof
+        if intake_proof is not None:
+            evidence["account_intake_successor"] = intake_proof
+        if four_platform_flow_proof is not None:
+            evidence["four_platform_flow_successor"] = four_platform_flow_proof
+        if preparation_operation_authority is not None:
+            evidence["preparation_operation_authority"] = preparation_operation_authority
+        if manual_scope_proof is not None:
+            evidence["manual_content_scope_successor"] = manual_scope_proof
+        if metric_gap_proof is not None:
+            evidence["metric_gap_successor"] = metric_gap_proof
+        evidence.update(catalog_policy_evidence)
+        if profile_operation_authority is not None:
+            evidence["profile_operation_authority"] = profile_operation_authority
+        if profile_compensation_authority is not None:
+            evidence["profile_compensation_authority"] = profile_compensation_authority
+        decision = cleanup_decision(evidence)
+        evidence["deployment"] = {"status": "accepted", "contract_version": GENERATION,
+                                  "release_decision": decision, "bindings": {**proof["active"],
+                                      **{k: evidence[k] for k in ("build_sha256", "runtime_sha256", "config_sha256")}}}
     return evidence
 
 

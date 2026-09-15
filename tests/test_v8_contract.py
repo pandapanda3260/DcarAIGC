@@ -12,6 +12,7 @@ from v8.contracts import (
     CURRENT_REPORT_EVIDENCE_VERSION,
     CURRENT_REPORT_RULE_VERSION,
     CURRENT_REPORT_VERSION,
+    FOUR_PLATFORM_REPORT_VERSION,
     LEGACY_CONTRACT_PATHS,
     REPORT_RULE_VERSIONS,
     V8ContractViolation,
@@ -248,7 +249,7 @@ class V8ContractTest(unittest.TestCase):
     def test_contract_registry_is_exact_and_unknown_versions_fail_closed(self) -> None:
         self.assertEqual(
             set(REPORT_RULE_VERSIONS),
-            {CURRENT_REPORT_VERSION, *LEGACY_CONTRACT_PATHS},
+            {CURRENT_REPORT_VERSION, FOUR_PLATFORM_REPORT_VERSION, *LEGACY_CONTRACT_PATHS},
         )
         current = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
         self.assertEqual(load_contract(), current)

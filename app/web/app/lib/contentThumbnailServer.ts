@@ -1,8 +1,13 @@
 import { execFile } from "node:child_process";
+import { stat } from "node:fs/promises";
 import type { ContentThumbnails } from "./contentThumbnails";
+import { BoundedReadCache } from "./boundedReadCache.mjs";
 
 type Reader = (ids: number[]) => Promise<ContentThumbnails>;
-let activeReads = 0;
+const metadataCache = new BoundedReadCache<ContentThumbnails>({
+  ttlMs: 10_000, maxEntries: 16, maxBytes: 8 * 1024 * 1024,
+  concurrency: 1, maxQueued: 4, queueTimeoutMs: 2_000,
+});
 
 // The existing loopback page service reads metadata only. No network fetching,
 // image generation, database writes, media cache, or writer restart is needed.
@@ -11,12 +16,17 @@ export async function readThumbnailMetadata(ids: number[]): Promise<ContentThumb
   const helper = process.env.DCAR_THUMBNAIL_HELPER;
   const db = process.env.DCAR_THUMBNAIL_DB;
   const projectRoot = process.env.DCAR_THUMBNAIL_PROJECT_ROOT;
-  if (!python || !helper || !db || !projectRoot || activeReads >= 1) throw new Error("Thumbnail reader unavailable");
-  activeReads += 1;
-  try {
-    return await new Promise((resolve, reject) => {
-      execFile(python, ["-B", "-I", helper, "--db", db, "--project-root", projectRoot, "--ids", ids.join(",")], {
-        timeout: 8000, maxBuffer: 1024 * 1024, windowsHide: true,
+  if (!python || !helper || !db || !projectRoot) throw new Error("Thumbnail reader unavailable");
+  const file = await stat(db);
+  // Snapshot replacement changes inode; unrelated WAL writes do not evict covers.
+  // Changes inside the same database are bounded by the short ten-second TTL.
+  const normalized = [...new Set(ids)].sort((a, b) => a - b);
+  const key = JSON.stringify([python, helper, projectRoot, db, file.dev, file.ino, normalized]);
+  return metadataCache.get(key, () => new Promise((resolve, reject) => {
+      execFile(python, ["-B", "-I", helper, "--db", db, "--project-root", projectRoot, "--ids", normalized.join(",")], {
+        // Up to 100 items, each with three bounded cover URLs plus the legacy
+        // first URL. Leave room for JSON escaping without truncating a page.
+        timeout: 8000, maxBuffer: 4 * 1024 * 1024, windowsHide: true,
       }, (error, stdout) => {
         if (error) { reject(error); return; }
         try {
@@ -25,8 +35,7 @@ export async function readThumbnailMetadata(ids: number[]): Promise<ContentThumb
           resolve(result);
         } catch (reason) { reject(reason); }
       });
-    });
-  } finally { activeReads -= 1; }
+    }));
 }
 
 export async function thumbnailResponse(request: Request, reader: Reader = readThumbnailMetadata): Promise<Response> {

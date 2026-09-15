@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .runtime_phase_timing import timed
+
 import hashlib
 import json
 import math
@@ -15,7 +17,7 @@ from typing import Any, Callable, Dict, Literal, Mapping, Optional
 from zoneinfo import ZoneInfo
 
 from . import capture_singletons, operation_recovery, paid_drain, raw_archive, usage_settlements
-from .capture_evidence_preflight import evidence_boundary, prepare_installed_evidence
+from .runtime_evidence_context import inheritance_boundary, prepare_inheritance
 from .paid_dispatch import (
     TERMINAL_EVENTS,
     close_dispatch_not_sent_in_transaction,
@@ -73,7 +75,7 @@ BILLING_UNKNOWN_SLOT_MESSAGE = (
 
 
 def _schema20(connection: sqlite3.Connection) -> bool:
-    return connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}
+    return connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21, 22, 23, 24}
 
 
 class CaptureError(RuntimeError):
@@ -207,6 +209,7 @@ class SlotClaim:
     member_assignment_ids: tuple[int, ...] = ()
     compensation_issuance_ids: Mapping[str, int] | None = None
     compensation_proof_sha256: str | None = None
+    intake_request_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -332,24 +335,30 @@ def load_succeeded_raw_response(
     db_path: Path = DEFAULT_DB,
     content_id: Optional[int] = None,
     account_id: Optional[int] = None,
+    intake_request_id: int | None = None,
     operation: Optional[str] = None,
 ) -> StoredRawResponse:
     """Read the newest raw response for a successful slot without any provider call."""
 
-    if (content_id is None) == (account_id is None):
-        raise ValueError("exactly one of content_id and account_id is required")
-    target_column = "content_id" if content_id is not None else "account_id"
-    target_value = content_id if content_id is not None else account_id
+    if sum(value is not None for value in (content_id, account_id, intake_request_id)) != 1:
+        raise ValueError("exactly one of content_id, account_id and intake_request_id is required")
+    target_column = "intake_request_id" if intake_request_id is not None else "content_id" if content_id is not None else "account_id"
+    target_value = intake_request_id if intake_request_id is not None else content_id if content_id is not None else account_id
     operation_clause = " AND pr.operation=?" if operation is not None else ""
     parameters: list[Any] = [target_value, stage, window_key]
     if operation is not None:
         parameters.append(operation)
     with connect(db_path) as connection:
+        if intake_request_id is not None:
+            if connection.execute("PRAGMA user_version").fetchone()[0] not in {22, 23, 24} or stage != "profile_prepare":
+                raise ValueError("intake replay requires schema22 profile_prepare")
+            operation_clause += " AND pr.intake_request_id=fs.intake_request_id AND pr.account_id IS NULL AND pr.content_id IS NULL"
         if _schema20(connection):
             from .capture_compensation import replay_sequence
 
             compensation = replay_sequence(connection, content_id=content_id, account_id=account_id,
-                stage=stage, window_key=window_key, operation=operation)
+                stage=stage, window_key=window_key, operation=operation,
+                **({"intake_request_id": intake_request_id} if intake_request_id is not None else {}))
             if compensation is not None:
                 operation_clause += " AND pr.paid_scope_identity=? AND pr.sequence=?"
                 parameters.extend(compensation)
@@ -491,11 +500,30 @@ def ensure_account_slot(
     return int(cursor.lastrowid)
 
 
+def ensure_intake_slot(connection: sqlite3.Connection, *, intake_request_id: int,
+                       stage: str, window_key: str, provider: str, adapter_version: str) -> int:
+    if connection.execute("PRAGMA user_version").fetchone()[0] not in {22, 23, 24} or stage != "profile_prepare":
+        raise ValueError("intake fetch requires schema22 profile_prepare")
+    if type(intake_request_id) is not int or intake_request_id <= 0:
+        raise ValueError("intake fetch requires a positive intake request id")
+    row = connection.execute("SELECT id FROM fetch_slots WHERE intake_request_id=? AND stage=? AND window_key=?",
+                             (intake_request_id, stage, window_key)).fetchone()
+    if row is not None:
+        return int(row[0])
+    at = now_utc()
+    inserted = connection.execute("""INSERT INTO fetch_slots(intake_request_id,stage,window_key,provider,
+        adapter_version,status,created_at,updated_at) VALUES(?,?,?,?,?,'pending',?,?)""",
+        (intake_request_id, stage, window_key, provider, adapter_version, at, at))
+    assert inserted.lastrowid is not None
+    return int(inserted.lastrowid)
+
+
 def recover_stale_fetch_slots(
     *,
     db_path: Path = DEFAULT_DB,
     stale_after_seconds: int = 600,
     current_time: Optional[datetime] = None,
+    preserve_live_owners: bool = False,
 ) -> Dict[str, int]:
     """Release capture slots abandoned by an interrupted service process."""
     if stale_after_seconds <= 0:
@@ -510,8 +538,20 @@ def recover_stale_fetch_slots(
             SELECT id FROM fetch_slots
             WHERE status='running' AND COALESCE(started_at,updated_at) < ?
             ORDER BY id
+            """ if not preserve_live_owners else """
+            SELECT id FROM fetch_slots
+            WHERE status='running' AND COALESCE(started_at,updated_at) < ?
+              AND NOT EXISTS (
+                SELECT 1 FROM paid_provider_dispatch_events d
+                JOIN scheduler_run_attempts a ON a.id=d.scheduler_attempt_id
+                  AND a.scheduler_run_id=d.scheduler_run_id
+                WHERE d.fetch_slot_id=fetch_slots.id AND a.status='running'
+                  AND a.owner_token IS NOT NULL
+                  AND julianday(a.lease_expires_at)>=julianday(?)
+              )
+            ORDER BY id
             """,
-            (cutoff_at,),
+            (cutoff_at,) if not preserve_live_owners else (cutoff_at, captured_at),
         ).fetchall()
         if rows:
             for row in rows:
@@ -1025,6 +1065,7 @@ def activate_pilot_budget(
         )
 
 
+@timed("admission.reserve_budget")
 def _reserve_budget(
     connection: sqlite3.Connection,
     *,
@@ -1238,18 +1279,27 @@ def _store_raw_response(
     raw_root: Path,
     entity_bytes: bytes | None = None,
     transport_receipt: Mapping[str, Any] | None = None,
+    entity_recovery_key: str | None = None,
 ) -> int:
     captured_at = now_utc()
+    if entity_recovery_key is not None:
+        from .capture_transport_recovery import recovery_storage_identity
+        if entity_bytes is None or transport_receipt is not None:
+            raise RawEvidenceError("recovery requires original entity and separate immutable transport evidence")
+        captured_at = recovery_storage_identity(connection, key=entity_recovery_key, claim=claim, entity_bytes=entity_bytes)
     schema20 = _schema20(connection)
+    if claim.intake_request_id is not None and (connection.execute("PRAGMA user_version").fetchone()[0] not in {22, 23, 24}
+            or claim.content_id is not None or claim.account_id is not None or claim.stage != "profile_prepare"):
+        raise RawEvidenceError("intake raw requires its original schema22 preparation target")
     if claim.request_batch_id is not None:
         attempt = connection.execute("SELECT slot_id,request_batch_id FROM fetch_attempts WHERE id=?", (claim.attempt_id,)).fetchone()
         if not schema20 or attempt is None or tuple(attempt) != (None, claim.request_batch_id):
             raise RawEvidenceError("batch raw requires its exact shared request attempt")
         if claim.singleton_batch:
             capture_singletons.validate_raw_target(connection, batch_id=claim.request_batch_id,
-                content_id=claim.content_id, account_id=claim.account_id)
+                content_id=claim.content_id, account_id=claim.account_id, intake_request_id=claim.intake_request_id)
         else:
-            claim = replace(claim, content_id=None, account_id=None)
+            claim = replace(claim, content_id=None, account_id=None, intake_request_id=None)
     if schema20 and claim.dispatch_scope is not None and (transport_receipt is None or entity_bytes is None):
         raise RawEvidenceError("schema20 paid raw requires actual entity bytes and transport evidence")
     if entity_bytes is None:
@@ -1268,8 +1318,8 @@ def _store_raw_response(
         # Exact transport bytes are still the raw source of truth and are bound
         # to their receipt instead of being compared to that projection.
         if transport_receipt is not None:
-            _validate_complete_transport_receipt(
-                transport_receipt,
+            _validate_usable_content_receipt(
+                transport_receipt, operation=operation,
                 entity_bytes=entity_bytes,
                 http_status=http_status,
             )
@@ -1280,6 +1330,7 @@ def _store_raw_response(
     target = f"batch-{claim.request_batch_id}" if claim.request_batch_id is not None else (
         str(claim.content_id)
         if claim.content_id is not None
+        else f"intake-{claim.intake_request_id}" if claim.intake_request_id is not None
         else f"account-{claim.account_id}"
     )
     is_paid_identity = claim.paid_scope_identity is not None
@@ -1317,7 +1368,7 @@ def _store_raw_response(
             index_path=path.with_name(path.name.removesuffix(".json.zst") + ".response.json"),
             response_identity=response_identity, paid_scope_identity=paid_scope_identity,
             sequence=sequence if is_paid_identity else 0, captured_at=captured_at,
-            transport_receipt=transport_receipt)
+            transport_receipt=transport_receipt, entity_recovery_key=entity_recovery_key)
     receipt = write_zstd_raw_evidence(
         path,
         entity_bytes,
@@ -1402,7 +1453,7 @@ def _store_raw_response(
 def _store_schema20_raw_response(connection: sqlite3.Connection, *, claim: SlotClaim,
         operation: str, entity_bytes: bytes, http_status: int | None, raw_root: Path,
         index_path: Path, response_identity: str, paid_scope_identity: str, sequence: int,
-        captured_at: str, transport_receipt: Mapping[str, Any] | None) -> int:
+        captured_at: str, transport_receipt: Mapping[str, Any] | None, entity_recovery_key: str | None = None) -> int:
     """Store one shared body and an immutable per-response recovery index.
 
     The index does not embed database-generated blob/response IDs: a transaction
@@ -1421,12 +1472,18 @@ def _store_schema20_raw_response(connection: sqlite3.Connection, *, claim: SlotC
         "entity_sha256": hashlib.sha256(entity_bytes).hexdigest(), "entity_size": len(entity_bytes),
         "codec_version": raw_archive.CODEC_VERSION,
         "transport_receipt": dict(transport_receipt) if transport_receipt is not None else None}
+    if entity_recovery_key is not None:
+        identity["entity_recovery_key"] = entity_recovery_key
+    if claim.intake_request_id is not None:
+        identity["intake_request_id"] = claim.intake_request_id
     retained = connection.execute("SELECT * FROM provider_raw_responses WHERE paid_scope_identity=? AND sequence=?",
                                    (paid_scope_identity, sequence)).fetchone()
     if retained is not None:
         for field in ("provider", "operation", "fetch_attempt_id", "account_id", "content_id", "http_status"):
             if retained[field] != identity[field]:
                 raise RawEvidenceError("raw scope already belongs to another response attempt")
+        if (retained["intake_request_id"] if "intake_request_id" in retained.keys() else None) != claim.intake_request_id:
+            raise RawEvidenceError("raw scope already belongs to another intake request")
         if raw_archive.read_response_entity(connection, retained["id"]) != entity_bytes:
             raise RawEvidenceError("raw scope already binds another entity")
         captured_at = str(retained["captured_at"])
@@ -1449,11 +1506,14 @@ def _store_schema20_raw_response(connection: sqlite3.Connection, *, claim: SlotC
              "blob_path": blob["hot_path"], "stored_sha256": blob["stored_sha256"], "stored_size": blob["stored_size"]}
     write_immutable_json_receipt(index_path, index, evidence_root=raw_root)
     if retained is None:
-        inserted = connection.execute("""INSERT INTO provider_raw_responses(fetch_attempt_id,account_id,content_id,
+        intake_column = ",intake_request_id" if claim.intake_request_id is not None else ""
+        intake_placeholder = ",?" if claim.intake_request_id is not None else ""
+        inserted = connection.execute(f"""INSERT INTO provider_raw_responses(fetch_attempt_id,account_id,content_id,
             provider,operation,local_path,sha256,byte_size,http_status,captured_at,source,paid_scope_identity,sequence,
-            raw_blob_id,raw_stored_at) VALUES(?,?,?,?,?,?,?,?,?,?,'live',?,?,?,?)""",
+            raw_blob_id,raw_stored_at{intake_column}) VALUES(?,?,?,?,?,?,?,?,?,?,'live',?,?,?,?{intake_placeholder})""",
             (claim.attempt_id, claim.account_id, claim.content_id, claim.provider, operation, blob["hot_path"],
-             blob["stored_sha256"], blob["stored_size"], http_status, captured_at, paid_scope_identity, sequence, blob_id, stored_at))
+             blob["stored_sha256"], blob["stored_size"], http_status, captured_at, paid_scope_identity, sequence, blob_id, stored_at)
+            + ((claim.intake_request_id,) if claim.intake_request_id is not None else ()))
         if inserted.lastrowid is None:
             raise RawEvidenceError("raw response insert returned no id")
         raw_response_id = int(inserted.lastrowid)
@@ -1487,7 +1547,8 @@ def replay_schema20_response_index(connection: sqlite3.Connection, *, index_path
     index = read_raw_json(index_path)
     if not isinstance(index, dict) or index.get("schema") != "provider-response-index-v1":
         raise RawEvidenceError("unsupported response recovery index")
-    row = connection.execute(f"""SELECT a.id,COALESCE(a.slot_id,s.id) slot_id,a.request_batch_id,a.attempt_number,s.account_id,s.content_id,
+    intake_column = "s.intake_request_id" if connection.execute("PRAGMA user_version").fetchone()[0] in {22, 23, 24} else "NULL intake_request_id"
+    row = connection.execute(f"""SELECT a.id,COALESCE(a.slot_id,s.id) slot_id,a.request_batch_id,a.attempt_number,s.account_id,s.content_id,{intake_column},
         s.stage,s.window_key,s.provider,s.adapter_version FROM fetch_attempts a
         JOIN fetch_slots s ON s.id={capture_singletons.attempt_slot_sql(connection, 'a')}
         WHERE a.id=?""", (index.get("fetch_attempt_id"),)).fetchone()
@@ -1498,12 +1559,12 @@ def replay_schema20_response_index(connection: sqlite3.Connection, *, index_path
             "WHERE x.fetch_attempt_id=? AND x.batch_id=? AND b.operation=? AND b.request_scope_identity=?",
             (attempt['id'], attempt['request_batch_id'], index.get('operation'), index.get('paid_scope_identity'))).fetchone():
             raise RawEvidenceError("batch response index has no exact execution")
-        if index.get('content_id') is not None or index.get('account_id') is not None:
+        if any(index.get(key) is not None for key in ('content_id', 'account_id', 'intake_request_id')):
             capture_singletons.validate_raw_target(connection, batch_id=attempt['request_batch_id'],
-                content_id=index.get('content_id'), account_id=index.get('account_id'))
+                content_id=index.get('content_id'), account_id=index.get('account_id'), intake_request_id=index.get('intake_request_id'))
         else:
-            attempt.update(content_id=None, account_id=None)
-    if attempt is None or any(attempt[key] != index.get(key) for key in ("account_id", "content_id", "provider")):
+            attempt.update(content_id=None, account_id=None, intake_request_id=None)
+    if attempt is None or any(attempt[key] != index.get(key) for key in ("account_id", "content_id", "intake_request_id", "provider")):
         raise RawEvidenceError("response recovery index attempt is missing or changed")
     identity = str(index.get("paid_scope_identity", ""))
     sequence = index.get("sequence")
@@ -1513,7 +1574,8 @@ def replay_schema20_response_index(connection: sqlite3.Connection, *, index_path
     operation = require_path_component(str(index.get("operation", "")), field="operation")
     provider = require_path_component(str(attempt["provider"]).lower(), field="provider")
     target = (f"batch-{attempt['request_batch_id']}" if attempt['request_batch_id'] is not None else
-              str(attempt["content_id"]) if attempt["content_id"] is not None else f"account-{attempt['account_id']}")
+              str(attempt["content_id"]) if attempt["content_id"] is not None else
+              f"intake-{attempt['intake_request_id']}" if attempt['intake_request_id'] is not None else f"account-{attempt['account_id']}")
     expected = raw_root / provider / target / operation / f"scope-{identity}-sequence-{sequence:04d}.response.json"
     if expected != index_path or index.get("codec_version") != raw_archive.CODEC_VERSION:
         raise RawEvidenceError("response recovery index path or codec conflicts")
@@ -1539,11 +1601,11 @@ def replay_schema20_response_index(connection: sqlite3.Connection, *, index_path
             raise RawEvidenceError("response recovery blob is outside the content-addressed root")
         entity = raw_archive._decode_blob({**index, "codec": "zstd"}, raw_archive._read_bytes(blob_path))
     claim = SlotClaim(slot_id=attempt["slot_id"], attempt_id=attempt["id"], attempt_number=attempt["attempt_number"],
-        content_id=attempt["content_id"], account_id=attempt["account_id"], stage=attempt["stage"],
+        content_id=attempt["content_id"], account_id=attempt["account_id"], intake_request_id=attempt["intake_request_id"], stage=attempt["stage"],
         window_key=attempt["window_key"], provider=attempt["provider"], adapter_version=attempt["adapter_version"],
         paid_scope_identity=identity, paid_sequence=sequence, request_batch_id=attempt['request_batch_id'],
         singleton_batch=attempt['request_batch_id'] is not None and
-                        (attempt['content_id'] is not None or attempt['account_id'] is not None))
+                        any(attempt[key] is not None for key in ('content_id', 'account_id', 'intake_request_id')))
     return _store_raw_response(connection, claim=claim, operation=operation, value=json.loads(entity),
         http_status=index.get("http_status"), raw_root=raw_root, entity_bytes=entity,
         transport_receipt=index.get("transport_receipt"))
@@ -1555,6 +1617,27 @@ def _validate_complete_transport_receipt(
     entity_bytes: bytes,
     http_status: Optional[int],
 ) -> None:
+    _validate_transport_receipt(receipt, entity_bytes=entity_bytes, http_status=http_status)
+
+
+def _validate_usable_content_receipt(receipt: Mapping[str, Any], *, operation: str,
+                                   entity_bytes: bytes, http_status: Optional[int]) -> None:
+    _validate_transport_receipt(receipt, entity_bytes=entity_bytes, http_status=http_status,
+                                content_operation=operation)
+
+
+def _validate_transport_receipt(receipt: Mapping[str, Any], *, entity_bytes: bytes,
+                                http_status: Optional[int], content_operation: str | None = None) -> None:
+    _validate_transport_entity_identity(receipt, entity_size=len(entity_bytes),
+        entity_sha256=hashlib.sha256(entity_bytes).hexdigest(), http_status=http_status,
+        content_operation=content_operation)
+
+
+def _validate_transport_entity_identity(receipt: Mapping[str, Any], *, entity_size: int,
+                                       entity_sha256: str, http_status: Optional[int],
+                                       content_operation: str | None = None) -> None:
+    """Check a validated blob's identity without decoding it again in a write transaction."""
+    from .provider_transport import usable_content_entity
     content_encoding = receipt.get("content_encoding")
     content_length = receipt.get("content_length")
     length_match = receipt.get("length_match")
@@ -1569,13 +1652,13 @@ def _validate_complete_transport_receipt(
         and receipt.get("status") == "succeeded"
         and receipt.get("error_code") is None
         and receipt.get("json_parse_ok") is True
-        and receipt.get("clean_eof") is True
+        and (receipt.get("clean_eof") is True or content_operation is not None
+             and usable_content_entity(receipt, content_operation))
         and receipt.get("http_status") == http_status
         and isinstance(http_status, int)
         and not isinstance(http_status, bool)
-        and receipt.get("entity_bytes") == len(entity_bytes)
-        and receipt.get("entity_sha256")
-        == hashlib.sha256(entity_bytes).hexdigest()
+        and receipt.get("entity_bytes") == entity_size
+        and receipt.get("entity_sha256") == entity_sha256
         and content_encoding in {"identity", "gzip"}
         and length_match in {None, True}
         and (content_length is None or length_match is True)
@@ -1584,7 +1667,7 @@ def _validate_complete_transport_receipt(
             if content_encoding == "gzip"
             else receipt.get("gzip_crc_ok") is None
         )
-        and receipt.get("zero_body") is (not entity_bytes)
+        and receipt.get("zero_body") is (not entity_size)
         and all(
             isinstance(receipt.get(field), str)
             and bool(str(receipt.get(field)).strip())
@@ -1911,6 +1994,17 @@ def _validate_batch_members(connection: sqlite3.Connection, *, batch_id: int,
     return results
 
 
+def _intake_request_subject(connection: sqlite3.Connection, *, scope: PaidScope,
+                            request_identity: PaidRequestIdentity, operation: str, at: str) -> str:
+    from .account_preparation import validate_paid_target
+    target = validate_paid_target(connection, scope, at=at, for_payment=True)
+    document = request_identity.document
+    if (target["operation"] != operation or document["request_parameters"] != target["params"]
+            or document["cursor"] is not None or document["request_window"] is not None):
+        raise PaidScopeBlocked("preparation_request_changed", "Paid preparation parameters differ from frozen target")
+    return str(target["subject"])
+
+
 def _claim_paid_tikhub(
     *,
     content_id: Optional[int],
@@ -1925,6 +2019,7 @@ def _claim_paid_tikhub(
     task_id: Optional[str],
     task_max_amount: Optional[float],
     allow_terminal_retry: bool,
+    intake_request_id: int | None = None,
     paid_request_identity: PaidRequestIdentity | None = None,
     request_transport: Mapping[str, Any] | None = None,
     request_batch_id: int | None = None,
@@ -1941,9 +2036,9 @@ def _claim_paid_tikhub(
     diagnostic_binding = current_diagnostic_request_binding()
     if budget_id is None:
         raise BudgetBlocked("TikHub network execution requires a verified budget")
-    with prepare_installed_evidence(db_path, enabled=diagnostic_binding is None), transaction_metrics_context(
+    with prepare_inheritance(db_path, enabled=diagnostic_binding is None), transaction_metrics_context(
         job_id="tikhub_paid_claim", operation=operation
-    ), connect(db_path) as connection, transaction(connection), evidence_boundary(connection):
+    ), connect(db_path) as connection, transaction(connection), inheritance_boundary(connection):
         claimed_at = now_utc()
         if diagnostic_binding is None:
             paid_drain.require_paid_dispatch_open(
@@ -1955,10 +2050,13 @@ def _claim_paid_tikhub(
         if request_transport is not None:
             from .provider_transport import validate_request_transport_binding
             request_transport = validate_request_transport_binding(request_transport)
-        if content_id is None and account_id is None:
-            raise BudgetBlocked("Paid fetch requires an account or content")
-        target_column = "content_id" if content_id is not None else "account_id"
-        target_id = content_id if content_id is not None else account_id
+        if sum(value is not None for value in (content_id, account_id, intake_request_id)) != 1:
+            raise BudgetBlocked("Paid fetch requires exactly one account, content or intake")
+        if intake_request_id is not None and (connection.execute("PRAGMA user_version").fetchone()[0] not in {22, 23, 24}
+                or stage != "profile_prepare" or paid_request_identity is None):
+            raise PaidScopeBlocked("paid_identity_invalid", "Intake requires schema22 preparation and exact paid request identity")
+        target_column = "intake_request_id" if intake_request_id is not None else "content_id" if content_id is not None else "account_id"
+        target_id = intake_request_id if intake_request_id is not None else content_id if content_id is not None else account_id
         row = connection.execute(
             f"SELECT * FROM fetch_slots WHERE {target_column}=? AND stage=? AND window_key=?",
             (target_id, stage, window_key),
@@ -1993,7 +2091,8 @@ def _claim_paid_tikhub(
         )
         try:
             scope = freeze_scope(
-                connection, content_id=content_id, account_id=account_id, stage=stage
+                connection, content_id=content_id, account_id=account_id, stage=stage,
+                **({"intake_request_id": intake_request_id} if intake_request_id is not None else {})
             )
         except PaidScopeBlocked as error:
             if diagnostic_binding is not None:
@@ -2010,6 +2109,9 @@ def _claim_paid_tikhub(
                 raise PaidScopeBlocked("batch_identity_invalid", "Batch request parameters differ")
             _validate_batch_members(connection, batch_id=request_batch_id, identities=member_request_identities,
                 assignments=member_assignment_ids, scope=scope, at=claimed_at, window_key=window_key)
+        elif intake_request_id is not None:
+            expected_subject = _intake_request_subject(connection, scope=scope, request_identity=request_identity,
+                operation=operation, at=claimed_at)
         elif content_id is not None:
             target = connection.execute(
                 "SELECT platform_content_id FROM content_items WHERE id=?",
@@ -2104,16 +2206,26 @@ def _claim_paid_tikhub(
             connection, budget_id=budget_id, provider=provider, operation=operation,
             task_id=task_id, task_max_amount=task_max_amount, dispatch_scope=scope,
         )
+        reservation_row = connection.execute(
+            "SELECT recorded_at,details_json FROM provider_usage WHERE id=?", (usage_id,)
+        ).fetchone()
+        # The reservation TTL starts at the budget ledger's actual reservation,
+        # after claim-time qualification, rather than when transaction A began.
+        reserved_at = str(reservation_row["recorded_at"])
         if request_batch_id is not None:
             connection.execute("""INSERT INTO admission_reservations(batch_id,state,amount_microusd,
                 charge_business_day,created_at,expires_at,updated_at) VALUES(?,'reserved_unsent',?,?,?,?,?)
-                ON CONFLICT(batch_id) DO UPDATE SET state='reserved_unsent',updated_at=excluded.updated_at,
+                ON CONFLICT(batch_id) DO UPDATE SET state='reserved_unsent',created_at=excluded.created_at,updated_at=excluded.updated_at,
+                amount_microusd=excluded.amount_microusd,charge_business_day=excluded.charge_business_day,
                 expires_at=excluded.expires_at WHERE admission_reservations.state='released_unsent'""",
-                (request_batch_id, micro_usd(unit_price), budget_day(claimed_at), claimed_at,
-                 (datetime.fromisoformat(claimed_at.replace('Z','+00:00'))+timedelta(minutes=3)).strftime('%Y-%m-%dT%H:%M:%SZ'), claimed_at))
+                (request_batch_id, micro_usd(unit_price), budget_day(reserved_at), reserved_at,
+                 (datetime.fromisoformat(reserved_at.replace('Z','+00:00'))+timedelta(minutes=3)).strftime('%Y-%m-%dT%H:%M:%SZ'), reserved_at))
             if connection.execute("SELECT state FROM admission_reservations WHERE batch_id=?", (request_batch_id,)).fetchone()[0] != 'reserved_unsent':
                 raise PaidScopeBlocked("batch_identity_invalid", "Batch reservation was already sent")
-        if content_id is not None:
+        if intake_request_id is not None:
+            slot_id = ensure_intake_slot(connection, intake_request_id=intake_request_id, stage=stage,
+                window_key=window_key, provider=provider, adapter_version=adapter_version)
+        elif content_id is not None:
             slot_id = ensure_content_slot(
                 connection, content_id=content_id, stage=stage, window_key=window_key,
                 provider=provider, adapter_version=adapter_version,
@@ -2124,9 +2236,7 @@ def _claim_paid_tikhub(
                 connection, account_id=account_id, stage=stage, window_key=window_key,
                 provider=provider, adapter_version=adapter_version,
             )
-        metadata = json.loads(connection.execute(
-            "SELECT details_json FROM provider_usage WHERE id=?", (usage_id,)
-        ).fetchone()[0])
+        metadata = json.loads(reservation_row["details_json"])
         attempt_number = int(row["attempt_count"]) + 1 if row is not None else 1
         metadata.update(
             slot_id=slot_id,
@@ -2220,6 +2330,7 @@ def _claim_paid_tikhub(
             provider=provider,
             adapter_version=adapter_version,
             account_id=account_id,
+            intake_request_id=intake_request_id,
             dispatch_scope=scope,
             reserved_usage_id=usage_id,
             reserved_unit_price=unit_price,
@@ -2250,10 +2361,14 @@ def _paid_slot_owner(
         except PaidScopeBlocked:
             return False
     row = connection.execute(
-        "SELECT status,attempt_count FROM fetch_slots WHERE id=?", (claim.slot_id,)
+        "SELECT * FROM fetch_slots WHERE id=?", (claim.slot_id,)
     ).fetchone()
     expected = claim.attempt_number if claim.attempt_id else claim.attempt_number - 1
     if row is None or row["status"] != "running" or row["attempt_count"] != expected:
+        return False
+    if claim.intake_request_id is not None and ("intake_request_id" not in row.keys()
+            or row["intake_request_id"] != claim.intake_request_id or row["stage"] != "profile_prepare"
+            or row["account_id"] is not None or row["content_id"] is not None):
         return False
     usage = connection.execute(
         """SELECT provider,request_attempts,billed_requests,currency,amount,details_json
@@ -2291,12 +2406,12 @@ def _mark_paid_sent(
 ) -> SlotClaim:
     try:
         scope = claim.dispatch_scope
-        with prepare_installed_evidence(db_path, enabled=claim.diagnostic_binding is None), transaction_metrics_context(
+        with prepare_inheritance(db_path, enabled=claim.diagnostic_binding is None), transaction_metrics_context(
             job_id="tikhub_paid_send",
             scheduler_run_id=(scope.scheduler_run_id if scope else None),
             attempt_id=(scope.scheduler_attempt_id if scope else None),
             operation=operation,
-        ), connect(db_path) as connection, transaction(connection), evidence_boundary(connection):
+        ), connect(db_path) as connection, transaction(connection, priority="send"), inheritance_boundary(connection):
             sent_at = now_utc()
             diagnostic_dispatch = None
             if claim.diagnostic_binding is None:
@@ -2401,6 +2516,7 @@ def _mark_paid_sent(
             scope = freeze_scope(
                 connection, content_id=claim.content_id, account_id=claim.account_id,
                 stage=claim.stage, scope=claim.dispatch_scope,
+                **({"intake_request_id": claim.intake_request_id} if claim.intake_request_id is not None else {})
             )
             if scope.business_day is not None and budget_day(sent_at) != scope.business_day:
                 raise PaidScopeBlocked(
@@ -2474,7 +2590,7 @@ def _mark_paid_sent(
                         scope=scope, at=sent_at, window_key=claim.window_key, singleton=claim.singleton_batch)
                     admitted = connection.execute("SELECT * FROM admission_reservations WHERE batch_id=?",
                                                   (claim.request_batch_id,)).fetchone()
-                    if (admitted is None or admitted['state'] != 'reserved_unsent' or admitted['expires_at'] <= sent_at
+                    if (admitted is None or admitted['state'] != 'reserved_unsent'
                             or admitted['amount_microusd'] != micro_usd(claim.reserved_unit_price)
                             or admitted['charge_business_day'] != budget_day(sent_at)):
                         raise PaidSendClaimHeld("batch reservation expired or changed")
@@ -2489,7 +2605,10 @@ def _mark_paid_sent(
                 if (request_identity is None or request_identity.scope_identity != claim.paid_scope_identity
                         or request_identity.sequence != claim.paid_sequence
                         or metadata.get("paid_identity") != request_identity.document
-                        or metadata.get("paid_scope_identity") != claim.paid_scope_identity):
+                        or metadata.get("paid_scope_identity") != claim.paid_scope_identity
+                        or type(metadata.get("paid_sequence")) is not int
+                        or metadata["paid_sequence"] != claim.paid_sequence
+                        or metadata.get("paid_execution_identity") != claim.paid_execution_identity):
                     raise PaidSendClaimHeld("schema20 reserved request identity changed before send")
                 try:
                     usage_settlements.require_scope_available(connection,
@@ -2499,6 +2618,11 @@ def _mark_paid_sent(
                             identity=member_hash, sequence=claim.paid_sequence)
                 except usage_settlements.SettlementError as error:
                     raise PaidSendClaimHeld(str(error)) from error
+                if claim.request_batch_id is not None and admitted['expires_at'] <= sent_at:
+                    # All identity, quote, authority and paid-scope checks have
+                    # passed. No send marker/attempt/claim exists yet; cleanup
+                    # must prove zero sends before reopening this original slot.
+                    raise PaidScopeBlocked("batch_reservation_expired", "batch reservation expired before send")
             operation_recovery.require_operation_lock(connection, operation=operation)
             if claim.diagnostic_binding is None:
                 from .capture_manual import permits_transport_retry
@@ -3384,6 +3508,34 @@ def execute_account_fetch(
         task_id=task_id,
         task_max_amount=task_max_amount,
     )
+
+
+def execute_intake_fetch(
+    *, intake_request_id: int, window_key: str, provider: str, adapter_version: str,
+    operation: str, call: Callable[[], ProviderResult],
+    paid_request_identity: PaidRequestIdentity, request_transport: Mapping[str, Any],
+    stage: str = "profile_prepare", db_path: Path = DEFAULT_DB, raw_root: Optional[Path] = None,
+    budget_id: Optional[str] = None, task_id: Optional[str] = None,
+    task_max_amount: Optional[float] = None, allow_terminal_retry: bool = False,
+) -> CaptureOutcome:
+    """Execute one preparation request with the existing paid send protections."""
+    if stage != "profile_prepare":
+        raise BudgetBlocked("Intake execution only permits the preparation stage")
+    if provider.lower() != "tikhub":
+        raise BudgetBlocked("Intake preparation requires the registered TikHub adapter")
+    _validate_task_budget(budget_id=budget_id, task_id=task_id, task_max_amount=task_max_amount,
+                          provider=provider, operation=operation)
+    with paid_dispatch_owner(job_id="paid_capture_direct", identity={
+        "provider": provider.lower(), "operation": operation, "intake_request_id": intake_request_id,
+        "stage": "profile_prepare", "window_key": window_key, "purpose": "reconcile",
+    }, db_path=db_path, at=now_utc()):
+        claim = _claim_paid_tikhub(content_id=None, account_id=None, intake_request_id=intake_request_id,
+            stage="profile_prepare", window_key=window_key, provider=provider, adapter_version=adapter_version,
+            operation=operation, db_path=db_path, budget_id=budget_id, task_id=task_id,
+            task_max_amount=task_max_amount, allow_terminal_retry=allow_terminal_retry,
+            paid_request_identity=paid_request_identity, request_transport=request_transport)
+        return _execute_claimed_fetch(claim=claim, operation=operation, call=call, db_path=db_path,
+            raw_root=raw_root, budget_id=budget_id, task_id=task_id, task_max_amount=task_max_amount)
 
 
 def execute_derived_content_fetch(

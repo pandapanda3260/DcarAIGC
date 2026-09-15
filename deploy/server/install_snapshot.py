@@ -46,6 +46,12 @@ EXPECTED_DATABASE_SCHEMA_VERSION = 19
 EXPECTED_DATABASE_SCHEMA_MIGRATION = "dual-acquisition-profile-roster-v1"
 CLASSIFICATION_SCHEMA_VERSION = 21
 CLASSIFICATION_SCHEMA_MIGRATION = "account-classification-v1"
+INTAKE_SCHEMA_VERSION = 22
+INTAKE_SCHEMA_MIGRATION = "unified-account-intake-v1"
+FLOW_SCHEMA_VERSION = 23
+FLOW_SCHEMA_MIGRATION = "four-platform-forward-flow-v1"
+DUPLICATE_SCHEMA_VERSION = 24
+DUPLICATE_SCHEMA_MIGRATION = "duplicate-fingerprint-index-v1"
 EXPECTED_ACTIVE_RELEASE_ID = "evaluation-v9__selling-points-v5.2"
 EXPECTED_ACTIVE_RELEASE_STATUS = "active"
 EXPECTED_RULE_VERSION = "evaluation-v9"
@@ -78,8 +84,14 @@ INTEGRATED_SCHEMA_TRANSITION_CONTRACT = "dcar-schema19-to20-server-transition-v1
 INTEGRATED_SCHEMA_SEAL_CONTRACT = "dcar-schema19-to20-release-seal-v1"
 CLASSIFICATION_SCHEMA_TRANSITION_CONTRACT = "dcar-schema20-to21-server-transition-v1"
 CLASSIFICATION_SCHEMA_SEAL_CONTRACT = "dcar-schema20-to21-release-seal-v1"
-SUPPORTED_SCHEMA_VERSIONS = frozenset({17, 18, 19, 20, 21})
-SUPPORTED_SCHEMA_TRANSITIONS = frozenset({(17, 18), (18, 19), (19, 20), (20, 21)})
+INTAKE_SCHEMA_TRANSITION_CONTRACT = "dcar-schema21-to22-server-transition-v1"
+INTAKE_SCHEMA_SEAL_CONTRACT = "dcar-schema21-to22-release-seal-v1"
+FLOW_SCHEMA_TRANSITION_CONTRACT = "dcar-schema22-to23-server-transition-v1"
+FLOW_SCHEMA_SEAL_CONTRACT = "dcar-schema22-to23-release-seal-v1"
+DUPLICATE_SCHEMA_TRANSITION_CONTRACT = "dcar-schema23-to24-server-transition-v1"
+DUPLICATE_SCHEMA_SEAL_CONTRACT = "dcar-schema23-to24-release-seal-v1"
+SUPPORTED_SCHEMA_VERSIONS = frozenset({17, 18, 19, 20, 21, 22, 23, 24})
+SUPPORTED_SCHEMA_TRANSITIONS = frozenset({(17, 18), (18, 19), (19, 20), (20, 21), (21, 22), (22, 23), (23, 24)})
 RELEASE_CONTRACTS = {
     17: ("dcar-content-operations-report-v8.7", "optional-account-phone"),
     18: ("dcar-content-operations-report-v8.8", "matrix-roster-source-routing"),
@@ -89,12 +101,18 @@ RELEASE_CONTRACTS = {
     ),
     20: ("dcar-content-operations-report-v8.9", "integrated-video-capture-v25"),
     21: ("dcar-content-operations-report-v8.9", "account-classification-v1"),
+    22: ("dcar-content-operations-report-v8.9", "unified-account-intake-v1"),
+    23: ("dcar-content-operations-report-v8.9", "four-platform-forward-flow-v1"),
+    24: ("dcar-content-operations-report-v8.9", "duplicate-fingerprint-index-v1"),
 }
 TRANSITION_CONTRACTS = {
     (17, 18): (LEGACY_SCHEMA_TRANSITION_CONTRACT, LEGACY_SCHEMA_SEAL_CONTRACT),
     (18, 19): (SCHEMA_TRANSITION_CONTRACT, SCHEMA_SEAL_CONTRACT),
     (19, 20): (INTEGRATED_SCHEMA_TRANSITION_CONTRACT, INTEGRATED_SCHEMA_SEAL_CONTRACT),
     (20, 21): (CLASSIFICATION_SCHEMA_TRANSITION_CONTRACT, CLASSIFICATION_SCHEMA_SEAL_CONTRACT),
+    (21, 22): (INTAKE_SCHEMA_TRANSITION_CONTRACT, INTAKE_SCHEMA_SEAL_CONTRACT),
+    (22, 23): (FLOW_SCHEMA_TRANSITION_CONTRACT, FLOW_SCHEMA_SEAL_CONTRACT),
+    (23, 24): (DUPLICATE_SCHEMA_TRANSITION_CONTRACT, DUPLICATE_SCHEMA_SEAL_CONTRACT),
 }
 SCHEMA_SERVICES = ("dcar-auth.service", "dcar-douyin-control.service", "dcar-web.service", "dcar-api.service")
 SETTLED_TRANSITIONS = frozenset({"succeeded", "rolled_back"})
@@ -171,7 +189,7 @@ def _transition_contract(
         return TRANSITION_CONTRACTS[(from_schema, to_schema)]
     except KeyError as exc:
         raise SnapshotInstallError(
-            "schema-upgrade supports only sealed 17-to-18, 18-to-19, 19-to-20 or 20-to-21"
+            "schema-upgrade supports only sealed 17-to-18, 18-to-19, 19-to-20, 20-to-21 or 21-to-22"
         ) from exc
 
 
@@ -281,6 +299,7 @@ def _strict_schema(path: Path, version: int) -> None:
     connection.row_factory = sqlite3.Row
     try:
         connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA recursive_triggers=ON")
         if version == 17:
             storage._validate_v17_structure(connection)
         elif version == 18:
@@ -293,6 +312,14 @@ def _strict_schema(path: Path, version: int) -> None:
         elif version == 21:
             from v8.schema_v21 import validate_structure
             validate_structure(connection)
+        elif version == 22:
+            from v8.schema_v22 import migration_proof
+            from v8.account_intake_release import inherited_classification_proof
+            migration_proof(connection)
+            inherited_classification_proof(connection)
+        elif version in {23, 24}:
+            from v8.snapshot_schema_successor import migration_chain
+            migration_chain(connection)
         else:
             raise SnapshotInstallError("unsupported schema transition version")
     except (ValueError, RuntimeError, sqlite3.Error) as exc:
@@ -392,23 +419,26 @@ def _literal(path: Path, name: str) -> Any:
 
 def _verify_release_contract(release: Path, version: int) -> None:
     expected_report, expected_migration = _release_contract(version)
-    # Schema20/21 are deliberately explicit; bootstrap remains19. Verify its real
+    # Later schemas are deliberately explicit; bootstrap remains19. Verify their
     # migration/read-support closure instead of changing global fixture defaults.
-    bootstrap = 19 if version in {20, 21} else version
+    bootstrap = 19 if version in {20, 21, 22, 23, 24} else version
     checks: tuple[tuple[str, str, Any], ...] = (("src/dcar_eval/v8/storage.py", "SCHEMA_VERSION", bootstrap),
               ("src/dcar_eval/v8/storage.py", "CURRENT_SCHEMA_MIGRATION_NAME", _release_contract(bootstrap)[1]),
               ("src/dcar_eval/v8/contracts.py", "CURRENT_REPORT_VERSION", expected_report))
-    if version in {20, 21}:
+    if version in {20, 21, 22, 23, 24}:
         schema_module = f"src/dcar_eval/v8/schema_v{version}.py"
-        checks += (("src/dcar_eval/v8/storage.py", "LATEST_SCHEMA_VERSION", version),
-                   (schema_module, "SCHEMA_VERSION", version),
+        latest = _literal(release / "src/dcar_eval/v8/storage.py", "LATEST_SCHEMA_VERSION")
+        if latest not in SUPPORTED_SCHEMA_VERSIONS or latest < version:
+            raise SnapshotInstallError(f"sealed release does not explicitly support schema{version} reads")
+        checks += ((schema_module, "SCHEMA_VERSION", version),
                    (schema_module, "MIGRATION_NAME", expected_migration))
         migrations = _literal(release / "src/dcar_eval/v8/storage.py", "SCHEMA_MIGRATION_NAMES")
         if not isinstance(migrations, dict) or migrations.get(version) != expected_migration:
             raise SnapshotInstallError(f"sealed release does not explicitly support schema{version} reads")
         definitions = {node.name for node in ast.parse((release / schema_module).read_text()).body
                        if isinstance(node, ast.FunctionDef)}
-        if not {"migrate", "validate_structure", "validate_lineage"} <= definitions:
+        required_definitions = {"migrate", "validate_structure", "migration_proof"} if version in {23, 24} else {"migrate", "validate_structure", "validate_lineage"}
+        if not required_definitions <= definitions:
             raise SnapshotInstallError(f"sealed release has no complete schema{version} migration contract")
         if version == 21:
             if migrations.get(20) != RELEASE_CONTRACTS[20][1]:
@@ -421,6 +451,35 @@ def _verify_release_contract(release: Path, version: int) -> None:
             ))
             checks += (("deploy/server/install_snapshot.py", "CLASSIFICATION_SCHEMA_TRANSITION_CONTRACT", CLASSIFICATION_SCHEMA_TRANSITION_CONTRACT),
                        ("deploy/server/install_snapshot.py", "CLASSIFICATION_SCHEMA_SEAL_CONTRACT", CLASSIFICATION_SCHEMA_SEAL_CONTRACT))
+        if version == 22:
+            if any(migrations.get(parent) != RELEASE_CONTRACTS[parent][1] for parent in (20,21)):
+                raise SnapshotInstallError("schema22 release lost its migration parent contracts")
+            if "migration_proof" not in definitions:
+                raise SnapshotInstallError("sealed release has no schema22 immutable migration proof")
+            inherited = ast.parse((release / "src/dcar_eval/v8/account_intake_release.py").read_text())
+            if "inherited_classification_proof" not in {node.name for node in inherited.body if isinstance(node,ast.FunctionDef)}:
+                raise SnapshotInstallError("sealed release has no schema22 classification inheritance proof")
+            checks += tuple((name,constant,expected) for name in (
+                "deploy/server/install_snapshot.py", "deploy/macos/publish_snapshot.py", "scripts/build_server_snapshot.py"
+            ) for constant,expected in (("INTAKE_SCHEMA_VERSION",22),("INTAKE_SCHEMA_MIGRATION",expected_migration),
+                                       ("EXPECTED_REPORT_VERSION",expected_report)))
+            checks += (("deploy/server/install_snapshot.py","INTAKE_SCHEMA_TRANSITION_CONTRACT",INTAKE_SCHEMA_TRANSITION_CONTRACT),
+                       ("deploy/server/install_snapshot.py","INTAKE_SCHEMA_SEAL_CONTRACT",INTAKE_SCHEMA_SEAL_CONTRACT))
+        if version in {23, 24}:
+            if any(migrations.get(parent) != RELEASE_CONTRACTS[parent][1] for parent in range(20, version)):
+                raise SnapshotInstallError("sealed successor lost its historical schema contract")
+            helper = release / "src/dcar_eval/v8/snapshot_schema_successor.py"
+            helper_defs = {node.name for node in ast.parse(helper.read_text()).body if isinstance(node, ast.FunctionDef)}
+            if not {"migration_chain", "publication_evidence", "verify_publication", "installed_source_release", "validate_source_release"} <= helper_defs:
+                raise SnapshotInstallError("sealed successor has no complete portable inheritance verifier")
+            prefix = "FLOW" if version == 23 else "DUPLICATE"
+            checks += tuple((name, constant, expected) for name in (
+                "deploy/server/install_snapshot.py", "deploy/macos/publish_snapshot.py", "scripts/build_server_snapshot.py")
+                for constant, expected in ((prefix + "_SCHEMA_VERSION", version),
+                    (prefix + "_SCHEMA_MIGRATION", expected_migration), ("EXPECTED_REPORT_VERSION", expected_report)))
+            transition, seal = TRANSITION_CONTRACTS[(version - 1, version)]
+            checks += (("deploy/server/install_snapshot.py", prefix + "_SCHEMA_TRANSITION_CONTRACT", transition),
+                ("deploy/server/install_snapshot.py", prefix + "_SCHEMA_SEAL_CONTRACT", seal))
     if version in {18, 19}:
         checks += tuple((name, constant, expected) for name in (
             "deploy/server/install_snapshot.py", "deploy/macos/publish_snapshot.py", "scripts/build_server_snapshot.py"
@@ -920,7 +979,7 @@ def verify_bundle(
                 raise SnapshotInstallError(
                     "snapshot database runtime identity does not match the manifest"
                 )
-            if expected_schema in {20, 21}:
+            if expected_schema in {20, 21, 22, 23, 24}:
                 _strict_schema(source, expected_schema)
                 _verify_schema20_deployment(source, manifest, bundle=bundle)
     if "dcar_insight.sqlite3" not in seen_names:
@@ -1100,6 +1159,53 @@ def _verify_portable_release_decision(connection: sqlite3.Connection, proof: Map
             raise ValueError("portable decision installed reference differs")
 
 
+def _verify_schema22_publication(connection: sqlite3.Connection, proof: Mapping[str, Any],
+                                 source_receipt: Mapping[str, Any] | None) -> None:
+    """Recompute the exact portable intake snapshot, preserving schema21 lineage."""
+    from v8.capture_authorizations import digest
+    version = connection.execute("PRAGMA user_version").fetchone()[0]
+    if version in {23, 24}:
+        from v8.snapshot_schema_successor import migration_chain
+        chain = migration_chain(connection)
+        current, inherited = chain["account_intake_migration"], chain["account_classification_migration"]
+    else:
+        from v8.schema_v22 import migration_proof
+        from v8.account_intake_release import inherited_classification_proof
+        current = migration_proof(connection)
+        inherited = inherited_classification_proof(connection)
+    if (proof.get("schema_version") != version or proof.get("schema_migration") != RELEASE_CONTRACTS[version][1]
+            or digest(proof.get("account_intake_migration")) != digest(current)
+            or digest(proof.get("account_classification_migration")) != digest(inherited)
+            or current["source_schema_sha256"] != inherited["target_schema_sha256"]):
+        raise ValueError("schema22 portable migration and inheritance proof differ")
+    if not isinstance(source_receipt,dict):
+        raise ValueError("schema22 requires a sealed snapshot source receipt")
+    formal = source_receipt.get("formal_database",{})
+    if (not isinstance(formal,dict) or formal.get("access_mode") != "formal_read"
+            or not isinstance(formal.get("sha256"),str) or SHA256_RE.fullmatch(formal["sha256"]) is None):
+        raise ValueError("schema22 original source database hash is missing")
+    publication = source_receipt.get("publication_evidence",{})
+    labels = [dict(row) for row in connection.execute(
+        "SELECT id,account_id,account_group,business_direction FROM account_directory_rows ORDER BY id")]
+    expected_classification = {"contract_version":"account-classification-publication-v1", "schema_version":21,
+        "schema_migration":CLASSIFICATION_SCHEMA_MIGRATION, "migration_receipt_sha256":inherited["receipt_sha256"],
+        "row_count":len(labels), "unlinked_row_count":sum(row["account_id"] is None for row in labels),
+        "rows_sha256":digest(labels)}
+    requests = [tuple(row) for row in connection.execute("SELECT * FROM account_intake_requests ORDER BY id")]
+    references = [tuple(row) for row in connection.execute(
+        "SELECT * FROM account_provider_references ORDER BY account_identity_id,provider,reference_kind")]
+    expected_intake = {"contract_version":"account-intake-publication-v1", "schema_version":22,
+        "schema_migration":INTAKE_SCHEMA_MIGRATION, "migration_receipt_sha256":current["receipt_sha256"],
+        "source_schema_sha256":current["source_schema_sha256"], "target_schema_sha256":current["target_schema_sha256"],
+        "inherited_classification_receipt_sha256":inherited["receipt_sha256"],
+        "request_count":len(requests), "completed_request_count":connection.execute(
+            "SELECT count(*) FROM account_intake_requests WHERE completed_at IS NOT NULL").fetchone()[0],
+        "requests_sha256":digest(requests), "reference_count":len(references), "references_sha256":digest(references)}
+    if (not isinstance(publication,dict) or digest(publication.get("account_classification")) != digest(expected_classification)
+            or digest(publication.get("account_intake")) != digest(expected_intake)):
+        raise ValueError("schema22 publication no longer matches the frozen snapshot rows")
+
+
 def _verify_schema20_deployment(database: Path, manifest: Mapping[str, Any], *, bundle: Path) -> None:
     """Bind portable Writer proof to snapshot rows; never grant paid authority.
 
@@ -1113,13 +1219,15 @@ def _verify_schema20_deployment(database: Path, manifest: Mapping[str, Any], *, 
     connection.row_factory = sqlite3.Row
     try:
         connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA recursive_triggers=ON")
         connection.execute("PRAGMA query_only=ON")
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-        if version not in {20, 21}:
-            raise ValueError("portable deployment proof requires schema20 or schema21")
+        if version not in {20, 21, 22, 23, 24}:
+            raise ValueError("portable deployment proof requires schema20, schema21, schema22, schema23 or schema24")
         from v8.account_cleanup_snapshot import CONTRACT as CLEANUP_CONTRACT, validate as validate_cleanup
         if proof.get("contract_version") == CLEANUP_CONTRACT:
-            checked = validate_cleanup(connection, deployment_id=proof.get("deployment_id"), verify_files=False)
+            checked = validate_cleanup(connection, deployment_id=proof.get("deployment_id"), verify_files=False,
+                source_release=proof.get("snapshot_source_release"))
             if version == 21 and (proof.get("schema_version") != 21
                     or proof.get("schema_migration") != CLASSIFICATION_SCHEMA_MIGRATION
                     or not isinstance(proof.get("account_classification_migration"), dict)):
@@ -1134,10 +1242,19 @@ def _verify_schema20_deployment(database: Path, manifest: Mapping[str, Any], *, 
                 source_receipt = _read_object(receipt_path)
                 if source_receipt.get("manifest_sha256") != _sha256(bundle / "manifest.json"):
                     raise ValueError("snapshot source receipt manifest differs")
+            if version in {22, 23, 24}:
+                _verify_schema22_publication(connection,proof,source_receipt)
+                if source_receipt.get("snapshot_contract") != manifest.get("snapshot_contract"):
+                    raise ValueError("schema22 source snapshot contract differs")
+            if version in {23, 24}:
+                from v8.snapshot_schema_successor import verify_publication
+                verify_publication(connection, proof, source_receipt)
+                if source_receipt.get("publication_evidence", {}).get("snapshot_source_release") != proof.get("snapshot_source_release"):
+                    raise ValueError("snapshot source installed successor differs")
             _verify_schema20_activation(connection, proof, manifest, source_receipt=source_receipt)
             return
-        if version == 21:
-            raise ValueError("schema21 requires inherited cleanup proof")
+        if version in {21,22,23,24}:
+            raise ValueError("schema21/22 require inherited cleanup proof")
         row = connection.execute("SELECT * FROM deployment_readiness_receipts WHERE deployment_id=?",
                                  (proof.get("deployment_id"),)).fetchone()
         if row is None:
@@ -2130,7 +2247,7 @@ def install_bundle(
                 f"normal install requires an existing schema{expected_schema} database"
             )
         _database_runtime_identity(active, expected_schema=expected_schema)
-        if expected_schema in {20, 21}:
+        if expected_schema in {20, 21, 22, 23, 24}:
             _verify_release_contract(_current_release(config), expected_schema)
             _strict_schema(active, expected_schema)
         return _install_bundle_locked(bundle, config, service_action=service_action, smoke_check=smoke_check,
@@ -2750,6 +2867,9 @@ def schema_upgrade(
     predecessor_pair, predecessor_contract = (
         ((16, 17), PREDECESSOR_SCHEMA_TRANSITION_CONTRACT)
         if (from_schema, to_schema) == (17, 18)
+        else ((22, 23), FLOW_SCHEMA_TRANSITION_CONTRACT) if (from_schema, to_schema) == (23, 24)
+        else ((21, 22), INTAKE_SCHEMA_TRANSITION_CONTRACT) if (from_schema, to_schema) == (22, 23)
+        else ((20, 21), CLASSIFICATION_SCHEMA_TRANSITION_CONTRACT) if (from_schema, to_schema) == (21, 22)
         else ((19, 20), INTEGRATED_SCHEMA_TRANSITION_CONTRACT) if (from_schema, to_schema) == (20, 21)
         else ((18, 19), SCHEMA_TRANSITION_CONTRACT) if (from_schema, to_schema) == (19, 20)
         else ((17, 18), LEGACY_SCHEMA_TRANSITION_CONTRACT)
@@ -3135,7 +3255,7 @@ def rollback_snapshot(
         # Only the sealed transition owns paired cross-version recovery.
         _database_runtime_identity(config.database_root / "dcar_insight.sqlite3", expected_schema=expected_schema)
         _database_runtime_identity(source / "dcar_insight.sqlite3", expected_schema=expected_schema)
-        if expected_schema in {20, 21}:
+        if expected_schema in {20, 21, 22, 23, 24}:
             _verify_release_contract(_current_release(config), expected_schema)
             _strict_schema(source / "dcar_insight.sqlite3", expected_schema)
         if snapshot_id is None:
@@ -3275,7 +3395,7 @@ def _parser() -> argparse.ArgumentParser:
     rollback.add_argument("--snapshot-id")
     _common_arguments(rollback)
     for explicit in (verify, install, rollback):
-        explicit.add_argument("--expected-schema", type=int, choices=(19, 20, 21), default=19)
+        explicit.add_argument("--expected-schema", type=int, choices=(19, 20, 21, 22, 23, 24), default=19)
     prune = commands.add_parser(
         "prune", help="Prune inactive snapshot staging and rollback history."
     )

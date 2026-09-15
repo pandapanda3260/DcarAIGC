@@ -36,6 +36,20 @@ COHORT_CONTRACT = "capture-operation-cohort-v1"
 CONTINUITY_OPERATIONS = frozenset({"douyin_user_posts", "xiaohongshu_user_posts",
     "douyin_video_detail", "douyin_video_statistics", "douyin_video_comments",
     "xiaohongshu_note_detail", "xiaohongshu_note_statistics", "xiaohongshu_note_comments"})
+# New platforms have no legacy cohort to inherit. They may only maintain an
+# explicitly installed operator release for these exact operations.
+NEW_PLATFORM_OPERATIONS = frozenset(
+    platform + suffix for platform in ("kuaishou", "wechat_channels")
+    for suffix in ("_user_profile", "_user_posts", "_video_detail", "_video_statistics")
+) | frozenset({"wechat_channels_video_comments"})
+# Preparation profiles also need renewal after their first explicit release.
+# They have no legacy cohort authority and must never enter that fallback.
+PREPARATION_OPERATIONS = frozenset({
+    "douyin_uid_profile", "douyin_sec_profile", "douyin_display_profile",
+    "xiaohongshu_user_profile", "xiaohongshu_user_search",
+    "kuaishou_user_profile", "wechat_channels_resolve",
+    "wechat_channels_channel_info", "wechat_channels_user_profile",
+})
 _PERMIT_KEYS = ("provider", "operation", "qualification_sha256", "build_sha256", "config_sha256",
                 "start_high_watermark", "max_starts", "expires_at", "created_at", "payload_json")
 
@@ -99,15 +113,6 @@ def _release_tools() -> Any:
 
 def _installed_evidence(connection: sqlite3.Connection, *, at: str,
                         maintenance_only: bool = False) -> dict[str, Any]:
-    from .capture_evidence_preflight import installed_evidence
-    prepared = installed_evidence(connection, at=at, maintenance_only=maintenance_only)
-    if prepared is not None:
-        return prepared
-    return _installed_evidence_uncached(connection, at=at, maintenance_only=maintenance_only)
-
-
-def _installed_evidence_uncached(connection: sqlite3.Connection, *, at: str,
-                                 maintenance_only: bool = False) -> dict[str, Any]:
     if os.environ.get("DCAR_ACCOUNT_CLEANUP_INSTALL_RECEIPT"):
         from .account_cleanup_runtime import installed_evidence
         return installed_evidence(connection, at=at, maintenance_only=maintenance_only)
@@ -249,7 +254,7 @@ def _source_samples(connection: sqlite3.Connection, *, operation: str, high_wate
         raw = connection.execute("SELECT * FROM provider_raw_responses WHERE id=?", (terminal.raw_response_id,)).fetchone()
         _require(raw is not None and raw["fetch_attempt_id"] == sent.fetch_attempt_id
                  and raw["operation"] == operation and raw["provider"].lower() == "tikhub", "Source raw lineage differs")
-        if connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}:
+        if connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21, 22, 23}:
             entity = raw_archive.read_response_entity(connection, raw["id"])
         else:
             path = Path(raw["local_path"])
@@ -270,7 +275,7 @@ def freeze_operation_cohort(connection: sqlite3.Connection, *, operation: str, a
     _require(connection.in_transaction, "Cohort freeze requires a writer transaction")
     require_current_process_writer_lock(connection)
     version = connection.execute("PRAGMA user_version").fetchone()[0]
-    if version in {20, 21}:
+    if version in {20, 21, 22, 23}:
         return _freeze_native_cohort(connection, operation=operation, at=at,
             mirror_root=mirror_root, after_qualification_id=after_qualification_id)
     _require(version == 19 and operation in provider_budget.PRICES_MICROUSD,
@@ -1001,6 +1006,13 @@ def renew_operation_gate(connection: sqlite3.Connection, *, operation: str, at: 
     """Renew from the latest verified native batch; repeated calls cannot extend TTL."""
     _require(connection.in_transaction, "Gate renewal requires a writer transaction")
     evidence = _installed_evidence(connection, at=at)
+    from .capture_operator_release import authority, maintain
+    if authority(connection, evidence=evidence, operation=operation, at=at) is not None:
+        latest = connection.execute("SELECT * FROM capture_paid_send_gate_events WHERE provider='tikhub' AND operation=? ORDER BY id DESC LIMIT 1", (operation,)).fetchone()
+        _require(latest is not None, "Operator renewal requires its previous issued gate")
+        result = maintain(connection, evidence=evidence, operation=operation, latest=latest, at=at)
+        _require(result is not None, "Operation has no previous operator gate")
+        return result
     native = _native_authority(connection, operation=operation, at=at, evidence=evidence)
     _require(native is not None and native[1]["native_qualified"], "Native operation has no completed current 200-start qualification")
     return _publish_gate(connection, operation=operation, at=at, ordinary=True)
@@ -1165,7 +1177,7 @@ def maintain_operation_qualifications(connection: sqlite3.Connection, *, at: str
     except (RuntimeError, ValueError, OSError, sqlite3.Error) as error:
         return {**result, "status": "blocked", "reason": str(error)}
     from .account_profile_authority import OPERATIONS as PROFILE_OPERATIONS
-    for operation in sorted(CONTINUITY_OPERATIONS | PROFILE_OPERATIONS):
+    for operation in sorted(CONTINUITY_OPERATIONS | NEW_PLATFORM_OPERATIONS | PREPARATION_OPERATIONS):
         latest = connection.execute("SELECT * FROM capture_paid_send_gate_events WHERE provider='tikhub' AND operation=? ORDER BY id DESC LIMIT 1", (operation,)).fetchone()
         from .account_cleanup_runtime import OPERATIONS as cleanup_operations
         initialize_cleanup = latest is None and bool(evidence.get("account_cleanup_generation")) and operation in cleanup_operations
@@ -1193,8 +1205,8 @@ def maintain_operation_qualifications(connection: sqlite3.Connection, *, at: str
             if approved is not None:
                 result["operations"][operation] = approved
                 continue
-            _require(operation not in PROFILE_OPERATIONS,
-                     "Account profile operation requires its installed operator authority")
+            _require(operation in CONTINUITY_OPERATIONS,
+                     "New platform or preparation operation requires its explicit installed operator release")
             enabled = _previously_enabled_operation(connection, operation=operation, evidence=evidence, at=at)
             cohort = _latest_native(connection, operation=operation, kind="cohort", activation_id=evidence["active"]["activation_id"])
             qualification = _latest_native_qualification(connection, operation=operation, activation_id=evidence["active"]["activation_id"])

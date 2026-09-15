@@ -1,6 +1,6 @@
 :global(.filter-bar).filters { flex-direction: row; align-items: center; gap: 9px; }
 .filters > input { flex: 1 1 230px; min-width: 200px; max-width: 300px; }
-.filters > input, .filters > select { font-size: 11px; }
+:global(.filter-bar).filters > input, :global(.filter-bar).filters > select { font-size: 12px; }
 .filters > button { min-height: 36px; height: 36px; padding: 0 14px; font-size: 12px; }
 @media (max-width: 640px) {
   .filters > input { flex-basis: 100%; max-width: none; width: 100%; min-width: 0; }
@@ -81,7 +81,7 @@
 .table :global(.content-title) { position: relative; display: block; min-width: 0; max-width: 100%; color: var(--ink); font-size: var(--list-title-size); line-height: 20px; overflow-wrap: anywhere; }
 .table :global(.content-title:not([data-measured])) { max-height: 2lh; overflow: hidden; }
 .table :global(.content-title-text) { display: inline; margin: 0; color: var(--ink); font-size: inherit; line-height: inherit; font-weight: 500; text-decoration: none; }
-.table :global(.content-title-text):hover { color: var(--teal); }
+.table :global(a.content-title-text):hover { color: var(--teal); }
 .table :global(.content-title-tail) { display: inline; white-space: nowrap; }
 .table :global(.content-title-ellipsis) { display: inline; font-weight: 500; }
 .table :global(.content-title-toggle) { position: static; display: inline; min-height: 0; margin: 0; padding: 0; border: 0; background: transparent; color: var(--teal); font-size: var(--list-action-size); line-height: 1; font-weight: 400; vertical-align: baseline; white-space: nowrap; }
@@ -116,6 +116,7 @@
 }
 .table :global(.content-media-glyph svg) { width: 16px; height: 16px; }
 .table :global(.content-media-label) { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.table :global(.content-media-box[data-action="unavailable"]) { cursor: default; border-color: #dce5e9; background: #e8edf0; color: #33525e; }
 /* 第三级（跳出去看原作品）的角标：右上角一个外链箭头，margin 归零压过 td:first-child span 的全局 margin-top */
 .table :global(.content-media-badge) { position: absolute; top: 4px; right: 4px; display: grid; place-items: center; width: 14px; height: 14px; margin: 0; color: #4e6c76; }
 .table :global(.content-media-badge svg) { display: block; width: 13px; height: 13px; }

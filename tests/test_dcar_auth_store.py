@@ -126,7 +126,10 @@ class AuthStoreTestCase(unittest.TestCase):
                     password_updated_at INTEGER NOT NULL
                 )
             """)
-            connection.execute("INSERT INTO auth_users_v2 SELECT * FROM auth_users")
+            connection.execute(
+                "INSERT INTO auth_users_v2 SELECT username, phone, password_hash, "
+                "status, role, created_at, password_updated_at FROM auth_users"
+            )
             connection.execute("DROP TABLE auth_users")
             connection.execute("ALTER TABLE auth_users_v2 RENAME TO auth_users")
             connection.execute("PRAGMA user_version=2")
@@ -205,13 +208,11 @@ class AuthStoreTestCase(unittest.TestCase):
             self.assertIn("phone", columns)
         finally:
             connection.close()
-        self.assertTrue(self.store.username_reserved("GONE_USER"))
+        self.assertFalse(self.store.username_reserved("GONE_USER"))
         challenge_id, code = self._sent_code("register", NEW_PHONE)
-        with self.assertRaises(auth_store.UsernameTaken):
-            self.store.prepare_register("gone_user", NEW_PHONE, code, IP)
-        challenge = self.store.prepare_register("fresh_user", NEW_PHONE, code, IP)
-        self.store.complete_register("fresh_user", NEW_PHONE, HASH, challenge, TTL)
-        user = self.store.get_user("fresh_user")
+        challenge = self.store.prepare_register("gone_user", NEW_PHONE, code, IP)
+        self.store.complete_register("gone_user", NEW_PHONE, HASH, challenge, TTL)
+        user = self.store.get_user("gone_user")
         assert user is not None
         self.assertEqual(user.status, "active")
         connection = sqlite3.connect(self.path)
@@ -255,6 +256,7 @@ class AuthStoreTestCase(unittest.TestCase):
             self.store.healthcheck()
         self.assertEqual(self.store.initialize(), (2, 3))
         self.store.healthcheck()
+        before["auth_users"] = [(*row, "") for row in before["auth_users"]]
         self.assertEqual(self._database_rows(), before)
         self.assertEqual(self.store.change_log_path.read_bytes(), audit_before)
         self.assertTrue(all(entry["user_version"] == 2 for entry in self.store.read_changes()))
@@ -317,6 +319,137 @@ class AuthStoreTestCase(unittest.TestCase):
         self.assertEqual(auth_store.ROLE_RANK["new_user"], 0)
         self.assertNotIn("new_user", auth_store.USER_ADMIN_ROLES)
 
+    def test_schema_three_profile_upgrade_preserves_identity_sessions_and_audit(self) -> None:
+        token = self.store.create_session(USERNAME, TTL)
+        self._sent_code("login")
+        with sqlite3.connect(self.path) as connection:
+            connection.execute("ALTER TABLE auth_users DROP COLUMN display_name")
+        before = self._database_rows()
+        audit_before = self.store.change_log_path.read_bytes()
+        with self.assertRaisesRegex(RuntimeError, "display_name column/default"):
+            self.store.healthcheck()
+        self.assertEqual(self.store.initialize(), (3, 3))
+        self.store.healthcheck()
+        before["auth_users"] = [(*row, "") for row in before["auth_users"]]
+        self.assertEqual(self._database_rows(), before)
+        self.assertEqual(self.store.change_log_path.read_bytes(), audit_before)
+        principal = self.store.resolve_principal(token)
+        self.assertEqual(principal.username, USERNAME)
+        self.assertEqual(principal.role, "operator")
+        self.assertEqual(principal.display_name, "")
+        self.assertEqual(self.store.initialize(), (3, 3))
+        # Previous schema-3 runtimes use named fields and accept user_version 3.
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                "INSERT INTO auth_users(username, password_hash, created_at, password_updated_at) "
+                "VALUES('old-runtime', ?, 1, 1)", (HASH,)
+            )
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 3)
+        self.assertEqual(self.store.get_user("old-runtime").display_name, "")
+
+    def test_schema_three_profile_upgrade_failure_rolls_back_without_losing_sessions(self) -> None:
+        token = self.store.create_session(USERNAME, TTL)
+        with sqlite3.connect(self.path) as connection:
+            connection.execute("ALTER TABLE auth_users DROP COLUMN display_name")
+        before = self._database_rows()
+        audit_before = self.store.change_log_path.read_bytes()
+        original = auth_store.AuthStore._apply_schema
+
+        def fail_after_column_add(connection: sqlite3.Connection) -> None:
+            original(connection)
+            raise RuntimeError("simulated profile migration failure")
+
+        with patch.object(auth_store.AuthStore, "_apply_schema", side_effect=fail_after_column_add):
+            with self.assertRaisesRegex(RuntimeError, "simulated profile migration failure"):
+                self.store.initialize()
+        self.assertEqual(self._database_rows(), before)
+        self.assertEqual(self._user_version(), 3)
+        self.assertEqual(self.store.change_log_path.read_bytes(), audit_before)
+        self.store.initialize()
+        self.assertEqual(self.store.resolve_session(token), USERNAME)
+
+    # ---------------------------------------------------------- own profile
+
+    def test_display_name_preserves_arbitrary_text_and_survives_reopening(self) -> None:
+        token = self.store.create_session(USERNAME, TTL)
+        session_hash = auth_store.session_token_hash(token)
+        names = ["程鑫 · A@B.com 🚗", "  ", "a\x00b\n\t'\"<>&/\\😀", "任意" * 20_000, ""]
+        for name in names:
+            with self.subTest(length=len(name)):
+                updated = self.store.update_own_display_name(session_hash, name)
+                self.assertEqual(updated.display_name, name)
+                self.assertEqual(updated.to_public()["display_name"], name)
+                reopened = auth_store.AuthStore(self.path, pepper=PEPPER)
+                self.assertEqual(reopened.get_user(USERNAME).display_name, name)
+                self.assertEqual(reopened.get_user_by_phone(PHONE).display_name, name)
+                self.assertEqual(reopened.resolve_principal(token).display_name, name)
+                summary = next(user for user in reopened.list_users() if user.username == USERNAME)
+                self.assertEqual(summary.display_name, name)
+                self.assertEqual(summary.to_public()["display_name"], name)
+                self.assertNotIn("password_hash", summary.to_public())
+
+    def test_display_name_updates_only_session_owner_for_every_role(self) -> None:
+        other_before = self.store.get_user(USERNAME)
+        for role in auth_store.ROLES:
+            with self.subTest(role=role):
+                username = "profile-" + role
+                self.store.create_user(username, HASH, role=role)
+                token = self.store.create_session(username, TTL)
+                session_hash = auth_store.session_token_hash(token)
+                before = self._database_rows()
+                audit_before = self.store.change_log_path.read_bytes()
+                updated = self.store.update_own_display_name(session_hash, "重复昵称 '")
+                self.assertEqual(updated.username, username)
+                self.assertEqual(updated.role, role)
+                self.assertEqual(updated.password_hash, HASH)
+                self.assertEqual(self.store.resolve_session(token), username)
+                self.assertEqual(self.store.get_user(USERNAME), other_before)
+                self.assertEqual(self.store.change_log_path.read_bytes(), audit_before)
+                after = self._database_rows()
+                for table in auth_store.REQUIRED_TABLES - {"auth_users"}:
+                    self.assertEqual(after[table], before[table])
+                self.assertEqual(
+                    [row[:-1] for row in after["auth_users"]],
+                    [row[:-1] for row in before["auth_users"]],
+                )
+                if role == auth_store.ROLE_NEW_USER:
+                    with self.assertRaises(auth_store.ActorForbidden):
+                        self.store.update_user(session_hash, USERNAME, phone=PHONE,
+                                               role="admin", password_hash=None)
+
+    def test_display_name_rejects_expired_revoked_disabled_or_stale_sessions(self) -> None:
+        changes = {
+            "expired": "UPDATE auth_sessions SET expires_at=1 WHERE username=?",
+            "revoked": "DELETE FROM auth_sessions WHERE username=?",
+            "disabled": "UPDATE auth_users SET status='disabled' WHERE username=?",
+            "stale_password": "UPDATE auth_users SET password_hash='changed' WHERE username=?",
+            "deleted": "DELETE FROM auth_users WHERE username=?",
+        }
+        for name, sql in changes.items():
+            with self.subTest(name=name):
+                self.store.create_user(name, HASH, role="new_user")
+                token = self.store.create_session(name, TTL)
+                principal = self.store.resolve_principal(token)
+                with sqlite3.connect(self.path) as connection:
+                    connection.execute(sql, (name,))
+                # Even a caller resolved before the account/session changed is
+                # rejected by the second check within the write transaction.
+                with self.assertRaises(auth_store.SessionRevoked):
+                    self.store.update_own_display_name(principal.token_sha256, "拒绝保存")
+                user = self.store.get_user(name)
+                if user is not None:
+                    self.assertEqual(user.display_name, "")
+        with self.assertRaises(auth_store.SessionRevoked):
+            self.store.update_own_display_name("unknown-session", "拒绝保存")
+
+    def test_display_name_requires_a_string_without_coercing_other_types(self) -> None:
+        session_hash = self._session_hash(USERNAME)
+        for name in (None, 123, [], {"username": "another"}):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, "display_name must be a string"):
+                    self.store.update_own_display_name(session_hash, name)
+        self.assertEqual(self.store.get_user(USERNAME).display_name, "")
+
     def test_send_limits_are_rolling_and_count_all_statuses(self) -> None:
         first, _ = self.store.reserve_send("login", PHONE, IP, "111111")
         self.store.finish_send(first, "rejected", "isv.BUSINESS_LIMIT_CONTROL")
@@ -345,17 +478,15 @@ class AuthStoreTestCase(unittest.TestCase):
                 self.store.reserve_send("login", PHONE, "198.51.100.3", "666666")
 
     def test_reservation_rejections_commit_failures_without_challenges(self) -> None:
-        self.store.throttle_max_failures = 4
+        self.store.throttle_max_failures = 3
         with self.assertRaises(auth_store.PhoneNotRegistered):
             self.store.reserve_send("login", "13600136000", IP, "111111")
         with self.assertRaises(auth_store.PhoneRegistered):
             self.store.reserve_send("register", PHONE, IP, "111111")
-        with self.assertRaises(auth_store.PhoneNotAllowed):
-            self.store.reserve_send("register", "13700137000", IP, "111111")
         self.store.set_status(USERNAME, "disabled")
         with self.assertRaises(auth_store.AccountDisabled):
             self.store.reserve_send("login", PHONE, IP, "111111")
-        self.assertEqual(self.store.failure_count(auth_store.AuthStore.ip_key(IP)), 4)
+        self.assertEqual(self.store.failure_count(auth_store.AuthStore.ip_key(IP)), 3)
         self.assertEqual(self.store.counts()["auth_challenges"], 0)
         with self.assertRaises(auth_store.RateLimited):
             self.store.reserve_send("register", NEW_PHONE, IP, "111111")
@@ -480,6 +611,72 @@ class AuthStoreTestCase(unittest.TestCase):
         self.store.allow_phone("13700137000")
         with self.assertRaises(auth_store.InvalidCode):
             self.store.complete_register("another", "13700137000", HASH, challenge_id, TTL)
+
+    def test_registration_needs_no_phone_admission_and_accepts_all_nonempty_names(self) -> None:
+        names = ["中", "ops@example.com", "汽车 🚗", "@/:#.!", " a ", " ", "x",
+                 "temporary-bypass", "\x00\n\t", "n" * 16000]
+        self.assertFalse(auth_store.valid_username(""))
+        for index, username in enumerate(names):
+            with self.subTest(username=username[:20]):
+                phone = f"1360000{index:04d}"
+                self.assertTrue(auth_store.valid_username(username))
+                self.assertFalse(self.store.phone_allowed(phone))
+                challenge, code = self._sent_code("register", phone)
+                prepared = self.store.prepare_register(username, phone, code, IP)
+                self.assertEqual(prepared, challenge)
+                token = self.store.complete_register(username, phone, HASH, prepared, TTL)
+                principal = self.store.resolve_principal(token)
+                self.assertEqual((principal.username, principal.role), (username, "new_user"))
+                self.assertFalse(self.store.phone_allowed(phone))
+        # Read the whole log again so long/Unicode actor and target values do
+        # not poison the next security change after successful registration.
+        changes = self.store.read_changes()
+        registered = [entry for entry in changes if entry["action"] == "user.register"]
+        self.assertEqual([entry["target"] for entry in registered], names)
+
+    def test_username_keys_match_existing_sqlite_nocase_identity(self) -> None:
+        pairs = [("A", "a"), ("Å", "å"), (" a ", "a"), ("汽车", "汽车"),
+                 ("a\x00x", "A\x00Y"), ("a\x00x", "a\x00yz")]
+        with sqlite3.connect(self.path) as connection:
+            for left, right in pairs:
+                with self.subTest(left=left, right=right):
+                    same = bool(connection.execute("SELECT ? = ? COLLATE NOCASE", (left, right)).fetchone()[0])
+                    self.assertEqual(auth_store.username_key(left) == auth_store.username_key(right), same)
+                    self.assertEqual(self.store.user_key(left) == self.store.user_key(right), same)
+        self.store.create_user("Å", HASH)
+        self.store.create_user("å", HASH)
+        self.assertFalse(self.store.username_reserved("temporary-bypass"))
+
+    def test_unicode_line_separators_survive_registration_audit_and_authorization(self) -> None:
+        self.store.create_user("管理员", HASH, role="admin")
+        actor_session = self._session_hash("管理员")
+        for index, character in enumerate(("\u0085", "\u2028", "\u2029")):
+            username = f"前{character}后"
+            phone = f"1360001{index:04d}"
+            challenge, code = self._sent_code("register", phone)
+            self.store.prepare_register(username, phone, code, IP)
+            token = self.store.complete_register(username, phone, HASH, challenge, TTL)
+            self.assertEqual(self.store.read_changes()[-1]["target"], username)
+            self.store.update_user(actor_session, username, phone=phone, role="operator", password_hash=None)
+            self.assertEqual(self.store.read_changes()[-1]["target"], username)
+            self.assertEqual(self.store.resolve_principal(token).role, "operator")
+
+    def test_reused_name_retires_orphan_sessions_and_reset_tickets(self) -> None:
+        self.store.create_user("Reused", HASH, phone="13500000000")
+        old_token = self.store.create_session("Reused", TTL)
+        _challenge, reset_code = self._sent_code("reset", "13500000000")
+        ticket = self.store.verify_reset("13500000000", reset_code, IP)
+        with sqlite3.connect(self.path) as connection:
+            # Simulate legacy/orphan state that did not receive a proper delete.
+            connection.execute("UPDATE auth_sessions SET username='REUSED' WHERE username='Reused'")
+            connection.execute("DELETE FROM auth_users WHERE username='Reused'")
+        challenge, code = self._sent_code("register", "13600000000")
+        self.store.prepare_register("reused", "13600000000", code, IP)
+        new_token = self.store.complete_register("reused", "13600000000", HASH, challenge, TTL)
+        self.assertIsNone(self.store.resolve_principal(old_token))
+        self.assertEqual(self.store.resolve_principal(new_token).role, "new_user")
+        with self.assertRaises(auth_store.ResetExpired):
+            self.store.peek_ticket(ticket, IP)
 
     def test_concurrent_registration_admits_one_and_keeps_code_for_loser(self) -> None:
         _challenge, code = self._sent_code("register", NEW_PHONE)
@@ -695,13 +892,12 @@ class AuthStoreTestCase(unittest.TestCase):
         self.assertGreater(len(auth_store.common_passwords()), 9000)
 
     def test_htpasswd_parser_rules(self) -> None:
-        good = f"alice:{HASH}\nBob.Ops@x:{HASH}\n"
-        self.assertEqual([u for u, _ in auth_store.parse_htpasswd(good)], ["alice", "Bob.Ops@x"])
+        good = f"alice:{HASH}\nBob.Ops@x:{HASH}\ntemporary-bypass:{HASH}\n"
+        self.assertEqual([u for u, _ in auth_store.parse_htpasswd(good)], ["alice", "Bob.Ops@x", "temporary-bypass"])
         for bad in (
             "",
             f"alice:{HASH}\nALICE:{HASH}\n",
             f"a:b:{HASH}\n",
-            f"temporary-bypass:{HASH}\n",
             f"运营:{HASH}\n",
             "alice:$apr1$x$y\n",
             f"alice:{HASH}\n\n",
@@ -779,6 +975,21 @@ class AuthStoreTestCase(unittest.TestCase):
             self.store.export_htpasswd(target)
         self.assertEqual(target.read_bytes(), before)
 
+    def test_rollback_export_refuses_unrepresentable_authorized_names_atomically(self) -> None:
+        target = Path(self.temporary.name) / "rollback.htpasswd"
+        target.write_text("previous verified export", encoding="utf-8")
+        for username in ("中", "a:b", "with space", "#comment", "line\nbreak", "x" * 129):
+            with self.subTest(username=username[:20]):
+                self.store.create_user(username, HASH, role="new_user")
+                # Unapproved names are not exported by the rollback path.
+                self.assertEqual(self.store.export_htpasswd(target), 1)
+                before = target.read_bytes()
+                self.store.set_role(username, "operator")
+                with self.assertRaises(auth_store.HtpasswdExportError):
+                    self.store.export_htpasswd(target)
+                self.assertEqual(target.read_bytes(), before)
+                self.store.delete_user_cli(username)
+
     # ------------------------------------------------------- user management
 
     def _session_hash(self, username: str) -> str:
@@ -836,7 +1047,7 @@ class AuthStoreTestCase(unittest.TestCase):
         self.assertEqual(self.store.read_changes()[-1]["after"], {"role": "new_user"})
         self.store.delete_user(lead_session, "pending")
         self.assertIsNone(self.store.resolve_principal(token))
-        self.assertTrue(self.store.username_reserved("pending"))
+        self.assertFalse(self.store.username_reserved("pending"))
 
     def test_privilege_checks_are_evaluated_inside_the_locked_transaction(self) -> None:
         self.store.create_user("boss", HASH, role="superadmin", actor="test")
@@ -942,7 +1153,7 @@ class AuthStoreTestCase(unittest.TestCase):
         self.assertIsNone(self.store.get_user("temp"))
         self.assertIsNone(self.store.resolve_session(temp_token))
         self.assertFalse(self.store.phone_allowed("13700000000"))
-        self.assertTrue(self.store.username_reserved("Temp"))
+        self.assertFalse(self.store.username_reserved("Temp"))
         self.assertEqual(
             self._invalidations(),
             [(login_row, "user_deleted"), (register_row, "user_deleted")],
@@ -959,19 +1170,21 @@ class AuthStoreTestCase(unittest.TestCase):
         finally:
             connection.close()
         self.assertIsNone(self.store.challenge_status(other_row + 1))
-        with self.assertRaises(auth_store.UsernameTaken):
-            self.store.create_user("temp", HASH, actor="test")
         with self.assertRaises(auth_store.UserNotFound):
             self.store.delete_user(boss_session, "temp")
-        # The retired rows still count for the send ledger of that number, and
-        # the tombstone blocks a page registration with the deleted name.
-        self.store.allow_phone("13700000000", "again", actor="test")
+        # Retired rows still count for send limits. A reused name starts with
+        # no permissions and never restores the old token, even with the same hash.
         with self.assertRaises(auth_store.RateLimited):
             self._sent_code("register", "13700000000")
-        self.store.allow_phone("13500000000", "fresh", actor="test")
         challenge_id, code = self._sent_code("register", "13500000000")
-        with self.assertRaises(auth_store.UsernameTaken):
-            self.store.prepare_register("temp", "13500000000", code, IP)
+        prepared = self.store.prepare_register("TEMP", "13500000000", code, IP)
+        new_token = self.store.complete_register("TEMP", "13500000000", HASH, prepared, TTL)
+        self.assertEqual(prepared, challenge_id)
+        self.assertIsNone(self.store.resolve_principal(temp_token))
+        self.assertEqual(self.store.resolve_principal(new_token).role, "new_user")
+        self.store.delete_user(boss_session, "temp")
+        self.assertIsNone(self.store.resolve_principal(new_token))
+        self.assertFalse(self.store.username_reserved("Temp"))
 
     def test_change_log_records_security_changes_without_secrets(self) -> None:
         self.store.create_user("boss", HASH, role="superadmin", phone="13800000000", actor="cli:mark")

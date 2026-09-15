@@ -460,6 +460,7 @@ def compute_slice_rate(
 
 def load_calibration_record(
     record_path: Optional[Path] = None,
+    *, platform: str | None = None,
 ) -> Dict[str, Any]:
     """Load and fail-closed-validate the gold-set calibration record.
 
@@ -478,6 +479,9 @@ def load_calibration_record(
     record is defect-free, otherwise ``rejected``.
     """
 
+    if platform is not None and platform not in {"douyin", "xiaohongshu", "kuaishou", "wechat_channels"}:
+        raise ValueError("unsupported calibration platform")
+    required_platforms = (platform,) if platform is not None else CALIBRATION_PLATFORMS
     path = Path(record_path) if record_path is not None else CALIBRATION_RECORD_PATH
     if not path.exists():
         # Never-created record: publish uncalibrated machine estimates,
@@ -485,7 +489,7 @@ def load_calibration_record(
         # distinct from a record that exists but is defective — that stays
         # rejected below, because it means tampering or a failed calibration.
         return {
-            "state": "uncalibrated",
+            "state": "rejected" if platform in {"kuaishou", "wechat_channels"} else "uncalibrated",
             "platforms": {},
             "reasons": ["定标记录尚未建立，按未定标口径发布（上限仅样本）"],
             "record": None,
@@ -519,7 +523,7 @@ def load_calibration_record(
         reasons.append("platforms 必须是对象")
         platforms_block = {}
     platform_states: Dict[str, str] = {}
-    for platform in CALIBRATION_PLATFORMS:
+    for platform in required_platforms:
         block = platforms_block.get(platform)
         if not isinstance(block, Mapping):
             reasons.append(f"{platform} 缺少定标结果")
@@ -557,14 +561,14 @@ def load_calibration_record(
         platform_states[platform] = state
     missing = [
         platform
-        for platform in CALIBRATION_PLATFORMS
+        for platform in required_platforms
         if platform not in platform_states
     ]
     if reasons or missing:
         effective = "rejected"
     else:
         effective = max(
-            (platform_states[platform] for platform in CALIBRATION_PLATFORMS),
+            (platform_states[platform] for platform in required_platforms),
             key=lambda state: _STATE_RANK[state],
         )
     return {
@@ -579,6 +583,7 @@ def active_classifier_state(
     connection: sqlite3.Connection,
     *,
     record_path: Optional[Path] = None,
+    platform: str | None = None,
 ) -> str:
     """Return the calibrated classifier state for publication decisions.
 
@@ -592,7 +597,7 @@ def active_classifier_state(
     """
 
     del connection  # the record is file-based (schema 10 is frozen)
-    return str(load_calibration_record(record_path)["state"])
+    return str(load_calibration_record(record_path, platform=platform)["state"])
 
 
 def default_warm_up(evidence_window_end: str, switchover_date: Optional[str]) -> bool:
@@ -614,7 +619,7 @@ def build_channel_audience_rates(
     connection: sqlite3.Connection,
     rows: Sequence[Mapping[str, Any]],
     *,
-    classifier_state: str,
+    classifier_state: str | Mapping[str, str],
     evidence_window_start: str,
     evidence_window_end: str,
     report_cutoff_at: str,
@@ -626,20 +631,27 @@ def build_channel_audience_rates(
 
     result: Dict[str, Dict[str, Any]] = {}
     for platform, _label in channels:
+        # A legacy aggregate approval is never evidence for a new platform.
+        platform_state = (classifier_state.get(platform, "rejected") if isinstance(classifier_state, Mapping)
+            else active_classifier_state(connection, platform=platform)
+            if platform not in CALIBRATION_PLATFORMS else classifier_state)
         channel_rows = [r for r in rows if r["platform"] == platform]
         channel_ids = [int(r["content_id"]) for r in channel_rows]
 
         def slice_value(content_ids: Sequence[int], publication_count: int) -> Dict[str, Any]:
-            return compute_slice_rate(
+            value = compute_slice_rate(
                 connection,
                 content_ids,
                 publication_count=publication_count,
-                classifier_state=classifier_state,
+                classifier_state=platform_state,
                 evidence_window_start=evidence_window_start,
                 evidence_window_end=evidence_window_end,
                 report_cutoff_at=report_cutoff_at,
                 warm_up=warm_up,
             )
+            if isinstance(classifier_state, Mapping) or platform not in CALIBRATION_PLATFORMS:
+                value["audience_quality"]["platform_calibration_state"] = platform_state
+            return value
 
         scene_values: Dict[str, Any] = {}
         for scene, _scene_label in scenes:
@@ -654,3 +666,20 @@ def build_channel_audience_rates(
             "scenes": scene_values,
         }
     return result
+
+
+def calibration_binding(*, record_path: Optional[Path] = None) -> dict[str, Any]:
+    """Freeze platform decisions and the exact local calibration-file digest."""
+    import hashlib
+    path = Path(record_path) if record_path is not None else CALIBRATION_RECORD_PATH
+    before = path.read_bytes() if path.exists() else None
+    decisions = {platform: load_calibration_record(path, platform=platform)
+                 for platform in ("douyin", "xiaohongshu", "kuaishou", "wechat_channels")}
+    after = path.read_bytes() if path.exists() else None
+    if before != after:
+        raise ValueError("calibration record changed while freezing report scope")
+    return {"contract_version": "platform-audience-calibration-binding-v1",
+            "record_sha256": hashlib.sha256(before).hexdigest() if before is not None else None,
+            "classifier_version": CLASSIFIER_VERSION, "audience_definition_version": AUDIENCE_DEFINITION_VERSION,
+            "platforms": {platform: {"state": value["state"], "reasons": value["reasons"]}
+                          for platform, value in decisions.items()}}

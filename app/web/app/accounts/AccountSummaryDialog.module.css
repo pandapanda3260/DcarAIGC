@@ -1,0 +1,213 @@
+.contextNote {
+  margin: 14px 0 0;
+  color: #728087;
+  font-size: 12px;
+  line-height: 1.75;
+}
+
+.emptyNotice,
+.pendingNotice {
+  margin: 16px 0 0;
+  padding: 12px 14px;
+  border: 1px solid #e6ecec;
+  border-radius: 10px;
+  background: #f5f8f8;
+  color: #54676e;
+  font-size: 12px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+
+.pendingNotice {
+  display: grid;
+  gap: 3px;
+  border-color: #eae4d5;
+  background: #faf8f1;
+  color: #706447;
+}
+
+.pendingNotice strong {
+  font-weight: 600;
+}
+
+.groups {
+  margin-top: 24px;
+}
+
+.group + .group {
+  margin-top: 22px;
+  padding-top: 21px;
+  border-top: 1px solid #e9eeee;
+}
+
+.groupTitle {
+  margin: 0 0 17px;
+  color: #173139;
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.5;
+}
+
+.fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 19px 30px;
+  margin: 0;
+}
+
+.field {
+  min-width: 0;
+}
+
+.field dt {
+  margin: 0 0 5px;
+  color: #728087;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.field dd {
+  margin: 0;
+  color: #173139;
+  font-size: 14px;
+  font-weight: 450;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.source {
+  margin-top: 26px;
+  padding: 15px 16px;
+  border: 1px solid #e9eeee;
+  border-radius: 12px;
+  background: #f5f8f8;
+}
+
+.sourceTitle {
+  margin: 0 0 12px;
+  color: #54676e;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.captureIssue {
+  margin: 6px 0 0;
+  color: #54676e;
+  font-size: 12px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+
+.sourceFields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 11px 24px;
+  margin: 0;
+}
+
+.sourceFields > div {
+  min-width: 0;
+}
+
+.sourceFields dt {
+  margin-bottom: 3px;
+  color: #728087;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.sourceFields dd {
+  margin: 0;
+  color: #54676e;
+  font-size: 12px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.sourceFields .importedAt {
+  grid-column: 1 / -1;
+}
+
+.importedAt dd {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 6px;
+}
+
+.importedAt dd span {
+  color: #728087;
+}
+
+.comments {
+  margin-top: 16px;
+  padding-top: 15px;
+  border-top: 1px solid #e9eeee;
+}
+
+.comments summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-radius: 5px;
+  color: #54676e;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.6;
+  list-style: none;
+  cursor: pointer;
+}
+
+.comments summary::-webkit-details-marker {
+  display: none;
+}
+
+.comments summary:hover {
+  color: #173139;
+}
+
+.comments summary:focus-visible {
+  outline: 2px solid #52767e;
+  outline-offset: 5px;
+}
+
+.comments summary svg {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.comments[open] summary svg {
+  transform: rotate(180deg);
+}
+
+.comments p {
+  margin: 12px 0 0;
+  color: #54676e;
+  font-size: 13px;
+  line-height: 1.8;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+@media (max-width: 560px) {
+  .fields,
+  .sourceFields {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 16px;
+  }
+
+  .group + .group {
+    margin-top: 20px;
+    padding-top: 19px;
+  }
+}

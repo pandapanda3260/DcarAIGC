@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { publicAssetPath } from "../lib/paths";
 import { showToast } from "./Feedback";
+import tooltipStyles from "./QuickActionTooltip.module.css";
 
 export default function LogoutButton() {
   const [busy, setBusy] = useState(false);
@@ -31,8 +32,7 @@ export default function LogoutButton() {
   return (
     <button
       type="button"
-      className="sidebar-logout"
-      title={busy ? "正在退出" : "退出登录"}
+      className={`sidebar-logout ${tooltipStyles.trigger}`}
       aria-label={busy ? "正在退出登录" : "退出登录"}
       onClick={() => void logout()}
       disabled={busy}
@@ -41,6 +41,7 @@ export default function LogoutButton() {
         <path d="M12.5 6.3V5.1a1.8 1.8 0 0 0-1.8-1.8H5.4a1.8 1.8 0 0 0-1.8 1.8v9.8a1.8 1.8 0 0 0 1.8 1.8h5.3a1.8 1.8 0 0 0 1.8-1.8v-1.2" />
         <path d="M8.2 10h8.3M13.9 7.4 16.5 10l-2.6 2.6" />
       </svg>
+      <span className={tooltipStyles.tip} aria-hidden="true">{busy ? "正在退出登录" : "退出登录"}</span>
     </button>
   );
 }

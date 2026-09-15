@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 
-const bundle = await build({ entryPoints: [new URL("../app/contents/contentDateRange.ts", import.meta.url).pathname], bundle: true, write: false, platform: "node", format: "esm" });
+const bundle = await build({ entryPoints: [fileURLToPath(new URL("../app/contents/contentDateRange.ts", import.meta.url))], bundle: true, write: false, platform: "node", format: "esm" });
 const { todayInShanghai, isCalendarDate, shiftDate, monthOf, shiftMonth, dateInMonth, daysInMonth, moveDateByMonth, mondayOffset, inclusiveDays, dateRangeError, publicationPresets, rangeSummary } = await import(`data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].text).toString("base64")}`);
 
 test("Shanghai date changes at 16:00 UTC independently of the host timezone", () => {

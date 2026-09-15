@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 
-const bundle = await build({ entryPoints: [new URL("../app/contents/contentUpdatePresentation.ts", import.meta.url).pathname], bundle: true, write: false, platform: "node", format: "esm" });
+const bundle = await build({ entryPoints: [fileURLToPath(new URL("../app/contents/contentUpdatePresentation.ts", import.meta.url))], bundle: true, write: false, platform: "node", format: "esm" });
 const { contentUpdateRowState } = await import(`data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].text).toString("base64")}`);
 const job = (overrides = {}) => ({ id: 1, content_id: 12, title: "测试内容", status: "running", stage: "updating", stage_label: "正在更新数据", created_at: "2026-09-06T08:00:00Z", updated_at: "2026-09-06T08:01:00Z", completed_at: null, result: null, error: null, ...overrides });
 const pending = (overrides = {}) => ({ contentId: 12, title: "测试内容", requestId: "12345678-1234-4234-8234-123456789abc", createdAt: "2026-09-06T08:00:00Z", status: "submitting", error: "", ...overrides });

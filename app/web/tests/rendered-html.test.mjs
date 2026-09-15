@@ -283,7 +283,7 @@ test("douyin authorization management locks every scan to the selected business 
   assert.match(source, /<AppShell active="accounts" header=\{/);
   assert.match(source, /href="\/accounts">返回账号页<\/Link>/);
   assert.match(source, /const sessionQuery = useQuery\(sessionQueryOptions\(\)\)/);
-  assert.match(source, /sessionQuery\.data\?\.username === "temporary-bypass"/);
+  assert.match(source, /sessionQuery\.data\?\.bypass === true/);
   assert.match(source, /enabled: canUseControl/);
   assert.match(source, /PRODUCTION_AUTHORIZATION_URL = "https:\/\/origin\.tj\.cn\/dcar\/accounts\/douyin-authorization"/);
   assert.match(source, /isBypassMode \? <article[\s\S]*请在正式 HTTPS 工作台完成扫码[\s\S]*href=\{productionUrl\}/);
@@ -626,16 +626,16 @@ test("spu audience page keeps rule assets, association and 3D stats together", a
   assert.match(mediaBox, /<Image src=\{publicAssetPath\(logoPath\)\} alt="" width=\{14\} height=\{14\} unoptimized \/>/);
   // 第三级（原帖）是新标签链接而不是按钮；前两级是按钮，点击交给页面打开弹窗。
   // 链接带 title 悬停说明与中文无障碍名称（去抖音查看原作品：标题），角标只放一个外链箭头图标，不再写"原帖"。
-  assert.match(mediaBox, /<a className="content-media-box" data-action=\{action\.kind\} href=\{action\.href \?\? item\.canonical_url\} target="_blank" rel="noreferrer" title=\{originalPostHint\(platformName\)\} aria-label=\{`\$\{originalPostAction\(platformName\)\}：\$\{title\}`\}>/);
+  assert.match(mediaBox, /<a className="content-media-box" data-action=\{action\.kind\} href=\{action\.href!\} target="_blank" rel="noreferrer" title=\{hint\(originalPostHint\(platformName\)\)\} aria-label=\{`\$\{originalPostAction\(platformName\)\}：\$\{title\}`\}>/);
   assert.match(mediaBox, /const platformName = label\(item\.platform\);/);
-  assert.match(mediaBox, /<button type="button" className="content-media-box" data-action=\{action\.kind\} onClick=\{\(\) => onOpen\(item\)\} aria-label=\{`\$\{action\.label\}：\$\{title\}`\}>/);
+  assert.match(mediaBox, /<button type="button" className="content-media-box" data-action=\{action\.kind\} onClick=\{\(\) => onOpen\(item\)\} title=\{hint\(action\.label\)\} aria-label=\{`\$\{action\.label\}：\$\{title\}`\}>/);
   assert.match(mediaBox, /\{action\.kind === "original" && <span className="content-media-badge" aria-hidden="true"><ArrowSquareOutIcon weight="bold" \/><\/span>\}/);
   assert.doesNotMatch(mediaBox, />原帖<|"原帖"|action\.badge/);
   assert.doesNotMatch(mediaBox, /readQueryJson|readJson|fetch\(|<video|<iframe/);
   assert.match(contentMedia, /export const DOUYIN_PLAYER_ORIGIN = "https:\/\/open\.douyin\.com";/);
   assert.match(contentMedia, /\$\{DOUYIN_PLAYER_ORIGIN\}\/player\/video\?vid=\$\{platformContentId\}&autoplay=0&mode=mobile&width=100vw&height=100vh/);
   const contentTitle = await readFile(new URL("../app/contents/ContentTitle.tsx", import.meta.url), "utf8");
-  assert.match(contentTitle, /<a[^>]+href=\{href\}[^>]+target="_blank"[^>]+aria-label=\{text\}/);
+  assert.match(contentTitle, /<a[^>]+href=\{originalUrl\}[^>]+target="_blank"[^>]+aria-label=\{text\}/);
   // 展开/收起仍是链接外的独立按钮，避免点击它时跳转作品页。
   assert.match(contentTitle, /<\/a>[\s\S]*<button[^>]+className="content-title-toggle"[^>]+aria-expanded=\{expanded\}[^>]+aria-controls=\{titleId\}/);
   assert.match(contentCells[1], /item\.primary_selling_point_code/);
@@ -779,9 +779,10 @@ test("spu audience page keeps rule assets, association and 3D stats together", a
 });
 
 test("routes preserve operations and expose read-only evidence workbench", async () => {
-  const [shell, accounts, pagination, contents, evidence, tasks, taskDetail, sellingPoints, apiSource, operationsSource, formatSource, layout, packageJson, queryContracts] = await Promise.all([
+  const [shell, accounts, accountOperations, pagination, contents, evidence, tasks, taskDetail, sellingPoints, apiSource, operationsSource, formatSource, layout, packageJson, queryContracts] = await Promise.all([
     readWorkbenchShell(),
     readFile(new URL("../app/accounts/AccountsPage.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/accounts/AccountOperationsDialog.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/components/Pagination.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/contents/ContentsPage.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/contents/EvidenceModal.tsx", import.meta.url), "utf8"),
@@ -800,18 +801,18 @@ test("routes preserve operations and expose read-only evidence workbench", async
   assert.match(accounts, /一个平台账号一行/);
   assert.match(accounts, /<table className=\{styles\.memberTable\}>/);
   assert.match(accounts, /styles\.accountPanel/);
-  assert.match(accounts, /<AccountsPagination page=\{appliedRequest\.page\} pageSize=\{appliedRequest\.page_size\} total=\{total\} busy=\{accountsQuery\.isFetching \|\| saving\} onChange=\{\(next\) => applySearch\(\{ page: next\.page, pageSize: next\.pageSize \}\)\}/);
+  assert.doesNotMatch(accounts, /\sbusy=\{accountsQuery\.isFetching/);
   assert.equal((accounts.match(/<AccountsPagination\b/g) ?? []).length, 1, "account pagination appears once below the table");
   assert.ok(accounts.indexOf("<AccountsPagination") > accounts.indexOf("</table>"));
   assert.match(accounts, /buildAccountSearchRequest/);
   assert.match(accounts, /applySearch\(\{ page: 1 \}\)/);
-  assert.match(accounts, /if \(!result \|\| accountsQuery\.isPlaceholderData\) return;[\s\S]*lastPageFor\(result\.total, appliedRequest\.page_size\)[\s\S]*\{ \.\.\.current, page: lastPage \}/);
+  assert.match(accounts, /if \(!result \|\| displayingPrevious \|\| accountsQuery\.isError\) return;[\s\S]*lastPageFor\(result\.total, appliedRequest\.page_size\)/);
   assert.match(queryContracts, /page_size: positiveInteger\(pageSize\)/);
   assert.match(pagination, /aria-label=\{ariaLabel\}/);
   assert.match(pagination, /首页.*上一页/s);
   assert.match(pagination, /下一页.*末页/s);
   assert.match(pagination, /pagination-\$\{placement\}/);
-  assert.match(contents, /<Pagination page=\{appliedRequest\.page\} pageSize=\{appliedRequest\.page_size\} total=\{total\} busy=\{contentsQuery\.isFetching \|\| saving\}/);
+  assert.match(contents, /<Pagination page=\{appliedRequest\.page\} pageSize=\{appliedRequest\.page_size\} total=\{total\} busy=\{saving\}/);
   assert.match(contents, /if \(!contentsQuery\.data \|\| contentsQuery\.isPlaceholderData\) return;[\s\S]*lastPageFor\(contentsQuery\.data\.total, appliedRequest\.page_size\)[\s\S]*\{ \.\.\.current, page: lastPage \}/);
   assert.doesNotMatch(contents, /function pageWindow/);
   assert.match(accounts, /managedMode \? "系统账号" : "矩阵通账号名单"/);
@@ -831,7 +832,7 @@ test("routes preserve operations and expose read-only evidence workbench", async
   assert.match(accountRow, /<th scope="row" className=\{styles\.identityCell\}>/);
   assert.doesNotMatch(accounts, /platformKeys\.map\(\(key\) => <th|account-group-row/);
   assert.match(accounts, /const identity = item\.platforms\[0\]/);
-  assert.match(accounts, /手机号可留空，也可以由多个账号共用/);
+  assert.match(accountOperations, /手机号可留空，也可以由多个账号共用/);
   assert.match(accounts, /<PlatformHeaderMark platformKey=\{identity\.platform\} \/>/);
   assert.doesNotMatch(accounts, /AccountScope|defaultScopeFilter|setScope|appliedRequest\.scope|名单范围|当前成员|历史档案|待身份对齐/);
   assert.match(formatSource, /platformKeys = \["douyin", "xiaohongshu", "wechat_channels", "kuaishou"\]/);
@@ -843,15 +844,17 @@ test("routes preserve operations and expose read-only evidence workbench", async
   assert.doesNotMatch(accountRow, /roster_state|未在当前生效名单|待补充平台 UID/);
   assert.match(accounts, /const metricTitle = identity\?\.data_status && identity\.data_status !== "not_collected" && identity\?\.data_date \? `\$\{statusLabels\[identity\.data_status\] \|\| identity\.data_status\} · 数据日期 /);
   assert.equal((accountRow.match(/title=\{metricTitle\}/g) ?? []).length, 2, "fans and platform work counts carry the data-date tooltip");
-  assert.match(accountRow, /title=\{`平台 UID：[\s\S]*短号：/);
-  assert.match(accountRow, /aria-label=\{`复制\$\{identity\.nickname \|\| "账号"\}的平台 UID`\}[\s\S]*copyUid\(identity\.uid\)/);
+  assert.match(accountRow, /className=\{styles\.uid\}[^>]*>\{identity\?\.uid \|\| "—"\}/);
+  assert.match(accountRow, /className=\{styles\.shortId\}[^>]*>\{identity\?\.unique_id \|\| "—"\}/);
+  assert.match(accountRow, /aria-label=\{`复制\$\{identity\.nickname \|\| "账号"\}的平台 UID`\}[\s\S]*copyAccountIdentifier\(identity\.uid, "平台 UID"\)/);
+  assert.match(accountRow, /aria-label=\{`复制\$\{identity\.nickname \|\| "账号"\}的\$\{platformAccountLabel\}`\}[\s\S]*copyAccountIdentifier\(identity\.unique_id, platformAccountLabel\)/);
   for (const field of ["item.operator_name", "item.account_group", "item.business_direction", "item.phone"]) assert.ok(accountRow.includes(field), `${field} remains accessible in the grouped account row`);
   for (const field of ["identity?.data_date", "identity?.data_status"]) assert.ok(accounts.includes(field), `${field} still feeds the account row tooltip`);
   assert.match(accountRow, /title=\{`账号分组：\$\{accountGroupLabel\(item\.account_group\)\}；业务方向：\$\{businessDirectionLabel\(item\.business_direction\)\}`\}/);
-  assert.match(accountRow, /aria-label=\{`修改\$\{identity\?\.nickname \|\| "账号"\}的运营信息`\} onClick=\{\(\) => edit\(item\)\}/);
+  assert.match(accountRow, /aria-label=\{`修改\$\{identity\?\.nickname \|\| "账号"\}的运营信息`\} onClick=\{\(\) => void openAccountAction\(item, "edit"\)\}/);
   assert.match(accountRow, /changeAccountStatus\(item, action\.status\)/);
   assert.match(accounts, /const body = \{ account_status: status \};[\s\S]*statusRequestId\(account\.id, body\)/);
-  assert.match(accounts, /暂停后只停止自动采集，历史内容和数据保留/);
+  assert.match(accountOperations, /账号状态由人工维护；当前所有状态均参与自动采集。/);
   assert.doesNotMatch(accounts, /removeManagedAccount|移出名单|method: "DELETE"/);
   assert.match(accountRow, /<details data-account-menu className=\{styles\.rowMenu\}/);
   assert.match(accountRow, /data-account-menu-panel className=\{styles\.menuPanel\}/);
@@ -866,15 +869,14 @@ test("routes preserve operations and expose read-only evidence workbench", async
   assert.match(accounts, /setAccountStatus\(nextStatus\); applySearch\(\{ accountStatus: nextStatus, page: 1 \}\)/);
   assert.match(accounts, /accountManagementVersion=\{accountManagementVersion\}/);
   assert.match(accounts, /account_status: appliedRequest\.account_status/);
-  const editForm = accounts.match(/\{form && <div[\s\S]*?<\/section><\/div>\}/)?.[0];
-  assert.ok(editForm);
+  assert.match(accounts, /<AccountOperationsDialog\b/);
+  const editForm = accountOperations;
   for (const [status, text] of [["daily", "日更"], ["weekly", "周更"], ["paused", "暂停"]]) {
     assert.ok(editForm.includes(`<option value="${status}">${text}</option>`));
   }
   assert.match(editForm, /<option value="" disabled>待标记<\/option>/);
   assert.doesNotMatch(editForm, /<option value="unmarked"/);
-  assert.match(editForm, /日更、周更仅标注作品更新频率。暂停只停止自动采集，历史内容和数据保留。/);
-  assert.match(editForm, /暂停只停止自动采集，历史内容和数据保留/);
+  assert.match(editForm, /账号状态由人工维护；当前所有状态均参与自动采集。/);
   assert.match(accounts, /formatIdentityCount\(identity\?\.follower_count\)/);
   assert.match(accounts, /formatIdentityCount\(identity\?\.platform_work_count\)/);
   assert.match(accounts, /formatIdentityCount\(identity\?\.content_count \?\? 0\)/);
@@ -1087,8 +1089,8 @@ test("private account searches stay in POST bodies and obsolete static assets re
   assert.match(accounts, /useQuery\(accountSearchQueryOptions\(appliedRequest\)\)/);
   assert.doesNotMatch(accounts, /\?phone=|URLSearchParams/);
   assert.match(contents, /useQuery\(contentSearchQueryOptions\(appliedRequest\)\)/);
-  assert.match(queries, /readQueryJson<AccountSearchResult>\("\/api\/v8\/accounts\/search", jsonRequest\(/);
-  assert.match(queries, /readQueryJson<ContentSearchResult>\(CONTENT_SEARCH_PATH, jsonRequest\(request\)\)/);
+  assert.match(queries, /readQueryJson<AccountSearchResult>\("\/api\/v8\/accounts\/search", \{[\s\S]*?jsonRequest\(/);
+  assert.match(queries, /readQueryJson<ContentSearchResult>\(CONTENT_SEARCH_PATH, \{ \.\.\.jsonRequest\(request\), signal \}\)/);
   assert.doesNotMatch(queries, /\/api\/v8\/(?:accounts|contents)\/search\?/);
   assert.doesNotMatch(contents, /latest-report\.json|channel-structured-conclusions-v7\.0/);
   assert.match(apiSource, /\/api\/v7\/history\/reports/);
@@ -1190,7 +1192,8 @@ test("user management is gated by role in the shell and served by the gateway co
   assert.match(page, /<article className="panel"><div className="empty-state">/);
   assert.doesNotMatch(page, /table-read-error/);
   assert.match(page, /\{!isSelf\(user\) && <button type="button" className="text-button danger"/);
-  assert.match(page, /\{!form\.isSelf && <label>新密码/);
+  // 非本人编辑时才渲染整个密码组；managed-usernames 另验证真实组件中本人的字段不存在。
+  assert.match(page, /\{!form\.isSelf && <div className=\{styles\.editField\}>[\s\S]*?<label htmlFor="edit-user-password">新密码<\/label>[\s\S]*?<input id="edit-user-password"[\s\S]*?<\/div>\}/);
   assert.match(page, /disabled=\{saving \|\| form\.isSelf\}/);
   assert.match(page, /className="secondary danger-button"[\s\S]*?>\{saving \? "删除中" : "确认删除"\}/);
   // 弹窗焦点 hook：Effect Event 读取最新的 onClose / busy，effect 只依赖打开状态

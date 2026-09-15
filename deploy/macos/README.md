@@ -12,6 +12,8 @@
 
 该目录定义 DcarAIGC 正式拓扑中唯一允许运行调度的 macOS writer。writer 监听 `127.0.0.1:8766`，同时承担本地正式 API、供应商抓取、媒体处理、增量评估和报告任务。日常 4173 网关经 4174 Web 连接 8766；8765 只保留给 operator freeze 下的只读快照。
 
+可选的 `cn.tj.dcar.live-read-api` 在 `127.0.0.1:8768` 承担网关白名单内的业务读取，使用同一正式库的只读 WAL 连接。它与历史 8765 快照服务不同，不加载 writer 生命周期，也不持有调度锁；所有写入及采集控制继续交给 8766。部署边界、鉴权和回滚见 [独立读服务说明](../../docs/read-service.md)。
+
 writer renderer 只生成 disabled-by-default plist，永不调用 `launchctl`；writer 仍按生效日人工启用。snapshot publisher plist 是已授权的无人值守任务，但它的 renderer 同样只渲染，必须经过一次本机门禁后由部署流程显式 bootstrap。
 
 ## 安全合同
@@ -27,7 +29,7 @@ writer renderer 只生成 disabled-by-default plist，永不调用 `launchctl`�
 - wrapper 使用 `caffeinate -s`，只能在接交流电时防止系统空闲睡眠。合盖、断电、人工睡眠或重启仍可以跳过 Cron。
 - 这是 per-user LaunchAgent，Mac 重启后指定账号必须登录 GUI session。
 
-本地 UI 不另设 LaunchAgent。登录后用唯一的 `dcar-live-ui` SCREEN 运行 `scripts/start_web_mvp.sh`，日志写到 `$HOME/Library/Logs/DcarAIGC/local-ui.log`（该日志文件必须以 `umask 077` 创建：本地验证码通过 `DCAR_AUTH_SMS_PROVIDER=log` 打印在其中，手机号已脱敏）；脚本首次启动会把 `runtime/auth/users.htpasswd` 的旧账号一次性导入 `runtime/auth/sessions.sqlite3`，并生成 `runtime/auth/pepper`；新账号在登录页用准入名单内的手机号注册，名单用 `PYTHONPATH=src/dcar_eval python3 -m uv run --frozen python -m dcar_auth.admin --db runtime/auth/sessions.sqlite3 allow-phone <手机号>` 维护；旧 `dcar-view-ui`/`dcar-read-api` 必须停用。该脚本只启动 4173/4174，并在启动前验证 8766 正式 writer 合同，不会启动、停止或重启 8766。
+本地 UI 不另设 LaunchAgent。登录后用唯一的 `dcar-live-ui` SCREEN 运行 `scripts/start_web_mvp.sh`，日志写到 `$HOME/Library/Logs/DcarAIGC/local-ui.log`（该日志文件必须以 `umask 077` 创建：本地验证码通过 `DCAR_AUTH_SMS_PROVIDER=log` 打印在其中，手机号已脱敏）；脚本首次启动会把 `runtime/auth/users.htpasswd` 的旧账号一次性导入 `runtime/auth/sessions.sqlite3`，并生成 `runtime/auth/pepper`；新账号在登录页直接通过手机号验证码注册，无需预登记；注册后为“新用户”，由管理员在用户权限页授予业务权限；旧 `dcar-view-ui`/`dcar-read-api` 必须停用。该脚本只启动 4173/4174，并在启动前验证 8766 正式 writer 合同，不会启动、停止或重启 8766。
 
 ## 1. 准备项目外 writer 配置
 

@@ -52,7 +52,7 @@ function DouyinAuthorizationWorkspace() {
   const targetRequest = buildAccountSearchRequest({ query: platformUid, accountGroup: "", businessDirection: "", platform: "douyin" }, 1, 100);
 
   const sessionQuery = useQuery(sessionQueryOptions());
-  const isBypassMode = sessionQuery.data?.username === "temporary-bypass";
+  const isBypassMode = sessionQuery.data?.bypass === true;
   const canUseControl = sessionQuery.isSuccess && !isBypassMode;
   const authorizationsQuery = useQuery({ ...douyinAuthorizationsQueryOptions(), enabled: canUseControl });
   const statusesQuery = useQuery({ ...douyinAuthorizationStatusesQueryOptions(), enabled: canUseControl });

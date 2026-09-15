@@ -312,6 +312,7 @@ class AuthAdminCliTestCase(unittest.TestCase):
         self._run("import-htpasswd", "--source", str(self.htpasswd))
         code, out, _ = self._run("allow-phone", PHONE, "--note", "Mark")
         self.assertEqual(code, 0)
+        self.assertIn("注册无需预先授权", out)
         self.assertTrue(self._store().phone_allowed(PHONE))
         code, out, _ = self._run("allow-phone", PHONE, "--remove")
         self.assertEqual(code, 0)
@@ -329,6 +330,23 @@ class AuthAdminCliTestCase(unittest.TestCase):
         user = self._store().get_user("operator")
         assert user is not None
         self.assertEqual(user.phone, PHONE)
+
+    def test_cli_preserves_arbitrary_names_and_escapes_terminal_controls(self) -> None:
+        self.assertEqual(self._run("migrate")[0], 0)
+        store = self._store()
+        username = " 中文🚗 \n\x1b[31m "
+        store.create_user(username, HASH, role="new_user")
+        code, out, _ = self._run("set-role", username, "operator")
+        self.assertEqual(code, 0)
+        self.assertNotIn("\x1b", out)
+        self.assertIn("中文🚗", out)
+        self.assertEqual(store.get_user(username).role, "operator")
+        code, out, _ = self._run("list")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(out.splitlines()), 2)
+        self.assertNotIn("\x1b", out)
+        self.assertEqual(self._run("delete-user", username)[0], 0)
+        self.assertFalse(store.username_reserved(username))
 
     def test_set_password_disable_enable_and_revocation(self) -> None:
         self.assertEqual(self._run("migrate")[0], 0)
@@ -433,7 +451,8 @@ class AuthAdminCliTestCase(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("已删除 Second.Ops", out)
         self.assertIsNone(store.get_user("Second.Ops"))
-        self.assertTrue(store.username_reserved("SECOND.OPS"))
+        self.assertFalse(store.username_reserved("SECOND.OPS"))
+        self.assertIn("可以重新注册", out)
         self.assertFalse(store.phone_allowed(PHONE))
         self.assertEqual(self._run("delete-user", "second.ops")[0], 2)
         code, _, err = self._run("import-htpasswd", "--source", str(self.htpasswd))

@@ -13,11 +13,15 @@ import sqlite3
 from datetime import date, timedelta
 from typing import Any, Mapping
 
-from .account_classification import classification_sql, classification_updated_at_sql
+from .account_classification import ACCOUNT_GROUPS, BUSINESS_DIRECTIONS, classification_sql, classification_updated_at_sql
 from .content_scope import canonical_content_predicate
-from .source_routing import parse_time
+from .source_routing import load_policy, parse_time
 from .statistics_scope import content_statistics_scope_sql
 from .storage import now_utc
+from . import report_metric_validity
+from .insights import OVERVIEW_CHANNELS
+from .contracts import FOUR_PLATFORM_REPORT_VERSION
+from .audience_rate import calibration_binding
 
 SCOPE_EVENT = "report_scope_v1"
 INPUT_EVENT = "report_inputs_v1"
@@ -25,6 +29,64 @@ CONTRACT_VERSION = "report-inputs-v1"
 ACCOUNT_CLASSIFICATION_VERSION = "account-classification-v2"
 PROFILE_DAY_SCAN_INPUT_CONTRACT = "report-profile-day-scan-inputs-v1"
 PROFILE_DAY_PERIOD_COVERAGE_CONTRACT = "profile-day-coverage-period-v1"
+
+
+def project_content_classification(content: Mapping[str, Any]) -> dict[str, Any]:
+    """Expose only explicitly frozen current account labels, never infer legacy enums."""
+    result = dict(content)
+    for field in ("account_type", "legacy_account_type", "account_content_direction"):
+        result.pop(field, None)
+    for field, options in (("account_group", ACCOUNT_GROUPS),
+                           ("business_direction", BUSINESS_DIRECTIONS)):
+        value = result.get(field)
+        result[field] = value if isinstance(value, str) and value in options else "unknown"
+    return result
+
+
+def project_account_classification(report: Mapping[str, Any]) -> dict[str, Any]:
+    """Present archived reports with current labels without rewriting their evidence.
+
+    Classification is sourced only from this frozen report. Missing labels remain
+    unknown; today's directory cannot establish an account's historical group.
+    A changed presentation identifies its original frozen input hash separately.
+    """
+    result = copy.deepcopy(dict(report))
+    legacy_dimensions = result.pop("account_type_dimensions", [])
+    for field in ("account_type", "legacy_account_type", "account_content_direction"):
+        result.pop(field, None)
+    details = result.get("content_details")
+    details = details if isinstance(details, list) else []
+    projected_details = [project_content_classification(row) for row in details]
+    if "content_details" in result:
+        result["content_details"] = projected_details
+    publication = result.get("summary_metrics", {}).get("publication_count", {}).get("value")
+    total = max(0, int(publication)) if isinstance(publication, (int, float)) else len(details)
+    if not total and isinstance(legacy_dimensions, list):
+        total = sum(max(0, int(row.get("count") or 0)) for row in legacy_dimensions)
+    for field in ("account_group", "business_direction"):
+        key = f"{field}_dimensions"
+        if isinstance(result.get(key), list):
+            # Existing new dimensions are already frozen; do not replace them
+            # from incomplete historical detail rows or the current directory.
+            continue
+        counts: dict[str, int] = {}
+        for row in projected_details:
+            value = row[field]
+            counts[value] = counts.get(value, 0) + 1
+        missing = max(0, total - len(projected_details))
+        if missing:
+            counts["unknown"] = counts.get("unknown", 0) + missing
+        result[key] = [{"key": value, "count": count,
+                        "percentage": round(count / total * 100, 2) if total else 0.0}
+                       for value, count in sorted(counts.items())]
+    metadata = result.setdefault("metadata", {})
+    metadata["account_classification_version"] = ACCOUNT_CLASSIFICATION_VERSION
+    if result != report:
+        frozen = result.pop("frozen_inputs", None)
+        if frozen is not None:
+            result["source_frozen_inputs"] = frozen
+        metadata["account_classification_projection"] = "account-classification-display-v2"
+    return result
 
 
 class FrozenInputError(RuntimeError):
@@ -98,9 +160,23 @@ def compact_profile_day_scan_inputs(
         referenced_days.add(business_day)
         day = days_by_date[business_day]
         if day.get("known") is not True:
-            raise FrozenInputError(
-                "profile-day receipt reference points to an unknown day"
-            )
+            discovery = scans.get("discovery_coverage", {})
+            observation = scans.get("pipeline_observation", {})
+            if not (
+                day.get("known") is False
+                and day.get("complete") is False
+                and day.get("partial_publishable") is False
+                and isinstance(day.get("reason"), str) and day["reason"].strip()
+                and scans.get("complete") is False
+                and scans.get("partial_publishable") is False
+                and isinstance(discovery, Mapping)
+                and discovery.get("status") == "unknown"
+                and discovery.get("percentage") is None
+                and discovery.get("accounted_percentage") is None
+                and isinstance(observation, Mapping)
+                and observation.get("status") == "incomplete"
+            ):
+                raise FrozenInputError("unknown profile-day receipt cannot claim coverage")
         for field in ("run_id", "attempt_id", "sequence"):
             value = reference.get(field)
             if type(value) is not int or value < 1:
@@ -146,7 +222,9 @@ def compact_profile_day_scan_inputs(
         for business_day, day in days_by_date.items()
         if day.get("known") is True
     }
-    if referenced_days != known_days:
+    # Unknown native receipts also have immutable identities. Their presence
+    # establishes traceability of the unknown result, never successful coverage.
+    if not known_days.issubset(referenced_days):
         raise FrozenInputError(
             "profile-day receipt references do not cover every known day"
         )
@@ -196,6 +274,42 @@ def _store(connection: sqlite3.Connection, task_id: str, kind: str, payload: Map
     return {**value, "event_id": inserted.lastrowid}
 
 
+def freeze_content_identity_aliases(connection: sqlite3.Connection, contents: list[dict[str, Any]],
+                                   *, knowledge_at: str) -> dict[str, Any]:
+    """Freeze platform IDs with their owner as known at the scope cutoff.
+
+    Merge events retain the pre-merge identity rows. Reverse later merges so a
+    subsequently moved alias cannot establish an earlier report's ownership.
+    """
+    platforms = {int(row["id"]): str(row["platform"]) for row in contents}
+    selected = {}
+    ids = sorted(platforms)
+    for offset in range(0, len(ids), 800):
+        batch = ids[offset:offset+800]
+        query = "SELECT * FROM content_identities WHERE identity_kind='platform_content_id' AND julianday(created_at)<=julianday(?) AND content_id IN (" + ",".join("?" for _ in batch) + ")"
+        selected.update({int(row["id"]): dict(row) for row in connection.execute(query, (knowledge_at,*batch))})
+    for event in connection.execute("SELECT identity_snapshot_json FROM content_identity_merge_events "
+            "WHERE julianday(recorded_at)>julianday(?) ORDER BY julianday(recorded_at) DESC,id DESC", (knowledge_at,)):
+        for row in json.loads(event[0]).get("identities", []):
+            if row.get("identity_kind") != "platform_content_id" or parse_time(row["created_at"]) > parse_time(knowledge_at):
+                continue
+            if int(row["content_id"]) in platforms:
+                selected[int(row["id"])] = row
+            else:
+                selected.pop(int(row["id"]), None)
+    frozen = []
+    aliases = {cid:set() for cid in ids}
+    for row in sorted(selected.values(), key=lambda item: (int(item["content_id"]), int(item["id"]))):
+        cid, value = int(row["content_id"]), str(row["identity_value"])
+        if not value or row["platform_identity_key"] != platforms[cid] + ":" + value:
+            raise FrozenInputError("content identity alias platform binding is invalid")
+        aliases[cid].add(value)
+        frozen.append({key:row[key] for key in ("id","content_id","identity_kind","identity_value","platform_identity_key","created_at")})
+    for row in contents:
+        row["platform_content_id_aliases"] = sorted(aliases[int(row["id"])])
+    return {"contract_version":"report-content-identity-aliases-v1", "knowledge_at":knowledge_at, "rows":frozen}
+
+
 def freeze_scope(connection: sqlite3.Connection, task: Mapping[str, Any], *, start_at: str,
                  end_at: str, cutoff_at: str) -> dict[str, Any]:
     existing = load_event(connection, str(task["id"]), SCOPE_EVENT)
@@ -234,7 +348,7 @@ def freeze_scope(connection: sqlite3.Connection, task: Mapping[str, Any], *, sta
             value.update(account_id=None, account_group="unknown", business_direction="unknown")
         # Content imports may still carry legacy source metadata; new snapshots
         # never turn that historical label into the current account taxonomy.
-        value.pop("legacy_account_type", None)
+        value = project_content_classification(value)
         if reasons:
             unknown[str(value["id"])] = reasons
             value.update(account_group="unknown", business_direction="unknown")
@@ -251,11 +365,24 @@ def freeze_scope(connection: sqlite3.Connection, task: Mapping[str, Any], *, sta
                        f"AND {canonical_content_predicate(connection, knowledge_at=cutoff_at)} "
                        f"AND {content_statistics_scope_sql(connection=connection)} "
                        "ON CONFLICT(task_id,content_id) DO NOTHING", (task["id"], cutoff_at, cutoff_at))
+    metric_validity = report_metric_validity.scope_binding(
+        task, cutoff_at=cutoff_at,
+        schema_version=int(connection.execute("PRAGMA user_version").fetchone()[0]),
+    )
+    source_policy = (load_policy(policy_version=metric_validity["source_policy_version"])
+                     if metric_validity else None)
+    current = bool(metric_validity and metric_validity["contract_version"] == report_metric_validity.CURRENT_CONTRACT_VERSION)
+    aliases = freeze_content_identity_aliases(connection, contents, knowledge_at=cutoff_at) if current else None
     return _store(connection, str(task["id"]), SCOPE_EVENT, {
         "task_id": task["id"], "cutoff_at": cutoff_at, "period_start_at": start_at,
         "period_end_at": end_at, "content_ids": [row["id"] for row in contents],
         "contents": contents, "unknown_dimensions": unknown,
         "account_classification_version": ACCOUNT_CLASSIFICATION_VERSION,
+        **({"channels": [list(item) for item in OVERVIEW_CHANNELS], "knowledge_at": cutoff_at,
+            "report_version": FOUR_PLATFORM_REPORT_VERSION, "audience_calibration": calibration_binding(),
+            "content_identity_aliases": aliases} if current else {}),
+        **({"metric_validity": metric_validity, "source_policy": source_policy,
+            "source_policy_sha256": digest(source_policy)} if metric_validity else {}),
     })
 
 
@@ -279,3 +406,31 @@ def render_frozen(event: Mapping[str, Any], *, revision: int, generated_at: str,
     report["files"] = copy.deepcopy(files)
     report["frozen_inputs"] = {"contract_version": CONTRACT_VERSION, "event_id": event["event_id"], "sha256": event["sha256"]}
     return report
+
+
+def validate_account_classification_projection(
+    report: Mapping[str, Any], source_event: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Verify a displayed revision against its exact immutable source evidence.
+
+    Source hashes are never checked against a changed presentation. Instead the
+    original report must pass its frozen contract, and its deterministic current
+    projection must equal the entire presented report.
+    """
+    from .contracts import validate_report
+
+    if (source_event.get("contract_version") != CONTRACT_VERSION
+            or type(source_event.get("event_id")) is not int
+            or source_event.get("sha256") != digest(source_event.get("payload"))):
+        raise FrozenInputError("classification projection source event hash differs")
+    metadata = report.get("metadata")
+    if not isinstance(metadata, Mapping):
+        raise FrozenInputError("classification projection metadata is missing")
+    source = render_frozen(source_event, revision=metadata.get("revision"),
+                           generated_at=metadata.get("generated_at"), files=report.get("files", []))
+    validate_report(source)
+    if report.get("source_frozen_inputs") != source["frozen_inputs"]:
+        raise FrozenInputError("classification projection source binding differs")
+    if project_account_classification(source) != report:
+        raise FrozenInputError("classification projection differs from its frozen source")
+    return source

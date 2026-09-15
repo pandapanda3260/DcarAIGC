@@ -7,6 +7,10 @@ SUPPORTED_OPERATIONS = frozenset({
     "douyin_uid_profile", "douyin_user_posts", "xiaohongshu_user_posts",
     "douyin_video_detail", "douyin_video_statistics",
     "xiaohongshu_note_detail", "xiaohongshu_note_statistics",
+    "xiaohongshu_user_profile", "kuaishou_user_profile", "wechat_channels_user_profile",
+    "kuaishou_user_posts", "wechat_channels_user_posts",
+    "kuaishou_video_detail", "kuaishou_video_statistics",
+    "wechat_channels_video_detail", "wechat_channels_video_statistics",
 })
 
 
@@ -32,6 +36,45 @@ def require_response(operation: str, identity: Mapping[str, Any], payload: Any, 
     try:
         subject = identity["subject"]
         params = identity.get("request_parameters", {})
+        platform = next((name for name in ("kuaishou", "wechat_channels") if operation.startswith(name + "_")), None)
+        if platform:
+            from . import kuaishou_adapter, wechat_channels_adapter
+            adapter = kuaishou_adapter if platform == "kuaishou" else wechat_channels_adapter
+            if operation.endswith("_user_profile"):
+                parameter = "user_id" if platform == "kuaishou" else "username"
+                if params.get(parameter) != subject or account_uid not in (None, subject):
+                    raise OperationContractError("Recovery profile request identity differs")
+                adapter.parse_profile(payload, subject)
+            elif operation.endswith("_user_posts"):
+                parameter = "user_id" if platform == "kuaishou" else "username"
+                if not account_uid or subject != account_uid or params.get(parameter) != subject:
+                    raise OperationContractError("Recovery discovery account identity differs")
+                parsed = adapter.parse_discovery(payload, account_uid)
+                if parsed.get("has_more") and (not parsed.get("items") or parsed.get("next_cursor") in (None, "", identity.get("cursor"))):
+                    raise OperationContractError("Recovery page has no advancing cursor")
+                from .tikhub_scan import _item_evidence
+                evidence = [_item_evidence(platform, item) for item in parsed["items"]]
+                if any(item["event_tuple"] is None for item in evidence):
+                    raise OperationContractError("Recovery page omitted a member identity or publication time")
+                identifiers = [item["platform_content_id"] for item in evidence]
+                if len(set(identifiers)) != len(identifiers):
+                    raise OperationContractError("Recovery page contains duplicate members")
+            else:
+                parameter = "photo_id" if platform == "kuaishou" else "object_id"
+                if not account_uid or params.get(parameter) != subject:
+                    raise OperationContractError("Recovery content has no bound author UID")
+                stage = "detail" if operation.endswith("_detail") else "metrics"
+                parsed = adapter.parse_stage(stage, subject, payload, expected_uid=account_uid)
+                if stage == "metrics" and not any(value.get("status") == "provided"
+                        for value in parsed.get("metrics", parsed).get("_field_status", {}).values()):
+                    raise OperationContractError("Recovery statistics have no provided metrics")
+            return
+        if operation == "xiaohongshu_user_profile":
+            from .account_metrics import parse_tikhub_profile
+            parsed = parse_tikhub_profile(payload, platform="xiaohongshu", uid=params.get("user_id", subject))
+            if parsed["field_status"]["follower_count"]["status"] != "provided":
+                raise OperationContractError("Recovery profile omitted a valid follower count")
+            return
         # Recovery uses actual provider envelopes, never local replay shortcuts.
         if operation.startswith("douyin_"):
             providers._tikhub_douyin_data(payload)

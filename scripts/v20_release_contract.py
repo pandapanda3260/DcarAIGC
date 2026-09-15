@@ -74,8 +74,6 @@ def verified_reference(value: Any, *, project_root: Path | None = None) -> dict[
     if not isinstance(value, dict) or not isinstance(value.get("path"), str) or not _HASH.fullmatch(str(value.get("sha256"))):
         raise ReleaseContractError("evidence requires an exact path and SHA-256")
     path = Path(value["path"])
-    from v8.capture_evidence_preflight import observe_file
-    observe_file(path)
     if not path.is_absolute() or path.is_symlink() or path.resolve(strict=True) != path:
         raise ReleaseContractError("release evidence path must be canonical")
     if project_root is not None and path.is_relative_to(project_root.resolve()):

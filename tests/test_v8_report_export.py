@@ -15,6 +15,7 @@ from v8.report_export import (
     build_accounts_workbook,
     build_report_detail_workbook,
     build_report_download_bundle,
+    project_content_csv,
     report_bundle_filename,
     report_file_filename,
 )
@@ -124,8 +125,8 @@ class ReportExportTest(unittest.TestCase):
         svg = render_summary_svg(report)
         root = ElementTree.fromstring(svg)
         self.assertEqual(root.attrib["width"], "1200")
-        self.assertEqual(root.attrib["height"], "675")
-        self.assertEqual(root.attrib["viewBox"], "0 0 1200 675")
+        self.assertEqual(root.attrib["height"], "815")
+        self.assertEqual(root.attrib["viewBox"], "0 0 1200 815")
         text = "".join(
             "".join(element.itertext())
             for element in root.iter()
@@ -138,7 +139,8 @@ class ReportExportTest(unittest.TestCase):
             "部分完成",
             "已纳入内容中",
             "平台结构",
-            "账号类型构成",
+            "账号分组构成",
+            "业务方向",
             "内容方向",
             "数据完整度",
             "1,234",
@@ -148,8 +150,8 @@ class ReportExportTest(unittest.TestCase):
             "其他平台",
             "494 条",
             "混剪",
-            "原创",
-            "精品 IP",
+            "创新号",
+            "精品IP号",
             "待补齐",
             "新车",
             "其他",
@@ -318,8 +320,9 @@ class ReportExportTest(unittest.TestCase):
                 "标题",
                 "平台账号编号",
                 "账号名称",
-                "账号类型",
-                "内容方向",
+                "账号分组",
+                "业务方向",
+                "作品内容方向",
                 "资料完整度",
                 "主要卖点编号",
                 "卖点信息",
@@ -329,17 +332,18 @@ class ReportExportTest(unittest.TestCase):
                 "评论数",
             ],
         )
-        self.assertEqual(len(values[0]), 20)
+        self.assertEqual(len(values[0]), 21)
+        self.assertEqual(values[1][11:13], ["未填写", "未填写"])
         self.assertEqual(values[1][0], "2026-08-03 至 2026-08-16")
         self.assertEqual(values[1][1], "D8-C-TEST")
         self.assertEqual(values[1][2], "7668604214154726706")
         self.assertEqual(values[1][2], values[1][7].rsplit("/", 1)[-1])
         self.assertEqual(values[1][3], "RC49YU")
-        self.assertEqual(values[1][13], "资料完整（V3）")
-        self.assertEqual(values[1][14:16], ["C1", "汽车服务"])
-        self.assertEqual(values[2][14:16], ["卖点资料不足", "卖点资料不足"])
+        self.assertEqual(values[1][14], "资料完整（V3）")
+        self.assertEqual(values[1][15:17], ["C1", "汽车服务"])
+        self.assertEqual(values[2][15:17], ["卖点资料不足", "卖点资料不足"])
         self.assertEqual(
-            {row[13] for row in values[1:]},
+            {row[14] for row in values[1:]},
             {"资料完整（V3）", "资料较完整（V2，图文内容）", "资料较完整（V2）", "资料不足（V1）", "还没有评估"},
         )
         root = ElementTree.fromstring(content_sheet)
@@ -350,12 +354,12 @@ class ReportExportTest(unittest.TestCase):
         auto_filter = root.find("x:autoFilter", _SHEET_NAMESPACE)
         self.assertIsNotNone(auto_filter)
         assert auto_filter is not None
-        self.assertEqual(auto_filter.attrib["ref"], "A1:T6")
+        self.assertEqual(auto_filter.attrib["ref"], "A1:U6")
         self.assertEqual(cells["C2"].attrib.get("t"), "inlineStr")
         self.assertEqual(cells["C2"].attrib.get("s"), "12")
         self.assertEqual(cells["G2"].attrib.get("s"), "8")
         self.assertEqual(cells["G2"].find("x:v", _SHEET_NAMESPACE).text, "46238")
-        for reference, expected in (("Q2", "92"), ("R2", "86"), ("S2", "61853"), ("T2", "0")):
+        for reference, expected in (("R2", "92"), ("S2", "86"), ("T2", "61853"), ("U2", "0")):
             self.assertNotEqual(cells[reference].attrib.get("t"), "inlineStr")
             self.assertEqual(cells[reference].find("x:v", _SHEET_NAMESPACE).text, expected)
 
@@ -572,6 +576,32 @@ class ReportExportTest(unittest.TestCase):
                 return SimpleNamespace(returncode=0)
             with patch("v8.reports.shutil.which", side_effect=lambda name: "/usr/bin/sips" if name == "sips" else None), patch("v8.reports.subprocess.run", side_effect=fake_run):
                 self.assertTrue(render_summary_png(svg_path, png_path))
+
+    def test_historical_csv_uses_only_explicit_frozen_new_labels(self) -> None:
+        source = b"content_id,account_type,account_content_direction,content_direction,title\n1,original,used_car,media,=1+1\n2,mixed_edit,new_car,new_car,plain\n"
+        frozen = [{"content_id": 1, "account_group": "image_text", "business_direction": "used_car_c2"}]
+        projected = project_content_csv(source, content_rows=frozen)
+        rows = list(csv.DictReader(io.StringIO(projected.decode("utf-8-sig"))))
+        self.assertEqual((rows[0]["account_group"], rows[0]["business_direction"], rows[0]["content_direction"]),
+                         ("image_text", "used_car_c2", "media"))
+        self.assertEqual((rows[1]["account_group"], rows[1]["business_direction"], rows[1]["content_direction"]),
+                         ("unknown", "unknown", "new_car"))
+        self.assertEqual(rows[0]["title"], "'=1+1")
+        self.assertNotIn(b"account_type", projected)
+        self.assertNotIn(b"account_content_direction", projected)
+        self.assertEqual(project_content_csv(projected), projected)
+        self.assertIn(b"original", source)
+
+    def test_early_historical_svg_has_current_taxonomy_without_invented_quality_gates(self) -> None:
+        report = {"report_version": "dcar-content-operations-report-v8.1",
+                  "summary_metrics": {"publication_count": {"value": 2}},
+                  "account_type_dimensions": [{"key": "original", "count": 2, "percentage": 100}]}
+        svg = render_summary_svg(report)
+        self.assertIn("账号分组构成", svg)
+        self.assertIn("业务方向", svg)
+        self.assertIn("历史检查规则未声明", svg)
+        self.assertNotIn("账号类型", svg)
+        self.assertNotIn("原创", svg)
 
     def test_summary_png_renderer_uses_aspect_ratio_preserving_renderer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

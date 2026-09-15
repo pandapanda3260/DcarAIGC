@@ -27,6 +27,9 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src/dcar_eval"))
+if str(Path(__file__).resolve().parent) not in sys.path:
+    # The publisher also loads this module by file, outside the CLI entry point.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
 from v8 import media_completion, media_lifecycle, raw_evidence  # noqa: E402
 from v8.artifact_paths import using_artifact_root  # noqa: E402
 from v8.artifact_paths import (  # noqa: E402
@@ -63,6 +66,12 @@ EXPECTED_DATABASE_SCHEMA_VERSION = 19
 EXPECTED_DATABASE_SCHEMA_MIGRATION = "dual-acquisition-profile-roster-v1"
 CLASSIFICATION_SCHEMA_VERSION = 21
 CLASSIFICATION_SCHEMA_MIGRATION = "account-classification-v1"
+INTAKE_SCHEMA_VERSION = 22
+INTAKE_SCHEMA_MIGRATION = "unified-account-intake-v1"
+FLOW_SCHEMA_VERSION = 23
+FLOW_SCHEMA_MIGRATION = "four-platform-forward-flow-v1"
+DUPLICATE_SCHEMA_VERSION = 24
+DUPLICATE_SCHEMA_MIGRATION = "duplicate-fingerprint-index-v1"
 EXPECTED_ACTIVE_RELEASE_ID = "evaluation-v9__selling-points-v5.2"
 EXPECTED_ACTIVE_RELEASE_STATUS = "active"
 EXPECTED_RULE_VERSION = "evaluation-v9"
@@ -236,9 +245,12 @@ def _runtime_identity(snapshot_db: Path, *, expected_user_version: int = EXPECTE
         "taxonomy_status": str(release["taxonomy_status"]),
         "matcher_rule_sha256": matcher_rule_sha256,
     }
-    versions = {19: EXPECTED_DATABASE_SCHEMA_MIGRATION, 20: "integrated-video-capture-v25", 21: "account-classification-v1"}
+    versions = {19: EXPECTED_DATABASE_SCHEMA_MIGRATION, 20: "integrated-video-capture-v25",
+                CLASSIFICATION_SCHEMA_VERSION: CLASSIFICATION_SCHEMA_MIGRATION,
+                INTAKE_SCHEMA_VERSION: INTAKE_SCHEMA_MIGRATION,
+                FLOW_SCHEMA_VERSION: FLOW_SCHEMA_MIGRATION, DUPLICATE_SCHEMA_VERSION: DUPLICATE_SCHEMA_MIGRATION}
     if expected_user_version not in versions:
-        raise SnapshotBuildError("snapshot requires explicit schema19, schema20 or schema21")
+        raise SnapshotBuildError("snapshot requires explicit schema19, schema20, schema21, schema22, schema23 or schema24")
     expected = {
         "schema": RUNTIME_IDENTITY_SCHEMA,
         "report_version": EXPECTED_REPORT_VERSION,
@@ -1198,7 +1210,8 @@ def build_snapshot(
         )
         deployment_readiness = None
         code_successor = None
-        if runtime_identity["database_schema_version"] in {20, 21}:
+        schema_version = runtime_identity["database_schema_version"]
+        if schema_version in {20, 21, 22, 23, 24}:
             from v20_release_contract import ReleaseContractError, validate_deployment_receipt
 
             try:
@@ -1207,18 +1220,25 @@ def build_snapshot(
 
                     from v8.account_cleanup_snapshot import is_cleanup, validate as validate_cleanup
                     cleanup = is_cleanup(connection, deployment_id)
-                    if runtime_identity["database_schema_version"] == 21 and not cleanup:
-                        raise SnapshotBuildError("schema21 requires inherited cleanup and classification migration proof")
+                    if schema_version in {21, 22, 23, 24} and not cleanup:
+                        raise SnapshotBuildError(f"schema{schema_version} requires inherited cleanup and migration proof")
                     if not cleanup:
                         code_successor = current_proof(connection, project_root=project_root, at=_utc_now())
-                    if runtime_identity["database_schema_version"] == 21:
+                    if schema_version in {21, 22, 23, 24}:
                         deployment_readiness = validate_cleanup(connection, deployment_id=deployment_id, project_root=project_root)
-                        if (deployment_readiness.get("schema_version") != 21
-                                or deployment_readiness.get("schema_migration") != CLASSIFICATION_SCHEMA_MIGRATION
+                        migration_name = {21: CLASSIFICATION_SCHEMA_MIGRATION, 22: INTAKE_SCHEMA_MIGRATION,
+                            23: FLOW_SCHEMA_MIGRATION, 24: DUPLICATE_SCHEMA_MIGRATION}[schema_version]
+                        if (deployment_readiness.get("schema_version") != schema_version
+                                or deployment_readiness.get("schema_migration") != migration_name
                                 or not isinstance(deployment_readiness.get("account_classification_migration"), dict)):
-                            raise SnapshotBuildError("schema21 classification migration proof is missing")
+                            raise SnapshotBuildError(f"schema{schema_version} classification migration proof is missing")
+                        if schema_version in {22, 23, 24} and not isinstance(deployment_readiness.get("account_intake_migration"), dict):
+                            raise SnapshotBuildError("schema22 account intake migration proof is missing")
+                        if schema_version in {23, 24}:
+                            from v8.snapshot_schema_successor import publication_evidence
+                            publication_evidence(connection)  # Ready generation and full posting verification.
                         if require_accepted_deployment and deployment_readiness.get("status") != "accepted":
-                            raise SnapshotBuildError("schema21 deployment has not been accepted")
+                            raise SnapshotBuildError(f"schema{schema_version} deployment has not been accepted")
                     else:
                         deployment_readiness = validate_deployment_receipt(
                             connection, deployment_id=deployment_id, require_accepted=require_accepted_deployment,
@@ -1227,7 +1247,7 @@ def build_snapshot(
             except ReleaseContractError as exc:
                 raise SnapshotBuildError(str(exc)) from exc
         elif deployment_id is not None or require_accepted_deployment:
-            raise SnapshotBuildError("deployment readiness selection requires explicit schema20 or schema21")
+            raise SnapshotBuildError("deployment readiness selection requires explicit schema20, schema21, schema22, schema23 or schema24")
         aliases: dict[str, dict[str, Any]] = {}
         private_directory = _private_deployment_directory(deployment_readiness, project_root=project_root,
             code_successor=code_successor)

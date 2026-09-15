@@ -245,7 +245,7 @@ phone receipt must already have passed with the production signature/template.
 
 Before cutover, **do not run new account CLI commands against the live old
 database**. Only explicit `migrate` changes the schema; normal commands such as
-`list`, `set-phone` and `allow-phone` check schema/health and reject an old or
+`list` and `set-phone` check schema/health and reject an old or
 missing database with a "run migrate first" error. `sms-test` does not open the
 account database. Use it for the real receipt test, and keep other candidate
 experiments on scratch databases. Leave formal migration/import/bootstrap to
@@ -276,8 +276,9 @@ every change made on the user-management page is appended to
 the database transaction commits, and a commit marker supplies the completion
 time. `changes --since <ISO time>` emits normalized committed/conservative
 records. Exit 3 requires reconciliation, not retrying or ignoring the warning.
-Only after `deploy` returns success, bind the verified operator phone with `set-phone dcar <phone>`
-and `allow-phone <phone> --note <operator>` using the CLI below. Do not guess a
+Only after `deploy` returns success, bind an existing operator's verified phone if needed with
+`set-phone dcar <phone>` using the CLI below. New users register through SMS verification
+without a phone admission list, then an administrator grants business access. Do not guess a
 phone or send registration SMS to a person whose number has not been confirmed.
 Do not insert these account writes between the deploy helper's migration and
 its successful final smoke. A corrupt or partially written change log fails

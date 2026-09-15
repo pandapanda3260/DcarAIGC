@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Label the 30-account Douyin sample with the DCar user-task taxonomy v2.
+"""Replay the frozen 2026-08-01 Douyin sample with the historical v2 taxonomy.
+
+The standalone export preserves that sample's original quality labels for
+historical reproducibility. It is not the current account directory or report
+export; current account classifications live in v8.account_classification.
 
 The classifier is deliberately conservative: a DCar hashtag or account ownership
 alone never establishes an official selling point.  Official labels require an

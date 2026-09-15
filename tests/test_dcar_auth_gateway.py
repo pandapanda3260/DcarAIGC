@@ -13,6 +13,7 @@ import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
+from html import escape
 from pathlib import Path
 from typing import Iterator
 from unittest.mock import patch
@@ -474,7 +475,7 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
                 self.assertEqual(page.json()["upstream"], "web")
                 self.assertEqual(
                     page.json()["authenticated_user"],
-                    auth_gateway.BYPASS_USERNAME,
+                    hashlib.sha256(auth_gateway.BYPASS_USERNAME.encode()).hexdigest(),
                 )
 
                 api = client.get(_route(base_path, "/api/v8/overview"))
@@ -482,7 +483,7 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
                 self.assertEqual(api.json()["upstream"], "api")
                 self.assertEqual(
                     api.json()["authenticated_user"],
-                    auth_gateway.BYPASS_USERNAME,
+                    hashlib.sha256(auth_gateway.BYPASS_USERNAME.encode()).hexdigest(),
                 )
 
                 destination = _route(base_path, "/selling-points?window=this-week")
@@ -508,6 +509,8 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
                     {
                         "authenticated": True,
                         "username": auth_gateway.BYPASS_USERNAME,
+                        "display_name": "",
+                        "bypass": True,
                     },
                 )
 
@@ -932,7 +935,7 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
                 self.assertEqual(session.status_code, 200)
                 self.assertEqual(
                     session.json(),
-                    {"authenticated": True, "username": USERNAME, "role": "operator"},
+                    {"authenticated": True, "username": USERNAME, "display_name": "", "role": "operator", "bypass": False},
                 )
 
                 client.post(
@@ -1207,7 +1210,7 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
                     web.json()["path"], _route(base_path, "/selling-points")
                 )
                 self.assertEqual(web.json()["query"], "window=this-week")
-                self.assertEqual(web.json()["authenticated_user"], USERNAME)
+                self.assertEqual(web.json()["authenticated_user"], hashlib.sha256(USERNAME.encode()).hexdigest())
                 self.assertIsNone(web.json()["authorization"])
                 self.assertIsNone(web.json()["cookie"])
 
@@ -1224,7 +1227,7 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
                 self.assertEqual(api.json()["path"], "/api/v8/contents/search")
                 self.assertEqual(api.json()["query"], "limit=5")
                 self.assertEqual(api.json()["body"], '{"query":"demo"}')
-                self.assertEqual(api.json()["authenticated_user"], USERNAME)
+                self.assertEqual(api.json()["authenticated_user"], hashlib.sha256(USERNAME.encode()).hexdigest())
                 self.assertIsNone(api.json()["authorization"])
                 self.assertIsNone(api.json()["cookie"])
 
@@ -1443,7 +1446,7 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
                         self.assertEqual(conditional.content, b"")
                         self.assertEqual(conditional.headers["cache-control"], "private, no-cache")
                         self.assertEqual(seen[-1].headers["if-none-match"], first.headers["etag"])
-                        self.assertEqual(seen[-1].headers["x-dcar-authenticated-user"], USERNAME)
+                        self.assertEqual(seen[-1].headers["x-dcar-authenticated-user"], hashlib.sha256(USERNAME.encode()).hexdigest())
                     changed = client.get(path, headers={"If-None-Match": 'W/"older123"'})
                     self.assertEqual(changed.status_code, 200)
                     reached_before = len(seen)
@@ -1567,7 +1570,6 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
         for content in (
             f"{USERNAME}:$apr1$legacy$hash\n",
             f"{USERNAME}:{self.password_hash}\nOPERATOR:{self.password_hash}\n",
-            f"temporary-bypass:{self.password_hash}\n",
             "bad line without colon\n",
             f"运营:{self.password_hash}\n",
             "",
@@ -1669,9 +1671,6 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
 
     def test_register_rejections_do_not_send_or_consume(self) -> None:
         with self._client("") as (client, config):
-            not_allowed = self._request_code(client, "", "13700137000", "register")
-            self.assertEqual(not_allowed.status_code, 403)
-            self.assertEqual(not_allowed.json()["code"], "phone_not_allowed")
             already = self._request_code(client, "", PHONE, "register")
             self.assertEqual(already.status_code, 409)
             self.assertEqual(already.json()["code"], "phone_registered")
@@ -1725,6 +1724,77 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
             self.assertEqual(ok.status_code, 200, ok.text)
             store = self._store_for(config)
             self.assertGreaterEqual(store.failure_count(auth_store.AuthStore.ip_key("testclient")), 1)
+
+    def test_open_registration_unrestricted_names_complete_approval_lifecycle(self) -> None:
+        # No allow-phone step: exercise the public path and the same session
+        # before/after an administrator grants business access.
+        from urllib.parse import quote
+        names = (
+            "person@example.com",
+            " 中文🚗 @.:/<>\"'&%+_\\\r\n\t\x00 ",
+            "a",
+            "   ",
+            "temporary-bypass",
+            "long_" + "名!" * 300,
+            "line\u0085next\u2028line\u2029end",
+        )
+        password = "7Q!z9V@k2R#m"
+        for base_path in ("", "/dcar"):
+            with self._client(base_path, douyin_enabled=True) as (client, config):
+                self._seed_user(config, "reviewer", role="superadmin")
+                store = self._store_for(config)
+                for index, username in enumerate(names):
+                    with self.subTest(base_path=base_path, name_index=index):
+                        phone = f"139012340{index:02d}"
+                        self.assertFalse(store.phone_allowed(phone))
+                        sent = self._request_code(client, base_path, phone, "register")
+                        self.assertEqual(sent.status_code, 200, sent.text)
+                        created = self._post(client, base_path, "/auth/register", {
+                            "username": username, "phone": phone,
+                            "password": password, "code": self._last_code(),
+                        })
+                        self.assertEqual(created.status_code, 200, created.text)
+                        token = client.cookies.get(auth_gateway.SESSION_COOKIE)
+                        session = client.get(_route(base_path, "/auth/session")).json()
+                        self.assertEqual(session["username"], username)
+                        self.assertEqual(session["role"], "new_user")
+                        self.assertIs(session["bypass"], False)
+                        denied = client.get(_route(base_path, "/api/v8/overview"))
+                        self.assertEqual(denied.status_code, 403)
+                        self.assertEqual(denied.json()["code"], "approval_required")
+
+                        self._login_as(client, base_path, "reviewer")
+                        listed = client.get(_route(base_path, "/auth/users")).json()
+                        self.assertIn(username, [row["username"] for row in listed["items"]])
+                        approved = self._post_users(client, base_path, "update", {
+                            "username": username, "phone": phone, "role": "admin", "password": "",
+                        })
+                        self.assertEqual(approved.status_code, 200, approved.text)
+                        self.assertEqual(approved.json()["item"]["username"], username)
+                        client.cookies.clear()
+                        client.cookies.set(auth_gateway.SESSION_COOKIE, token)
+                        business = client.get(_route(base_path, "/api/v8/overview"))
+                        self.assertEqual(business.status_code, 200, business.text)
+                        self.assertEqual(business.json()["authenticated_user"], hashlib.sha256(username.encode()).hexdigest())
+                        for endpoint in ("/users", "/api/douyin/authorizations"):
+                            result = client.get(_route(base_path, endpoint), headers={
+                                "X-Dcar-Authenticated-User-Encoding": "forged",
+                            })
+                            self.assertEqual(result.status_code, 200, result.text)
+                            self.assertEqual(result.json()["authenticated_user"], quote(username, safe="") if "douyin" in endpoint else hashlib.sha256(username.encode()).hexdigest())
+                        client.cookies.clear()
+                        login = self._login(client, base_path, username=username, password=password)
+                        self.assertEqual(login.status_code, 200, login.text)
+                        self.assertEqual(client.get(_route(base_path, "/auth/session")).json()["username"], username)
+                        self._login_as(client, base_path, "reviewer")
+                        deleted = self._post_users(client, base_path, "delete", {"username": username})
+                        self.assertEqual(deleted.status_code, 200, deleted.text)
+                        self.assertIsNone(store.get_user(username))
+                        client.cookies.clear()
+                        replay = client.get(_route(base_path, "/auth/session"), headers={
+                            "Cookie": f"{auth_gateway.SESSION_COOKIE}={token}",
+                        })
+                        self.assertEqual(replay.status_code, 401)
 
     def test_code_login_and_disabled_account(self) -> None:
         with self._client("") as (client, config):
@@ -2112,6 +2182,184 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
             _route(base_path, f"/auth/users/{action}"), json=payload, headers=headers, **overrides
         )
 
+    def _post_profile(self, client: TestClient, base_path: str, payload, **overrides):
+        headers = {"Origin": ORIGIN, "X-Dcar-Request": "profile-update"}
+        headers.update(overrides.pop("headers", {}))
+        if payload is None:
+            return client.post(
+                _route(base_path, "/auth/profile"), content="null",
+                headers={**headers, "Content-Type": "application/json"}, **overrides
+            )
+        return client.post(
+            _route(base_path, "/auth/profile"), json=payload, headers=headers, **overrides
+        )
+
+    def test_profile_update_is_available_to_every_role_and_preserves_login_identity(self) -> None:
+        for base_path in ("", "/dcar"):
+            with self.subTest(base_path=base_path), self._client(base_path) as (client, config):
+                store = self._store_for(config)
+                original = store.get_user(USERNAME)
+                for role in ("new_user", "operator", "admin", "superadmin"):
+                    with self.subTest(role=role):
+                        username = f"profile-{role}"
+                        self._seed_user(config, username, role=role)
+                        self._login_as(client, base_path, username)
+                        before = client.get(_route(base_path, "/auth/session")).json()
+                        self.assertEqual(before["display_name"], "")
+                        token = client.cookies.get(auth_gateway.SESSION_COOKIE)
+                        record_before = store.get_user(username)
+                        display_name = "  程鑫 @ Dcar + / & <昵称> \" ' 😀 e\u0301\n\t  "
+                        updated = self._post_profile(client, base_path, {"display_name": display_name})
+                        self.assertEqual(updated.status_code, 200, updated.text)
+                        self.assertEqual(updated.json(), {**before, "display_name": display_name})
+                        self.assertEqual(updated.headers["cache-control"], "no-store")
+                        self.assertEqual(client.cookies.get(auth_gateway.SESSION_COOKIE), token)
+                        record_after = store.get_user(username)
+                        self.assertEqual(record_after.display_name, display_name)
+                        for field in ("username", "phone", "password_hash", "role", "status"):
+                            self.assertEqual(getattr(record_after, field), getattr(record_before, field))
+                        self.assertEqual(client.get(_route(base_path, "/auth/session")).json(), updated.json())
+                        client.post(
+                            _route(base_path, "/auth/logout"),
+                            headers={"Origin": ORIGIN, "X-Dcar-Request": "logout"},
+                        )
+                        self._login_as(client, base_path, username)
+                        self.assertEqual(client.get(_route(base_path, "/auth/session")).json(), updated.json())
+                # Editing one's profile never changes another account, even
+                # when the actor is an administrator or chooses the same name.
+                self.assertEqual(store.get_user(USERNAME), original)
+
+    def test_profile_accepts_long_and_empty_names_and_admins_can_identify_duplicate_names(self) -> None:
+        with self._client("") as (client, config):
+            self._login_as(client, "", USERNAME)
+            for display_name in ("昵称" * 1000, " ", "", "同名用户"):
+                with self.subTest(length=len(display_name)):
+                    updated = self._post_profile(client, "", {"display_name": display_name})
+                    self.assertEqual(updated.status_code, 200, updated.text)
+                    self.assertEqual(updated.json()["display_name"], display_name)
+                    self.assertEqual(client.get("/auth/session").json()["display_name"], display_name)
+                    self.assertEqual(self._store_for(config).get_user(USERNAME).display_name, display_name)
+            self._seed_user(config, "profile-admin", role="admin")
+            self._login_as(client, "", "profile-admin")
+            self.assertEqual(
+                self._post_profile(client, "", {"display_name": "同名用户"}).status_code, 200
+            )
+            listed = client.get("/auth/users")
+            self.assertEqual(listed.status_code, 200, listed.text)
+            users = {item["username"]: item for item in listed.json()["items"]}
+            self.assertEqual(users[USERNAME]["display_name"], "同名用户")
+            self.assertEqual(users["profile-admin"]["display_name"], "同名用户")
+            self.assertEqual(users[USERNAME]["role"], "operator")
+            self.assertEqual(users["profile-admin"]["role"], "admin")
+
+    def test_profile_contract_rejects_csrf_bad_payloads_and_target_account_fields(self) -> None:
+        with self._client("") as (client, config):
+            self.assertEqual(self._post_profile(client, "", {"display_name": "未登录"}).status_code, 401)
+            self._login_as(client, "", USERNAME)
+            before = self._store_for(config).get_user(USERNAME)
+            for method in ("GET", "PUT", "PATCH", "DELETE"):
+                with self.subTest(method=method):
+                    result = client.request(method, "/auth/profile")
+                    self.assertEqual(result.status_code, 405)
+            for headers in (
+                {"Origin": "https://evil.test"},
+                {"X-Dcar-Request": ""},
+                {"X-Dcar-Request": "user-update"},
+                {"Origin": "", "Sec-Fetch-Site": "cross-site"},
+            ):
+                with self.subTest(headers=headers):
+                    result = self._post_profile(client, "", {"display_name": "不应保存"}, headers=headers)
+                    self.assertEqual(result.status_code, 403, result.text)
+            for payload in (
+                {}, None, [], ["nickname"], {"display_name": None},
+                {"display_name": 123}, {"display_name": True},
+                {"display_name": ["nickname"]}, {"display_name": {"text": "nickname"}},
+                {"display_name": "昵称", "username": "another-user"},
+                {"display_name": "昵称", "role": "superadmin"},
+                {"display_name": "昵称", "phone": NEW_PHONE},
+                {"display_name": "昵称", "password": "changed-password"},
+            ):
+                with self.subTest(payload=payload):
+                    result = self._post_profile(client, "", payload)
+                    self.assertEqual(result.status_code, 400, result.text)
+                    self.assertEqual(result.json()["code"], "invalid_payload")
+            form = client.post(
+                "/auth/profile", data={"display_name": "昵称"},
+                headers={"Origin": ORIGIN, "X-Dcar-Request": "profile-update"},
+            )
+            self.assertEqual(form.status_code, 415)
+            no_length = client.post(
+                "/auth/profile", content=iter([b"{}"]),
+                headers={"Origin": ORIGIN, "X-Dcar-Request": "profile-update", "Content-Type": "application/json"},
+            )
+            self.assertEqual(no_length.status_code, 411)
+            oversized = client.post(
+                "/auth/profile", content=b"{}",
+                headers={"Origin": ORIGIN, "X-Dcar-Request": "profile-update", "Content-Type": "application/json",
+                         "Content-Length": str(auth_gateway.MAX_LOGIN_BODY_BYTES + 1)},
+            )
+            self.assertEqual(oversized.status_code, 413)
+            self.assertEqual(self._store_for(config).get_user(USERNAME), before)
+        with self._client("/bypass", bypass_auth=True) as (client, _config):
+            self.assertEqual(self._post_profile(client, "/bypass", {"display_name": "昵称"}).status_code, 404)
+
+    def test_profile_refuses_disabled_or_revoked_sessions_including_stale_principals(self) -> None:
+        for state in ("disabled", "revoked"):
+            with self.subTest(state=state), self._client("/" + state) as (client, config):
+                base_path = "/" + state
+                store = self._store_for(config)
+                self._login_as(client, base_path, USERNAME)
+                token = client.cookies.get(auth_gateway.SESSION_COOKIE)
+                principal = store.resolve_principal(token)
+                if state == "disabled":
+                    store.set_status(USERNAME, "disabled", actor="test")
+                else:
+                    store.revoke_session(token)
+                # An in-flight request may have resolved the principal before
+                # a concurrent logout/disable. The write must still reject it.
+                with patch.object(auth_store.AuthStore, "resolve_principal", return_value=principal):
+                    result = self._post_profile(client, base_path, {"display_name": "不应保存"})
+                self.assertEqual(result.status_code, 401, result.text)
+                self.assertEqual(result.json()["code"], "session_revoked")
+                self.assertIn("Max-Age=0", result.headers.get("set-cookie", ""))
+                self.assertEqual(store.get_user(USERNAME).display_name, "")
+                client.cookies.set(auth_gateway.SESSION_COOKIE, token)
+                self.assertEqual(self._post_profile(client, base_path, {"display_name": "仍不应保存"}).status_code, 401)
+
+    def test_new_user_pages_render_the_actual_account_and_escape_custom_nicknames(self) -> None:
+        for base_path in ("", "/dcar"):
+            with self.subTest(base_path=base_path), self._client(base_path) as (client, config):
+                username = "new.person+中文@example.com"
+                self._seed_user(config, username, role="new_user")
+                self._login_as(client, base_path, username)
+                self.assertEqual(client.get(_route(base_path, "/auth/session")).json()["display_name"], "")
+                for display_name in ("", "程鑫 </script><img src=x onerror=alert(1)> & \" ' 😀", ""):
+                    updated = self._post_profile(client, base_path, {"display_name": display_name})
+                    self.assertEqual(updated.status_code, 200, updated.text)
+                    for path in ("/overview", "/contents", "/selling-points", "/spu-audience", "/tasks"):
+                        with self.subTest(path=path, display_name=display_name):
+                            shell = client.get(_route(base_path, path), headers={"Accept": "text/html"})
+                            self.assertEqual(shell.status_code, 200, shell.text)
+                            initial_html = shell.text.split("<script>", 1)[0]
+                            self.assertIn(escape(display_name or username, quote=True), initial_html)
+                            self.assertIn("待开通权限", initial_html)
+                            self.assertIn(
+                                '>权限审核开通请飞书联系管理员@程鑫</p>', initial_html
+                            )
+                            self.assertRegex(
+                                initial_html,
+                                r'<p class="empty-copy">联系管理员授予权限，即可查看[^<。]+</p>',
+                            )
+                            self.assertIn('id="profile-nickname"', initial_html)
+                            self.assertRegex(
+                                initial_html,
+                                r'<form(?=[^>]*\bid="profile-form")(?=[^>]*\bhidden\b)[^>]*>',
+                            )
+                            self.assertNotIn("<dialog", initial_html)
+                            self.assertNotIn(">新用户</strong>", initial_html)
+                            self.assertNotIn("</script><img src=x onerror=alert(1)>", shell.text)
+                            self.assertEqual(shell.headers["cache-control"], "no-store")
+
     def test_new_user_has_only_data_free_workbench_and_auth_access(self) -> None:
         for base_path in ("", "/dcar"):
             with self.subTest(base_path=base_path), self._client(
@@ -2138,7 +2386,7 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
                             self.assertEqual(shell.status_code, 200, shell.text)
                             self.assertIn('data-access="pending"', shell.text)
                             self.assertIn(f'data-section="{path[1:]}"', shell.text)
-                            self.assertIn("当前内容尚未开通", shell.text)
+                            self.assertIn("下一步，开通业务权限", shell.text)
                             self.assertIn("刷新权限", shell.text)
                             self.assertIn("退出登录", shell.text)
                             self.assertIn(f"const basePath={json.dumps(base_path)};", shell.text)
@@ -2347,7 +2595,7 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
                 self.assertEqual(listed.headers.get("cache-control"), "no-store")
                 proxied = client.get(_route(base_path, "/users"))
                 self.assertEqual(proxied.status_code, 200)
-                self.assertEqual(proxied.json()["authenticated_user"], "lead")
+                self.assertEqual(proxied.json()["authenticated_user"], hashlib.sha256(b"lead").hexdigest())
                 self.assertEqual(client.post(_route(base_path, "/auth/users")).status_code, 405)
 
     def test_bypass_mode_hides_user_management_entirely(self) -> None:
@@ -2539,7 +2787,7 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
             self.assertEqual(deleted.json(), {})
 
             self.assertIsNone(store.get_user("temp"))
-            self.assertTrue(store.username_reserved("Temp"))
+            self.assertFalse(store.username_reserved("Temp"))
             self.assertFalse(store.phone_allowed("13700000000"))
             with sqlite3.connect(config.session_db_path) as connection:
                 tombstone = connection.execute(
@@ -2552,8 +2800,6 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
                 headers={"Cookie": f"{auth_gateway.SESSION_COOKIE}={temp_cookie}"},
             )
             self.assertEqual(replay.status_code, 401)
-            with self.assertRaises(auth_store.UsernameTaken):
-                store.create_user("temp", self.password_hash, actor="test")
             self._login_as(client, "", "lead")
             self.assertEqual(
                 self._post_users(client, "", "delete", {"username": "temp"}).status_code, 404
@@ -2615,6 +2861,16 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
                 deleted = self._post_users(client, "", "delete", {"username": USERNAME})
             self.assertEqual(deleted.status_code, 503)
             self.assertEqual(deleted.json(), {"detail": "暂时无法处理，请稍后重试", "code": "storage_unavailable"})
+            token = client.cookies.get(auth_gateway.SESSION_COOKIE)
+            with patch.object(
+                auth_store.AuthStore, "update_own_display_name", side_effect=sqlite3.OperationalError("locked")
+            ):
+                profile = self._post_profile(client, "", {"display_name": "未保存的昵称"})
+            self.assertEqual(profile.status_code, 503)
+            self.assertEqual(profile.json()["code"], "storage_unavailable")
+            self.assertNotIn("set-cookie", profile.headers)
+            self.assertEqual(client.cookies.get(auth_gateway.SESSION_COOKIE), token)
+            self.assertEqual(self._store_for(config).get_user("lead").display_name, "")
 
     def test_change_log_defaults_next_to_the_store_and_follows_the_environment(self) -> None:
         config = self._config("")
@@ -2916,7 +3172,7 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
                                  "/workbench-api/accounts", "/workbench-api/account-roster/import"):
                         response = client.get(_route(base_path, path))
                         self.assertEqual(response.status_code, 200, response.text)
-                        self.assertEqual(response.json()["authenticated_user"], username)
+                        self.assertEqual(response.json()["authenticated_user"], hashlib.sha256(username.encode()).hexdigest())
                     for method in ("GET", "POST", "OPTIONS"):
                         for path in ("/api/v8/accounts", "/api/v8/accounts/search", "/api/v8/accounts/export",
                                      "/api/v8/account-roster/import", "/api/v8/account-roster/system/bootstrap"):
@@ -2941,7 +3197,8 @@ class DcarAuthGatewayTestCase(unittest.TestCase):
                              "/oauth/douyin/callback?code=fixture&state=fixture"):
                     response = client.get(_route(base_path, path))
                     self.assertEqual(response.status_code, 200, response.text)
-                    self.assertEqual(response.json()["authenticated_user"], USERNAME)
+                    expected_identity = USERNAME if path.startswith("/oauth/douyin/") else hashlib.sha256(USERNAME.encode()).hexdigest()
+                    self.assertEqual(response.json()["authenticated_user"], expected_identity)
                 response = client.post(_route(base_path, "/workbench-api/contents/9/update-jobs"), json={})
                 self.assertEqual(response.status_code, 200)
 

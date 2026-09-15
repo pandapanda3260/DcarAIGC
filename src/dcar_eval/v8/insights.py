@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from .contracts import ratio_metric, score_metric
 
 
 CHANNELS = (("douyin", "抖音"), ("xiaohongshu", "小红书"))
+# Overview can cover new account platforms without changing frozen report
+# contracts, whose default channel set remains CHANNELS.
+OVERVIEW_CHANNELS = (*CHANNELS, ("kuaishou", "快手"), ("wechat_channels", "视频号"))
 SCENES = (("used_car", "二手车"), ("new_car", "新车"), ("media", "媒体-AI小懂"))
 METRIC_ORDER = (
     "selling_point_count_share",
@@ -85,6 +88,7 @@ def _metrics(
     exposure_calculable: bool,
     exposure_coverage: Optional[float],
     automotive_user_rate: Optional[Dict[str, Any]] = None,
+    audience_classifier_state: str | None = None,
 ) -> Dict[str, Any]:
     eligible = sum(row.get("evidence_level") in {"V2", "V3"} for row in rows)
     selling = [row for row in rows if row.get("selling_point_included")]
@@ -110,6 +114,9 @@ def _metrics(
     if not channel_total:
         exposure_status = "not_applicable"
         exposure_reason = "所选时间内该平台没有发布内容"
+    elif platform == "wechat_channels":
+        exposure_status = "not_calculable"
+        exposure_reason = "当前数据源无法提供视频号可信播放量，曝光指标不可计算"
     elif total_exposure <= 0 and platform in EXPOSURE_SOURCE_GAPS:
         exposure_status = "not_applicable"
         exposure_reason = EXPOSURE_SOURCE_GAPS[platform]
@@ -148,6 +155,10 @@ def _metrics(
             reason=exposure_reason,
         )
 
+    acquisition = _score_metric(rows, "acquisition_potential_score")
+    if rows and (audience_classifier_state is not None and audience_classifier_state != "approved"
+                 or platform in {"kuaishou", "wechat_channels"} and audience_classifier_state != "approved"):
+        acquisition.update(value=None, status="below_threshold", reason="该平台受众定标尚未通过，暂不输出获客结论")
     return {
         "selling_point_count_share": count_metric(selling),
         "core_selling_point_count_share": count_metric(core),
@@ -159,7 +170,7 @@ def _metrics(
             if automotive_user_rate is not None
             else _automotive_user_rate_placeholder(rows)
         ),
-        "acquisition_potential": _score_metric(rows, "acquisition_potential_score"),
+        "acquisition_potential": acquisition,
     }
 
 
@@ -222,6 +233,7 @@ def _channel(
                 exposure_calculable=exposure_calculable,
                 exposure_coverage=exposure_coverage,
                 automotive_user_rate=scene_rate.get("metric"),
+                audience_classifier_state=(scene_rate.get("audience_quality") or {}).get("platform_calibration_state"),
             ),
         }
     return {
@@ -232,6 +244,7 @@ def _channel(
             round(identifiable * 100 / total, 2) if total else None
         ),
         "valid_exposure_items": len(valid_exposure),
+        **({"exposure_capability": "unavailable", "exposure_complete": False} if platform == "wechat_channels" else {}),
         "exposure_coverage_percentage": exposure_coverage,
         "summary": {
             "label": "汇总",
@@ -249,6 +262,7 @@ def _channel(
                 exposure_calculable=exposure_calculable,
                 exposure_coverage=exposure_coverage,
                 automotive_user_rate=summary_audience.get("metric"),
+                audience_classifier_state=(summary_audience.get("audience_quality") or {}).get("platform_calibration_state"),
             ),
         },
         "scenes": scenes,
@@ -259,9 +273,12 @@ def build_channel_conclusions(
     rows: List[Dict[str, Any]],
     *,
     audience_rates: Optional[Dict[str, Dict[str, Any]]] = None,
+    channels: Sequence[tuple[str, str]] = CHANNELS,
 ) -> Dict[str, Any]:
-    """Return the fixed channel -> summary/scenes -> seven-metric contract.
+    """Return channel -> summary/scenes -> seven-metric conclusions.
 
+    The default channel set preserves the published report contract; overview
+    callers explicitly select ``OVERVIEW_CHANNELS``.
     ``audience_rates`` (from :mod:`audience_rate`) supplies the user-level
     ``automotive_user_rate`` and ``audience_quality`` per slice. When omitted,
     the rate degrades to a non-fabricating placeholder so callers that have not
@@ -271,5 +288,5 @@ def build_channel_conclusions(
     audience_rates = audience_rates or {}
     return {
         platform: _channel(rows, platform, label, audience=audience_rates.get(platform))
-        for platform, label in CHANNELS
+        for platform, label in channels
     }

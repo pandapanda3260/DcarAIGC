@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from v8 import capture_day_coverage as coverage, profile_activations, scan_receipts
+from v8.account_catalog_capture_release import ACCOUNT_CATALOG_POLICY_V2
 
 DAY = "2026-09-10"
 LOWER = "2026-09-09T16:00:00Z"
@@ -18,6 +19,12 @@ UPPER = "2026-09-10T16:00:00Z"
 CUTOFF = "2026-09-10T17:00:00Z"
 CREATED = "2026-09-10T16:10:00Z"
 FINISHED = "2026-09-10T16:11:00Z"
+LEGACY_POLICY = {
+    "contract": "account-catalog-automatic-capture-policy-v1",
+    "statuses": ["daily", "weekly"], "identity": "existing_verified",
+    "locator_required": True, "legacy_enabled_ignored": True,
+    "legacy_membership_ignored": True, "pending_labels": "blocked_with_reason",
+}
 
 
 class CatalogDayCoverageTest(unittest.TestCase):
@@ -146,7 +153,7 @@ class CatalogDayCoverageTest(unittest.TestCase):
         }
         self.write_receipts()
 
-    def make_snapshot(self, members):
+    def make_snapshot(self, members, *, policy_sha256=None):
         selection = [
             {
                 k: m[k]
@@ -162,7 +169,7 @@ class CatalogDayCoverageTest(unittest.TestCase):
         ]
         snap = {
             "contract": coverage.SNAPSHOT_CONTRACT,
-            "policy_sha256": "d" * 64,
+            "policy_sha256": policy_sha256 or coverage.planning.digest(LEGACY_POLICY),
             "eligibility": {
                 "eligible_members": members,
                 "excluded_members": [],
@@ -536,6 +543,47 @@ class CatalogDayCoverageTest(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             coverage.validate_source_binding(self.c, binding, CUTOFF)
+
+    def test_all_status_policy_labels_do_not_invalidate_complete_coverage(self):
+        policy_hash = coverage.planning.digest(ACCOUNT_CATALOG_POLICY_V2)
+        self.snapshot = self.make_snapshot([self.member], policy_sha256=policy_hash)
+        self.add_plan(1, "2026-09-09", "2026-09-08T16:10:00Z")
+        self.add_plan(3, "2026-09-11", CREATED)
+        baseline_scope = None
+        for status in ("daily", "weekly", "paused", "unmarked"):
+            with self.subTest(status=status):
+                member = {**self.member, "account_status": status}
+                self.add_plan(2, DAY, "2026-09-09T16:10:00Z",
+                    self.make_snapshot([member], policy_sha256=policy_hash))
+                result = self.result()
+                self.assertTrue(result["complete"], result)
+                binding = result["source_binding"]
+                self.assertTrue(coverage.validate_source_binding(self.c, binding, CUTOFF)["valid"])
+                if baseline_scope is None:
+                    baseline_scope = binding["catalog_scope_sha256"]
+                self.assertEqual(binding["catalog_scope_sha256"], baseline_scope)
+        self.add_plan(2, DAY, "2026-09-09T16:10:00Z",
+            self.make_snapshot([{**self.member, "locator_sha256": "different"}], policy_sha256=policy_hash))
+        self.assertFalse(self.result()["known"])
+
+    def test_legacy_scope_hash_and_frozen_binding_remain_unchanged(self):
+        first = coverage._plan(self.c, 1, CUTOFF)
+        snapshot = first["payload"]["catalog_snapshot"]
+        expected = coverage.planning.digest({"policy_sha256": snapshot["policy_sha256"], "members": [
+            {key: member.get(key) for key in (*coverage.MEMBER_KEYS, "locator_sha256", "account_status")}
+            for member in snapshot["eligibility"]["eligible_members"]]})
+        self.assertEqual(coverage._business_scope_sha256(first), expected)
+        binding = self.result()["source_binding"]
+        self.assertEqual(binding["catalog_scope_sha256"], expected)
+        self.assertTrue(coverage.validate_source_binding(self.c, binding, CUTOFF)["valid"])
+
+    def test_policy_change_during_report_day_is_not_silently_combined(self):
+        self.add_plan(2, DAY, "2026-09-09T16:10:00Z", self.make_snapshot(
+            [self.member], policy_sha256=coverage.planning.digest(ACCOUNT_CATALOG_POLICY_V2)))
+        result = self.result()
+        self.assertFalse(result["known"])
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["source_binding"]["reason"], "catalog_day_scope_changed")
 
 
 if __name__ == "__main__":

@@ -24,7 +24,11 @@ export async function readContentSearch(payload: Record<string, unknown>): Promi
       const child = execFile(python, ["-B", "-I", helper, "--db", db,
         "--backend-root", backend, "--project-root", project], {
         timeout: 12_000, maxBuffer: 8 * 1024 * 1024, windowsHide: true,
-        env: { ...process.env, DCAR_READ_ONLY: "1", DCAR_SCHEDULER_ENABLED: "0", DCAR_LLM_DISABLED: "1" },
+        env: { NODE_ENV: "production", PATH: process.env.PATH, LANG: "en_US.UTF-8",
+          TMPDIR: process.env.TMPDIR, PYTHONDONTWRITEBYTECODE: "1",
+          DCAR_READ_ONLY: "1", DCAR_SCHEDULER_ENABLED: "0", DCAR_LLM_DISABLED: "1",
+          DCAR_CONTENT_DATA_MODE: process.env.DCAR_CONTENT_DATA_MODE,
+          DCAR_ACTIVE_SNAPSHOT: process.env.DCAR_ACTIVE_SNAPSHOT },
       }, (error, stdout) => {
         try {
           const result = JSON.parse(stdout);

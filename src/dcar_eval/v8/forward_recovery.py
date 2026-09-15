@@ -7,6 +7,8 @@ HOLD and its complete diagnostic tail remain authoritative.
 
 from __future__ import annotations
 
+from .runtime_phase_timing import phase, measured, timed
+
 import hashlib
 import ast
 import io
@@ -177,14 +179,18 @@ def _scope(scope_start: str, at: str) -> None:
     )
 
 
+@timed('runtime.receipt')
 def _private_receipt(path: Path, expected_sha: str, contract: str) -> dict[str, Any]:
     try:
         st = path.lstat()
         _require(path.is_absolute() and stat.S_ISREG(st.st_mode) and st.st_nlink == 1
                  and st.st_uid == os.geteuid() and stat.S_IMODE(st.st_mode) == 0o600,
                  "forward_build_invalid", "Runtime evidence must be a private, single-link regular file")
-        data = path.read_bytes()
-        envelope = json.loads(data)
+        from .runtime_evidence_context import prepared_file_bytes
+        data = prepared_file_bytes(path, private=True)
+        if data is None:
+            data = path.read_bytes()
+        envelope = measured("json.runtime_receipt", json.loads, data)
         # sealed-build/runtime-root receipts use seal_r0_receipts._canonical_json:
         # compact sorted UTF-8 JSON without the raw-evidence trailing newline.
         payload_digest = hashlib.sha256(json.dumps(
@@ -201,6 +207,7 @@ def _private_receipt(path: Path, expected_sha: str, contract: str) -> dict[str, 
         raise ProfileControlError("forward_build_invalid", "Runtime evidence is unreadable") from exc
 
 
+@timed('runtime.identity')
 def _runtime_identity(connection: sqlite3.Connection, binding: Mapping[str, Any]) -> dict[str, Any]:
     """Bind the actual loaded receipt, code files and live database inode."""
     build_sha = str(binding["build_receipt_sha256"])
@@ -219,11 +226,21 @@ def _runtime_identity(connection: sqlite3.Connection, binding: Mapping[str, Any]
     critical = build.get("critical_files")
     _require(isinstance(critical, dict) and bool(critical), "forward_build_invalid", "Build has no verified code inventory")
     assert isinstance(critical, dict)
-    for relative, expected in critical.items():
-        path = source_root(PROJECT_ROOT) / relative
-        _require(not path.is_symlink() and path.is_file() and path.resolve().is_relative_to(source_root(PROJECT_ROOT))
-                 and hashlib.sha256(path.read_bytes()).hexdigest() == expected,
-                 "forward_build_invalid", "Runtime code changed after the sealed build")
+    resolved_source = source_root(PROJECT_ROOT)
+    from .runtime_evidence_context import prepared_critical_inventory
+    critical_prepared = prepared_critical_inventory(resolved_source, critical)
+    with phase("runtime.critical_file_read_hash", files=len(critical), bytes=0) as counts:
+        counts["prepared"] = critical_prepared
+        for relative, expected in (() if critical_prepared else critical.items()):
+            path = resolved_source / relative
+            _require(not path.is_symlink() and path.is_file() and path.resolve().is_relative_to(resolved_source),
+                     "forward_build_invalid", "Runtime code changed after the sealed build")
+            body = path.read_bytes()
+            counts["bytes"] += len(body)
+            _require(hashlib.sha256(body).hexdigest() == expected,
+                     "forward_build_invalid", "Runtime code changed after the sealed build")
+    _require(source_root(PROJECT_ROOT) == resolved_source,
+             "forward_build_invalid", "Runtime source root changed during code verification")
     database = Path(str(connection.execute("PRAGMA database_list").fetchone()[2])).resolve(strict=True)
     current = database.stat()
     frozen = runtime.get("formal_database", {})
@@ -593,6 +610,7 @@ def _released_runtime_identity(connection: sqlite3.Connection, binding: Mapping[
     raise ProfileControlError("forward_build_invalid", "Successor chain exceeds its bounded depth")
 
 
+@timed('runtime.capacity')
 def _capacity(connection: sqlite3.Connection) -> dict[str, Any]:
     from .capture import RAW_ROOT
 
@@ -719,6 +737,7 @@ def _passed_control(connection: sqlite3.Connection, receipt_id: int, binding: Ma
             "source_verdict_status": payload["status"], "source_route_passed": payload["route_passed"], **admission}
 
 
+@timed('runtime.live_guards')
 def _live_guards(connection: sqlite3.Connection, *, at: str, check_capacity: bool = True,
                  release_admission: bool = False) -> dict[str, Any]:
     provider_budget.require_storage_ready(connection)

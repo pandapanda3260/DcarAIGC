@@ -43,6 +43,16 @@ def account_operating_status(account: Mapping[str, Any]) -> str:
     return str(frequency) if frequency in {"daily", "weekly"} else "unmarked"
 
 
+def current_catalog_capture_status(connection: sqlite3.Connection, identity_id: int) -> dict[str, Any]:
+    """Describe current evidence and labels without granting execution authority."""
+    from .account_capture_eligibility import DirectoryCaptureEligibilityError, require_directory_capture_member
+    try:
+        member = require_directory_capture_member(connection, identity_id)
+        return {key: member[key] for key in ("eligible", "reason_code", "reason_label")}
+    except DirectoryCaptureEligibilityError as error:
+        return {"eligible": False, "reason_code": error.code, "reason_label": error.label}
+
+
 def _uses_fixed_cleanup_scope(
     connection: sqlite3.Connection, identity: Mapping[str, Any], *,
     activation_id: int | None, status: str, at: str,
@@ -53,7 +63,7 @@ def _uses_fixed_cleanup_scope(
     permits recorded operator pauses. Resuming still passes the ordinary API
     gate/route validation after enabled is changed inside the same transaction.
     """
-    if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
+    if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21, 22, 23, 24}:
         return False
     from . import account_cleanup_runtime as cleanup
     from .capture_authorizations import AuthorizationError
@@ -181,6 +191,13 @@ def update_account_operating_status_in_transaction(
                 )
             result = dict(payload["result"])
             result["status_replayed"] = True
+            from .account_catalog_capture import installed_policy
+            from .storage import now_utc
+            if installed_policy(connection, at=now_utc()) is not None:
+                capture_status = current_catalog_capture_status(connection, int(payload["account_identity_id"]))
+                result["activation_status"] = "catalog_managed"
+                result["automatic_capture"] = capture_status
+                result["message"] = "该状态请求此前已完成，本次未重复修改；当前采集状态：" + capture_status["reason_label"] + "。"
             connection.execute("RELEASE account_operating_status")
             return result
         before = connection.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
@@ -210,10 +227,10 @@ def update_account_operating_status_in_transaction(
                 directory = connection.execute(
                     "SELECT * FROM account_directory_rows WHERE account_id=?", (account_id,),
                 ).fetchone()
-                if (directory is None or directory["identity_status"] != "existing_verified"
+                if (directory is None
                         or directory["platform"] != identity["platform"] or directory["uid"] != identity["uid"]):
                     raise AccountOperatingStatusError(
-                        "account_directory_identity_changed", "账号身份尚未核验，请先完善主页信息。"
+                        "account_directory_identity_changed", "账号目录与平台身份不一致，请刷新后重试。"
                     )
                 # Saving an operating label does not require a ready locator,
                 # a provider gate or membership in the historical roster.
@@ -221,15 +238,18 @@ def update_account_operating_status_in_transaction(
             fixed_cleanup_scope = catalog_policy is None and _uses_fixed_cleanup_scope(
                 connection, identity, activation_id=activation_id, status=status, at=timestamp,
             )
-            set_account_enabled_in_transaction(
-                connection, int(identity["id"]), enabled=status != "paused",
-                effective_at=timestamp, created_at=timestamp, actor=actor, reason=reason,
-                activation_id=activation_id,
-                metadata={
-                    "operation": "update_account_status", "account_status": status,
-                    "previous_update_frequency": previous_frequency,
-                },
-            )
+            if catalog_policy is None:
+                set_account_enabled_in_transaction(
+                    connection, int(identity["id"]), enabled=status != "paused",
+                    effective_at=timestamp, created_at=timestamp, actor=actor, reason=reason,
+                    activation_id=activation_id,
+                    metadata={
+                        "operation": "update_account_status", "account_status": status,
+                        "previous_update_frequency": previous_frequency,
+                    },
+                )
+            # In catalog mode the planner owns the legacy enabled projection.
+            # A manual operating label must neither stop nor start collection.
             # Changing daily <-> weekly on an enabled account only changes its
             # manual label. It must not silently repair/rebuild a roster.
             label_only = admission is None and bool(before["enabled"]) and previous_frequency in {"daily", "weekly"} and status != "paused"
@@ -368,16 +388,18 @@ def update_account_operating_status_in_transaction(
             else:
                 result["message"] = "账号和运营状态已保存，加入待激活系统名单；名单激活后才开始采集。"
         if catalog_policy is not None:
+            result["account_status"] = status
             result["directory_row_id"] = int(directory["id"])
-            result["activation_status"] = "disabled" if status == "paused" else "pending_verification"
+            result["activation_status"] = "catalog_managed"
             result["message"] = (
-                "账号已暂停自动更新，历史内容和数据保留。" if status == "paused" else
-                "账号状态已保存，系统会自动核验并更新采集状态，无需另行加入名单。"
+                "账号状态已保存；当前所有状态均参与自动采集，状态仅为人工标记。"
             )
-            result["automatic_capture"] = {
-                "eligible": False, "reason_code": "account_paused" if status == "paused" else "pending_verification",
-                "reason_label": "账号已暂停" if status == "paused" else "等待系统核验",
-            }
+            if admission is None:
+                result["automatic_capture"] = current_catalog_capture_status(connection, int(identity["id"]))
+                result["message"] += result["automatic_capture"]["reason_label"] + "。无需另行加入名单。"
+            # A new admission becomes evidence only after the immutable receipt
+            # below is sealed. Do not invent a pending state, pre-approve it, or
+            # rewrite that receipt after the enclosing creation materializes it.
         if status is not None:
             result["status_request_id"] = request_id
             record_status_receipt(
@@ -386,7 +408,7 @@ def update_account_operating_status_in_transaction(
                 update_frequency=frequency, request=request, actor=actor, reason=reason,
                 before={"enabled": bool(before["enabled"]), "update_frequency": previous_frequency},
                 after={"enabled": bool(after["enabled"]), "update_frequency": frequency},
-                result=result, timestamp=timestamp,
+                result=result, timestamp=timestamp, labels_only=catalog_policy is not None,
             )
     except Exception:
         connection.execute("ROLLBACK TO account_operating_status")

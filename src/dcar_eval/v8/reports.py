@@ -22,12 +22,13 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
 from xml.etree import ElementTree
 
+from .duplicate_readiness import relation_coverage, relation_states, valid_relation_sql, indexed_duplicates, current_fingerprint_sql
 from .account_classification import ACCOUNT_GROUPS, BUSINESS_DIRECTIONS
 from .audience_classifier import EVIDENCE_WINDOW_DAYS
 from .audience_rate import active_classifier_state, build_channel_audience_rates
 from .contracts import (
     CURRENT_REPORT_EVIDENCE_VERSION,
-    CURRENT_REPORT_VERSION,
+    CURRENT_REPORT_VERSION, FOUR_PLATFORM_REPORT_VERSION, CURRENT_REPORT_VERSIONS,
     CURRENT_REPORT_RULE_VERSION,
     LEGACY_CONTRACT_PATHS,
     REPORT_RULE_VERSIONS,
@@ -45,12 +46,13 @@ from .evaluation_selectors import (
     formal_eligible_release_evaluations,
 )
 from .duplicates import FINGERPRINT_VERSION, THRESHOLDS, duplicate_metric_decision
-from .insights import CHANNELS, SCENES, build_channel_conclusions
+from .insights import CHANNELS, OVERVIEW_CHANNELS, SCENES, build_channel_conclusions
 from .media_state import media_terminal_states
 from .report_export import formula_safe_csv_value
-from . import report_inputs, runtime_receipts
+from . import report_inputs, report_metric_validity, runtime_receipts
 from .scan_receipts import coverage as scan_coverage
-from .source_routing import METRIC_FIELDS, load_policy, select_content_metrics
+from .source_routing import METRIC_FIELDS, POLICY_VERSION, load_policy, select_content_metrics
+from .metric_source_policy import CURRENT_METRIC_POLICY, field_capability
 from .storage import (
     DEFAULT_DB,
     PROJECT_ROOT,
@@ -68,7 +70,7 @@ TASK_TYPES = {"daily", "weekly", "custom"}
 RUNNABLE_STATUSES = {"queued", "partial", "failed", "interrupted"}
 IMPLICIT_RUN_STATUSES = {"queued", "failed", "interrupted"}
 _REPORT_ID_BATCH_SIZE = 500
-_REPORT_SCHEMA_VERSIONS = frozenset({19, 20, 21})
+_REPORT_SCHEMA_VERSIONS = frozenset({19, 20, 21, 22, 23, 24})
 
 _QUALITY_GATE_LABELS = {
     "discovery_coverage": "账号采集完成率",
@@ -78,6 +80,7 @@ _QUALITY_GATE_LABELS = {
     "core_artifact_coverage": "语音和画面文字识别完成率",
     "media_terminal_coverage": "视频和图片处理完成率",
     "duplicate_fingerprint_coverage": "重复内容识别完成率",
+    "duplicate_relation_coverage": "重复比对完成率",
     "weekly_comment_coverage": "评论采集完成率",
     "duplicate_calibration_ready": "重复内容规则校验",
     "pipeline_observation": "每日抓取观测完整度",
@@ -201,12 +204,12 @@ def assert_report_runtime_ready(connection) -> Dict[str, Any]:
             """
             SELECT COUNT(*) FROM report_revisions rr
             JOIN report_tasks rt ON rt.id=rr.task_id
-            WHERE rr.contract_version=?
+            WHERE rr.contract_version IN (?,?)
               AND rr.invalidated_at IS NULL
               AND rt.creation_source='automatic'
               AND rr.release_id<>?
             """,
-            (CURRENT_REPORT_VERSION, value["id"]),
+            (CURRENT_REPORT_VERSION, FOUR_PLATFORM_REPORT_VERSION, value["id"]),
         ).fetchone()[0]
     )
     if unsafe_automatic_revisions:
@@ -521,7 +524,7 @@ def _task_revision_read_model(connection, task_id: str) -> Dict[str, Any]:
             for value in revision_values
             if value["invalidated_at"] is None
             and value["release_id"] == active["id"]
-            and value["contract_version"] == CURRENT_REPORT_VERSION
+            and value["contract_version"] in CURRENT_REPORT_VERSIONS
             and value["rule_version"] == CURRENT_REPORT_RULE_VERSION
             and value["rule_version"] == active["rule_version"]
             and value["taxonomy_version"] == active["taxonomy_version"]
@@ -536,7 +539,7 @@ def _task_revision_read_model(connection, task_id: str) -> Dict[str, Any]:
                 for value in revision_values
                 if value["invalidated_at"] is None
                 and value["release_id"] == active["id"]
-                and value["contract_version"] != CURRENT_REPORT_VERSION
+                and value["contract_version"] not in CURRENT_REPORT_VERSIONS
                 and value["contract_version"] in LEGACY_CONTRACT_PATHS
                 and value["rule_version"] == active["rule_version"]
                 and value["taxonomy_version"] == active["taxonomy_version"]
@@ -688,9 +691,9 @@ def _collection_cutoff_at(
 
 
 def _latest_metric_observations_at(
-    connection, ids: Sequence[int], *, cutoff_at: str
+    connection, ids: Sequence[int], *, cutoff_at: str, policy_version: str = POLICY_VERSION,
 ) -> Dict[int, Dict[str, Any]]:
-    return select_content_metrics(connection, ids, cutoff_at=cutoff_at)
+    return select_content_metrics(connection, ids, cutoff_at=cutoff_at, policy_version=policy_version)
 
 
 def _metric_freshness_detail(
@@ -700,12 +703,19 @@ def _metric_freshness_detail(
     cutoff_at: str,
     minimum_percentage: float,
     latest_observations: Optional[Mapping[int, Mapping[str, Any]]] = None,
+    policy_version: str = POLICY_VERSION,
+    platforms: Optional[Mapping[int, str]] = None,
 ) -> Dict[str, Any]:
     latest = (
         dict(latest_observations)
         if latest_observations is not None
-        else _latest_metric_observations_at(connection, ids, cutoff_at=cutoff_at)
+        else _latest_metric_observations_at(connection, ids, cutoff_at=cutoff_at, policy_version=policy_version)
     )
+    if policy_version in report_metric_validity.SOURCE_POLICY_VERSIONS:
+        return report_metric_validity.quality_detail(
+            ids, latest, platforms=platforms or {}, cutoff_at=cutoff_at,
+            minimum_percentage=minimum_percentage, policy_version=policy_version,
+        )
     eligible_count = len(ids)
     cutoff = datetime.fromisoformat(cutoff_at.replace("Z", "+00:00"))
     freshness_start = cutoff - timedelta(hours=36)
@@ -721,7 +731,7 @@ def _metric_freshness_detail(
             for value in required
         )
 
-    fresh_count = sum(1 for observation in latest.values() if required_fields_fresh(observation))
+    fresh_count = sum(1 for content_id in set(ids) if content_id in latest and required_fields_fresh(latest[content_id]))
     percentage = _percentage(fresh_count, eligible_count)
     if eligible_count == 0:
         status = "not_applicable"
@@ -1122,6 +1132,9 @@ def _report_audience_rates(
     *,
     window_end_utc: str,
     report_cutoff_at: str,
+    channels: Sequence[tuple[str, str]] = CHANNELS,
+    per_platform_calibration: bool = False,
+    frozen_classifier_states: Mapping[str, str] | None = None,
 ) -> Dict[str, Dict[str, Any]]:
     """Per-slice automotive_user_rate for one report window.
 
@@ -1139,12 +1152,14 @@ def _report_audience_rates(
     return build_channel_audience_rates(
         connection,
         conclusion_rows,
-        classifier_state=active_classifier_state(connection),
+        classifier_state=(dict(frozen_classifier_states) if frozen_classifier_states is not None else
+                          {platform: active_classifier_state(connection, platform=platform) for platform, _ in channels}
+                          if per_platform_calibration else active_classifier_state(connection)),
         evidence_window_start=evidence_window_start,
         evidence_window_end=window_end_utc,
         report_cutoff_at=report_cutoff_at,
         warm_up=True,
-        channels=CHANNELS,
+        channels=channels,
         scenes=SCENES,
     )
 
@@ -1227,13 +1242,9 @@ def _report_scan_coverage(
     )
 
 
-def _frozen_content_direction(content: Mapping[str, Any], evaluation: Mapping[str, Any] | None,
-                              *, new_classification: bool) -> str:
-    """Preserve only the old account fallback already sealed inside an old scope."""
-    direction = effective_direction({**content, "evaluation_content_direction": None}, evaluation)
-    if not new_classification and direction == "unknown":
-        return effective_direction({"manual_content_direction": content.get("account_content_direction")}, None)
-    return direction
+def _frozen_content_direction(content: Mapping[str, Any], evaluation: Mapping[str, Any] | None) -> str:
+    """Resolve the work's direction from frozen work evidence only."""
+    return effective_direction({**content, "evaluation_content_direction": None}, evaluation)
 
 
 def _assemble_report_data(connection, task: Mapping[str, Any], *, release: Mapping[str, Any], revision: int,
@@ -1248,15 +1259,29 @@ def _assemble_report_data(connection, task: Mapping[str, Any], *, release: Mappi
     if scope_event is None:
         raise ReportTaskError("report scope must be frozen before assembly")
     content_rows = scope_event["payload"]["contents"]
-    contents = [dict(row) for row in content_rows]
-    new_classification = (scope_event["payload"].get("account_classification_version")
-                          == report_inputs.ACCOUNT_CLASSIFICATION_VERSION)
+    contents = [report_inputs.project_content_classification(row) for row in content_rows]
     ids = [int(row["id"]) for row in content_rows]
     collection_cutoff_at = _collection_cutoff_at(task, generated_at=generated_at)
+    source_policy_version = report_metric_validity.policy_for_scope(scope_event["payload"])
+    new_metric_validity = source_policy_version in report_metric_validity.SOURCE_POLICY_VERSIONS
+    source_policy = load_policy(policy_version=source_policy_version)
+    current_metric_policy = source_policy_version == CURRENT_METRIC_POLICY
+    frozen_channels = scope_event["payload"].get("channels")
+    if current_metric_policy and frozen_channels != [list(item) for item in OVERVIEW_CHANNELS]:
+        raise ReportTaskError("frozen report channels changed")
+    report_channels = tuple(tuple(item) for item in frozen_channels) if current_metric_policy else CHANNELS
+    if new_metric_validity and (
+        scope_event["payload"].get("source_policy") != source_policy
+        or scope_event["payload"].get("source_policy_sha256") != report_inputs.digest(source_policy)
+    ):
+        raise ReportTaskError("frozen report metric source policy changed; create a correction task")
     snapshots = _latest_metric_observations_at(
-        connection, ids, cutoff_at=collection_cutoff_at
+        connection, ids, cutoff_at=collection_cutoff_at, policy_version=source_policy_version,
     )
-    contract = load_contract(report_version=CURRENT_REPORT_VERSION)
+    report_version = scope_event["payload"].get("report_version", CURRENT_REPORT_VERSION)
+    if report_version != (FOUR_PLATFORM_REPORT_VERSION if current_metric_policy else CURRENT_REPORT_VERSION):
+        raise ReportTaskError("frozen report version differs from metric contract")
+    contract = load_contract(report_version=report_version)
     coverage_thresholds = contract["required_coverage_thresholds"]
     metric_display_thresholds = contract["metric_display_coverage_thresholds"]
     evaluation_minimum = float(coverage_thresholds["evaluation_coverage"])
@@ -1279,6 +1304,8 @@ def _assemble_report_data(connection, task: Mapping[str, Any], *, release: Mappi
         cutoff_at=collection_cutoff_at,
         minimum_percentage=float(freshness_contract["minimum_percentage"]),
         latest_observations=snapshots,
+        policy_version=source_policy_version,
+        platforms={int(row["id"]): str(row["platform"]) for row in contents},
     )
     eligible_evaluations: Dict[int, Dict[str, Any]] = {}
     for batch in _report_id_batches(
@@ -1297,7 +1324,7 @@ def _assemble_report_data(connection, task: Mapping[str, Any], *, release: Mappi
     for content in contents:
         content_id = int(content["id"])
         content["resolved_direction"] = _frozen_content_direction(
-            content, eligible_evaluations.get(content_id), new_classification=new_classification
+            content, eligible_evaluations.get(content_id)
         )
     total = len(contents)
     eval_ready = len(eligible_evaluations)
@@ -1339,9 +1366,10 @@ def _assemble_report_data(connection, task: Mapping[str, Any], *, release: Mappi
             fingerprint_ready += int(
                 connection.execute(
                     f"""
-                    SELECT COUNT(DISTINCT content_id) FROM duplicate_fingerprints
-                    WHERE content_id IN ({placeholders}) AND fingerprint_version=?
-                      AND julianday(created_at)<=julianday(?)
+                    SELECT COUNT(DISTINCT f.content_id) FROM duplicate_fingerprints f
+                    WHERE f.content_id IN ({placeholders}) AND f.fingerprint_version=?
+                      AND julianday(f.created_at)<=julianday(?)
+                      AND {current_fingerprint_sql(connection, "f.content_id", cutoff_at=collection_cutoff_at)}
                     """,
                     [*batch, FINGERPRINT_VERSION, collection_cutoff_at],
                 ).fetchone()[0]
@@ -1419,10 +1447,12 @@ def _assemble_report_data(connection, task: Mapping[str, Any], *, release: Mappi
         if task["task_type"] == "weekly" and total
         else 100.0
     )
+    relation_quality = relation_coverage(connection, ids, cutoff_at=collection_cutoff_at)
+    duplicate_ready = relation_quality.get("duplicate_relation_ready", fingerprint_ready)
     duplicate_status, duplicate_coverage, duplicate_reason = (
         duplicate_metric_decision(
             total,
-            fingerprint_ready,
+            duplicate_ready,
             duplicate_calibration_ready,
             threshold=fingerprint_minimum,
         )
@@ -1431,6 +1461,7 @@ def _assemble_report_data(connection, task: Mapping[str, Any], *, release: Mappi
         round(eval_ready * 100 / total, 2) if total else 100.0
     )
     data_quality: Dict[str, Any] = {
+        **relation_quality,
         "roster_evidence_valid": scans["roster_evidence_valid"],
         "scan_traceable": scans["scan_traceable"],
         "scope_reconstructable": not scope_event["payload"]["unknown_dimensions"],
@@ -1441,7 +1472,7 @@ def _assemble_report_data(connection, task: Mapping[str, Any], *, release: Mappi
         "core_artifact_coverage": 100.0,
         "media_terminal_coverage": media_terminal_coverage,
         "duplicate_fingerprint_coverage": (
-            duplicate_coverage if duplicate_coverage is not None else 100.0
+            _percentage(fingerprint_ready, total) if total else 100.0
         ),
         "duplicate_calibration_ready": duplicate_calibration_ready,
         "weekly_comment_coverage": weekly_comment_coverage,
@@ -1455,17 +1486,17 @@ def _assemble_report_data(connection, task: Mapping[str, Any], *, release: Mappi
         },
         enforce_boolean_quality_gates=bool(total),
     )
-    view_values = [
-        int(value["view_count"])
-        for value in snapshots.values()
-        if value["view_count"] is not None
-    ]
+    view_eligible_ids = {int(content["id"]) for content in contents
+        if (field_capability(str(content["platform"]), "view_count")["status"] == "supported"
+            if current_metric_policy else str(content["platform"]) == "douyin")}
+    view_values = [int(snapshots[cid]["view_count"]) for cid in view_eligible_ids
+                   if cid in snapshots and snapshots[cid].get("view_count") is not None]
     comment_values = [
         int(value["comment_count"])
         for value in snapshots.values()
         if value["comment_count"] is not None
     ]
-    view_eligible = sum(str(content["platform"]) == "douyin" for content in contents)
+    view_eligible = len(view_eligible_ids)
     view_metric_coverage = _percentage(len(view_values), view_eligible)
     all_historical = bool(view_values) and all(
         value.get("fields", {}).get("view_count", {}).get("freshness") != "fresh"
@@ -1512,6 +1543,12 @@ def _assemble_report_data(connection, task: Mapping[str, Any], *, release: Mappi
         if view_status == "below_threshold" and view_metric_coverage is not None
         else ""
     )
+    if current_metric_policy:
+        unavailable_views = sum(field_capability(str(content["platform"]), "view_count")["status"] == "unavailable" for content in contents)
+        if unavailable_views:
+            view_reason = f"有 {unavailable_views} 条内容的数据源无法提供可信播放量；曝光完整性存在缺口。" + view_reason
+            if view_status in {"available", "not_applicable"}:
+                view_status = "below_threshold" if view_values else "missing"
     comment_metric_coverage = _percentage(len(comment_values), total)
     comment_reason = (
         "现有数据只有互动人数，没有评论总数"
@@ -1521,13 +1558,23 @@ def _assemble_report_data(connection, task: Mapping[str, Any], *, release: Mappi
         if comment_status == "below_threshold" and comment_metric_coverage is not None
         else ""
     )
+    if new_metric_validity:
+        # Historical numbers may still be useful, but a mixed total must not
+        # claim to contain exclusively current data.
+        for field in ("view_count", "comment_count"):
+            stale_count = freshness_detail["fields"][field]["stale_count"]
+            reason = f"包含 {stale_count} 条旧数据；每条采集时间及未取到的指标见明细"
+            if stale_count and field == "view_count":
+                view_status, view_reason = "stale", reason
+            elif stale_count and field == "comment_count":
+                comment_status, comment_reason = "stale", reason
     point_counts = Counter(
         str(value["primary_selling_point_code"])
         for value in included_evaluations.values()
         if value["primary_selling_point_code"]
     )
     duplicate_rows = connection.execute(
-        """
+        f"""
         SELECT d.*, duplicate.link_id duplicate_link_id, original.link_id original_link_id
         FROM duplicate_relations d
         JOIN content_items duplicate ON duplicate.id=d.duplicate_content_id
@@ -1537,10 +1584,12 @@ def _assemble_report_data(connection, task: Mapping[str, Any], *, release: Mappi
             WHERE task_id=? AND inclusion_status='included'
         )
           AND d.status='confirmed'
+          AND {valid_relation_sql(connection, 'd', cutoff_at=collection_cutoff_at)}
           AND julianday(d.created_at)<=julianday(?)
           AND d.id=(
               SELECT d2.id FROM duplicate_relations d2
               WHERE d2.duplicate_content_id=d.duplicate_content_id AND d2.status='confirmed'
+                AND {valid_relation_sql(connection, 'd2', cutoff_at=collection_cutoff_at)}
                 AND julianday(d2.created_at)<=julianday(?)
               ORDER BY d2.confidence DESC,d2.id LIMIT 1
           )
@@ -1589,7 +1638,11 @@ def _assemble_report_data(connection, task: Mapping[str, Any], *, release: Mappi
             {
                 "content_id": content_id,
                 **{field: snapshot.get(field) if snapshot else None for field in METRIC_FIELDS},
-                "metric_sources": snapshot.get("fields", {}) if snapshot else {},
+                "metric_sources": (
+                    report_metric_validity.display_sources(snapshot, platform=str(content["platform"]),
+                                                          cutoff_at=collection_cutoff_at, policy_version=source_policy_version)
+                    if new_metric_validity else snapshot.get("fields", {}) if snapshot else {}
+                ),
                 "platform": str(content["platform"]),
                 "content_direction": content["resolved_direction"],
                 "evidence_level": evaluation["evidence_level"] if evaluation else None,
@@ -1622,9 +1675,16 @@ def _assemble_report_data(connection, task: Mapping[str, Any], *, release: Mappi
             conclusion_rows,
             window_end_utc=end_utc,
             report_cutoff_at=collection_cutoff_at,
+            channels=report_channels, per_platform_calibration=current_metric_policy,
+            frozen_classifier_states=({platform: value["state"] for platform, value in
+                scope_event["payload"]["audience_calibration"]["platforms"].items()} if current_metric_policy else None),
         ),
+        channels=report_channels,
     )
+    if new_metric_validity:
+        report_metric_validity.mark_historical_exposure(channel_conclusions, conclusion_rows)
     details: List[Dict[str, Any]] = []
+    current_relations = relation_states(connection, ids, cutoff_at=collection_cutoff_at) if indexed_duplicates(connection) else {}
     for content in contents:
         content_id = int(content["id"])
         evaluation = eligible_evaluations.get(content_id)
@@ -1633,9 +1693,14 @@ def _assemble_report_data(connection, task: Mapping[str, Any], *, release: Mappi
         details.append(
             {
                 **{field: snapshot.get(field) if snapshot else None for field in METRIC_FIELDS},
-                "metric_sources": snapshot.get("fields", {}) if snapshot else {},
+                "metric_sources": (
+                    report_metric_validity.display_sources(snapshot, platform=str(content["platform"]),
+                                                          cutoff_at=collection_cutoff_at, policy_version=source_policy_version)
+                    if new_metric_validity else snapshot.get("fields", {}) if snapshot else {}
+                ),
                 "content_id": content_id,
                 "platform_content_id": content["platform_content_id"],
+                **({"platform_content_id_aliases": content["platform_content_id_aliases"]} if current_metric_policy else {}),
                 "link_id": content["link_id"],
                 "platform": content["platform"],
                 "content_type": content["content_type"],
@@ -1644,11 +1709,9 @@ def _assemble_report_data(connection, task: Mapping[str, Any], *, release: Mappi
                 "title": content["title"],
                 "account_uid": content["raw_account_uid"],
                 "account_name": content["raw_account_name"],
-                **({"account_group": content["account_group"],
-                    "business_direction": content["business_direction"]}
-                   if new_classification else {"account_type": content["account_type"]}),
-                "content_direction": (evaluation["content_direction"]
-                                      if evaluation and not new_classification else content["resolved_direction"]),
+                "account_group": content["account_group"],
+                "business_direction": content["business_direction"],
+                "content_direction": content["resolved_direction"],
                 "evidence_level": evaluation["evidence_level"] if evaluation else None,
                 "primary_selling_point_code": evaluation["primary_selling_point_code"]
                 if evaluation
@@ -1666,6 +1729,7 @@ def _assemble_report_data(connection, task: Mapping[str, Any], *, release: Mappi
                 else None,
                 "view_count": snapshot["view_count"] if snapshot else None,
                 "comment_count": snapshot["comment_count"] if snapshot else None,
+                **current_relations.get(content_id, {}),
                 "duplicate_original_link_id": duplicate["original_link_id"]
                 if duplicate
                 else None,
@@ -1675,7 +1739,7 @@ def _assemble_report_data(connection, task: Mapping[str, Any], *, release: Mappi
             }
         )
     return {
-        "report_version": CURRENT_REPORT_VERSION,
+        "report_version": report_version,
         "rule_version": str(release["rule_version"]),
         "taxonomy_version": str(taxonomy["version"]),
         "evidence_version": CURRENT_REPORT_EVIDENCE_VERSION,
@@ -1684,8 +1748,7 @@ def _assemble_report_data(connection, task: Mapping[str, Any], *, release: Mappi
             "revision": revision,
             "generated_at": generated_at,
             "collection_cutoff_at": collection_cutoff_at,
-            **({"account_classification_version": report_inputs.ACCOUNT_CLASSIFICATION_VERSION}
-               if new_classification else {}),
+            "account_classification_version": report_inputs.ACCOUNT_CLASSIFICATION_VERSION,
         },
         "scope": {
             "period_start": f"{task['period_start']}T00:00:00+08:00",
@@ -1746,7 +1809,7 @@ def _assemble_report_data(connection, task: Mapping[str, Any], *, release: Mappi
                 len(duplicate_rows) if total else None,
                 total,
                 status=duplicate_status,
-                eligible_count=fingerprint_ready,
+                eligible_count=duplicate_ready,
                 coverage_percentage=duplicate_coverage,
                 reason=duplicate_reason,
             ),
@@ -1773,15 +1836,10 @@ def _assemble_report_data(connection, task: Mapping[str, Any], *, release: Mappi
         "platform_dimensions": _dimension(
             (str(row["platform"]) for row in contents), total
         ),
-        **({
-            "account_group_dimensions": _dimension(
-                (str(row["account_group"]) for row in contents), total),
-            "business_direction_dimensions": _dimension(
-                (str(row["business_direction"]) for row in contents), total),
-        } if new_classification else {
-            "account_type_dimensions": _dimension(
-                (str(row["account_type"]) for row in contents), total),
-        }),
+        "account_group_dimensions": _dimension(
+            (str(row["account_group"]) for row in contents), total),
+        "business_direction_dimensions": _dimension(
+            (str(row["business_direction"]) for row in contents), total),
         "content_direction_dimensions": _dimension(
             (str(row["resolved_direction"]) for row in contents),
             total,
@@ -1795,7 +1853,11 @@ def _assemble_report_data(connection, task: Mapping[str, Any], *, release: Mappi
         "provider_costs": [dict(row) for row in cost_rows],
         "input_references": {
             "scope_event_id": scope_event["event_id"], "scope_sha256": scope_event["sha256"],
-            "source_policy": load_policy(), "source_policy_sha256": report_inputs.digest(load_policy()),
+            "source_policy": source_policy, "source_policy_sha256": report_inputs.digest(source_policy),
+            **({"channels": frozen_channels, "knowledge_at": scope_event["payload"]["knowledge_at"],
+                "audience_calibration": scope_event["payload"]["audience_calibration"],
+                "content_identity_aliases": scope_event["payload"]["content_identity_aliases"]} if current_metric_policy else {}),
+            **({"metric_validity": scope_event["payload"]["metric_validity"]} if new_metric_validity else {}),
             "release_id": release["id"], "matcher_rule_sha256": release["matcher_rule_sha256"],
             "content_ids": ids, "metrics": snapshots, "evaluations": eligible_evaluations,
             "media_states": media_states, "comment_content_ids": sorted(recent_comment_ids), "scans": frozen_scan_inputs,
@@ -1907,6 +1969,7 @@ def _conclusion_cell(metric: Mapping[str, Any]) -> str:
 
 
 def _markdown(report: Mapping[str, Any]) -> str:
+    report = report_inputs.project_account_classification(report)
     metrics = report["summary_metrics"]
     period_start = str(report["scope"]["period_start"])[:10]
     period_end_exclusive = date.fromisoformat(str(report["scope"]["period_end"])[:10])
@@ -1932,7 +1995,7 @@ def _markdown(report: Mapping[str, Any]) -> str:
     channels = report.get("channels") or {}
     if channels:
         lines.extend(["## 渠道结论", ""])
-        for platform, _label in CHANNELS:
+        for platform, channel in channels.items():
             channel = channels.get(platform)
             if not channel:
                 continue
@@ -1995,13 +2058,29 @@ def _markdown(report: Mapping[str, Any]) -> str:
                     f" · {value}%"
                 )
         elif key == "metrics_freshness" and isinstance(freshness_detail, Mapping):
+            metric_label = (
+                "受支持指标有效且未过期的内容占比"
+                if freshness_detail.get("contract_version") == report_metric_validity.CURRENT_CONTRACT_VERSION else
+                "全部指标有效且未过期的内容占比"
+                if freshness_detail.get("contract_version") in report_metric_validity.CONTRACT_VERSIONS
+                else _QUALITY_GATE_LABELS.get(key, '其他数据检查')
+            )
             if freshness_detail.get("status") == "not_applicable":
-                lines.append(f"- {_QUALITY_GATE_LABELS.get(key, '其他数据检查')}: 无适用内容")
+                lines.append(f"- {metric_label}: 无适用内容")
             else:
                 lines.append(
-                    f"- {_QUALITY_GATE_LABELS.get(key, '其他数据检查')}: {freshness_detail.get('fresh_count', 0)}/"
+                    f"- {metric_label}: {freshness_detail.get('fresh_count', 0)}/"
                     f"{freshness_detail.get('eligible_count', 0)} · {value}%"
                 )
+                for detail in freshness_detail.get("fields", {}).values():
+                    if detail.get("unavailable_count"):
+                        lines.append(f"- {detail['label']}：{detail['unavailable_count']} 条内容无可信数据源，业务可得性存在缺口")
+                    if detail["eligible_count"]:
+                        lines.append(
+                            f"- {detail['label']}：有效 {detail['fresh_count']}/{detail['eligible_count']}"
+                            f"（{detail['percentage']:.2f}%）；旧数据 {detail['stale_count']}，"
+                            f"未取到 {detail['missing_count']}，无效 {detail['invalid_count']}"
+                        )
         elif isinstance(value, bool):
             lines.append(
                 f"- {_QUALITY_GATE_LABELS.get(key, '其他数据检查')}: "
@@ -2031,12 +2110,6 @@ _SVG_PLATFORM_LABELS = {
     "xiaohongshu": "小红书",
     "wechat_channels": "视频号",
     "kuaishou": "快手",
-}
-_SVG_ACCOUNT_TYPE_LABELS = {
-    "mixed_edit": "混剪",
-    "original": "原创",
-    "boutique_ip": "精品 IP",
-    "unknown": "未识别",
 }
 _SVG_DIRECTION_LABELS = {
     "unknown": "待补齐",
@@ -2154,8 +2227,15 @@ def _svg_period(report: Mapping[str, Any]) -> tuple[str, str, int]:
         return "统计周期未声明", "截止时间未声明", 0
 
 
+def _presentation_contract(report: Mapping[str, Any]) -> Dict[str, Any] | None:
+    version = str(report.get("report_version") or "")
+    if version and version not in CURRENT_REPORT_VERSIONS and version not in LEGACY_CONTRACT_PATHS:
+        return None
+    return load_contract(report_version=version)
+
+
 def _svg_quality_thresholds(report: Mapping[str, Any]) -> Dict[str, float]:
-    contract = load_contract(report_version=str(report.get("report_version") or ""))
+    contract = _presentation_contract(report) or {}
     thresholds = {
         str(key): float(value)
         for key, value in contract.get("required_coverage_thresholds", {}).items()
@@ -2174,6 +2254,7 @@ def render_summary_svg(report: Mapping[str, Any]) -> str:
     quality values visible in this compact image, remains the publication truth.
     """
 
+    report = report_inputs.project_account_classification(report)
     metrics = report.get("summary_metrics")
     metrics = metrics if isinstance(metrics, Mapping) else {}
     publication_metric = metrics.get("publication_count")
@@ -2233,15 +2314,13 @@ def render_summary_svg(report: Mapping[str, Any]) -> str:
     major_percentage = _svg_percentage(major["percentage"])
     minor_percentage = _svg_percentage(minor["percentage"])
 
-    new_classification = metadata.get("account_classification_version") == report_inputs.ACCOUNT_CLASSIFICATION_VERSION
-    account_types = _svg_dimensions(report, "account_group_dimensions" if new_classification else "account_type_dimensions")
-    account_order = ("mixed_edit", "innovation", "image_text", "boutique_ip", "unknown") if new_classification else ("mixed_edit", "original", "boutique_ip", "unknown")
-    account_labels = ACCOUNT_GROUPS if new_classification else _SVG_ACCOUNT_TYPE_LABELS
-    account_heading = "账号分组构成" if new_classification else "账号类型构成"
-    account_footnote = "按发布内容统计账号分组占比" if new_classification else "按发布内容统计账号类型占比"
+    account_groups = _svg_dimensions(report, "account_group_dimensions")
+    account_order = ("mixed_edit", "innovation", "image_text", "boutique_ip", "unknown")
+    account_labels = ACCOUNT_GROUPS
+    account_heading = "账号分组构成"
+    account_footnote = "按发布内容统计账号分组占比"
     account_colors = {
         "mixed_edit": "#2db8ad",
-        "original": "#ffcd32",
         "innovation": "#ffcd32",
         "image_text": "#66aee9",
         "boutique_ip": "#8ddcd5",
@@ -2251,7 +2330,7 @@ def render_summary_svg(report: Mapping[str, Any]) -> str:
     account_legend: List[str] = []
     segment_x = 415.0
     for index, key in enumerate(account_order):
-        value = account_types.get(key, {"count": 0, "percentage": 0.0})
+        value = account_groups.get(key, {"count": 0, "percentage": 0.0})
         percentage = _svg_percentage(value["percentage"])
         width = 330 * percentage / 100
         if width > 0:
@@ -2260,7 +2339,7 @@ def render_summary_svg(report: Mapping[str, Any]) -> str:
                 f'height="42" fill="{account_colors[key]}"/>'
             )
             segment_x += width
-        y = 326 + index * (43 if new_classification else 56)
+        y = 326 + index * 43
         account_legend.append(
             f'<circle cx="428" cy="{y - 6}" r="7" fill="{account_colors[key]}"/>'
             f'<text class="t" x="446" y="{y}" font-size="17">'
@@ -2309,7 +2388,8 @@ def render_summary_svg(report: Mapping[str, Any]) -> str:
     thresholds = _svg_quality_thresholds(report)
     quality_items = (
         ("discovery_coverage", "账号采集"),
-        ("metrics_freshness", "数据更新"),
+        ("metrics_freshness", "指标齐全" if report.get("data_quality_details", {}).get(
+            "metrics_freshness", {}).get("contract_version") in report_metric_validity.CONTRACT_VERSIONS else "数据更新"),
         ("evaluation_coverage", "卖点评估"),
         ("detail_coverage", "详情采集"),
         ("media_terminal_coverage", "媒体处理"),
@@ -2384,7 +2464,7 @@ def render_summary_svg(report: Mapping[str, Any]) -> str:
         (report.get("scope") or {}).get("timezone") or "Asia/Shanghai"
     )
     timezone_label = "北京时间" if timezone_value == "Asia/Shanghai" else "当地时间"
-    contract = load_contract(report_version=str(report.get("report_version") or ""))
+    contract = _presentation_contract(report)
     failures = quality_gate_failures(
         quality,
         data_quality_details=(
@@ -2394,7 +2474,7 @@ def render_summary_svg(report: Mapping[str, Any]) -> str:
         ),
         contract=contract,
         enforce_boolean_quality_gates=bool(publication),
-    )
+    ) if contract is not None else []
     estimated_metrics = tuple(
         metrics.get(key)
         for key in (
@@ -2414,7 +2494,7 @@ def render_summary_svg(report: Mapping[str, Any]) -> str:
         effect_boundary = "拉新、拉活和线索暂时无法计算"
     else:
         effect_boundary = "拉新、拉活和线索暂不显示"
-    quality_boundary = (
+    quality_boundary = "历史检查规则未声明" if contract is None else (
         f"{len(failures)} 项数据未达到要求"
         if failures
         else "数据检查已通过"
@@ -2432,28 +2512,26 @@ def render_summary_svg(report: Mapping[str, Any]) -> str:
         active_accounts, large=29, medium=24, small=19
     )
 
-    business_panel = ""
-    if new_classification:
-        business_dimensions = _svg_dimensions(report, "business_direction_dimensions")
-        business_cards: List[str] = []
-        for index, key in enumerate(("new_car", "used_car_c1", "used_car_c2", "ai_xiaodong", "unknown")):
-            x = 40 + index * 226
-            value = business_dimensions.get(key, {"count": 0, "percentage": 0})
-            percentage = _svg_percentage(value["percentage"])
-            business_cards.append(
-                f'<rect x="{x}" y="661" width="208" height="75" rx="10" fill="#173b45"/>'
-                f'<text class="t" x="{x + 15}" y="686" font-size="15">{BUSINESS_DIRECTIONS[key]}</text>'
-                f'<text class="num" x="{x + 15}" y="718" font-size="21" fill="#2db8ad">{percentage:.2f}%</text>'
-                f'<text class="m" x="{x + 192}" y="717" font-size="13" text-anchor="end">{value["count"]:,} 条</text>'
-            )
-        business_panel = ('<line x1="40" y1="620" x2="1160" y2="620" stroke="#31505a"/>'
-                          '<text class="t" x="40" y="647" font-size="18" font-weight="700">业务方向</text>'
-                          '<text class="m" x="1160" y="647" font-size="12" text-anchor="end">按发布账号的业务归属统计内容</text>'
-                          + ''.join(business_cards))
-    canvas_height = 815 if new_classification else 675
-    footer_line_y = 760 if new_classification else 620
-    footer_text_y = 791 if new_classification else 651
-    content_direction_heading = "作品内容方向" if new_classification else "内容方向"
+    business_dimensions = _svg_dimensions(report, "business_direction_dimensions")
+    business_cards: List[str] = []
+    for index, key in enumerate(("new_car", "used_car_c1", "used_car_c2", "ai_xiaodong", "unknown")):
+        x = 40 + index * 226
+        value = business_dimensions.get(key, {"count": 0, "percentage": 0})
+        percentage = _svg_percentage(value["percentage"])
+        business_cards.append(
+            f'<rect x="{x}" y="661" width="208" height="75" rx="10" fill="#173b45"/>'
+            f'<text class="t" x="{x + 15}" y="686" font-size="15">{BUSINESS_DIRECTIONS[key]}</text>'
+            f'<text class="num" x="{x + 15}" y="718" font-size="21" fill="#2db8ad">{percentage:.2f}%</text>'
+            f'<text class="m" x="{x + 192}" y="717" font-size="13" text-anchor="end">{value["count"]:,} 条</text>'
+        )
+    business_panel = ('<line x1="40" y1="620" x2="1160" y2="620" stroke="#31505a"/>'
+                      '<text class="t" x="40" y="647" font-size="18" font-weight="700">业务方向</text>'
+                      '<text class="m" x="1160" y="647" font-size="12" text-anchor="end">按发布账号的业务归属统计内容</text>'
+                      + ''.join(business_cards))
+    canvas_height = 815
+    footer_line_y = 760
+    footer_text_y = 791
+    content_direction_heading = "作品内容方向"
     return f"""<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="{canvas_height}" viewBox="0 0 1200 {canvas_height}">
 <rect width="1200" height="{canvas_height}" fill="#102c35"/>
 <style>
@@ -2518,10 +2596,11 @@ def render_summary_svg(report: Mapping[str, Any]) -> str:
 
 
 def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]], *,
-               new_classification: bool = False) -> None:
+               new_classification: bool = True) -> None:
     fields = [
         "content_id",
         "platform_content_id",
+        *(["platform_content_id_aliases"] if any("platform_content_id_aliases" in row for row in rows) else []),
         "link_id",
         "platform",
         "content_type",
@@ -2530,7 +2609,8 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]], *,
         "title",
         "account_uid",
         "account_name",
-        *(["account_group", "business_direction"] if new_classification else ["account_type"]),
+        "account_group",
+        "business_direction",
         "content_direction",
         "evidence_level",
         "primary_selling_point_code",
@@ -2548,13 +2628,36 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]], *,
         "duplicate_confidence",
         "evaluation_current",
     ]
+    if any("relation_status" in row for row in rows):
+        fields.append("relation_status")
+    readable_metrics = any(
+        "report_status" in row.get("metric_sources", {}).get("view_count", {}) for row in rows
+    )
+    if readable_metrics:
+        fields.extend(
+            label + suffix
+            for label in report_metric_validity.FIELD_LABELS.values()
+            for suffix in ("状态", "采集时间")
+        )
+    def export_row(row: Mapping[str, Any]) -> Dict[str, Any]:
+        result = report_inputs.project_content_classification(row)
+        if readable_metrics:
+            for name, label in report_metric_validity.FIELD_LABELS.items():
+                source = row.get("metric_sources", {}).get(name, {})
+                result[label + "状态"] = source.get("report_status_label", "未取到")
+                captured = source.get("captured_at")
+                result[label + "采集时间"] = (
+                    datetime.fromisoformat(str(captured).replace("Z", "+00:00"))
+                    .astimezone(SHANGHAI).strftime("%Y-%m-%d %H:%M:%S %z") if captured else ""
+                )
+        return result
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         writer.writerows(
             {
-                field: formula_safe_csv_value(json.dumps(value, ensure_ascii=False, sort_keys=True) if isinstance(value, dict) else value)
-                for field, value in row.items()
+                field: formula_safe_csv_value(json.dumps(value, ensure_ascii=False, sort_keys=True) if isinstance(value, (dict, list)) else value)
+                for field, value in export_row(row).items()
             }
             for row in rows
         )
@@ -2597,7 +2700,7 @@ def _write_channel_csv(path: Path, channels: Mapping[str, Any]) -> None:
         "warm_up",
     ]
     rows: List[Dict[str, Any]] = []
-    for platform, _label in CHANNELS:
+    for platform, channel in channels.items():
         channel = channels.get(platform) or {}
         scene_groups = channel.get("scenes") or {}
         groups = [("summary", channel.get("summary") or {})]
@@ -2916,7 +3019,7 @@ def run_task(
             raise ReportTaskError(f"task does not exist: {task_id}")
         legacy = _legacy_report(connection, task_id)
         if legacy is not None:
-            return legacy
+            return report_inputs.project_account_classification(legacy)
         if task["task_status"] not in RUNNABLE_STATUSES:
             raise ReportTaskError(
                 f"task {task_id} is not runnable from {task['task_status']}"
@@ -3063,13 +3166,16 @@ def run_task(
             message="正在生成报告文件",
             db_path=db_path,
         )
+        # Verify immutable evidence using its original contract; every newly
+        # written artifact uses the current account presentation, including a
+        # retry whose evidence was frozen before classification v2 existed.
+        source_report = report
+        report = report_inputs.project_account_classification(source_report)
         temp_paths = {kind: temporary / path.name for kind, path in final_paths.items()}
         temp_paths["report-markdown"].write_text(_markdown(report), encoding="utf-8")
         temp_paths["content-csv"].parent.mkdir(parents=True, exist_ok=True)
         _write_csv(
             temp_paths["content-csv"], report["content_details"],
-            new_classification=(report["metadata"].get("account_classification_version")
-                                == report_inputs.ACCOUNT_CLASSIFICATION_VERSION),
         )
         _write_channel_csv(temp_paths["channel-csv"], report["channels"])
         temp_paths["summary-svg"].write_text(
@@ -3092,7 +3198,8 @@ def run_task(
             message="正在检查并保存报告版本",
             db_path=db_path,
         )
-        validate_report(report)
+        source_report["files"] = report["files"]
+        validate_report(source_report)
         if str(report["rule_version"]) != str(release_value["rule_version"]) or str(
             report["taxonomy_version"]
         ) != str(release_value["taxonomy_version"]):
@@ -3133,7 +3240,7 @@ def run_task(
                     task_id,
                     revision,
                     release_value["id"],
-                    CURRENT_REPORT_VERSION,
+                    report["report_version"],
                     release_value["rule_version"],
                     release_value["taxonomy_version"],
                     _relative(final_paths["report-json"]),

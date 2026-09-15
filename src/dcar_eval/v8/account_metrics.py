@@ -50,7 +50,34 @@ def _integer(value: Any, *, signed: bool = False) -> int | None:
 def parse_tikhub_profile(
     payload: Any, *, platform: str, uid: str, http_status: int = 200
 ) -> dict[str, Any]:
-    """The verified Douyin contract only supplies fans; XHS stays disabled."""
+    """Normalize only fields in the platform-specific verified profile contract."""
+    if platform in {"xiaohongshu", "kuaishou", "wechat_channels"}:
+        if platform == "xiaohongshu":
+            from .platform_adapters import normalize_profile, PlatformAdapterError
+            try:
+                if http_status != 200:
+                    raise PlatformAdapterError("provider_http_failure")
+                profile = normalize_profile(platform, {"uid": uid}, payload)
+            except PlatformAdapterError as error:
+                raise AccountMetricError(str(error)) from error
+        else:
+            from .providers import _extra_parse
+            profile = _extra_parse(platform, "profile", uid, payload, status=http_status).data
+        from .source_routing import load_policy
+        fields = load_policy()["routes"][platform + "_profile"]["enabled_fields"]
+        metrics = profile.get("metrics", profile)
+        supplied_status = profile.get("field_status", metrics.get("_field_status", {}))
+        normalized = {"identity": {"platform": platform, "uid": uid}, "statistics_date": None,
+            "basis": "realtime_profile", "metrics": {}, "field_status": {}}
+        for field in ACCOUNT_FIELDS:
+            value = metrics.get(field)
+            count = _integer(value)
+            status = "not_requested" if field not in fields else "missing" if value is None else "provided" if count is not None else "invalid"
+            if field in fields and isinstance(supplied_status.get(field), Mapping):
+                status = supplied_status[field].get("status", status)
+            normalized["metrics"][field] = count if status == "provided" else None
+            normalized["field_status"][field] = {"status": status, "reason": "verified_profile_field" if field in fields else "contract_not_verified"}
+        return normalized
     if platform != "douyin":
         raise AccountMetricError("xiaohongshu profile contract is not enabled")
     if not isinstance(uid, str) or not uid:
@@ -89,8 +116,8 @@ def _validated_payload(
     identity = value.get("identity")
     if not isinstance(identity, Mapping) or identity.get("platform") != platform or identity.get("uid") != uid:
         raise AccountMetricError("account metric subject does not match platform identity")
-    if provider == "tikhub" and platform != "douyin":
-        raise AccountMetricError("xiaohongshu profile contract is not enabled")
+    if provider == "tikhub" and platform not in {"douyin", "xiaohongshu", "kuaishou", "wechat_channels"}:
+        raise AccountMetricError("profile platform is not enabled")
     statistics_date = value.get("statistics_date")
     basis = "matrix_daily" if provider == "newrank_matrix" else "realtime_profile"
     if provider == "newrank_matrix":
@@ -105,17 +132,19 @@ def _validated_payload(
     if not isinstance(metrics, Mapping) or not isinstance(statuses, Mapping):
         raise AccountMetricError("account metric fields and statuses are required")
     fields: dict[str, Any] = {}
+    from .source_routing import load_policy
+    profile_fields = load_policy()["routes"].get(platform + "_profile", {}).get("enabled_fields", [])
     for field in ACCOUNT_FIELDS:
         detail = statuses.get(field, {"status": "not_requested", "reason": "not_requested"})
         if not isinstance(detail, Mapping) or detail.get("status") not in FIELD_STATUSES:
             raise AccountMetricError("invalid account metric field status")
         status = str(detail["status"])
         parsed = _integer(metrics.get(field), signed=field.endswith("daily_increment"))
-        if provider == "tikhub" and field != "follower_count" and status != "not_requested":
+        if provider == "tikhub" and field not in profile_fields and status != "not_requested":
             raise AccountMetricError("profile field is outside the verified contract")
         if status == "provided" and parsed is None:
             raise AccountMetricError("provided account metric requires a valid integer")
-        if field == "total_likes" and platform != "douyin":
+        if field == "total_likes" and platform not in {"douyin", "kuaishou"}:
             parsed, status = None, "not_applicable"
         if field in {"total_likes_and_collects"} and platform != "xiaohongshu":
             parsed, status = None, "not_applicable"
@@ -157,7 +186,8 @@ def persist_account_metric_observation(
     allowed_operations = (
         {"matrix_account_list", "/api/matrix/v1/account/list"}
         if provider == "newrank_matrix"
-        else {"douyin_user_profile", "douyin_uid_profile", "douyin_user_reference"}
+        else ({"douyin_user_profile", "douyin_uid_profile", "douyin_user_reference"} if identity["platform"] == "douyin"
+              else {str(identity["platform"]) + "_user_profile"} if identity["platform"] in {"xiaohongshu", "kuaishou", "wechat_channels"} else set())
     )
     if raw["operation"] not in allowed_operations:
         raise AccountMetricError("account metric raw operation is not the verified profile contract")
@@ -201,14 +231,22 @@ def select_account_metrics(
     cutoff = _time(cutoff_at)
     freshness_seconds = int(load_policy().get("account_freshness_seconds", 86400))
     output: dict[int, dict[str, Any]] = {}
-    for identity_id in dict.fromkeys(account_identity_ids):
-        rows = connection.execute(
-            """SELECT * FROM account_metric_observations
-            WHERE account_identity_id=? AND julianday(captured_at)<=julianday(?)
-              AND julianday(recorded_at)<=julianday(?)
-            ORDER BY julianday(captured_at) DESC,julianday(recorded_at) DESC,id DESC""",
-            (identity_id, cutoff_at, cutoff_at),
-        ).fetchall()
+    identity_ids = list(dict.fromkeys(account_identity_ids))
+    if not identity_ids:
+        return output
+    # Preserve each identity's original ordering/selection rules, but obtain the
+    # page's observations together instead of one SQLite/GIL round trip per row.
+    by_identity: dict[int, list[Any]] = {identity_id: [] for identity_id in identity_ids}
+    for row in connection.execute(
+        """SELECT * FROM account_metric_observations
+        WHERE account_identity_id IN (SELECT value FROM json_each(?))
+          AND julianday(captured_at)<=julianday(?) AND julianday(recorded_at)<=julianday(?)
+        ORDER BY account_identity_id,julianday(captured_at) DESC,julianday(recorded_at) DESC,id DESC""",
+        (json.dumps(identity_ids), cutoff_at, cutoff_at),
+    ):
+        by_identity[row["account_identity_id"]].append(row)
+    for identity_id in identity_ids:
+        rows = by_identity[identity_id]
         observations = [dict(row) | {"payload": json.loads(row["payload_json"])} for row in rows]
         fields: dict[str, Any] = {}
         for field in ACCOUNT_FIELDS:

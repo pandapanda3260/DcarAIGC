@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 
 const require = createRequire(new URL("../app/web/package.json", import.meta.url));
@@ -14,6 +15,7 @@ const PREFIX = new URL(BASE).pathname.replace(/\/$/, "");
 const PASSWORD = "T3mp-Smoke-Passphrase!";
 const UNICODE_PASSWORD = "🔑".repeat(64);
 const RESET_PASSWORD = "🔐".repeat(64);
+const REGISTERED_USERNAME = '  注册用户 🚗.\nfirst+test@example.com / & = ? # % \\ " <script>window.usernameInjected=true</script> ' + "长名称".repeat(50) + "  ";
 const results = [];
 const pageErrors = [];
 let executionError = false;
@@ -73,17 +75,28 @@ async function passwordLogin(page, username, password, returnTo = "/overview") {
   await page.click("#submit-btn");
 }
 
-const browser = await chromium.launch({ headless: true });
+async function waitForPendingShell(page, section = "overview") {
+  await page.waitForURL((url) => url.pathname === `${PREFIX}/${section}`);
+  await page.locator(`main[data-section="${section}"][data-access="pending"]`).waitFor({ state: "visible" });
+}
+
+async function waitForApprovedWorkbench(page, section = "overview") {
+  await page.waitForURL((url) => url.pathname === `${PREFIX}/${section}`);
+  await page.locator(`main[data-section="${section}"]:not([data-access="pending"])`).waitFor({ state: "visible" });
+}
+
+const browser = await chromium.launch({ headless: true, channel: process.env.DCAR_SMOKE_BROWSER_CHANNEL || undefined });
 try {
-  // Registration creates an authenticated but unapproved session. Neither a
-  // guessed page URL nor a direct API request may open the workbench.
+  // Registration creates an authenticated but unapproved session. Navigation
+  // shows a data-free shell; direct API requests remain gated by the gateway.
   {
     const context = await browser.newContext();
     const page = await context.newPage();
     trackPage(page);
     await page.goto(`${BASE}/login?return_to=${encodeURIComponent("/overview")}`);
     await page.click("#to-register");
-    await page.fill("#reg-username", "registered_smoke");
+    await page.fill("#reg-username", REGISTERED_USERNAME);
+    check("registration retains arbitrary symbols, Unicode, whitespace and a name longer than 128 characters", await page.inputValue("#reg-username") === REGISTERED_USERNAME);
     await page.fill("#reg-phone", "13800138108");
     await page.fill("#reg-password", "🔑".repeat(7));
     await page.click("#register-form .submit");
@@ -97,21 +110,25 @@ try {
     const code = await nextSmsCode();
     await page.fill("#reg-code", code);
     await page.click("#register-form .submit");
-    await page.waitForURL(`${BASE}/pending-approval`);
+    await waitForPendingShell(page);
     const session = await authSession(page);
-    check("registration creates a new-user session", session.status === 200 && session.body.username === "registered_smoke" && session.body.role === "new_user", JSON.stringify(session));
-    check("new user sees only the pending approval page", await page.getByRole("heading", { name: "等待管理员授权" }).isVisible() && await page.getByRole("navigation").count() === 0);
+    check("registration without phone admission creates a new-user session with the exact account name", session.status === 200 && session.body.username === REGISTERED_USERNAME && session.body.role === "new_user" && session.body.bypass === false, JSON.stringify(session));
+    check("registration username cannot inject markup into the pending shell", await page.evaluate(() => window.usernameInjected) === undefined);
+    check("new user sees the data-free workbench shell with ordinary navigation", await page.getByRole("heading", { name: "下一步，开通业务权限" }).isVisible() && await page.getByRole("navigation", { name: "主导航" }).count() === 1 && await page.getByRole("link", { name: "用户权限" }).count() === 0);
     const denied = await page.evaluate(async (url) => {
       const response = await fetch(url);
       return { status: response.status, body: await response.json() };
     }, `${BASE}/api/v8/smoke`);
     check("new-user API request is denied by the gateway", denied.status === 403 && denied.body.code === "approval_required" && !("upstream" in denied.body), JSON.stringify(denied));
-    await page.goto(`${BASE}/overview`);
-    await page.waitForURL(`${BASE}/pending-approval`);
-    check("new user cannot bypass approval with a business URL", await page.getByRole("navigation").count() === 0);
+    await page.goto(`${BASE}/contents`);
+    await waitForPendingShell(page, "contents");
+    check("new user cannot expose business data through a business URL", await page.getByRole("heading", { name: "下一步，开通业务权限" }).isVisible() && await page.getByPlaceholder("内容编号、标题、账号编号、昵称或链接").count() === 0);
+    const permissionResponse = page.waitForResponse((response) => response.url() === `${BASE}/auth/session`);
     await page.getByRole("button", { name: "刷新权限" }).click();
-    await waitUntil(() => page.getByRole("status").innerText().then((text) => text.includes("暂未获得授权")), "unapproved permission refresh");
-    check("refresh keeps an unapproved user on the waiting page", page.url() === `${BASE}/pending-approval`);
+    await permissionResponse;
+    await waitUntil(() => page.getByRole("button", { name: "刷新权限" }).isEnabled(), "unapproved permission refresh");
+    check("the pending shell shows the administrator contact", await page.getByText("权限还未开通，请飞书联系管理员@程鑫 后再试。", { exact: true }).isVisible());
+    check("refresh keeps an unapproved user in the selected data-free shell", page.url() === `${BASE}/contents` && await page.locator('main[data-access="pending"]').isVisible());
     await context.close();
   }
 
@@ -120,10 +137,10 @@ try {
     const context = await browser.newContext();
     const page = await context.newPage();
     trackPage(page);
-    await passwordLogin(page, "registered_smoke", UNICODE_PASSWORD);
-    await page.waitForURL(`${BASE}/pending-approval`);
+    await passwordLogin(page, REGISTERED_USERNAME, UNICODE_PASSWORD);
+    await waitForPendingShell(page);
     const session = await authSession(page);
-    check("password login preserves the new-user role", session.status === 200 && session.body.username === "registered_smoke" && session.body.role === "new_user", JSON.stringify(session));
+    check("password login preserves the exact account name and new-user role", session.status === 200 && session.body.username === REGISTERED_USERNAME && session.body.role === "new_user", JSON.stringify(session));
     await context.close();
   }
 
@@ -178,8 +195,8 @@ try {
     await oldContext.close();
   }
 
-  // Disabled account and unadmitted registration phone both surface the real
-  // gateway's 403 copy in the login-template banner.
+  // Disabled accounts remain blocked. An ordinary unregistered phone can
+  // receive a code and register directly, without an admission fixture.
   {
     const context = await browser.newContext();
     const page = await context.newPage();
@@ -189,12 +206,17 @@ try {
     const disabledCopy = await page.locator("#login-form .banner-text").innerText();
     check("disabled-account 403 is shown in the banner", disabledCopy === "该账号已停用。", disabledCopy);
     await page.click("#to-register");
+    await page.fill("#reg-username", "email.only+signup@example.com");
     await page.fill("#reg-phone", "13800138199");
+    await page.fill("#reg-password", PASSWORD);
     await page.click("#register-form .code-btn");
-    await page.waitForSelector("#register-form .banner:not([hidden])");
-    const deniedCopy = await page.locator("#register-form .banner-text").innerText();
-    check("unadmitted phone is rejected in the banner", deniedCopy === "该手机号未获授权。", deniedCopy);
-    check("failed code send re-enables its button", !(await page.locator("#register-form .code-btn").isDisabled()));
+    const code = await nextSmsCode();
+    check("unregistered phone receives a registration code without admission", Boolean(code));
+    await page.fill("#reg-code", code);
+    await page.click("#register-form .submit");
+    await waitForPendingShell(page);
+    const session = await authSession(page);
+    check("an email account name registers as a new user", session.status === 200 && session.body.username === "email.only+signup@example.com" && session.body.role === "new_user", JSON.stringify(session));
     await context.close();
   }
 
@@ -268,11 +290,14 @@ try {
     const pendingContext = await browser.newContext();
     const pendingPage = await pendingContext.newPage();
     trackPage(pendingPage);
-    await passwordLogin(pendingPage, "registered_smoke", UNICODE_PASSWORD);
-    await pendingPage.waitForURL(`${BASE}/pending-approval`);
-    const registeredRow = page.locator('[data-username="registered_smoke"]');
+    await passwordLogin(pendingPage, REGISTERED_USERNAME, UNICODE_PASSWORD);
+    await waitForPendingShell(pendingPage);
+    const registeredSelector = await page.evaluate((username) => `[data-username="${CSS.escape(username)}"]`, REGISTERED_USERNAME);
+    const registeredRow = page.locator(registeredSelector);
     check("registered account is listed as new user", await registeredRow.getByText("新用户", { exact: true }).isVisible());
     await registeredRow.getByRole("button", { name: "修改" }).click();
+    check("management shows the complete unchanged account name", await dialog.getByLabel("账号", { exact: true }).inputValue() === REGISTERED_USERNAME);
+    check("management does not interpret account names as markup", await page.evaluate(() => window.usernameInjected) === undefined);
     await dialog.getByLabel("权限等级").selectOption("operator");
     const approvalResponse = page.waitForResponse((response) => response.url().endsWith("/auth/users/update"));
     await dialog.getByRole("button", { name: "保存", exact: true }).click();
@@ -280,14 +305,21 @@ try {
     await dialog.waitFor({ state: "hidden" });
     await waitUntil(() => registeredRow.getByText("运营人员", { exact: true }).isVisible(), "approved role in table");
     await pendingPage.getByRole("button", { name: "刷新权限" }).click();
-    await pendingPage.waitForURL(`${BASE}/overview`);
-    await pendingPage.waitForSelector("main[data-section='overview']");
+    await waitForApprovedWorkbench(pendingPage);
     check("approved user enters the workbench without logging in again", (await authSession(pendingPage)).body.role === "operator");
     const upstream = await pendingPage.evaluate(async (url) => {
       const response = await fetch(url);
       return { status: response.status, body: await response.json() };
     }, `${BASE}/api/v8/smoke`);
-    check("approved user reaches the upstream with its authenticated identity", upstream.status === 200 && upstream.body.upstream === "api" && upstream.body.user === "registered_smoke", JSON.stringify(upstream));
+    check("approved user reaches the upstream with its fixed-size authenticated identity", upstream.status === 200 && upstream.body.upstream === "api" && upstream.body.user === createHash("sha256").update(REGISTERED_USERNAME).digest("hex"), JSON.stringify(upstream));
+    const approvedContext = await browser.newContext();
+    const approvedPage = await approvedContext.newPage();
+    trackPage(approvedPage);
+    await passwordLogin(approvedPage, REGISTERED_USERNAME, UNICODE_PASSWORD);
+    await approvedPage.waitForURL(`${BASE}/overview`);
+    const approvedSession = await authSession(approvedPage);
+    check("approved account logs in using its original unrestricted name", approvedSession.body.username === REGISTERED_USERNAME && approvedSession.body.role === "operator");
+    await approvedContext.close();
     await pendingPage.goto(`${BASE}/contents`);
     await pendingPage.getByPlaceholder("内容编号、标题、账号编号、昵称或链接").waitFor({ state: "visible" });
     await registeredRow.getByRole("button", { name: "修改" }).click();
@@ -299,21 +331,45 @@ try {
     const deniedSearch = pendingPage.waitForResponse((response) => response.url().endsWith("/api/v8/contents/search") && response.status() === 403);
     await pendingPage.getByPlaceholder("内容编号、标题、账号编号、昵称或链接").fill("permission-recheck");
     await pendingPage.getByRole("button", { name: "搜索", exact: true }).click();
-    check("live business request observes approval revocation", (await (await deniedSearch).json()).code === "approval_required");
-    await pendingPage.waitForURL(`${BASE}/pending-approval`);
-    check("revoked user leaves its cached business page without exposing navigation", await pendingPage.getByRole("heading", { name: "等待管理员授权" }).isVisible() && await pendingPage.getByRole("navigation").count() === 0 && await pendingPage.locator("main[data-section]").count() === 0);
+    check("live business request observes approval revocation", (await deniedSearch).status() === 403);
+    await waitForPendingShell(pendingPage, "contents");
+    const revokedApi = await pendingPage.request.get(`${BASE}/api/v8/smoke`);
+    check("revoked account remains denied by the approval gate", revokedApi.status() === 403 && (await revokedApi.json()).code === "approval_required");
+    check("revoked user returns to the data-free shell without cached business controls", await pendingPage.getByRole("heading", { name: "下一步，开通业务权限" }).isVisible() && await pendingPage.getByRole("navigation", { name: "主导航" }).count() === 1 && await pendingPage.getByPlaceholder("内容编号、标题、账号编号、昵称或链接").count() === 0);
     await pendingContext.close();
 
     const deleteRow = page.locator('[data-username="delete_smoke"]');
     await deleteRow.getByRole("button", { name: "删除" }).click();
     const deleteDialog = page.getByRole("dialog", { name: "删除用户" });
     await deleteDialog.waitFor({ state: "visible" });
+    check("delete confirmation explains new-user registration and fresh approval", (await deleteDialog.innerText()).includes("再次注册后为新用户，需要管理员重新授权"));
     const deleteResponse = page.waitForResponse((response) => response.url().endsWith("/auth/users/delete"));
     await deleteDialog.getByRole("button", { name: "确认删除" }).click();
     const deleted = await deleteResponse;
     check("delete reaches the real gateway", deleted.status() === 200, deleted.status());
     await waitUntil(() => deleteRow.count().then((count) => count === 0), "deleted user to leave table");
     check("deleted user leaves the table", true);
+
+    const returningContext = await browser.newContext();
+    const returningPage = await returningContext.newPage();
+    trackPage(returningPage);
+    await returningPage.goto(`${BASE}/login`);
+    await returningPage.click("#to-register");
+    await returningPage.fill("#reg-username", "delete_smoke");
+    await returningPage.fill("#reg-phone", "13800138107");
+    await returningPage.fill("#reg-password", PASSWORD);
+    await returningPage.click("#register-form .code-btn");
+    await returningPage.fill("#reg-code", await nextSmsCode());
+    await returningPage.click("#register-form .submit");
+    await waitForPendingShell(returningPage);
+    const returningSession = await authSession(returningPage);
+    check("deleted account name and phone can register again without inherited permission", returningSession.status === 200 && returningSession.body.username === "delete_smoke" && returningSession.body.role === "new_user", JSON.stringify(returningSession));
+    const returningDenied = await returningPage.evaluate(async (url) => {
+      const response = await fetch(url);
+      return { status: response.status, body: await response.json() };
+    }, `${BASE}/api/v8/smoke`);
+    check("re-registered account still needs administrator approval for business data", returningDenied.status === 403 && returningDenied.body.code === "approval_required");
+    await returningContext.close();
     await context.close();
   }
 

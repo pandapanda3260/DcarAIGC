@@ -92,8 +92,6 @@ class AccountCatalogCaptureTest(unittest.TestCase):
         row = connection.execute('SELECT * FROM current_members WHERE identity_id=?', (identity_id,)).fetchone()
         if row is None:
             raise eligibility.DirectoryCaptureEligibilityError('identity_missing')
-        if row['status'] == 'paused':
-            raise eligibility.DirectoryCaptureEligibilityError('account_paused')
         return {key: row[key] for key in catalog.IDENTITY_KEYS}
 
     def save_plan(self, plan_id, plan):
@@ -116,12 +114,12 @@ class AccountCatalogCaptureTest(unittest.TestCase):
             self.validate(13, 1003)
         self.assertEqual(result.exception.error_code, 'catalog_batch_invalid')
 
-    def test_current_pause_and_identity_change_block_already_frozen_work(self):
-        self.connection.execute("UPDATE current_members SET status='paused' WHERE identity_id=12")
-        with self.assertRaises(PaidScopeBlocked) as result:
-            self.validate(12, 1002)
-        self.assertEqual(result.exception.error_code, 'account_paused')
-        self.connection.execute("UPDATE current_members SET status='daily',locator_sha256='changed' WHERE identity_id=12")
+    def test_current_operating_status_never_vetoes_but_identity_change_blocks_frozen_work(self):
+        for status in ('daily', 'weekly', 'paused', 'unmarked'):
+            with self.subTest(status=status):
+                self.connection.execute("UPDATE current_members SET status=? WHERE identity_id=12", (status,))
+                self.assertEqual(self.validate(12, 1002)['account_id'], 102)
+        self.connection.execute("UPDATE current_members SET locator_sha256='changed' WHERE identity_id=12")
         with self.assertRaises(PaidScopeBlocked) as result:
             self.validate(12, 1002)
         self.assertEqual(result.exception.error_code, 'catalog_identity_changed')
@@ -201,7 +199,7 @@ class AccountCatalogCaptureTest(unittest.TestCase):
             self.validate()
             self.assertEqual(self.installed.call_count, 1)
             self.assertEqual(self.resolver.call_count, 1)
-            self.connection.execute("UPDATE current_members SET status='paused' WHERE identity_id=11")
+            self.connection.execute("UPDATE current_members SET uid='changed' WHERE identity_id=11")
             with self.assertRaises(PaidScopeBlocked):
                 self.validate()
         self.connection.rollback()
@@ -246,8 +244,10 @@ class AccountCatalogCaptureTest(unittest.TestCase):
         scope = self.real_paid_scope()
         with patch.object(provider_budget, 'require_active_member',
                 side_effect=AssertionError('catalog must derive eligibility without old roster')):
-            self.assertEqual(self.freeze(scope).identity_id, 11)
-            self.assertEqual(self.freeze(scope, 1002).identity_id, 12)
+            for status in ('daily', 'weekly', 'paused', 'unmarked'):
+                self.connection.execute("UPDATE current_members SET status=?", (status,))
+                self.assertEqual(self.freeze(scope).identity_id, 11)
+                self.assertEqual(self.freeze(scope, 1002).identity_id, 12)
             with self.assertRaises(PaidScopeBlocked):
                 self.freeze(scope, 1003)
             for changed in (replace(scope, scheduler_attempt_id=None),
@@ -300,6 +300,50 @@ class AccountCatalogCaptureTest(unittest.TestCase):
                     with provider_budget.paid_scope('metrics', **inner):
                         self.fail('mixed manual and catalog scope entered')
                 self.assertEqual(result.exception.error_code, 'paid_scope_mismatch')
+
+
+class AccountCatalogReplicaStatusTest(unittest.TestCase):
+    def setUp(self):
+        self.connection = sqlite3.connect(':memory:')
+        self.connection.row_factory = sqlite3.Row
+        self.addCleanup(self.connection.close)
+        self.account = {'id': 101, 'directory_row_id': 1, 'account_status': 'daily',
+            'directory_platform': 'douyin', 'directory_uid': '1000001',
+            'platforms': [{'id': 11, 'platform': 'douyin', 'uid': '1000001'}]}
+        self.member = {'account_id': 101, 'identity_id': 11, 'account_status': 'daily',
+            'platform': 'douyin', 'uid': '1000001', 'eligible': True,
+            'reason_code': 'eligible', 'reason_label': '可自动采集'}
+
+    def test_replica_keeps_proven_members_eligible_across_all_operating_labels(self):
+        with patch.object(catalog, 'public_statuses', return_value={1: self.member}):
+            for old_status in ('daily', 'weekly', 'paused', 'unmarked'):
+                self.member['account_status'] = old_status
+                for current_status in ('daily', 'weekly', 'paused', 'unmarked'):
+                    with self.subTest(old=old_status, current=current_status):
+                        self.account['account_status'] = current_status
+                        catalog.annotate_accounts(self.connection, [self.account])
+                        self.assertTrue(self.account['automatic_capture']['eligible'])
+
+    def test_replica_does_not_promote_historical_status_exclusions_without_a_new_plan(self):
+        with patch.object(catalog, 'public_statuses', return_value={1: self.member}):
+            for reason in ('account_paused', 'account_status_unmarked', 'account_status_invalid'):
+                with self.subTest(reason=reason):
+                    self.member.update(eligible=False, reason_code=reason, reason_label='old status rule')
+                    catalog.annotate_accounts(self.connection, [self.account])
+                    result = self.account['automatic_capture']
+                    self.assertFalse(result['eligible'])
+                    self.assertEqual(result['reason_code'], 'capture_plan_pending')
+                    self.assertIn('全量名单', result['reason_label'])
+
+    def test_replica_still_rejects_identity_changes_and_retains_evidence_failures(self):
+        with patch.object(catalog, 'public_statuses', return_value={1: self.member}):
+            self.member.update(eligible=False, reason_code='reference_missing', reason_label='缺少可用的账号定位信息')
+            self.account['account_status'] = 'paused'
+            catalog.annotate_accounts(self.connection, [self.account])
+            self.assertEqual(self.account['automatic_capture']['reason_code'], 'reference_missing')
+            self.account['directory_uid'] = '9999999'
+            catalog.annotate_accounts(self.connection, [self.account])
+            self.assertEqual(self.account['automatic_capture']['reason_code'], 'identity_conflict')
 
 
 if __name__ == '__main__':

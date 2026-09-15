@@ -1,4 +1,11 @@
-import type { ConclusionMetricKey, Metric, OverviewChannel } from "../lib/types";
+import type { ConclusionMetricKey, Metric, OverviewChannel, OverviewChannelKey } from "../lib/types";
+
+export const overviewChannels = [
+  { key: "douyin", label: "抖音", logo: "/brand-douyin-tiktok.svg" },
+  { key: "xiaohongshu", label: "小红书", logo: "/brand-xiaohongshu-official.png" },
+  { key: "kuaishou", label: "快手", logo: "/brand-kuaishou-official.png" },
+  { key: "wechat_channels", label: "视频号", logo: "/brand-wechat-channels-official.png" },
+] as const satisfies ReadonlyArray<{ key: OverviewChannelKey; label: string; logo: string }>;
 
 export const overviewMetrics = [
   ["selling_point_count_share", "卖点条数占比", "blue"],

@@ -2,7 +2,8 @@
 
 This module never probes alternative endpoints. A known detail response is used
 for counters that the statistics endpoint does not expose, without rewriting
-text/media or rerunning analysis. Each route has a separate cycle-scoped slot.
+text or rerunning analysis. Shared new-platform detail responses also register
+their media source without another request. Each route has a cycle-scoped slot.
 """
 
 from __future__ import annotations
@@ -24,21 +25,49 @@ from .capture import (
     load_succeeded_raw_response,
 )
 from .provider_budget import DEFAULT_TASK_MAX_AMOUNT_USD, paid_scope
-from .source_routing import METRIC_FIELDS, load_policy, metric_cycle_key, parse_time, select_content_metrics
+from .source_routing import (
+    METRIC_FIELDS, OPERATION_FIELD_POLICY_VERSION, POLICY_VERSION,
+    load_policy, metric_cycle_key, parse_time, select_content_metrics,
+)
 from .storage import DEFAULT_DB, connect, now_utc, transaction
+from .metric_source_policy import CURRENT_METRIC_POLICY, auto_collectable_fields
 
 BEIJING = ZoneInfo("Asia/Shanghai")
+
+
+def _metric_only_result(result: ProviderResult, *, platform: str, source_stage: str,
+                        expected_uid: str | None) -> ProviderResult:
+    """Use the same author check and projection for a live response or replay."""
+    providers._validate_content_author(source_stage, result, expected_uid)
+    values = result.data.get("metrics") if source_stage == "detail" else result.data
+    if not isinstance(values, Mapping):
+        raise CaptureError("fixed counter route omitted metrics", retryable=True,
+            error_code="invalid_response", http_status=result.http_status,
+            billed=result.billed, raw_response=result.raw_response,
+            entity_bytes=result.entity_bytes, transport_receipt=result.transport_receipt)
+    data = dict(values)
+    if source_stage == "detail" and platform in {"kuaishou", "wechat_channels"}:
+        data["account_uid"] = result.data.get("account_uid")
+        data["_detail_projection"] = dict(result.data)
+    return ProviderResult(data, result.raw_response, result.http_status, result.billed,
+        entity_bytes=result.entity_bytes, transport_receipt=result.transport_receipt)
 
 
 def missing_metric_fields(connection, content_id: int, *, at: str) -> list[str]:
     content = connection.execute("SELECT platform FROM content_items WHERE id=?", (content_id,)).fetchone()
     if content is None:
         raise providers.ProviderConfigurationError("content does not exist")
-    selected = select_content_metrics(connection, [content_id], cutoff_at=at).get(content_id, {})
+    # The capture planner must use the same qualified operation/field sources
+    # as current reports. A post's incidental VV or likes cannot satisfy a
+    # statistics gap, nor invalidate a fresh value from statistics.
+    schema = connection.execute("PRAGMA user_version").fetchone()[0]
+    policy = CURRENT_METRIC_POLICY if schema >= 20 else POLICY_VERSION
+    selected = select_content_metrics(
+        connection, [content_id], cutoff_at=at, policy_version=policy,
+    ).get(content_id, {})
     fields = selected.get("fields", {})
-    return [name for name in METRIC_FIELDS
-            if not (name == "view_count" and content["platform"] == "xiaohongshu")
-            and not (fields.get(name, {}).get("status") == "provided"
+    return [name for name in auto_collectable_fields(content["platform"])
+            if not (fields.get(name, {}).get("status") == "provided"
                      and fields.get(name, {}).get("freshness") == "fresh")]
 
 
@@ -89,8 +118,9 @@ def refresh_content_metrics(
         content = dict(row)
         missing = missing_metric_fields(connection, content_id, at=timestamp)
     platform = content["platform"]
-    if platform not in {"douyin", "xiaohongshu"}:
+    if platform not in providers.SUPPORTED_CONTENT_PLATFORMS:
         raise providers.ProviderConfigurationError("unsupported metrics platform")
+    subject = providers._content_subject(content)
     cycle = cycle_key or metric_cycle_key(content_id, content["published_at"], as_of=timestamp)
     groups = load_policy()["metric_supplement_groups"][platform]
     policy_groups = {str(rule["name"]) for rule in groups}
@@ -131,53 +161,29 @@ def refresh_content_metrics(
                     content_id=content_id, operation=operation, stage="metrics")
 
         def parse(raw: Any, http_status: int) -> ProviderResult:
-            parsed = (providers._parse_douyin_stage_payload(source_stage, content["platform_content_id"], raw, status=http_status)
-                      if platform == "douyin" else providers._parse_xhs_stage_payload("metrics", content["platform_content_id"], content["content_type"], raw, status=http_status))
-            values = parsed.data.get("metrics") if source_stage == "detail" else parsed.data
-            if not isinstance(values, Mapping):
-                raise providers.ProviderConfigurationError("fixed counter route omitted metrics")
-            return ProviderResult(dict(values), raw, http_status, parsed.billed)
+            parsed = providers._parse_content_payload(platform, source_stage, subject,
+                content["content_type"], raw, status=http_status, expected_uid=content.get("raw_account_uid"))
+            return _metric_only_result(parsed, platform=platform, source_stage=source_stage,
+                expected_uid=content.get("raw_account_uid"))
 
         def call() -> ProviderResult:
             if call_override is not None:
-                return call_override(group, content)
+                supplied = call_override(group, content)
+                try:
+                    parsed = parse(supplied.raw_response, supplied.http_status)
+                except CaptureError as error:
+                    error.entity_bytes = supplied.entity_bytes
+                    error.transport_receipt = supplied.transport_receipt
+                    error.billed = supplied.billed
+                    raise
+                return ProviderResult(parsed.data, supplied.raw_response,
+                    supplied.http_status, supplied.billed, entity_bytes=supplied.entity_bytes,
+                    transport_receipt=supplied.transport_receipt)
             key = providers._load_key(providers.TIKHUB_KEY_FILE, "TIKHUB_API_KEY")
-            result = (providers._douyin_call(source_stage, content["platform_content_id"], key)
-                      if platform == "douyin" else providers._xhs_call("metrics", content["platform_content_id"], key, content["content_type"]))
-            if source_stage == "detail" and result.data.get("account_uid") and content.get("raw_account_uid"):
-                if str(result.data["account_uid"]) != str(content["raw_account_uid"]):
-                    raise CaptureError(
-                        "counter detail author conflicts with stored identity",
-                        retryable=False,
-                        error_code="identity_conflict",
-                        http_status=result.http_status,
-                        billed=result.billed,
-                        raw_response=result.raw_response,
-                        entity_bytes=result.entity_bytes,
-                        transport_receipt=result.transport_receipt,
-                    )
-            values = (
-                result.data.get("metrics") if source_stage == "detail" else result.data
-            )
-            if not isinstance(values, Mapping):
-                raise CaptureError(
-                    "fixed counter route omitted metrics",
-                    retryable=True,
-                    error_code="invalid_response",
-                    http_status=result.http_status,
-                    billed=result.billed,
-                    raw_response=result.raw_response,
-                    entity_bytes=result.entity_bytes,
-                    transport_receipt=result.transport_receipt,
-                )
-            return ProviderResult(
-                dict(values),
-                result.raw_response,
-                result.http_status,
-                result.billed,
-                entity_bytes=result.entity_bytes,
-                transport_receipt=result.transport_receipt,
-            )
+            result = providers._content_call(platform, source_stage, subject, key,
+                content["content_type"], expected_uid=content.get("raw_account_uid"))
+            return _metric_only_result(result, platform=platform, source_stage=source_stage,
+                expected_uid=content.get("raw_account_uid"))
 
         replayed = False
         try:
@@ -203,16 +209,7 @@ def refresh_content_metrics(
             # A surrounding history scope is retained by paid_scope.
             with route_context, paid_scope("metrics", manual_command_run_id=manual_command_run_id):
                 platform_content_id = str(content["platform_content_id"])
-                if platform == "douyin":
-                    _, request_params = providers._douyin_request(
-                        source_stage, platform_content_id
-                    )
-                else:
-                    _, request_params = providers._xhs_request(
-                        "metrics",
-                        platform_content_id,
-                        str(content["content_type"]),
-                    )
+                request_params = providers._content_request_params(platform, source_stage, subject, str(content["content_type"]))
                 outcome = execute_content_fetch(
                     request_transport=providers._freeze_tikhub_transport(call_override),
                     content_id=content_id,

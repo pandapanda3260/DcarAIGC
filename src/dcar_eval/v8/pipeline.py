@@ -6,6 +6,7 @@ functions remain readable for old receipts, but are not scheduled or chained.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
@@ -30,6 +31,7 @@ from .account_roster import (
 from .capture import ProviderResult
 from .automatic_scope import automatic_from_date, automatic_scope, automatic_start_at, within_automatic_scope
 from .duplicates import FINGERPRINT_VERSION, _current_source_state, run_duplicate_fingerprint_queue
+from .duplicate_readiness import indexed_duplicates, relation_coverage, relation_states
 from .evaluation import evaluate_content
 from .media import run_media_download_queue, run_media_processing_queue
 from .media_lifecycle import LifecycleError, current_bundle
@@ -73,6 +75,7 @@ QUEUE_KINDS = {"content_pipeline", "metrics_backfill", "comments_refresh", "hist
 HISTORY_START = "2026-08-02T16:00:00Z"
 LOCAL_PROCESSING_LOCK = RLock()
 LOCAL_ANALYSIS_JOB = "local_content_analysis"
+DUPLICATE_RELATION_JOB = "duplicate_relation_update"
 QUEUE_RESERVATION_LOCKS = {kind: RLock() for kind in QUEUE_KINDS}
 MEDIA_BLOCKED_REASONS = frozenset({"restore_required", "expired_non_replayable", "original_unavailable"})
 CRON_ROUNDS = {
@@ -146,6 +149,7 @@ TIKHUB_DISCOVERY_WORKERS = 2
 SCHEDULER_CONTROL_EXECUTOR = "control"
 SCHEDULER_REPORT_EXECUTOR = "report"
 SCHEDULER_RECONCILE_EXECUTOR = "reconcile"
+SCHEDULER_DUPLICATE_EXECUTOR = "duplicate"
 CONTROL_CRON_REGISTRATIONS = frozenset({
     "daily_pipeline_summary", "daily_report", "weekly_report",
 })
@@ -312,7 +316,7 @@ def _require_job_dispatch_open(
     diagnostic cohort; treating that job name as an operation prevents either
     path from ever obtaining its natural owner.
     """
-    if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
+    if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21, 22, 23, 24}:
         require_paid_dispatch_open(connection, provider=provider, operation=job_id, at=at)
         return
     if not connection.in_transaction:
@@ -949,10 +953,67 @@ def _fingerprint_ready(connection, content_id: int) -> bool:
         if error.error_code != "managed_source_pending":
             raise
         return False  # A new source awaits enrollment; never fall back to an old bundle.
+    if indexed_duplicates(connection):
+        row = connection.execute("SELECT 1 FROM duplicate_current_fingerprints p JOIN duplicate_index_generations g "
+            "ON g.generation_id=p.generation_id WHERE g.state='ready' AND p.content_id=? "
+            "AND p.input_status='available' AND p.source_sha256=?", (content_id, source_sha)).fetchone()
+        return row is not None
     return connection.execute(
         "SELECT 1 FROM duplicate_fingerprints WHERE content_id=? AND fingerprint_version=? AND source_sha256=?",
         (content_id, FINGERPRINT_VERSION, source_sha),
     ).fetchone() is not None
+
+
+def _relations_ready(connection, content_id: int) -> bool:
+    if not indexed_duplicates(connection):
+        return True
+    return relation_states(connection, [content_id]).get(content_id, {}).get("relation_status") == "ready"
+
+
+def _finish_duplicate_media_tags(connection, content_ids: Sequence[int]) -> None:
+    """Prepare media state outside the write lock; ACK/source revision fences commit."""
+    release = connection.execute("SELECT id FROM evaluation_releases WHERE status='active'").fetchone()
+    if release is None or not content_ids:
+        return
+    states = media_terminal_state_details(connection, release["id"], content_ids)
+    ready = relation_states(connection, content_ids)
+    candidates = [cid for cid in content_ids if cid in states and states[cid].state == "complete"
+                  and ready.get(cid, {}).get("relation_status") == "ready"]
+    if not candidates:
+        return
+    with transaction(connection):
+        current_release = connection.execute("SELECT id FROM evaluation_releases WHERE status='active'").fetchone()
+        if current_release is None or current_release["id"] != release["id"]:
+            return
+        current = relation_states(connection, candidates)
+        for cid in candidates:
+            if current.get(cid) == ready.get(cid):
+                connection.execute("UPDATE content_items SET source_group='',updated_at=? "
+                                   "WHERE id=? AND source_group='history-backfill'", (now_utc(), cid))
+
+
+def run_duplicate_relation_update(*, db_path: Path = DEFAULT_DB, limit: int = 20,
+                                  time_budget_seconds: float = 5,
+                                  scope_content_ids: Sequence[int] | None = None) -> dict[str, Any]:
+    """Independent, local-only recovery of relation debt and deletion tombstones."""
+    from .runtime_database import require_current_process_writer_lock
+    with connect(db_path) as connection:
+        if not indexed_duplicates(connection):
+            return {"status": "skipped", "reason": "indexed_duplicates_unavailable", "provider_calls": 0}
+        require_current_process_writer_lock(connection)
+    from .duplicate_runtime import drain_duplicate_work
+    result = drain_duplicate_work(db_path=db_path, limit=min(limit, 20),
+        time_budget_seconds=time_budget_seconds, scope_content_ids=scope_content_ids)
+    ready_ids = sorted(set(result.get("acknowledged_content_ids", [])) | {
+        int(item["content_id"]) for item in result.get("results", []) if item.get("relation_status") == "ready"})
+    if ready_ids:
+        with connect(db_path) as connection:
+            marks = ",".join("?" for _ in ready_ids)
+            tagged = [int(row[0]) for row in connection.execute(
+                f"SELECT id FROM content_items WHERE source_group='history-backfill' AND id IN ({marks})", ready_ids)]
+            if tagged:
+                _finish_duplicate_media_tags(connection, tagged)
+    return {**result, "provider_calls": 0}
 
 
 def _media_work_blockers(connection, content_ids: Sequence[int], *, states=None) -> dict[str, Any]:
@@ -1517,13 +1578,56 @@ def _paid_result_is_terminal(result: Mapping[str, Any]) -> bool:
     }
 
 
-def run_local_batch(content_ids: Sequence[int], *, db_path: Path) -> dict[str, Any]:
+def run_local_batch(content_ids: Sequence[int], *, db_path: Path,
+                    process_relations: bool = True) -> dict[str, Any]:
     """Cached media/local analysis is independent of provider availability."""
-    with LOCAL_PROCESSING_LOCK:
-        return _run_local_batch(content_ids, db_path=db_path)
+    ids = list(dict.fromkeys(content_ids))
+    with connect(db_path) as connection:
+        indexed = indexed_duplicates(connection)
+    # Never hold the global processor/retention fence across a whole batch.
+    # Existing per-bundle leases remain inside the media jobs.
+    combined: dict[str, Any] = {"downloads": {"results": []}, "processing": {"results": []},
+        "fingerprints": {"results": []}, "evaluation": [], "errors": [],
+        "terminal_ids": [], "pending_ids": [], "media_complete_ids": [], "blocked_media": {}}
+    for offset, cid in enumerate(ids):
+        if not LOCAL_PROCESSING_LOCK.acquire(blocking=False):
+            combined["pending_ids"].extend(ids[offset:])
+            combined["blocked_media"].update({str(value): {"reason": "local_processing_busy", "bundle_id": None}
+                                             for value in ids[offset:]})
+            combined["reason"] = "local_processing_busy"
+            break
+        try:
+            item = (_run_local_batch([cid], db_path=db_path, process_relations=False) if indexed
+                    else _run_local_batch([cid], db_path=db_path))
+        finally:
+            LOCAL_PROCESSING_LOCK.release()
+        for field in ("evaluation", "errors", "terminal_ids", "pending_ids", "media_complete_ids"):
+            combined[field].extend(item.get(field, []))
+        for field in ("downloads", "processing", "fingerprints"):
+            for key, value in item.get(field, {}).items():
+                if isinstance(value, list):
+                    combined[field].setdefault(key, []).extend(value)
+                elif type(value) in {int, float}:
+                    combined[field][key] = combined[field].get(key, 0) + value
+                else:
+                    combined[field][key] = value
+        combined["blocked_media"].update(item.get("blocked_media", {}))
+    if indexed:
+        if process_relations and combined["media_complete_ids"]:
+            combined["relations"] = run_duplicate_relation_update(db_path=db_path,
+                scope_content_ids=combined["media_complete_ids"], limit=20, time_budget_seconds=5)
+        with connect(db_path) as connection:
+            states = relation_states(connection, combined["media_complete_ids"])
+        combined["terminal_ids"] = [cid for cid in combined["media_complete_ids"]
+                                    if states.get(cid, {}).get("relation_status") == "ready"]
+        combined["pending_ids"] = [cid for cid in ids if cid not in combined["terminal_ids"]]
+        combined["relation_pending_ids"] = [cid for cid in combined["media_complete_ids"] if cid not in combined["terminal_ids"]]
+        combined["relation_results"] = [{"content_id": cid, **value} for cid, value in states.items()]
+    return combined
 
 
-def _run_local_batch(content_ids: Sequence[int], *, db_path: Path) -> dict[str, Any]:
+def _run_local_batch(content_ids: Sequence[int], *, db_path: Path,
+                     process_relations: bool = True) -> dict[str, Any]:
     ids = list(dict.fromkeys(content_ids))
     downloads = run_media_download_queue(limit=len(ids), scope_content_ids=ids, db_path=db_path)
     processing = run_media_processing_queue(limit=len(ids), scope_content_ids=ids, db_path=db_path)
@@ -1544,20 +1648,52 @@ def _run_local_batch(content_ids: Sequence[int], *, db_path: Path) -> dict[str, 
             evaluation_results.append({"content_id": cid, "evaluation_id": result.evaluation_id, "created": result.created})
         except Exception as error:
             errors.append({"content_id": cid, "reason": type(error).__name__})
-    fingerprints = run_duplicate_fingerprint_queue(limit=len(ids), scope_content_ids=ids, db_path=db_path)
+    with connect(db_path) as connection:
+        indexed = indexed_duplicates(connection)
+    fingerprint_options = {"process_relations": process_relations} if indexed else {}
+    fingerprints = run_duplicate_fingerprint_queue(limit=len(ids), scope_content_ids=ids, db_path=db_path,
+                                                  **fingerprint_options)
     with connect(db_path) as connection, transaction(connection):
         final_states = media_terminal_state_details(connection, release_id, ids)
         complete = []
+        media_complete = []
         for cid in ids:
             if final_states[cid].state in {"complete", "terminal_insufficient", "terminal_failed"} and _fingerprint_ready(connection, cid):
+                media_complete.append(cid)
+                if not _relations_ready(connection, cid):
+                    continue
                 complete.append(cid)
                 if final_states[cid].state == "complete":
                     connection.execute("UPDATE content_items SET source_group='',updated_at=? WHERE id=? AND source_group='history-backfill'", (now_utc(), cid))
         blocked = _media_work_blockers(connection, ids, states=final_states)
     return {"downloads": downloads, "processing": processing, "evaluation": evaluation_results,
             "fingerprints": fingerprints, "errors": errors, "terminal_ids": complete,
-            "blocked_media": blocked,
+            "media_complete_ids": media_complete, "blocked_media": blocked,
             "pending_ids": [cid for cid in ids if cid not in complete]}
+
+
+@contextmanager
+def _local_policy_connection(*, db_path: Path, at: str):
+    """Prepare one logical scope without holding a SQLite writer transaction."""
+    from .storage import live_wal_read_only_connections
+    from .runtime_evidence_context import inheritance_boundary, prepare_inheritance
+
+    with connect(db_path) as connection:
+        if not indexed_duplicates(connection):
+            # Keep the schema19..23 policy path and its caller semantics.
+            yield connection
+            return
+    # The enclosing local job's original soft deadline is already running.
+    # A reserved preparation worker changes contention, never that deadline
+    # or the supplied business time. Live scope/lease checks remain in parent.
+    with prepare_inheritance(db_path, lane="local", logical_at=at), \
+            live_wal_read_only_connections(), connect(db_path, read_only=True) as connection:
+        connection.execute("BEGIN")
+        try:
+            with inheritance_boundary(connection):
+                yield connection
+        finally:
+            connection.rollback()
 
 
 def _local_analysis_scope(*, db_path: Path, at: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -1572,7 +1708,7 @@ def _local_analysis_scope(*, db_path: Path, at: str) -> tuple[dict[str, Any], li
         if error.name != f"{__package__}.account_catalog_capture":
             raise
     else:
-        with connect(db_path) as connection:
+        with _local_policy_connection(db_path=db_path, at=at) as connection:
             if catalog.installed_policy(connection, at=at) is not None:
                 from .account_capture_eligibility import derive_capture_eligibility
 
@@ -1588,11 +1724,14 @@ def _local_analysis_scope(*, db_path: Path, at: str) -> tuple[dict[str, Any], li
     eligible = {int(item["identity_id"]) for item in members if item["enabled"] and item["uid"]}
     with connect(db_path) as connection:
         rows = connection.execute(
-            "SELECT c.*,i.id identity_id FROM content_items c "
+            "SELECT c.*,i.id identity_id,"
+            "(SELECT e.captured_at FROM evidence_artifacts e WHERE e.content_id=c.id "
+            "AND e.artifact_type='media_source' AND e.status='available' ORDER BY e.id DESC LIMIT 1) source_captured_at "
+            "FROM content_items c "
             "JOIN accounts a ON a.id=c.account_id "
             "JOIN account_platform_identities i ON i.account_id=c.account_id AND i.platform=c.platform "
             "WHERE " + ("a.enabled=1" if directory_scope is None else "1=1") +
-            " AND c.platform IN ('douyin','xiaohongshu') "
+            " AND c.platform IN ('douyin','xiaohongshu','kuaishou','wechat_channels') "
             "AND c.content_type IN ('video','image') "
             "AND COALESCE(c.source_group,'') NOT IN ('history-backfill','history-archive') "
             "AND julianday(c.published_at)<=julianday(?) "
@@ -1604,7 +1743,9 @@ def _local_analysis_scope(*, db_path: Path, at: str) -> tuple[dict[str, Any], li
             "AND e.artifact_type IN ('media_source','media','media_manifest','media_lifecycle_manifest'))) "
             "ORDER BY c.published_at,c.id", (at, at),
         ).fetchall()
+    from .media_work_queue import local_media_supported
     return snapshot, [dict(row) for row in rows if row["identity_id"] in eligible
+                      and local_media_supported(row["platform"], row["content_type"])
                       and within_automatic_scope(row["published_at"])]
 
 
@@ -1626,6 +1767,11 @@ def _local_analysis_identity(connection, content: Mapping[str, Any], release_id:
             "release_id": release_id, "source": dict(source) if source else None,
             "original": dict(original) if original else None,
             "processors": processor_versions(), "fingerprint_version": FINGERPRINT_VERSION}
+    if indexed_duplicates(connection):
+        from .duplicates import _normalize_text
+        text_row = connection.execute("SELECT title,body FROM content_items WHERE id=?", (content["id"],)).fetchone()
+        normalized = _normalize_text(f"{text_row['title'] or ''}\n{text_row['body'] or ''}") if text_row else ""
+        identity["text_input_sha256"] = hashlib.sha256(normalized.encode()).hexdigest()
     return {**identity, "input_sha256": durable_runs.scan_identity(LOCAL_ANALYSIS_JOB, identity)}
 
 
@@ -1633,6 +1779,7 @@ def _local_analysis_current(connection, content_id: int, *, snapshot: Mapping[st
                             active: Mapping[str, Any], at: str):
     """Recheck one identity/content without rescanning the entire directory."""
     from .content_scope import canonical_content_predicate
+    from .media_work_queue import local_media_supported
 
     row = connection.execute(
         "SELECT c.*,i.id identity_id FROM content_items c JOIN account_platform_identities i "
@@ -1641,7 +1788,7 @@ def _local_analysis_current(connection, content_id: int, *, snapshot: Mapping[st
     ).fetchone()
     if (row is None or not within_automatic_scope(row["published_at"])
             or row["source_group"] in {"history-backfill", "history-archive"}
-            or row["content_type"] not in {"video", "image"}
+            or not local_media_supported(row["platform"], row["content_type"])
             or not timedelta(0) <= parse_time(at) - parse_time(row["published_at"]) <= timedelta(days=30)):
         return None, snapshot
     try:
@@ -1656,6 +1803,96 @@ def _local_analysis_current(connection, content_id: int, *, snapshot: Mapping[st
     except ValueError:
         return None, snapshot
     return dict(row), current_scope
+
+
+def _reuse_captured_media_source(content: Mapping[str, Any], *, db_path: Path) -> dict[str, Any]:
+    """Reuse the latest verified detail attempt; never send or retry a paid call.
+
+    Metric detail requests already contain URLs. A failed original may consume
+    newer successful bytes, but cannot fall back past a newer failed/unknown
+    attempt, reset the same URL's attempt cap, or reacquire a managed original.
+    """
+    from . import capture, media, providers
+    from .storage import write_lock
+
+    cid = int(content["id"])
+    result: dict[str, Any] = {"content_id": cid, "provider_calls": 0}
+    with connect(db_path) as connection:
+        if media._managed_bundle(connection, cid) is not None or media._has_managed_history(connection, cid):
+            return {**result, "status": "blocked", "reason": "managed_reacquire_requires_task"}
+        operation = providers.STAGE_CONFIG[(str(content["platform"]), "detail")][2]
+        latest_query = (
+            "WITH candidates AS (SELECT fa.id,fs.id slot_id FROM fetch_slots fs "
+            "JOIN fetch_attempts fa ON fa.slot_id=fs.id WHERE fs.content_id=? AND fs.provider='TikHub' "
+            "UNION SELECT d.fetch_attempt_id,fs.id FROM fetch_slots fs "
+            "JOIN paid_provider_dispatch_events d ON d.fetch_slot_id=fs.id "
+            "WHERE fs.content_id=? AND fs.provider='TikHub' AND d.event_type='send_marked' AND d.operation=?) "
+            "SELECT pr.*,pr.id raw_response_id,fa.id candidate_attempt_id,fa.error_code,fa.billed,"
+            "fa.response_finished_at,fs.status slot_status FROM candidates ca "
+            "JOIN fetch_attempts fa ON fa.id=ca.id JOIN fetch_slots fs ON fs.id=ca.slot_id "
+            " LEFT JOIN provider_raw_responses pr ON pr.fetch_attempt_id=fa.id "
+            "WHERE (COALESCE(pr.operation,"
+            "(SELECT CASE WHEN count(DISTINCT d.operation)=1 THEN min(d.operation) END "
+            "FROM paid_provider_dispatch_events d WHERE d.fetch_attempt_id=fa.id "
+            "AND d.event_type='send_marked'))=? OR (pr.id IS NULL AND fs.stage IN ('detail','media_source_refresh'))) "
+            "ORDER BY julianday(fa.request_started_at) DESC,fa.id DESC,pr.id DESC LIMIT 1")
+        latest_args = (cid, cid, operation, operation)
+        latest = connection.execute(latest_query, latest_args).fetchone()
+        if latest is None:
+            return {**result, "status": "waiting", "reason": "new_detail_evidence_required"}
+        result.update(fetch_attempt_id=int(latest["candidate_attempt_id"]), raw_response_id=latest["raw_response_id"])
+        if (latest["slot_status"] != "succeeded" or latest["error_code"]
+                or latest["billed"] not in {0, 1} or not latest["response_finished_at"]
+                or latest["raw_response_id"] is None):
+            return {**result, "status": "blocked", "reason": latest["error_code"] or "detail_attempt_not_succeeded"}
+        if latest["content_id"] != cid or latest["provider"] != "TikHub":
+            return {**result, "status": "blocked", "reason": "detail_identity_conflict"}
+        _path, value = capture._read_verified_raw_response(latest, connection=connection)
+        old = media.get_media_source_state(cid, db_path=db_path)
+        previous = None if old is None else connection.execute(
+            "SELECT captured_at FROM provider_raw_responses WHERE id=?", (old["raw_response_id"],),
+        ).fetchone()
+        if old is not None and (old["raw_response_id"] == latest["raw_response_id"]
+                or previous is None or parse_time(latest["captured_at"]) <= parse_time(previous["captured_at"])):
+            return {**result, "status": "unchanged", "reason": "newer_detail_evidence_required"}
+    platform = str(content["platform"])
+    try:
+        parsed = providers._parse_content_payload(platform, "detail", str(content["platform_content_id"]),
+            str(content["content_type"]), value, status=latest["http_status"] or 200,
+            expected_uid=str(content.get("raw_account_uid") or "") or None).data
+    except capture.CaptureError as error:
+        if error.error_code == "identity_conflict":
+            return {**result, "status": "blocked", "reason": "detail_identity_conflict"}
+        raise
+    if (parsed.get("content_type") != content["content_type"] or not content.get("raw_account_uid")
+            or str(parsed.get("account_uid") or "") != str(content["raw_account_uid"])):
+        return {**result, "status": "blocked", "reason": "detail_identity_conflict"}
+    source_urls = parsed.get("media_urls", [])
+    if platform == "wechat_channels":
+        from .wechat_video_crypto import media_material
+        source_urls = [media_material(parsed)["url"]]
+    urls, source_sha = media._media_source_identity(str(content["content_type"]), source_urls)
+    if not urls or old is not None and source_sha == old["source_sha256"]:
+        return {**result, "status": "unchanged", "reason": "new_media_urls_required"}
+    # Keep the latest-attempt check and registration serialized with other
+    # Writer threads; a concurrently completed failure must block older bytes.
+    with write_lock(), connect(db_path) as connection:
+        current_latest = connection.execute(latest_query, latest_args).fetchone()
+        if current_latest is None or dict(current_latest) != dict(latest):
+            return {**result, "status": "blocked", "reason": "detail_attempt_changed"}
+        current_content = connection.execute(
+            "SELECT account_id,platform,platform_content_id,raw_account_uid,content_type FROM content_items WHERE id=?",
+            (cid,),
+        ).fetchone()
+        if current_content is None or any(current_content[key] != content[key] for key in current_content.keys()):
+            return {**result, "status": "blocked", "reason": "detail_identity_conflict"}
+        if (media.get_media_source_state(cid, db_path=db_path) != old
+                or media._managed_bundle(connection, cid) is not None or media._has_managed_history(connection, cid)):
+            return {**result, "status": "blocked", "reason": "media_source_changed"}
+        artifact = media.store_media_source_from_detail(cid, parsed,
+            raw_response_id=int(latest["raw_response_id"]), db_path=db_path)
+    return {**result, "status": "reused", "reason": "verified_detail_media_urls",
+            "source_artifact_id": artifact.id if artifact else None, "source_sha256": source_sha}
 
 
 @contextmanager
@@ -1685,13 +1922,60 @@ def _local_analysis_lease(claim: durable_runs.DurableClaim, *, db_path: Path):
         worker.join(timeout=1)
 
 
+def _local_analysis_dispatch_history(connection) -> dict[str, Any]:
+    """Read committed claim order once, without inferring old media stages."""
+    groups = connection.execute(
+        "SELECT c.id content_id,c.platform,COUNT(*) claimed_count,MAX(a.id) last_attempt_id "
+        "FROM scheduler_run_attempts a "
+        "JOIN scheduler_runs r ON r.id=a.scheduler_run_id "
+        "LEFT JOIN content_items c ON c.id=CASE WHEN json_valid(a.details_json) "
+        "THEN json_extract(a.details_json,'$.identity.content_id') END "
+        "WHERE r.job_id=? "
+        "AND julianday(a.started_at) IS NOT NULL "
+        "GROUP BY c.id,c.platform",
+        (LOCAL_ANALYSIS_JOB,),
+    ).fetchall()
+    last_platform = None
+    newest_attempt_id = 0
+    claimed_count = 0
+    last_attempt_ids: dict[int, int] = {}
+    for group in groups:
+        claimed_count += int(group["claimed_count"])
+        if group["content_id"] is not None:
+            attempt_id = int(group["last_attempt_id"])
+            last_attempt_ids[int(group["content_id"])] = attempt_id
+            if attempt_id > newest_attempt_id:
+                newest_attempt_id = attempt_id
+                last_platform = str(group["platform"])
+    if not groups:
+        # Pre-attempt history remains a usable initial cursor. Once a real
+        # claim exists, an unclaimed/backoff-only run cannot move the cursor.
+        last = connection.execute(
+            "SELECT c.platform FROM scheduler_runs r JOIN content_items c "
+            "ON c.id=json_extract(r.details_json,'$.identity.content_id') "
+            "WHERE r.job_id=? AND json_valid(r.details_json) "
+            "ORDER BY julianday(r.started_at) DESC,r.id DESC LIMIT 1",
+            (LOCAL_ANALYSIS_JOB,),
+        ).fetchone()
+        last_platform = str(last["platform"]) if last is not None else None
+    # Attempt IDs are append-only claim order even if the wall clock rolls
+    # backward. The platform cursor and oldest-waiting rotation use this same
+    # order; started_at remains a required actual-claim timestamp.
+    return {"last_platform": last_platform, "claimed_count": claimed_count,
+            "last_attempt_ids": last_attempt_ids}
+
+
+def _local_analysis_last_platform(connection) -> str | None:
+    return _local_analysis_dispatch_history(connection)["last_platform"]
+
+
 def run_local_content_analysis(*, db_path: Path = DEFAULT_DB, at: str | None = None,
                                automatic_from: date | None = None, limit: int = 20,
                                time_limit_seconds: float = 60) -> dict[str, Any]:
     """Resume integrated local media/evaluation debt without any provider dispatch.
 
-    Download uses only stored source URLs. Missing/expired sources stay explicit;
-    this worker never calls update_content_data, retry_content_media or paid_scope.
+    Download uses only stored source URLs or newer verified detail evidence.
+    This worker never calls update_content_data, retry_content_media or paid_scope.
     """
     from .runtime_database import require_current_process_writer_lock
 
@@ -1699,32 +1983,58 @@ def run_local_content_analysis(*, db_path: Path = DEFAULT_DB, at: str | None = N
         raise ValueError("local analysis requires limit 1..500 and positive time limit")
     timestamp = at or now_utc()
     deadline = monotonic() + time_limit_seconds
-    with automatic_scope(automatic_from), LOCAL_PROCESSING_LOCK:
+    with automatic_scope(automatic_from):
         with connect(db_path) as connection:
-            if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
+            if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21, 22, 23, 24}:
                 return {"status": "skipped", "reason": "schema19_legacy", "provider_calls": 0}
             require_current_process_writer_lock(connection)
             active = activation(connection, at=timestamp)
+            indexed = indexed_duplicates(connection)
+        if indexed:
+            limit = min(limit, 20)
+        media_deadline = deadline - min(5.0, time_limit_seconds) if indexed else deadline
         if active is None or active.get("mode") != "active" or active.get("profile_id") != "integrated_route_v1":
             return {"status": "skipped", "reason": "integrated_profile_required", "provider_calls": 0}
         if not within_automatic_scope(timestamp):
             return {"status": "skipped", "reason": "automatic_before_start", "provider_calls": 0}
         snapshot, rows = _local_analysis_scope(db_path=db_path, at=timestamp)
-        with connect(db_path) as connection, transaction(connection):
-            running = [int(row[0]) for row in connection.execute(
-                "SELECT id FROM scheduler_runs WHERE job_id=? AND status='running'", (LOCAL_ANALYSIS_JOB,),
-            )]
-            recovered = durable_runs.recover_expired_leases(connection, now=timestamp, owned_run_ids=running)
+        with connect(db_path) as connection:
+            with transaction(connection):
+                running = [int(row[0]) for row in connection.execute(
+                    "SELECT id FROM scheduler_runs WHERE job_id=? AND status='running'", (LOCAL_ANALYSIS_JOB,),
+                )]
+                recovered = durable_runs.recover_expired_leases(connection, now=timestamp, owned_run_ids=running)
             release = connection.execute("SELECT id FROM evaluation_releases WHERE status='active'").fetchone()
             if release is None:
                 raise RuntimeError("local analysis requires an active evaluation release")
             release_id = str(release["id"])
             states = media_terminal_state_details(connection, release_id, [int(row["id"]) for row in rows])
-            candidates = [row for row in rows if states[int(row["id"])].state != "complete"
-                          or not _fingerprint_ready(connection, int(row["id"]))]
+            unfinished: dict[int, set[str]] = {}
+            for pending in connection.execute(
+                "SELECT json_extract(details_json,'$.identity.content_id'),"
+                "json_extract(details_json,'$.identity.input_sha256') FROM scheduler_runs "
+                "WHERE job_id=? AND status IN ('running','partial','interrupted') "
+                "AND json_extract(details_json,'$.complete')=0", (LOCAL_ANALYSIS_JOB,),
+            ):
+                unfinished.setdefault(pending[0], set()).add(str(pending[1]))
+            candidates = [row for row in rows if states[int(row["id"])].state not in (
+                              {"complete", "terminal_insufficient"} if indexed else {"complete"})
+                          or not _fingerprint_ready(connection, int(row["id"]))
+                          or (not indexed and row["id"] in unfinished and _local_analysis_identity(
+                              connection, row, release_id)["input_sha256"] in unfinished[row["id"]])]
+            waiting_relation_ids = [int(row["id"]) for row in rows if indexed
+                and states[int(row["id"])].state in {"complete", "terminal_insufficient"}
+                and _fingerprint_ready(connection, int(row["id"]))]
+            dispatch_history = _local_analysis_dispatch_history(connection)
+        from .media_work_queue import LocalMediaSelector
+        selection = LocalMediaSelector(candidates, states, **dispatch_history)
         results: list[dict[str, Any]] = []
-        for row in candidates:
-            if len(results) >= limit or monotonic() >= deadline:
+        source_refreshes: list[dict[str, Any]] = []
+        while True:
+            if len(results) >= limit or monotonic() >= media_deadline:
+                break
+            row = selection.next_candidate()
+            if row is None:
                 break
             # Pause/removal and source changes are re-read before each item,
             # including previously interrupted work from an earlier day.
@@ -1741,6 +2051,14 @@ def run_local_content_analysis(*, db_path: Path = DEFAULT_DB, at: str | None = N
                 if current is None:
                     continue
                 cid = int(current["id"])
+                current_state = media_terminal_state_details(connection, release_id, [cid])[cid]
+            if current_state.reason in {"source_missing", "download_terminal_failed"}:
+                try:
+                    source_refreshes.append(_reuse_captured_media_source(current, db_path=db_path))
+                except Exception as error:
+                    source_refreshes.append({"content_id": cid, "status": "blocked",
+                        "reason": _error_reason(error), "provider_calls": 0})
+            with connect(db_path) as connection:
                 identity = _local_analysis_identity(connection, current, release_id)
                 failed = connection.execute(
                     "SELECT id FROM scheduler_runs WHERE job_id=? AND status='failed' "
@@ -1752,22 +2070,40 @@ def run_local_content_analysis(*, db_path: Path = DEFAULT_DB, at: str | None = N
                 # runnable without changing its source URL/release identity.
                 claim_identity = {**identity, **({"recovery_after_run_id": int(failed["id"])}
                     if failed is not None and current_state.state != "terminal_failed" else {})}
+                if indexed and not _fingerprint_ready(connection, cid):
+                    previous_success = connection.execute(
+                        "SELECT id FROM scheduler_runs WHERE job_id=? AND status='succeeded' "
+                        "AND json_extract(details_json,'$.identity.input_sha256')=? ORDER BY id DESC LIMIT 1",
+                        (LOCAL_ANALYSIS_JOB, identity["input_sha256"])).fetchone()
+                    if previous_success is not None:
+                        claim_identity["fingerprint_recovery_after_run_id"] = int(previous_success["id"])
             claim = durable_runs.claim_run(LOCAL_ANALYSIS_JOB, claim_identity, db_path=db_path, now=item_at,
                 initial_checkpoint={"complete": False, "content_id": cid})
             if claim is None:
                 continue
+            selection.record_claim()
             previous = durable_runs.get_run(claim.scheduler_run_id, db_path=db_path)["details"]["checkpoint"]
             local: dict[str, Any] = {}
-            error_reason: str | None = None
+            error_reason: str | None = next((r["reason"] for r in reversed(source_refreshes)
+                if r["content_id"] == cid and r.get("reason") in {"decryption_material_missing", "decryption_failed", "decryption_runtime_unavailable"}), None)
             try:
                 with _local_analysis_lease(claim, db_path=db_path):
                     with connect(db_path) as connection:
                         before = media_terminal_state_details(connection, release_id, [cid])
                         blocked = _media_work_blockers(connection, [cid], states=before)
-                    if blocked or before[cid].reason == "source_missing":
+                        reused_complete = before[cid].state == "complete" and _fingerprint_ready(connection, cid)
+                    if reused_complete:
+                        local = {"reused_completed_evidence": True}
+                    elif blocked or before[cid].reason == "source_missing":
                         local = {"blocked_media": blocked}
                     else:
-                        local = run_local_batch([cid], db_path=db_path)
+                        local = (run_local_batch([cid], db_path=db_path, process_relations=False)
+                                 if indexed else run_local_batch([cid], db_path=db_path))
+                        if local.get("reason") == "local_processing_busy":
+                            error_reason = "local_processing_busy"
+                        else:
+                            error_reason = next((r["error_code"] for r in local.get("downloads", {}).get("results", [])
+                                if r.get("error_code") in {"decryption_material_missing", "decryption_failed", "decryption_runtime_unavailable"}), error_reason)
                     _request_local_restores(local.get("blocked_media", {}), db_path=db_path)
             except durable_runs.LostOwnership:
                 raise
@@ -1778,35 +2114,65 @@ def run_local_content_analysis(*, db_path: Path = DEFAULT_DB, at: str | None = N
                 state = media_terminal_state_details(connection, release_id, [cid])[cid]
                 source_changed = _local_analysis_identity(connection, current, release_id) != identity
                 terminal_failed = state.state == "terminal_failed" and not source_changed
-                complete = (state.state in {"complete", "terminal_insufficient"}
+                media_complete = (state.state in {"complete", "terminal_insufficient"}
                             and _fingerprint_ready(connection, cid) and not source_changed and error_reason is None)
-                reason = ("media_source_changed" if source_changed else error_reason or state.reason)
-                failures = 0 if complete else int(previous.get("consecutive_failures", 0)) + 1
+                complete = media_complete and _relations_ready(connection, cid)
+                reason = ("media_source_changed" if source_changed else "duplicate_relation_pending"
+                          if media_complete and not complete else error_reason or state.reason)
+                if indexed and media_complete:
+                    waiting_relation_ids.append(cid)
+                failures = (0 if media_complete else int(previous.get("consecutive_failures", 0))
+                            + (0 if reason == "local_processing_busy" else 1))
                 stage_errors = [item for key in ("downloads", "processing", "fingerprints")
                                 for item in local.get(key, {}).get("results", []) if item.get("error")]
+                stage_errors.extend(local.get("fingerprints", {}).get("failures", []))
                 receipt = {"content_id": cid, "state": state.state, "reason": reason,
-                           "complete": complete, "consecutive_failures": failures,
+                           "complete": complete, "media_complete": media_complete, "consecutive_failures": failures,
+                           "relation_status": "ready" if complete else "pending",
                            "roster_snapshot_id": current_snapshot_value["id"],
                            "roster_snapshot_hash": current_snapshot_value["members_sha256"],
                            "scope_kind": current_snapshot_value.get("scope_kind", "runtime_roster"),
+                           "reused_completed_evidence": bool(local.get("reused_completed_evidence")),
                            "provider_calls": 0, "errors": local.get("errors", []) + stage_errors,
                            "next_action": "media_source_refresh_required" if reason in {"source_missing", "download_terminal_failed"}
                                           else "original_media_required" if reason in MEDIA_BLOCKED_REASONS else None}
-                durable_runs.checkpoint(connection, claim, receipt, now=finished_at)
-                if failures >= LOCAL_BATCH_ALERT_FAILURES:
+                durable_runs.checkpoint(connection, claim, {**receipt,
+                    **({"complete": media_complete, "relation_complete": complete} if indexed else {})}, now=finished_at)
+                if failures >= LOCAL_BATCH_ALERT_FAILURES and reason != "local_processing_busy":
                     _open_local_batch_alert(connection, claim=claim, kind=LOCAL_ANALYSIS_JOB,
                                           reason=reason, failures=failures, at=finished_at)
-                status = "succeeded" if complete else "failed" if terminal_failed or source_changed else "partial"
+                status = "succeeded" if media_complete else "failed" if terminal_failed or source_changed else "partial"
                 durable_runs.finish_run_in_transaction(connection, claim, status=status, now=finished_at,
                     summary={"content_id": cid, "state": state.state, "reason": reason, "provider_calls": 0},
                     next_resume_at=_iso(parse_time(finished_at) + timedelta(
                         seconds=min(300 * 2 ** min(max(failures - 1, 0), 7), 21600))) if status == "partial" else None)
             results.append({**receipt, "scheduler_run_id": claim.scheduler_run_id, "status": status})
-        complete = not candidates or len(results) == len(candidates) and all(item["complete"] for item in results)
+            if reason == "local_processing_busy":
+                break
+        duplicate_result = None
+        if indexed and monotonic() < deadline:
+            duplicate_result = run_duplicate_relation_update(db_path=db_path, limit=20,
+                time_budget_seconds=min(5.0, max(0.001, deadline - monotonic())),
+                scope_content_ids=list(dict.fromkeys(waiting_relation_ids)))
+        if indexed:
+            with connect(db_path) as connection:
+                pending_relations = relation_coverage(connection, [int(row["id"]) for row in rows])
+                latest_states = relation_states(connection, [int(item["content_id"]) for item in results])
+            for item in results:
+                item["relation_status"] = latest_states.get(item["content_id"], {}).get("relation_status", "pending")
+                item["complete"] = item["media_complete"] and item["relation_status"] == "ready"
+                if item["complete"] and item["reason"] == "duplicate_relation_pending":
+                    item["reason"] = "complete"
+        else:
+            pending_relations = {}
+        complete = (not candidates or len(results) == len(candidates) and all(item["complete"] for item in results))
+        complete = complete and pending_relations.get("duplicate_relation_coverage", 100.0) == 100.0
         return {"status": "succeeded" if complete else "partial", "complete": complete,
+                "duplicates": duplicate_result, **pending_relations,
                 "reason": "queue_empty_not_discovery_complete" if not candidates else None,
                 "eligible": len(rows), "candidates": len(candidates), "processed": len(results),
                 "recovered": recovered, "provider_calls": 0, "results": results,
+                "source_refreshes": source_refreshes,
                 "roster_snapshot_id": snapshot["id"]}
 
 
@@ -2099,12 +2465,13 @@ def run_content_batch(
                     durable_runs.assert_owner(connection, claim)
                 local_result = local_runner(ids, db_path=db_path)
             paid_complete = {
-                cid for cid in local_result.get("terminal_ids", [])
+                cid for cid in local_result.get("media_complete_ids", local_result.get("terminal_ids", []))
                 if _paid_result_is_terminal(results.get(str(cid), {}))
             }
             blocked.update(_request_local_restores(local_result.get("blocked_media", {}), db_path=db_path))
             pending = [cid for cid in pending if cid not in paid_complete and str(cid) not in blocked]
-            local[purpose] = {"terminal_ids": local_result.get("terminal_ids", []), "pending_ids": local_result.get("pending_ids", []),
+            local[purpose] = {"relation_pending_ids": local_result.get("relation_pending_ids", []),
+                              "terminal_ids": local_result.get("terminal_ids", []), "pending_ids": local_result.get("pending_ids", []),
                               "errors": local_result.get("errors", []), "fingerprint_failures": local_result.get("fingerprints", {}).get("failed", 0)}
             local_batch_failures = 0
         except Exception as error:
@@ -2115,9 +2482,12 @@ def run_content_batch(
             local_batch_error = _error_reason(error)
             local_batch_failures += 1
             local[purpose] = {"status": "partial", "reason": local_batch_error}
+    relation_pending = sorted({cid for item in local.values() for cid in item.get("relation_pending_ids", [])})
     with connect(db_path) as connection, transaction(connection):
         durable_runs.checkpoint(connection, claim, {"pending_ids": pending, "results": results, "local": local,
                                                   "blocked_media": blocked, "complete": not pending and not blocked,
+                                                  "relation_complete": not pending and not blocked and not relation_pending,
+                                                  "media_complete": not pending and not blocked, "relation_pending_ids": relation_pending,
                                                   "local_batch_failures": local_batch_failures,
                                                   "local_batch_error": local_batch_error}, now=timestamp)
         if local_batch_error and local_batch_failures >= LOCAL_BATCH_ALERT_FAILURES:
@@ -2136,8 +2506,9 @@ def run_content_batch(
                                               "local_batch_failures": local_batch_failures},
                                      next_resume_at=_iso(parse_time(timestamp) + timedelta(seconds=delay)) if pending else None, now=timestamp)
     missing_fields = {cid: item["missing_fields"] for cid, item in results.items() if item.get("missing_fields")}
-    return {"status": "partial" if pending or missing_fields else "blocked" if blocked or scope_blocked or blocked_work else "succeeded",
-            "complete": not pending and not blocked and not scope_blocked and not blocked_work,
+    return {"status": "partial" if pending or missing_fields or relation_pending else "blocked" if blocked or scope_blocked or blocked_work else "succeeded",
+            "complete": not pending and not blocked and not scope_blocked and not blocked_work and not relation_pending,
+            "relation_pending_ids": relation_pending,
             "reason": "profile_superseded" if superseded else "local_batch_error" if local_batch_error else None,
             "local_batch_error": local_batch_error,
             "blocked_media": {**scope_blocked, **blocked},
@@ -2472,7 +2843,7 @@ def resume_due_work(*, at: str, db_path: Path, limit: int = 20,
 
     with connect(db_path) as connection:
         rows = connection.execute("SELECT id,job_id,status,details_json FROM scheduler_runs WHERE status IN ('partial','interrupted') ORDER BY COALESCE(completed_at,started_at),id").fetchall()
-        schema20 = connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}
+        schema20 = connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21, 22, 23, 24}
         effective_activation = activation(connection, at=at)
         effective_activation_id = (
             int(effective_activation["activation_id"])
@@ -2755,7 +3126,7 @@ def _run_tikhub_account_profiles(
     """Refresh account-only TikHub facts without invoking Matrix."""
     _snapshot_value, members = _scope(db_path, frozen_roster, at=at)
     with connect(db_path) as connection:
-        if connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}:
+        if connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21, 22, 23, 24}:
             members = [member for member in members if member["platform"] == "douyin" and legacy_queue_allowed(
                 connection, account_id=int(member["account_id"]), content_id=None,
                 operations=["douyin_uid_profile"], at=at)]
@@ -2818,7 +3189,7 @@ def _run_tikhub_discovery_round(
         return {"status": "skipped", "complete": True, "reason": "automatic_before_start", "scans": []}
     window_start, window_end = _iso(start), _iso(end)
     with connect(db_path) as connection:
-        if connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}:
+        if connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21, 22, 23, 24}:
             members = [member for member in members if legacy_queue_allowed(
                 connection, account_id=int(member["account_id"]), content_id=None,
                 operations=[str(member["platform"]) + "_user_posts"], at=at)]
@@ -3231,7 +3602,7 @@ def _legacy_runtime_authority(db_path: Path) -> AbstractContextManager[None]:
     revalidates the installed evidence; schema19 retains its existing contract.
     """
     with connect(db_path) as connection:
-        if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
+        if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21, 22, 23, 24}:
             return nullcontext()
     from . import capture_authorizations, capture_release
     return capture_authorizations.runtime_authority(capture_release.current_runtime_bindings)
@@ -3504,7 +3875,8 @@ def _capture_v25_job(*, kind: str, db_path: Path,
 
     timestamp = at or now_utc()
     with connect(db_path) as connection:
-        if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
+        schema_version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if schema_version not in {20, 21, 22, 23, 24}:
             return {"status": "skipped", "reason": "schema19_legacy", "provider_calls": 0}
         require_current_process_writer_lock(connection)
     with automatic_scope(automatic_from), capture_authorizations.runtime_authority(capture_release.current_runtime_bindings):
@@ -3517,15 +3889,27 @@ def _capture_v25_job(*, kind: str, db_path: Path,
         if kind == "execute":
             from .capture_commands import process_commands
             process_commands(db_path=db_path, at=timestamp)
-            return capture_runtime.run_ready(db_path, timestamp, max_items=TIKHUB_NETWORK_CONCURRENCY)
+            return capture_runtime.run_ready(db_path, timestamp, max_items=TIKHUB_NETWORK_CONCURRENCY,
+                                             rolling=schema_version in {22, 23, 24})
         if kind == "maintenance":
-            from .capture_evidence_preflight import evidence_boundary, prepare_installed_evidence
+            if schema_version in {22, 23, 24}:
+                from .capture import recover_stale_fetch_slots
+                recovered_fetch_slots = recover_stale_fetch_slots(
+                    db_path=db_path,
+                    current_time=datetime.fromisoformat(timestamp.replace("Z", "+00:00")),
+                    preserve_live_owners=True,
+                )
             result = capture_quality.maintenance_tick(db_path=db_path, at=timestamp)
+            if schema_version in {22, 23, 24}:
+                result["recovered_fetch_slots"] = recovered_fetch_slots
             # Qualification renewal is a separate, evidence-bound control
             # action. Quality measurement itself never opens paid gates.
-            with prepare_installed_evidence(db_path), connect(db_path) as connection, transaction(connection), evidence_boundary(connection):
+            from .runtime_evidence_context import inheritance_boundary, prepare_inheritance
+            with prepare_inheritance(db_path, enabled=schema_version in {23, 24}) as prepared, \
+                    transaction_metrics_context(job_id="capture_qualification_maintenance"), \
+                    connect(db_path) as connection, transaction(connection), inheritance_boundary(connection):
                 qualification = capture_release.maintain_operation_qualifications(
-                    connection, at=at or now_utc(),
+                    connection, at=now_utc() if prepared is not None else timestamp,
                     mirror_root=db_path.resolve().parent / "current-hold-control")
             return {**result, "qualification_maintenance": qualification}
         if kind == "archive":
@@ -3581,13 +3965,20 @@ def install_pipeline_jobs(scheduler, *, db_path: Path, reports_root: Path, call_
                       next_run_time=datetime.now(BEIJING))
     install_lifecycle_jobs(scheduler, db_path=db_path)
     with connect(db_path) as connection:
-        integrated_schema = connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}
+        integrated_schema = connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21, 22, 23, 24}
     if integrated_schema:
         scheduler.add_job(run_local_content_analysis, IntervalTrigger(minutes=5, timezone=BEIJING),
             id=LOCAL_ANALYSIS_JOB, replace_existing=True,
             kwargs={"db_path": db_path, "automatic_from": authorization_effective_date},
             coalesce=True, max_instances=1, misfire_grace_time=None, executor="default",
             next_run_time=datetime.now(BEIJING))
+        with connect(db_path) as connection:
+            duplicate_runtime_available = indexed_duplicates(connection)
+        if duplicate_runtime_available:
+            scheduler.add_job(run_duplicate_relation_update, IntervalTrigger(minutes=1, timezone=BEIJING),
+                id=DUPLICATE_RELATION_JOB, replace_existing=True, kwargs={"db_path": db_path},
+                coalesce=True, max_instances=1, misfire_grace_time=None,
+                executor=SCHEDULER_DUPLICATE_EXECUTOR, next_run_time=datetime.now(BEIJING))
         for kind, seconds, executor in (
             ("plan", 300, SCHEDULER_CONTROL_EXECUTOR),
             ("execute", 10, "default"),

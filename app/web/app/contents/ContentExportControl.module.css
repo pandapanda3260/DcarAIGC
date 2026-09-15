@@ -1,0 +1,32 @@
+.control { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px 12px; }
+.backdrop { position: fixed; inset: 0; z-index: 80; display: flex; align-items: center; justify-content: center; padding: 20px; background: rgb(14 34 41 / 38%); }
+.panel { width: min(580px, 100%); max-height: min(760px, calc(100dvh - 40px)); display: flex; flex-direction: column; padding: 0; border: 1px solid var(--line); border-radius: 14px; background: var(--paper); color: var(--ink); box-shadow: 0 20px 70px rgb(14 34 41 / 20%); }
+.header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 22px; border-bottom: 1px solid var(--line); }
+.header h2 { margin: 0; font-size: 18px; font-weight: 600; }
+.close { width: 30px; height: 30px; border: 0; border-radius: 6px; color: var(--muted); background: var(--surface); font-size: 23px; line-height: 1; }
+.body { min-height: 0; padding: 20px 22px; overflow: auto; overscroll-behavior: contain; }
+.body p { margin: 0; }
+.scope { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0; }
+.tag { padding: 5px 8px; max-width: 100%; border: 1px solid var(--line); border-radius: 5px; background: #f6f8f8; color: #526971; font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
+.muted { color: var(--muted); font-size: 12px; line-height: 1.7; }
+.count { margin: 16px 0 8px !important; font-size: 14px; }
+.count strong { font-size: 22px; font-weight: 600; }
+.dates { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+.feedback { margin: 14px 0 0 !important; color: var(--teal); font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+.feedback[data-error="true"] { color: #b42318; }
+.footer { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 10px; padding: 15px 22px; border-top: 1px solid var(--line); background: #fafcfc; border-radius: 0 0 14px 14px; }
+.back { margin-right: auto; }
+.history { list-style: none; padding: 0; margin: 0; display: grid; gap: 12px; }
+.job { border: 1px solid var(--line); border-radius: 8px; padding: 13px 14px; }
+.jobHead { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; font-size: 13px; }
+.jobHead time { font-size: 11px; color: var(--muted); }
+.job .scope { margin: 9px 0; }
+.jobActions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 10px; }
+.jobActions button { min-height: 32px; padding: 5px 12px; font-size: 12px; }
+.pending { margin-bottom: 14px; border-color: #dbb363; background: #fffbf2; }
+.panel button:focus-visible { outline: 2px solid var(--teal); outline-offset: 3px; }
+@media (max-width: 640px) {
+  .backdrop { padding: 12px; }
+  .panel { max-height: calc(100dvh - 24px); }
+  .header, .body, .footer { padding-inline: 16px; }
+}

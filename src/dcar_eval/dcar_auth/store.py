@@ -12,6 +12,8 @@ security-relevant change is appended to ``auth-changes.log`` next to the
 database (outside of it, so a restored backup can be reconciled against it).
 Schema 3 adds ``new_user``, the default for self-registration, with no business
 permissions. Existing account roles are preserved during the table rebuild.
+Its additive ``display_name`` column stores optional profile text without
+changing account identity, credentials or security-change reconciliation.
 """
 
 from __future__ import annotations
@@ -64,7 +66,9 @@ CHANGE_LOG_FILENAME = "auth-changes.log"
 CHANGE_LOG_SCHEMA = "dcar-auth-change-v2"
 # The audit event format is unchanged; schema-2 evidence remains appendable.
 CHANGE_LOG_USER_VERSIONS = frozenset({2, 3})
-CHANGE_LOG_MAX_LINE_BYTES = 16 * 1024
+# Actor and target may each contain a whole bounded request's username, with
+# JSON escaping expanding control characters to six bytes per character.
+CHANGE_LOG_MAX_LINE_BYTES = 256 * 1024
 PASSWORD_ROUNDS = 100_000
 HTPASSWD_MIN_ROUNDS = 5_000
 HTPASSWD_MAX_ROUNDS = 1_000_000
@@ -83,8 +87,6 @@ PURPOSES = ("register", "login", "reset")
 INVALIDATION_REASONS = frozenset(
     {"password_changed", "phone_changed", "user_disabled", "user_deleted", "revoked"}
 )
-RESERVED_USERNAMES = frozenset({"temporary-bypass"})
-USERNAME_PATTERN = re.compile(r"[A-Za-z0-9_]{4,32}")
 LEGACY_USERNAME_PATTERN = re.compile(r"[\x21-\x39\x3b-\x7e]{1,128}")
 PHONE_PATTERN = re.compile(r"1[3-9][0-9]{9}", re.ASCII)
 CODE_PATTERN = re.compile(r"[0-9]{6}", re.ASCII)
@@ -142,7 +144,8 @@ _SCHEMA_STATEMENTS = (
         role TEXT NOT NULL DEFAULT 'new_user'
             CHECK(role IN ('superadmin','admin','operator','new_user')),
         created_at INTEGER NOT NULL,
-        password_updated_at INTEGER NOT NULL
+        password_updated_at INTEGER NOT NULL,
+        display_name TEXT NOT NULL DEFAULT ''
     )
     """,
     """
@@ -190,8 +193,8 @@ _SCHEMA_STATEMENTS = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS auth_failures_key ON auth_failures(key, at)",
-    # Tombstones: a deleted username can never be registered or imported again,
-    # and the deletion survives a rollback of the code.
+    # Retain the latest deletion for audit/backup reconciliation. Deletion does
+    # not reserve a username: a subsequent registration starts as new_user.
     """
     CREATE TABLE IF NOT EXISTS auth_deleted_users(
         username TEXT PRIMARY KEY COLLATE NOCASE,
@@ -218,6 +221,9 @@ _COLUMN_UPGRADES: tuple[tuple[str, str, str], ...] = (
     ("auth_challenges", "invalidated_at", "INTEGER"),
     ("auth_challenges", "invalidated_reason", "TEXT"),
     ("auth_deleted_users", "phone", "TEXT"),
+    # This additive profile column deliberately keeps schema 3 readable by
+    # previous runtimes, so rolling back code never requires restoring the DB.
+    ("auth_users", "display_name", "TEXT NOT NULL DEFAULT ''"),
 )
 
 
@@ -344,6 +350,7 @@ class Principal:
     username: str
     role: Optional[str]
     token_sha256: str
+    display_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -355,6 +362,7 @@ class UserRecord:
     role: str
     created_at: int
     password_updated_at: int
+    display_name: str = ""
 
     def to_public(self) -> dict[str, object]:
         """The user-management page representation: no hash, ISO-8601 times."""
@@ -374,11 +382,13 @@ class UserSummary:
     created_at: int
     password_updated_at: int
     active_sessions: int
+    display_name: str = ""
 
     def to_public(self) -> dict[str, object]:
         """The user-management list row (session counts stay CLI-only)."""
         return {
             "username": self.username,
+            "display_name": self.display_name,
             "phone": self.phone,
             "role": self.role,
             "status": self.status,
@@ -450,7 +460,20 @@ def load_pepper(path: Path) -> bytes:
 
 
 def valid_username(value: str) -> bool:
-    return USERNAME_PATTERN.fullmatch(value) is not None
+    return value != ""
+
+
+def username_key(value: str) -> str:
+    """Match the existing SQLite NOCASE identity comparison, including NULs.
+
+    SQLite folds ASCII only, then compares UTF-8 lengths if a NUL ends both
+    comparisons early. Keep throttle and in-flight work keys consistent with
+    database identity without changing how existing accounts are matched.
+    """
+    folded = value.translate(str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"))
+    if "\x00" in folded:
+        return folded.split("\x00", 1)[0] + "\x00" + str(len(value.encode("utf-8")))
+    return folded
 
 
 def valid_phone(value: str) -> bool:
@@ -547,17 +570,15 @@ def parse_htpasswd(text: str) -> list[tuple[str, str]]:
         username, password_hash = line.split(":", 1)
         if LEGACY_USERNAME_PATTERN.fullmatch(username) is None:
             raise HtpasswdImportError(f"line {number}: invalid username")
-        if username.lower() in RESERVED_USERNAMES:
-            raise HtpasswdImportError(f"line {number}: reserved username")
         try:
             _sha512_crypt_rounds(password_hash)
         except ValueError as exc:
             raise HtpasswdImportError(
                 f"line {number}: invalid SHA-512 crypt ($6$) hash: {exc}"
             ) from exc
-        if username.lower() in seen:
+        if username_key(username) in seen:
             raise HtpasswdImportError(f"line {number}: duplicate username")
-        seen.add(username.lower())
+        seen.add(username_key(username))
         entries.append((username, password_hash))
     if not entries:
         raise HtpasswdImportError("account file is empty")
@@ -595,7 +616,8 @@ class AuthStore:
 
         Versions 0 through 2 are upgraded to 3 inside one write transaction.
         The role constraint is rebuilt while existing account rows, sessions,
-        challenge ledgers and audit files are preserved. Newer versions refuse.
+        challenge ledgers and audit files are preserved. Missing additive
+        profile columns are also filled in schema 3. Newer versions refuse.
         """
         # A missing password-policy artifact must stop the service instead of
         # silently disabling the blocklist.
@@ -682,7 +704,7 @@ class AuthStore:
         # account table, keeping its name so session/ledger references survive.
         columns = (
             "username", "phone", "password_hash", "status", "role",
-            "created_at", "password_updated_at",
+            "created_at", "password_updated_at", "display_name",
         )
         existing = {row["name"] for row in connection.execute("PRAGMA table_info(auth_users)")}
         if existing != set(columns):
@@ -730,6 +752,17 @@ class AuthStore:
                     connection.execute("PRAGMA journal_mode").fetchone()[0]
                 ).lower()
                 role_schema_ready = self._has_new_user_role_schema(connection)
+                display_name_column = next(
+                    (row for row in connection.execute("PRAGMA table_info(auth_users)")
+                     if row["name"] == "display_name"),
+                    None,
+                )
+                profile_schema_ready = (
+                    display_name_column is not None
+                    and str(display_name_column["type"]).upper() == "TEXT"
+                    and bool(display_name_column["notnull"])
+                    and display_name_column["dflt_value"] == "''"
+                )
             finally:
                 connection.execute("ROLLBACK")
         finally:
@@ -742,6 +775,8 @@ class AuthStore:
             raise RuntimeError("authentication schema is missing required tables")
         if not role_schema_ready:
             raise RuntimeError("authentication schema is missing the new_user role/default")
+        if not profile_schema_ready:
+            raise RuntimeError("authentication schema is missing the display_name column/default")
         if journal_mode != "delete":
             raise RuntimeError(
                 f"authentication database requires DELETE journal mode, got {journal_mode}"
@@ -782,7 +817,7 @@ class AuthStore:
 
     @staticmethod
     def user_key(username: str) -> str:
-        return f"user:{username.lower()}"
+        return f"user:{username_key(username)}"
 
     @staticmethod
     def phone_key(phone: str) -> str:
@@ -859,6 +894,7 @@ class AuthStore:
             role=str(row["role"]),
             created_at=int(row["created_at"]),
             password_updated_at=int(row["password_updated_at"]),
+            display_name=str(row["display_name"]),
         )
 
     @staticmethod
@@ -867,7 +903,7 @@ class AuthStore:
     ) -> Optional[sqlite3.Row]:
         return connection.execute(
             "SELECT username, phone, password_hash, status, role, created_at, "
-            "password_updated_at FROM auth_users WHERE username=?",
+            "password_updated_at, display_name FROM auth_users WHERE username=?",
             (username,),
         ).fetchone()
 
@@ -877,7 +913,7 @@ class AuthStore:
     ) -> Optional[sqlite3.Row]:
         return connection.execute(
             "SELECT username, phone, password_hash, status, role, created_at, "
-            "password_updated_at FROM auth_users WHERE phone=?",
+            "password_updated_at, display_name FROM auth_users WHERE phone=?",
             (phone,),
         ).fetchone()
 
@@ -935,18 +971,18 @@ class AuthStore:
     def _username_reserved(
         self, connection: sqlite3.Connection, username: str
     ) -> bool:
-        if username.lower() in RESERVED_USERNAMES:
-            return True
-        if self._select_user(connection, username) is not None:
-            return True
-        if self._table_exists(connection, "auth_deleted_users"):
-            row = connection.execute(
-                "SELECT 1 FROM auth_deleted_users WHERE username=? COLLATE NOCASE",
-                (username,),
-            ).fetchone()
-            if row is not None:
-                return True
-        return False
+        return self._select_user(connection, username) is not None
+
+    def _retire_previous_identity(
+        self, connection: sqlite3.Connection, username: str, now: int
+    ) -> None:
+        """A reused name must never inherit old sessions or reset tickets."""
+        connection.execute(
+            "DELETE FROM auth_sessions WHERE username=? COLLATE NOCASE", (username,)
+        )
+        self._invalidate_challenges(
+            connection, username=username, phone=None, reason="user_deleted", now=now
+        )
 
     def username_reserved(self, username: str) -> bool:
         connection = self._connect()
@@ -972,7 +1008,7 @@ class AuthStore:
             rows = connection.execute(
                 """
                 SELECT u.username, u.phone, u.status, u.role, u.created_at,
-                       u.password_updated_at,
+                       u.password_updated_at, u.display_name,
                        (SELECT COUNT(*) FROM auth_sessions s
                         WHERE s.username=u.username AND s.expires_at>?) AS sessions
                 FROM auth_users u ORDER BY u.created_at DESC, u.rowid DESC
@@ -990,6 +1026,7 @@ class AuthStore:
                 created_at=int(row["created_at"]),
                 password_updated_at=int(row["password_updated_at"]),
                 active_sessions=int(row["sessions"]),
+                display_name=str(row["display_name"]),
             )
             for row in rows
         ]
@@ -1040,6 +1077,7 @@ class AuthStore:
                 raise UsernameTaken(username)
             if phone and self._select_user_by_phone(connection, phone) is not None:
                 raise PhoneConflict(phone)
+            self._retire_previous_identity(connection, username, now)
             connection.execute(
                 "INSERT INTO auth_users(username, phone, password_hash, status, role, "
                 "created_at, password_updated_at) VALUES(?,?,?,?,?,?,?)",
@@ -1060,6 +1098,7 @@ class AuthStore:
         return self._user_from_row(row)
 
     def allow_phone(self, phone: str, note: str = "", *, actor: str = "cli") -> None:
+        """Maintain legacy metadata; this no longer controls registration."""
         change_id: Optional[str] = None
         with self._immediate() as connection:
             connection.execute(
@@ -1158,8 +1197,7 @@ class AuthStore:
                 "UPDATE auth_users SET phone=? WHERE username=?", (phone, canonical)
             )
             if previous is not None:
-                # The old number loses its admission: registering with it again
-                # needs an explicit allow-phone.
+                # Clean up legacy admission metadata on rebinding.
                 connection.execute(
                     "DELETE FROM auth_allowed_phones WHERE phone=?", (previous,)
                 )
@@ -1317,8 +1355,8 @@ class AuthStore:
     ) -> int:
         """Import active accounts; any defect rejects the whole transaction.
 
-        Only an empty account table accepts an import, and a username that is
-        reserved, present or tombstoned rejects the whole file.  Roles are
+        Only an empty account table accepts an import. Duplicate identities
+        reject the whole file. Roles are
         assigned afterwards with ``set_role`` unless the offline caller explicitly
         bootstraps the first parsed account in this same import transaction.
         """
@@ -1334,6 +1372,7 @@ class AuthStore:
             for username, password_hash in entries:
                 if self._username_reserved(connection, username):
                     raise HtpasswdImportError(f"username reserved: {username}")
+                self._retire_previous_identity(connection, username, now)
                 connection.execute(
                     "INSERT INTO auth_users(username, phone, password_hash, status, "
                     "role, created_at, password_updated_at) "
@@ -1381,6 +1420,11 @@ class AuthStore:
             connection.close()
         lines = []
         for row in rows:
+            username = str(row["username"])
+            if LEGACY_USERNAME_PATTERN.fullmatch(username) is None or username.startswith("#"):
+                raise HtpasswdExportError(
+                    f"account {username!r} cannot be represented by the legacy htpasswd format"
+                )
             password_hash = str(row["password_hash"])
             try:
                 _sha512_crypt_rounds(password_hash)
@@ -1457,7 +1501,7 @@ class AuthStore:
             row = connection.execute(
                 """
                 SELECT u.username, s.credential_fingerprint, s.expires_at,
-                       u.password_hash, u.status, u.role
+                       u.password_hash, u.status, u.role, u.display_name
                 FROM auth_sessions s JOIN auth_users u ON u.username=s.username
                 WHERE s.token_sha256=?
                 """,
@@ -1486,6 +1530,7 @@ class AuthStore:
                 username=str(row["username"]),
                 role=str(row["role"]),
                 token_sha256=token_hash,
+                display_name=str(row["display_name"]),
             )
         finally:
             connection.close()
@@ -1582,8 +1627,6 @@ class AuthStore:
             if purpose == "register":
                 if self._select_user_by_phone(connection, phone) is not None:
                     self._reject(connection, keys, now, PhoneRegistered(phone))
-                if not self._phone_allowed(connection, phone):
-                    self._reject(connection, keys, now, PhoneNotAllowed(phone))
             else:
                 row = self._select_user_by_phone(connection, phone)
                 if row is None:
@@ -1735,8 +1778,6 @@ class AuthStore:
                 self._reject(connection, keys, now, UsernameTaken(username))
             if self._select_user_by_phone(connection, phone) is not None:
                 self._reject(connection, keys, now, PhoneRegistered(phone))
-            if not self._phone_allowed(connection, phone):
-                self._reject(connection, keys, now, PhoneNotAllowed(phone))
             row, _user = self._match_code(connection, "register", phone, code, now)
             if row is None:
                 self._reject(connection, keys, now, InvalidCode(phone))
@@ -1757,8 +1798,7 @@ class AuthStore:
                 raise UsernameTaken(username)
             if self._select_user_by_phone(connection, phone) is not None:
                 raise PhoneRegistered(phone)
-            if not self._phone_allowed(connection, phone):
-                raise PhoneNotAllowed(phone)
+            self._retire_previous_identity(connection, username, now)
             if not self._consume(connection, challenge_id, now):
                 raise InvalidCode(phone)
             try:
@@ -1942,16 +1982,10 @@ class AuthStore:
 
     # ------------------------------------------------- user management (page)
 
-    def _load_actor(self, connection: sqlite3.Connection, session_hash: str) -> sqlite3.Row:
-        """Re-verify the caller's session inside the write transaction.
-
-        The request already resolved the session, but a password reset, a
-        deletion or a demotion may have landed between that lookup and the
-        write lock; the transaction is the only place where the decision is
-        final.  A session that no longer verifies raises ``SessionRevoked`` and
-        an account whose role can no longer manage users raises
-        ``ActorForbidden``.
-        """
+    def _load_session_user(
+        self, connection: sqlite3.Connection, session_hash: str
+    ) -> sqlite3.Row:
+        """Re-verify current credentials and status inside the write lock."""
         row = connection.execute(
             """
             SELECT u.username, s.expires_at, s.credential_fingerprint,
@@ -1971,6 +2005,35 @@ class AuthStore:
             )
         ):
             raise SessionRevoked(session_hash[:8])
+        return row
+
+    def update_own_display_name(self, session_hash: str, display_name: str) -> UserRecord:
+        """Save the authenticated user's optional nickname, exactly as entered.
+
+        The session determines the only editable account. Display text does
+        not alter permissions or credentials and is intentionally excluded
+        from the security-change journal used for backup reconciliation.
+        """
+        if not isinstance(display_name, str):
+            raise ValueError("display_name must be a string")
+        with self._immediate() as connection:
+            actor = self._load_session_user(connection, session_hash)
+            username = str(actor["username"])
+            connection.execute(
+                "UPDATE auth_users SET display_name=? WHERE username=?",
+                (display_name, username),
+            )
+            updated = self._select_user(connection, username)
+        assert updated is not None
+        return self._user_from_row(updated)
+
+    def _load_actor(self, connection: sqlite3.Connection, session_hash: str) -> sqlite3.Row:
+        """Re-check the session and user-management role inside the write lock.
+
+        Password resets, deletions and demotions can happen after the initial
+        request lookup; only this transaction decides whether a write is valid.
+        """
+        row = self._load_session_user(connection, session_hash)
         if str(row["role"]) not in USER_ADMIN_ROLES:
             raise ActorForbidden(str(row["username"]))
         return row
@@ -2136,7 +2199,7 @@ class AuthStore:
     def _delete_row(
         self, connection: sqlite3.Connection, row: sqlite3.Row, *, deleted_by: str
     ) -> UserRecord:
-        """Deletion revokes access: tombstone, phone admission, sessions, codes."""
+        """Record deletion and revoke sessions/codes; names remain reusable."""
         target_name = str(row["username"])
         target_role = str(row["role"])
         phone = None if row["phone"] is None else str(row["phone"])
@@ -2149,12 +2212,14 @@ class AuthStore:
         now = self._now()
         connection.execute(
             "INSERT INTO auth_deleted_users(username, deleted_at, deleted_by, role, phone) "
-            "VALUES(?,?,?,?,?)",
+            "VALUES(?,?,?,?,?) ON CONFLICT(username) DO UPDATE SET "
+            "deleted_at=excluded.deleted_at, deleted_by=excluded.deleted_by, "
+            "role=excluded.role, phone=excluded.phone",
             (target_name, now, deleted_by, target_role, phone),
         )
         if phone is not None:
             connection.execute("DELETE FROM auth_allowed_phones WHERE phone=?", (phone,))
-        connection.execute("DELETE FROM auth_sessions WHERE username=?", (target_name,))
+        connection.execute("DELETE FROM auth_sessions WHERE username=? COLLATE NOCASE", (target_name,))
         self._invalidate_challenges(
             connection, username=target_name, phone=phone, reason="user_deleted", now=now
         )
@@ -2247,7 +2312,7 @@ class AuthStore:
             raise ChangeLogError(f"change log line {line_number}: unknown action")
         for name in ("actor", "target"):
             value = entry.get(name)
-            if not isinstance(value, str) or not value or len(value) > 256:
+            if not isinstance(value, str) or not value:
                 raise ChangeLogError(
                     f"change log line {line_number}: invalid {name}"
                 )
@@ -2585,11 +2650,15 @@ class AuthStore:
     ) -> list[dict[str, object]]:
         if not text:
             return []
+        if not text.endswith("\n"):
+            raise ChangeLogError("security change log has an incomplete final line")
         intents: dict[str, dict[str, object]] = {}
         intent_order: list[str] = []
         committed: dict[str, str] = {}
         legacy: list[dict[str, object]] = []
-        for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        # JSON strings may contain U+0085/U+2028/U+2029 verbatim. Only the
+        # literal LF written by _append_change_event separates log records.
+        for line_number, raw_line in enumerate(text[:-1].split("\n"), start=1):
             if len(raw_line.encode("utf-8")) + 1 > CHANGE_LOG_MAX_LINE_BYTES:
                 raise ChangeLogError(f"change log line {line_number}: line is too large")
             if not raw_line.strip():

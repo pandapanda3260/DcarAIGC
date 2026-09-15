@@ -26,15 +26,16 @@ def _planning_cache(connection):
 
 
 @contextmanager
-def planning_validation(connection: sqlite3.Connection, policy: Mapping[str, Any], snapshot: Mapping[str, Any]):
+def planning_validation(connection: sqlite3.Connection, policy: Mapping[str, Any], snapshot: Mapping[str, Any], *,
+                        plan: Mapping[str, Any] | None = None):
     """Reuse a verified snapshot only inside the caller's single planning transaction.
 
     The planner holds BEGIN IMMEDIATE for this whole block and does not mutate
     directory identities/status. Admission and send checks explicitly disable
     this cache and always resolve current member evidence again.
     """
-    from .account_catalog_capture_release import ACCOUNT_CATALOG_POLICY
-    if (not connection.in_transaction or policy != ACCOUNT_CATALOG_POLICY
+    from .account_catalog_capture_release import ACCOUNT_CATALOG_POLICY_V2, ACCOUNT_CATALOG_POLICY_V3
+    if (not connection.in_transaction or policy not in (ACCOUNT_CATALOG_POLICY_V2, ACCOUNT_CATALOG_POLICY_V3)
             or snapshot.get("contract") != CONTRACT
             or snapshot.get("policy_sha256") != planning.digest(policy)
             or snapshot.get("snapshot_sha256") != planning.digest({k: v for k, v in snapshot.items() if k != "snapshot_sha256"})):
@@ -43,10 +44,29 @@ def planning_validation(connection: sqlite3.Connection, policy: Mapping[str, Any
     indexed = {member["identity_id"]: member for member in members}
     if len(indexed) != len(members):
         raise ValueError("catalog snapshot repeats an identity")
+    if plan is not None and plan.get("catalog_snapshot", {}).get("snapshot_sha256") != snapshot["snapshot_sha256"]:
+        raise ValueError("planning source plan differs from catalog snapshot")
     token = _PLANNING_VALIDATION.set({"connection": connection, "policy": dict(policy),
         "snapshot_sha256": snapshot["snapshot_sha256"], "members": indexed, "plans": {}})
     try:
-        yield
+        from .capture_metric_cycles import planning_validation as metric_cycle_validation, verified_planning_plan
+        with metric_cycle_validation(connection, plan=plan) as bound_plan:
+            if plan is not None:
+                verified = verified_planning_plan(connection, plan["id"])
+                # The ordinary call passes the exact snapshot just validated
+                # above. The cycle binding already proved its whole plan equals
+                # persisted JSON. Separate snapshot copies retain a strict check.
+                if (plan.get("catalog_snapshot") is not snapshot and
+                        planning.canonical(verified.get("catalog_snapshot")) != planning.canonical(snapshot)):
+                    raise ValueError("planning source plan differs from catalog snapshot")
+                if (verified.get("catalog_mode") == "active" and verified.get("shadow") is False
+                        and type(verified.get("roster_snapshot_id")) is int
+                        and verified.get("roster_members_sha256")):
+                    _PLANNING_VALIDATION.get()["plans"][plan["id"]] = {k: v for k, v in verified.items() if k != "id"}
+                # An empty plan can predate its roster binding. Keep the old
+                # behavior: no member can use it until validate_plan_member
+                # performs (and fails) the complete catalog proof below.
+            yield bound_plan
         if not connection.in_transaction:
             raise ValueError("catalog planning transaction ended inside validation context")
     finally:
@@ -65,8 +85,8 @@ def installed_policy(connection: sqlite3.Connection, *, at: str, use_planning_ca
     proof = evidence.get("catalog_capture_proof")
     if policy is None and proof is None:
         return None
-    from .account_catalog_capture_release import ACCOUNT_CATALOG_POLICY
-    if (policy != ACCOUNT_CATALOG_POLICY or not isinstance(proof, dict)
+    from .account_catalog_capture_release import ACCOUNT_CATALOG_POLICY_V2, ACCOUNT_CATALOG_POLICY_V3
+    if (policy not in (ACCOUNT_CATALOG_POLICY_V2, ACCOUNT_CATALOG_POLICY_V3) or not isinstance(proof, dict)
             or evidence.get("catalog_capture_policy_sha256") != planning.digest(policy)
             or proof.get("proof_sha256") != planning.digest({k: v for k, v in proof.items() if k != "proof_sha256"})):
         raise ValueError("catalog capture policy is not verified")
@@ -243,7 +263,35 @@ def validate_paid_target(connection: sqlite3.Connection, scope: Any, *, identity
     return member
 
 
-def materialize_proven_locators(connection: sqlite3.Connection, members: list[dict[str, Any]], *, at: str) -> int:
+def prepare_proven_locators(connection: sqlite3.Connection, members: list[dict[str, Any]]) -> dict[int, str]:
+    """Validate admission/raw evidence before acquiring the SQLite write lock."""
+    import hashlib
+    from .account_capture_eligibility import require_directory_capture_member
+    from .account_operating_receipts import load_admission_members
+    candidates = [m for m in members if m.get("locator_evidence", {}).get("kind") == "verified_account_admission"]
+    if not candidates:
+        return {}
+    admissions = load_admission_members(connection)
+    result = {}
+    for member in candidates:
+        current = require_directory_capture_member(connection, member["identity_id"])
+        admission = admissions.get(member["identity_id"])
+        if (admission is None or any(current.get(k) != member.get(k) for k in IDENTITY_KEYS)
+                or current.get("locator_evidence") != member.get("locator_evidence")
+                or planning.digest(admission) != member["locator_evidence"].get("admission_sha256")
+                or admission["account_id"] != member["account_id"]
+                or admission["member"].get("platform") != "douyin"
+                or admission["member"].get("uid") != member["uid"]):
+            raise ValueError("Catalog locator admission no longer matches its frozen member")
+        sec = admission["member"]["metadata"]["sec_user_id"]
+        if hashlib.sha256(sec.encode()).hexdigest() != member["locator_sha256"]:
+            raise ValueError("Catalog locator differs from its verified admission")
+        result[member["identity_id"]] = sec
+    return result
+
+
+def materialize_proven_locators(connection: sqlite3.Connection, members: list[dict[str, Any]], *, at: str,
+                               verified_locators: Mapping[int, str] | None = None) -> int:
     """Cache receipt-proven locators without purchasing or replacing a reference."""
     import hashlib
     from .account_capture_eligibility import require_directory_capture_member
@@ -255,6 +303,24 @@ def materialize_proven_locators(connection: sqlite3.Connection, members: list[di
                   if member.get("locator_evidence", {}).get("kind") == "verified_account_admission"]
     if not candidates:
         return 0
+    if verified_locators is not None:
+        created = 0
+        for member in candidates:
+            identity_id = member["identity_id"]
+            sec = verified_locators.get(identity_id)
+            if not isinstance(sec, str) or hashlib.sha256(sec.encode()).hexdigest() != member["locator_sha256"]:
+                raise ValueError("Prepared catalog locator differs from snapshot")
+            old = connection.execute("SELECT reference_value FROM account_provider_references "
+                "WHERE account_identity_id=? AND lower(provider)='tikhub' AND reference_kind='sec_user_id'", (identity_id,)).fetchall()
+            if any(row[0] != sec for row in old):
+                raise ValueError("An existing account locator cannot be replaced")
+            if not old:
+                from .account_reference_storage import store_reference
+                store_reference(connection, account_identity_id=identity_id, platform=member["platform"],
+                    provider="tikhub", reference_kind="sec_user_id", reference_value=sec,
+                    source_raw_response_id=None, created_at=at, updated_at=at)
+                created += 1
+        return created
     admissions = load_admission_members(connection)
     created = 0
     for member in candidates:
@@ -276,18 +342,20 @@ def materialize_proven_locators(connection: sqlite3.Connection, members: list[di
         if any(row[0] != sec for row in old):
             raise ValueError("An existing account locator cannot be replaced")
         if not old:
-            connection.execute("INSERT INTO account_provider_references(account_identity_id,provider,reference_kind,"
-                "reference_value,source_raw_response_id,created_at,updated_at) VALUES(?,'tikhub','sec_user_id',?,NULL,?,?)",
-                (identity_id, sec, at, at))
+            from .account_reference_storage import store_reference
+            store_reference(connection, account_identity_id=identity_id, platform=member["platform"],
+                provider="tikhub", reference_kind="sec_user_id", reference_value=sec,
+                source_raw_response_id=None, created_at=at, updated_at=at)
             created += 1
     return created
 
 
 def synchronize_enabled(connection: sqlite3.Connection, snapshot: Mapping[str, Any], *,
-                        activation_id: int, at: str) -> None:
+                        activation_id: int, at: str, verified_locators: Mapping[int, str] | None = None) -> None:
     """Keep the legacy projection derived, never another input to eligibility."""
     from .account_states import set_account_enabled_in_transaction
-    materialize_proven_locators(connection, snapshot["eligibility"]["eligible_members"], at=at)
+    materialize_proven_locators(connection, snapshot["eligibility"]["eligible_members"], at=at,
+                               verified_locators=verified_locators)
     eligible = {m["account_id"] for m in snapshot["eligibility"]["eligible_members"]}
     for row in connection.execute("SELECT DISTINCT i.id identity_id,a.id account_id,a.enabled "
             "FROM account_directory_rows d JOIN accounts a ON a.id=d.account_id "
@@ -324,34 +392,102 @@ def public_statuses(connection: sqlite3.Connection) -> dict[int, dict[str, Any]]
     return output
 
 
-def annotate_accounts(connection: sqlite3.Connection, accounts: list[dict[str, Any]]) -> None:
-    values = public_statuses(connection)
-    if not values:
-        # A legacy installation or an unpublished first catalog plan must keep
-        # its existing read model. Replicas never infer new scope from raw data.
-        return
+def _public_platform_blocks(connection: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+    """Project installed transport state without reading local evidence files.
+
+    Schema23 exposes the first missing stage contract even before the first
+    catalog plan exists. This read model never grants send permission: complete
+    runtime, budget and immutable scope checks still run at dispatch time.
+    """
+    from . import platform_adapters as adapters
+    from .account_capture_eligibility import SUPPORTED_PLATFORMS
+    output = {}
+    tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    current = connection.execute("PRAGMA user_version").fetchone()[0] >= 23
+    gates = {}
+    if "capture_paid_send_gate_events" in tables:
+        gates = {row["operation"]: row["state"] for row in connection.execute(
+            "SELECT operation,state FROM capture_paid_send_gate_events WHERE provider='tikhub' "
+            "AND julianday(recorded_at)<=julianday('now') ORDER BY id")}
+    # The policy digest is part of every published plan. A replica can inspect
+    # its platform scope without opening the local installation receipt/raw.
+    policy_platforms = None
+    if "capture_source_plans" in tables:
+        plan = connection.execute("SELECT payload_json FROM capture_source_plans WHERE mode='active' "
+            "AND json_extract(payload_json,'$.catalog_mode')='active' "
+            "AND json_extract(payload_json,'$.shadow')=0 ORDER BY id DESC LIMIT 1").fetchone()
+        if plan:
+            from .account_catalog_capture_release import ACCOUNT_CATALOG_POLICY_V2, ACCOUNT_CATALOG_POLICY_V3
+            policy_hash = json.loads(plan[0]).get("catalog_snapshot", {}).get("policy_sha256")
+            for policy in (ACCOUNT_CATALOG_POLICY_V2, ACCOUNT_CATALOG_POLICY_V3):
+                if planning.digest(policy) == policy_hash:
+                    policy_platforms = policy.get("platforms", ["douyin", "xiaohongshu"])
+                    break
+    for platform in SUPPORTED_PLATFORMS:
+        stages = (adapters.PROFILE_OPERATIONS.get(platform), adapters.POST_OPERATIONS.get(platform))
+        if any(not operation or operation not in adapters.ROUTES for operation in stages):
+            reason, label = "platform_unsupported", "当前运行版本未配置此平台采集合同"
+        elif policy_platforms is not None and platform not in policy_platforms:
+            reason, label = "platform_policy_unavailable", "当前采集运行合同尚未启用此平台"
+        elif current and any(operation not in gates for operation in stages):
+            reason, label = "platform_source_unconfigured", "平台资料或作品数据源尚未启用"
+        elif any(operation in gates and gates[operation] not in {"open", "diagnostic_only"} for operation in stages):
+            reason, label = "provider_transport_blocked", "平台数据源当前暂停采集"
+        elif any(gates.get(operation) == "diagnostic_only" for operation in stages):
+            reason, label = "provider_diagnostic_only", "平台数据源仅开放验证，尚未开放日常采集"
+        else:
+            continue
+        output[platform] = {"eligible": False, "reason_code": reason, "reason_label": label}
+    return output
+
+
+def annotate_accounts(
+    connection: sqlite3.Connection, accounts: list[dict[str, Any]], *, live: bool = False,
+) -> None:
+    """Show stage capability before identity and published evidence/plan state.
+
+    Only an explicit local preview reads raw evidence. Replicas can show missing
+    contracts and inputs before the first snapshot, but never infer admission.
+    """
+    from .account_capture_eligibility import SUPPORTED_PLATFORMS
+    blocks = _public_platform_blocks(connection)
+    if live:
+        from .account_capture_eligibility import derive_capture_eligibility
+        checked = derive_capture_eligibility(connection)
+        values = {member["directory_row_id"]: member for member in
+                  checked["eligible_members"] + checked["excluded_members"]}
+    else:
+        values = public_statuses(connection)
     for account in accounts:
-        value = values.get(account.get("directory_row_id"))
-        status = account.get("account_status")
-        identity_status = account.get("directory_identity_status")
         platform = account.get("directory_platform")
+        if platform is None:
+            # Non-directory/legacy callers have no platform authority to show.
+            continue
+        value = values.get(account.get("directory_row_id"))
         uid = account.get("directory_uid")
         current_identity = next((item for item in account.get("platforms", [])
                                  if item.get("platform") == platform and item.get("uid") == uid), None)
-        if status == "paused":
-            value = {"eligible": False, "reason_code": "account_paused", "reason_label": "已暂停自动更新"}
-        elif status == "unmarked":
-            value = {"eligible": False, "reason_code": "account_status_unmarked", "reason_label": "请先标记账号状态"}
-        elif identity_status != "existing_verified":
-            value = {"eligible": False,
-                "reason_code": "identity_missing" if identity_status == "identity_missing" else "identity_unverified",
-                "reason_label": "平台身份待完善" if identity_status == "identity_missing" else "平台身份待核验"}
+        if platform not in SUPPORTED_PLATFORMS:
+            value = {"eligible": False, "reason_code": "platform_unsupported", "reason_label": "暂不支持此平台采集"}
+        elif platform in blocks:
+            value = blocks[platform]
+        elif live and value is not None:
+            pass
+        elif not uid or account.get("id", 0) <= 0:
+            value = {"eligible": False, "reason_code": "identity_missing", "reason_label": "缺少有效的平台 UID 或账号关联"}
         elif current_identity is None:
             value = {"eligible": False, "reason_code": "identity_conflict", "reason_label": "账号与平台身份不一致"}
-        elif (value is None or value.get("account_status") != status
-                or value.get("identity_status") != identity_status
+        elif (value is None
                 or value.get("account_id") != account.get("id")
                 or value.get("identity_id") != current_identity.get("id")
                 or value.get("platform") != platform or value.get("uid") != uid):
-            value = {"eligible": False, "reason_code": "pending_verification", "reason_label": "等待系统核验"}
+            value = {"eligible": False, "reason_code": "capture_plan_pending", "reason_label": "采集计划尚未更新"}
+        elif value.get("reason_code") == "identity_unverified":
+            value = {"eligible": False, "reason_code": "identity_evidence_missing", "reason_label": "缺少可验证的主页资料"}
+        elif value.get("reason_code") == "pending_verification":
+            value = {"eligible": False, "reason_code": "capture_plan_pending", "reason_label": "采集计划尚未更新"}
+        elif value.get("reason_code") in {"account_paused", "account_status_unmarked", "account_status_invalid"}:
+            value = {"eligible": False, "reason_code": "capture_plan_pending", "reason_label": "采集计划尚未按全量名单规则更新"}
+        elif value.get("reason_code") == "platform_unsupported":
+            value = {"eligible": False, "reason_code": "capture_plan_pending", "reason_label": "采集计划尚未接入此平台"}
         account["automatic_capture"] = {key: value[key] for key in ("eligible", "reason_code", "reason_label")}

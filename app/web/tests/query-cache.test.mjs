@@ -221,7 +221,45 @@ test("readQueryJson bounds reads without creating an automatic retry", async () 
   }
 });
 
-test("provider is SSR-safe and cached read query functions do not consume AbortSignal", async () => {
+test("query timeout remains bounded with an external cancellation signal", async () => {
+  const previousFetch = globalThis.fetch;
+  const controller = new AbortController();
+  let receivedSignal;
+  globalThis.fetch = (_url, init) => new Promise((_resolve, reject) => {
+    receivedSignal = init.signal;
+    init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+  });
+  try {
+    await assert.rejects(readQueryJson("/combined-timeout", { signal: controller.signal }, 5), (error) => {
+      assert.equal(error.name, "AbortError");
+      assert.match(error.message, /读取超时/);
+      assert.equal(shouldRetryQuery(0, error), false);
+      return true;
+    });
+    assert.equal(receivedSignal.aborted, true);
+    assert.equal(controller.signal.aborted, false, "timeout does not abort the caller's other work");
+  } finally { globalThis.fetch = previousFetch; }
+});
+
+test("query cancellation preserves its cause and does not start an already cancelled read", async () => {
+  const previousFetch = globalThis.fetch;
+  let called = 0;
+  globalThis.fetch = (_url, init) => new Promise((_resolve, reject) => {
+    called++;
+    init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+  });
+  try {
+    const controller = new AbortController();
+    const reason = new DOMException("newer page selected", "AbortError");
+    const request = readQueryJson("/cancel-page", { signal: controller.signal }, 50);
+    controller.abort(reason);
+    await assert.rejects(request, (error) => error === reason);
+    await assert.rejects(readQueryJson("/already-cancelled", { signal: controller.signal }), (error) => error === reason);
+    assert.equal(called, 1);
+  } finally { globalThis.fetch = previousFetch; }
+});
+
+test("provider is SSR-safe and list/detail queries consume cancellation without changing cache keys", async () => {
   const [layout, providers, client, queries, packageJson] = await Promise.all([
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/components/Providers.tsx", import.meta.url), "utf8"),
@@ -243,9 +281,9 @@ test("provider is SSR-safe and cached read query functions do not consume AbortS
   assert.match(client, /retry:\s*shouldRetryQuery/);
   assert.match(client, /retryDelay:\s*250/);
 
-  assert.doesNotMatch(queries, /\bAbortController\b|\bsignal\b|QueryFunctionContext/);
-  assert.equal((queries.match(/queryFn:\s*\(\)\s*=>/g) ?? []).length, 12);
-  assert.equal((queries.match(/readQueryJson</g) ?? []).length, 15);
+  assert.match(queries, /contentSearchQueryOptions[\s\S]*?queryFn: \(\{ signal \}\) =>/);
+  assert.match(queries, /accountSearchQueryOptions[\s\S]*?queryFn: \(\{ signal \}\) => readAccountSearch\(request, signal\)/);
+  assert.match(queries, /accountDirectoryDetailQueryOptions[\s\S]*?\{ signal \}/);
   assert.doesNotMatch(queries, /queryKey:[^\n]*(?:timeout|signal)/);
   assert.match(queries, /spuAssetsQueryOptions[\s\S]*refetchInterval:\s*\(query\) => !query\.state\.error/);
   assert.match(queries, /tasksListQueryOptions[\s\S]*refetchInterval:\s*\(query\) => !query\.state\.error/);
@@ -323,14 +361,14 @@ test("list read failures stay distinct from real empty states and expose retry",
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
   ]);
 
-  assert.match(accounts, /const accountsReadFailed = accountsQuery\.isLoadingError \|\| retrying/);
+  assert.match(accounts, /const accountsReadFailed = !result && \(accountsQuery\.isLoadingError \|\| retrying\)/);
   assert.match(accounts, /accountsReadFailed \? "读取失败" : `\$\{total\} 个账号`/);
   assert.match(accounts, /className=\{`\$\{styles\.accountPanel\}\$\{accountsReadFailed \? " has-read-error" : ""\}`\}/);
   assert.match(accounts, /<\/table><\/div>\s*\{accountsReadFailed && <ReadErrorState title="账号读取失败" retrying=\{retrying\} onRetry=\{retryAccountsRead\} \/>\}/);
   assert.doesNotMatch(accounts, /<td[^>]*className="table-read-error"/);
   assert.match(accounts, /setRetrying\(true\);[\s\S]*accountsQuery\.refetch\(\)\.finally\(\(\) => setRetrying\(false\)\)/);
-  assert.match(accounts, /accountsQuery\.isPending && !accountsQuery\.data && !accountsReadFailed/);
-  assert.match(accounts, /!accountsReadFailed && accountsQuery\.data && <AccountsPagination/);
+  assert.match(accounts, /accountsQuery\.isPending && !result && !accountsReadFailed/);
+  assert.match(accounts, /!accountsReadFailed && result && <AccountsPagination/);
   assert.match(accounts, /!accountsReadFailed && !items\.length && <tr><td className=\{styles\.empty\} colSpan=\{9\}/);
   assert.match(accounts, /!accountsReadFailed && items\.map/);
 
@@ -342,7 +380,7 @@ test("list read failures stay distinct from real empty states and expose retry",
   assert.doesNotMatch(contents, /<td[^>]*className="table-read-error"/);
   assert.match(contents, /setRetrying\(true\);[\s\S]*contentsQuery\.refetch\(\)\.finally\(\(\) => setRetrying\(false\)\)/);
   assert.match(contents, /contentsQuery\.isPending && !contentsQuery\.data && !contentsReadFailed/);
-  assert.match(contents, /!contentsReadFailed && contentsQuery\.data && <Pagination/);
+  assert.match(contents, /!contentsReadFailed && contentsQuery\.data && <>[\s\S]*<Pagination/);
 
   assert.match(tasks, /const tasksReadFailed = tasksQuery\.isLoadingError \|\| retrying/);
   assert.match(tasks, /tasksReadFailed \? "读取失败"/);

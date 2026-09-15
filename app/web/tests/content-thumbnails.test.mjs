@@ -1,19 +1,42 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, rm, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { thumbnailSources } from "../app/lib/contentThumbnails.ts";
+import { thumbnailMissingHint, thumbnailSource, thumbnailSources } from "../app/lib/contentThumbnails.ts";
 import { readThumbnailMetadata, thumbnailResponse } from "../app/lib/contentThumbnailServer.ts";
 
-test("thumbnail sources prefer reusable local images and reject cross-content or executable URLs", () => {
+test("thumbnails use only online covers and reject unsafe URLs", () => {
   const local = "/api/v8/contents/7/evidence/files/12/0";
   const remote = "https://example.com/cover.jpg";
-  assert.deepEqual(thumbnailSources(7, { local_url: local, remote_url: remote }), [local, remote]);
-  assert.deepEqual(thumbnailSources(8, { local_url: local, remote_url: remote }), [remote]);
+  assert.equal(thumbnailSource({ local_url: local, remote_url: remote }), remote);
+  assert.equal(thumbnailSource({ local_url: local, remote_url: null }), null);
+  assert.equal(thumbnailSource(), null);
   for (const url of ["javascript:alert(1)", "http://example.com/x", "https://user:secret@example.com/x", "/other", "bad url"]) {
-    assert.deepEqual(thumbnailSources(7, { local_url: null, remote_url: url }), []);
+    assert.equal(thumbnailSource({ local_url: local, remote_url: url }), null);
   }
+});
+
+test("candidate covers retain exact signed URLs, remove duplicates, and cap valid sources at three", () => {
+  const signed = "HTTPS://Other-Provider.example:443/a/../cover.webp?signature=a%2Fb%2bc&x=1#still-signed";
+  const second = "https://new-cdn.example/two.webp";
+  const third = "https://another.example/three.jpg";
+  const fourth = "https://ignored.example/four.png";
+  assert.deepEqual(thumbnailSources({ remote_url: signed, remote_urls: [signed, signed, "http://unsafe.example/x", second, third, fourth] }), [signed, second, third]);
+  assert.deepEqual(thumbnailSources({ remote_url: second, remote_urls: [signed] }), [signed, second]);
+  assert.deepEqual(thumbnailSources({ remote_url: signed }), [signed], "old metadata still works");
+  assert.deepEqual(thumbnailSources({ remote_url: signed, remote_urls: null }), [signed]);
+  for (const remote_url of [null, 7, {}, "https://", "https:example.com/x", "https://@example.com/x", "https://example.com:/x", "https://example.com:444/x", "https://bad_host.example/x", "https://-bad.example/x", "https://example.com/\ncover", "https://example.com/ cover", "https://example.com\\cover", "https://example.com/" + "x".repeat(4096), "https://example.com/" + "封".repeat(1400)]) {
+    assert.deepEqual(thumbnailSources({ remote_url }), [], String(remote_url));
+  }
+});
+
+test("missing cover hints distinguish metadata outcomes and stay quiet before metadata arrives", () => {
+  assert.equal(thumbnailMissingHint(), null);
+  assert.equal(thumbnailMissingHint({ remote_url: null }), "未取得封面");
+  assert.equal(thumbnailMissingHint({ remote_url: null, reason: "not_found" }), "未取得封面");
+  assert.equal(thumbnailMissingHint({ remote_url: null, reason: "unsupported_format" }), "封面格式暂不支持");
+  assert.equal(thumbnailMissingHint({ remote_url: null, reason: "source_unavailable" }), "封面资料暂不可用");
 });
 
 test("metadata reader requires gateway identity and a bounded id list before any file reads", async () => {
@@ -39,18 +62,58 @@ test("missing thumbnail sources fail quietly without leaking internal paths", as
   assert.doesNotMatch(await response.text(), /private database/);
 });
 
-test("large snapshot projection permits one child process and releases capacity after completion", async () => {
+test("thumbnail loads merge identical requests and queue different pages with one child process", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dcar-thumbnail-concurrency-"));
   const previous = Object.fromEntries(["DCAR_THUMBNAIL_PYTHON", "DCAR_THUMBNAIL_HELPER", "DCAR_THUMBNAIL_DB", "DCAR_THUMBNAIL_PROJECT_ROOT"].map((key) => [key, process.env[key]]));
   try {
     const executable = join(directory, "reader.mjs");
-    await writeFile(executable, '#!/usr/bin/env node\nsetTimeout(() => process.stdout.write(JSON.stringify({items:{}})), 100);\n');
+    const lock = join(directory, "active");
+    const calls = join(directory, "calls");
+    await writeFile(executable, `#!/usr/bin/env node
+import { mkdirSync, rmdirSync, appendFileSync } from 'node:fs';
+mkdirSync(${JSON.stringify(lock)});
+appendFileSync(${JSON.stringify(calls)}, process.argv.at(-1) + '\\n');
+setTimeout(() => { rmdirSync(${JSON.stringify(lock)}); process.stdout.write(JSON.stringify({items:{}})); }, 100);
+`);
     await chmod(executable, 0o700);
-    Object.assign(process.env, { DCAR_THUMBNAIL_PYTHON: executable, DCAR_THUMBNAIL_HELPER: "unused", DCAR_THUMBNAIL_DB: "unused", DCAR_THUMBNAIL_PROJECT_ROOT: directory });
+    const database = join(directory, "test.sqlite3");
+    await writeFile(database, "test fixture");
+    Object.assign(process.env, { DCAR_THUMBNAIL_PYTHON: executable, DCAR_THUMBNAIL_HELPER: "unused", DCAR_THUMBNAIL_DB: database, DCAR_THUMBNAIL_PROJECT_ROOT: directory });
     const first = readThumbnailMetadata([1]);
-    await assert.rejects(readThumbnailMetadata([2]), /Thumbnail reader unavailable/);
-    assert.deepEqual(await first, { items: {} });
+    const same = readThumbnailMetadata([1]);
+    const second = readThumbnailMetadata([2]);
+    assert.deepEqual(await Promise.all([first, same, second]), [{ items: {} }, { items: {} }, { items: {} }]);
+    assert.deepEqual(await readThumbnailMetadata([1]), { items: {} });
+    assert.deepEqual((await readFile(calls, "utf8")).trim().split("\n"), ["1", "2"]);
     assert.deepEqual(await readThumbnailMetadata([3]), { items: {} });
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a full page of signed fallback covers fits the metadata helper response buffer", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dcar-thumbnail-large-page-"));
+  const previous = Object.fromEntries(["DCAR_THUMBNAIL_PYTHON", "DCAR_THUMBNAIL_HELPER", "DCAR_THUMBNAIL_DB", "DCAR_THUMBNAIL_PROJECT_ROOT"].map((key) => [key, process.env[key]]));
+  try {
+    const ids = Array.from({ length: 100 }, (_, index) => 10_000 + index);
+    const covers = Array.from({ length: 3 }, (_, index) => `https://source${index}.example/cover.webp?sig=` + "a".repeat(3900));
+    const payload = { items: Object.fromEntries(ids.map((id) => [String(id), { remote_url: covers[0], remote_urls: covers, reason: null, local_url: null }])) };
+    const serialized = JSON.stringify(payload);
+    assert.ok(Buffer.byteLength(serialized) > 1024 * 1024, "fixture exceeds the previous one-MiB limit");
+    const executable = join(directory, "reader.mjs");
+    await writeFile(executable, `#!/usr/bin/env node\nimport { readFileSync } from 'node:fs';\nprocess.stdout.write(readFileSync(${JSON.stringify(join(directory, "payload.json"))}));\n`);
+    await chmod(executable, 0o700);
+    await writeFile(join(directory, "payload.json"), serialized);
+    const database = join(directory, "test.sqlite3");
+    await writeFile(database, "test fixture");
+    Object.assign(process.env, { DCAR_THUMBNAIL_PYTHON: executable, DCAR_THUMBNAIL_HELPER: "unused", DCAR_THUMBNAIL_DB: database, DCAR_THUMBNAIL_PROJECT_ROOT: directory });
+    const response = await readThumbnailMetadata(ids);
+    assert.equal(Object.keys(response.items).length, 100);
+    assert.deepEqual(response.items[ids.at(-1)], payload.items[ids.at(-1)]);
   } finally {
     for (const [key, value] of Object.entries(previous)) {
       if (value === undefined) delete process.env[key];

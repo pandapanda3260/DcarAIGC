@@ -4,17 +4,18 @@ import { useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ClockIcon, ShieldCheckIcon } from "@phosphor-icons/react";
 import AppShell from "../components/AppShell";
+import DataFreshnessNote from "../components/DataFreshnessNote";
 import { Loading, ReadErrorState } from "../components/Feedback";
 import { formatDate, formatDateTime } from "../lib/format";
 import { overviewQueryOptions } from "../lib/queries";
-import type { OverviewChannelKey, WindowKey } from "../lib/types";
+import type { WindowKey } from "../lib/types";
 import { OverviewChannelReport } from "./OverviewReport";
+import { overviewChannels } from "./overviewModel";
 import styles from "./OverviewReport.module.css";
 
 const windowLabels: Record<WindowKey, string> = {
   yesterday: "昨天", this_week: "本周", last_week: "上周",
 };
-const channelOrder: OverviewChannelKey[] = ["douyin", "xiaohongshu"];
 
 export default function OverviewPage() {
   const [windowKey, setWindowKey] = useState<WindowKey>("last_week");
@@ -49,9 +50,18 @@ export default function OverviewPage() {
       {overviewQuery.isPending && !overview && !readFailed && <Loading label="正在加载运营数据" />}
       {overview && (
         <section className="page-stack overview-dashboard">
+          {!readFailed && <DataFreshnessNote />}
           <h2 className="visually-hidden">渠道结论</h2>
           <p className="visually-hidden" aria-live="polite">已切换到{windowLabels[windowKey]}，数据已更新</p>
-          {activeWindow && channelOrder.map((key) => <OverviewChannelReport key={`${windowKey}-${key}`} channel={activeWindow.channels[key]} />)}
+          {activeWindow && overviewChannels.map(({ key, label }) => {
+            const channel = activeWindow.channels[key];
+            return channel
+              ? <OverviewChannelReport key={`${windowKey}-${key}`} channel={channel} />
+              : <section key={`${windowKey}-${key}`} className={styles.channel} data-channel={key}>
+                <h2 className={styles.heading}>{label}渠道</h2>
+                <p className={styles.emptyState}>渠道数据暂不可用，请稍后刷新。</p>
+              </section>;
+          })}
           <div className={styles.support}>
             <article className={styles.supportPanel}>
               <div className={styles.supportTitle}><ClockIcon size={19} weight="regular" aria-hidden="true" /><h3>{windowLabels[windowKey]}统计时间范围</h3></div>
@@ -67,7 +77,12 @@ export default function OverviewPage() {
               <div className={styles.supportTitle}><ShieldCheckIcon size={19} weight="regular" aria-hidden="true" /><div><h3>数据质量状态</h3><p>缺日期内容不进入任何日期窗口，重复内容单独记录。</p></div></div>
               <div className={styles.quality}>
                 <div><strong>{overview?.data_quality.missing_published_at ?? "—"}</strong><span>缺失发布日期</span></div>
-                <div><strong>{overview?.data_quality.duplicate_fingerprint_coverage ?? "—"}%</strong><span>重复内容识别完成率</span></div>
+                <div><strong>{overview?.data_quality.duplicate_relation_coverage ?? overview?.data_quality.duplicate_fingerprint_coverage ?? "—"}%</strong><span>重复比对完成率</span></div>
+                {overview?.data_quality.duplicate_relation_coverage != null && <>
+                  <div><strong>{overview.data_quality.duplicate_fingerprint_coverage}%</strong><span>查重准备完成率</span></div>
+                  <div><strong>{overview.data_quality.duplicate_relation_pending ?? 0}</strong><span>查重处理中</span></div>
+                  <div><strong>{overview.data_quality.duplicate_relation_failed ?? 0}</strong><span>查重失败，需重试</span></div>
+                </>}
                 <div><strong>{overview?.data_quality.confirmed_duplicate_count ?? "—"}</strong><span>确认重复内容</span></div>
                 <div><strong>{overview?.data_quality.duplicate_calibration_ready ? "已通过" : "未通过"}</strong><span>重复识别规则校验</span></div>
               </div>

@@ -26,6 +26,7 @@ from zoneinfo import ZoneInfo
 
 from .provider_budget import BudgetBlocked
 from .source_routing import parse_time
+from .runtime_phase_timing import timed
 from .storage import (
     DEFAULT_DB,
     connect,
@@ -430,6 +431,7 @@ def _details_to_receipt(details: Mapping[str, Any]) -> DrainReceipt:
     )
 
 
+@timed("paid_drain.bridge_chain")
 def _validated_chain(connection: sqlite3.Connection) -> list[DrainReceipt]:
     receipts: list[DrainReceipt] = []
     active_drain: str | None = None
@@ -551,6 +553,7 @@ def _uses_profile_drain(connection: sqlite3.Connection) -> bool:
     return int(connection.execute("PRAGMA user_version").fetchone()[0]) >= 19
 
 
+@timed("paid_drain.profile_chain")
 def _validated_profile_chain(
     connection: sqlite3.Connection,
 ) -> list[_ProfileDrainEvent]:
@@ -587,7 +590,7 @@ def _validated_profile_chain(
             or row["previous_event_hash"] != expected_previous_hash
             or row["event_type"] not in _PROFILE_EVENT_SEQUENCE
             or (row["event_type"] == "ABORT_RESTORE" and (
-                bridge_run_id is not None or connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}))
+                bridge_run_id is not None or connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21, 22, 23, 24}))
             or int(row["sequence"]) != _PROFILE_EVENT_SEQUENCE[str(row["event_type"])]
             or _time(str(row["created_at"])) != row["created_at"]
         )
@@ -669,6 +672,7 @@ def _validated_profile_chain(
     return events
 
 
+@timed("paid_drain.profile_dispatch_state")
 def _profile_dispatch_state(
     connection: sqlite3.Connection, *, at: str
 ) -> DrainState:
@@ -689,7 +693,7 @@ def _profile_dispatch_state(
             reason="no acquisition profile is active",
         )
 
-    if last is not None and connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}:
+    if last is not None and connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21, 22, 23, 24}:
         from .profile_control import _abort_source_release, read_cross_profile_abort
 
         try:
@@ -878,6 +882,7 @@ def dispatch_state(
         return DrainState("invalid", reason=str(exc))
 
 
+@timed("paid_drain.require_open")
 def require_paid_dispatch_open(
     connection: sqlite3.Connection,
     *,
@@ -922,7 +927,7 @@ def require_paid_dispatch_open(
             from .profile_control import ProfileControlError
 
             try:
-                if connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}:
+                if connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21, 22, 23, 24}:
                     from .capture_release import validate_current_dispatch_control
                     from .capture_authorizations import AuthorizationError
                     try:
@@ -1225,7 +1230,7 @@ def start_profile_drain_in_transaction(
         return matches[0]
     if events and events[-1].event_type not in {"release", "ABORT_RESTORE"}:
         raise PaidDrainError("another paid drain is already active")
-    if events and connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}:
+    if events and connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21, 22, 23, 24}:
         from .profile_control import read_cross_profile_abort
 
         if read_cross_profile_abort(connection, events[-1].drain_id) is not None and events[-1].event_type != "ABORT_RESTORE":

@@ -270,6 +270,34 @@ test("SSR omits the removed metrics even when legacy payloads still contain thei
   }
 });
 
+for (const [platform, label] of [["kuaishou", "快手"], ["wechat_channels", "视频号"]]) {
+  test(`${platform} renders its own identity, metrics, scenes and selling-point details`, () => {
+    const value = { ...channel(), platform, label, selling_points: [point("P1", 10, 100)] };
+    const html = renderChannel(value);
+    assert.ok(html.includes(`<h2>${label}渠道</h2>`));
+    assert.ok(html.includes(platform === "kuaishou" ? "/brand-kuaishou-official.png" : "/brand-wechat-channels-official.png"));
+    assert.doesNotMatch(html, /brand-xiaohongshu|小红书接口未提供/);
+    assert.match(html, /100<\/strong> 条发布/);
+    assert.match(card(html, "卖点曝光占比"), /70\.0/);
+    for (const scene of ["二手车", "新车", "媒体-AI小懂"]) assert.ok(html.includes(`<h4>${scene}</h4>`));
+    assert.ok(html.includes(`id="overview-selling-points-${platform}"`));
+    assert.match(tableBody(html), />P1<\/span>/);
+  });
+
+  test(`${platform} keeps absent exposure unavailable while preserving publication data`, () => {
+    const value = { ...channel(), platform, label, valid_exposure_items: 0, exposure_coverage_percentage: null };
+    for (const group of [value.summary, ...Object.values(value.scenes)]) {
+      for (const key of ["selling_point_exposure_share", "core_selling_point_exposure_share"]) {
+        group.metrics[key] = ratio(null, 0, "not_calculable", { reason: "没有 view_count > 0 的内容" });
+      }
+    }
+    const html = renderChannel(value);
+    assert.match(card(html, "卖点曝光占比"), /class="metricValue">—<\/strong>/);
+    assert.match(html, /100<\/strong> 条发布/);
+    assert.doesNotMatch(html, /小红书接口未提供|NaN|Infinity/);
+  });
+}
+
 test("SSR calls the remaining content group 其余内容 and does not claim it is all 无卖点", () => {
   const html = renderChannel(channel());
   assert.match(html, /核心卖点 30 条，其他卖点 40 条，其余内容 30 条/);

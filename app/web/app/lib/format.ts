@@ -4,7 +4,7 @@ export const platformKeys = ["douyin", "xiaohongshu", "wechat_channels", "kuaish
 
 const enumLabels: Record<string, string> = {
   douyin: "抖音", xiaohongshu: "小红书", wechat_channels: "视频号", kuaishou: "快手",
-  boutique_ip: "精品 IP", original: "原创", mixed_edit: "混剪", unknown: "未知",
+  unknown: "未知",
   new_car: "新车", used_car: "二手车", media: "媒体", other: "其他",
   content_explicit: "内容中直接提到", rule_prior: "系统按规则判断", llm: "系统智能判断", series: "车系", trim: "款型",
   yes: "是", no: "否", succeeded: "已完成", partial: "部分完成", failed: "失败",

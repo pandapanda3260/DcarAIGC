@@ -122,6 +122,21 @@ class AccountDirectoryTest(unittest.TestCase):
             admit_directory_account(self.db, account_id=8, member={"platform": "douyin", "uid": "999999999"},
                                     account_status="daily", request_id="invalid", at=STAMP)
 
+    def test_imported_fields_have_separate_provenance_and_readable_pending_reasons(self):
+        self.install()
+        raw = {"account_summary": {"fields": {"手机号开卡人姓名": "开卡人", "使用人证件号码": "001234567890123456", "持卡人": "持卡人", "粉丝": "约38000"},
+               "pending_fields": {"账号名称": "名称待核实，沿用已确认值"}, "comment": "原始批注", "source_row": 22}}
+        self.db.execute("UPDATE account_directory_rows SET raw_json=? WHERE account_id=7", (json.dumps(raw),))
+        def read_model(connection, account, **kwargs):
+            return {**dict(account), "platforms": [{"nickname": "旧", "follower_count": 20}]}
+        with patch("v8.operations.account_read_model", side_effect=read_model):
+            item = directory_account_items(self.db, roster={}, update_frequencies={}, admission_members={})[0]
+        self.assertEqual(item["account_summary"]["fields"]["粉丝"], "约38000")
+        self.assertEqual(item["platforms"][0]["follower_count"], 20)
+        self.assertEqual(item["account_summary"]["pending_fields"], ["账号名称"])
+        self.assertIn("名称待核实，沿用已确认值", item["account_summary"]["comment"])
+        self.assertEqual(item["account_summary"]["source_row"], 22)
+
 
 if __name__ == "__main__":
     unittest.main()

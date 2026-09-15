@@ -316,6 +316,19 @@ def _current_source_state(
     return inputs, _sha256_json(inputs["source"])
 
 
+
+def _schema24(connection: sqlite3.Connection) -> bool:
+    return int(connection.execute("PRAGMA user_version").fetchone()[0]) >= 24
+
+
+def _source_database_identity(connection: sqlite3.Connection, content_id: int) -> tuple:
+    """Cheap commit fence for source rows; never opens a media/manifest file."""
+    content = connection.execute("SELECT title,body,content_type FROM content_items WHERE id=?", (content_id,)).fetchone()
+    artifacts = connection.execute("SELECT id,artifact_type,local_path,status,sha256,metadata_json FROM evidence_artifacts "
+        "WHERE content_id=? AND artifact_type IN ('media_source','media','media_manifest','media_lifecycle_manifest',"
+        "'asr','transcript','media_transcript','ocr','media_ocr') ORDER BY id", (content_id,)).fetchall()
+    return (tuple(content) if content else None, tuple(tuple(row) for row in artifacts))
+
 def fingerprint_content(content_id: int, *, db_path: Path = DEFAULT_DB) -> Dict[str, Any]:
     with ExitStack() as leases:
         return _fingerprint_content(content_id, db_path=db_path, leases=leases)
@@ -327,7 +340,28 @@ def _fingerprint_content(
     if package_version("ImageHash") != "4.3.2" or package_version("Pillow") != "12.3.0":
         raise DuplicateDetectionError("duplicate processor dependency version mismatch")
     with connect(db_path) as connection:
+        is_v24 = _schema24(connection)
+        before_identity = _source_database_identity(connection, content_id) if is_v24 else None
         inputs, source_sha256 = _current_source_state(connection, content_id)
+        if is_v24 and before_identity != _source_database_identity(connection, content_id):
+            raise DuplicateDetectionError("fingerprint source changed during preparation")
+        generation = None
+        input_revision = None
+        if is_v24:
+            from .duplicate_index import active_generation
+            generation = active_generation(connection)
+            if generation is None:
+                raise DuplicateDetectionError("duplicate generation is not ready")
+            pointer = connection.execute("SELECT input_revision FROM duplicate_current_fingerprints WHERE generation_id=? AND content_id=?",
+                (generation["generation_id"], content_id)).fetchone()
+            input_revision = int(pointer[0]) if pointer else 0
+            cached = connection.execute("SELECT f.payload_json FROM duplicate_current_fingerprints p JOIN duplicate_fingerprints f ON f.id=p.fingerprint_id "
+                "WHERE p.generation_id=? AND p.content_id=? AND p.source_sha256=? AND p.input_status='available'",
+                (generation["generation_id"], content_id, source_sha256)).fetchone()
+            if cached is not None:
+                value = json.loads(cached[0])
+                if value.get("source_sha256") == source_sha256:
+                    return value
     content = inputs["content"]
     output_root = _fingerprint_root_for_database(db_path)
     # A source change must not replace bytes referenced by an older slot or
@@ -363,7 +397,10 @@ def _fingerprint_content(
             ))
 
     def validate_source(connection: sqlite3.Connection) -> None:
-        if _current_source_state(connection, content_id)[1] != source_sha256:
+        if is_v24:
+            if _source_database_identity(connection, content_id) != before_identity:
+                raise DuplicateDetectionError("fingerprint source identity changed")
+        elif _current_source_state(connection, content_id)[1] != source_sha256:
             raise DuplicateDetectionError("fingerprint source identity changed")
 
     def produce() -> Path:
@@ -425,7 +462,7 @@ def _fingerprint_content(
     if payload.get("source_sha256") != source_sha256:
         raise DuplicateDetectionError("cached duplicate fingerprint has stale source")
     with connect(db_path) as connection, transaction(connection):
-        if bundle is not None:
+        if bundle is not None or is_v24:
             validate_source(connection)
         connection.execute(
             """
@@ -448,6 +485,12 @@ def _fingerprint_content(
                 artifact.id, _canonical_json(payload), str(payload.get("created_at") or now_utc()),
             ),
         )
+        if is_v24:
+            from .duplicate_index import index_fingerprint
+            fingerprint_id = connection.execute("SELECT id FROM duplicate_fingerprints WHERE content_id=? AND fingerprint_version=? AND source_sha256=?",
+                (content_id, FINGERPRINT_VERSION, source_sha256)).fetchone()[0]
+            index_fingerprint(connection, content_id=content_id, fingerprint_id=int(fingerprint_id),
+                source_sha256=source_sha256, generation_id=generation["generation_id"], expected_input_revision=input_revision)
     return payload
 
 
@@ -463,59 +506,14 @@ def _phash_distance(left: Sequence[str], right: Sequence[str]) -> tuple[Optional
 
 
 def compare_fingerprints(left: Mapping[str, Any], right: Mapping[str, Any]) -> Dict[str, Any]:
-    left_media = set(json.loads(str(left["media_sha256_json"])))
-    right_media = set(json.loads(str(right["media_sha256_json"])))
-    left_phash = list(json.loads(str(left["frame_phashes_json"])))
-    right_phash = list(json.loads(str(right["frame_phashes_json"])))
-    phash_distance, phash_match_count = _phash_distance(left_phash, right_phash)
-    similarities = {
-        "text": _simhash_similarity(left.get("text_simhash"), right.get("text_simhash")),
-        "asr": _simhash_similarity(left.get("asr_simhash"), right.get("asr_simhash")),
-        "ocr": _simhash_similarity(left.get("ocr_simhash"), right.get("ocr_simhash")),
-    }
-    semantic_values = [value for value in similarities.values() if value is not None]
-    semantic_max = max(semantic_values, default=0.0)
-    exact_media = bool(left_media & right_media)
-    exact_text = bool(left.get("text_sha256") and left.get("text_sha256") == right.get("text_sha256"))
-    diverse_visual = len(set(left_phash)) >= 2 and len(set(right_phash)) >= 2
-    strong_visual = bool(
-        phash_distance is not None
-        and phash_match_count >= 3
-        and diverse_visual
-        and phash_distance <= THRESHOLDS["phash_strong_distance"]
-    )
-    visual_semantic = bool(
-        phash_distance is not None
-        and phash_match_count >= 2
-        and phash_distance <= THRESHOLDS["phash_confirm_distance"]
-        and semantic_max >= THRESHOLDS["visual_semantic_min"]
-    )
-    reasons = [
-        name
-        for name, matched in (
-            ("media_sha256", exact_media), ("text_sha256", exact_text),
-            ("phash_strong", strong_visual), ("phash_plus_semantic", visual_semantic),
-        )
-        if matched
-    ]
-    confirmed = bool(reasons)
-    confidence = 1.0 if exact_media or exact_text else max(
-        1.0 - (phash_distance or 64.0) / 64.0 if phash_distance is not None else 0.0,
-        semantic_max,
-    )
-    return {
-        "confirmed": confirmed,
-        "confidence": round(confidence, 6),
-        "reasons": reasons,
-        "exact_media": exact_media,
-        "exact_text": exact_text,
-        "phash_distance": phash_distance,
-        "phash_match_count": phash_match_count,
-        "similarities": similarities,
-    }
+    from .duplicate_index import compare_prepared, prepare_fingerprint
+    return compare_prepared(prepare_fingerprint(left), prepare_fingerprint(right))
 
 
 def _current_fingerprints(connection: sqlite3.Connection) -> List[Dict[str, Any]]:
+    if _schema24(connection):
+        from .duplicate_index import read_current_fingerprints
+        return list(read_current_fingerprints(connection).values())
     rows = connection.execute(
         """
         SELECT df.*, c.link_id, c.published_at, c.imported_at
@@ -627,6 +625,9 @@ def calibrate(
 
 
 def rebuild_duplicate_relations(*, db_path: Path = DEFAULT_DB) -> Dict[str, Any]:
+    with connect(db_path) as connection:
+        if _schema24(connection):
+            raise DuplicateDetectionError("schema24 full rebuild requires the offline generation builder")
     if is_formal_database_path(db_path, formal_database=DEFAULT_DB):
         raise DuplicateDetectionError(
             "full duplicate relation rebuild is forbidden on the formal database"
@@ -715,6 +716,12 @@ def update_duplicate_relations_incremental(
     content_ids: Sequence[int], *, db_path: Path = DEFAULT_DB
 ) -> Dict[str, Any]:
     """Recompute only relation clusters affected by current fingerprints."""
+
+    with connect(db_path) as connection:
+        is_v24 = _schema24(connection)
+    if is_v24:
+        from .duplicate_runtime import drain_duplicate_work
+        return drain_duplicate_work(db_path=db_path, scope_content_ids=content_ids)
 
     started = time.perf_counter()
     seed_ids = sorted({int(content_id) for content_id in content_ids})
@@ -1015,6 +1022,12 @@ def update_duplicate_relations_incremental(
 def refresh_content_duplicates(
     content_id: int, *, db_path: Path = DEFAULT_DB
 ) -> Dict[str, Any]:
+    with connect(db_path) as connection:
+        is_v24 = _schema24(connection)
+    if is_v24:
+        result = run_duplicate_fingerprint_queue(limit=1, db_path=db_path, scope_content_ids=[content_id])
+        item = next((row for row in result.get("results", []) if row["content_id"] == content_id), {})
+        return {**result, **item, "content_id": content_id}
     fingerprint = fingerprint_content(content_id, db_path=db_path)
     relations = (
         update_duplicate_relations_incremental((content_id,), db_path=db_path)
@@ -1077,6 +1090,9 @@ def _pending_content_ids(
                     (FINGERPRINT_VERSION, *chunk),
                 ).fetchall()
             ]
+        if _schema24(connection):
+            fingerprint_rows = connection.execute("SELECT p.content_id,p.source_sha256 FROM duplicate_current_fingerprints p "
+                "JOIN duplicate_index_generations g ON g.generation_id=p.generation_id WHERE g.state='ready' AND p.input_status='available'").fetchall()
         completed = {
             (int(row["content_id"]), str(row["source_sha256"]))
             for row in fingerprint_rows
@@ -1112,6 +1128,7 @@ def run_duplicate_fingerprint_queue(
     limit: Optional[int] = 200,
     db_path: Path = DEFAULT_DB,
     scope_content_ids: Optional[Sequence[int]] = None,
+    process_relations: bool = True,
 ) -> Dict[str, Any]:
     content_ids = _pending_content_ids(
         limit=limit, db_path=db_path, scope_content_ids=scope_content_ids
@@ -1139,7 +1156,17 @@ def run_duplicate_fingerprint_queue(
     )
     ready = calibration_ready(db_path=db_path)
     relations: Optional[Dict[str, Any]] = None
-    if fingerprinted_ids and ready:
+    with connect(db_path) as connection:
+        is_v24 = _schema24(connection)
+    if is_v24:
+        from .duplicate_runtime import drain_duplicate_work
+        drain = drain_duplicate_work(db_path=db_path, limit=20 if process_relations else 0,
+            scope_content_ids=scope_content_ids)
+        return {**drain, "candidates": len(content_ids), "processed": processed,
+            "failed": len(failures) + drain["failed"], "failures": failures + drain["failures"],
+            "fingerprinted_content_ids": fingerprinted_ids,
+            "has_more": has_more or drain["has_more"], "truncated": has_more or drain["has_more"]}
+    if process_relations and fingerprinted_ids and ready:
         relations = update_duplicate_relations_incremental(
             fingerprinted_ids, db_path=db_path
         )

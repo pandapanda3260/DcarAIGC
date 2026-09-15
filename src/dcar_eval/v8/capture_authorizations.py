@@ -9,6 +9,8 @@ fault and transport-manifest checks at the existing paid boundary remain require
 """
 from __future__ import annotations
 
+from .runtime_phase_timing import measured, timed
+
 import hashlib
 import json
 import sqlite3
@@ -45,6 +47,7 @@ def runtime_authority(verifier: Callable[[sqlite3.Connection, str, str], Mapping
         _RUNTIME_VERIFIER.reset(token)
 
 
+@timed('authorization.runtime_bindings')
 def current_runtime_bindings(connection: sqlite3.Connection, operation: str, at: str) -> Mapping[str, Any]:
     verifier = _RUNTIME_VERIFIER.get()
     if verifier is None:
@@ -57,6 +60,7 @@ class AuthorizationError(provider_budget.PaidScopeBlocked):
         super().__init__("capture_authorization_blocked", message)
 
 
+@timed('json.authorization_encode')
 def canonical(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
@@ -70,6 +74,7 @@ def _require(value: bool, message: str) -> None:
         raise AuthorizationError(message)
 
 
+@timed('json.authorization_decode')
 def _payload(value: str) -> dict[str, Any]:
     try:
         result = json.loads(value)
@@ -136,6 +141,7 @@ def _validate_continuity_request(connection: sqlite3.Connection, *, bindings: Ma
     _require(started < 20, "Fixed continuity start cap is exhausted")
 
 
+@timed('authorization.validate')
 def validate_authorization(
     connection: sqlite3.Connection, *, runtime_bindings: Mapping[str, Any],
     operation: str, request_identity: str, at: str,
@@ -152,7 +158,7 @@ def validate_authorization(
     """
     _require(connection.in_transaction, "Authorization requires a writer transaction")
     require_current_process_writer_lock(connection)
-    _require(connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}, "Authorization requires schema20")
+    _require(connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21, 22, 23, 24}, "Authorization requires schema20")
     at = usage_settlements._utc(at)
     _require_binding(connection, runtime_bindings, at=at)
     _require(provider == "tikhub" and operation in provider_budget.PRICES_MICROUSD,
@@ -211,7 +217,7 @@ def validate_authorization(
     elif evidence["qualification"] == "operator_authorized":
         _require(gate["state"] == "open" and readiness["status"] == "ready", "Operator production release is not open")
         from .capture_operator_release import validate_request
-        validate_request(connection, runtime_bindings=runtime_bindings, operation=operation, at=at,
+        measured("authorization.operator_request", validate_request, connection, runtime_bindings=runtime_bindings, operation=operation, at=at,
                          readiness_evidence=evidence, gate_payload=payload)
     else:
         _require(gate["state"] == "open" and readiness["status"] == "ready", "Ordinary qualification is not open")
@@ -238,7 +244,7 @@ def validate_authorization(
                  and details.get("paid_scope_identity") == request_identity
                  and str(details.get("budget_day")) == provider_budget.budget_day(at),
                  "Budget exclusion does not identify this current reserved/sent request")
-    summary = provider_budget.budget_summary(connection, at=at, exclude_usage_id=exclude_usage_id)
+    summary = measured("authorization.budget_summary", provider_budget.budget_summary, connection, at=at, exclude_usage_id=exclude_usage_id)
     budget = payload.get("budget", {})
     _require(isinstance(budget, dict), "Authorization budget is missing")
     bucket, budget_blocker = provider_budget.assess_budget_capacity(

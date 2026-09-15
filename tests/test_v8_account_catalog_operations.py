@@ -71,7 +71,8 @@ class AccountCatalogOperationsTest(unittest.TestCase):
         counts = [self.count(table) for table in ("account_roster_snapshots", "account_roster_members", "acquisition_profile_activations")]
         result = self.status("daily")
         self.assertEqual(result["account_status"], "daily")
-        self.assertEqual(result["activation_status"], "pending_verification")
+        self.assertEqual(result["activation_status"], "catalog_managed")
+        self.assertEqual(result["automatic_capture"]["reason_code"], "reference_missing")
         self.assertNotIn("roster_change", result)
         self.assertIn("无需另行加入名单", result["message"])
         self.assertEqual(self.connection.execute("SELECT account_status FROM account_directory_rows WHERE account_id=?", (self.account_id,)).fetchone()[0], "daily")
@@ -81,19 +82,30 @@ class AccountCatalogOperationsTest(unittest.TestCase):
         self.assertEqual([self.count(table) for table in ("account_roster_snapshots", "account_roster_members", "acquisition_profile_activations")], counts)
         self.schedule.assert_not_called()
 
-    def test_pause_and_resume_update_directory_atomically(self):
+    def test_pause_and_resume_only_update_manual_label(self):
+        before = self.connection.execute("SELECT enabled FROM accounts WHERE id=?", (self.account_id,)).fetchone()[0]
+        events = self.count("account_state_events")
         self.status("daily")
         result = self.status("paused")
-        self.assertEqual(result["automatic_capture"]["reason_code"], "account_paused")
-        self.assertIn("历史内容和数据保留", result["message"])
-        self.assertFalse(self.connection.execute("SELECT enabled FROM accounts WHERE id=?", (self.account_id,)).fetchone()[0])
+        self.assertEqual(result["account_status"], "paused")
+        self.assertEqual(result["automatic_capture"]["reason_code"], "reference_missing")
+        self.assertIn("当前所有状态均参与自动采集", result["message"])
+        self.assertEqual(self.connection.execute("SELECT enabled FROM accounts WHERE id=?", (self.account_id,)).fetchone()[0], before)
+        self.assertEqual(self.count("account_state_events"), events)
         self.assertEqual(self.status("weekly")["account_status"], "weekly")
 
-    def test_unverified_identity_remains_label_only(self):
+    def test_unverified_identity_label_edit_preserves_projection_and_reports_missing_proof(self):
+        values = {"account_status": "daily", "status_request_id": str(uuid4())}
         with transaction(self.connection):
-            result = update_directory_only_status_in_transaction(self.connection, self.unverified_id,
-                {"account_status": "daily", "status_request_id": str(uuid4())}, actor="test", reason="label")
+            self.assertIsNone(update_directory_only_status_in_transaction(self.connection, self.unverified_id,
+                values, actor="test", reason="label"))
+            result = update_account_operating_status_in_transaction(self.connection, self.unverified_id, values,
+                raw_root=self.root / "raw", actor="test", reason="label", schedule_activation=self.schedule)
         self.assertFalse(result["enabled"])
+        self.assertFalse(result["automatic_capture"]["eligible"])
+        self.assertEqual(result["automatic_capture"]["reason_code"], "reference_missing")
+        self.assertEqual(result["account_status"], "daily")
+        self.assertFalse(self.connection.execute("SELECT enabled FROM accounts WHERE id=?", (self.unverified_id,)).fetchone()[0])
         self.assertEqual(self.connection.execute("SELECT identity_status FROM account_directory_rows WHERE account_id=?", (self.unverified_id,)).fetchone()[0], "uid_unverified")
         with transaction(self.connection):
             self.assertIsNone(update_directory_only_status_in_transaction(self.connection, self.account_id,
@@ -164,13 +176,53 @@ class AccountCatalogOperationsTest(unittest.TestCase):
         self.assertEqual(replay["account_status"], "daily")
         self.assertEqual(replay["current_account_status"], "daily")
         self.assertFalse(replay["current_enabled"])
-        self.assertEqual(replay["activation_status"], "pending_verification")
+        self.assertEqual(replay["activation_status"], "catalog_managed")
+        self.assertTrue(replay["automatic_capture"]["eligible"])
 
-    def test_new_paused_account_keeps_verified_admission_but_is_not_selected(self):
+    def test_new_paused_account_is_selected_and_materializes_locator(self):
         result = self.create(status="paused")
-        member = next(row for row in derive_capture_eligibility(self.connection)["excluded_members"] if row["account_id"] == result["account_id"])
-        self.assertEqual(member["reason_code"], "account_paused")
+        member = next(row for row in derive_capture_eligibility(self.connection)["eligible_members"] if row["account_id"] == result["account_id"])
+        self.assertEqual(member["reason_code"], "eligible")
+        self.assertEqual(member["account_status"], "paused")
+        self.assertEqual(self.count("account_provider_references"), 1)
         self.assertEqual(self.count("account_roster_snapshots"), 0)
+
+    def test_legacy_paused_creation_replay_replaces_stop_message_without_changing_receipt(self):
+        from v8.account_creation import replay_account_creation
+        from v8.account_directory import admit_directory_account
+        from v8.account_operating_receipts import find_status_request
+        self.policy.return_value = None
+        result = self.create(status="paused")
+        request_id = result["request_id"]
+        frozen = find_status_request(self.connection, request_id=request_id)
+        admission = frozen["payload"]["request"]["admission"]
+        self.assertIn("不会采集", frozen["payload"]["result"]["message"])
+        # The historical API added the directory entry around account creation.
+        with transaction(self.connection):
+            admit_directory_account(self.connection, account_id=result["account_id"],
+                member=admission["member"], account_status="paused", request_id=request_id,
+                at="2026-09-11T10:00:00Z")
+        self.policy.return_value = {"catalog": "verified-test-policy"}
+        before = self.connection.total_changes
+        replay = replay_account_creation(self.connection, request_id=request_id, request_context=admission["input"])
+        self.assertEqual(replay["account_status"], "paused")
+        self.assertEqual(replay["activation_status"], "catalog_managed")
+        self.assertTrue(replay["automatic_capture"]["eligible"])
+        self.assertIn("当前采集状态：可自动采集", replay["message"])
+        self.assertNotIn("不会采集", replay["message"])
+        self.assertEqual(find_status_request(self.connection, request_id=request_id), frozen)
+        self.assertEqual(self.connection.total_changes, before)
+
+        # A later manual label is still reported as a later edit on replay.
+        self.connection.execute("UPDATE account_directory_rows SET account_status='weekly' WHERE account_id=?", (result["account_id"],))
+        self.connection.commit()
+        before = self.connection.total_changes
+        replay = replay_account_creation(self.connection, request_id=request_id, request_context=admission["input"])
+        self.assertEqual(replay["account_status"], "weekly")
+        self.assertIn("没有覆盖后续修改", replay["message"])
+        self.assertIn("当前采集状态：可自动采集", replay["message"])
+        self.assertEqual(find_status_request(self.connection, request_id=request_id), frozen)
+        self.assertEqual(self.connection.total_changes, before)
 
     def test_receipt_failure_rolls_back_directory_and_new_identity(self):
         tables = ("accounts", "account_platform_identities", "account_directory_rows", "scheduler_runs")
@@ -218,10 +270,8 @@ class AccountCatalogOperationsTest(unittest.TestCase):
             annotate_accounts(self.connection, [current])
             self.assertTrue(current["automatic_capture"]["eligible"])
             for field, replacement, reason in (
-                ("directory_identity_status", "uid_unverified", "identity_unverified"),
                 ("directory_uid", "777777777", "identity_conflict"),
-                ("id", 999, "pending_verification"),
-                ("account_status", "paused", "account_paused"),
+                ("id", 999, "capture_plan_pending"),
             ):
                 with self.subTest(field=field):
                     current = account()
@@ -232,13 +282,60 @@ class AccountCatalogOperationsTest(unittest.TestCase):
             current = account()
             current["directory_uid"] = current["platforms"][0]["uid"] = "777777777"
             annotate_accounts(self.connection, [current])
-            self.assertEqual(current["automatic_capture"]["reason_code"], "pending_verification")
+            self.assertEqual(current["automatic_capture"]["reason_code"], "capture_plan_pending")
+            for field, replacement in (("account_status", "weekly"), ("account_status", "paused"), ("account_status", "unmarked"), ("directory_identity_status", "uid_unverified")):
+                current = account()
+                current[field] = replacement
+                annotate_accounts(self.connection, [current])
+                self.assertTrue(current["automatic_capture"]["eligible"])
+
+    def test_replica_never_reads_raw_files_and_old_verification_labels_are_removed(self):
+        from v8.account_catalog_capture import annotate_accounts
+        current = {"id": self.account_id, "directory_row_id": self.directory_id, "account_status": "weekly",
+            "directory_identity_status": "uid_unverified", "directory_platform": "douyin", "directory_uid": "123456789",
+            "platforms": [{"id": self.identity_id, "platform": "douyin", "uid": "123456789"}]}
+        published = {self.directory_id: {"account_id": self.account_id, "identity_id": self.identity_id,
+            "account_status": "daily", "platform": "douyin", "uid": "123456789",
+            "eligible": False, "reason_code": "identity_unverified", "reason_label": "平台身份待核验"}}
+        with patch("v8.account_catalog_capture.public_statuses", return_value=published), \
+                patch("v8.account_capture_eligibility.derive_capture_eligibility", side_effect=AssertionError("replica must not read raw files")):
+            annotate_accounts(self.connection, [current])
+        self.assertEqual(current["automatic_capture"]["reason_code"], "identity_evidence_missing")
+        self.assertNotIn("待核验", current["automatic_capture"]["reason_label"])
+
+    def test_local_search_uses_current_evidence_without_changing_database(self):
+        from v8.api import AccountSearchRequest, _account_search
+        self.status("daily")
+        # Read-only replicas inspect a sealed DB file, not this fixture's WAL.
+        self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        with patch("v8.api.active_release", return_value={}), \
+                patch("v8.account_catalog_capture.public_statuses", side_effect=AssertionError("local check must use current evidence")):
+            result = _account_search(AccountSearchRequest(query="现有账号"), db_path=self.db,
+                read_only=True, live_capture_status=True)
+        self.assertEqual(result["items"][0]["automatic_capture"]["reason_code"], "reference_missing")
 
     def test_legacy_search_without_published_catalog_keeps_existing_model(self):
         from v8.account_catalog_capture import annotate_accounts
         current = {"directory_row_id": self.directory_id, "account_status": "daily"}
         annotate_accounts(self.connection, [current])
         self.assertNotIn("automatic_capture", current)
+
+    def test_local_preview_sees_committed_wal_while_replica_stays_sealed(self):
+        import hashlib
+        from v8.api import AccountSearchRequest, _account_search
+        self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        self.create(uid="223456789")
+        wal = Path(str(self.db) + "-wal")
+        self.assertGreater(wal.stat().st_size, 0)
+        before = (hashlib.sha256(self.db.read_bytes()).hexdigest(), hashlib.sha256(wal.read_bytes()).hexdigest())
+        with patch("v8.api.active_release", return_value={}):
+            sealed = _account_search(AccountSearchRequest(query="223456789"), db_path=self.db, read_only=True)
+            live = _account_search(AccountSearchRequest(query="223456789"), db_path=self.db,
+                read_only=True, live_capture_status=True)
+        self.assertEqual(sealed["total"], 0)
+        self.assertEqual(live["total"], 1)
+        self.assertTrue(live["items"][0]["automatic_capture"]["eligible"])
+        self.assertEqual((hashlib.sha256(self.db.read_bytes()).hexdigest(), hashlib.sha256(wal.read_bytes()).hexdigest()), before)
 
 
 if __name__ == "__main__":

@@ -124,6 +124,10 @@ services:
       - -m
       - uvicorn
       - dcar_douyin_control.app:app
+      - --http
+      - h11
+      - --h11-max-incomplete-event-size
+      - "65536"
       - --app-dir
       - /app/src/dcar_eval
       - --host

@@ -23,6 +23,16 @@ case "$scheduler_start_paused" in
   *) fail "DCAR_SCHEDULER_START_PAUSED must be 0 or 1" ;;
 esac
 
+writer_entry="${DCAR_WRITER_ENTRY:-service}"
+case "$writer_entry" in
+  service) ;;
+  repair)
+    [[ "${DCAR_WRITER_REPAIR_PLAN:-}" = /* && -n "${DCAR_WRITER_REPAIR_PLAN_SHA256:-}" ]] || \
+      fail "repair entry requires an absolute frozen plan and its digest"
+    ;;
+  *) fail "DCAR_WRITER_ENTRY must be service or repair" ;;
+esac
+
 [[ "${DCAR_WORKER_HOST:-}" == "127.0.0.1" ]] || \
   fail "worker host must be 127.0.0.1"
 [[ "${DCAR_WORKER_PORT:-}" == "8766" ]] || \
@@ -298,6 +308,12 @@ else
   export DCAR_STARTUP_CATCHUP_ENABLED=1
 fi
 export DCAR_DAILY_CAPTURE_RECONCILE_FROM="$reconcile_from"
+
+if [[ "$writer_entry" == "repair" ]]; then
+  # All installed-source, plist, receipt and database checks above are shared.
+  # The selected module is part of the sealed source; no caller-supplied code.
+  exec /usr/bin/caffeinate -s "$python_bin" -m v8.capture_repair
+fi
 
 if [[ "$scheduler_start_paused" == "1" ]]; then
   echo "Dcar writer worker starting on 127.0.0.1:8766; scheduler=paused catchup=disabled"

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
+from .duplicate_readiness import valid_relation_sql, indexed_duplicates, relation_states
 from .account_operating_status import account_operating_status
 from .account_operating_receipts import load_admission_members, load_update_frequencies
 from .account_classification import classification_for_account, classification_sql
@@ -31,13 +32,18 @@ from .evaluation_selectors import (
 from .migration import generate_link_id, normalize_timestamp
 from .metric_observations import merge_metric_snapshots
 from .report_export import build_accounts_workbook, formula_safe_csv_value
-from .source_routing import select_content_metrics
+from .source_routing import (
+    LEGACY_POLICY_VERSION, select_content_metrics, select_current_content_metrics,
+)
 from .storage import DEFAULT_DB, connect, now_utc, transaction, write_lock
 
 
 PLATFORMS = {"douyin", "xiaohongshu", "wechat_channels", "kuaishou"}
-ACCOUNT_TYPES = {"boutique_ip", "original", "mixed_edit", "unknown"}
 DIRECTIONS = {"new_car", "used_car", "media", "other", "unknown"}
+OBSOLETE_ACCOUNT_CLASSIFICATION_FIELDS = frozenset({
+    "account_type", "legacy_account_type", "account_content_direction",
+    "directory_quality_label", "directory_business_label",
+})
 REAL_NAME_STATUSES = {"yes", "no", "unknown"}
 # 账号平台身份 + 关联内容量：账号页表格（api._account_search）与账号表格导出
 # （export_accounts_xlsx）共用的取数口径，改一处两边同时生效。
@@ -175,38 +181,16 @@ def normalize_url(value: Any) -> str:
     return urlunsplit(("https", f"{host}{port}", path, "", ""))
 
 
-def content_identity(
-    platform: str, url: str, explicit_id: Any = None
-) -> Dict[str, Any]:
-    if platform not in PLATFORMS:
-        raise OperationError(f"不支持的平台：{platform}")
-    canonical = normalize_url(url)
-    content_id = str(explicit_id or "").strip()
-    if platform == "douyin":
-        match = DOUYIN_ID_RE.search(str(url))
-        content_id = content_id or (match.group(1) if match else "")
-        if not re.fullmatch(r"\d{6,24}", content_id):
-            raise OperationError("抖音链接必须能解析出数字作品 ID，短链需先展开")
-    elif platform == "xiaohongshu":
-        match = XHS_ID_RE.search(str(url))
-        content_id = (content_id or (match.group(1) if match else "")).lower()
-        if not re.fullmatch(r"[0-9a-f]{24}", content_id):
-            raise OperationError("小红书链接必须能解析出 24 位笔记 ID，短链需先展开")
-    elif content_id and len(content_id) > 128:
-        raise OperationError("平台内容 ID 不能超过 128 个字符")
-    normalized_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    key = (
-        f"{platform}:{content_id}"
-        if content_id
-        else f"{platform}:url:{normalized_hash}"
-    )
-    return {
-        "platform": platform,
-        "platform_content_id": content_id or None,
-        "canonical_url": canonical,
-        "normalized_url_hash": normalized_hash,
-        "identity_key": key,
-    }
+def content_identity(platform: str, url: str, explicit_id: Any = None, *, allow_missing_url: bool = False,
+                     verified_provider_alias: bool = False, connection: sqlite3.Connection | None = None) -> Dict[str, Any]:
+    from .content_identity import parse, ContentIdentityError
+    try:
+        return parse(platform, url, explicit_id, allow_missing_url=allow_missing_url,
+                     verified_provider_alias=verified_provider_alias, connection=connection)
+    except ContentIdentityError as error:
+        failure = OperationError(str(error))
+        failure.code = error.code
+        raise failure from error
 
 
 def _enum(value: Any, allowed: set[str], field: str, default: str = "unknown") -> str:
@@ -214,6 +198,12 @@ def _enum(value: Any, allowed: set[str], field: str, default: str = "unknown") -
     if normalized not in allowed:
         raise OperationError(f"{field} 的值无效：{normalized}")
     return normalized
+
+
+def reject_obsolete_account_classification(value: Mapping[str, Any], *, account: bool) -> None:
+    obsolete = OBSOLETE_ACCOUNT_CLASSIFICATION_FIELDS | ({"content_direction"} if account else set())
+    if obsolete.intersection(value):
+        raise OperationError("账号分类已更新，请使用账号分组和业务方向。")
 
 
 def _identity_rows(value: Mapping[str, Any]) -> List[Dict[str, str]]:
@@ -303,6 +293,7 @@ def _save_account(
     """Internal stable-identity upsert; a phone is never an ownership key."""
 
     supplied = dict(value)
+    reject_obsolete_account_classification(supplied, account=True)
     if target_account_id is None and supplied.get("id") is not None:
         target_account_id = int(supplied["id"])
     identities = _identity_rows(supplied)
@@ -542,6 +533,42 @@ def update_account_in_transaction(
 def import_accounts(
     rows: Sequence[Mapping[str, Any]], *, source_name: str, db_path: Path = DEFAULT_DB
 ) -> Dict[str, Any]:
+    for row in rows:
+        reject_obsolete_account_classification(row, account=True)
+    # Schema 22 uses exactly the public intake rules. Keep the pre-migration
+    # function below solely for historical callers on their original schema.
+    from .account_intake import has_account_intake, import_account_summary, HEADERS, DISPLAY_ID
+    from .account_classification import ACCOUNT_GROUPS, BUSINESS_DIRECTIONS, normalize_classification
+    with connect(db_path) as connection:
+        if has_account_intake(connection):
+            records = []
+            labels = {"douyin":"抖音","xiaohongshu":"小红书","kuaishou":"快手","wechat_channels":"视频号"}
+            for index, original in enumerate(rows, 1):
+                expanded = _expand_flat_account_row(original)
+                identities = expanded.get("platforms", [])
+                identity = identities[0] if len(identities) == 1 else {}
+                platform = identity.get("platform") or expanded.get("platform")
+                raw = dict.fromkeys(HEADERS)
+                raw.update({"平台":labels.get(platform), "uid":identity.get("uid") or expanded.get("uid"),
+                            DISPLAY_ID:expanded.get("display_account_id"), "账号名称":identity.get("nickname") or expanded.get("nickname"),
+                            "手机号":expanded.get("phone"), "运营人员":expanded.get("operator_name"),
+                            "更新状态":{"daily":"日更","weekly":"周更","paused":"暂停"}.get(expanded.get("account_status"))})
+                for field, header, choices in (("account_group", "质量标签", ACCOUNT_GROUPS),
+                                                ("business_direction", "业务标签", BUSINESS_DIRECTIONS)):
+                    if field in expanded:
+                        try:
+                            raw[header] = choices[normalize_classification(field, expanded[field])]
+                        except ValueError as error:
+                            raise OperationError(str(error)) from error
+                records.append({"sourceRow":index,"raw":raw,"comment":"", "metadata":{"legacy_input":dict(original),
+                                "conflict_fields":["uid"] if len(identities)>1 else []}})
+            source_sha = hashlib.sha256(json.dumps(list(rows),ensure_ascii=False,sort_keys=True,separators=(",",":")).encode()).hexdigest()
+            with transaction(connection):
+                result = import_account_summary(connection,{"sha256":source_sha,"source":source_name,
+                    "sheet":"legacy-import","records":records},imported_at=now_utc())
+            return {"batch_id":"intake-"+source_sha,"inserted_rows":result["counts"]["added"],
+                    "updated_rows":result["counts"]["updated"],"rejected_rows":result["counts"]["review"],
+                    "unchanged_rows":result["counts"]["unchanged"],"rows":result["rows"]}
     batch_id = f"account-{uuid.uuid4().hex}"
     captured_at = now_utc()
     normalized_keys: List[Optional[str]] = []
@@ -753,8 +780,25 @@ def _raise_identity_conflict(
     )
 
 
+def _invalidate_duplicate_inputs(connection, content_id: int, previous: Mapping[str, Any],
+                                 updated: Mapping[str, Any]) -> None:
+    """Fence the old component before a source/canonical input is changed."""
+    from .duplicate_readiness import indexed_duplicates
+    if not indexed_duplicates(connection):
+        return
+    from .duplicate_index import invalidate_content, mark_content_dirty
+    from .duplicates import _normalize_text
+    old = dict(previous)
+    new = {**old, **updated}
+    if _normalize_text(f"{old.get('title', '')}\n{old.get('body', '')}") != _normalize_text(
+            f"{new.get('title', '')}\n{new.get('body', '')}"):
+        invalidate_content(connection, content_id, reason="source_changed")
+    elif any(old.get(key) != new.get(key) for key in ("published_at", "imported_at")):
+        mark_content_dirty(connection, content_id, reason="canonical_changed")
+
+
 def merge_content_records(connection, first_id: int, second_id: int) -> int:
-    schema20 = connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}
+    schema20 = connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21, 22, 23, 24}
     if schema20:
         from .metric_field_facts import resolve_metric_content_id
         first_id = resolve_metric_content_id(connection, first_id)
@@ -936,6 +980,11 @@ def _merge_content_records_schema20(
     )]
     connection.execute("SAVEPOINT merge_content_records_v20")
     try:
+        from .duplicate_readiness import indexed_duplicates
+        if indexed_duplicates(connection):
+            from .duplicate_index import invalidate_content, mark_content_dirty
+            invalidate_content(connection, loser_id, reason="content_merged", deleted=True)
+            mark_content_dirty(connection, survivor_id, reason="canonical_changed")
         event_id = append_identity_merge(
             connection, winner_id=survivor_id, loser_id=loser_id, recorded_at=stamp,
             identity_snapshot={"winner": dict(survivor), "loser": dict(loser), "identities": identities},
@@ -953,8 +1002,8 @@ def _merge_content_records_schema20(
         connection.execute("UPDATE content_identities SET content_id=?,is_primary=0 WHERE content_id=?",
                            (survivor_id, loser_id))
         for row in (survivor, loser):
-            aliases = [("canonical_url", str(row["canonical_url"]),
-                        f"{row['platform']}:url:{hashlib.sha256(normalize_url(row['canonical_url']).encode()).hexdigest()}")]
+            aliases = ([("canonical_url", str(row["canonical_url"]),
+                        f"{row['platform']}:url:{hashlib.sha256(normalize_url(row['canonical_url']).encode()).hexdigest()}")] if row["canonical_url"] else [])
             if row["platform_content_id"] is not None:
                 aliases.append(("platform_content_id", str(row["platform_content_id"]),
                                 f"{row['platform']}:{row['platform_content_id']}"))
@@ -998,6 +1047,8 @@ def _rebuild_text_duplicate_groups(
     *,
     touched_content_ids: set[int],
 ) -> None:
+    if indexed_duplicates(connection):
+        return  # The indexed worker owns exact-text matching and graph publication.
     groups: Dict[str, List[sqlite3.Row]] = {
         fingerprint: [] for fingerprint in fingerprints
     }
@@ -1058,33 +1109,82 @@ def _rebuild_text_duplicate_groups(
             )
 
 
+
+def _save_content_identity_aliases(connection: sqlite3.Connection, *, content_id: int,
+                                  identity: Mapping[str, Any], alias_urls: list[str], at: str) -> None:
+    from .content_identity import alias_url_key
+    from .metric_field_facts import resolve_metric_content_id
+    platform = identity["platform"]
+    aliases = [("platform_content_id", value, f"{platform}:{value}") for value in identity.get("identity_aliases", [])]
+    aliases.extend(("canonical_url", url, alias_url_key(platform, url)) for url in dict.fromkeys(alias_urls) if url)
+    for kind, value, key in aliases:
+        previous = connection.execute("SELECT content_id FROM content_identities WHERE platform_identity_key=?", (key,)).fetchone()
+        if previous is not None:
+            previous_id = resolve_metric_content_id(connection, int(previous[0])) if connection.execute("PRAGMA user_version").fetchone()[0] >= 20 else int(previous[0])
+            if previous_id != content_id:
+                raise IdentityConflictError("作品链接别名已归属其他作品，不能覆盖")
+            continue
+        connection.execute("INSERT INTO content_identities(content_id,identity_kind,identity_value,platform_identity_key,is_primary,created_at) VALUES(?,?,?,?,0,?)",
+                           (content_id,kind,value,key,at))
+
+
 def upsert_content(
     value: Mapping[str, Any],
     *,
     db_path: Path = DEFAULT_DB,
     source_group_on_insert: str = "",
     connection: Optional[sqlite3.Connection] = None,
+    verified_provider_identity: tuple[str, str] | None = None,
 ) -> Dict[str, Any]:
     if source_group_on_insert not in {"", "history-archive", "history-backfill"}:
         raise OperationError("新内容内部来源分组无效")
+    reject_obsolete_account_classification(value, account=False)
     platform = str(value.get("platform") or "")
-    identity = content_identity(
-        platform,
-        str(value.get("canonical_url") or value.get("url") or ""),
-        value.get("platform_content_id"),
-    )
+    provider_identity_matches = (verified_provider_identity is not None
+        and platform in PLATFORMS
+        and verified_provider_identity == (platform, value.get("account_uid"))
+        and isinstance(value.get("account_uid"), str) and bool(value["account_uid"]))
+    if verified_provider_identity is not None and not provider_identity_matches:
+        raise OperationError("供应商作品身份与账号不一致")
     published_raw = value.get("published_at")
     published = (
         normalize_timestamp(published_raw) if published_raw not in (None, "") else None
     )
     if published_raw not in (None, "") and published is None:
         raise OperationError("发布日期必须是 ISO 时间或 Unix 秒")
-    account_type = _enum(value.get("account_type"), ACCOUNT_TYPES, "account_type")
     direction = _enum(value.get("content_direction"), DIRECTIONS, "content_direction")
     content_type = str(value.get("content_type") or "unknown").strip() or "unknown"
     uid = str(value.get("account_uid") or "").strip()
     captured_at = now_utc()
     with _content_write_transaction(db_path, connection=connection) as connection:
+        try:
+            identity = content_identity(platform, str(value.get("canonical_url") or value.get("url") or ""),
+                value.get("platform_content_id"), allow_missing_url=provider_identity_matches,
+                verified_provider_alias=provider_identity_matches, connection=connection)
+        except OperationError as error:
+            # Preserve the existing conflict ledger when a newly rejected
+            # explicit ID/URL pair points at two already stored works. The
+            # stricter parser must not turn that auditable conflict into an
+            # untracked generic validation failure.
+            if getattr(error, "code", None) == "identity_conflict":
+                from .content_identity import alias_content
+                try:
+                    linked = content_identity(platform, str(value.get("canonical_url") or value.get("url") or ""))
+                    explicit = content_identity(platform, "", value.get("platform_content_id"), allow_missing_url=True)
+                except OperationError:
+                    pass
+                else:
+                    by_explicit = alias_content(connection, platform, explicit["platform_content_id"])
+                    by_link = connection.execute("SELECT * FROM content_items WHERE platform=? AND normalized_url_hash=?",
+                        (platform,linked["normalized_url_hash"])).fetchone()
+                    if by_link is None:
+                        by_link = alias_content(connection, platform, linked["platform_content_id"])
+                    if by_explicit is not None and by_link is not None and int(by_explicit["id"]) != int(by_link["id"]):
+                        histories = {int(row["id"]): _protected_content_history(connection, int(row["id"]))
+                                     for row in (by_explicit,by_link)}
+                        _raise_identity_conflict(connection, by_explicit, by_link,
+                            histories=histories, reason="explicit_id_url_conflict")
+            raise
         by_id = None
         if identity["platform_content_id"]:
             by_id = connection.execute(
@@ -1095,7 +1195,7 @@ def upsert_content(
             "SELECT * FROM content_items WHERE platform=? AND normalized_url_hash=?",
             (platform, identity["normalized_url_hash"]),
         ).fetchone()
-        if connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}:
+        if connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21, 22, 23, 24}:
             from .metric_field_facts import resolve_metric_content_id
             identity_match = connection.execute(
                 "SELECT content_id FROM content_identities WHERE platform_identity_key=?", (identity["identity_key"],),
@@ -1112,6 +1212,34 @@ def upsert_content(
                 by_url = connection.execute("SELECT * FROM content_items WHERE id=?", (
                     resolve_metric_content_id(connection, int(by_url["id"])),
                 )).fetchone()
+        from .content_identity import alias_content, alias_url_key
+        for alias_id in identity.get("identity_aliases", []):
+            existing_alias = alias_content(connection, platform, alias_id)
+            if existing_alias is not None:
+                if by_url is not None and int(by_url["id"]) != existing_alias["id"]:
+                    raise IdentityConflictError("作品链接别名对应多个主体，请先处理身份冲突")
+                by_url = existing_alias
+        alias_urls = list(dict.fromkeys([identity["canonical_url"], *value.get("_content_alias_urls", [])]))
+        for alias_url in alias_urls:
+            if not alias_url:
+                continue
+            alias = connection.execute("SELECT content_id FROM content_identities WHERE platform_identity_key=?",
+                                       (alias_url_key(platform, alias_url),)).fetchone()
+            if alias is not None:
+                alias_id = resolve_metric_content_id(connection, int(alias[0])) if connection.execute("PRAGMA user_version").fetchone()[0] >= 20 else int(alias[0])
+                if by_url is not None and int(by_url["id"]) != alias_id:
+                    raise IdentityConflictError("作品链接别名对应多个主体，请先处理身份冲突")
+                by_url = connection.execute("SELECT * FROM content_items WHERE id=?", (alias_id,)).fetchone()
+        # A verified provider photo_id remains primary when a known public eid
+        # is pasted later. Only the saved alias relation permits this choice.
+        if by_id is not None and platform == "kuaishou" and str(by_id["platform_content_id"] or "").isdigit():
+            if str(identity["platform_content_id"]) != str(by_id["platform_content_id"]):
+                identity = content_identity(platform, identity["canonical_url"], by_id["platform_content_id"], connection=connection)
+        if platform == "kuaishou" and identity.get("identity_aliases"):
+            allowed_ids = {identity["platform_content_id"], *identity["identity_aliases"]}
+            if any(row is not None and row["platform_content_id"] not in (None, "")
+                   and row["platform_content_id"] not in allowed_ids for row in (by_id, by_url)):
+                raise IdentityConflictError("快手分享别名与已保存的平台作品 ID 冲突，不能自动合并")
         affected_text_ids = {
             int(row["id"]) for row in (by_id, by_url) if row is not None
         }
@@ -1143,11 +1271,11 @@ def upsert_content(
                 """
                 INSERT INTO content_items(
                     link_id, platform, platform_content_id, canonical_url, normalized_url_hash,
-                    account_id, raw_account_uid, raw_account_name, legacy_account_type,
+                    account_id, raw_account_uid, raw_account_name,
                     title, body, content_type, published_at, published_at_raw,
                     manual_content_direction, source_group,
                     imported_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     link_id,
@@ -1158,7 +1286,6 @@ def upsert_content(
                     account_id,
                     effective_uid or None,
                     str(value.get("account_name") or "").strip() or None,
-                    account_type,
                     str(value.get("title") or "").strip(),
                     str(value.get("body") or "").strip(),
                     content_type,
@@ -1177,6 +1304,10 @@ def upsert_content(
             action = "inserted"
         else:
             content_id = int(current["id"])
+            # A provider may omit an otherwise known share URL on later pages.
+            if provider_identity_matches and not identity["canonical_url"] and current["canonical_url"]:
+                identity["canonical_url"] = current["canonical_url"]
+                identity["normalized_url_hash"] = current["normalized_url_hash"]
             preserve_existing_content_fields = bool(
                 value.get("_preserve_existing_content_fields")
             )
@@ -1211,13 +1342,25 @@ def upsert_content(
                     else None
                 )
             )
-            effective_uid = uid or str(current["raw_account_uid"] or "").strip()
+            established_uid = str(current["raw_account_uid"] or "").strip()
+            if uid and established_uid and uid != established_uid:
+                raise OperationError("作品作者与已验证归属不一致，不能自动改绑账号。")
+            if uid and current["account_id"] is not None:
+                owner = _account_for_uid(connection, platform, uid)
+                if owner is not None and owner != current["account_id"]:
+                    raise OperationError("作品作者与现有账号归属冲突。")
+            effective_uid = uid or established_uid
             account_id = _account_for_uid(connection, platform, effective_uid)
-            effective_account_type = (
-                str(current["legacy_account_type"] or "unknown")
-                if account_type == "unknown"
-                else account_type
-            )
+            if current["account_id"] is not None and not established_uid:
+                # Matrix ownership may precede the provider's author field.
+                # Retain that binding without fabricating a raw author UID.
+                bound_uids = {str(row["uid"]) for row in connection.execute(
+                    "SELECT uid FROM account_platform_identities WHERE account_id=? AND platform=?",
+                    (current["account_id"], platform),
+                )}
+                if not bound_uids or (uid and uid not in bound_uids):
+                    raise OperationError("作品作者与现有账号归属冲突。")
+                account_id = current["account_id"]
             effective_content_type = (
                 str(current["content_type"] or "unknown")
                 if content_type == "unknown"
@@ -1228,11 +1371,14 @@ def upsert_content(
                 if direction == "unknown"
                 else direction
             )
+            _invalidate_duplicate_inputs(connection, content_id, current, {
+                "title": effective_title, "body": effective_body, "published_at": effective_published,
+            })
             connection.execute(
                 """
                 UPDATE content_items SET platform_content_id=?, canonical_url=?,
                     normalized_url_hash=?, account_id=?,
-                    raw_account_uid=?, raw_account_name=?, legacy_account_type=?,
+                    raw_account_uid=?, raw_account_name=?,
                     title=?, body=?, content_type=?, published_at=?, published_at_raw=?,
                     manual_content_direction=?, updated_at=? WHERE id=?
                 """,
@@ -1246,7 +1392,6 @@ def upsert_content(
                         value.get("account_name") or current["raw_account_name"] or ""
                     ).strip()
                     or None,
-                    effective_account_type,
                     effective_title,
                     effective_body,
                     effective_content_type,
@@ -1280,6 +1425,8 @@ def upsert_content(
             """,
             (content_id, kind, identity_value, identity["identity_key"], captured_at),
         )
+        _save_content_identity_aliases(connection, content_id=content_id, identity=identity,
+            alias_urls=alias_urls, at=captured_at)
         updated_content = connection.execute(
             "SELECT title,body FROM content_items WHERE id=?", (content_id,)
         ).fetchone()
@@ -1290,7 +1437,7 @@ def upsert_content(
 
             old_text = _normalize_text(f"{current['title']}\n{current['body']}")
             new_text = _normalize_text(f"{updated_content['title']}\n{updated_content['body']}")
-            if old_text != new_text:
+            if old_text != new_text and int(connection.execute("PRAGMA user_version").fetchone()[0]) < 24:
                 connection.execute(
                     """
                     DELETE FROM duplicate_relations
@@ -1313,7 +1460,9 @@ def upsert_content(
                 affected_text_fingerprints,
                 touched_content_ids=affected_text_ids,
             )
-        reconcile_content_account_identity(connection, content_id)
+        # A checked matrix binding can exist before a raw author UID does.
+        if effective_uid or account_id is None:
+            reconcile_content_account_identity(connection, content_id)
     return {"id": content_id, "action": action}
 
 
@@ -1363,6 +1512,8 @@ def update_content(
     content_id: int, value: Mapping[str, Any], *, db_path: Path = DEFAULT_DB
 ) -> Dict[str, Any]:
     updates = dict(value)
+    alias_urls = updates.pop("_content_alias_urls", [])
+    updates.pop("_locator_references", None)
     unexpected = set(updates) - CONTENT_PATCH_FIELDS
     if unexpected:
         raise OperationError(f"不支持修改的内容字段：{sorted(unexpected)}")
@@ -1371,7 +1522,7 @@ def update_content(
     original_content_id = content_id
     captured_at = now_utc()
     with _content_write_transaction(db_path) as connection:
-        if connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}:
+        if connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21, 22, 23, 24}:
             from .metric_field_facts import resolve_metric_content_id
             content_id = resolve_metric_content_id(connection, content_id)
         row = connection.execute(
@@ -1389,11 +1540,33 @@ def update_content(
         identity = None
         identity_merged = False
         if identity_fields & updates.keys():
-            identity = content_identity(
-                str(updates.get("platform", row["platform"]) or ""),
-                str(updates.get("canonical_url", row["canonical_url"]) or ""),
-                updates.get("platform_content_id", row["platform_content_id"]),
-            )
+            try:
+                identity = content_identity(
+                    str(updates.get("platform", row["platform"]) or ""),
+                    str(updates.get("canonical_url", row["canonical_url"]) or ""),
+                    updates.get("platform_content_id", row["platform_content_id"]), connection=connection,
+                )
+            except OperationError as error:
+                if getattr(error, "code", None) == "identity_conflict":
+                    from .content_identity import alias_content
+                    platform = str(updates.get("platform", row["platform"]) or "")
+                    try:
+                        linked = content_identity(platform, str(updates.get("canonical_url", row["canonical_url"]) or ""))
+                        explicit = content_identity(platform, "", updates.get("platform_content_id", row["platform_content_id"]), allow_missing_url=True)
+                    except OperationError:
+                        pass
+                    else:
+                        candidates = [alias_content(connection, platform, explicit["platform_content_id"]),
+                            connection.execute("SELECT * FROM content_items WHERE platform=? AND normalized_url_hash=?",
+                                (platform,linked["normalized_url_hash"])).fetchone()]
+                        external = {int(candidate["id"]):candidate for candidate in candidates
+                                    if candidate is not None and int(candidate["id"]) != content_id}
+                        for candidate in external.values():
+                            histories = {int(item["id"]):_protected_content_history(connection,int(item["id"])) for item in (row,candidate)}
+                            _record_identity_conflict(connection,row,candidate,histories=histories,reason="explicit_id_url_conflict")
+                        if external:
+                            raise IdentityConflictError("identity_conflict: 作品 ID 和链接指向不同记录，已保存身份冲突") from error
+                raise
             candidate_ids: set[int] = set()
             if identity["platform_content_id"]:
                 by_id = connection.execute(
@@ -1414,6 +1587,10 @@ def update_content(
             ).fetchone()
             if by_url is not None:
                 candidate_ids.add(int(by_url["id"]))
+            from .content_identity import alias_content
+            alias = alias_content(connection, identity["platform"], identity["platform_content_id"])
+            if alias is not None:
+                candidate_ids.add(alias["id"])
             external_candidate_ids = sorted(candidate_ids - {content_id})
             if len(external_candidate_ids) > 1:
                 for candidate_id in external_candidate_ids:
@@ -1513,6 +1690,7 @@ def update_content(
                 None if direction == "unknown" else direction
             )
 
+        _invalidate_duplicate_inputs(connection, content_id, row, columns)
         assignments = [f"{column}=?" for column in columns]
         assignments.append("updated_at=?")
         connection.execute(
@@ -1549,7 +1727,11 @@ def update_content(
                     captured_at,
                 ),
             )
-        if {"title", "body"} & updates.keys():
+        if identity is not None:
+            _save_content_identity_aliases(connection, content_id=content_id, identity=identity,
+                alias_urls=[identity["canonical_url"], *alias_urls], at=captured_at)
+        if ({"title", "body"} & updates.keys()
+                and int(connection.execute("PRAGMA user_version").fetchone()[0]) < 24):
             connection.execute(
                 """
                 DELETE FROM duplicate_relations
@@ -1592,21 +1774,35 @@ def import_contents(
 ) -> Dict[str, Any]:
     batch_id = f"content-{uuid.uuid4().hex}"
     captured_at = now_utc()
+    normalized_rows: List[Optional[Dict[str, Any]]] = []
+    normalization_errors: List[Exception | None] = []
+    pending_intakes: List[Dict[str, Any]] = []
     keys: List[Optional[str]] = []
     last_by_key: Dict[str, int] = {}
     for index, row in enumerate(rows, start=1):
         try:
-            identity = content_identity(
-                str(row.get("platform") or ""),
-                str(row.get("canonical_url") or row.get("url") or ""),
-                row.get("platform_content_id"),
-            )
-            key = str(identity["identity_key"])
-        except OperationError:
+            from .content_identity import normalize_submission, ContentIdentityError
+            reject_obsolete_account_classification(row, account=False)
+            with connect(db_path) as reader:
+                normalized = normalize_submission(dict(row), connection=reader)
+            key = f"{normalized["platform"]}:{normalized["platform_content_id"]}"
+            normalized_rows.append(normalized)
+            normalization_errors.append(None)
+        except (OperationError, ContentIdentityError) as error:
             key = None
+            normalized_rows.append(None)
+            normalization_errors.append(error)
         keys.append(key)
         if key:
             last_by_key[key] = index
+    # All redirects above were proved outside write transactions. Preserve
+    # every equivalent source URL even when the last spreadsheet row wins.
+    for position, key in enumerate(keys):
+        if key and normalized_rows[position] is not None:
+            winner = normalized_rows[last_by_key[key] - 1]
+            winner["_content_alias_urls"] = list(dict.fromkeys([
+                *winner.get("_content_alias_urls", []),
+                *normalized_rows[position].get("_content_alias_urls", [])]))
     with connect(db_path) as connection, transaction(connection):
         connection.execute(
             """
@@ -1627,7 +1823,16 @@ def import_contents(
             counts.rejected += 1
         else:
             try:
-                result = upsert_content(row, db_path=db_path)
+                error = normalization_errors[index - 1]
+                if error is not None:
+                    if getattr(error, "code", None) == "identity_unresolved":
+                        from .content_identity import enqueue_pending_link
+                        with connect(db_path) as pending_connection, transaction(pending_connection):
+                            if pending_connection.execute("PRAGMA user_version").fetchone()[0] >= 23:
+                                pending = enqueue_pending_link(pending_connection, dict(row), reason=str(error), at=captured_at)
+                                pending_intakes.append({"row":index, **pending})
+                    raise error
+                result = upsert_content(normalized_rows[index - 1], db_path=db_path)
                 status, entity_id, reason = str(result["action"]), int(result["id"]), ""
                 counts.inserted += int(status == "inserted")
                 counts.updated += int(status == "updated")
@@ -1659,7 +1864,7 @@ def import_contents(
             """,
             (counts.inserted, counts.updated, counts.rejected, now_utc(), batch_id),
         )
-    return {"batch_id": batch_id, **counts.as_dict()}
+    return {"batch_id": batch_id, **counts.as_dict(), "pending_identity_rows":len(pending_intakes), "pending_link_intakes":pending_intakes}
 
 
 
@@ -1687,6 +1892,7 @@ def account_read_model(
     roster: Mapping[str, Any] | None = None,
     update_frequencies: Mapping[int, str | None] | None = None,
     admission_members: Mapping[int, Mapping[str, Any]] | None = None,
+    read_projection: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
     from .account_roster import account_metadata, runtime_account_summary
     from .account_metrics import select_account_metrics
@@ -1699,14 +1905,14 @@ def account_read_model(
     frequency = frequencies.get(int(account["id"]))
     source_family = str(runtime.get("source_family") or "matrix")
     snapshot_id = runtime.get("snapshot_id") if runtime.get("ready") else None
-    metadata = account_metadata(
+    metadata = read_projection["metadata"] if read_projection is not None else account_metadata(
         connection,
         int(account["id"]),
         source_family=source_family,
         snapshot_id=int(snapshot_id) if snapshot_id is not None else None,
         latest_if_unspecified=bool(runtime.get("ready")),
     )
-    identities = [
+    identities = [dict(row) for row in read_projection["identities"]] if read_projection is not None else [
         dict(row)
         for row in connection.execute(
             ACCOUNT_IDENTITY_STATS_SQL.replace(
@@ -1716,7 +1922,8 @@ def account_read_model(
     ]
     if len(identities) > 1:
         raise OperationError("账号模型尚未完成单平台升级，不能合并展示")
-    statistics = select_account_metrics(connection, [int(row["id"]) for row in identities])
+    statistics = (read_projection["statistics"] if read_projection is not None
+                  else select_account_metrics(connection, [int(row["id"]) for row in identities]))
     admissions = admission_members if admission_members is not None else load_admission_members(connection)
     for identity in identities:
         admitted = admissions.get(int(identity["id"]), {})
@@ -1752,7 +1959,9 @@ def account_read_model(
             identity["unique_id"] = statistic_metadata["display_account_id"]
     return {
         "id": account["id"], "phone": account["phone"],
-        "operator_name": account["operator_name"], **classification_for_account(connection, int(account["id"])),
+        "operator_name": account["operator_name"],
+        **(read_projection["classification"] if read_projection is not None
+           else classification_for_account(connection, int(account["id"]))),
         "enabled": bool(account["enabled"]),
         "platforms": identities, "updated_at": account["updated_at"],
         "account_status": account_operating_status({**dict(account), "update_frequency": frequency}),
@@ -1844,10 +2053,13 @@ def export_contents_csv(*, db_path: Path = DEFAULT_DB) -> bytes:
         "comment_count",
         "duplicate_original_link_id",
     ]
-    writer = csv.DictWriter(output, fieldnames=fields)
-    writer.writeheader()
     direction_sql = effective_direction_sql()
     with connect(db_path) as connection:
+        indexed = indexed_duplicates(connection)
+        if indexed:
+            fields.append("relation_status")
+        writer = csv.DictWriter(output, fieldnames=fields)
+        writer.writeheader()
         active_release(connection)
         rows = connection.execute(
             f"""
@@ -1860,14 +2072,20 @@ def export_contents_csv(*, db_path: Path = DEFAULT_DB) -> bytes:
                    original.link_id duplicate_original_link_id
             FROM content_items c LEFT JOIN accounts a ON a.id=c.account_id
             LEFT JOIN display_effective_evaluations ev ON ev.content_id=c.id
-            LEFT JOIN duplicate_relations d ON d.id=(SELECT id FROM duplicate_relations WHERE duplicate_content_id=c.id AND status='confirmed' ORDER BY id LIMIT 1)
+            LEFT JOIN duplicate_relations d ON d.id=(SELECT d2.id FROM duplicate_relations d2 WHERE d2.duplicate_content_id=c.id AND d2.status='confirmed' AND {valid_relation_sql(connection, 'd2')} ORDER BY d2.id LIMIT 1)
             LEFT JOIN content_items original ON original.id=d.original_content_id
             WHERE {canonical_content_predicate(connection)}
               AND {content_statistics_scope_sql("c", connection=connection)}
             ORDER BY c.id
             """
         ).fetchall()
-        metrics = select_content_metrics(connection, [int(item["id"]) for item in rows])
+        content_ids = [int(item["id"]) for item in rows]
+        relation_statuses = relation_states(connection, content_ids) if indexed else {}
+        if connection.execute("PRAGMA user_version").fetchone()[0] == 19:
+            # Archived schema19 keeps the same explicit v2 contract as the API.
+            metrics = select_content_metrics(connection, content_ids, policy_version=LEGACY_POLICY_VERSION)
+        else:
+            metrics = select_current_content_metrics(connection, content_ids)
         for item in rows:
             writer.writerow(
                 {
@@ -1896,6 +2114,7 @@ def export_contents_csv(*, db_path: Path = DEFAULT_DB) -> bytes:
                         "duplicate_original_link_id": item[
                             "duplicate_original_link_id"
                         ],
+                        **({"relation_status": relation_statuses[int(item["id"])]["relation_status"]} if indexed else {}),
                     }.items()
                 }
             )

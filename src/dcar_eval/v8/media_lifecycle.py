@@ -577,9 +577,14 @@ def prepare_download(content_id: int, source_artifact_id: int, media_root: Path,
             if record["mode"] == "enrollment_only" and content_id not in record["canary_content_ids"]:
                 return None
             if reacquire_request_id is not None:
-                # The explicit paid reacquire workflow needs its own approved
-                # request and fresh slot contract; ordinary retries cannot act as it.
-                raise LifecycleError("explicit_reacquire_contract_not_bound")
+                from .media_source_refresh import authorized_source_request
+                if authorized_source_request(connection, content_id, source_artifact_id) != reacquire_request_id:
+                    raise LifecycleError("explicit_reacquire_contract_not_bound")
+                # A new immutable source gets its own instance and slot. Never
+                # reuse a same-URL slot or change the old bundle's deadline.
+                source_aliases = {source["sha256"]}
+                if download_source_sha256 != source["sha256"]:
+                    raise LifecycleError("download_slot_source_invalid")
             slots = connection.execute(
                 "SELECT * FROM media_processing_slots WHERE content_id=? AND processor_type='download'",
                 (content_id,),
@@ -598,7 +603,7 @@ def prepare_download(content_id: int, source_artifact_id: int, media_root: Path,
                 "SELECT metadata_json FROM evidence_artifacts WHERE content_id=? AND artifact_type IN ('media','media_manifest')",
                 (content_id,),
             ).fetchall()
-            if any(_object(row[0]).get("source_sha256") == source["logical_sha256"]
+            if reacquire_request_id is None and any(_object(row[0]).get("source_sha256") == source["logical_sha256"]
                    for row in prior if source["logical_sha256"] is not None):
                 return None
             bundle_id = uuid.uuid4().hex

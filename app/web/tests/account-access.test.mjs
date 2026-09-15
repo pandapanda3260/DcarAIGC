@@ -62,7 +62,8 @@ function harness({ role, sessionState = "ready", basePath = "" } = {}) {
   };
   const Link = (props) => {
     links.push(props);
-    const { prefetch: _prefetch, ...attributes } = props;
+    const attributes = { ...props };
+    delete attributes.prefetch;
     return React.createElement("a", attributes);
   };
   const Image = (props) => {

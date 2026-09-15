@@ -31,6 +31,7 @@ function loadComponent(relativePath, imports = {}) {
 }
 
 const feedback = loadComponent("../app/components/Feedback.tsx");
+const model = loadComponent("../app/overview/overviewModel.ts");
 
 function allElements(node) {
   if (Array.isArray(node)) return node.flatMap(allElements);
@@ -65,7 +66,7 @@ function hasLoading(tree) {
 
 function makeOverview(count = 37) {
   const window = {
-    channels: { douyin: {}, xiaohongshu: {} },
+    channels: Object.fromEntries(model.overviewChannels.map(({ key }) => [key, { platform: key }])),
     period_start: "2026-08-24",
     period_end: "2026-08-31",
     metrics: { publication_count: { value: count } },
@@ -121,11 +122,14 @@ function setup(t, cachedOverview) {
     "@phosphor-icons/react": new Proxy({}, { get: () => "svg" }),
     "next/image": "img",
     "../components/AppShell": "main",
+    // Health observer behavior is exercised by the real React lifecycle suite.
+    "../components/DataFreshnessNote": () => null,
     "../components/Feedback": feedback,
     "../lib/format": { formatDate: (date) => date, formatDateTime: (date) => date },
     "../lib/paths": { publicAssetPath: (path) => path },
     "../lib/queries": { overviewQueryOptions: () => options },
     "./OverviewReport": { OverviewChannelReport: "overview-channel" },
+    "./overviewModel": model,
     "./OverviewReport.module.css": new Proxy({}, { get: (_, key) => String(key) }),
   });
   return {
@@ -249,4 +253,36 @@ test("this-week cutoff includes the current day and its actual time", (t) => {
   const content = textContent(dashboard(view.render()));
   assert.match(content, /统计截止（北京时间）2026-09-06T14:35:00\+08:00/);
   assert.doesNotMatch(content, /统计到此日期前一天/);
+});
+
+test("all four channels follow each selected window without additional reads", (t) => {
+  const overview = makeOverview();
+  for (const key of ["yesterday", "this_week", "last_week"]) {
+    overview.windows[key] = { ...overview.windows[key], channels: Object.fromEntries(
+      model.overviewChannels.map(({ key: platform }) => [platform, { platform, sample: key }]),
+    ) };
+  }
+  const view = setup(t, overview);
+  const buttons = allElements(view.render().props.actions).filter((node) => node.type === "button");
+  for (const [index, window] of ["yesterday", "this_week", "last_week"].entries()) {
+    buttons[index].props.onClick();
+    const channels = allElements(dashboard(view.render())).filter((node) => node.type === "overview-channel");
+    assert.deepEqual(channels.map((node) => node.props.channel.platform), ["douyin", "xiaohongshu", "kuaishou", "wechat_channels"]);
+    assert.ok(channels.every((node) => node.props.channel.sample === window));
+  }
+  assert.equal(view.requests.length, 0);
+});
+
+test("older channel payloads retain existing reports and mark missing channels unavailable", (t) => {
+  const overview = makeOverview();
+  delete overview.windows.last_week.channels.kuaishou;
+  delete overview.windows.last_week.channels.wechat_channels;
+  const view = setup(t, overview);
+  const nodes = allElements(dashboard(view.render()));
+  assert.equal(nodes.filter((node) => node.type === "overview-channel").length, 2);
+  for (const platform of ["kuaishou", "wechat_channels"]) {
+    const placeholder = nodes.find((node) => node.props["data-channel"] === platform);
+    assert.match(textContent(placeholder), /渠道数据暂不可用/);
+    assert.doesNotMatch(textContent(placeholder), /0 条/);
+  }
 });

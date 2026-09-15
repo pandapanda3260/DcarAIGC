@@ -3,14 +3,14 @@ import type { AccountGroup, BusinessDirection } from "./accountClassification";
 export type Section = "overview" | "tasks" | "accounts" | "contents" | "selling-points" | "spu-audience" | "users";
 export type UserRole = "superadmin" | "admin" | "operator" | "new_user";
 export type UserStatus = "active" | "disabled";
-export type AuthSession = { authenticated: true; username: string; role?: UserRole };
+export type AuthSession = { authenticated: true; username: string; display_name?: string; role?: UserRole; bypass?: boolean };
 export type ManagedUser = {
-  username: string; phone: string | null; role: UserRole; status: UserStatus;
+  username: string; display_name?: string; phone: string | null; role: UserRole; status: UserStatus;
   created_at: string; password_updated_at: string;
 };
 export type ManagedUsersResult = { actor: { username: string; role: UserRole }; items: ManagedUser[] };
 export type WindowKey = "yesterday" | "this_week" | "last_week";
-export type OverviewChannelKey = "douyin" | "xiaohongshu";
+export type OverviewChannelKey = "douyin" | "xiaohongshu" | "kuaishou" | "wechat_channels";
 export type BusinessSceneKey = "used_car" | "new_car" | "media";
 export type ConclusionMetricKey =
   | "selling_point_count_share"
@@ -112,6 +112,10 @@ export type Overview = {
   data_quality: {
     missing_published_at: number;
     duplicate_fingerprint_coverage: number;
+    duplicate_relation_coverage?: number;
+    duplicate_relation_ready?: number;
+    duplicate_relation_pending?: number;
+    duplicate_relation_failed?: number;
     duplicate_calibration_ready: boolean;
     confirmed_duplicate_count: number;
   };
@@ -184,8 +188,6 @@ export type ReportView = {
   platform_dimensions: Array<Record<string, string | number | null>>;
   account_group_dimensions?: Array<Record<string, string | number | null>>;
   business_direction_dimensions?: Array<Record<string, string | number | null>>;
-  /** Frozen legacy reports only; never relabel these as current account groups. */
-  account_type_dimensions?: Array<Record<string, string | number | null>>;
   content_direction_dimensions: Array<Record<string, string | number | null>>;
   content_details: Array<Record<string, string | number | boolean | null>>;
   capture_summary: Array<Record<string, string | number>>;
@@ -213,7 +215,22 @@ export type PlatformIdentity = {
 
 export type AccountStatus = "daily" | "weekly" | "paused" | "unmarked";
 
+export type AccountSummary = {
+  fields: Record<string, string | number | null>;
+  source_name: string;
+  source_sheet: string;
+  source_row: number;
+  imported_at: string;
+  comment: string;
+  pending_fields?: string[];
+};
+
 export type Account = {
+  locator_sha256?: string;
+  locator_revision?: number;
+  directory_platform?: "douyin" | "xiaohongshu" | "kuaishou" | "wechat_channels";
+  directory_uid?: string | null;
+  directory_locator?: { platform?: string; uid?: string; display_account_id?: string; profile_url?: string; references?: Record<string, unknown> };
   directory_row_id?: number;
   directory_identity_status?: "existing_verified" | "uid_unverified" | "identity_missing";
   id: number;
@@ -224,6 +241,12 @@ export type Account = {
   account_status: AccountStatus;
   update_frequency: "daily" | "weekly" | null;
   enabled: boolean;
+  account_summary?: AccountSummary;
+  has_account_summary?: boolean;
+  account_preparation?: {
+    intake_id: number; state: "queued" | "running" | "blocked" | "ready"; label: string;
+    reason: string | null; reason_label: string | null; due_at: string | null; message: string;
+  };
   automatic_capture?: {
     eligible: boolean;
     reason_code: string;
@@ -326,6 +349,10 @@ export type ContentItem = {
   like_count: number | null;
   metrics_captured_at: string | null;
   duplicate_original_link_id: string | null;
+  relation_status?: "pending" | "ready" | "failed";
+  fingerprint_available?: boolean;
+  generation_id?: string | null;
+  input_revision?: number | null;
   spu: ContentTagSpu | null;
   spu_secondary_count: number;
   spu_gray_count: number;

@@ -65,8 +65,9 @@ from .media import (
     store_media_source_manifest,
 )
 from .metric_observations import persist_metric_observation
-from .source_routing import select_content_metrics
+from .source_routing import select_content_metrics, select_current_content_metrics
 from .operations import (
+    OperationError,
     IdentityConflictError,
     reconcile_content_account_identity,
     upsert_content,
@@ -92,8 +93,14 @@ RNOTE_BASE = "https://rnote.dev/api/v2/crawler/note"
 TIKHUB_PRICE = 0.001
 TIKHUB_DOUYIN_HIGH_QUALITY_PRICE = 0.005
 TIKHUB_XHS_PRICE = 0.01
+# Fixed operation prices are validated by provider_budget before every send.
+TIKHUB_KUAISHOU_PRICE = 0.01
+TIKHUB_WECHAT_CHANNELS_PRICE = 0.01
+SUPPORTED_CONTENT_PLATFORMS = frozenset({"douyin", "xiaohongshu", "kuaishou", "wechat_channels"})
+PROFILE_OPERATIONS = {"douyin": "douyin_uid_profile", "xiaohongshu": "xiaohongshu_user_profile", "kuaishou": "kuaishou_user_profile", "wechat_channels": "wechat_channels_user_profile"}
 RNOTE_PRICE = 0.008
 RNOTE_RETIRED_MESSAGE = "Rnote retired; use TikHub"
+NEW_PLATFORM_PRICE_VERIFIED_AT = "2026-09-12T02:17:01Z"
 PRICE_VERIFIED_AT = "2026-08-02T13:55:00Z"
 DISCOVERY_PRICE_VERIFIED_AT = "2026-08-02T14:49:00Z"
 TIKHUB_XHS_PRICE_VERIFIED_AT = "2026-08-03T06:28:14Z"
@@ -139,6 +146,13 @@ STAGE_CONFIG = {
         TIKHUB_XHS_PRICE,
     ),
 }
+
+for _platform, _price in (("kuaishou", 0.001), ("wechat_channels", TIKHUB_WECHAT_CHANNELS_PRICE)):
+    for _stage, _suffix in (("detail", "video_detail"), ("metrics", "video_statistics")):
+        STAGE_CONFIG[(_platform, _stage)] = ("TikHub", f"tikhub-{_platform}-{_stage}-v1", f"{_platform}_{_suffix}", _price)
+
+STAGE_CONFIG[("wechat_channels", "comments")] = (
+    "TikHub", "tikhub-wechat-channels-comments-v1", "wechat_channels_video_comments", TIKHUB_WECHAT_CHANNELS_PRICE)
 
 
 class ProviderConfigurationError(RuntimeError):
@@ -260,7 +274,7 @@ def ensure_operational_budget(
                     max_requests,
                     round(max_requests * price, 6),
                     daily_quota,
-                    PRICE_VERIFIED_AT,
+                    NEW_PLATFORM_PRICE_VERIFIED_AT if operation.startswith(("kuaishou_", "wechat_channels_")) else PRICE_VERIFIED_AT,
                     captured_at,
                     captured_at,
                 ),
@@ -294,6 +308,7 @@ def ensure_task_budget(
     max_requests = max(1, math.floor((task_max_amount + 1e-9) / price))
     captured_at = now_utc()
     verified_at = (
+        NEW_PLATFORM_PRICE_VERIFIED_AT if operation.startswith(("kuaishou_", "wechat_channels_")) else
         TIKHUB_XHS_PRICE_VERIFIED_AT
         if provider == "TikHub" and abs(price - TIKHUB_XHS_PRICE) < 1e-9
         else PRICE_VERIFIED_AT
@@ -371,6 +386,9 @@ def _request_json(
     headers: Mapping[str, str],
     params: Mapping[str, Any],
     provider: str,
+    method: str = "GET",
+    body: Mapping[str, Any] | None = None,
+    content_operation: str | None = None,
 ) -> JsonTransportResult:
     from .provider_transport import current_request_transport
     binding = current_request_transport()
@@ -383,8 +401,11 @@ def _request_json(
         {key: value for key, value in params.items() if value is not None}
     )
     request = urllib.request.Request(
-        f"{url}?{query}",
+        f"{url}?{query}" if query else url,
+        data=json.dumps(dict(body), ensure_ascii=False, separators=(",", ":")).encode("utf-8") if body is not None else None,
+        method=method,
         headers={
+            **({"Content-Type": "application/json"} if body is not None else {}),
             **headers,
             "Accept": "application/json",
             "User-Agent": "DCar-Insight-v8/1.0",
@@ -404,14 +425,16 @@ def _request_json(
             route_generation=manifest["route_generation"] if manifest else route_generation,
             http_stack=manifest["http_stack"] if manifest else "urllib-stream-v1",
             timeout=45,
+            **({"content_operation": content_operation} if content_operation is not None else {}),
         )
     except ProviderTransportError as exc:
         raise CaptureError(
-            f"{provider} transport error: {exc.error_code}",
+            f"{provider} transport error: {exc.error_code}; {exc.receipt.get('safe_message', type(exc).__name__)}",
             retryable=True,
             error_code="transport_error",
             transport_receipt=exc.receipt,
             transport_partial=exc.partial_bytes,
+            http_status=exc.receipt.get("http_status"),
         ) from exc
     if manifest is not None:
         for field in ("request_host", "transport_route_id", "route_generation", "http_stack"):
@@ -913,6 +936,149 @@ def _douyin_reference_call(uid: str, key: str) -> ProviderResult:
     return _with_transport(response, result)
 
 
+
+def _extra_adapter(platform: str):
+    if platform == "kuaishou":
+        from . import kuaishou_adapter
+        return kuaishou_adapter
+    if platform == "wechat_channels":
+        from . import wechat_channels_adapter
+        return wechat_channels_adapter
+    raise ProviderConfigurationError(f"unsupported platform: {platform}")
+
+
+def _platform_price(platform: str) -> float:
+    return {"douyin": TIKHUB_PRICE, "xiaohongshu": TIKHUB_XHS_PRICE,
+            "kuaishou": TIKHUB_KUAISHOU_PRICE, "wechat_channels": TIKHUB_WECHAT_CHANNELS_PRICE}[platform]
+
+
+def _extra_parse(platform: str, stage: str, subject: str, payload: Any,
+                 *, status: int = 200, expected_uid: str | None = None) -> ProviderResult:
+    if status != 200:
+        raise CaptureError("TikHub HTTP response is not successful", error_code="provider_http_error",
+                           retryable=status >= 500, http_status=status, raw_response=payload)
+    if platform == "xiaohongshu" and stage in {"profile", "account_metrics"}:
+        from .platform_adapters import normalize_profile
+        profile = normalize_profile(platform, {"uid": subject}, payload)
+        return ProviderResult(data=profile, raw_response=payload, http_status=status, billed=True)
+    adapter = _extra_adapter(platform)
+    if stage in {"profile", "account_metrics"}:
+        data = adapter.parse_profile(payload, subject)
+    elif stage == "discovery":
+        data = adapter.parse_discovery(payload, subject)
+    else:
+        data = adapter.parse_stage(stage, str(subject["object_id"]) if isinstance(subject, Mapping) else subject, payload, expected_uid=expected_uid)
+        if platform == "wechat_channels" and stage == "comments":
+            hasher, platform_hasher = CommentHasher(), PlatformUserHasher()
+            subject_id = str(subject["object_id"]) if isinstance(subject, Mapping) else str(subject)
+            comments = []
+            for raw_comment in data["comments"]:
+                comment = dict(raw_comment)
+                raw_user = comment.pop("raw_user_id")
+                comment["anonymous_user_key"] = hasher.user_key(platform, subject_id, raw_user)
+                comment["pseudonymous_user_key"] = platform_hasher.user_key(platform, raw_user)
+                comment["comment_identity_key"] = comment_identity_key(
+                    platform_comment_id=comment["platform_comment_id"],
+                    pseudonymous_user_key=comment["pseudonymous_user_key"],
+                    body=comment["body"], published_at=comment["published_at"])
+                comments.append(comment)
+            data = {**data, "comments": comments}
+    return ProviderResult(data=data, raw_response=payload, http_status=status, billed=True)
+
+
+def _extra_call(platform: str, stage: str, subject: str, key: str, *, cursor: Any = None,
+                expected_uid: str | None = None) -> ProviderResult:
+    if platform == "xiaohongshu" and stage in {"profile", "account_metrics"}:
+        from .platform_adapters import next_profile_request
+        spec = next_profile_request({"platform": platform, "uid": subject})
+    else:
+        spec = _extra_adapter(platform).request_spec(stage, subject, cursor=cursor)
+    response = _request_json(_tikhub_url(spec["path"]), headers={"Authorization": f"Bearer {key}"},
+        params=spec.get("params", {}), method=spec["method"], body=spec.get("body"), provider="TikHub",
+        **({"content_operation": STAGE_CONFIG[(platform, stage)][2]} if stage in {"detail", "metrics"} else {}))
+    status, payload = response
+    try:
+        parse_stage = "detail" if stage == "metrics" and platform in {"kuaishou", "wechat_channels"} else stage
+        parsed = _extra_parse(platform, parse_stage, subject, payload, status=status, expected_uid=expected_uid)
+        if parse_stage != stage:
+            parsed = ProviderResult({**parsed.data["metrics"], "account_uid": parsed.data["account_uid"],
+                "_detail_projection": dict(parsed.data)}, parsed.raw_response, parsed.http_status, parsed.billed)
+    except Exception as error:
+        _raise_parse_failure_with_transport(error, response, payload=payload, status=status)
+    return _with_transport(response, parsed)
+
+
+def _content_request_params(platform: str, stage: str, subject: str, content_type: str,
+                            cursor: Any = None) -> dict[str, Any]:
+    if stage in {"profile", "account_metrics"} and platform == "xiaohongshu":
+        from .platform_adapters import next_profile_request
+        return next_profile_request({"platform": platform, "uid": subject})["params"]
+    if platform == "douyin":
+        return _douyin_request(stage, subject, cursor)[1]
+    if platform == "xiaohongshu":
+        return _xhs_request(stage, subject, content_type, cursor=cursor)[1]
+    spec = _extra_adapter(platform).request_spec(stage, subject, cursor=cursor)
+    return dict(spec.get("body", spec.get("params", {})))
+
+
+def _content_subject(content: Mapping[str, Any]) -> Any:
+    """Retain the video locator's nonce for providers that require it."""
+    identifier = str(content["platform_content_id"])
+    if content["platform"] != "wechat_channels":
+        return identifier
+    from urllib.parse import parse_qs, urlsplit
+    params = parse_qs(urlsplit(str(content.get("canonical_url") or content.get("url") or "")).query)
+    nonce = params.get("object_nonce_id", [None])[0]
+    return {"object_id": identifier, "object_nonce_id": nonce} if nonce else identifier
+
+
+def _validate_content_author(stage: str, result: ProviderResult, expected_uid: str | None) -> ProviderResult:
+    actual = str(result.data.get("account_uid") or "")
+    if expected_uid and (stage == "detail" or actual) and actual != str(expected_uid):
+        raise CaptureError("作品作者与已绑定账号不一致，原始响应保留待核对", error_code="identity_conflict",
+            retryable=False, billed=result.billed, http_status=result.http_status,
+            raw_response=result.raw_response, entity_bytes=result.entity_bytes,
+            transport_receipt=result.transport_receipt)
+    return result
+
+
+def _content_call(platform: str, stage: str, subject: Any, key: str, content_type: str,
+                  *, cursor: Any = None, expected_uid: str | None = None) -> ProviderResult:
+    if stage in {"profile", "account_metrics"} and platform == "xiaohongshu":
+        return _extra_call(platform, stage, subject, key, cursor=cursor)
+    if platform == "douyin":
+        parsed = _douyin_call(stage, subject, key, cursor=cursor)
+    elif platform == "xiaohongshu":
+        parsed = _xhs_call(stage, subject, key, content_type, cursor=cursor)
+    else:
+        parsed = _extra_call(platform, stage, subject, key, cursor=cursor, expected_uid=expected_uid)
+    return _validate_content_author(stage, parsed, expected_uid)
+
+
+def _parse_content_payload(platform: str, stage: str, subject: Any, content_type: str,
+                           payload: Any, *, status: int = 200, expected_uid: str | None = None) -> ProviderResult:
+    identifier = str(subject["object_id"]) if isinstance(subject, Mapping) else str(subject)
+    if platform == "douyin":
+        parsed = _parse_douyin_stage_payload(stage, identifier, payload, status=status)
+    elif platform == "xiaohongshu":
+        parsed = _parse_xhs_stage_payload(stage, identifier, content_type, payload, status=status)
+    elif (isinstance(payload, Mapping) and payload.get("derived_from_operation") in
+          {platform + "_user_posts", platform + "_video_detail"}
+          and payload.get("source_raw_response_id") and isinstance(payload.get("data"), Mapping)):
+        parsed = ProviderResult(dict(payload["data"]), payload, status, False)
+        returned = parsed.data.get("platform_content_id")
+        if returned and str(returned) != identifier:
+            raise CaptureError("派生证据属于另一作品", error_code="identity_conflict", retryable=False,
+                               billed=False, raw_response=payload, http_status=status)
+    else:
+        parse_stage = "detail" if stage == "metrics" and platform in {"kuaishou", "wechat_channels"} else stage
+        parsed = _extra_parse(platform, parse_stage, identifier, payload, status=status, expected_uid=expected_uid)
+        if parse_stage != stage:
+            parsed = ProviderResult({**parsed.data["metrics"], "account_uid": parsed.data["account_uid"],
+                "_detail_projection": dict(parsed.data)}, parsed.raw_response, parsed.http_status, parsed.billed)
+    return _validate_content_author(stage, parsed, expected_uid)
+
+
 def _valid_douyin_sec_user_id(value: str) -> bool:
     return value.startswith("MS4wLjAB") and 40 <= len(value) <= 128
 
@@ -1203,6 +1369,7 @@ def _douyin_call(
         headers={"Authorization": f"Bearer {key}"},
         params=params,
         provider="TikHub",
+        **({"content_operation": STAGE_CONFIG[("douyin", stage)][2]} if stage in {"detail", "metrics"} else {}),
     )
     status, payload = response
     try:
@@ -1222,6 +1389,7 @@ def _douyin_web_detail_call(content_id: str, key: str) -> ProviderResult:
         headers={"Authorization": f"Bearer {key}"},
         params={"aweme_id": content_id},
         provider="TikHub",
+        content_operation="douyin_video_detail",
     )
     status, payload = response
     try:
@@ -1692,6 +1860,7 @@ def _xhs_call(
         headers={"Authorization": f"Bearer {key}"},
         params=params,
         provider="TikHub",
+        **({"content_operation": STAGE_CONFIG[("xiaohongshu", stage)][2]} if stage in {"detail", "metrics"} else {}),
     )
     status, payload = response
     try:
@@ -2028,15 +2197,18 @@ def _store_stage_result(
     mark_raw_applied: bool = True,
     media_root: Optional[Path] = None,
     preserve_existing_content_fields: bool = False,
+    defer_media_source: bool = False,
 ) -> None:
     data = outcome.data
-    if stage == "detail" and data.get("content_type") not in {"video", "image"}:
+    if stage == "detail" and data.get("content_type") not in {"video", "image", "unknown"}:
         raise ProviderConfigurationError("详情未确认视频或图文类型，不能把 unknown 当主体图片")
     mutation_at = now_utc()
     detail_media_kind: Optional[str] = None
     with connect(db_path) as connection, transaction(connection):
         from .provider_budget import assert_paid_scope_owner
         assert_paid_scope_owner(connection)
+        from .capture_transport_recovery import assert_local_recovery_owner
+        assert_local_recovery_owner(connection, content_id=int(content["id"]), raw_response_id=int(outcome.raw_response_id), required=defer_media_source)
         source_raw = connection.execute(
             """
             SELECT captured_at,local_path,sha256,provider,operation
@@ -2046,6 +2218,16 @@ def _store_stage_result(
         ).fetchone()
         if source_raw is None:
             raise RuntimeError("stage raw response is missing")
+        alias_detail = data if stage == "detail" else data.get("_detail_projection")
+        if (content["platform"] == "kuaishou" and isinstance(alias_detail, Mapping)
+                and source_raw["operation"] in {"kuaishou_video_detail", "kuaishou_video_statistics"}):
+            # Discovery aliases were already bound during canonical upsert.
+            raw_owner = connection.execute("SELECT content_id FROM provider_raw_responses WHERE id=?",
+                (outcome.raw_response_id,)).fetchone()
+            if raw_owner is not None and raw_owner[0] == content["id"]:
+                from .content_identity import record_provider_content_aliases
+                record_provider_content_aliases(connection, int(content["id"]), dict(alias_detail),
+                    int(outcome.raw_response_id), mutation_at)
         evidence_captured_at = str(
             data.get("_evidence_captured_at") or source_raw["captured_at"]
         )
@@ -2112,7 +2294,7 @@ def _store_stage_result(
             stored_detail = connection.execute(
                 "SELECT content_type FROM content_items WHERE id=?", (content["id"],),
             ).fetchone()
-            if stored_detail is None or stored_detail["content_type"] not in {"video", "image"}:
+            if stored_detail is None or stored_detail["content_type"] not in {"video", "image", "unknown"}:
                 raise ProviderConfigurationError("详情落库后仍未确认视频或图文类型")
             detail_media_kind = str(stored_detail["content_type"])
         if stage == "metrics" or (stage == "detail" and isinstance(data.get("metrics"), Mapping)):
@@ -2189,22 +2371,20 @@ def _store_stage_result(
                 comments=data.get("comments") or [],
                 captured_at=evidence_captured_at,
             )
-    if stage == "detail":
+    if stage == "detail" and not defer_media_source:
         media_kwargs: Dict[str, Any] = {}
         if media_root is not None:
             media_kwargs["media_root"] = media_root
-        store_media_source_manifest(
-            int(content["id"]),
-            media_kind=str(detail_media_kind),
-            urls=[
-                str(value)
-                for value in data.get("media_urls", [])
-                if isinstance(value, str)
-            ],
-            raw_response_id=int(outcome.raw_response_id),
-            db_path=db_path,
-            **media_kwargs,
-        )
+        from .media import store_media_source_from_detail
+        store_media_source_from_detail(int(content["id"]), data,
+            raw_response_id=int(outcome.raw_response_id), db_path=db_path, **media_kwargs)
+
+    if stage == "metrics" and isinstance(data.get("_detail_projection"), Mapping):
+        detail = data["_detail_projection"]
+        if detail.get("content_type") in {"video", "image"}:
+            from .media import store_media_source_from_detail
+            store_media_source_from_detail(int(content["id"]), detail,
+                raw_response_id=int(outcome.raw_response_id), db_path=db_path, media_root=media_root)
     if stage == "comments" and evidence_id is not None:
         upsert_comment_user_scores(
             int(content["id"]),
@@ -2229,6 +2409,8 @@ def _mark_raw_response_applied(
     if applied_source not in {"live_applied", "derived_applied"}:
         raise ValueError(f"unsupported applied source: {applied_source}")
     with connect(db_path) as connection, transaction(connection):
+        from .capture_transport_recovery import assert_local_recovery_owner
+        assert_local_recovery_owner(connection, raw_response_id=raw_response_id)
         connection.execute(
             """
             UPDATE provider_raw_responses SET source=?
@@ -2309,6 +2491,7 @@ def _materialize_discovery_stages(
     """Persist fields already present in a paid discovery response at zero extra cost."""
 
     with connect(db_path) as connection:
+        field_facts_enabled = connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21, 22, 23, 24}
         row = connection.execute(
             "SELECT * FROM content_items WHERE id=?", (content_id,)
         ).fetchone()
@@ -2360,22 +2543,26 @@ def _materialize_discovery_stages(
                 or (zero_view_is_authoritative and discovery_view_count == 0)
             )
         )
-        if has_authoritative_discovery_exposure:
+        if has_authoritative_discovery_exposure and not field_facts_enabled:
             stage_values.append(("metrics", metrics_window_key, metrics))
-        elif any(value is not None for value in metrics.values()):
+        # Each page is a new observation even when today's derived slot already
+        # succeeded. Keep the original operation/time so the field policy, not
+        # a synthetic statistics label, decides which values are usable.
+        if (field_facts_enabled or not has_authoritative_discovery_exposure) and any(
+                value is not None for value in metrics.values()):
+            fields = dict(metrics.get("_field_status", {}))
+            if not has_authoritative_discovery_exposure:
+                fields["view_count"] = {
+                    "status": "not_applicable" if platform == "xiaohongshu" else
+                              "invalid" if discovery_view_count == 0 else "missing",
+                    "reason": "missing_or_placeholder",
+                }
             metadata = json.dumps(
                 {
                     "derived_from_operation": discovery_operation,
-                    "exposure_observation": "missing_or_placeholder",
+                    "exposure_observation": "observed" if has_authoritative_discovery_exposure else "missing_or_placeholder",
                     "reported_view_count": discovery_view_count,
-                    "fields": {
-                        **metrics.get("_field_status", {}),
-                        "view_count": {
-                            "status": "not_applicable" if platform == "xiaohongshu" else
-                                      "invalid" if discovery_view_count == 0 else "missing",
-                            "reason": "missing_or_placeholder",
-                        },
-                    },
+                    "fields": fields,
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -2387,12 +2574,12 @@ def _materialize_discovery_stages(
                     content_id=content_id,
                     captured_at=str(source_raw["captured_at"]),
                     window_key=metrics_window_key,
-                    view_count=None,
+                    view_count=discovery_view_count if has_authoritative_discovery_exposure else None,
                     comment_count=metrics.get("comment_count"),
                     like_count=metrics.get("like_count"),
                     share_count=metrics.get("share_count"),
                     collect_count=metrics.get("collect_count"),
-                    status="missing",
+                    status="available" if has_authoritative_discovery_exposure else "missing",
                     provider="tikhub" if provider == "TikHub" else provider,
                     platform=platform,
                     raw_response_id=source_raw_response_id,
@@ -2552,6 +2739,24 @@ def _materialize_discovery_stages(
     return output
 
 
+def _validated_discovery_intervals(
+    intervals: Optional[Sequence[tuple[datetime, datetime]]],
+) -> Optional[tuple[tuple[datetime, datetime], ...]]:
+    """Validate a frozen union of half-open admitted publication intervals."""
+    if intervals is None:
+        return None
+    result: list[tuple[datetime, datetime]] = []
+    for interval in intervals:
+        if (not isinstance(interval, (tuple, list)) or len(interval) != 2
+                or any(not isinstance(value, datetime) or value.tzinfo is None for value in interval)):
+            raise ValueError("discovery publication intervals require aware datetime pairs")
+        start, end = interval
+        if start >= end or (result and start < result[-1][1]):
+            raise ValueError("discovery publication intervals must be ordered and disjoint")
+        result.append((start, end))
+    return tuple(result)
+
+
 def materialize_account_discovery_page(
     *,
     account_id: int,
@@ -2568,6 +2773,7 @@ def materialize_account_discovery_page(
     db_path: Path = DEFAULT_DB,
     published_start: Optional[datetime] = None,
     published_end: Optional[datetime] = None,
+    published_intervals: Optional[Sequence[tuple[datetime, datetime]]] = None,
     materialize_detail: bool = True,
     materialize_existing_stages: bool = True,
     new_content_source_group: Optional[Callable[[str], str]] = None,
@@ -2585,7 +2791,8 @@ def materialize_account_discovery_page(
 
     if provider == "DouyinOpenAPI":
         raise ProviderConfigurationError("DouyinOpenAPI discovery is retired; raw evidence is audit-only")
-    if platform not in {"douyin", "xiaohongshu"}:
+    intervals = _validated_discovery_intervals(published_intervals)
+    if platform not in SUPPORTED_CONTENT_PLATFORMS:
         raise ProviderConfigurationError(f"unsupported platform: {platform}")
     if not provider.strip() or not derived_adapter_version.strip():
         raise ProviderConfigurationError(
@@ -2637,7 +2844,7 @@ def materialize_account_discovery_page(
     missing_published_at_count = 0
     for item in page_items:
         published_iso = _timestamp_iso(item.get("published_at"))
-        if published_start is not None or published_end is not None:
+        if published_start is not None or published_end is not None or intervals is not None:
             if published_iso is None:
                 missing_published_at_count += 1
                 continue
@@ -2646,9 +2853,16 @@ def materialize_account_discovery_page(
                 continue
             if published_end is not None and published > published_end:
                 continue
+            if intervals is not None and not any(start <= published < end for start, end in intervals):
+                continue
         if published_iso is not None:
             item["published_at"] = published_iso
-        persisted_items.append(item)
+        actual_uid = str(item.get("account_uid") or "")
+        if (str(item.get("platform") or "") != platform or actual_uid != str(account_uid)
+                or not item.get("platform_content_id")):
+            derived_failures.append({"stage": "discovery", "error_code": "identity_conflict",
+                "message": "作品平台、作者或作品标识与本页账号不一致；原始响应保留待核对"})
+            continue
         source_group_on_insert = (
             new_content_source_group(published_iso)
             if new_content_source_group is not None and published_iso is not None
@@ -2662,43 +2876,45 @@ def materialize_account_discovery_page(
             # content row but must not overwrite richer detail/manual text.
             "_preserve_existing_content_fields": True,
         }
-        result = upsert_content(
-            value,
-            db_path=db_path,
-            source_group_on_insert=source_group_on_insert,
-        )
+        try:
+            result = upsert_content(value, db_path=db_path,
+                source_group_on_insert=source_group_on_insert,
+                verified_provider_identity=(platform, account_uid))
+        except IdentityConflictError:
+            # Preserve the existing conflict ledger/slot terminal path for a
+            # collision with a saved canonical work; never demote it to a gap.
+            raise
+        except (ValueError, OperationError) as error:
+            derived_failures.append({"stage": "discovery", "error_code": getattr(error, "code", "identity_conflict"),
+                "message": str(error)[:300]})
+            continue
+        persisted_items.append(item)
         content_id = int(result["id"])
         content_changes.append(
             {"content_id": content_id, "action": str(result["action"])}
         )
         inserted += int(result["action"] == "inserted")
         updated += int(result["action"] == "updated")
-        if result["action"] == "inserted" or materialize_existing_stages:
-            derived = _materialize_discovery_stages(
-                content_id=content_id,
-                item=item,
-                account_uid=account_uid,
-                metrics_window_key=metrics_window_key,
-                discovery_operation=discovery_operation,
-                source_raw_response_id=source_raw_response_id,
-                provider=provider,
-                derived_adapter_version=derived_adapter_version,
-                derived_operations=derived_operations,
-                zero_view_is_authoritative=zero_view_is_authoritative,
-                db_path=db_path,
-                materialize_detail=materialize_detail,
-                derived_raw_root=derived_raw_root,
-                media_root=media_root,
-                preserve_existing_content_fields=preserve_existing_content_fields,
-            )
-        else:
-            derived = {
-                "created": [],
-                "replayed": [],
-                "already_succeeded": [],
-                "skipped": ["detail", "metrics"],
-                "failed": [],
-            }
+        # Attached counters belong to link acquisition. Reusing existing media
+        # or skipping detail must never discard a newer provider observation.
+        derived = _materialize_discovery_stages(
+            content_id=content_id,
+            item=item,
+            account_uid=account_uid,
+            metrics_window_key=metrics_window_key,
+            discovery_operation=discovery_operation,
+            source_raw_response_id=source_raw_response_id,
+            provider=provider,
+            derived_adapter_version=derived_adapter_version,
+            derived_operations=derived_operations,
+            zero_view_is_authoritative=zero_view_is_authoritative,
+            db_path=db_path,
+            materialize_detail=materialize_detail and (
+                result["action"] == "inserted" or materialize_existing_stages),
+            derived_raw_root=derived_raw_root,
+            media_root=media_root,
+            preserve_existing_content_fields=preserve_existing_content_fields,
+        )
         derived_created += len(derived["created"])
         derived_replayed += len(derived["replayed"])
         derived_already_succeeded += len(derived["already_succeeded"])
@@ -2716,6 +2932,12 @@ def materialize_account_discovery_page(
                 ),
             }
         )
+    # Schedule only these persisted links through the normal durable queue.
+    # This is local, idempotent work; a retry reuses the saved page, not the API.
+    from .capture_runtime import enqueue_discovered_metrics
+    metric_followup = enqueue_discovered_metrics(
+        [change["content_id"] for change in content_changes], db_path=db_path,
+    )
     if not derived_failures:
         _mark_raw_response_applied(source_raw_response_id, db_path=db_path)
     return {
@@ -2725,6 +2947,7 @@ def materialize_account_discovery_page(
         "persisted_item_count": len(persisted_items),
         "missing_published_at_count": missing_published_at_count,
         "content_changes": content_changes,
+        "metric_followup": metric_followup,
         "derived_stages": {
             "created": derived_created,
             "replayed": derived_replayed,
@@ -2752,6 +2975,7 @@ def discover_account_content(
     window_key: Optional[str] = None,
     published_start: Optional[datetime] = None,
     published_end: Optional[datetime] = None,
+    published_intervals: Optional[Sequence[tuple[datetime, datetime]]] = None,
     task_id: Optional[str] = None,
     task_max_amount: Optional[float] = None,
     db_path: Path = DEFAULT_DB,
@@ -2760,7 +2984,9 @@ def discover_account_content(
     materialize_existing_discovery_stages: bool = True,
     new_content_source_group: Optional[Callable[[str], str]] = None,
 ) -> Dict[str, Any]:
-    if platform not in {"douyin", "xiaohongshu"}:
+    # Reject malformed scope before entering the paid request boundary.
+    intervals = _validated_discovery_intervals(published_intervals)
+    if platform not in SUPPORTED_CONTENT_PLATFORMS:
         return {
             "account_id": account_id,
             "platform": platform,
@@ -2865,36 +3091,21 @@ def discover_account_content(
                     "账号 UID 未解析出有效 App V3 sec_user_id"
                 )
             with connect(db_path) as connection, transaction(connection):
-                connection.execute(
-                    """
-                    INSERT INTO account_provider_references(
-                        account_identity_id, provider, reference_kind, reference_value,
-                        source_raw_response_id, created_at, updated_at
-                    ) VALUES (?, 'TikHub', 'sec_user_id', ?, ?, ?, ?)
-                    ON CONFLICT(account_identity_id,provider,reference_kind) DO UPDATE SET
-                        reference_value=excluded.reference_value,
-                        source_raw_response_id=excluded.source_raw_response_id,
-                        updated_at=excluded.updated_at
-                    """,
-                    (
-                        identity["id"],
-                        reference,
-                        reference_raw_response_id,
-                        now_utc(),
-                        now_utc(),
-                    ),
-                )
+                from .account_reference_storage import store_reference
+                store_reference(connection, account_identity_id=identity["id"], platform=platform,
+                    provider="TikHub", reference_kind="sec_user_id", reference_value=reference,
+                    source_raw_response_id=reference_raw_response_id, created_at=now_utc(), updated_at=now_utc(),
+                    update_existing=True)
             _mark_raw_response_applied(int(reference_raw_response_id), db_path=db_path)
 
     provider = "TikHub"
-    price = TIKHUB_PRICE if platform == "douyin" else TIKHUB_XHS_PRICE
-    operation = (
-        "douyin_user_posts" if platform == "douyin" else "xiaohongshu_user_posts"
-    )
+    price = _platform_price(platform)
+    operation = platform + "_user_posts"
     adapter = (
         "tikhub-user-posts-v8.1"
         if platform == "douyin"
-        else "tikhub-xhs-app-v2-user-posts-v8.1"
+        else "tikhub-xhs-app-v2-user-posts-v8.1" if platform == "xiaohongshu"
+        else f"tikhub-{platform}-user-posts-v1"
     )
     budget_id = _budget_for_call(
         provider=provider,
@@ -2920,6 +3131,8 @@ def discover_account_content(
             uid,
             _load_key(TIKHUB_KEY_FILE, "TIKHUB_API_KEY"),
             cursor or "",
+        ) if platform == "xiaohongshu" else partial(
+            _extra_call, platform, "discovery", uid, _load_key(TIKHUB_KEY_FILE, "TIKHUB_API_KEY"), cursor=cursor or ""
         )
     )
     effective_window_key = window_key or target_day.isoformat()
@@ -2931,7 +3144,8 @@ def discover_account_content(
             "sort_type": 0,
         }
         if platform == "douyin"
-        else {"user_id": uid, "cursor": cursor or ""}
+        else {"user_id": uid, "cursor": cursor or ""} if platform == "xiaohongshu"
+        else _content_request_params(platform, "discovery", uid, "", cursor or "")
     )
     try:
         outcome = execute_account_fetch(
@@ -2978,8 +3192,10 @@ def discover_account_content(
                 stored_raw.value, status=stored_raw.http_status or 200
             )
             page_data = parsed_page.data
-        else:
+        elif platform == "xiaohongshu":
             page_data = _parse_xhs_discovery_payload(stored_raw.value)
+        else:
+            page_data = _extra_parse(platform, "discovery", uid, stored_raw.value, status=stored_raw.http_status or 200).data
         page_amount = 0.0
         page_raw_response_id = stored_raw.raw_response_id
         page_slot_id = stored_raw.slot_id
@@ -3004,10 +3220,11 @@ def discover_account_content(
                         "detail": STAGE_CONFIG[(platform, "detail")][2],
                         "metrics": STAGE_CONFIG[(platform, "metrics")][2],
                     },
-                    zero_view_is_authoritative=False,
+                    zero_view_is_authoritative=platform in {"kuaishou", "wechat_channels"},
                     db_path=db_path,
                     published_start=published_start,
                     published_end=published_end,
+                    published_intervals=intervals,
                     materialize_detail=materialize_discovery_detail,
                     materialize_existing_stages=materialize_existing_discovery_stages,
                     new_content_source_group=new_content_source_group,
@@ -3106,21 +3323,9 @@ def _replay_content_stage(
         db_path=db_path,
     )
     platform = str(content["platform"])
-    if platform == "douyin":
-        parsed = _parse_douyin_stage_payload(
-            stage,
-            str(content["platform_content_id"]),
-            stored.value,
-            status=stored.http_status or 200,
-        )
-    else:
-        parsed = _parse_xhs_stage_payload(
-            stage,
-            str(content["platform_content_id"]),
-            str(content["content_type"]),
-            stored.value,
-            status=stored.http_status or 200,
-        )
+    parsed = _parse_content_payload(platform, stage, str(content["platform_content_id"]),
+        str(content["content_type"]), stored.value, status=stored.http_status or 200,
+        expected_uid=str(content.get("raw_account_uid") or "") or None)
     replayed_data = dict(parsed.data)
     stored_payload = _mapping(stored.value)
     stored_data = _mapping(stored_payload.get("data"))
@@ -3185,17 +3390,16 @@ def _comment_page_call(
     call_override: Optional[Callable[[str, Mapping[str, Any]], ProviderResult]],
 ) -> ProviderResult:
     platform = str(content["platform"])
-    content_key = str(content["platform_content_id"])
+    content_key = _content_subject(content)
     if call_override is not None:
         override_content = dict(content)
         override_content["_comment_cursor"] = cursor
         return call_override("comments", override_content)
     key = _load_key(TIKHUB_KEY_FILE, "TIKHUB_API_KEY")
-    if platform == "douyin":
-        return _douyin_call("comments", content_key, key, cursor=cursor)
-    return _xhs_call(
-        "comments", content_key, key, str(content["content_type"]), cursor=cursor
-    )
+    return _content_call(platform, "comments", content_key, key,
+        str(content["content_type"]), cursor=cursor,
+        expected_uid=str(content.get("raw_account_uid") or "") or None)
+
 
 
 def _stored_comment_page(
@@ -3212,21 +3416,10 @@ def _stored_comment_page(
         operation=operation,
         db_path=db_path,
     )
-    if str(content["platform"]) == "douyin":
-        result = _parse_douyin_stage_payload(
-            "comments",
-            str(content["platform_content_id"]),
-            stored.value,
-            status=stored.http_status or 200,
-        )
-    else:
-        result = _parse_xhs_stage_payload(
-            "comments",
-            str(content["platform_content_id"]),
-            str(content["content_type"]),
-            stored.value,
-            status=stored.http_status or 200,
-        )
+    result = _parse_content_payload(str(content["platform"]), "comments",
+        str(content["platform_content_id"]), str(content["content_type"]),
+        stored.value, status=stored.http_status or 200,
+        expected_uid=str(content.get("raw_account_uid") or "") or None)
     return PageFetch(
         raw_response_id=int(stored.raw_response_id),
         fetch_slot_id=int(stored.slot_id),
@@ -3244,7 +3437,13 @@ def _zero_comment_metric_result(
     with connect(db_path) as connection:
         # Route-cycle and Matrix-date observations share the same field
         # selector; an exact legacy daily slot would hide fresh valid zeros.
-        selected = select_content_metrics(connection, [content_id]).get(content_id, {})
+        if connection.execute("PRAGMA user_version").fetchone()[0] < 20:
+            # Historical schema19 archives predate field facts. Installed
+            # schema20+ always use the single current policy, never v2 fallback.
+            from .source_routing import select_content_metrics as legacy_metrics
+            selected = legacy_metrics(connection, [content_id]).get(content_id, {})
+        else:
+            selected = select_current_content_metrics(connection, [content_id]).get(content_id, {})
         field = selected.get("fields", {}).get("comment_count", {})
         if (field.get("value") != 0 or field.get("status") != "provided"
                 or field.get("freshness") != "fresh" or not field.get("raw_response_id")
@@ -3360,17 +3559,8 @@ def _live_comment_page_fetcher(
         try:
             platform = str(content["platform"])
             platform_content_id = str(content["platform_content_id"])
-            if platform == "douyin":
-                _, request_params = _douyin_request(
-                    "comments", platform_content_id, cursor
-                )
-            else:
-                _, request_params = _xhs_request(
-                    "comments",
-                    platform_content_id,
-                    str(content["content_type"]),
-                    cursor=cursor,
-                )
+            request_params = _content_request_params(platform, "comments", _content_subject(content),
+                str(content["content_type"]), cursor=cursor)
             outcome = execute_content_fetch(
                 request_transport=_freeze_tikhub_transport(call_override),
                 content_id=content_id,
@@ -3436,10 +3626,12 @@ def capture_content_comments_live(
         raise ProviderConfigurationError("内容不存在")
     content = dict(row)
     platform = str(content["platform"])
-    if platform not in {"douyin", "xiaohongshu"}:
+    if platform not in SUPPORTED_CONTENT_PLATFORMS:
         raise ProviderConfigurationError(
-            "视频号和快手首版只支持人工导入，未配置自动数据源"
+            f"未配置该平台的自动数据源：{platform}"
         )
+    if (platform, "comments") not in STAGE_CONFIG:
+        raise ProviderConfigurationError(f"{platform} comment capture contract is not configured")
     local_date = as_of or datetime.now(SHANGHAI).date()
     iso = local_date.isocalendar()
     window_key = f"{iso.year}-W{iso.week:02d}"
@@ -3664,9 +3856,9 @@ def update_content_data(
             ).fetchall()
         }
     platform = str(content["platform"])
-    if platform not in {"douyin", "xiaohongshu"}:
+    if platform not in SUPPORTED_CONTENT_PLATFORMS:
         raise ProviderConfigurationError(
-            "视频号和快手首版只支持人工导入，未配置自动数据源"
+            f"未配置该平台的自动数据源：{platform}"
         )
     local_date = as_of or datetime.now(SHANGHAI).date()
     iso = local_date.isocalendar()
@@ -3687,9 +3879,10 @@ def update_content_data(
             ("comments", f"{iso.year}-W{iso.week:02d}"),
         ]
     )
+    requested_stages = [entry for entry in requested_stages if (platform, entry[0]) in STAGE_CONFIG]
     if stages is not None:
         requested = set(stages)
-        invalid = requested - {"detail", "metrics", "comments"}
+        invalid = requested - {stage for candidate, stage in STAGE_CONFIG if candidate == platform}
         if invalid:
             raise ProviderConfigurationError(
                 f"未知抓取阶段：{','.join(sorted(invalid))}"
@@ -3701,14 +3894,13 @@ def update_content_data(
             and {"detail", "metrics"}.issubset(requested)
         ):
             requested_stages.insert(0, ("detail", "lifetime"))
-    paired_xhs_detail_metrics = (
-        platform == "xiaohongshu"
-        and stages is not None
-        and {"detail", "metrics"}.issubset(set(stages))
+    paired_detail_metrics = (
+        platform in {"xiaohongshu", "kuaishou", "wechat_channels"}
+        and {"detail", "metrics"}.issubset({stage for stage, _window in requested_stages})
     )
     outcomes: List[Dict[str, Any]] = []
-    xhs_detail_metrics: Optional[Mapping[str, Any]] = None
-    xhs_detail_raw_response_id: Optional[int] = None
+    shared_detail_metrics: Optional[Mapping[str, Any]] = None
+    shared_detail_raw_response_id: Optional[int] = None
     for stage, window_key in requested_stages:
         if stage == "comments":
             try:
@@ -3793,7 +3985,7 @@ def update_content_data(
             succeeded_provider == "legacy-cache"
             or (raw_is_applied and storage_is_ready)
         ):
-            if paired_xhs_detail_metrics and stage == "detail":
+            if paired_detail_metrics and stage == "detail":
                 try:
                     outcome = _replay_content_stage(
                         content,
@@ -3807,8 +3999,8 @@ def update_content_data(
                     )
                     detail_metrics = outcome.data.get("metrics")
                     if isinstance(detail_metrics, dict):
-                        xhs_detail_metrics = detail_metrics
-                        xhs_detail_raw_response_id = int(outcome.raw_response_id)
+                        shared_detail_metrics = detail_metrics
+                        shared_detail_raw_response_id = int(outcome.raw_response_id)
                     outcomes.append(
                         {
                             "stage": stage,
@@ -3854,8 +4046,8 @@ def update_content_data(
                 if platform == "xiaohongshu" and stage == "detail":
                     detail_metrics = outcome.data.get("metrics")
                     if isinstance(detail_metrics, dict):
-                        xhs_detail_metrics = detail_metrics
-                        xhs_detail_raw_response_id = int(outcome.raw_response_id)
+                        shared_detail_metrics = detail_metrics
+                        shared_detail_raw_response_id = int(outcome.raw_response_id)
                 outcomes.append(
                     {
                         "stage": stage,
@@ -3940,23 +4132,23 @@ def update_content_data(
                 break
         derived_xhs_detail = type_probe is not None and content["content_type"] == "image"
 
-        derived_xhs_metrics = (
-            platform == "xiaohongshu"
+        derived_shared_metrics = (
+            platform in {"xiaohongshu", "kuaishou", "wechat_channels"}
             and stage == "metrics"
-            and xhs_detail_metrics is not None
+            and shared_detail_metrics is not None
         )
-        if paired_xhs_detail_metrics and stage == "metrics" and not derived_xhs_metrics:
+        if paired_detail_metrics and stage == "metrics" and not derived_shared_metrics:
             outcomes.append(
                 {
                     "stage": stage,
                     "status": "failed",
-                    "error_code": "xhs_detail_metrics_missing",
+                    "error_code": "shared_detail_metrics_missing",
                     "retryable": False,
-                    "message": "小红书详情未返回可派生指标；未发起未报价的第二次调用",
+                    "message": "详情未返回本次所需指标，请核对已保存的原始响应。",
                 }
             )
             continue
-        if cache_only and not (derived_xhs_metrics or derived_xhs_detail):
+        if cache_only and not (derived_shared_metrics or derived_xhs_detail):
             outcomes.append(
                 {
                     "stage": stage,
@@ -3976,7 +4168,7 @@ def update_content_data(
             continue
         budget_id = (
             None
-            if derived_xhs_metrics or derived_xhs_detail
+            if derived_shared_metrics or derived_xhs_detail
             else _budget_for_call(
                 provider=provider,
                 operation=operation,
@@ -4004,20 +4196,25 @@ def update_content_data(
                     source_sha256=str(probe_raw["sha256"]),
                     source_captured_at=str(probe_raw["captured_at"]),
                 )
-            elif derived_xhs_metrics:
+            elif derived_shared_metrics:
                 adapter_version = "tikhub-xhs-app-v2-statistics-derived-v8.1"
-                metrics = dict(xhs_detail_metrics or {})
-                if xhs_detail_raw_response_id is None:
+                metrics = dict(shared_detail_metrics or {})
+                if shared_detail_raw_response_id is None:
                     raise ProviderConfigurationError("小红书详情指标缺少原始响应")
                 source_captured_at = _raw_response_captured_at(
-                    xhs_detail_raw_response_id, db_path=db_path
+                    shared_detail_raw_response_id, db_path=db_path
                 )
-                call = partial(
-                    _derived_xhs_metrics_result,
-                    metrics,
-                    xhs_detail_raw_response_id,
-                    source_captured_at,
-                )
+                if platform == "xiaohongshu":
+                    call = partial(_derived_xhs_metrics_result, metrics, shared_detail_raw_response_id, source_captured_at)
+                else:
+                    with connect(db_path) as connection:
+                        source_sha = connection.execute("SELECT sha256 FROM provider_raw_responses WHERE id=?",
+                            (shared_detail_raw_response_id,)).fetchone()[0]
+                    adapter_version = f"tikhub-{platform}-detail-derived-metrics-v1"
+                    call = partial(_derived_discovery_result, stage="metrics", data=metrics,
+                        discovery_operation=STAGE_CONFIG[(platform, "detail")][2],
+                        source_raw_response_id=shared_detail_raw_response_id, source_sha256=source_sha,
+                        source_captured_at=source_captured_at)
             elif call_override is not None:
                 override_content = dict(content)
                 if platform == "xiaohongshu" and stage == "detail":
@@ -4026,22 +4223,12 @@ def update_content_data(
                         _xhs_endpoint="get_video_note_detail" if content["content_type"] == "video" else "get_image_note_detail",
                     )
                 call = partial(call_override, stage, override_content)
-            elif platform == "douyin":
-                key = _load_key(TIKHUB_KEY_FILE, "TIKHUB_API_KEY")
-                call = partial(
-                    _douyin_call, stage, str(content["platform_content_id"]), key
-                )
             else:
                 key = _load_key(TIKHUB_KEY_FILE, "TIKHUB_API_KEY")
-                call = partial(
-                    _xhs_call,
-                    stage,
-                    str(content["platform_content_id"]),
-                    key,
-                    str(content["content_type"]),
-                )
-            if derived_xhs_metrics or derived_xhs_detail:
-                source_raw_id = type_probe.raw_response_id if derived_xhs_detail and type_probe is not None else xhs_detail_raw_response_id
+                call = partial(_content_call, platform, stage, _content_subject(content),
+                    key, str(content["content_type"]), expected_uid=str(content.get("raw_account_uid") or "") or None)
+            if derived_shared_metrics or derived_xhs_detail:
+                source_raw_id = type_probe.raw_response_id if derived_xhs_detail and type_probe is not None else shared_detail_raw_response_id
                 assert source_raw_id is not None
                 outcome = execute_derived_content_fetch(
                     content_id=content_id, stage=stage, window_key=window_key,
@@ -4051,14 +4238,7 @@ def update_content_data(
                 )
             else:
                 platform_content_id = str(content["platform_content_id"])
-                if platform == "douyin":
-                    _, request_params = _douyin_request(stage, platform_content_id)
-                else:
-                    _, request_params = _xhs_request(
-                        stage,
-                        platform_content_id,
-                        str(content["content_type"]),
-                    )
+                request_params = _content_request_params(platform, stage, _content_subject(content), str(content["content_type"]))
                 outcome = execute_content_fetch(
                     request_transport=_freeze_tikhub_transport(call_override),
                     content_id=content_id,
@@ -4084,11 +4264,11 @@ def update_content_data(
                     ),
                 )
             _store_stage_result(content, stage, window_key, outcome, db_path=db_path)
-            if platform == "xiaohongshu" and stage == "detail":
+            if platform in {"xiaohongshu", "kuaishou", "wechat_channels"} and stage == "detail":
                 detail_metrics = outcome.data.get("metrics")
                 if isinstance(detail_metrics, dict):
-                    xhs_detail_metrics = detail_metrics
-                    xhs_detail_raw_response_id = int(outcome.raw_response_id)
+                    shared_detail_metrics = detail_metrics
+                    shared_detail_raw_response_id = int(outcome.raw_response_id)
             outcomes.append(
                 {
                     "stage": stage,
@@ -4208,7 +4388,7 @@ def update_content_data(
         failed = True
     if (
         duplicate_result is not None
-        and duplicate_result.get("status") == "retryable_failed"
+        and (duplicate_result.get("status") == "retryable_failed" or _duplicate_pending(duplicate_result))
     ):
         failed = True
     return {
@@ -4224,6 +4404,10 @@ def update_content_data(
         ),
         "currency": "USD",
     }
+
+
+def _duplicate_pending(result: Optional[Mapping[str, Any]]) -> bool:
+    return result is not None and result.get("relation_status") in {"pending", "failed"}
 
 
 def update_content_data_manual(
@@ -4298,7 +4482,7 @@ def update_content_data_manual(
             media_result = {"status": "retryable_failed", "reason": str(getattr(error, "error_code", type(error).__name__))}
     return {
         "content_id": content_id,
-        "status": "partial" if any(item["status"] != "succeeded" for item in results) or metrics["status"] != "succeeded" else "succeeded",
+        "status": "partial" if any(item["status"] != "succeeded" for item in results) or metrics["status"] != "succeeded" or _duplicate_pending(duplicate_result) else "succeeded",
         "stages": [stage for item in results for stage in item.get("stages", [])],
         "metrics": metrics, "media": media_result, "duplicates": duplicate_result,
         "evaluation_id": evaluation_result.evaluation_id if evaluation_result else None,
@@ -4392,7 +4576,9 @@ def retry_content_media(
         duplicates = refresh_content_duplicates(content_id, db_path=db_path)
         return {
             "content_id": content_id,
-            "status": str(local.get("status")),
+            "status": "partial" if _duplicate_pending(duplicates) else str(local.get("status")),
+            "media_complete": local.get("status") == "evidence_ready",
+            "relation_status": duplicates.get("relation_status", "ready"),
             "media": local,
             "evaluation_id": evaluation.evaluation_id,
             "evaluation_created": evaluation.created,
@@ -4433,13 +4619,14 @@ def retry_content_media(
             raise ProviderConfigurationError("内容不存在")
         content = dict(row)
     platform = str(content["platform"])
-    if platform not in {"douyin", "xiaohongshu"}:
-        raise ProviderConfigurationError("视频号和快手未配置自动媒体源刷新")
+    if platform not in SUPPORTED_CONTENT_PLATFORMS:
+        raise ProviderConfigurationError(f"未配置该平台的自动媒体源刷新：{platform}")
     provider, _, operation, price = STAGE_CONFIG[(platform, "detail")]
     adapter_version = (
         "tikhub-media-source-refresh-v8.1"
         if platform == "douyin"
-        else "tikhub-xhs-app-v2-media-source-refresh-v8.1"
+        else "tikhub-xhs-app-v2-media-source-refresh-v8.1" if platform == "xiaohongshu"
+        else f"tikhub-{platform}-media-source-refresh-v1"
     )
     budget_id = _budget_for_call(
         provider=provider,
@@ -4451,28 +4638,12 @@ def retry_content_media(
     )
     if call_override is not None:
         call = partial(call_override, "detail", content)
-    elif platform == "douyin":
-        call = partial(
-            _douyin_call,
-            "detail",
-            str(content["platform_content_id"]),
-            _load_key(TIKHUB_KEY_FILE, "TIKHUB_API_KEY"),
-        )
     else:
-        call = partial(
-            _xhs_call,
-            "detail",
-            str(content["platform_content_id"]),
-            _load_key(TIKHUB_KEY_FILE, "TIKHUB_API_KEY"),
-            str(content["content_type"]),
-        )
+        call = partial(_content_call, platform, "detail", str(content["platform_content_id"]),
+            _load_key(TIKHUB_KEY_FILE, "TIKHUB_API_KEY"), str(content["content_type"]),
+            expected_uid=str(content.get("raw_account_uid") or "") or None)
     platform_content_id = str(content["platform_content_id"])
-    if platform == "douyin":
-        _, request_params = _douyin_request("detail", platform_content_id)
-    else:
-        _, request_params = _xhs_request(
-            "detail", platform_content_id, str(content["content_type"])
-        )
+    request_params = _content_request_params(platform, "detail", platform_content_id, str(content["content_type"]))
     outcome = execute_content_fetch(
         request_transport=_freeze_tikhub_transport(call_override),
         content_id=content_id,
@@ -4529,7 +4700,9 @@ def retry_content_media(
     duplicates = refresh_content_duplicates(content_id, db_path=db_path)
     return {
         "content_id": content_id,
-        "status": str(media.get("status")),
+        "status": "partial" if _duplicate_pending(duplicates) else str(media.get("status")),
+        "media_complete": media.get("status") == "evidence_ready",
+        "relation_status": duplicates.get("relation_status", "ready"),
         "media": media,
         "evaluation_id": evaluation.evaluation_id,
         "evaluation_created": evaluation.created,

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, type ReactNode } from "react";
+import { Fragment, useEffect, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { canAccessAccounts } from "../lib/accountAccess";
 import { publicAssetPath } from "../lib/paths";
@@ -24,5 +24,7 @@ export default function AccountPageAccess({ children }: { children: ReactNode })
     </AppShell>;
   }
 
-  return children;
+  // Local placeholder/error snapshots must obey the same scope as QueryClient.
+  const scope = JSON.stringify([session.data?.username, session.data?.role, session.data?.bypass === true]);
+  return <Fragment key={scope}>{children}</Fragment>;
 }

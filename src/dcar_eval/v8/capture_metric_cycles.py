@@ -7,7 +7,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, time, timedelta, timezone
+from types import MappingProxyType
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
@@ -22,6 +25,55 @@ CONTRACT = "capture-runtime-v1"
 _BINDINGS = ("activation_id", "profile_id", "activation_sha256",
              "roster_snapshot_id", "roster_members_sha256")
 _MEMBER = ("identity_id", "account_id", "platform", "uid")
+_PLANNING_PLANS: ContextVar[dict[str, Any] | None] = ContextVar("metric_cycle_planning_plans", default=None)
+
+
+@contextmanager
+def planning_validation(connection: sqlite3.Connection, *, plan: Mapping[str, Any] | None = None):
+    """Reuse parsed immutable plans only in this verified writer transaction.
+
+    Every access still compares the exact persisted JSON, hash, mode and day.
+    A caller cannot retain this cache across a page, connection or transaction.
+    Account eligibility and old work/slot ownership are never cached here.
+    """
+    if not connection.in_transaction:
+        raise ValueError("metric cycle planning requires a transaction")
+    token = _PLANNING_PLANS.set({"connection": connection, "plans": {}})
+    try:
+        bound = None
+        if plan is not None:
+            stored = _stored_plan(connection, plan["id"])
+            if planning.canonical(stored) != planning.canonical(dict(plan)):
+                raise ValueError("planning input differs from persisted source plan")
+            bound = _immutable_json(stored)
+            _PLANNING_PLANS.get()["bound_plan"] = bound
+        yield bound
+        if not connection.in_transaction:
+            raise ValueError("metric cycle planning transaction ended")
+    finally:
+        _PLANNING_PLANS.reset(token)
+
+
+def _immutable_json(value: Any) -> Any:
+    if isinstance(value, dict):
+        return MappingProxyType({key: _immutable_json(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_immutable_json(item) for item in value)
+    return value
+
+
+def _same_plan(connection: sqlite3.Connection, stored: dict[str, Any], supplied: Mapping[str, Any]) -> bool:
+    """Only the page's deeply immutable, verified binding skips serialization.
+
+    Mutable inputs retain the original strict canonical JSON comparison; object
+    identity or a caller-supplied digest cannot prove such an input is unchanged.
+    """
+    context = _PLANNING_PLANS.get()
+    if (context is not None and context["connection"] is connection and connection.in_transaction
+            and supplied is context.get("bound_plan")
+            and context["plans"].get(stored["id"], (None, None))[1] is stored):
+        return True
+    return planning.canonical(stored) == planning.canonical(dict(supplied))
 
 
 def _time(value: str) -> datetime:
@@ -41,12 +93,53 @@ def _stored_plan(connection: sqlite3.Connection, plan_id: int) -> dict[str, Any]
     row = connection.execute("SELECT * FROM capture_source_plans WHERE id=?", (plan_id,)).fetchone()
     if row is None or row["mode"] != "active":
         raise ValueError("source plan is absent or inactive")
+    context = _PLANNING_PLANS.get()
+    cache = (context["plans"] if context is not None and context["connection"] is connection
+             and connection.in_transaction else None)
+    signature = (row["payload_json"], row["plan_sha256"], row["mode"], row["business_day"])
+    if cache is not None and plan_id in cache:
+        previous_signature, previous_plan = cache[plan_id]
+        if previous_signature != signature:
+            raise ValueError("source plan changed during planning")
+        return previous_plan
     payload = json.loads(row["payload_json"])
     if (payload.get("shadow") is not False or payload.get("contract_version") != CONTRACT
             or payload["business_day"] != row["business_day"]
             or planning.digest(payload) != row["plan_sha256"]):
         raise ValueError("source plan evidence differs")
-    return {"id": row["id"], **payload}
+    result = {"id": row["id"], **payload}
+    if cache is not None:
+        cache[plan_id] = (signature, result)
+    return result
+
+
+def verified_planning_plan(connection: sqlite3.Connection, plan_id: int) -> dict[str, Any]:
+    """Share this page's validated evidence, retaining the exact database fence."""
+    context = _PLANNING_PLANS.get()
+    if (context is None or context["connection"] is not connection or not connection.in_transaction
+            or context.get("bound_plan", {}).get("id") != plan_id):
+        raise ValueError("source plan has no active immutable planning binding")
+    return _stored_plan(connection, plan_id)
+
+
+def require_planning_comparison(connection: sqlite3.Connection,
+                                original_plan: Mapping[str, Any],
+                                comparison_plan: Mapping[str, Any]) -> None:
+    """Bind a planning loop to this transaction's exact immutable comparison.
+
+    Recheck the persisted signature and the original JSON once before any
+    writes. Equal-looking copies, stale contexts and mutated caller inputs are
+    not proof that the two representations still describe the same plan.
+    """
+    context = _PLANNING_PLANS.get()
+    if (context is None or context["connection"] is not connection
+            or not connection.in_transaction
+            or comparison_plan is not context.get("bound_plan")
+            or not isinstance(original_plan, dict)):
+        raise ValueError("planning comparison has no current immutable binding")
+    stored = verified_planning_plan(connection, original_plan.get("id"))
+    if not _same_plan(connection, stored, original_plan):
+        raise ValueError("planning input differs from its immutable comparison")
 
 
 def _business_active(connection: sqlite3.Connection, content_id: int, at: datetime) -> bool:
@@ -74,7 +167,7 @@ Catalog eligibility deliberately does not reuse the old accounts.enabled flag.
     try:
         now = _time(at)
         current_plan = _stored_plan(connection, plan["id"])
-        if planning.canonical(current_plan) != planning.canonical(dict(plan)):
+        if not _same_plan(connection, current_plan, plan):
             return True
         active = profile_activations.activation_at(connection, at)
         local = now.astimezone(BEIJING)

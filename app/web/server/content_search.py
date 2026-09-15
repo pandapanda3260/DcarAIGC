@@ -108,11 +108,40 @@ def search(payload: Any, db_path: Path, api: Any, storage: Any) -> dict[str, Any
         )
 
 
-def verify_database(db_path: Path, project_root: Path) -> None:
-    from v8.runtime_database import DatabaseAccessMode, resolve_installed_database_access
+def verify_database(db_path: Path, project_root: Path) -> tuple[Any, ...] | None:
+    from v8.runtime_database import DatabaseAccessMode, resolve_installed_database_access, resolve_read_only_replica
+    mode = os.environ.get("DCAR_CONTENT_DATA_MODE", "formal")
+    if mode == "snapshot":
+        from v8 import api, artifact_paths, storage
+        from v8.reader_readiness import database_version
+        # The mode selects the existing replica verifier; it grants no access
+        # without a protected, completed installation bound to these bytes.
+        access = resolve_read_only_replica(db_path)
+        before = database_version(access.database)
+        if Path(str(access.database) + "-wal").exists():
+            raise RuntimeError("snapshot must not have an unsealed WAL")
+        installed = artifact_paths.installed_snapshot()
+        if installed is None:
+            raise RuntimeError("snapshot installation receipt required")
+        receipt = installed["receipt"]
+        if (receipt.get("schema") != "dcar-read-replica-install-receipt-v1"
+                or receipt.get("activation_status") != "succeeded"):
+            raise RuntimeError("snapshot installation is not verified")
+        digest = api._file_sha256(access.database)
+        with storage.connect(access.database, read_only=True) as connection:
+            storage.require_schema_compatibility(connection, supported_versions=frozenset({19, 20, 21, 22, 23, 24}))
+            identity = api._database_state(connection)["runtime_identity"]
+        if (receipt.get("database_sha256", {}).get("dcar_insight.sqlite3") != digest
+                or receipt.get("runtime_identity") != identity
+                or database_version(access.database) != before):
+            raise RuntimeError("snapshot installation does not bind this database")
+        return before
+    if mode != "formal":
+        raise RuntimeError("unsupported content database mode")
     resolve_installed_database_access(
         DatabaseAccessMode.FORMAL_READ, database=db_path, project_root=project_root,
     )
+    return None
 
 
 def _timeout(_signal: int, _frame: Any) -> None:

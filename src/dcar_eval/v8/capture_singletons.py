@@ -5,6 +5,7 @@ discovery works are response data and never become pre-send batch members.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from typing import Any
 
@@ -17,7 +18,7 @@ def attempt_slot_sql(connection: sqlite3.Connection, alias: str = "fa") -> str:
     """Only one actual send marker may carry a batch attempt's legacy slot."""
     if alias not in {"fa", "a"}:
         raise ValueError("unsupported attempt alias")
-    if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
+    if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21, 22, 23, 24}:
         return f"{alias}.slot_id"
     return (f"COALESCE({alias}.slot_id,(SELECT CASE WHEN count(*)=1 THEN min(d.fetch_slot_id) END "
             f"FROM paid_provider_dispatch_events d WHERE d.fetch_attempt_id={alias}.id "
@@ -26,7 +27,7 @@ def attempt_slot_sql(connection: sqlite3.Connection, alias: str = "fa") -> str:
 
 def freeze(connection: sqlite3.Connection, *, request: PaidRequestIdentity,
            scope: PaidScope, at: str) -> tuple[int, int]:
-    if not connection.in_transaction or connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
+    if not connection.in_transaction or connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21, 22, 23, 24}:
         raise ValueError("singleton freeze requires schema20 writer transaction")
     route = planning.require_send_route(connection, scope=scope,
                                         operation=request.document["operation"], at=at)
@@ -40,9 +41,17 @@ def freeze(connection: sqlite3.Connection, *, request: PaidRequestIdentity,
     batch = connection.execute("SELECT * FROM fetch_request_batches WHERE request_scope_identity=? AND sequence=?",
                                (request.scope_identity, request.sequence)).fetchone()
     assert batch is not None
-    connection.execute("""INSERT OR IGNORE INTO fetch_request_batch_members(batch_id,member_scope_identity,
-        sequence,content_id,account_id) VALUES(?,?,?,?,?)""",
-        (batch["id"], member, request.sequence, scope.content_id, scope.account_id))
+    intake_id = getattr(scope, "intake_request_id", None)
+    if intake_id is not None:
+        if connection.execute("PRAGMA user_version").fetchone()[0] not in {22, 23, 24}:
+            raise PaidScopeBlocked("batch_identity_invalid", "Intake singleton requires schema22")
+        connection.execute("""INSERT OR IGNORE INTO fetch_request_batch_members(batch_id,member_scope_identity,
+            sequence,content_id,account_id,intake_request_id) VALUES(?,?,?,NULL,NULL,?)""",
+            (batch["id"], member, request.sequence, intake_id))
+    else:
+        connection.execute("""INSERT OR IGNORE INTO fetch_request_batch_members(batch_id,member_scope_identity,
+            sequence,content_id,account_id) VALUES(?,?,?,?,?)""",
+            (batch["id"], member, request.sequence, scope.content_id, scope.account_id))
     validate(connection, batch_id=batch["id"], request=request, assignment_id=route["id"], scope=scope, at=at)
     return int(batch["id"]), int(route["id"])
 
@@ -59,8 +68,11 @@ def validate(connection: sqlite3.Connection, *, batch_id: int, request: PaidRequ
         raise PaidScopeBlocked("batch_identity_invalid", "Singleton request or frozen membership changed")
     member = members[0]
     member_hash = usage_settlements.member_identity(request.document)
+    intake_id = getattr(scope, "intake_request_id", None)
     if (member["member_scope_identity"] != member_hash or member["sequence"] != request.sequence
-            or member["content_id"] != scope.content_id or member["account_id"] != scope.account_id):
+            or member["content_id"] != (None if intake_id is not None else scope.content_id)
+            or member["account_id"] != (None if intake_id is not None else scope.account_id)
+            or (member["intake_request_id"] if "intake_request_id" in member.keys() else None) != intake_id):
         raise PaidScopeBlocked("batch_identity_invalid", "Singleton member target or paid identity changed")
     with planning.execution_route_context(assignment_id):
         route = planning.require_send_route(connection, scope=scope, operation=batch["operation"], at=at)
@@ -70,13 +82,19 @@ def validate(connection: sqlite3.Connection, *, batch_id: int, request: PaidRequ
 
 
 def validate_raw_target(connection: sqlite3.Connection, *, batch_id: int,
-                        content_id: int | None, account_id: int | None) -> None:
-    rows = connection.execute("""SELECT m.content_id,m.account_id FROM fetch_request_batch_members m
+                        content_id: int | None, account_id: int | None,
+                        intake_request_id: int | None = None) -> None:
+    schema22 = connection.execute("PRAGMA user_version").fetchone()[0] in {22, 23, 24}
+    intake_column = "m.intake_request_id" if schema22 else "NULL intake_request_id"
+    rows = connection.execute(f"""SELECT m.content_id,m.account_id,{intake_column} FROM fetch_request_batch_members m
         JOIN fetch_request_batches b ON b.id=m.batch_id WHERE m.batch_id=? AND b.work_id IS NULL""", (batch_id,)).fetchall()
-    # Content slots retain content only in raw; account membership remains in m.
-    if (len(rows) != 1 or rows[0]["content_id"] != content_id
+    # The raw preserves the original intake target after its account is bound.
+    # Content slots similarly retain content only, while membership has account.
+    if (len(rows) != 1 or rows[0]["intake_request_id"] != intake_request_id
+            or rows[0]["content_id"] != content_id
             or (content_id is None and rows[0]["account_id"] != account_id)
-            or (content_id is not None and account_id is not None)):
+            or (content_id is not None and account_id is not None)
+            or (intake_request_id is not None and (content_id is not None or account_id is not None))):
         raise PaidScopeBlocked("batch_identity_invalid", "Singleton raw target differs from requested member")
 
 
@@ -95,9 +113,26 @@ def record_disposition(connection: sqlite3.Connection, *, batch_id: int, attempt
         "fetch_attempt_id": attempt_id, "raw_response_id": raw_response_id, "reason": reason,
         "disposition": disposition, "requested_content_id": members[0]["content_id"],
         "requested_account_id": members[0]["account_id"]})
+    if "intake_request_id" in members[0].keys() and members[0]["intake_request_id"] is not None:
+        evidence = planning.canonical({**json.loads(evidence),
+            "requested_intake_request_id": members[0]["intake_request_id"]})
     previous = connection.execute("SELECT * FROM fetch_request_member_dispositions WHERE member_id=?", (members[0]["id"],)).fetchone()
     if previous is not None and previous["evidence_json"] != evidence:
         raise PaidScopeBlocked("batch_identity_invalid", "Singleton disposition is immutable")
     connection.execute("""INSERT OR IGNORE INTO fetch_request_member_dispositions(member_id,disposition,
         raw_response_id,evidence_json,recorded_at) VALUES(?,?,?,?,?)""",
         (members[0]["id"], disposition, raw_response_id, evidence, at))
+
+
+def effective_disposition(connection: sqlite3.Connection, *, member_id: int, raw_response_id: int) -> str:
+    """Derive recovery usability without updating an immutable failed disposition."""
+    row = connection.execute("SELECT * FROM fetch_request_member_dispositions WHERE member_id=?", (member_id,)).fetchone()
+    if row is None:
+        return "missing"
+    if row["disposition"] == "valid" and row["raw_response_id"] == raw_response_id:
+        return "valid"
+    if row["disposition"] == "unusable":
+        from .capture_transport_recovery import recovered_member
+        if recovered_member(connection, member_id=member_id, raw_response_id=raw_response_id):
+            return "valid_by_entity_recovery"
+    return str(row["disposition"])

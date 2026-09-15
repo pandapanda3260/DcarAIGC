@@ -130,5 +130,51 @@ class ProcessCommandsTest(unittest.TestCase):
                     self.assertEqual(connection.execute("SELECT count(*) FROM provider_usage").fetchone()[0], 0)
 
 
+class TerminalCommandResultsV23Test(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.connection = connect(Path(temporary.name).resolve() / "commands.sqlite3")
+        self.addCleanup(self.connection.close)
+        initialize_database(self.connection, target_version=23)
+        self.at = "2026-09-13T03:00:00Z"
+
+    def command(self, reasons, *, initial_reason=""):
+        c = self.connection
+        route = c.execute("INSERT INTO capture_route_assignments(scope_type,scope_key,provider,operation,"
+            "generation,route,mode,effective_at,recorded_at,assignment_sha256) "
+            "VALUES('platform_operation','kuaishou','tikhub','kuaishou_video_statistics',1,"
+            "'integrated','active',?,?,?)", (self.at, self.at, "a" * 64)).lastrowid
+        ids = []
+        for index, reason in enumerate(reasons):
+            ids.append(c.execute("INSERT INTO capture_work_items(work_identity,assignment_id,provider,"
+                "operation,due_at,data_business_day,state,reason,envelope_json,created_at,updated_at,completed_at) "
+                "VALUES(?,?,'tikhub','kuaishou_video_statistics',?,'2026-09-13','terminal',?,'{}',?,?,?)",
+                (str(index + 1) * 64, route, self.at, reason, self.at, self.at, self.at)).lastrowid)
+        details = {"identity": {"specification": {"content_id": 101, "kind": "metrics_update"}},
+            "checkpoint": {"result": {"status": "queued", "work_ids": ids, "reason": initial_reason}}}
+        run = c.execute("INSERT INTO scheduler_runs(job_id,scheduled_for,status,started_at,completed_at,details_json) "
+            "VALUES(?,?,'succeeded',?,?,?)", (capture_commands.JOB, self.at, self.at, self.at,
+                json.dumps(details))).lastrowid
+        c.commit()
+        return run
+
+    def test_partial_shared_consumer_is_not_reported_as_all_success(self):
+        run = self.command(["", "shared_response_partial_metrics", "shared_response_partial_metrics"],
+            initial_reason="comments_capability_unavailable")
+        before = self.connection.total_changes
+        self.connection.execute("PRAGMA query_only=ON")
+        result = capture_commands.read_command(self.connection, run_id=run, content_id=101)
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["reason"], "comments_capability_unavailable;shared_response_partial_metrics")
+        self.assertEqual(result["provider_calls"], 0)
+        self.assertEqual(self.connection.total_changes, before)
+
+    def test_complete_linked_work_stays_successful(self):
+        run = self.command(["", ""])
+        result = capture_commands.read_command(self.connection, run_id=run, content_id=101)
+        self.assertEqual((result["status"], result["reason"]), ("succeeded", ""))
+
+
 if __name__ == "__main__":
     unittest.main()

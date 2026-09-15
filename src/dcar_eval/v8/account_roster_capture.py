@@ -61,6 +61,8 @@ _PLATFORM_OPERATIONS = {
         "xiaohongshu_note_detail",
         "xiaohongshu_note_statistics",
     },
+    "kuaishou": {"kuaishou_user_posts", "kuaishou_video_detail", "kuaishou_video_statistics"},
+    "wechat_channels": {"wechat_channels_user_posts", "wechat_channels_video_detail", "wechat_channels_video_statistics", "wechat_channels_video_comments"},
 }
 
 
@@ -817,7 +819,7 @@ def _prepare(
     from .profile_control import CONTROL_CONTRACT, _next_midnight
 
     _require(
-        connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21},
+        connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21, 22, 23, 24},
         "当前数据库不支持名单资格继承",
     )
     evidence = release._installed_evidence(connection, at=timestamp)

@@ -5,13 +5,13 @@
 .tableScroll { border: 1px solid var(--line); border-radius: 10px; }
 table.memberTable { width: 100%; min-width: 1180px !important; table-layout: fixed; border-collapse: separate; border-spacing: 0; }
 .accountPanel:global(.has-read-error) .tableScroll { overflow-x: hidden; }
-.accountColumn { width: 25%; }
-.rosterColumn { width: 10%; }
-.phoneColumn { width: 10%; }
-.metricColumn { width: 7%; }
-.operatorColumn { width: 10%; }
-.classificationColumn { width: 14%; }
-.actionsColumn { width: 10%; }
+.accountColumn { width: auto; }
+.rosterColumn { width: 132px; }
+.phoneColumn { width: 116px; }
+.metricColumn { width: 76px; }
+.operatorColumn { width: 90px; }
+.classificationColumn { width: 144px; }
+.actionsColumn { width: 264px; }
 .memberTable thead th { position: static; width: auto; height: 30px; padding: 6px 12px; border: 0; border-right: 1px solid #e7ecee; border-bottom: 1px solid var(--line); background: #f6f8f9; color: #35474f; text-align: center; font-size: 12px; font-weight: 600; white-space: nowrap; line-height: 18px; letter-spacing: 0; }
 .memberTable thead tr:first-child > th:last-child { border-right: 0; }
 .memberTable thead .accountHeading { padding-left: 20px; text-align: left; }
@@ -30,9 +30,10 @@ table.memberTable { width: 100%; min-width: 1180px !important; table-layout: fix
 .platformBadge .platformMark { width: 15px; height: 15px; border-radius: 3px; }
 .identityCopy { flex: 1; min-width: 0; }
 .identityCopy > strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); font-size: 13px; font-weight: 600; line-height: 20px; }
-.identityMeta { display: flex; flex-wrap: wrap; align-items: center; gap: 3px; margin-top: 5px; color: #687880; font-size: 11px; font-weight: 400; line-height: 17px; white-space: nowrap; }
-.uid { min-width: 0; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
-.shortId { min-width: 0; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.identityMeta { display: grid; gap: 2px; margin-top: 4px; color: #687880; font-size: 11px; font-weight: 400; line-height: 17px; }
+.identityLine { display: flex; align-items: center; gap: 3px; min-width: 0; }
+.identifierLabel { flex: none; white-space: nowrap; }
+.uid, .shortId { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .copyButton { display: inline-grid; place-items: center; width: 16px; height: 16px; flex: 0 0 16px; padding: 0; border: 0; border-radius: 4px; background: transparent; color: #91a0a6; }
 .copyButton svg { width: 13px; height: 13px; }
 .copyButton:hover { background: #e9eff0; color: var(--navy); }
@@ -40,17 +41,18 @@ table.memberTable { width: 100%; min-width: 1180px !important; table-layout: fix
 .status svg { width: 5px; height: 5px; flex: 0 0 5px; color: currentColor; }
 .memberTable .status[data-state="daily"] { background: #edf8f4; color: #247b69; }
 .memberTable .status[data-state="weekly"] { background: #edf3fb; color: #3c6da5; }
-.captureReason { display: block; max-width: 144px; margin: 5px auto 0; color: var(--muted); font-size: 11px; line-height: 16px; white-space: normal; overflow-wrap: anywhere; }
 .statusHelp { color: var(--muted); font-size: 12px; font-weight: 400; line-height: 1.6; }
 .memberTable .metric { color: #43545c; font-variant-numeric: tabular-nums; }
 .memberTable .localCount { color: var(--ink); font-weight: 500; }
 .phone { font-variant-numeric: tabular-nums; }
 .classification { overflow-wrap: anywhere; }
-.actions { display: flex; align-items: center; justify-content: center; gap: 6px; }
+.memberTable tbody .actionsCell { padding-right: 20px; }
+.actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 6px; }
+.actions > * { flex: 0 0 auto; }
 .editButton { min-height: 28px; padding: 3px 11px; border: 1px solid var(--navy); border-radius: 5px; background: var(--navy); color: #fff; font-size: 12px; font-weight: 600; white-space: nowrap; }
 .editButton:hover { background: #23424c; }
 .rowMenu { position: relative; }
-.rowMenu summary { display: grid; place-items: center; width: 24px; height: 28px; cursor: pointer; border-radius: 4px; color: var(--navy); list-style: none; }
+.rowMenu summary { display: grid; place-items: center; width: 28px; height: 28px; cursor: pointer; border-radius: 4px; color: var(--navy); list-style: none; }
 .rowMenu summary::-webkit-details-marker { display: none; }
 .rowMenu summary svg { width: 20px; height: 20px; }
 .rowMenu summary:hover, .rowMenu[open] summary { background: #e9eff0; }

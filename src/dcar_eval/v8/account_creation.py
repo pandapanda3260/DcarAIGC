@@ -18,6 +18,7 @@ from .account_operating_status import (
     ACCOUNT_STATUSES,
     ScheduleActivation,
     account_operating_status,
+    current_catalog_capture_status,
     update_account_operating_status_in_transaction,
 )
 from .account_roster import SYSTEM_SOURCE_FAMILY, RosterError, normalize_member
@@ -84,9 +85,14 @@ def replay_account_creation(
             result.pop(key, None)
     if result["account_status"] == "paused" or (catalog_policy is None and not result["enabled"]):
         result["activation_status"] = "disabled"
-    elif catalog_policy is not None and not result["enabled"]:
-        result["activation_status"] = "pending_verification"
-        result["automatic_capture"] = {"eligible": False, "reason_code": "pending_verification", "reason_label": "等待系统核验"}
+    if catalog_policy is not None:
+        result["activation_status"] = "catalog_managed"
+        result["automatic_capture"] = current_catalog_capture_status(connection, int(payload["account_identity_id"]))
+        result["message"] = (
+            "该新增请求此前已完成；账号后来已被修改，本次没有覆盖后续修改。"
+            if result["account_status"] != result["original_account_status"] else
+            "该新增请求此前已完成，本次未重复新增或修改。"
+        ) + "当前采集状态：" + result["automatic_capture"]["reason_label"] + "。"
     return result
 
 
@@ -202,7 +208,7 @@ def create_managed_account_in_transaction(
                 "SELECT identity_status,account_status FROM account_directory_rows WHERE account_id=?",
                 (existing["account_id"],),
             ).fetchone()
-            if directory is not None and directory["identity_status"] == "existing_verified" and directory["account_status"] in {"daily", "weekly"}:
+            if directory is not None and directory["identity_status"] == "existing_verified":
                 raise RosterError("system_member_exists", "账号已存在，请在账号页修改状态。")
         _check_profile_identity(connection, normalized, int(existing["identity_id"]) if existing else None)
         if existing is None:
@@ -225,7 +231,7 @@ def create_managed_account_in_transaction(
             admission={"member": normalized, "input": context, "action": action,
                        "active_snapshot_id": active_snapshot_id},
         )
-        if catalog_policy is not None and account_status != "paused":
+        if catalog_policy is not None:
             from .account_capture_eligibility import derive_capture_eligibility
             from .account_catalog_capture import materialize_proven_locators
             members = [row for row in derive_capture_eligibility(connection)["eligible_members"]

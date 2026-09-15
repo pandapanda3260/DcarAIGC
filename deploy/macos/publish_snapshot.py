@@ -53,10 +53,20 @@ EXPECTED_DATABASE_SCHEMA_MIGRATION = "dual-acquisition-profile-roster-v1"
 CLASSIFICATION_SCHEMA_VERSION = 21
 CLASSIFICATION_SCHEMA_MIGRATION = "account-classification-v1"
 CLASSIFICATION_PUBLICATION_CONTRACT = "account-classification-publication-v1"
+INTAKE_SCHEMA_VERSION = 22
+INTAKE_SCHEMA_MIGRATION = "unified-account-intake-v1"
+INTAKE_PUBLICATION_CONTRACT = "account-intake-publication-v1"
+FLOW_SCHEMA_VERSION = 23
+FLOW_SCHEMA_MIGRATION = "four-platform-forward-flow-v1"
+DUPLICATE_SCHEMA_VERSION = 24
+DUPLICATE_SCHEMA_MIGRATION = "duplicate-fingerprint-index-v1"
 SUPPORTED_SCHEMA_MIGRATIONS = {
     19: EXPECTED_DATABASE_SCHEMA_MIGRATION,
     20: "integrated-video-capture-v25",
     21: "account-classification-v1",
+    22: "unified-account-intake-v1",
+    23: "four-platform-forward-flow-v1",
+    24: "duplicate-fingerprint-index-v1",
 }
 EXPECTED_ACTIVE_RELEASE_ID = "evaluation-v9__selling-points-v5.2"
 EXPECTED_ACTIVE_RELEASE_STATUS = "active"
@@ -88,10 +98,16 @@ SOURCE_RECEIPT_FILENAME = "snapshot-source-receipt.json"
 FROZEN_ARTIFACT_DIRECTORY = "frozen-artifacts"
 FROZEN_ARTIFACT_CONTRACT = "snapshot-frozen-artifacts-v1"
 REMOTE_PROBE_SCHEMA = "dcar-remote-publisher-probe-v1"
+RECEIVER_BINDING_PATH = Path(__file__).resolve().parents[2] / "config/snapshot_receiver.json"
+RECEIVER_SOURCE_ROOT = "/var/www/dcar-aigc/receiver-releases/20260911-daily-pipeline-v2/source"
+RECEIVER_ENTRYPOINT = "deploy/server/install_snapshot.py"
 LEGACY_TRANSITION_SCHEMA = "dcar-schema17-to18-server-transition-v1"
 TRANSITION_SCHEMA = "dcar-schema18-to19-server-transition-v1"
 INTEGRATED_TRANSITION_SCHEMA = "dcar-schema19-to20-server-transition-v1"
 CLASSIFICATION_TRANSITION_SCHEMA = "dcar-schema20-to21-server-transition-v1"
+INTAKE_TRANSITION_SCHEMA = "dcar-schema21-to22-server-transition-v1"
+FLOW_TRANSITION_SCHEMA = "dcar-schema22-to23-server-transition-v1"
+DUPLICATE_TRANSITION_SCHEMA = "dcar-schema23-to24-server-transition-v1"
 AUTOMATIC_START_HOUR = 9
 AUTOMATIC_DEDUP_SECONDS = 1800
 WRITER_ENDPOINT_TIMEOUT_SECONDS = 120
@@ -177,7 +193,7 @@ class PublishConfig:
 
     @property
     def remote_installer(self) -> str:
-        return self.remote_project_root + "/deploy/server/install_snapshot.py"
+        return _receiver_binding()["source_root"] + "/" + RECEIVER_ENTRYPOINT
 
 
 @dataclass(frozen=True)
@@ -228,7 +244,7 @@ def _validate_runtime_identity(value: object, *, label: str,
         raise SnapshotPublishError(f"{label} runtime identity has an invalid shape")
     version = value.get("database_schema_version") if expected_schema is None else expected_schema
     if type(version) is not int or version not in SUPPORTED_SCHEMA_MIGRATIONS:
-        raise SnapshotPublishError(f"{label} requires explicit schema 19, 20 or 21")
+        raise SnapshotPublishError(f"{label} requires explicit schema 19, 20, 21, 22, 23 or 24")
     expected = {
         "schema": RUNTIME_IDENTITY_SCHEMA,
         "report_version": EXPECTED_REPORT_VERSION,
@@ -327,7 +343,7 @@ def _validate_snapshot_contract(value: object, *, label: str) -> dict[str, str]:
 def _require_current_config(config: PublishConfig) -> None:
     if config.expected_user_version not in SUPPORTED_SCHEMA_MIGRATIONS:
         raise SnapshotPublishError(
-            "normal publisher requires explicit schema 19, 20 or 21; "
+            "normal publisher requires explicit schema 19, 20, 21, 22, 23 or 24; "
             "the first version transition must use schema-upgrade"
         )
 
@@ -514,16 +530,29 @@ def _observed_publication_evidence(
     classification = _account_classification_publication_evidence(connection)
     if classification is not None:
         evidence["account_classification"] = classification
+    intake = _account_intake_publication_evidence(connection)
+    if intake is not None:
+        evidence["account_intake"] = intake
+    if connection.execute("PRAGMA user_version").fetchone()[0] in {23, 24}:
+        from v8.snapshot_schema_successor import publication_evidence
+        evidence.update(publication_evidence(connection))
     return evidence
 
 
 def _account_classification_publication_evidence(connection: sqlite3.Connection) -> dict[str, Any] | None:
     """Bind mutable directory labels without timestamp-only publication churn."""
-    if connection.execute("PRAGMA user_version").fetchone()[0] != CLASSIFICATION_SCHEMA_VERSION:
+    version = connection.execute("PRAGMA user_version").fetchone()[0]
+    if version not in {CLASSIFICATION_SCHEMA_VERSION, INTAKE_SCHEMA_VERSION, 23, 24}:
         return None
-    from v8.schema_v21 import migration_proof
-
-    proof = migration_proof(connection)
+    if version in {23, 24}:
+        from v8.snapshot_schema_successor import migration_chain
+        proof = migration_chain(connection)["account_classification_migration"]
+    elif version == INTAKE_SCHEMA_VERSION:
+        from v8.account_intake_release import inherited_classification_proof
+        proof = inherited_classification_proof(connection)
+    else:
+        from v8.schema_v21 import migration_proof
+        proof = migration_proof(connection)
     rows = [dict(row) for row in connection.execute(
         "SELECT id,account_id,account_group,business_direction FROM account_directory_rows ORDER BY id"
     )]
@@ -538,14 +567,46 @@ def _account_classification_publication_evidence(connection: sqlite3.Connection)
     }
 
 
+def _account_intake_publication_evidence(connection: sqlite3.Connection) -> dict[str, Any] | None:
+    """Bind the real schema22 receipt, pending inputs and exact profile references."""
+    version = connection.execute("PRAGMA user_version").fetchone()[0]
+    if version not in {22, 23, 24}:
+        return None
+    from v8.schema_v22 import migration_proof
+    from v8.account_intake_release import inherited_classification_proof
+    if version in {23, 24}:
+        from v8.snapshot_schema_successor import migration_chain
+        chain = migration_chain(connection)
+        proof, original = chain["account_intake_migration"], chain["account_classification_migration"]
+    else:
+        proof = migration_proof(connection)
+        original = inherited_classification_proof(connection)
+    requests = [tuple(row) for row in connection.execute("SELECT * FROM account_intake_requests ORDER BY id")]
+    references = [tuple(row) for row in connection.execute(
+        "SELECT * FROM account_provider_references ORDER BY account_identity_id,provider,reference_kind")]
+    completed = connection.execute("SELECT COUNT(*) FROM account_intake_requests WHERE completed_at IS NOT NULL").fetchone()[0]
+    return {"contract_version": INTAKE_PUBLICATION_CONTRACT, "schema_version": INTAKE_SCHEMA_VERSION,
+        "schema_migration": INTAKE_SCHEMA_MIGRATION, "migration_receipt_sha256": proof["receipt_sha256"],
+        "source_schema_sha256": proof["source_schema_sha256"], "target_schema_sha256": proof["target_schema_sha256"],
+        "inherited_classification_receipt_sha256": original["receipt_sha256"], "request_count": len(requests),
+        "completed_request_count": completed, "requests_sha256": pipeline_cutover.digest(requests),
+        "reference_count": len(references), "references_sha256": pipeline_cutover.digest(references)}
+
+
 def _validate_publication_evidence(value: object, *, expected_schema: int | None = None) -> dict[str, Any]:
     if not isinstance(value, dict) or value.get("schema") != FRESHNESS_SCHEMA:
         raise SnapshotPublishError("publication freshness receipt contract is invalid")
+    if expected_schema in {23, 24}:
+        from v8.snapshot_schema_successor import validate_publication_shape
+        try:
+            validate_publication_shape(value, expected_schema)
+        except ValueError as error:
+            raise SnapshotPublishError(str(error)) from error
     classification = value.get("account_classification")
-    if expected_schema == CLASSIFICATION_SCHEMA_VERSION and not isinstance(classification, dict):
+    if expected_schema in {CLASSIFICATION_SCHEMA_VERSION, INTAKE_SCHEMA_VERSION, 23, 24} and not isinstance(classification, dict):
         raise SnapshotPublishError("schema21 publication is missing account classification evidence")
     if classification is not None:
-        if (expected_schema not in {None, CLASSIFICATION_SCHEMA_VERSION}
+        if (expected_schema not in {None, CLASSIFICATION_SCHEMA_VERSION, INTAKE_SCHEMA_VERSION, 23, 24}
                 or not isinstance(classification, dict)
                 or set(classification) != {"contract_version", "schema_version", "schema_migration",
                                             "migration_receipt_sha256", "row_count", "unlinked_row_count", "rows_sha256"}
@@ -558,6 +619,24 @@ def _validate_publication_evidence(value: object, *, expected_schema: int | None
                 or type(classification.get("unlinked_row_count")) is not int
                 or not 0 <= classification["unlinked_row_count"] <= classification["row_count"]):
             raise SnapshotPublishError("account classification publication evidence is invalid")
+    intake = value.get("account_intake")
+    if expected_schema in {INTAKE_SCHEMA_VERSION, 23, 24} and not isinstance(intake, dict):
+        raise SnapshotPublishError("schema22 publication is missing account intake evidence")
+    if intake is not None:
+        keys = {"contract_version", "schema_version", "schema_migration", "migration_receipt_sha256",
+                "source_schema_sha256", "target_schema_sha256", "inherited_classification_receipt_sha256",
+                "request_count", "completed_request_count", "requests_sha256", "reference_count", "references_sha256"}
+        if (expected_schema not in {None, INTAKE_SCHEMA_VERSION, 23, 24} or not isinstance(intake, dict)
+                or set(intake) != keys or intake.get("contract_version") != INTAKE_PUBLICATION_CONTRACT
+                or intake.get("schema_version") != INTAKE_SCHEMA_VERSION or intake.get("schema_migration") != INTAKE_SCHEMA_MIGRATION
+                or any(not isinstance(intake.get(key), str) or SHA256_RE.fullmatch(intake[key]) is None
+                       for key in keys if key.endswith("sha256"))
+                or any(type(intake.get(key)) is not int or intake[key] < 0
+                       for key in ("request_count", "completed_request_count", "reference_count"))
+                or intake["completed_request_count"] > intake["request_count"]
+                or not isinstance(classification, dict)
+                or intake["inherited_classification_receipt_sha256"] != classification["migration_receipt_sha256"]):
+            raise SnapshotPublishError("account intake publication evidence is invalid")
     verified = _parse_iso(value.get("verified_at"), label="publication verified_at")
     if (verified.astimezone(SHANGHAI).date().isoformat() != value.get("beijing_date")
             or value.get("status") not in TERMINAL_REPORT_STATUSES
@@ -608,14 +687,16 @@ def _validate_publication_evidence(value: object, *, expected_schema: int | None
 
 
 def _schema20_deployment(connection: sqlite3.Connection, *, project_root: Path) -> dict[str, Any]:
-    if connection.execute("PRAGMA user_version").fetchone()[0] == 21:
+    version = connection.execute("PRAGMA user_version").fetchone()[0]
+    if version in {21, 22, 23, 24}:
         from v8.account_cleanup_snapshot import is_cleanup, validate
         if not is_cleanup(connection):
-            raise SnapshotPublishError("schema21 requires inherited cleanup and classification migration proof")
+            raise SnapshotPublishError(f"schema{version} requires inherited cleanup and migration proof")
         proof = dict(validate(connection, project_root=project_root))
-        if (proof.get("schema_version") != 21 or proof.get("schema_migration") != CLASSIFICATION_SCHEMA_MIGRATION
-                or not isinstance(proof.get("account_classification_migration"), dict)):
-            raise SnapshotPublishError("schema21 classification migration proof is missing")
+        if (proof.get("schema_version") != version or proof.get("schema_migration") != SUPPORTED_SCHEMA_MIGRATIONS[version]
+                or not isinstance(proof.get("account_classification_migration"), dict)
+                or (version in {22, 23, 24} and not isinstance(proof.get("account_intake_migration"), dict))):
+            raise SnapshotPublishError(f"schema{version} migration proof is missing")
         return proof
     from v8.capture_release import _release_tools
     return dict(_release_tools().validate_deployment_receipt(connection, project_root=project_root))
@@ -710,6 +791,8 @@ def _schema20_publication_evidence(connection: sqlite3.Connection, *, current: d
         evidence["activation_successor"] = successor
     if code_successor is not None:
         evidence["code_successor"] = code_successor
+    if deployment.get("snapshot_source_release") is not None:
+        evidence["snapshot_source_release"] = deployment["snapshot_source_release"]
     return evidence
 
 
@@ -759,7 +842,7 @@ def _verify_snapshot_dependencies(output: Path, manifest: Mapping[str, Any], fre
                 raise SnapshotPublishError("snapshot database runtime identity drifted")
             evidence = _validate_publication_evidence(freshness.evidence, expected_schema=version)
             at = evidence["verified_at"]
-            if version in {20, 21}:
+            if version in {20, 21, 22, 23, 24}:
                 if _schema20_deployment(connection, project_root=project_root) != manifest.get("deployment_readiness"):
                     raise SnapshotPublishError("snapshot schema20 deployment/migration evidence drifted")
                 if _schema20_publication_evidence(connection,
@@ -815,8 +898,9 @@ def _verify_snapshot_dependencies(output: Path, manifest: Mapping[str, Any], fre
             # This exact proof was revalidated above and is bound independently
             # in the manifest. Its private files are never business artifacts.
             business_evidence = dict(freshness.evidence)
-            if version in {20, 21}:
+            if version in {20, 21, 22, 23, 24}:
                 business_evidence.pop("code_successor", None)
+            business_evidence.pop("snapshot_source_release", None)
             require_references(business_evidence)
         finally:
             connection.close()
@@ -1334,8 +1418,8 @@ def _verify_local_snapshot(
             connection.row_factory = sqlite3.Row
             configure_connection_safety(connection)
             connection.execute("PRAGMA query_only=ON")
-            at = observed_at.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-            if config.expected_user_version in {20, 21}:
+            at = observed_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            if config.expected_user_version in {20, 21, 22, 23, 24}:
                 evidence = _schema20_publication_evidence(connection, current=observed_at,
                     at=at, project_root=project_root)
             else:
@@ -1509,7 +1593,7 @@ def _read_external_env(path: Path, *, project_root: Path) -> PublishConfig:
         raise SnapshotPublishError("remote free-space reserve must be at least 1 GiB")
     if expected_user_version not in SUPPORTED_SCHEMA_MIGRATIONS:
         raise SnapshotPublishError(
-            "publisher environment must pin schema 19, 20 or 21 explicitly; "
+            "publisher environment must pin schema 19, 20, 21, 22, 23 or 24 explicitly; "
             "the first version transition uses schema-upgrade"
         )
     if not 0 <= maximum_content_lag_days <= 7:
@@ -1569,7 +1653,6 @@ def check_writer_freshness(
         **local_database_identity,
         "access_mode": "writer",
     }
-    current = (now or datetime.now(SHANGHAI)).astimezone(SHANGHAI)
     health = fetch_json("http://127.0.0.1:8766/api/v8/health")
     if health.get("status") != "ok" or health.get("database") != database.name:
         raise SnapshotPublishError("writer health does not match the formal database")
@@ -1626,7 +1709,6 @@ def check_writer_freshness(
             raise SnapshotPublishError("writer startup catch-up contains non-report work")
     connection = sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
-    timestamp = current.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     try:
         configure_connection_safety(connection)
         connection.execute("PRAGMA query_only=ON")
@@ -1638,7 +1720,12 @@ def check_writer_freshness(
         runtime_identity = _database_runtime_identity(connection, expected_schema=expected_user_version)
         if runtime_identity != health_runtime_identity:
             raise SnapshotPublishError("writer health runtime identity does not match the formal database")
-        if expected_user_version in {20, 21}:
+        # The identity queries establish this transaction's read snapshot.
+        # Sample after those reads so work completed during HTTP probes is not
+        # incorrectly treated as a future run. Explicit fixture times stay fixed.
+        current = (now or datetime.now(SHANGHAI)).astimezone(SHANGHAI)
+        timestamp = current.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        if expected_user_version in {20, 21, 22, 23, 24}:
             evidence = _schema20_publication_evidence(connection, current=current, at=timestamp, project_root=project_root)
             content = connection.execute("SELECT COUNT(*) content_count,MAX(published_at) latest_published_at FROM content_items").fetchone()
             return WriterFreshness(evidence=evidence, content_count=int(content["content_count"]),
@@ -1983,6 +2070,144 @@ def _json_command_output(output: str, *, label: str) -> dict[str, Any]:
     return dict(value)
 
 
+def _receiver_binding() -> dict[str, str]:
+    path = RECEIVER_BINDING_PATH
+    try:
+        if path.is_symlink() or path.resolve(strict=True) != path:
+            raise ValueError("unsafe receiver binding path")
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SnapshotPublishError("frozen receiver binding is missing or invalid") from exc
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schema", "source_root", "manifest_path", "manifest_sha256", "entrypoint_sha256"}
+        or value.get("schema") != "dcar-snapshot-receiver-binding-v1"
+        or value.get("source_root") != RECEIVER_SOURCE_ROOT
+        or value.get("manifest_path") != str(PurePosixPath(RECEIVER_SOURCE_ROOT).parent / "source-manifest.json")
+        or any(not isinstance(value.get(key), str) or not SHA256_RE.fullmatch(value[key])
+               for key in ("manifest_sha256", "entrypoint_sha256"))
+    ):
+        raise SnapshotPublishError("receiver binding is not frozen to the reviewed release")
+    return dict(value)
+
+
+# This stdlib-only guard runs inside the same isolated interpreter that imports
+# or executes the receiver. Every entry point checks the full source closure.
+_REMOTE_RECEIVER_CHECK = r'''
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+from pathlib import Path, PurePosixPath
+
+binding = json.loads(sys.argv.pop(1))
+
+def receiver_path(value):
+    path = Path(value)
+    if not path.is_absolute() or str(path) != value or ".." in path.parts:
+        raise RuntimeError("receiver path is not a canonical absolute path")
+    for part in (path, *path.parents):
+        if part.is_symlink():
+            raise RuntimeError("receiver path contains a symlink")
+    return path
+
+def receiver_bytes(path):
+    receiver_path(str(path))
+    before = path.lstat()
+    if not stat.S_ISREG(before.st_mode):
+        raise RuntimeError("receiver source must contain only regular files")
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as handle:
+        opened = os.fstat(handle.fileno())
+        data = handle.read()
+        after = os.fstat(handle.fileno())
+    def identity(item):
+        return (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns, item.st_ctime_ns)
+    if not identity(before) == identity(opened) == identity(after) == identity(path.lstat()):
+        raise RuntimeError("receiver source changed during verification")
+    return data
+
+receiver_root = receiver_path(binding["source_root"])
+receiver_manifest = receiver_path(binding["manifest_path"])
+if receiver_manifest != receiver_root.parent / "source-manifest.json" or not receiver_root.is_dir():
+    raise RuntimeError("receiver manifest location is invalid")
+manifest_bytes = receiver_bytes(receiver_manifest)
+if hashlib.sha256(manifest_bytes).hexdigest() != binding["manifest_sha256"]:
+    raise RuntimeError("receiver manifest SHA-256 mismatch")
+
+def unique_receiver_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise RuntimeError("duplicate receiver manifest key")
+        result[key] = value
+    return result
+
+manifest = json.loads(manifest_bytes, object_pairs_hook=unique_receiver_keys)
+if not isinstance(manifest, dict) or manifest.get("schema") != "dcar-snapshot-receiver-source-v1":
+    raise RuntimeError("receiver source manifest schema mismatch")
+entries = manifest.get("files")
+if not isinstance(entries, list) or not entries:
+    raise RuntimeError("receiver source manifest is empty")
+expected = set()
+receiver_installer = receiver_root / "deploy/server/install_snapshot.py"
+for entry in entries:
+    if not isinstance(entry, dict) or set(entry) != {"path", "sha256", "size"}:
+        raise RuntimeError("receiver source manifest entry is invalid")
+    name = entry["path"]
+    if not isinstance(name, str) or not name or "\\" in name:
+        raise RuntimeError("receiver source relative path is invalid")
+    relative = PurePosixPath(name)
+    if relative.is_absolute() or str(relative) != name or ".." in relative.parts or name in expected:
+        raise RuntimeError("receiver source relative path is unsafe or duplicated")
+    if (type(entry["size"]) is not int or entry["size"] < 0
+            or not isinstance(entry["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"])):
+        raise RuntimeError("receiver source size or SHA-256 is invalid")
+    path = receiver_root / name
+    data = receiver_bytes(path)
+    if len(data) != entry["size"] or hashlib.sha256(data).hexdigest() != entry["sha256"]:
+        raise RuntimeError("receiver source size or SHA-256 mismatch: " + name)
+    expected.add(name)
+    if path == receiver_installer and entry["sha256"] != binding["entrypoint_sha256"]:
+        raise RuntimeError("receiver entrypoint SHA-256 mismatch")
+if "deploy/server/install_snapshot.py" not in expected:
+    raise RuntimeError("receiver entrypoint is missing from the manifest")
+actual = set()
+def receiver_walk_error(error):
+    raise error
+
+for directory, directories, files in os.walk(receiver_root, followlinks=False, onerror=receiver_walk_error):
+    for name in directories:
+        child = Path(directory) / name
+        if child.is_symlink() or not child.is_dir():
+            raise RuntimeError("receiver source directory is unsafe")
+    for name in files:
+        child = Path(directory) / name
+        if child.is_symlink() or not stat.S_ISREG(child.lstat().st_mode):
+            raise RuntimeError("receiver source file is unsafe")
+        actual.add(child.relative_to(receiver_root).as_posix())
+if actual != expected:
+    raise RuntimeError("receiver source file inventory mismatch")
+'''.strip()
+
+
+def _receiver_command(
+    config: PublishConfig, arguments: Sequence[str], *, sudo: bool = True,
+    code: Optional[str] = None,
+) -> str:
+    binding = _receiver_binding()
+    if code is None:
+        code = ('import runpy\n'
+                'sys.argv = [str(receiver_installer), *sys.argv[1:]]\n'
+                'runpy.run_path(str(receiver_installer), run_name="__main__")')
+    return shlex.join([
+        *(["sudo", "-n"] if sudo else []), config.remote_python, "-I", "-B", "-c",
+        _REMOTE_RECEIVER_CHECK + "\n" + code,
+        json.dumps(binding, sort_keys=True, separators=(",", ":")), *arguments,
+    ])
+
+
 def _remote_probe(
     config: PublishConfig,
     ssh: Sequence[str],
@@ -2001,9 +2226,11 @@ project_root = Path(sys.argv[1])
 state_root = Path(sys.argv[2])
 python_path = Path(sys.argv[3])
 installer = Path(sys.argv[4])
+if installer != receiver_installer:
+    raise RuntimeError("receiver probe entrypoint does not match its verified binding")
 expected_schema = int(sys.argv[5])
 installer_schema_support = None
-if expected_schema in {20, 21}:
+if expected_schema in {20, 21, 22, 23, 24}:
     import importlib.util
     spec = importlib.util.spec_from_file_location("dcar_remote_installer_probe", installer)
     if spec is None or spec.loader is None:
@@ -2070,17 +2297,17 @@ print(json.dumps({
 """.replace(
         "__REMOTE_ENDPOINT_TIMEOUT__", str(REMOTE_ENDPOINT_TIMEOUT_SECONDS)
     ).strip()
-    command = shlex.join(
+    command = _receiver_command(
+        config,
         [
-            config.remote_python,
-            "-c",
-            code,
             config.remote_project_root,
             config.remote_state_root,
             config.remote_python,
             config.remote_installer,
             str(config.expected_user_version),
-        ]
+        ],
+        sudo=False,
+        code=code,
     )
     output = _run_checked(
         runner,
@@ -2118,14 +2345,15 @@ def _validate_remote_probe(
         raise SnapshotPublishError("remote probe omitted the schema transition barrier")
     transition = value["schema_transition"]
     version = config.expected_user_version
-    if version in {20, 21}:
+    if version in {20, 21, 22, 23, 24}:
         support = value.get("installer_schema_support")
         pair = [version - 1, version]
         if (not isinstance(support, dict) or not isinstance(support.get("versions"), list)
                 or version not in support["versions"] or not isinstance(support.get("transitions"), list)
                 or pair not in support["transitions"]):
             raise SnapshotPublishError(f"remote installed receiver has no verified schema{version} support")
-        expected_transition = CLASSIFICATION_TRANSITION_SCHEMA if version == 21 else INTEGRATED_TRANSITION_SCHEMA
+        expected_transition = {20: INTEGRATED_TRANSITION_SCHEMA, 21: CLASSIFICATION_TRANSITION_SCHEMA,
+            22: INTAKE_TRANSITION_SCHEMA, 23: FLOW_TRANSITION_SCHEMA, 24: DUPLICATE_TRANSITION_SCHEMA}[version]
         paired = (isinstance(transition, dict) and transition.get("schema") == expected_transition
                   and [transition.get("from_schema"), transition.get("to_schema")] == pair
                   and transition.get("status") == "succeeded")
@@ -2133,7 +2361,15 @@ def _validate_remote_probe(
                       and transition.get("schema") == CLASSIFICATION_TRANSITION_SCHEMA
                       and transition.get("from_schema") == 20 and transition.get("to_schema") == 21
                       and transition.get("status") == "rolled_back")
-        if not (paired or restored20):
+        restored21 = (version == 21 and isinstance(transition, dict)
+                      and transition.get("schema") == INTAKE_TRANSITION_SCHEMA
+                      and transition.get("from_schema") == 21 and transition.get("to_schema") == 22
+                      and transition.get("status") == "rolled_back")
+        restored_successor = (version in {22, 23} and isinstance(transition, dict)
+            and transition.get("schema") == {22: FLOW_TRANSITION_SCHEMA, 23: DUPLICATE_TRANSITION_SCHEMA}[version]
+            and transition.get("from_schema") == version and transition.get("to_schema") == version + 1
+            and transition.get("status") == "rolled_back")
+        if not (paired or restored20 or restored21 or restored_successor):
             raise SnapshotPublishError(f"remote {version - 1}-to-{version} pairing is unsettled; use explicit schema-upgrade first")
     if transition is not None:
         legacy_settled = (isinstance(transition, dict) and version == 19
@@ -2146,7 +2382,15 @@ def _validate_remote_probe(
             and transition.get("from_schema") == 20 and transition.get("to_schema") == 21
             and version in {20, 21}
             and transition.get("status") == ("succeeded" if version == 21 else "rolled_back"))
-        if not (legacy_settled or integrated_settled or classification_settled):
+        intake_settled = (isinstance(transition, dict) and transition.get("schema") == INTAKE_TRANSITION_SCHEMA
+            and transition.get("from_schema") == 21 and transition.get("to_schema") == 22
+            and version in {21, 22}
+            and transition.get("status") == ("succeeded" if version == 22 else "rolled_back"))
+        successor_settled = any(isinstance(transition, dict) and transition.get("schema") == contract
+            and transition.get("from_schema") == before and transition.get("to_schema") == after
+            and version in {before, after} and transition.get("status") == ("succeeded" if version == after else "rolled_back")
+            for before, after, contract in ((22, 23, FLOW_TRANSITION_SCHEMA), (23, 24, DUPLICATE_TRANSITION_SCHEMA)))
+        if not (legacy_settled or integrated_settled or classification_settled or intake_settled or successor_settled):
             raise SnapshotPublishError("remote schema-upgrade transition is unsettled; normal publishing is blocked")
         _parse_iso(transition.get("completed_at"), label="schema transition completed_at")
     current_release = value.get("current_release")
@@ -2255,9 +2499,7 @@ def _check_remote_sudo(
     *,
     runner: CommandRunner,
 ) -> None:
-    command = shlex.join(
-        ["sudo", "-n", config.remote_python, config.remote_installer, "--help"]
-    )
+    command = _receiver_command(config, ["--help"])
     _run_checked(runner, _remote_command(ssh, command), timeout=30)
 
 
@@ -2608,12 +2850,9 @@ def _prune_remote_snapshots(
     *,
     runner: CommandRunner,
 ) -> dict[str, Any]:
-    remote = shlex.join(
+    remote = _receiver_command(
+        config,
         [
-            "sudo",
-            "-n",
-            config.remote_python,
-            config.remote_installer,
             "prune",
             "--incoming-root",
             config.remote_incoming_root,
@@ -2646,22 +2885,16 @@ def _remote_installer_operation(
     bundle: Optional[str] = None,
     snapshot_id: Optional[str] = None,
 ) -> dict[str, Any]:
-    arguments = [
-        "sudo",
-        "-n",
-        config.remote_python,
-        config.remote_installer,
-        operation,
-    ]
+    arguments = [operation]
     if bundle is not None:
         arguments.extend(["--bundle", bundle])
     if snapshot_id is not None:
         arguments.extend(["--snapshot-id", snapshot_id])
-    if config.expected_user_version in {20, 21}:
+    if config.expected_user_version in {20, 21, 22, 23, 24}:
         arguments.extend(["--expected-schema", str(config.expected_user_version)])
     output = _run_checked(
         runner,
-        _remote_command(ssh, shlex.join(arguments)),
+        _remote_command(ssh, _receiver_command(config, arguments)),
         timeout=60 * 60,
     )
     value = _json_command_output(output, label=f"remote {operation}")
@@ -3306,10 +3539,18 @@ def publish_snapshot(
             source_observation = _observe_formal_read_source(
                 database,
                 project_root=project_root,
-                now=current,
+                now=now,
                 config=config,
                 fetch_json=fetch_json,
             )
+            publication_day = automatic_beijing_date or current.date()
+            if (source_observation.freshness.evidence["beijing_date"] != publication_day.isoformat()
+                    or current.date() != publication_day):
+                raise SnapshotPublishError("snapshot crossed the publication business day")
+            if automatic_beijing_date is not None:
+                # Validate both live observations before pruning prior attempts.
+                # Two retained directories plus this attempt stay within three.
+                _prune_local_snapshots(config.snapshot_root, retain_count=2)
             output = config.snapshot_root / (
                 "snapshot-"
                 + current.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -3324,6 +3565,9 @@ def publish_snapshot(
                 output=output,
                 expected_user_version=config.expected_user_version,
             )
+            snapshot_verification_time = (now or datetime.now(SHANGHAI)).astimezone(SHANGHAI)
+            if snapshot_verification_time.date() != current.date():
+                raise SnapshotPublishError("snapshot crossed the publication business day")
             (
                 manifest_runtime_identity,
                 freshness,
@@ -3332,7 +3576,7 @@ def publish_snapshot(
             ) = _verify_local_snapshot(
                 output,
                 manifest,
-                current=current,
+                current=snapshot_verification_time,
                 config=config,
                 project_root=project_root,
                 fetch_json=fetch_json,
@@ -3832,9 +4076,11 @@ def publish_snapshot_automatically(
             config.snapshot_root, beijing_date=current_day
         )
         observation = _observe_formal_read_source(
-            database, project_root=project_root, now=current,
+            database, project_root=project_root, now=now,
             config=config, fetch_json=fetch_json,
         )
+        if observation.freshness.evidence["beijing_date"] != current_day.isoformat():
+            raise SnapshotPublishError("snapshot crossed the publication business day")
         if prior_success is not None:
             prior_receipt = json.loads((config.snapshot_root / prior_success["output_name"] / "publisher-receipt.json").read_text())
             published_at = _parse_iso(prior_receipt.get("published_at"), label="automatic success published_at")
@@ -3858,15 +4104,12 @@ def publish_snapshot_automatically(
                     "no_snapshot_built": True,
                     "no_ssh_attempted": True,
                 }
-        # Bound failed build/transfer attempts too: two existing directories
-        # plus this attempt can never grow beyond the normal retain count.
-        _prune_local_snapshots(config.snapshot_root, retain_count=2)
         return publish_snapshot(
             project_root=project_root,
             database=database,
             legacy_database=legacy_database,
             config=config,
-            now=current,
+            now=now,
             runner=runner,
             fetch_json=fetch_json,
             build_snapshot=build_snapshot,

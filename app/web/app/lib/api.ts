@@ -143,18 +143,24 @@ export async function readQueryJson<T>(
   init?: RequestInit,
   timeoutMs = QUERY_READ_TIMEOUT_MS,
 ): Promise<T> {
-  // Callers that already own cancellation keep their exact AbortSignal contract.
-  if (init?.signal) return readJson<T>(path, init);
+  // A cancelled query must stop its HTTP read without losing the timeout bound.
+  const callerSignal = init?.signal;
   const controller = new AbortController();
   const timeoutError = new DOMException("读取超时，请重新加载。", "AbortError");
-  const timer = setTimeout(() => controller.abort(timeoutError), timeoutMs);
+  let timedOut = false;
+  const cancel = () => controller.abort(callerSignal?.reason ?? new DOMException("读取已取消。", "AbortError"));
+  callerSignal?.addEventListener("abort", cancel, { once: true });
+  if (callerSignal?.aborted) cancel();
+  const timer = setTimeout(() => { timedOut = true; controller.abort(timeoutError); }, timeoutMs);
   try {
+    if (controller.signal.aborted) throw controller.signal.reason;
     return await readJson<T>(path, { ...init, signal: controller.signal });
   } catch (reason) {
-    if (controller.signal.aborted) throw timeoutError;
+    if (controller.signal.aborted) throw timedOut ? timeoutError : controller.signal.reason;
     throw reason;
   } finally {
     clearTimeout(timer);
+    callerSignal?.removeEventListener("abort", cancel);
   }
 }
 

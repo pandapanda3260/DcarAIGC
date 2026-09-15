@@ -39,7 +39,7 @@ def _batch(connection: sqlite3.Connection, batch_id: int) -> dict[str, Any]:
 
 def freeze_batch(connection: sqlite3.Connection, *, work_ids: Sequence[int], at: str) -> dict[str, Any]:
     """Freeze a pair or odd final singleton; never rewrite an existing batch."""
-    if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21} or not connection.in_transaction:
+    if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21, 22, 23, 24} or not connection.in_transaction:
         raise ValueError("batch freeze requires a schema20 writer transaction")
     if not 1 <= len(work_ids) <= MAX_MEMBERS or len(set(work_ids)) != len(work_ids):
         raise ValueError("statistics batches contain one or two unique members")
@@ -147,8 +147,9 @@ def materialize_batch(connection: sqlite3.Connection, *, batch_id: int,
         raise ValueError("batch raw lacks request execution evidence")
     receipt = connection.execute("SELECT * FROM fetch_transport_receipts WHERE id=? AND fetch_attempt_id=?",
         (raw["transport_receipt_id"], raw["fetch_attempt_id"])).fetchone()
-    if receipt is None or not receipt["clean_eof"] or not receipt["json_parse_ok"] or receipt["length_match"] == 0:
+    if receipt is None:
         raise ValueError("batch raw lacks complete verified transport evidence")
+    raw_archive.response_entity_integrity(connection, raw_response_id)
     members = connection.execute("""SELECT m.*,c.platform_content_id FROM fetch_request_batch_members m
         JOIN content_items c ON c.id=m.content_id WHERE m.batch_id=? ORDER BY c.platform_content_id""", (batch_id,)).fetchall()
     requested = [str(row["platform_content_id"]) for row in members]
@@ -242,11 +243,23 @@ def execute_batch(frozen: dict[str, Any], *, db_path: Path, at: str,
 
 
 def run_one(db_path: Path = DEFAULT_DB, at: str | None = None) -> dict[str, Any]:
+    """Keep one closed inheritance proof through this pair's claim and A/B."""
+    from .runtime_evidence_context import prepare_inheritance
+    with prepare_inheritance(db_path):
+        return _run_one_prepared(db_path, at)
+
+
+def _run_one_prepared(db_path: Path, at: str | None) -> dict[str, Any]:
     """Own and execute one pair; blocked/held members never produce empty sends."""
     from . import capture_runtime as runtime
     from .profile_activations import activation_at
+    from .runtime_evidence_context import inheritance_boundary, prepare_inheritance
     at = at or now_utc()
-    with connect(db_path) as connection, transaction(connection):
+    # Statistics readiness uses the same installed catalog proof as a single
+    # claim; cold verification must not block other workers' lease heartbeats.
+    with prepare_inheritance(db_path) as inherited, connect(db_path) as connection, \
+            transaction(connection), inheritance_boundary(connection):
+        at = now_utc() if inherited is not None else at
         runtime._require20(connection)
         active = activation_at(connection, at)
         if not runtime.execution_profile_allowed(active):

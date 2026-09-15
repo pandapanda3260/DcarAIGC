@@ -145,16 +145,26 @@ def is_cleanup(connection: sqlite3.Connection, deployment_id: str | None = None)
 
 
 def validate(connection: sqlite3.Connection, *, deployment_id: str | None = None, project_root: Path | None = None,
-             verify_files: bool = True, expected_bindings: Mapping[str, Any] | None = None, require_accepted: bool = False) -> dict[str, Any]:
+             verify_files: bool = True, expected_bindings: Mapping[str, Any] | None = None, require_accepted: bool = False,
+             source_release: Mapping[str, Any] | None = None) -> dict[str, Any]:
     require(not require_accepted, "Read-only cleanup candidate does not claim production capture acceptance")
     schema_version = connection.execute("PRAGMA user_version").fetchone()[0]
+    if schema_version in {23, 24}:
+        return _validate_successor(connection, deployment_id=deployment_id, project_root=project_root,
+            verify_files=verify_files, expected_bindings=expected_bindings, source_release=source_release)
     classification = None
-    if schema_version == 21:
+    intake = None
+    if schema_version == 22:
+        from .schema_v22 import migration_proof
+        from .account_intake_release import inherited_classification_proof
+        intake = migration_proof(connection)
+        classification = inherited_classification_proof(connection)
+    elif schema_version == 21:
         from .schema_v21 import migration_proof, validate_structure
         validate_structure(connection)
         classification = migration_proof(connection)
     else:
-        require(schema_version == 20, "Cleanup publication requires schema20 or a proved schema21 migration")
+        require(schema_version == 20, "Cleanup publication requires schema20 or a proved schema21/schema22 migration")
     row = connection.execute("SELECT deployment_id,status,payload_json,recorded_at,receipt_sha256 FROM deployment_readiness_receipts " + ("WHERE deployment_id=? " if deployment_id else "") + "ORDER BY id DESC LIMIT 1", (deployment_id,) if deployment_id else ()).fetchone()
     require(row is not None, "Cleanup publication receipt missing")
     identifier, status, raw, recorded_at, receipt_sha = row
@@ -199,4 +209,56 @@ def validate(connection: sqlite3.Connection, *, deployment_id: str | None = None
     if classification is not None:
         result.update(schema_version=21, schema_migration="account-classification-v1",
                       account_classification_migration=classification)
+    if intake is not None:
+        result.update(schema_version=22, schema_migration="unified-account-intake-v1",
+                      account_intake_migration=intake)
+    return result
+
+
+def _validate_successor(connection, *, deployment_id, project_root, verify_files, expected_bindings, source_release):
+    from .snapshot_schema_successor import (migration_chain, installed_source_release, validate_source_release,
+        _retained, _tables, FLOW_SCHEMA_MIGRATION, DUPLICATE_SCHEMA_MIGRATION)
+    chain = migration_chain(connection)
+    flow = chain["four_platform_flow_migration"]
+    # The original candidate is historical authority. Its immutable row was
+    # sealed before schema23; a new/unknown deployment cannot inherit it.
+    _retained(connection, "deployment_readiness_receipts", flow["retained_tables"]["deployment_readiness_receipts"])
+    row = connection.execute("SELECT deployment_id,status,payload_json,recorded_at,receipt_sha256 FROM deployment_readiness_receipts "
+        + ("WHERE deployment_id=? " if deployment_id else "") + "ORDER BY id DESC LIMIT 1", (deployment_id,) if deployment_id else ()).fetchone()
+    require(row is not None, "Cleanup successor deployment is missing")
+    identifier, status, raw, recorded_at, receipt_sha = row
+    payload = json.loads(raw)
+    require(payload.get("contract_version") == CONTRACT and payload.get("schema_version") == 20 and status == "candidate"
+        and receipt_sha == digest({"deployment_id": identifier, "status": status, "payload": payload, "recorded_at": recorded_at}),
+        "Cleanup successor original deployment contract/digest differs")
+    require(payload.get("coverage_complete") is False and payload.get("paid_authority") is False
+        and payload.get("business_e2e") == "deferred_by_user" and payload.get("transport_qualification") == "not_verified",
+        "Cleanup successor overclaims acceptance")
+    bindings = payload["bindings"]
+    require(all(bindings.get(k) == v for k, v in (expected_bindings or {}).items()), "Cleanup successor expected binding differs")
+    active = activation_by_id(connection, int(bindings["activation_id"]))
+    require(all(active[k] == bindings[k] for k in ACTIVE_KEYS) and active.get("cancellation") is None
+        and active["build_receipt_sha256"] == bindings["build_sha256"], "Cleanup successor original activation differs")
+    require(set(payload["evidence"]) == set(EVIDENCE_ROLES), "Cleanup successor evidence roles differ")
+    for ref in payload["evidence"].values():
+        require(set(ref) == {"path", "sha256", "byte_size"} and Path(ref["path"]).is_absolute()
+            and HASH.fullmatch(str(ref["sha256"])) and type(ref["byte_size"]) is int and 0 < ref["byte_size"] <= 16 * 1024 * 1024,
+            "Cleanup successor private reference invalid")
+    if verify_files:
+        _lineage(_objects(payload["evidence"], project_root), payload["evidence"], payload)
+    version = connection.execute("PRAGMA user_version").fetchone()[0]
+    result = {"contract_version": CONTRACT, "deployment_id": identifier, "status": status, "receipt_sha256": receipt_sha,
+        "validation_scope": "readonly_cleanup_successor", "deployment_eligible": False, "readonly_publish_eligible": True,
+        "coverage_complete": False, "bindings": bindings, "evidence": payload["evidence"], "release_decision": None,
+        "storage_policy": None, "e2e_status": "deferred", "transport_qualification": "not_verified",
+        "selection_sha256": payload["selection_sha256"], "baseline": payload["baseline"],
+        "unmet_evidence": ["business_e2e_deferred_by_user", "transport_qualification_not_verified", "coverage_not_complete"],
+        "schema_version": version, "schema_migration": DUPLICATE_SCHEMA_MIGRATION if version == 24 else FLOW_SCHEMA_MIGRATION,
+        "current_snapshot": _tables(connection, ("accounts", "content_items", "account_directory_rows",
+            "acquisition_profile_activations", "account_roster_members")), **chain}
+    if verify_files:
+        require(project_root is not None, "Cleanup successor source verification requires project root")
+        source_release = installed_source_release(connection, result, chain, project_root=project_root)
+    validate_source_release(source_release, result, chain)
+    result["snapshot_source_release"] = dict(source_release)
     return result

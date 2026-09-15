@@ -256,11 +256,14 @@ def resolve_route(connection: sqlite3.Connection, *, account_id: int | None,
 
 def require_send_route(connection: sqlite3.Connection, *, scope: Any, operation: str, at: str) -> dict[str, Any] | None:
     """Both admission and the final send transaction re-read the same fence."""
-    if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
+    if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21, 22, 23, 24}:
         return None
     from .provider_budget import PaidScopeBlocked
 
-    if getattr(scope, "manual_command_run_id", None) is not None:
+    if getattr(scope, "intake_request_id", None) is not None:
+        from .account_preparation import assignment_for_scope
+        assignment = assignment_for_scope(connection, scope, operation=operation, at=at)
+    elif getattr(scope, "manual_command_run_id", None) is not None:
         from .capture_manual import assignment_for_command
         assignment = assignment_for_command(connection, scope.manual_command_run_id,
             content_id=scope.content_id, operation=operation, at=at)
@@ -288,7 +291,7 @@ def require_send_route(connection: sqlite3.Connection, *, scope: Any, operation:
 
 def legacy_queue_allowed(connection: sqlite3.Connection, *, account_id: int, content_id: int | None,
                          operations: list[str], at: str) -> bool:
-    if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
+    if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21, 22, 23, 24}:
         return True
     for operation in operations:
         assignment = resolve_route(connection, account_id=account_id, content_id=content_id, operation=operation, at=at)
@@ -351,6 +354,7 @@ def assign_route(connection: sqlite3.Connection, *, scope_type: str, scope_key: 
                  provider: str, operation: str, expected_generation: int,
                  route: str, mode: str, effective_at: str, recorded_at: str,
                  account_id: int | None = None, content_id: int | None = None,
+                 intake_request_id: int | None = None,
                  source_plan_id: int | None = None) -> int:
     """Append a fenced assignment; caller holds the writer transaction."""
     if not connection.in_transaction:
@@ -374,6 +378,11 @@ def assign_route(connection: sqlite3.Connection, *, scope_type: str, scope_key: 
         "effective_at": effective, "recorded_at": timestamp(recorded_at),
     }
     values["assignment_sha256"] = digest(values)
+    if intake_request_id is not None:
+        if scope_type != "intake" or scope_key != str(intake_request_id) or account_id is not None or content_id is not None:
+            raise ValueError("intake route target mismatch")
+        values["intake_request_id"] = intake_request_id
+        values["assignment_sha256"] = digest({key: item for key, item in values.items() if key != "assignment_sha256"})
     cursor = connection.execute(
         f"INSERT INTO capture_route_assignments({','.join(values)}) VALUES ({','.join('?' for _ in values)})",
         tuple(values.values()),

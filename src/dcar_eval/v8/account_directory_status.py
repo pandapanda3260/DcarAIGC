@@ -130,7 +130,7 @@ def _outside_cleanup_capture_scope(connection: sqlite3.Connection, row: sqlite3.
         # historical cleanup selection is no longer a business admission list.
         return None
     account = connection.execute("SELECT enabled FROM accounts WHERE id=?", (row["account_id"],)).fetchone()
-    if account is None or account["enabled"] or connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
+    if account is None or account["enabled"] or connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21, 22, 23, 24}:
         return None
     from . import account_cleanup_runtime as cleanup
     from .capture_authorizations import AuthorizationError
@@ -151,14 +151,28 @@ def _outside_cleanup_capture_scope(connection: sqlite3.Connection, row: sqlite3.
         raise _error("account_cleanup_status_unavailable", "当前账号名单校验未通过，请稍后重试。") from error
 
 
+def _has_bound_catalog_identity(connection: sqlite3.Connection, row: sqlite3.Row | None) -> bool:
+    """Route uniquely bound identities to the label-only catalog transaction."""
+    if row is None or row["identity_status"] != "uid_unverified" or row["account_id"] is None:
+        return False
+    from .account_catalog_capture import installed_policy
+    if installed_policy(connection, at=now_utc()) is None:
+        return False
+    identities = connection.execute(
+        "SELECT id FROM account_platform_identities WHERE account_id=? AND platform=? AND uid=?",
+        (row["account_id"], row["platform"], row["uid"]),
+    ).fetchall()
+    return len(identities) == 1
+
+
 def update_directory_only_status_in_transaction(
     connection: sqlite3.Connection, account_id: int, values: Mapping[str, Any], *, actor: str, reason: str,
 ) -> dict[str, Any] | None:
-    """Handle directory labels, or return None for the capture-enabled flow.
+    """Handle directory labels, or return None for the bound-account flow.
 
     A negative display ID is valid only while its exact directory row still has
-    no account identity. Unverified identities and verified identities outside
-    the frozen capture scope must remain disabled; only their labels change.
+    no account identity. Identities without usable evidence and verified
+    identities outside the frozen capture scope remain disabled; only labels change.
     The caller owns the write transaction; the savepoint also protects callers
     that catch a receipt failure inside their transaction.
     """
@@ -175,7 +189,9 @@ def update_directory_only_status_in_transaction(
                 if supplied_id is not None else None)
     selection_sha256 = (_outside_cleanup_capture_scope(connection, row)
                         if account_id > 0 and "account_status" in values else None)
-    if account_id >= 0 and (row is None or (row["identity_status"] == "existing_verified" and selection_sha256 is None)):
+    bound_identity = account_id > 0 and _has_bound_catalog_identity(connection, row)
+    if account_id >= 0 and (row is None or (bound_identity and existing is None)
+            or (row["identity_status"] == "existing_verified" and selection_sha256 is None)):
         if existing is not None:
             raise _error("account_status_request_conflict", "账号身份已变更，请刷新后重试。")
         return None
@@ -189,7 +205,7 @@ def update_directory_only_status_in_transaction(
             "SELECT 1 FROM account_platform_identities WHERE account_id=? AND platform=? AND uid=?",
             (account_id, row["platform"], row["uid"]),
         ).fetchone()
-        if (row["identity_status"] != "uid_unverified" and selection_sha256 is None) or account is None or account["enabled"] or identity is None:
+        if (row["identity_status"] != "uid_unverified" and selection_sha256 is None) or account is None or (account["enabled"] and not (bound_identity and existing is not None)) or identity is None:
             raise _error("account_directory_identity_changed", "账号身份状态已变更，请刷新后重试。")
     if "account_status" not in values and account_id > 0:
         return None

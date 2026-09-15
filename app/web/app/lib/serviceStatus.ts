@@ -112,6 +112,19 @@ export function dataServiceStatus(health: ServiceHealth | undefined, failed: boo
   return serviceState("normal", `自动任务运行中，采集通道可用；不代表所有数据已采集完整。${lastCapture}`);
 }
 
+/** Surface only confirmed data delays; operational faults have their own page notice. */
+export function dataFreshnessNotice(health: ServiceHealth | undefined, failed: boolean): string | null {
+  if (failed || !health || health.status !== "ok" || typeof health.read_only !== "boolean") return null;
+  if (health.read_only || health.automation?.scheduler_state === "read_only") {
+    if (health.snapshot_sync?.status !== "delayed") return null;
+    const time = snapshotTime(health.snapshot_sync.last_verified_install_at);
+    return `数据同步延迟，当前展示上次同步的数据。${time ? `最近同步：${time}（北京时间）。` : ""}`;
+  }
+  if (health.automation?.paid_dispatch_state === "invalid" || health.data_freshness?.status !== "stale") return null;
+  const time = snapshotTime(health.data_freshness.last_successful_capture_at);
+  return `数据更新延迟，当前展示已有数据。${time ? `最近成功采集：${time}（北京时间）。` : ""}`;
+}
+
 type ReportTask = { task_type: string; period_start: string; period_end: string; task_status: string };
 
 function validDay(value: string | null | undefined): value is string {

@@ -77,6 +77,8 @@ function setup() {
     },
     "@phosphor-icons/react": new Proxy({}, { get: () => "svg" }),
     "../components/AppShell": "main",
+    // Health observer behavior is exercised by the real React lifecycle suite.
+    "../components/DataFreshnessNote": () => null,
     "../components/Feedback": { Feedback: "feedback", Loading: "loading", Notice: "notice" },
     "../components/Pagination": { Pagination: "pagination" },
     "../lib/api": {},

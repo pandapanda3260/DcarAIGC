@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import re
 import secrets
 import time
 from contextlib import asynccontextmanager, suppress
 from typing import Any, Callable, Optional
-from urllib.parse import urlencode
+from urllib.parse import unquote_to_bytes, urlencode
 
 import httpx
 from fastapi import FastAPI, Request
@@ -91,6 +92,23 @@ def _trusted_header_matches(supplied: str, expected: str) -> bool:
     if not supplied.isascii() or not expected.isascii():
         return False
     return hmac.compare_digest(supplied, expected)
+
+
+def _authenticated_username(request: Request) -> Optional[str]:
+    """Decode the gateway's ASCII transport without changing the account name."""
+    value = request.headers.get("x-dcar-authenticated-user", "")
+    encoding = request.headers.get("x-dcar-authenticated-user-encoding", "")
+    if not value or not value.isascii():
+        return None
+    if not encoding:
+        # Older gateways sent ASCII names directly, including literal percent signs.
+        return value
+    if encoding != "percent-utf8" or re.search(r"%(?![0-9a-fA-F]{2})", value):
+        return None
+    try:
+        return unquote_to_bytes(value).decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return None
 
 
 class AccountDirectory:
@@ -268,20 +286,19 @@ def create_app(
             if (
                 request.headers.get("x-dcar-edge-key")
                 or request.headers.get("x-dcar-authenticated-user")
+                or request.headers.get("x-dcar-authenticated-user-encoding")
                 or request.headers.get("x-dcar-session-binding")
                 or not _trusted_header_matches(supplied, request.app.state.machine_key)
             ):
                 return _no_store(Response(status_code=403))
         else:
             supplied = request.headers.get("x-dcar-edge-key", "")
-            username = request.headers.get("x-dcar-authenticated-user", "")
+            username = _authenticated_username(request)
             binding = request.headers.get("x-dcar-session-binding", "")
             if (
                 request.headers.get("x-dcar-machine-key")
                 or not _trusted_header_matches(supplied, request.app.state.edge_key)
                 or not username
-                or len(username) > 128
-                or username == "temporary-bypass"
                 or len(binding) != 64
                 or any(character not in "0123456789abcdef" for character in binding)
             ):

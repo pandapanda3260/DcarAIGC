@@ -709,13 +709,10 @@ def _resolve_identity(
                 (identity_id, kind),
             ).fetchone()
             if old is None:
-                connection.execute(
-                    """INSERT INTO account_provider_references(
-                              account_identity_id,provider,reference_kind,reference_value,
-                              source_raw_response_id,created_at,updated_at)
-                       VALUES (?,'newrank_matrix',?,?,?,?,?)""",
-                    (identity_id, kind, value, raw_id, timestamp, timestamp),
-                )
+                from .account_reference_storage import store_reference
+                store_reference(connection, account_identity_id=identity_id, platform=member["platform"],
+                    provider="newrank_matrix", reference_kind=kind, reference_value=value,
+                    source_raw_response_id=raw_id, created_at=timestamp, updated_at=timestamp)
             elif old["reference_value"] != value:
                 if require_existing:
                     raise RosterError(
@@ -738,13 +735,10 @@ def _resolve_identity(
             (identity_id,),
         ).fetchall()
         if not old:
-            connection.execute(
-                """INSERT INTO account_provider_references(
-                          account_identity_id,provider,reference_kind,reference_value,
-                          source_raw_response_id,created_at,updated_at)
-                   VALUES (?,'tikhub','sec_user_id',?,?,?,?)""",
-                (identity_id, sec_user_id, raw_id, timestamp, timestamp),
-            )
+            from .account_reference_storage import store_reference
+            store_reference(connection, account_identity_id=identity_id, platform=member["platform"],
+                provider="tikhub", reference_kind="sec_user_id", reference_value=sec_user_id,
+                source_raw_response_id=raw_id, created_at=timestamp, updated_at=timestamp)
         elif any(row["reference_value"] != sec_user_id for row in old):
             raise RosterError(
                 "identity_conflict",

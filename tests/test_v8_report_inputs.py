@@ -95,12 +95,11 @@ class CurrentReportContractTest(unittest.TestCase):
         )
         self.assertEqual(contracts.load_contract(report_version="dcar-content-operations-report-v8.7")["report_version"], "dcar-content-operations-report-v8.7")
 
-    def test_legacy_scope_retains_only_its_frozen_account_direction_fallback(self):
+    def test_legacy_scope_does_not_use_frozen_account_direction_as_work_direction(self):
         legacy_content = {"manual_content_direction": "unknown", "evaluation_content_direction": "new_car",
                           "account_content_direction": "media"}
-        self.assertEqual(reports._frozen_content_direction(legacy_content, None, new_classification=False), "media")
-        self.assertEqual(reports._frozen_content_direction(legacy_content, None, new_classification=True), "unknown")
-        self.assertEqual(reports._frozen_content_direction(legacy_content, {"content_direction": "used_car"}, new_classification=False), "used_car")
+        self.assertEqual(reports._frozen_content_direction(legacy_content, None), "unknown")
+        self.assertEqual(reports._frozen_content_direction(legacy_content, {"content_direction": "used_car"}), "used_car")
 
     def test_current_account_classification_requires_two_dimensions_without_relabeling_legacy(self):
         report = current_report()
@@ -113,6 +112,65 @@ class CurrentReportContractTest(unittest.TestCase):
         with self.assertRaisesRegex(contracts.V8ContractViolation, "business_direction_dimensions"):
             contracts.validate_report(seal(report))
         contracts.validate_report(current_report())
+
+    def test_projection_preserves_explicit_new_fields_and_work_direction_without_legacy_guessing(self):
+        archived = current_report()
+        archived["content_details"] = [
+            {"content_id": 1, "account_type": "original", "account_content_direction": "used_car",
+             "content_direction": "media", "account_group": "image_text", "business_direction": "used_car_c2"},
+            {"content_id": 2, "account_type": "original", "account_content_direction": "used_car",
+             "content_direction": "new_car"},
+        ]
+        explicit_groups = [{"key": "innovation", "count": 10, "percentage": 100.0}]
+        archived["account_group_dimensions"] = copy.deepcopy(explicit_groups)
+        archived = seal(archived)
+        original = copy.deepcopy(archived)
+        projected = report_inputs.project_account_classification(archived)
+        self.assertEqual(projected["account_group_dimensions"], explicit_groups)
+        self.assertEqual(projected["business_direction_dimensions"], [
+            {"key": "unknown", "count": 9, "percentage": 90.0},
+            {"key": "used_car_c2", "count": 1, "percentage": 10.0},
+        ])
+        first, second = projected["content_details"]
+        self.assertEqual((first["account_group"], first["business_direction"], first["content_direction"]),
+                         ("image_text", "used_car_c2", "media"))
+        self.assertEqual((second["account_group"], second["business_direction"], second["content_direction"]),
+                         ("unknown", "unknown", "new_car"))
+        self.assertNotIn("account_type", json.dumps(projected))
+        self.assertNotIn("account_content_direction", json.dumps(projected))
+        self.assertEqual(archived, original)
+        self.assertEqual(report_inputs.project_account_classification(projected), projected)
+
+    def test_current_projection_keeps_its_valid_frozen_input_hash(self):
+        report = current_report()
+        report.pop("account_type_dimensions")
+        report.update(account_group_dimensions=[], business_direction_dimensions=[])
+        report["metadata"]["account_classification_version"] = report_inputs.ACCOUNT_CLASSIFICATION_VERSION
+        report = seal(report)
+        self.assertEqual(report_inputs.project_account_classification(report), report)
+        contracts.validate_report(report_inputs.project_account_classification(report))
+
+    def test_projection_verification_rejects_changed_metrics_labels_and_source_hash(self):
+        archived = current_report()
+        body = copy.deepcopy(archived)
+        body.pop("files", None)
+        body.pop("frozen_inputs")
+        body["metadata"].pop("revision")
+        body["metadata"].pop("generated_at")
+        event = {"contract_version": report_inputs.CONTRACT_VERSION, "event_id": 1,
+                 "payload": body, "sha256": report_inputs.digest(body)}
+        projected = report_inputs.project_account_classification(archived)
+        self.assertEqual(report_inputs.validate_account_classification_projection(projected, event), archived)
+        for field in ("account_group_dimensions", "summary_metrics", "source_frozen_inputs"):
+            changed = copy.deepcopy(projected)
+            if field == "account_group_dimensions":
+                changed[field][0]["key"] = "innovation"
+            elif field == "summary_metrics":
+                changed[field]["publication_count"]["value"] += 1
+            else:
+                changed[field]["sha256"] = "a" * 64
+            with self.subTest(field=field), self.assertRaises(report_inputs.FrozenInputError):
+                report_inputs.validate_account_classification_projection(changed, event)
 
     def test_freeze_hash_detects_fact_change_but_allows_new_revision_paths(self):
         report = current_report()
@@ -545,6 +603,27 @@ class FrozenReportIntegrationTest(unittest.TestCase):
         self.assertEqual(delayed["business_direction_dimensions"][0]["key"], "unknown")
         self.assertIn("account_dimension_unreconstructable", delayed["data_quality_details"]["unknown_dimensions"]["1"])
 
+    def test_first_generation_from_legacy_scope_uses_unknown_new_account_labels(self):
+        store = report_inputs._store
+        def legacy_scope(connection, task_id, kind, payload):
+            if kind == report_inputs.SCOPE_EVENT:
+                payload = copy.deepcopy(payload)
+                payload.pop("account_classification_version", None)
+                for row in payload["contents"]:
+                    row.pop("account_group", None)
+                    row.pop("business_direction", None)
+                    row.update(account_type="original", account_content_direction="used_car")
+            return store(connection, task_id, kind, payload)
+        task = self.task()
+        with patch.object(report_inputs, "_store", side_effect=legacy_scope):
+            report = self.run_report(task)
+        self.assertEqual(report["metadata"]["account_classification_version"], "account-classification-v2")
+        self.assertNotIn("account_type_dimensions", report)
+        self.assertEqual(report["account_group_dimensions"][0]["key"], "unknown")
+        self.assertEqual(report["business_direction_dimensions"][0]["key"], "unknown")
+        self.assertNotIn("account_type", report["content_details"][0])
+        contracts.validate_report(report)
+
     def test_historical_frozen_inputs_keep_old_dimensions_without_relabeling(self):
         task = self.task()
         historical = current_report()
@@ -560,6 +639,46 @@ class FrozenReportIntegrationTest(unittest.TestCase):
         self.assertNotIn("business_direction_dimensions", rendered)
         self.assertEqual(rendered["frozen_inputs"]["sha256"], event["sha256"])
         self.assertEqual(rendered["metadata"]["collection_cutoff_at"], historical["metadata"]["collection_cutoff_at"])
+        projected = report_inputs.project_account_classification(rendered)
+        self.assertNotIn("account_type_dimensions", projected)
+        self.assertEqual(projected["account_group_dimensions"], [{"key": "unknown", "count": 10, "percentage": 100.0}])
+        self.assertEqual(projected["business_direction_dimensions"], [{"key": "unknown", "count": 10, "percentage": 100.0}])
+        self.assertNotIn("frozen_inputs", projected)
+        self.assertEqual(projected["source_frozen_inputs"], rendered["frozen_inputs"])
+        self.assertEqual(rendered["account_type_dimensions"], historical["account_type_dimensions"])
+        with connect(self.db) as connection:
+            self.assertEqual(report_inputs.frozen_report(connection, task["id"]), stored)
+
+    def test_retry_of_historical_frozen_report_writes_only_current_account_artifacts(self):
+        store = report_inputs._store
+        def historical_inputs(connection, task_id, kind, payload):
+            if kind == report_inputs.INPUT_EVENT:
+                payload = copy.deepcopy(payload)
+                payload["metadata"].pop("account_classification_version", None)
+                payload["account_type_dimensions"] = payload.pop("account_group_dimensions")
+                payload.pop("business_direction_dimensions")
+                for row in payload["content_details"]:
+                    row.pop("account_group", None)
+                    row.pop("business_direction", None)
+                    row["account_type"] = "original"
+            return store(connection, task_id, kind, payload)
+        task = self.task()
+        with patch.object(report_inputs, "_store", side_effect=historical_inputs):
+            first = self.run_report(task)
+        with connect(self.db) as connection:
+            stored = report_inputs.frozen_report(connection, task["id"])
+        self.assertIn("account_type_dimensions", stored["payload"])
+        reports.retry_task(task["id"], db_path=self.db)
+        second = self.run_report(task, at=T1)
+        self.assertEqual(first["source_frozen_inputs"], second["source_frozen_inputs"])
+        self.assertNotIn("frozen_inputs", second)
+        self.assertNotIn("account_type", json.dumps(second))
+        for path in self.root.rglob("report.json"):
+            self.assertNotIn("account_type", path.read_text())
+        for path in self.root.rglob("content_details.csv"):
+            self.assertNotIn("account_type", path.read_text())
+        with connect(self.db) as connection:
+            self.assertEqual(report_inputs.frozen_report(connection, task["id"]), stored)
 
     def test_automatic_empty_scope_is_frozen_and_does_not_expand(self):
         task = self.task(automatic=True)
@@ -628,7 +747,7 @@ class FrozenReportIntegrationTest(unittest.TestCase):
                 (task["id"], self.fixture.release_id, str(path), sha, T0))
         with connect(self.db) as connection:
             before = [tuple(row) for row in connection.execute("SELECT * FROM task_events ORDER BY id")]
-        self.assertEqual(self.run_report(task, at=T1), report)
+        self.assertEqual(self.run_report(task, at=T1), report_inputs.project_account_classification(report))
         with self.assertRaisesRegex(reports.ReportTaskError, "read-only"):
             reports.retry_task(task["id"], db_path=self.db)
         self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), sha)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from .duplicate_readiness import valid_relation_sql, indexed_duplicates
 from . import durable_runs
 
 import json
@@ -2634,7 +2635,7 @@ def _report_duplicate_input_retry_before(
         ).fetchone()):
             return None
         watermark = connection.execute(
-            """
+            f"""
             SELECT MAX(changed_at) FROM (
                 SELECT df.created_at AS changed_at
                 FROM duplicate_fingerprints df
@@ -2645,7 +2646,7 @@ def _report_duplicate_input_retry_before(
                 SELECT dr.created_at AS changed_at
                 FROM duplicate_relations dr
                 JOIN content_items c ON c.id=dr.duplicate_content_id
-                WHERE dr.method=?
+                WHERE dr.method=? AND {valid_relation_sql(connection, "dr")}
                   AND c.published_at>=? AND c.published_at<?
             )
             """,
@@ -2658,6 +2659,13 @@ def _report_duplicate_input_retry_before(
                 end_key,
             ),
         ).fetchone()[0]
+        if indexed_duplicates(connection):
+            acknowledged_at = connection.execute(
+                "SELECT MAX(w.completed_at) FROM duplicate_dirty_work w "
+                "JOIN duplicate_index_generations g ON g.generation_id=w.generation_id "
+                "JOIN content_items c ON c.id=w.content_id WHERE g.state='ready' AND w.status='ready' "
+                "AND c.published_at>=? AND c.published_at<?", (start_key, end_key)).fetchone()[0]
+            watermark = max(value for value in (watermark, acknowledged_at) if value) if watermark or acknowledged_at else None
     if (
         run is None
         or str(run["status"]) not in TERMINAL_RUN_STATUSES

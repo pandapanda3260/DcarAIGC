@@ -52,6 +52,7 @@ from v8.reports import create_task
 from v8.storage import (
     CURRENT_SCHEMA_MIGRATION_NAME,
     LEGACY_MATCHER_RULE_SHA256,
+    LATEST_SCHEMA_VERSION,
     PROJECT_ROOT,
     RUNTIME_COMPATIBLE_SCHEMA_VERSIONS,
     SCHEMA_VERSION,
@@ -760,8 +761,10 @@ class ApiStartupSafetyTest(unittest.TestCase):
         with sqlite3.connect(config.db_path) as connection:
             self.assertEqual(
                 int(connection.execute("PRAGMA user_version").fetchone()[0]),
-                SCHEMA_VERSION,
+                LATEST_SCHEMA_VERSION,
             )
+            self.assertFalse({"account_type", "content_direction"} & {row[1] for row in connection.execute("PRAGMA table_info(accounts)")})
+            self.assertTrue({"account_group", "business_direction"} <= {row[1] for row in connection.execute("PRAGMA table_info(account_directory_rows)")})
 
     def test_writable_lifespan_keeps_wal_sidecar_inodes_stable(self) -> None:
         config = _test_config(self.root, db_name="anchor.sqlite3")
@@ -863,7 +866,7 @@ class ApiStartupSafetyTest(unittest.TestCase):
             with TestClient(api_module.create_app(config)):
                 pass
         with sqlite3.connect(config.db_path) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], LATEST_SCHEMA_VERSION)
 
     def test_formal_compatible_database_is_validated_without_initialization(
         self,
@@ -913,7 +916,7 @@ class ApiStartupSafetyTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(
                 RuntimeError,
-                r"offline schema migration is required:.*supported=\[19, 20, 21\]",
+                r"offline schema migration is required:.*supported=\[19, 20, 21, 22, 23, 24\]",
             ):
                 with TestClient(api_module.create_app(config)):
                     pass
@@ -1679,7 +1682,10 @@ class V8ApiTest(unittest.TestCase):
             self.assertEqual(metrics["estimated_new_users"]["unit"], "person")
             self.assertNotEqual(metrics["estimated_new_users"]["status"], "partial")
             self.assertIn("duplicate_rate", metrics)
-            self.assertEqual(list(window["channels"]), ["douyin", "xiaohongshu"])
+            self.assertEqual(
+                list(window["channels"]),
+                ["douyin", "xiaohongshu", "kuaishou", "wechat_channels"],
+            )
             for channel in window["channels"].values():
                 self.assertIsInstance(channel["selling_points"], list)
                 self.assertEqual(
@@ -1720,6 +1726,84 @@ class V8ApiTest(unittest.TestCase):
                     self.assertEqual(
                         scene["audience_quality"]["report_cutoff_at"], cutoff
                     )
+
+    def test_overview_new_platforms_join_totals_without_fabricating_missing_metrics(self) -> None:
+        published_at = "2026-08-08T06:00:00Z"
+        start = datetime(2026, 8, 8, tzinfo=timezone.utc)
+        end = datetime(2026, 8, 9, tzinfo=timezone.utc)
+        with connect(self.db) as connection:
+            new_ids = []
+            for index, (platform, views, comments) in enumerate((
+                ("douyin", 100, 1),
+                ("xiaohongshu", 0, 4),
+                ("kuaishou", 200, 2),
+                ("wechat_channels", 300, 3),
+                ("kuaishou", None, None),
+            ), start=1):
+                cursor = connection.execute(
+                    """
+                    INSERT INTO content_items(
+                        link_id,platform,platform_content_id,canonical_url,
+                        published_at,manual_content_direction,
+                        imported_at,created_at,updated_at
+                    ) VALUES (?,?,?,?,?,'new_car',?,?,?)
+                    """,
+                    (f"OVS{index:03d}", platform, f"overview-{index}",
+                     f"https://example.com/overview-{index}", published_at,
+                     published_at, published_at, published_at),
+                )
+                content_id = int(cursor.lastrowid)
+                new_ids.append(content_id)
+                connection.execute(
+                    """
+                    INSERT INTO content_metric_snapshots(
+                        content_id,captured_at,window_key,view_count,comment_count,status,source
+                    ) VALUES (?,?,'2026-08-08',?,?,'available','test')
+                    """,
+                    (content_id, published_at, views, comments),
+                )
+            connection.commit()
+            changes = connection.total_changes
+            window = api_module._window_summary(connection, start, end)
+            freshness = api_module._data_freshness(connection, current_at=end)
+            self.assertEqual(connection.total_changes, changes)
+            metrics = window["metrics"]
+            self.assertEqual(metrics["publication_count"]["value"], 5)
+            self.assertEqual(metrics["view_count"]["value"], 600)
+            self.assertEqual(metrics["view_count"]["coverage_percentage"], 75)
+            self.assertEqual(metrics["view_count"]["status"], "below_threshold")
+            self.assertEqual(metrics["comment_count"]["value"], 10)
+            self.assertEqual(metrics["comment_count"]["coverage_percentage"], 80)
+            self.assertEqual(freshness["latest_published_at"], published_at)
+            for platform, count in (("kuaishou", 2), ("wechat_channels", 1)):
+                channel = window["channels"][platform]
+                self.assertEqual(channel["publication_count"], count)
+                self.assertEqual(channel["scenes"]["new_car"]["publication_count"], count)
+                self.assertEqual(channel["selling_points"], [])
+                self.assertEqual(channel["summary"]["metrics"]
+                                 ["automotive_user_rate"]["status"], "missing")
+                self.assertIsNotNone(channel["summary"]["audience_quality"])
+                self.assertEqual(channel["scenes"]["used_car"]["metrics"]
+                                 ["automotive_user_rate"]["status"], "not_applicable")
+
+            connection.execute(
+                "UPDATE content_metric_snapshots SET view_count=0,comment_count=0 WHERE content_id=?",
+                (new_ids[-1],),
+            )
+            connection.execute(
+                "UPDATE content_items SET published_at='2026-08-08T07:00:00Z' WHERE id=?",
+                (new_ids[-1],),
+            )
+            connection.commit()
+            changes = connection.total_changes
+            with_zero = api_module._window_summary(connection, start, end)
+            freshness = api_module._data_freshness(connection, current_at=end)
+            self.assertEqual(connection.total_changes, changes)
+            self.assertEqual(with_zero["metrics"]["view_count"]["value"], 600)
+            self.assertEqual(with_zero["metrics"]["view_count"]["coverage_percentage"], 100)
+            self.assertEqual(with_zero["metrics"]["view_count"]["status"], "available")
+            self.assertEqual(with_zero["metrics"]["comment_count"]["coverage_percentage"], 100)
+            self.assertEqual(freshness["latest_published_at"], "2026-08-08T07:00:00Z")
 
     def test_overview_reuses_facts_without_changing_window_results(self) -> None:
         now = datetime(2026, 8, 4, 12, tzinfo=api_module.SHANGHAI)
@@ -2156,16 +2240,18 @@ class V8ApiTest(unittest.TestCase):
             after = "\n".join(connection.iterdump())
         self.assertEqual(after, before)
 
-    def test_content_filters_preserve_migrated_enums(self) -> None:
+    def test_content_filters_reject_obsolete_account_type(self) -> None:
         response = self.client.post(
             "/api/v8/contents/search",
             json={"account_type": "boutique_ip", "content_direction": "new_car"},
         )
+        self.assertEqual(response.status_code, 422)
+        response = self.client.post("/api/v8/contents/search", json={"account_group": "unknown", "business_direction": "unknown"})
         self.assertEqual(response.status_code, 200)
         self.assertGreater(response.json()["total"], 0)
         for item in response.json()["items"]:
-            self.assertEqual(item["account_type"], "boutique_ip")
-            self.assertEqual(item["content_direction"], "new_car")
+            self.assertNotIn("account_type", item)
+            self.assertEqual((item["account_group"], item["business_direction"]), ("unknown", "unknown"))
 
     def test_all_five_v7_revisions_are_listed_read_only(self) -> None:
         response = self.client.get("/api/v7/history/reports")
@@ -2250,7 +2336,7 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
                     link_id, platform, platform_content_id, canonical_url, published_at, title, body,
                     content_type, imported_at, created_at, updated_at
                 ) VALUES (
-                    'A2BC3D', 'douyin', '1', 'https://www.douyin.com/video/1', '2026-07-01T04:00:00Z',
+                    'A2BC3D', 'douyin', '7000000000001', 'https://www.douyin.com/video/7000000000001', '2026-07-01T04:00:00Z',
                     '汽车保养', '保养知识', 'video', ?, ?, ?
                 )
                 """,
@@ -3085,7 +3171,9 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         with zipfile.ZipFile(io.BytesIO(derived.content)) as archive:
             derived_svg = archive.read("01_图片报告.svg")
         self.assertIn("DCar Insight · 渠道与内容结构".encode(), derived_svg)
-        self.assertIn("账号类型构成".encode(), derived_svg)
+        self.assertIn("账号分组构成".encode(), derived_svg)
+        self.assertIn("业务方向".encode(), derived_svg)
+        self.assertNotIn("账号类型".encode(), derived_svg)
         self.assertNotIn(b"legacy-three-card", derived_svg)
 
         bundle = self.client.get(f"/api/v8/tasks/{task_id}/revisions/1/download")
@@ -3119,7 +3207,7 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
                         int.from_bytes(bundled_image[16:20], "big"),
                         int.from_bytes(bundled_image[20:24], "big"),
                     ),
-                    (1200, 675),
+                    (1200, 815),
                 )
             else:
                 self.assertIn(b'<svg xmlns="http://www.w3.org/2000/svg"', bundled_image)
@@ -3146,8 +3234,9 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
                 "标题",
                 "平台账号编号",
                 "账号名称",
-                "账号类型",
-                "内容方向",
+                "账号分组",
+                "业务方向",
+                "作品内容方向",
                 "资料完整度",
                 "主要卖点编号",
                 "卖点信息",
@@ -3161,9 +3250,9 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         self.assertEqual(historical_row[2], "7668604214154726706")
         self.assertEqual(historical_row[2], historical_row[7].rsplit("/", 1)[-1])
         self.assertEqual(historical_row[5], "图文")
-        self.assertEqual(historical_row[13], "还没有评估")
+        self.assertEqual(historical_row[14], "还没有评估")
         self.assertEqual(
-            historical_row[14:16], ["卖点资料不足", "卖点资料不足"]
+            historical_row[15:17], ["卖点资料不足", "卖点资料不足"]
         )
         with (
             patch.object(api_module, "render_summary_png", return_value=False),
@@ -3381,9 +3470,8 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
             patch.object(api_module, "render_summary_png", return_value=False),
         ):
             archived = self.client.get(f"{download_url}?format=image")
-        self.assertEqual(archived.status_code, 200)
-        self.assertEqual(archived.headers["content-type"], "image/svg+xml")
-        self.assertEqual(archived.content, paths["summary-svg"].read_bytes())
+        self.assertEqual(archived.status_code, 409)
+        self.assertIn("重新生成", archived.json()["detail"])
 
         with connect(self.db) as connection:
             connection.execute(
@@ -3397,6 +3485,47 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         self.assertEqual(
             self.client.get(f"{download_url}?format=xlsx").status_code, 200
         )
+
+    def test_archived_report_json_and_direct_downloads_project_new_account_classification(self) -> None:
+        self._activate_current_report_release()
+        task = self.client.post("/api/v8/tasks", json={"period_start": "2026-07-01", "period_end": "2026-07-01"}).json()
+        with connect(self.db) as connection:
+            rows = connection.execute("SELECT file_kind,local_path FROM report_files WHERE task_id=? AND revision=1", (task["id"],)).fetchall()
+            paths = {row["file_kind"]: PROJECT_ROOT / row["local_path"] for row in rows}
+            report = json.loads(paths["report-json"].read_text())
+            report.pop("account_group_dimensions", None)
+            report.pop("business_direction_dimensions", None)
+            report["account_type_dimensions"] = [{"key": "original", "count": 1, "percentage": 100}]
+            report["metadata"].pop("account_classification_version", None)
+            for item in report["content_details"]:
+                item.pop("account_group", None)
+                item.pop("business_direction", None)
+                item["account_type"] = "original"
+                item["account_content_direction"] = "new_car"
+                item["content_direction"] = "media"
+            payload = json.dumps(report, ensure_ascii=False).encode("utf-8")
+            paths["report-json"].write_bytes(payload)
+            connection.execute("UPDATE report_files SET sha256=?,byte_size=? WHERE task_id=? AND revision=1 AND file_kind='report-json'",
+                               (hashlib.sha256(payload).hexdigest(), len(payload), task["id"]))
+            connection.commit()
+        before = {kind: path.read_bytes() for kind, path in paths.items()}
+        base = f'/api/v8/tasks/{task["id"]}/revisions/1'
+        for suffix in ("/report", "/files/report-json"):
+            response = self.client.get(base + suffix)
+            self.assertEqual(response.status_code, 200, response.text)
+            value = response.json()
+            self.assertNotIn("account_type_dimensions", value)
+            item = value["content_details"][0]
+            self.assertFalse({"account_type", "account_content_direction"} & item.keys())
+            self.assertEqual((item["account_group"], item["business_direction"], item["content_direction"]), ("unknown", "unknown", "media"))
+            self.assertNotIn("frozen_inputs", value)
+            self.assertEqual(value["source_frozen_inputs"], report["frozen_inputs"])
+        for kind in ("report-markdown", "summary-svg", "content-csv"):
+            response = self.client.get(base + "/files/" + kind)
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertNotIn("账号类型", response.text)
+            self.assertNotIn("account_type", response.text)
+        self.assertEqual({kind: path.read_bytes() for kind, path in paths.items()}, before)
 
     def test_report_export_context_recovers_url_id_and_rejects_mismatch(
         self,
@@ -3961,8 +4090,6 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
             {
                 "phone": "13800138000",
                 "operator_name": "运营甲",
-                "account_type": "original",
-                "content_direction": "new_car",
                 "platforms": [
                     {
                         "platform": "douyin",
@@ -3980,8 +4107,6 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
             json={
                 "phone": "+86 138-0013-8000",
                 "operator_name": "运营乙",
-                "account_type": "boutique_ip",
-                "content_direction": "media",
             },
         )
         self.assertEqual(updated.status_code, 200)
@@ -3996,7 +4121,6 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
                 "content_type": "video",
                 "account_uid": "123456789",
                 "account_name": "账号乙",
-                "account_type": "boutique_ip",
                 "content_direction": "media",
             },
         )
@@ -4165,8 +4289,9 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
         )
         self.assertEqual(searched.status_code, 200)
         item = searched.json()["items"][0]
-        self.assertEqual(item["account_type"], "original")
-        self.assertEqual(item["content_direction"], "new_car")
+        self.assertNotIn("account_type", item)
+        self.assertEqual((item["account_group"], item["business_direction"]), ("unknown", "unknown"))
+        self.assertEqual(item["content_direction"], "unknown")
 
         updated = self.client.patch(
             f"/api/v8/contents/{self.content_id}", json={"title": "仅修改标题"}
@@ -4491,7 +4616,8 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
             "default": {},
             "query": {"query": "汽车保养"},
             "platform": {"platform": "douyin"},
-            "account_type": {"account_type": "original"},
+            "account_group": {"account_group": "unknown"},
+            "business_direction": {"business_direction": "unknown"},
             "content_direction": {"content_direction": "media"},
             "selling_point": {"selling_point": "C1"},
             "selling_point_none": {"selling_point": "__none__"},
@@ -4502,7 +4628,7 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
             "scene": {"scene": "S1"},
             "scene_none": {"scene": "__none__"},
             "account_and_selling": {
-                "account_type": "original",
+                "account_group": "unknown",
                 "selling_point": "C1",
                 "platform": "douyin",
             },
@@ -4521,7 +4647,7 @@ class V8ReviewAndTaxonomyApiTest(unittest.TestCase):
                 )
                 self.assertEqual(response.status_code, 200)
                 value = response.json()
-                expected_total = 2 if name == "default" else 1
+                expected_total = 2 if name in {"default", "account_group", "business_direction"} else 1
                 self.assertEqual(value["total"], expected_total)
                 self.assertEqual(value["total"], len(value["items"]))
 

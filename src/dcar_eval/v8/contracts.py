@@ -40,12 +40,15 @@ LEGACY_CONTRACT_PATHS = {
     ),
 }
 CURRENT_REPORT_VERSION = "dcar-content-operations-report-v8.9"
+FOUR_PLATFORM_REPORT_VERSION = "dcar-content-operations-report-v8.10"
+CURRENT_REPORT_VERSIONS = frozenset({CURRENT_REPORT_VERSION, FOUR_PLATFORM_REPORT_VERSION})
 CURRENT_REPORT_RULE_VERSION = "evaluation-v9"
 CURRENT_REPORT_EVIDENCE_VERSION = "evidence-v2"
 REPORT_RULE_VERSIONS = {
     "dcar-content-operations-report-v8.7": "evaluation-v9",
     "dcar-content-operations-report-v8.8": "evaluation-v9",
     CURRENT_REPORT_VERSION: CURRENT_REPORT_RULE_VERSION,
+    FOUR_PLATFORM_REPORT_VERSION: CURRENT_REPORT_RULE_VERSION,
     "dcar-content-operations-report-v8.6": "evaluation-v9",
     "dcar-content-operations-report-v8.5": "evaluation-v8",
     "dcar-content-operations-report-v8.4": "evaluation-v8",
@@ -65,6 +68,8 @@ def load_contract(
 ) -> Dict[str, Any]:
     if path is not None:
         selected = path
+    elif report_version == FOUR_PLATFORM_REPORT_VERSION:
+        selected = CONTRACT_PATH.with_name("report_contract_v8_10.json")
     elif not report_version or report_version == CURRENT_REPORT_VERSION:
         selected = CONTRACT_PATH
     else:
@@ -215,6 +220,15 @@ def quality_gate_failures(
                     "required": float(minimum),
                 }
             )
+    # schema24 relations have their own ACK; an unfinished graph cannot publish.
+    if "duplicate_relation_coverage" in data_quality:
+        try:
+            relation_coverage = float(data_quality["duplicate_relation_coverage"])
+        except (ValueError, TypeError):
+            relation_coverage = -1.0
+        if relation_coverage != 100.0:
+            failures.append({"key": "duplicate_relation_coverage", "kind": "coverage",
+                             "actual": data_quality["duplicate_relation_coverage"], "required": 100.0})
     details = data_quality_details or {}
     pipeline_observation = (
         details.get("pipeline_observation")
@@ -474,7 +488,8 @@ def _validate_summary_quality_alignment(
             if expected == "below_threshold" and metric.get("percentage") is not None:
                 errors.append(f"{path}.percentage must be null below threshold")
 
-    fingerprint_coverage = data_quality.get("duplicate_fingerprint_coverage")
+    coverage_key = "duplicate_relation_coverage" if "duplicate_relation_coverage" in data_quality else "duplicate_fingerprint_coverage"
+    fingerprint_coverage = data_quality.get(coverage_key)
     calibration_ready = data_quality.get("duplicate_calibration_ready")
     duplicate = summary.get("duplicate_rate")
     if (
@@ -487,7 +502,7 @@ def _validate_summary_quality_alignment(
         if duplicate_coverage != float(fingerprint_coverage):
             errors.append(
                 f"{path}.coverage_percentage must equal "
-                "$.data_quality.duplicate_fingerprint_coverage"
+                f"$.data_quality.{coverage_key}"
             )
         if calibration_ready is False:
             if duplicate.get("status") != "not_calculable":
@@ -1187,12 +1202,29 @@ def validate_report(
     new_classification = classification_version == "account-classification-v2"
     if classification_version is not None and not new_classification:
         errors.append("$.metadata.account_classification_version is unsupported")
-    required_keys = list(contract["required_top_level_keys"])
+    # Current contracts declare only the current taxonomy. The old keys remain
+    # readable solely to verify immutable archived reports before projection.
+    required_keys = [key for key in contract["required_top_level_keys"]
+                     if key not in {"account_type_dimensions", "account_group_dimensions",
+                                    "business_direction_dimensions"}]
     if new_classification:
-        required_keys = [key for key in required_keys if key != "account_type_dimensions"]
         required_keys.extend(["account_group_dimensions", "business_direction_dimensions"])
         if "account_type_dimensions" in report:
             errors.append("$.account_type_dimensions is only valid for historical classification")
+        from .account_classification import ACCOUNT_GROUPS, BUSINESS_DIRECTIONS
+        content_details = report.get("content_details")
+        for index, row in enumerate(content_details if isinstance(content_details, list) else []):
+            if not isinstance(row, Mapping):
+                continue
+            for obsolete in ("account_type", "legacy_account_type", "account_content_direction"):
+                if obsolete in row:
+                    errors.append(f"$.content_details[{index}].{obsolete} is retired")
+            for field, options in (("account_group", ACCOUNT_GROUPS),
+                                   ("business_direction", BUSINESS_DIRECTIONS)):
+                if not isinstance(row.get(field), str) or row[field] not in options:
+                    errors.append(f"$.content_details[{index}].{field} is invalid")
+    else:
+        required_keys.append("account_type_dimensions")
     missing = [key for key in required_keys if key not in report]
     if missing:
         errors.append(f"$ missing {missing}")
@@ -1432,8 +1464,70 @@ def validate_report(
         if key in report and not isinstance(report[key], list):
             errors.append(f"$.{key} must be an array")
 
+    if report_version == FOUR_PLATFORM_REPORT_VERSION:
+        _validate_four_platform_metrics(report, errors)
     forbidden_partial = _walk_metric_statuses(report)
     if forbidden_partial:
         errors.append(f"metric status partial is forbidden at {forbidden_partial}")
     if errors:
         raise V8ContractViolation("; ".join(errors))
+
+
+def _validate_four_platform_metrics(report: Mapping[str, Any], errors: List[str]) -> None:
+    """Recompute quality from the exact frozen facts, without changing old contracts."""
+    from . import report_metric_validity
+    from .metric_source_policy import CURRENT_METRIC_POLICY, current_policy_binding, load_operation_field_policy
+    from .insights import OVERVIEW_CHANNELS
+    try:
+        references = report["input_references"]
+        expected_policy = load_operation_field_policy(policy_version=CURRENT_METRIC_POLICY)
+        if references["source_policy"] != expected_policy or references["source_policy_sha256"] != current_policy_binding()["policy_sha256"]:
+            raise ValueError("source policy differs from its immutable contract")
+        cutoff = report["metadata"]["collection_cutoff_at"]
+        if references["knowledge_at"] != cutoff:
+            raise ValueError("report knowledge cutoff differs from its frozen contract")
+        if report_metric_validity.policy_for_scope({"cutoff_at": cutoff, "metric_validity": references["metric_validity"]}) != CURRENT_METRIC_POLICY:
+            raise ValueError("report does not bind the current metric policy")
+        if references["channels"] != [list(item) for item in OVERVIEW_CHANNELS]:
+            raise ValueError("channel scope differs from its frozen contract")
+        calibration = references["audience_calibration"]
+        if calibration.get("contract_version") != "platform-audience-calibration-binding-v1" or set(calibration["platforms"]) != {item[0] for item in OVERVIEW_CHANNELS}:
+            raise ValueError("platform audience calibration is not frozen")
+        if any(value.get("state") not in {"approved", "rejected", "conservative", "uncalibrated"} for value in calibration["platforms"].values()):
+            raise ValueError("invalid frozen platform classifier state")
+        ids = references["content_ids"]
+        if any(type(cid) is not int for cid in ids) or len(ids) != len(set(ids)):
+            raise ValueError("content cohort is not a unique integer set")
+        rows = report["content_details"]
+        platforms = {int(row["content_id"]): str(row["platform"]) for row in rows}
+        if len(rows) != len(platforms) or set(platforms) != set(ids):
+            raise ValueError("detail cohort differs from frozen inputs")
+        aliases = references["content_identity_aliases"]
+        from .source_routing import parse_time
+        if aliases.get("contract_version") != "report-content-identity-aliases-v1" or aliases.get("knowledge_at") != references["knowledge_at"]:
+            raise ValueError("content identity aliases are not bound to the frozen knowledge cutoff")
+        alias_values = {cid:set() for cid in ids}
+        alias_ids = set()
+        for alias in aliases["rows"]:
+            cid, value = alias["content_id"], alias["identity_value"]
+            if type(alias["id"]) is not int or alias["id"] in alias_ids or type(cid) is not int or cid not in alias_values:
+                raise ValueError("alias evidence identity or cohort differs")
+            if not isinstance(value,str) or not value or alias["identity_kind"] != "platform_content_id" or alias["platform_identity_key"] != platforms[cid]+":"+value:
+                raise ValueError("alias evidence platform binding differs")
+            if parse_time(alias["created_at"]) > parse_time(aliases["knowledge_at"]):
+                raise ValueError("alias evidence was learned after the report cutoff")
+            alias_ids.add(alias["id"]);alias_values[cid].add(value)
+        if any(row["platform_content_id_aliases"] != sorted(alias_values[row["content_id"]]) for row in rows):
+            raise ValueError("exported platform aliases differ from frozen identity evidence")
+        snapshots = {int(cid): value for cid, value in references["metrics"].items()}
+        if set(snapshots) - set(ids):
+            raise ValueError("metric numerator contains contents outside the frozen denominator")
+        actual = report["data_quality_details"]["metrics_freshness"]
+        minimum = load_contract(report_version=FOUR_PLATFORM_REPORT_VERSION)["required_quality_details"]["metrics_freshness"]["minimum_percentage"]
+        expected = report_metric_validity.quality_detail(ids, snapshots, platforms=platforms, cutoff_at=cutoff,
+            minimum_percentage=minimum, policy_version=CURRENT_METRIC_POLICY)
+        for key in ("fields", "business_availability", "fresh_count", "eligible_count", "percentage", "contract_version", "source_policy_version"):
+            if actual.get(key) != expected[key]:
+                raise ValueError("metric quality does not match its frozen cohort: " + key)
+    except (KeyError, TypeError, ValueError) as error:
+        errors.append("$.four_platform_metric_contract: " + str(error))

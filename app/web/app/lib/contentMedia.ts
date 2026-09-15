@@ -10,8 +10,8 @@ import type { ContentItem } from "./types";
 // width/height 支持 vw/vh，给 100vw/100vh 才会精确填满 iframe（不给时固定 324×672+48px 底条，iframe 更小就被裁）；
 // autoplay 播放器根本不读，按官方嵌入模板保留 autoplay=0，视频需要点播放键。
 
-export type MediaActionKind = "local" | "douyin_player" | "original";
-export type MediaLabel = "播放" | "查看";
+export type MediaActionKind = "local" | "douyin_player" | "original" | "unavailable";
+export type MediaLabel = "播放" | "查看" | "原帖链接暂不可用";
 
 export type MediaAction = {
   kind: MediaActionKind;
@@ -26,6 +26,20 @@ export type MediaActionInput = Pick<ContentItem, "platform" | "content_type" | "
 
 export const DOUYIN_PLAYER_ORIGIN = "https://open.douyin.com";
 export const DOUYIN_ITEM_ID_PATTERN = /^\d{5,25}$/;
+
+export const ORIGINAL_POST_UNAVAILABLE = "原帖链接暂不可用";
+
+// Only link to an actual absolute web URL. Keep the supplied query intact;
+// platform IDs alone are not enough to invent an original-post address.
+export function originalPostUrl(value: unknown): string | null {
+  if (typeof value !== "string" || !/^https?:\/\//i.test(value) || /[\s\\\u0000-\u001f\u007f]/u.test(value)) return null;
+  try {
+    const url = new URL(value);
+    return url.hostname && !url.username && !url.password ? value : null;
+  } catch {
+    return null;
+  }
+}
 
 // 平台 Logo（public/ 下的官方 PNG），媒体框左上角使用；缺失的平台退回通用图标。
 export const PLATFORM_LOGO_PATHS: Partial<Record<string, `/${string}`>> = {
@@ -61,14 +75,16 @@ export function douyinPlayerEligible(item: Pick<MediaActionInput, "platform" | "
 }
 
 export function resolveMediaAction(item: MediaActionInput): MediaAction {
+  const href = originalPostUrl(item.canonical_url);
   // Older running APIs omit this field. Unknown is not proof that media is
   // absent: inspect Evidence only after a click, without preloading each row.
-  if (item.local_media_available !== false) {
+  if (item.local_media_available === true || (item.local_media_available !== false && href !== null)) {
     return { kind: "local", label: mediaLabelFor(item.content_type), href: null, playerUrl: null };
   }
   const playerUrl = douyinPlayerEligible(item) ? douyinPlayerUrl(item.platform_content_id) : null;
   if (playerUrl) {
     return { kind: "douyin_player", label: "播放", href: null, playerUrl };
   }
-  return { kind: "original", label: mediaLabelFor(item.content_type), href: item.canonical_url, playerUrl: null };
+  if (href) return { kind: "original", label: mediaLabelFor(item.content_type), href, playerUrl: null };
+  return { kind: "unavailable", label: ORIGINAL_POST_UNAVAILABLE, href: null, playerUrl: null };
 }

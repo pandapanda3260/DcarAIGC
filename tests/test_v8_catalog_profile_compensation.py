@@ -267,8 +267,14 @@ class CatalogProfileCompensationTest(unittest.TestCase):
         self.enqueue_recovery()
         self.assertEqual(self.recovered_worker()["status"], "terminal")
         later = "2026-09-01T22:01:00Z"
+        # This crosses the 00:10 Beijing plan boundary. The recurring planner
+        # supplies that day's snapshot rather than borrowing yesterday's plan.
+        current_plan = self.base.fixture.plan(at=later)
         with connect(self.db) as connection, transaction(connection):
-            self.assertTrue(runtime._enqueue(connection, self.base.plan, self.base.plan["cohort"][0],
+            self.assertFalse(runtime._enqueue(connection, self.base.plan, self.base.plan["cohort"][0],
+                stage="account_metrics", operation=OPERATION,
+                logical_due="account-metrics:" + runtime._bucket(later, 6 * 3600), at=later))
+            self.assertTrue(runtime._enqueue(connection, current_plan, current_plan["cohort"][0],
                 stage="account_metrics", operation=OPERATION,
                 logical_due="account-metrics:" + runtime._bucket(later, 6 * 3600), at=later))
         result = self.recovered_worker(at=later, compensation=False)

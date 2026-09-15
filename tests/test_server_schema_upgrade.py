@@ -641,7 +641,7 @@ class ServerSchemaUpgradeTest(unittest.TestCase):
         self.assertFalse((self.new / "schema-upgrade-manifest.json").exists())
         _write(self.active_database, original, 0o640)
         self._seal()
-        with self.assertRaisesRegex(installer.SnapshotInstallError, "only sealed 17-to-18, 18-to-19, 19-to-20 or 20-to-21"):
+        with self.assertRaisesRegex(installer.SnapshotInstallError, "only sealed 17-to-18, 18-to-19, 19-to-20, 20-to-21 or 21-to-22"):
             self._upgrade(from_schema=17, to_schema=19)
         self.assertEqual(self._protected_state(), self.baseline)
         self.assertEqual(self.events, [])
@@ -649,7 +649,7 @@ class ServerSchemaUpgradeTest(unittest.TestCase):
     def test_seal_rejects_wrong_pair_and_nonexact_schema19_structure(self) -> None:
         with self.assertRaisesRegex(
             installer.SnapshotInstallError,
-            "only sealed 17-to-18, 18-to-19, 19-to-20 or 20-to-21",
+            "only sealed 17-to-18, 18-to-19, 19-to-20, 20-to-21 or 21-to-22",
         ):
             installer.seal_schema_upgrade(
                 self.bundle,
@@ -700,10 +700,10 @@ class ServerSchemaUpgradeTest(unittest.TestCase):
         self.assertEqual(self.events, [])
 
     def test_supported_contract_sets_are_exact_and_keep_17_to18(self) -> None:
-        self.assertEqual(installer.SUPPORTED_SCHEMA_VERSIONS, {17, 18, 19, 20, 21})
+        self.assertEqual(installer.SUPPORTED_SCHEMA_VERSIONS, {17, 18, 19, 20, 21, 22})
         self.assertEqual(
             installer.SUPPORTED_SCHEMA_TRANSITIONS,
-            {(17, 18), (18, 19), (19, 20), (20, 21)},
+            {(17, 18), (18, 19), (19, 20), (20, 21), (21, 22)},
         )
         self.assertEqual(
             installer._transition_contract(17, 18),

@@ -69,6 +69,12 @@ def _format_time(value: int) -> str:
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(value))
 
 
+def _display_username(value: str) -> str:
+    """Render arbitrary account names without terminal control sequences."""
+    return "".join(character if character.isprintable() else json.dumps(character)[1:-1]
+                   for character in value)
+
+
 def _read_new_password(username: str, phone: Optional[str]) -> str:
     password = getpass.getpass("请输入新密码：")
     confirmation = getpass.getpass("请再次输入新密码：")
@@ -118,10 +124,10 @@ def cmd_allow_phone(arguments: argparse.Namespace) -> int:
     store = _open_store(arguments)
     if arguments.remove:
         removed = store.remove_allowed_phone(arguments.phone, actor=_actor())
-        print("已移出准入名单" if removed else "该手机号不在准入名单中")
+        print("已移除历史准入记录（此记录不再影响注册）" if removed else "没有历史准入记录（注册无需预先授权）")
         return 0
     store.allow_phone(arguments.phone, arguments.note or "", actor=_actor())
-    print("已加入准入名单")
+    print("已更新历史准入记录（此命令已废弃，注册无需预先授权）")
     return 0
 
 
@@ -190,7 +196,7 @@ def cmd_list(arguments: argparse.Namespace) -> int:
     )
     for user in users:
         print(
-            f"{user.username:<24} {user.phone or '-':<13} {user.role:<11} {user.status:<8} "
+            f"{_display_username(user.username):<24} {user.phone or '-':<13} {user.role:<11} {user.status:<8} "
             f"{_format_time(user.created_at):<16} "
             f"{_format_time(user.password_updated_at):<16} {user.active_sessions}"
         )
@@ -230,7 +236,7 @@ def cmd_set_role(arguments: argparse.Namespace) -> int:
     except auth_store.LastSuperadmin:
         print("至少保留一个超级管理员", file=sys.stderr)
         return 2
-    print(f"{user.username} {user.role}")
+    print(f"{_display_username(user.username)} {user.role}")
     return 0
 
 
@@ -244,7 +250,7 @@ def cmd_delete_user(arguments: argparse.Namespace) -> int:
     except auth_store.LastSuperadmin:
         print("至少保留一个超级管理员", file=sys.stderr)
         return 2
-    print(f"已删除 {user.username}（用户名保留为墓碑，手机号退出准入名单，会话与验证码已失效）")
+    print(f"已删除 {_display_username(user.username)}（会话与验证码已失效；可以重新注册，新账号仍需管理员授权）")
     return 0
 
 
@@ -324,13 +330,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub.set_defaults(handler=cmd_export_htpasswd)
 
-    sub = commands.add_parser("allow-phone", help="维护运营人员准入名单（页面注册门控）")
+    sub = commands.add_parser("allow-phone", help="已废弃：仅维护历史记录，不再影响注册")
     sub.add_argument("phone")
     sub.add_argument("--note", default="")
     sub.add_argument("--remove", action="store_true")
     sub.set_defaults(handler=cmd_allow_phone)
 
-    sub = commands.add_parser("set-phone", help="绑定或改绑手机号（旧号同时退出准入名单）")
+    sub = commands.add_parser("set-phone", help="绑定或改绑手机号（同时作废旧验证码）")
     sub.add_argument("username")
     sub.add_argument("phone")
     sub.set_defaults(handler=cmd_set_phone)
@@ -360,7 +366,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_argument("role", choices=list(auth_store.ROLES))
     sub.set_defaults(handler=cmd_set_role)
 
-    sub = commands.add_parser("delete-user", help="删除账号（墓碑保留用户名，手机号退出准入名单）")
+    sub = commands.add_parser("delete-user", help="删除账号并撤销会话与验证码（可重新注册为新用户）")
     sub.add_argument("username")
     sub.set_defaults(handler=cmd_delete_user)
 

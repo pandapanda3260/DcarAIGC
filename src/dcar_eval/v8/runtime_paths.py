@@ -7,6 +7,8 @@ existing behavior.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import argparse
 import hashlib
 import json
@@ -21,6 +23,34 @@ from pathlib import Path
 from typing import Sequence
 
 
+@contextmanager
+def _runtime_phase(name):
+    # This file also runs as the stdlib-only pre-import bootstrap. Never load
+    # another source module before that standalone entry verifies the source.
+    if __package__:
+        from .runtime_phase_timing import phase
+        with phase(name):
+            yield
+    else:
+        yield
+
+
+def _measured_git_run(arguments, *, env):
+    with _runtime_phase("subprocess.spawn_setup"):
+        process = subprocess.Popen(arguments, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    with process:
+        try:
+            with _runtime_phase("subprocess.communicate_wait"):
+                stdout, stderr = process.communicate()
+        except BaseException:
+            process.kill()
+            raise
+        returncode = process.poll()
+        if returncode:
+            raise subprocess.CalledProcessError(returncode, arguments, output=stdout, stderr=stderr)
+    return subprocess.CompletedProcess(arguments, returncode, stdout, stderr)
+
+
 def verified_git(root: Path, *arguments: str) -> bytes:
     """Read local Git without running repository filters, monitors or textconv."""
     environment = {key: value for key, value in os.environ.items()
@@ -31,8 +61,7 @@ def verified_git(root: Path, *arguments: str) -> bytes:
     environment.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
                        GIT_NO_LAZY_FETCH="1", GIT_OPTIONAL_LOCKS="0", GIT_PAGER="cat")
     prefix = ["git", "-c", "core.fsmonitor=false", "-C", str(root)]
-    configured = subprocess.run([*prefix, "config", "--null", "--list"], check=True,
-                                env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
+    configured = _measured_git_run([*prefix, "config", "--null", "--list"], env=environment).stdout
     for item in configured.split(b"\0"):
         key, _, value = item.partition(b"\n")
         name = key.decode("utf-8").lower()
@@ -40,8 +69,7 @@ def verified_git(root: Path, *arguments: str) -> bytes:
                 or re.fullmatch(r"diff\..+\.(command|textconv)", name)
                 or (name == "core.fsmonitor" and value.lower() not in {b"false", b"0", b"no", b"off"})):
             raise ValueError("external Git helper is forbidden in a sealed source repository")
-    return subprocess.run([*prefix, *arguments], check=True, env=environment,
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
+    return _measured_git_run([*prefix, *arguments], env=environment).stdout
 
 
 def _raw_file(path: Path, *, private: bool = False, limit: int = 16 * 1024 * 1024) -> bytes:
@@ -162,7 +190,32 @@ def verify_source_before_import(*, data: Path, source: Path, build_receipt: Path
         install = _json_object(_raw_file(install_path, private=True))
         database = Path(environment.get("DCAR_V8_DB", ""))
         identity = database.stat()
-        if payload.get("account_classification_successor") is not None:
+        if (payload.get("duplicate_index_successor") is not None
+                or payload.get("four_platform_flow_successor") is not None or payload.get("account_intake_successor") is not None):
+            # Every source file has passed the manifest above. Use a private
+            # package namespace so relative stdlib verifier imports cannot
+            # reuse an already-imported v8 module from another checkout.
+            import importlib
+            import sys
+            import types
+            package_name = "_dcar_verified_intake_" + manifest["git"]["status_porcelain_sha256"][:16]
+            if any(name == package_name or name.startswith(package_name + ".") for name in sys.modules):
+                raise ValueError("verified intake bootstrap namespace already loaded")
+            package = types.ModuleType(package_name)
+            package.__path__ = [str(source / "src/dcar_eval/v8")]
+            package.__package__ = package_name
+            sys.modules[package_name] = package
+            try:
+                entry = (".duplicate_index_release" if payload.get("duplicate_index_successor") is not None else
+                         ".four_platform_flow_release" if payload.get("four_platform_flow_successor") is not None else ".account_intake_release")
+                module = importlib.import_module(package_name + entry)
+                module.verify_inheritance(build=payload, build_ref=module.reference(selected),
+                    install_path=install_path, database=database, source=source)
+            finally:
+                for name in list(sys.modules):
+                    if name == package_name or name.startswith(package_name + "."):
+                        sys.modules.pop(name, None)
+        elif payload.get("account_classification_successor") is not None:
             import importlib.util
             module_path = source / "src/dcar_eval/v8/account_classification_release.py"
             spec = importlib.util.spec_from_file_location("verified_classification_release", module_path)

@@ -89,15 +89,20 @@ export default function ContentUpdateJobsProvider({ children }: { children: Reac
   }, [owner, storageKey]);
 
   useEffect(() => {
+    let changed = false;
     for (const job of jobs) {
       const previous = previousStatuses.current.get(job.id);
       previousStatuses.current.set(job.id, job.status);
       if (!previous || !["queued", "running"].includes(previous) || isActiveContentUpdateJob(job)) continue;
+      changed = true;
       const summary = job.result ? contentUpdateFeedback(job.result) : { error: job.error || "更新失败，请查看任务结果。", message: "" };
       const failed = job.status === "failed" || Boolean(summary.error);
       const partial = !failed && summary.message.includes("未全部完成");
       showToast(failed ? "error" : "success", <><strong>{job.title || `内容 ${job.content_id}`}</strong><div>{failed ? "更新未完成" : partial ? "数据已部分更新" : "数据已更新"} · <button type="button" onClick={openTasks}>查看结果</button></div></>, { dedupeKey: `content-update-job:${job.id}:${job.status}` });
-      // Completion feedback never waits for unrelated, possibly slow cached reads.
+    }
+    if (changed) {
+      // One polling result can complete many jobs. Refresh each affected data
+      // domain once, after all feedback, without repeatedly cancelling refetches.
       for (const key of [queryKeys.contents, queryKeys.accounts, queryKeys.overview, queryKeys.activeSellingPoints, queryKeys.spu]) {
         void queryClient.invalidateQueries({ queryKey: key }).catch(() => {});
       }

@@ -886,7 +886,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
             return ProviderResult(
                 {
                     "items": [
-                        {
+                        {"account_uid": "99887779",
                             "platform": "douyin",
                             "platform_content_id": "987654330",
                             "canonical_url": "https://www.douyin.com/video/987654330",
@@ -905,7 +905,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
                         }
                     ],
                 },
-                {"data": {"aweme_list": [{"aweme_id": "987654330"}]}},
+                {"data": {"aweme_list": [{"author": {"uid": "99887779"}, "aweme_id": "987654330"}]}},
                 200,
                 True,
             )
@@ -1006,7 +1006,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
             return ProviderResult(
                 {
                     "items": [
-                        {
+                        {"account_uid": "99887779",
                             "platform": "douyin",
                             "platform_content_id": "987654330",
                             "canonical_url": "https://www.douyin.com/video/987654330",
@@ -1026,7 +1026,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
                     ],
                     "has_more": False,
                 },
-                {"data": {"aweme_list": [{"aweme_id": "987654330"}]}},
+                {"data": {"aweme_list": [{"author": {"uid": "99887779"}, "aweme_id": "987654330"}]}},
                 200,
                 True,
             )
@@ -1907,7 +1907,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
             return ProviderResult(
                 {
                     "items": [
-                        {
+                        {"account_uid": "99887766",
                             "platform": "douyin",
                             "platform_content_id": "987654321",
                             "canonical_url": "https://www.douyin.com/video/987654321",
@@ -1930,7 +1930,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
                 {
                     "data": {
                         "aweme_list": [
-                            {
+                            {"author": {"uid": "99887766"},
                                 "aweme_id": "987654321",
                                 "video": {
                                     "play_addr": {
@@ -2094,7 +2094,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
             return ProviderResult(
                 {
                     "items": [
-                        {
+                        {"account_uid": "identity-conflict-account",
                             "platform": "xiaohongshu",
                             "platform_content_id": second_id,
                             "canonical_url": first_url,
@@ -2204,7 +2204,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
                 "platforms": [
                     {
                         "platform": "xiaohongshu",
-                        "uid": "replay-identity-conflict-account",
+                        "uid": "aaaaaaaaaaaaaaaaaaaaaaaa",
                         "nickname": "重放冲突账号",
                     }
                 ],
@@ -2219,7 +2219,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
             {
                 "platform": "xiaohongshu",
                 "platform_content_id": first_id,
-                "canonical_url": second_url,
+                "canonical_url": first_url,
                 "title": "重放冲突第一条汽车保养内容",
                 "body": "重放冲突第一条汽车保养完整正文证据",
             },
@@ -2229,12 +2229,21 @@ class V8ProviderUpdateTest(unittest.TestCase):
             {
                 "platform": "xiaohongshu",
                 "platform_content_id": second_id,
-                "canonical_url": first_url,
+                "canonical_url": second_url,
                 "title": "重放冲突第二条汽车保养内容",
                 "body": "重放冲突第二条汽车保养完整正文证据",
             },
             db_path=self.db,
         )
+        # Model an existing pre-parser database whose IDs and URLs conflict.
+        # New manual submissions now reject this at admission.
+        with connect(self.db) as connection:
+            connection.execute("DELETE FROM content_identities WHERE content_id IN (?,?) AND identity_kind='canonical_url'", (first["id"], second["id"]))
+            connection.execute("UPDATE content_items SET normalized_url_hash=NULL WHERE id IN (?,?)", (first["id"], second["id"]))
+            for record, url in ((first, second_url), (second, first_url)):
+                connection.execute("UPDATE content_items SET canonical_url=?,normalized_url_hash=? WHERE id=?",
+                    (url, hashlib.sha256(url.encode()).hexdigest(), record["id"]))
+            connection.commit()
         evaluations = {
             evaluate_content(int(first["id"]), db_path=self.db).evaluation_id,
             evaluate_content(int(second["id"]), db_path=self.db).evaluation_id,
@@ -2258,6 +2267,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
                         {
                             "platform": "xiaohongshu",
                             "platform_content_id": second_id,
+                            "account_uid": "aaaaaaaaaaaaaaaaaaaaaaaa",
                             "canonical_url": second_url,
                             "title": "重放身份冲突内容",
                             "body": "重放身份冲突正文",
@@ -2273,6 +2283,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
                             "notes": [
                                 {
                                     "note_id": second_id,
+                                    "user": {"user_id": "aaaaaaaaaaaaaaaaaaaaaaaa"},
                                     "display_title": "重放身份冲突内容",
                                     "desc": "重放身份冲突正文",
                                     "type": "normal",
@@ -2294,7 +2305,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
                 discover_account_content(
                     int(account["id"]),
                     "xiaohongshu",
-                    "replay-identity-conflict-account",
+                    "aaaaaaaaaaaaaaaaaaaaaaaa",
                     as_of=date(2026, 8, 2),
                     window_key="replay-identity-conflict-page",
                     db_path=self.db,
@@ -2335,7 +2346,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
             discover_account_content(
                 int(account["id"]),
                 "xiaohongshu",
-                "replay-identity-conflict-account",
+                "aaaaaaaaaaaaaaaaaaaaaaaa",
                 as_of=date(2026, 8, 2),
                 window_key="replay-identity-conflict-page",
                 db_path=self.db,
@@ -2441,7 +2452,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
                 )
             data = {
                 "items": [
-                    {
+                    {"account_uid": "99887776",
                         "platform": "douyin",
                         "platform_content_id": "987654326",
                         "canonical_url": "https://www.douyin.com/video/987654326",
@@ -2515,7 +2526,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
             return ProviderResult(
                 {
                     "items": [
-                        {
+                        {"account_uid": "99887769",
                             "platform": "douyin",
                             "platform_content_id": "987654329",
                             "canonical_url": "https://www.douyin.com/video/987654329",
@@ -2539,7 +2550,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
                 {
                     "data": {
                         "aweme_list": [
-                            {
+                            {"author": {"uid": "99887769"},
                                 "aweme_id": "987654329",
                                 "desc": "中断恢复内容正文",
                                 "create_time": 1785632400,
@@ -2890,7 +2901,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
             return ProviderResult(
                 {
                     "items": [
-                        {
+                        {"account_uid": "xhs-user-1",
                             "platform": "xiaohongshu",
                             "platform_content_id": "64abcdef1234567890abcdef",
                             "canonical_url": "https://www.xiaohongshu.com/explore/64abcdef1234567890abcdef",
@@ -3090,7 +3101,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
 
         def detail_call(stage, current):
             calls.append(stage)
-            data = {
+            data = {"account_uid": "xhs-user",
                 "title": "详情先成功",
                 "body": "随后在指标派生前中断",
                 "published_at": "2026-08-01T04:00:00Z",
@@ -3940,7 +3951,7 @@ class V8ProviderUpdateTest(unittest.TestCase):
             return ProviderResult(
                 {
                     "items": [
-                        {
+                        {"account_uid": "lock-retry-xhs-user",
                             "platform": "xiaohongshu",
                             "platform_content_id": "6a123456000000001234abcd",
                             "canonical_url": (

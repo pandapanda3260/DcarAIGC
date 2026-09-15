@@ -7,7 +7,7 @@ import { metricEvidence, metricStatus, metricUnavailableLabel } from "../lib/for
 import { publicAssetPath } from "../lib/paths";
 import type { BusinessSceneKey, Metric } from "../lib/types";
 import {
-  contentStructure, numberText, overviewMetrics, percentageNumber, percentageText,
+  contentStructure, numberText, overviewChannels, overviewMetrics, percentageNumber, percentageText,
   progressWidth, ratioEvidence, sortedSellingPoints, visibleMetricNumber,
   type OverviewSellingPoint, type ReportChannel,
 } from "./overviewModel";
@@ -144,11 +144,12 @@ function SellingPointTable({ channel }: { channel: ReportChannel }) {
 }
 
 export function OverviewChannelReport({ channel }: { channel: ReportChannel }) {
+  const logo = overviewChannels.find(({ key }) => key === channel.platform)?.logo;
   const exposure = channel.summary.metrics.selling_point_exposure_share;
   const exposureUnavailable = visibleMetricNumber(exposure) == null;
   return <section className={styles.channel} data-channel={channel.platform}>
     <header className={styles.header}><div className={styles.heading}>
-      <Image className={styles.platform} src={publicAssetPath(channel.platform === "douyin" ? "/brand-douyin-tiktok.svg" : "/brand-xiaohongshu.svg")} alt="" width={30} height={30} unoptimized />
+      {logo && <Image className={styles.platform} src={publicAssetPath(logo)} alt="" width={30} height={30} unoptimized />}
       <h2>{channel.label}渠道</h2></div><span className={styles.publication}><strong>{numberText(channel.publication_count)}</strong> 条发布</span>
     </header>
     <div className={styles.meta}><span>可评估内容 <b>{percentageText(channel.evidence_coverage_percentage)}</b></span><span>有曝光数据 <b>{channel.platform === "xiaohongshu" ? "—" : `${numberText(channel.valid_exposure_items)} 条`}</b></span><span>已完成曝光分类 <b>{percentageText(channel.exposure_coverage_percentage)}</b></span></div>

@@ -99,8 +99,8 @@ class V8OperationsTest(unittest.TestCase):
         content = upsert_content(
             {
                 "platform": "kuaishou",
-                "platform_content_id": "KS-FORMULA",
-                "canonical_url": "https://www.kuaishou.com/short-video/KS-FORMULA",
+                "platform_content_id": "KSFORMULA",
+                "canonical_url": "https://www.kuaishou.com/short-video/KSFORMULA",
                 "title": '=HYPERLINK("https://example.invalid")',
                 "body": "公式注入导出测试",
                 "account_name": "  @SUM(1,1)",
@@ -126,8 +126,6 @@ class V8OperationsTest(unittest.TestCase):
             {
                 "phone": "13800138000",
                 "operator_name": "张三",
-                "account_type": "original",
-                "content_direction": "new_car",
                 "platforms": [
                     {
                         "platform": "douyin",
@@ -156,8 +154,6 @@ class V8OperationsTest(unittest.TestCase):
             {
                 "phone": "+86 138-0013-8000",
                 "operator_name": "李四",
-                "account_type": "boutique_ip",
-                "content_direction": "media",
                 "platforms": [
                     {
                         "platform": "douyin",
@@ -472,7 +468,7 @@ class V8OperationsTest(unittest.TestCase):
                 ).fetchone()[0],
                 account["id"],
             )
-        upsert_content(
+        update_content(content["id"],
             {
                 "platform": "douyin",
                 "platform_content_id": "778900",
@@ -538,8 +534,6 @@ class V8OperationsTest(unittest.TestCase):
                 {
                     "phone": "13900139000",
                     "operator_name": "运营乙",
-                    "account_type": "mixed_edit",
-                    "content_direction": "used_car",
                     "enabled": "1",
                     "xiaohongshu_uid": "5c668b3e0000000012021605",
                     "xiaohongshu_nickname": "二手车号",
@@ -561,14 +555,23 @@ class V8OperationsTest(unittest.TestCase):
         self.assertEqual(identity["platform"], "xiaohongshu")
         self.assertEqual(identity["uid"], "5c668b3e0000000012021605")
 
+    def test_current_account_import_keeps_explicit_new_classification(self) -> None:
+        current_db = Path(self.temp.name) / "current-import.sqlite3"
+        with connect(current_db) as connection:
+            initialize_database(connection, target_version=23)
+        import_accounts([{"platform": "douyin", "uid": "123456789", "nickname": "新分类账号",
+                          "account_status": "daily", "account_group": "innovation", "business_direction": "used_car_c2"}],
+                        source_name="current.json", db_path=current_db)
+        with connect(current_db) as connection:
+            row = connection.execute("SELECT account_group,business_direction FROM account_directory_rows").fetchone()
+        self.assertEqual(tuple(row), ("innovation", "used_car_c2"))
+
     def test_account_workbook_exports_frontend_labels_and_text_ids(self) -> None:
         import_accounts(
             [
                 {
                     "phone": "13900139000",
                     "operator_name": "运营乙",
-                    "account_type": "mixed_edit",
-                    "content_direction": "used_car",
                     "enabled": "1",
                     "douyin_uid": "7626610000000000000",
                     "douyin_nickname": "车圈大土豆",
@@ -577,8 +580,6 @@ class V8OperationsTest(unittest.TestCase):
                 {
                     "phone": "13800138000",
                     "operator_name": "",
-                    "account_type": "boutique_ip",
-                    "content_direction": "new_car",
                     "enabled": "停用",
                     "xiaohongshu_uid": "5c668b3e0000000012021605",
                     "xiaohongshu_nickname": "二手车号",
@@ -704,45 +705,18 @@ class V8OperationsTest(unittest.TestCase):
                 db_path=self.db,
             )
 
-    def test_douyin_and_xhs_require_platform_ids_but_other_platforms_allow_url_fallback(
-        self,
-    ) -> None:
-        with self.assertRaisesRegex(OperationError, "短链需先展开"):
-            upsert_content(
-                {"platform": "douyin", "canonical_url": "https://v.douyin.com/abc/"},
-                db_path=self.db,
-            )
-        with self.assertRaisesRegex(OperationError, "24 位"):
-            upsert_content(
-                {
-                    "platform": "xiaohongshu",
-                    "canonical_url": "https://www.xiaohongshu.com/explore/bad",
-                },
-                db_path=self.db,
-            )
-        first = upsert_content(
-            {
-                "platform": "wechat_channels",
-                "canonical_url": "https://channels.weixin.qq.com/post/a?x=1",
-                "title": "汽车保养方法详解",
-                "body": "汽车保养方法详解完整正文",
-            },
-            db_path=self.db,
-        )
-        second = upsert_content(
-            {
-                "platform": "wechat_channels",
-                "canonical_url": "http://channels.weixin.qq.com/post/a?y=2",
-                "title": "新标题",
-            },
-            db_path=self.db,
-        )
-        self.assertEqual(first["id"], second["id"])
+    def test_all_platforms_require_resolved_work_identity(self) -> None:
+        for platform, url in (("douyin", "https://v.douyin.com/abc/"),
+            ("xiaohongshu", "https://www.xiaohongshu.com/explore/bad"),
+            ("wechat_channels", "https://channels.weixin.qq.com/post/a?x=1")):
+            with self.assertRaises(OperationError):
+                upsert_content({"platform":platform, "canonical_url":url}, db_path=self.db)
+        first = upsert_content({"platform":"wechat_channels", "canonical_url":"https://channels.weixin.qq.com/video/123?object_nonce_id=known", "title":"旧标题"},db_path=self.db)
+        second = upsert_content({"platform":"wechat_channels", "canonical_url":"https://channels.weixin.qq.com/video/123?object_nonce_id=known&tracking=x", "title":"新标题"},db_path=self.db)
+        self.assertEqual(first["id"],second["id"])
         with connect(self.db) as connection:
-            count = connection.execute("SELECT COUNT(*) FROM content_items").fetchone()[
-                0
-            ]
-        self.assertEqual(count, 1)
+            self.assertEqual(connection.execute("SELECT platform_content_id FROM content_items").fetchone()[0],"123")
+
 
     def test_partial_content_update_preserves_omitted_fields_and_can_clear_identity_text(
         self,
@@ -750,7 +724,7 @@ class V8OperationsTest(unittest.TestCase):
         created = upsert_content(
             {
                 "platform": "kuaishou",
-                "platform_content_id": "KS-PATCH",
+                "platform_content_id": "patch",
                 "canonical_url": "https://www.kuaishou.com/short-video/patch",
                 "published_at": "2026-08-03T08:00:00Z",
                 "title": "原始标题",
@@ -758,7 +732,6 @@ class V8OperationsTest(unittest.TestCase):
                 "content_type": "video",
                 "account_uid": "patch-uid",
                 "account_name": "原始昵称",
-                "account_type": "original",
                 "content_direction": "media",
             },
             db_path=self.db,
@@ -879,8 +852,8 @@ class V8OperationsTest(unittest.TestCase):
             {
                 **common,
                 "platform": "kuaishou",
-                "platform_content_id": "KS-DUP-ORIGINAL",
-                "canonical_url": "https://www.kuaishou.com/short-video/dup-original",
+                "platform_content_id": "duporiginal",
+                "canonical_url": "https://www.kuaishou.com/short-video/duporiginal",
                 "published_at": "2026-08-01T00:00:00Z",
             },
             db_path=self.db,
@@ -889,8 +862,8 @@ class V8OperationsTest(unittest.TestCase):
             {
                 **common,
                 "platform": "kuaishou",
-                "platform_content_id": "KS-DUP-SECOND",
-                "canonical_url": "https://www.kuaishou.com/short-video/dup-second",
+                "platform_content_id": "dupsecond",
+                "canonical_url": "https://www.kuaishou.com/short-video/dupsecond",
                 "published_at": "2026-08-02T00:00:00Z",
             },
             db_path=self.db,
@@ -922,8 +895,8 @@ class V8OperationsTest(unittest.TestCase):
             {
                 **common,
                 "platform": "kuaishou",
-                "platform_content_id": "KS-DATE-FIRST",
-                "canonical_url": "https://www.kuaishou.com/short-video/date-first",
+                "platform_content_id": "datefirst",
+                "canonical_url": "https://www.kuaishou.com/short-video/datefirst",
                 "published_at": "2026-08-02T00:00:00Z",
             },
             db_path=self.db,
@@ -932,8 +905,8 @@ class V8OperationsTest(unittest.TestCase):
             {
                 **common,
                 "platform": "kuaishou",
-                "platform_content_id": "KS-DATE-SECOND",
-                "canonical_url": "https://www.kuaishou.com/short-video/date-second",
+                "platform_content_id": "datesecond",
+                "canonical_url": "https://www.kuaishou.com/short-video/datesecond",
                 "published_at": "2026-08-03T00:00:00Z",
             },
             db_path=self.db,
@@ -996,7 +969,7 @@ class V8OperationsTest(unittest.TestCase):
         with self.assertRaisesRegex(IdentityConflictError, "identity_conflict"):
             update_content(
                 int(first["id"]),
-                {"platform_content_id": second_id},
+                {"platform_content_id": second_id, "canonical_url": second_url},
                 db_path=self.db,
             )
 
@@ -1031,8 +1004,8 @@ class V8OperationsTest(unittest.TestCase):
         no_history = upsert_content(
             {
                 "platform": "kuaishou",
-                "platform_content_id": "KS-THREE-WAY-ID",
-                "canonical_url": "https://www.kuaishou.com/short-video/no-history",
+                "platform_content_id": "nohistory",
+                "canonical_url": "https://www.kuaishou.com/short-video/nohistory",
                 "title": "没有历史但带有子表记录的内容",
                 "body": "没有历史但带有子表记录的完整正文",
             },
@@ -1041,8 +1014,8 @@ class V8OperationsTest(unittest.TestCase):
         url_history = upsert_content(
             {
                 "platform": "kuaishou",
-                "platform_content_id": "KS-URL-HISTORY",
-                "canonical_url": "https://www.kuaishou.com/short-video/url-history",
+                "platform_content_id": "urlhistory",
+                "canonical_url": "https://www.kuaishou.com/short-video/urlhistory",
                 "title": "链接命中的保护历史内容",
                 "body": "链接命中的保护历史内容完整正文",
             },
@@ -1051,8 +1024,8 @@ class V8OperationsTest(unittest.TestCase):
         target = upsert_content(
             {
                 "platform": "kuaishou",
-                "platform_content_id": "KS-TARGET-HISTORY",
-                "canonical_url": "https://www.kuaishou.com/short-video/target-history",
+                "platform_content_id": "targethistory",
+                "canonical_url": "https://www.kuaishou.com/short-video/targethistory",
                 "title": "正在修改的保护历史内容",
                 "body": "正在修改的保护历史内容完整正文",
             },
@@ -1100,8 +1073,8 @@ class V8OperationsTest(unittest.TestCase):
             update_content(
                 int(target["id"]),
                 {
-                    "platform_content_id": "KS-THREE-WAY-ID",
-                    "canonical_url": "https://www.kuaishou.com/short-video/url-history",
+                    "platform_content_id": "nohistory",
+                    "canonical_url": "https://www.kuaishou.com/short-video/urlhistory",
                 },
                 db_path=self.db,
             )
@@ -1162,8 +1135,8 @@ class V8OperationsTest(unittest.TestCase):
             {
                 **group_a,
                 "platform": "kuaishou",
-                "platform_content_id": "KS-MERGE-TARGET",
-                "canonical_url": "https://www.kuaishou.com/short-video/merge-target",
+                "platform_content_id": "mergetarget",
+                "canonical_url": "https://www.kuaishou.com/short-video/mergetarget",
                 "account_uid": "merge-pending-a",
                 "account_name": "待认领甲",
             },
@@ -1173,8 +1146,8 @@ class V8OperationsTest(unittest.TestCase):
             {
                 **group_a,
                 "platform": "kuaishou",
-                "platform_content_id": "KS-MERGE-A-DUP",
-                "canonical_url": "https://www.kuaishou.com/short-video/merge-a-dup",
+                "platform_content_id": "mergeadup",
+                "canonical_url": "https://www.kuaishou.com/short-video/mergeadup",
             },
             db_path=self.db,
         )
@@ -1182,8 +1155,8 @@ class V8OperationsTest(unittest.TestCase):
             {
                 **group_b,
                 "platform": "kuaishou",
-                "platform_content_id": "KS-MERGE-CANDIDATE",
-                "canonical_url": "https://www.kuaishou.com/short-video/merge-candidate",
+                "platform_content_id": "mergecandidate",
+                "canonical_url": "https://www.kuaishou.com/short-video/mergecandidate",
                 "account_uid": "merge-pending-b",
                 "account_name": "待认领乙",
             },
@@ -1193,8 +1166,8 @@ class V8OperationsTest(unittest.TestCase):
             {
                 **group_b,
                 "platform": "kuaishou",
-                "platform_content_id": "KS-MERGE-B-DUP",
-                "canonical_url": "https://www.kuaishou.com/short-video/merge-b-dup",
+                "platform_content_id": "mergebdup",
+                "canonical_url": "https://www.kuaishou.com/short-video/mergebdup",
             },
             db_path=self.db,
         )
@@ -1226,7 +1199,7 @@ class V8OperationsTest(unittest.TestCase):
 
         result = update_content(
             int(target["id"]),
-            {"platform_content_id": "KS-MERGE-CANDIDATE"},
+            {"platform_content_id": "mergecandidate", "canonical_url": "https://www.kuaishou.com/short-video/mergecandidate"},
             db_path=self.db,
         )
         self.assertEqual(result["id"], target["id"])
@@ -1270,8 +1243,8 @@ class V8OperationsTest(unittest.TestCase):
     ) -> None:
         identity = {
             "platform": "kuaishou",
-            "platform_content_id": "KS-IMPORT-PRESERVE",
-            "canonical_url": "https://www.kuaishou.com/short-video/import-preserve",
+            "platform_content_id": "importpreserve",
+            "canonical_url": "https://www.kuaishou.com/short-video/importpreserve",
         }
         created = upsert_content(identity, db_path=self.db)
         with connect(self.db) as connection:
@@ -1283,12 +1256,15 @@ class V8OperationsTest(unittest.TestCase):
                 (created["id"],),
             ).fetchone()
         self.assertIsNone(initial["manual_content_direction"])
-        self.assertEqual(initial["legacy_account_type"], "unknown")
+        self.assertIsNone(initial["legacy_account_type"])
         self.assertEqual(initial["content_type"], "unknown")
 
-        # Historical import values remain archived but cannot be edited as
-        # a current operating classification through the content mutation API.
-        upsert_content({**identity, "account_type": "original"}, db_path=self.db)
+        # Legacy evidence stays archived, and active imports cannot overwrite it.
+        with connect(self.db) as connection:
+            connection.execute("UPDATE content_items SET legacy_account_type='original' WHERE id=?", (created["id"],))
+            connection.commit()
+        with self.assertRaises(OperationError):
+            upsert_content({**identity, "account_type": "original"}, db_path=self.db)
         with self.assertRaises(OperationError):
             update_content(int(created["id"]), {"account_type": "mixed_edit"}, db_path=self.db)
         update_content(
@@ -1303,12 +1279,10 @@ class V8OperationsTest(unittest.TestCase):
             {},
             {
                 "content_direction": "",
-                "account_type": "",
                 "content_type": "",
             },
             {
                 "content_direction": "unknown",
-                "account_type": "unknown",
                 "content_type": "unknown",
             },
         ):
@@ -1329,7 +1303,6 @@ class V8OperationsTest(unittest.TestCase):
             {
                 **identity,
                 "content_direction": "used_car",
-                "account_type": "mixed_edit",
                 "content_type": "image",
             },
             db_path=self.db,
@@ -1343,21 +1316,32 @@ class V8OperationsTest(unittest.TestCase):
                 (created["id"],),
             ).fetchone()
         self.assertEqual(explicit["manual_content_direction"], "used_car")
-        self.assertEqual(explicit["legacy_account_type"], "mixed_edit")
+        self.assertEqual(explicit["legacy_account_type"], "original")
         self.assertEqual(explicit["content_type"], "image")
+
+    def test_content_import_rejects_obsolete_classification_before_resolving_links(self) -> None:
+        from unittest.mock import patch
+
+        with patch("v8.content_identity.normalize_submission", side_effect=AssertionError("obsolete input must not resolve")):
+            result = import_contents([{"platform": "douyin", "canonical_url": "https://v.douyin.com/obsolete/",
+                                       "account_type": "original"}], source_name="obsolete.json", db_path=self.db)
+        self.assertEqual((result["inserted_rows"], result["updated_rows"], result["rejected_rows"]), (0, 0, 1))
+        with connect(self.db) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM content_items").fetchone()[0], 0)
+            self.assertIn("账号分组", connection.execute("SELECT reason FROM import_rows").fetchone()[0])
 
     def test_unknown_direction_data_normalization_is_idempotent(self) -> None:
         first = upsert_content(
             {
                 "platform": "kuaishou",
-                "canonical_url": "https://www.kuaishou.com/short-video/normalize-1",
+                "canonical_url": "https://www.kuaishou.com/short-video/normalize1",
             },
             db_path=self.db,
         )
         second = upsert_content(
             {
                 "platform": "kuaishou",
-                "canonical_url": "https://www.kuaishou.com/short-video/normalize-2",
+                "canonical_url": "https://www.kuaishou.com/short-video/normalize2",
                 "content_direction": "media",
             },
             db_path=self.db,
@@ -1392,7 +1376,7 @@ class V8OperationsTest(unittest.TestCase):
         fallback = upsert_content(
             {
                 "platform": "kuaishou",
-                "canonical_url": "https://www.kuaishou.com/short-video/fallback",
+                "canonical_url": "https://www.kuaishou.com/short-video/3xfallback",
                 "title": "汽车保养完整方法",
                 "body": "汽车保养完整方法正文证据",
             },
@@ -1401,8 +1385,8 @@ class V8OperationsTest(unittest.TestCase):
         identified = upsert_content(
             {
                 "platform": "kuaishou",
-                "platform_content_id": "KS123",
-                "canonical_url": "https://www.kuaishou.com/short-video/other",
+                "platform_content_id": "123456789",
+                "canonical_url": "https://www.kuaishou.com/short-video/123456789",
                 "title": "另一条汽车内容",
                 "body": "另一条汽车内容正文证据",
             },
@@ -1430,14 +1414,14 @@ class V8OperationsTest(unittest.TestCase):
             connection.commit()
         merge_value = {
             "platform": "kuaishou",
-            "platform_content_id": "KS123",
-            "canonical_url": "https://www.kuaishou.com/short-video/fallback",
+            "platform_content_id": "123456789",
+            "canonical_url": "https://www.kuaishou.com/short-video/3xfallback",
             "title": "合并后的汽车保养内容",
             "body": "合并后的汽车保养内容正文证据",
         }
         for _ in range(2):
             with self.assertRaisesRegex(IdentityConflictError, "identity_conflict"):
-                upsert_content(merge_value, db_path=self.db)
+                upsert_content({**merge_value, "account_uid":"001234"}, db_path=self.db, verified_provider_identity=("kuaishou","001234"))
         with connect(self.db) as connection:
             contents = connection.execute("SELECT * FROM content_items").fetchall()
             snapshots = connection.execute(
@@ -1475,15 +1459,15 @@ class V8OperationsTest(unittest.TestCase):
         fallback = upsert_content(
             {
                 "platform": "kuaishou",
-                "canonical_url": "https://www.kuaishou.com/short-video/no-history",
+                "canonical_url": "https://www.kuaishou.com/short-video/3xnohistory",
             },
             db_path=self.db,
         )
         identified = upsert_content(
             {
                 "platform": "kuaishou",
-                "platform_content_id": "KS-NO-HISTORY",
-                "canonical_url": "https://www.kuaishou.com/short-video/identified",
+                "platform_content_id": "12345001",
+                "canonical_url": "https://www.kuaishou.com/short-video/12345001",
             },
             db_path=self.db,
         )
@@ -1512,11 +1496,11 @@ class V8OperationsTest(unittest.TestCase):
             connection.commit()
         merged = upsert_content(
             {
-                "platform": "kuaishou",
-                "platform_content_id": "KS-NO-HISTORY",
-                "canonical_url": "https://www.kuaishou.com/short-video/no-history",
+                "platform": "kuaishou", "account_uid": "001234",
+                "platform_content_id": "12345001",
+                "canonical_url": "https://www.kuaishou.com/short-video/3xnohistory",
             },
-            db_path=self.db,
+            db_path=self.db, verified_provider_identity=("kuaishou","001234"),
         )
         self.assertEqual(merged["id"], fallback["id"])
         with connect(self.db) as connection:
@@ -1529,7 +1513,7 @@ class V8OperationsTest(unittest.TestCase):
             ).fetchall()
             violations = connection.execute("PRAGMA foreign_key_check").fetchall()
         self.assertEqual(content["link_id"], earliest_link)
-        self.assertEqual(content["platform_content_id"], "KS-NO-HISTORY")
+        self.assertEqual(content["platform_content_id"], "12345001")
         self.assertEqual(
             {(row["alias_link_id"], row["content_id"]) for row in aliases},
             {("OLD001", fallback["id"]), (loser_link, fallback["id"])},
@@ -1542,15 +1526,15 @@ class V8OperationsTest(unittest.TestCase):
         first = upsert_content(
             {
                 "platform": "kuaishou",
-                "canonical_url": "https://www.kuaishou.com/short-video/pending-a",
+                "canonical_url": "https://www.kuaishou.com/short-video/3xpendinga",
             },
             db_path=self.db,
         )
         second = upsert_content(
             {
                 "platform": "kuaishou",
-                "platform_content_id": "KS-PENDING",
-                "canonical_url": "https://www.kuaishou.com/short-video/pending-b",
+                "platform_content_id": "12345002",
+                "canonical_url": "https://www.kuaishou.com/short-video/12345002",
             },
             db_path=self.db,
         )
@@ -1568,11 +1552,11 @@ class V8OperationsTest(unittest.TestCase):
         with self.assertRaisesRegex(IdentityConflictError, "identity_conflict"):
             upsert_content(
                 {
-                    "platform": "kuaishou",
-                    "platform_content_id": "KS-PENDING",
-                    "canonical_url": "https://www.kuaishou.com/short-video/pending-a",
+                    "platform": "kuaishou", "account_uid": "001234",
+                    "platform_content_id": "12345002",
+                    "canonical_url": "https://www.kuaishou.com/short-video/3xpendinga",
                 },
-                db_path=self.db,
+                db_path=self.db, verified_provider_identity=("kuaishou","001234"),
             )
         with connect(self.db) as connection:
             content_count = connection.execute(
@@ -1613,15 +1597,15 @@ class V8OperationsTest(unittest.TestCase):
         upsert_content(
             {
                 "platform": "kuaishou",
-                "canonical_url": "https://www.kuaishou.com/short-video/older",
+                "canonical_url": "https://www.kuaishou.com/short-video/3xolder",
             },
             db_path=self.db,
         )
         protected = upsert_content(
             {
                 "platform": "kuaishou",
-                "platform_content_id": "KS-PROTECTED",
-                "canonical_url": "https://www.kuaishou.com/short-video/newer",
+                "platform_content_id": "12345003",
+                "canonical_url": "https://www.kuaishou.com/short-video/12345003",
                 "title": "汽车保养完整方法",
                 "body": "汽车保养完整方法正文证据",
             },
@@ -1639,11 +1623,11 @@ class V8OperationsTest(unittest.TestCase):
             connection.commit()
         merged = upsert_content(
             {
-                "platform": "kuaishou",
-                "platform_content_id": "KS-PROTECTED",
-                "canonical_url": "https://www.kuaishou.com/short-video/older",
+                "platform": "kuaishou", "account_uid": "001234",
+                "platform_content_id": "12345003",
+                "canonical_url": "https://www.kuaishou.com/short-video/3xolder",
             },
-            db_path=self.db,
+            db_path=self.db, verified_provider_identity=("kuaishou","001234"),
         )
         self.assertEqual(merged["id"], protected["id"])
         with connect(self.db) as connection:

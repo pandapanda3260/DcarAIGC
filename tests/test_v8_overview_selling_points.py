@@ -3,7 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 import unittest
 
-from v8.insights import build_channel_conclusions
+from v8.insights import OVERVIEW_CHANNELS, build_channel_conclusions
 from v8.overview_selling_points import build_overview_selling_points
 
 
@@ -24,6 +24,68 @@ def details(rows, *, threshold=90):
 
 
 class OverviewSellingPointsTest(unittest.TestCase):
+    def test_new_overview_platforms_use_their_own_publications_and_exposure(self):
+        rows = [
+            row(platform="douyin", views=900),
+            row(platform="kuaishou", views=100),
+            row("E8", platform="kuaishou", views=300, primary_tier="other",
+                content_direction="used_car"),
+            row(platform="wechat_channels", views=600),
+            row(platform="wechat_channels", views=400, selling_point_included=False),
+        ]
+        channels = build_channel_conclusions(rows, channels=OVERVIEW_CHANNELS)
+        items = build_overview_selling_points(rows, channels, minimum_view_coverage=90)
+        self.assertEqual(list(channels), ["douyin", "xiaohongshu", "kuaishou", "wechat_channels"])
+        for platform, label, selling_share, exposure_share in (
+            ("kuaishou", "快手", 100, 100),
+            ("wechat_channels", "视频号", 50, 60),
+        ):
+            with self.subTest(platform=platform):
+                channel = channels[platform]
+                self.assertEqual(channel["label"], label)
+                self.assertEqual(channel["publication_count"], 2)
+                self.assertEqual(channel["valid_exposure_items"], 2)
+                metrics = channel["summary"]["metrics"]
+                self.assertEqual(metrics["selling_point_count_share"]["percentage"], selling_share)
+                self.assertEqual(metrics["selling_point_exposure_share"]["percentage"], exposure_share)
+                self.assertEqual(sum(item["publication_count"] for item in items[platform]),
+                                 metrics["selling_point_count_share"]["numerator"])
+                self.assertEqual(sum(item["view_count"]["value"] for item in items[platform]),
+                                 metrics["selling_point_exposure_share"]["numerator"])
+                self.assertTrue(all(item["count_share"]["denominator"] == 2
+                                    for item in items[platform]))
+        self.assertEqual(channels["kuaishou"]["scenes"]["used_car"]["publication_count"], 1)
+        self.assertEqual(channels["kuaishou"]["scenes"]["used_car"]["metrics"]
+                         ["selling_point_exposure_share"]["percentage"], 75)
+        self.assertEqual(channels["wechat_channels"]["scenes"]["used_car"]["publication_count"], 0)
+        self.assertEqual(list(build_channel_conclusions(rows)), ["douyin", "xiaohongshu"])
+
+    def test_new_platforms_preserve_missing_zero_stale_and_empty_states(self):
+        for platform in ("kuaishou", "wechat_channels"):
+            with self.subTest(platform=platform):
+                rows = [
+                    row("ZERO", platform=platform, views=0),
+                    row("MISSING", platform=platform, views=None, status="missing"),
+                    row("STALE", platform=platform, views=200, freshness="stale"),
+                ]
+                channels = build_channel_conclusions(rows, channels=OVERVIEW_CHANNELS)
+                details_by_platform = build_overview_selling_points(
+                    rows, channels, minimum_view_coverage=90
+                )
+                items = {item["code"]: item for item in details_by_platform[platform]}
+                self.assertEqual(items["ZERO"]["view_count"]["value"], 0)
+                self.assertEqual(items["ZERO"]["view_count"]["status"], "available")
+                self.assertIsNone(items["MISSING"]["view_count"]["value"])
+                self.assertEqual(items["MISSING"]["view_count"]["status"], "missing")
+                self.assertEqual(items["STALE"]["view_count"]["value"], 200)
+                self.assertEqual(items["STALE"]["view_count"]["status"], "stale")
+                self.assertIsNone(items["STALE"]["exposure_share"]["percentage"])
+                empty = "wechat_channels" if platform == "kuaishou" else "kuaishou"
+                self.assertEqual(details_by_platform[empty], [])
+                self.assertEqual(channels[empty]["publication_count"], 0)
+                self.assertTrue(all(metric["status"] == "not_applicable"
+                                    for metric in channels[empty]["summary"]["metrics"].values()))
+
     def test_primary_included_counts_reconcile_and_use_channel_denominators(self):
         rows = [
             row(views=100), row(views=200),

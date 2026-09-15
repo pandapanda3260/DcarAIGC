@@ -13,6 +13,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import json
 import math
 import re
 import unicodedata
@@ -40,7 +41,7 @@ _WINDOWS_RESERVED_FILENAMES = {
     *(f"LPT{index}" for index in range(1, 10)),
 }
 
-_LEGACY_CONTENT_EXPORT_COLUMNS = (
+_CONTENT_EXPORT_COLUMNS = (
     ("report_period", "周期"),
     ("report_task", "报告任务"),
     ("platform_content_id", "平台作品编号"),
@@ -52,8 +53,9 @@ _LEGACY_CONTENT_EXPORT_COLUMNS = (
     ("title", "标题"),
     ("account_uid", "平台账号编号"),
     ("account_name", "账号名称"),
-    ("account_type", "账号类型"),
-    ("content_direction", "内容方向"),
+    ("account_group", "账号分组"),
+    ("business_direction", "业务方向"),
+    ("content_direction", "作品内容方向"),
     ("v3_status", "资料完整度"),
     ("primary_selling_point_code", "主要卖点编号"),
     ("primary_selling_point_label", "卖点信息"),
@@ -61,16 +63,6 @@ _LEGACY_CONTENT_EXPORT_COLUMNS = (
     ("content_automotive_score", "内容垂直度"),
     ("view_count", "播放/阅读数"),
     ("comment_count", "评论数"),
-)
-_CONTENT_EXPORT_COLUMNS = tuple(
-    entry
-    for column in _LEGACY_CONTENT_EXPORT_COLUMNS
-    for entry in (
-        (("account_group", "账号分组"), ("business_direction", "业务方向"))
-        if column[0] == "account_type"
-        else (("content_direction", "作品内容方向"),) if column[0] == "content_direction"
-        else (column,)
-    )
 )
 
 
@@ -85,6 +77,37 @@ def formula_safe_csv_value(value: Any) -> Any:
     ):
         return f"'{value}"
     return value
+
+
+def project_content_csv(payload: bytes, *,
+                        content_rows: Sequence[Mapping[str, Any]] | None = None) -> bytes:
+    """Derive current account columns from an archived CSV without altering it.
+
+    Optional enrichment must be the same revision's frozen report detail rows.
+    Work content_direction remains a separate, unchanged column.
+    """
+    from .report_inputs import project_content_classification
+
+    headers, raw_rows = _csv_rows(payload)
+    obsolete = {"account_type", "legacy_account_type", "account_content_direction"}
+    fields = [field for field in headers if field not in obsolete
+              and field not in {"account_group", "business_direction"}]
+    position = fields.index("content_direction") if "content_direction" in fields else len(fields)
+    fields[position:position] = ["account_group", "business_direction"]
+    frozen_details = {str(row.get("content_id")): row for row in content_rows or ()}
+    output = io.StringIO(newline="")
+    writer = csv.DictWriter(output, fieldnames=fields)
+    writer.writeheader()
+    for raw_row in raw_rows:
+        source = dict(zip(headers, raw_row))
+        frozen = frozen_details.get(str(source.get("content_id")), {})
+        for field, options in (("account_group", ACCOUNT_GROUPS),
+                               ("business_direction", BUSINESS_DIRECTIONS)):
+            if source.get(field) not in options and frozen.get(field) in options:
+                source[field] = frozen[field]
+        projected = project_content_classification(source)
+        writer.writerow({field: formula_safe_csv_value(projected.get(field, "")) for field in fields})
+    return output.getvalue().encode("utf-8-sig")
 
 
 _CONTENT_REQUIRED_HEADERS = {
@@ -113,12 +136,6 @@ _PLATFORM_LABELS = {
     "kuaishou": "快手",
 }
 _CONTENT_TYPE_LABELS = {"video": "视频", "image": "图文", "unknown": "未知"}
-_ACCOUNT_TYPE_LABELS = {
-    "boutique_ip": "精品 IP",
-    "original": "原创",
-    "mixed_edit": "混剪",
-    "unknown": "未知",
-}
 _CONTENT_DIRECTION_LABELS = {
     "new_car": "新车",
     "used_car": "二手车",
@@ -242,7 +259,6 @@ _COLUMN_WIDTHS = {
     "title": 52,
     "account_uid": 24,
     "account_name": 22,
-    "account_type": 16,
     "account_group": 16,
     "business_direction": 16,
     "content_direction": 16,
@@ -501,23 +517,12 @@ def _source_value(
     return "" if value is None else _clean_text(value)
 
 
-def platform_content_id_from_url(platform: str, canonical_url: str) -> str:
+def platform_content_id_from_url(platform: str, url: str) -> str:
+    from .content_identity import parse, ContentIdentityError
     try:
-        path = [unquote(value) for value in urlsplit(canonical_url).path.split("/") if value]
-    except ValueError:
+        return parse(platform, url)["platform_content_id"]
+    except ContentIdentityError:
         return ""
-    marker_paths = {
-        "douyin": (("video",),),
-        "xiaohongshu": (("explore",), ("discovery", "item")),
-        "kuaishou": (("short-video",), ("photo",)),
-        "wechat_channels": (("video",),),
-    }
-    for markers in marker_paths.get(platform, ()):
-        marker_count = len(markers)
-        for index in range(len(path) - marker_count):
-            if tuple(path[index : index + marker_count]) == markers:
-                return path[index + marker_count]
-    return ""
 
 
 def _v3_status(evidence_level: str, content_type: str) -> str:
@@ -538,11 +543,9 @@ def _content_sheet(
     content_enrichment: Mapping[str, Mapping[str, Any]],
     selling_point_labels: Mapping[str, str],
 ) -> tuple[_Worksheet, int]:
-    headers, raw_rows = _csv_rows(payload)
-    new_classification = "account_group" in headers or "business_direction" in headers
-    classification_headers = {"account_group", "business_direction"} if new_classification else {"account_type"}
-    missing_headers = sorted((_CONTENT_REQUIRED_HEADERS | classification_headers) - set(headers))
-    export_columns = _CONTENT_EXPORT_COLUMNS if new_classification else _LEGACY_CONTENT_EXPORT_COLUMNS
+    headers, raw_rows = _csv_rows(project_content_csv(payload))
+    missing_headers = sorted(_CONTENT_REQUIRED_HEADERS - set(headers))
+    export_columns = _CONTENT_EXPORT_COLUMNS
     if missing_headers:
         raise ValueError(
             "content detail CSV is missing required headers: "
@@ -566,15 +569,21 @@ def _content_sheet(
             source, enrichment, "platform_content_id"
         ).strip()
         url_platform_id = platform_content_id_from_url(platform, canonical_url)
-        if (
-            enriched_platform_id
-            and url_platform_id
-            and enriched_platform_id != url_platform_id
-        ):
-            raise ValueError(
-                f"platform content ID does not match canonical URL for content {internal_content_id}"
-            )
-        platform_content_id = url_platform_id or enriched_platform_id
+        if (enriched_platform_id and url_platform_id and enriched_platform_id != url_platform_id):
+            # Kuaishou's provider photo_id and public eid are different fields.
+            # Only the saved identity alias relation can reconcile that pair;
+            # an arbitrary explicit ID/URL disagreement remains an error.
+            try:
+                known_aliases = json.loads(source.get("platform_content_id_aliases") or "[]")
+            except (TypeError, ValueError):
+                raise ValueError("frozen platform content aliases are invalid") from None
+            if not (platform == "kuaishou" and enriched_platform_id.isascii()
+                    and enriched_platform_id.isdecimal() and url_platform_id.startswith("3x")
+                    and isinstance(known_aliases, (list, tuple)) and url_platform_id in known_aliases):
+                raise ValueError(
+                    f"platform content ID does not match canonical URL for content {internal_content_id}"
+                )
+        platform_content_id = enriched_platform_id or url_platform_id
         if not platform_content_id:
             raise ValueError(
                 f"platform content ID is unavailable for content {internal_content_id}"
@@ -610,12 +619,8 @@ def _content_sheet(
             source.get("title", ""),
             source.get("account_uid", ""),
             source.get("account_name", ""),
-            *([
-                _enum_or_dash(ACCOUNT_GROUPS, source.get("account_group")),
-                _enum_or_dash(BUSINESS_DIRECTIONS, source.get("business_direction")),
-            ] if new_classification else [
-                _ACCOUNT_TYPE_LABELS.get(source.get("account_type", ""), source.get("account_type", "")),
-            ]),
+            _enum_or_dash(ACCOUNT_GROUPS, source.get("account_group")),
+            _enum_or_dash(BUSINESS_DIRECTIONS, source.get("business_direction")),
             _CONTENT_DIRECTION_LABELS.get(
                 source.get("content_direction", ""),
                 source.get("content_direction", ""),

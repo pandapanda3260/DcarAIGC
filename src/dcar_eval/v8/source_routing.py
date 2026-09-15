@@ -5,11 +5,15 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections import defaultdict
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 from zoneinfo import ZoneInfo
+
+from .metric_source_policy import (CURRENT_METRIC_POLICY, OPERATION_FIELD_POLICY_VERSION,
+    OPERATION_FIELD_POLICY_VERSIONS, load_operation_field_policy)
 
 METRIC_FIELDS = (
     "view_count", "comment_count", "like_count", "share_count", "collect_count"
@@ -17,29 +21,42 @@ METRIC_FIELDS = (
 _METADATA_CACHE_KEY = "_source_routing_metadata"
 _PROVIDER_CACHE_KEY = "_source_routing_provider"
 _OPERATION_CACHE_KEY = "_source_routing_operation"
+_POLICY_CACHE_KEY = "_source_routing_provenance_policy"
 # Observation, original field state, proven source, effective field status.
 _FieldCandidate = tuple[
     dict[str, Any], tuple[str, int | None, str], tuple[str, str | None], str
 ]
-POLICY_VERSION = "source-routing-matrix-first-v2"
+POLICY_VERSION = "source-routing-matrix-first-v3"
+LEGACY_POLICY_VERSION = "source-routing-matrix-first-v2"
+MATRIX_POLICY_VERSIONS = frozenset({LEGACY_POLICY_VERSION, POLICY_VERSION})
+_SELECTION_POLICY = ContextVar("metric_selection_policy", default=POLICY_VERSION)
 _BEIJING = ZoneInfo("Asia/Shanghai")
 _POLICY_FILE = (
     Path(__file__).resolve().parents[3]
-    / "config" / "source_routing_matrix_first_v2.json"
+    / "config" / "source_routing_matrix_first_v3.json"
 )
 
 
-@lru_cache(maxsize=1)
-def _policy() -> dict[str, Any]:
-    result = json.loads(_POLICY_FILE.read_text(encoding="utf-8"))
-    if result.get("policy_version") != POLICY_VERSION:
+@lru_cache(maxsize=2)
+def _matrix_policy(policy_version: str) -> dict[str, Any]:
+    if policy_version not in MATRIX_POLICY_VERSIONS:
+        raise ValueError("unsupported metric source routing policy")
+    path = _POLICY_FILE if policy_version == POLICY_VERSION else _POLICY_FILE.with_name("source_routing_matrix_first_v2.json")
+    result = json.loads(path.read_text(encoding="utf-8"))
+    if result.get("policy_version") != policy_version:
         raise ValueError("unsupported metric source routing policy")
     return result
 
 
-def load_policy() -> dict[str, Any]:
-    """A copy prevents callers from mutating the fixed process policy."""
-    return json.loads(json.dumps(_policy()))
+def _policy() -> dict[str, Any]:
+    return _matrix_policy(_SELECTION_POLICY.get())
+
+
+def load_policy(*, policy_version: str = POLICY_VERSION) -> dict[str, Any]:
+    """A copy prevents callers from mutating a versioned, frozen policy."""
+    if policy_version in OPERATION_FIELD_POLICY_VERSIONS:
+        return load_operation_field_policy(policy_version=policy_version)
+    return json.loads(json.dumps(_matrix_policy(policy_version)))
 
 
 def parse_time(value: str) -> datetime:
@@ -88,7 +105,7 @@ def _proven_source(observation: Mapping[str, Any]) -> tuple[str, str | None]:
 
     cached = observation.get(_PROVIDER_CACHE_KEY)
     cached_operation = observation.get(_OPERATION_CACHE_KEY)
-    if isinstance(cached, str) and (
+    if observation.get(_POLICY_CACHE_KEY) == _SELECTION_POLICY.get() and isinstance(cached, str) and (
         isinstance(cached_operation, str) or cached_operation is None
     ):
         return cached, cached_operation
@@ -133,7 +150,7 @@ def _proven_source(observation: Mapping[str, Any]) -> tuple[str, str | None]:
         source_provider is not None and source_provider != raw_provider
     ) and not (
         observation.get("source")
-        not in {"douyin", "xiaohongshu", "migrated_historical"}
+        not in {"douyin", "xiaohongshu", "kuaishou", "wechat_channels", "migrated_historical"}
         and source_provider is None
     )
     operation_matches = bool(
@@ -180,7 +197,7 @@ def _proven_source(observation: Mapping[str, Any]) -> tuple[str, str | None]:
                 and (
                     observation.get("raw_batch_member_content_id") == observation.get("content_id")
                     or (
-                        raw_operation in {"douyin_user_posts", "xiaohongshu_user_posts"}
+                        raw_operation in {"douyin_user_posts", "xiaohongshu_user_posts", "kuaishou_user_posts", "wechat_channels_user_posts"}
                         and observation.get("raw_content_id") is None
                         and type(observation.get("raw_batch_member_account_id")) is int
                         and observation.get("raw_batch_member_account_id") == observation.get("account_id")
@@ -203,6 +220,7 @@ def _proven_source(observation: Mapping[str, Any]) -> tuple[str, str | None]:
     if isinstance(observation, dict):
         observation[_PROVIDER_CACHE_KEY] = provider
         observation[_OPERATION_CACHE_KEY] = operation
+        observation[_POLICY_CACHE_KEY] = _SELECTION_POLICY.get()
     return provider, operation
 
 
@@ -226,14 +244,16 @@ def _age_days(published_at: str | None, as_of: str) -> int | None:
         return None
 
 
-def metric_freshness_seconds(published_at: str | None, *, as_of: str) -> int:
+def metric_freshness_seconds(published_at: str | None, *, as_of: str,
+                             policy_version: str = POLICY_VERSION) -> int:
+    policy = _policy() if policy_version == POLICY_VERSION else load_policy(policy_version=policy_version)
     age = _age_days(published_at, as_of)
-    established = age is not None and age > int(_policy()["content_recent_days"])
+    established = age is not None and age > int(policy["content_recent_days"])
     key = (
         "content_established_freshness_seconds" if established
         else "content_recent_freshness_seconds"
     )
-    return int(_policy()[key])
+    return int(policy[key])
 
 
 def metric_refresh_due(
@@ -370,6 +390,19 @@ def _observation_key(row: Mapping[str, Any]) -> tuple[datetime, datetime, int]:
 
 
 def _select_row(
+    content: Mapping[str, Any], observations: list[dict[str, Any]], *,
+    cutoff_at: str, metric_fields: tuple[str, ...] = METRIC_FIELDS,
+    policy_version: str = POLICY_VERSION,
+) -> dict[str, Any] | None:
+    _matrix_policy(policy_version)
+    token = _SELECTION_POLICY.set(policy_version)
+    try:
+        return _select_row_with_policy(content, observations, cutoff_at=cutoff_at, metric_fields=metric_fields)
+    finally:
+        _SELECTION_POLICY.reset(token)
+
+
+def _select_row_with_policy(
     content: Mapping[str, Any],
     observations: list[dict[str, Any]],
     *,
@@ -380,7 +413,7 @@ def _select_row(
         return None
     platform = str(content["platform"])
     cutoff = parse_time(cutoff_at)
-    ttl = metric_freshness_seconds(content.get("published_at"), as_of=cutoff_at)
+    ttl = metric_freshness_seconds(content.get("published_at"), as_of=cutoff_at, policy_version=_SELECTION_POLICY.get())
     observations.sort(key=_observation_key, reverse=True)
     by_id = {row["id"]: row for row in observations}
     invalidated: dict[str, set[int]] = defaultdict(set)
@@ -525,7 +558,7 @@ def _select_row(
     )
     anchor_row = by_id.get(anchor["observation_id"], observations[0])
     metadata = _observation_metadata(observations[0]).copy()
-    metadata.update({"policy_version": POLICY_VERSION, "fields": selected})
+    metadata.update({"policy_version": _SELECTION_POLICY.get(), "fields": selected})
     raw_ids = {fact["raw_response_id"] for fact in provided}
     captured = min(
         (str(fact["captured_at"]) for fact in provided), key=parse_time,
@@ -547,7 +580,7 @@ def _select_row(
         ),
         "observation_origin": anchor_row.get("observation_origin"),
         "observation_sha256": anchor_row.get("observation_sha256"),
-        "policy_version": POLICY_VERSION,
+        "policy_version": _SELECTION_POLICY.get(),
     }
     result["legacy_snapshot_id"] = next(
         (
@@ -569,6 +602,7 @@ def select_content_metrics(
     knowledge_at: str | None = None,
     window_key: str | None = None,
     metric_fields: Iterable[str] = METRIC_FIELDS,
+    policy_version: str = POLICY_VERSION,
 ) -> dict[int, dict[str, Any]]:
     """Select facts known at both capture and recording cutoffs, in batches.
 
@@ -589,13 +623,15 @@ def select_content_metrics(
     parse_time(cutoff)
     knowledge = knowledge_at or cutoff
     parse_time(knowledge)
-    if connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}:
+    if connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21, 22, 23, 24}:
         from .metric_field_facts import select_metric_projections
         return select_metric_projections(
             connection, sorted({int(value) for value in content_ids}),
             cutoff_at=cutoff, knowledge_at=knowledge, window_key=window_key, metric_fields=requested_fields,
-            current_read=current_read,
+            current_read=current_read, policy_version=policy_version,
         )
+    if policy_version not in MATRIX_POLICY_VERSIONS:
+        raise ValueError("operation-field metric selection requires schema20 or schema21")
     result: dict[int, dict[str, Any]] = {}
     ids = sorted({int(value) for value in content_ids})
     batch_size = min(connection.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER) - 3, 400)
@@ -680,7 +716,19 @@ def select_content_metrics(
                 facts,
                 cutoff_at=cutoff,
                 metric_fields=requested_fields,
+                policy_version=policy_version,
             )
             if selected is not None:
                 result[content_id] = selected
     return result
+
+
+def select_current_content_metrics(
+    connection: sqlite3.Connection, content_ids: Iterable[int], *,
+    cutoff_at: str | None = None, knowledge_at: str | None = None,
+    window_key: str | None = None, metric_fields: Iterable[str] = METRIC_FIELDS,
+) -> dict[int, dict[str, Any]]:
+    """One explicit business read policy, independent of the routing contract."""
+    return select_content_metrics(connection, content_ids, cutoff_at=cutoff_at,
+        knowledge_at=knowledge_at, window_key=window_key, metric_fields=metric_fields,
+        policy_version=CURRENT_METRIC_POLICY)

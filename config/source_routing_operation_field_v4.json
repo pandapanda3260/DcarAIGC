@@ -1,0 +1,384 @@
+{
+  "policy_version": "source-routing-operation-field-v4",
+  "selection_scope": "platform_provider_operation_field",
+  "unlisted_source_eligibility": "historical_only",
+  "retired_providers": [
+    "newrank_matrix"
+  ],
+  "content_recent_days": 7,
+  "content_recent_freshness_seconds": 86400,
+  "content_established_freshness_seconds": 259200,
+  "xiaohongshu_exposure": "not_applicable",
+  "operation_rules": [
+    {
+      "platform": "douyin",
+      "provider": "tikhub",
+      "operation": "douyin_video_statistics",
+      "priority": 0,
+      "active_fields": [
+        "view_count",
+        "like_count"
+      ],
+      "audit_only_fields": [
+        "comment_count",
+        "share_count",
+        "collect_count"
+      ]
+    },
+    {
+      "platform": "douyin",
+      "provider": "tikhub",
+      "operation": "douyin_video_detail",
+      "priority": 0,
+      "active_fields": [
+        "comment_count",
+        "share_count",
+        "collect_count"
+      ],
+      "audit_only_fields": [
+        "view_count",
+        "like_count"
+      ]
+    },
+    {
+      "platform": "douyin",
+      "provider": "tikhub",
+      "operation": "douyin_user_posts",
+      "priority": 0,
+      "active_fields": [
+        "comment_count",
+        "share_count",
+        "collect_count"
+      ],
+      "audit_only_fields": [
+        "view_count",
+        "like_count"
+      ]
+    },
+    {
+      "platform": "douyin",
+      "provider": "tikhub",
+      "operation": "douyin_discovery_metrics",
+      "priority": 0,
+      "active_fields": [
+        "comment_count",
+        "share_count",
+        "collect_count"
+      ],
+      "audit_only_fields": [
+        "view_count",
+        "like_count"
+      ]
+    },
+    {
+      "platform": "xiaohongshu",
+      "provider": "tikhub",
+      "operation": "xiaohongshu_note_statistics",
+      "priority": 0,
+      "active_fields": [
+        "comment_count",
+        "like_count",
+        "share_count",
+        "collect_count"
+      ],
+      "audit_only_fields": []
+    },
+    {
+      "platform": "xiaohongshu",
+      "provider": "tikhub",
+      "operation": "xiaohongshu_note_detail",
+      "priority": 0,
+      "active_fields": [
+        "comment_count",
+        "like_count",
+        "share_count",
+        "collect_count"
+      ],
+      "audit_only_fields": []
+    },
+    {
+      "platform": "xiaohongshu",
+      "provider": "tikhub",
+      "operation": "xiaohongshu_video_detail",
+      "priority": 0,
+      "active_fields": [
+        "comment_count",
+        "like_count",
+        "share_count",
+        "collect_count"
+      ],
+      "audit_only_fields": []
+    },
+    {
+      "platform": "xiaohongshu",
+      "provider": "tikhub",
+      "operation": "xiaohongshu_user_posts",
+      "priority": 0,
+      "active_fields": [
+        "comment_count",
+        "like_count",
+        "share_count",
+        "collect_count"
+      ],
+      "audit_only_fields": []
+    },
+    {
+      "platform": "xiaohongshu",
+      "provider": "tikhub",
+      "operation": "xiaohongshu_discovery_metrics",
+      "priority": 0,
+      "active_fields": [
+        "comment_count",
+        "like_count",
+        "share_count",
+        "collect_count"
+      ],
+      "audit_only_fields": []
+    },
+    {
+      "platform": "kuaishou",
+      "provider": "tikhub",
+      "operation": "kuaishou_video_statistics",
+      "priority": 0,
+      "active_fields": [
+        "view_count",
+        "like_count",
+        "comment_count",
+        "share_count",
+        "collect_count"
+      ],
+      "audit_only_fields": []
+    },
+    {
+      "platform": "kuaishou",
+      "provider": "tikhub",
+      "operation": "kuaishou_video_detail",
+      "priority": 0,
+      "active_fields": [
+        "view_count",
+        "like_count",
+        "comment_count",
+        "share_count",
+        "collect_count"
+      ],
+      "audit_only_fields": []
+    },
+    {
+      "platform": "kuaishou",
+      "provider": "tikhub",
+      "operation": "kuaishou_user_posts",
+      "priority": 0,
+      "active_fields": [
+        "view_count",
+        "like_count",
+        "comment_count",
+        "share_count",
+        "collect_count"
+      ],
+      "audit_only_fields": []
+    },
+    {
+      "platform": "wechat_channels",
+      "provider": "tikhub",
+      "operation": "wechat_channels_video_statistics",
+      "priority": 0,
+      "active_fields": [
+        "like_count",
+        "comment_count",
+        "share_count",
+        "collect_count"
+      ],
+      "audit_only_fields": [
+        "view_count"
+      ]
+    },
+    {
+      "platform": "wechat_channels",
+      "provider": "tikhub",
+      "operation": "wechat_channels_video_detail",
+      "priority": 0,
+      "active_fields": [
+        "like_count",
+        "comment_count",
+        "share_count",
+        "collect_count"
+      ],
+      "audit_only_fields": [
+        "view_count"
+      ]
+    },
+    {
+      "platform": "wechat_channels",
+      "provider": "tikhub",
+      "operation": "wechat_channels_user_posts",
+      "priority": 0,
+      "active_fields": [
+        "like_count",
+        "comment_count",
+        "share_count",
+        "collect_count"
+      ],
+      "audit_only_fields": [
+        "view_count"
+      ]
+    }
+  ],
+  "latest_invalid_or_missing": "invalidate_only_the_same_qualified_operation",
+  "missing_or_invalid_renews_ttl": false,
+  "valid_zero_and_decreases": "use_latest_valid_value_without_maximum_or_confirmation",
+  "capture_and_knowledge_cutoffs_required": true,
+  "policy_basis": "docs/v8/视频数据抓取链路改造需求说明与优化方案_v1.0_2026-09-01.md:248-254; provider parsers retain the original field facts",
+  "qualified_source_choice": "newest_valid_capture_then_recording_then_fact_id_not_maximum",
+  "historical_streams": [
+    {
+      "provider": "newrank_matrix",
+      "operation": "aweme_list"
+    },
+    {
+      "provider": "newrank_matrix",
+      "operation": "matrix_works_list"
+    },
+    {
+      "provider": "newrank_matrix",
+      "operation": "matrix_account_list"
+    },
+    {
+      "provider": "tikhub",
+      "operation": "douyin_video_comments"
+    },
+    {
+      "provider": "tikhub",
+      "operation": "douyin_comments"
+    },
+    {
+      "provider": "tikhub",
+      "operation": "xiaohongshu_note_comments"
+    },
+    {
+      "provider": "tikhub",
+      "operation": "xiaohongshu_comments"
+    },
+    {
+      "provider": "douyin_openapi",
+      "operation": "aweme_list"
+    },
+    {
+      "provider": "douyin_openapi",
+      "operation": "douyin_openapi_video_list"
+    },
+    {
+      "provider": "legacy_unknown",
+      "operation": "legacy_unknown"
+    }
+  ],
+  "field_capabilities": {
+    "douyin": {
+      "view_count": {
+        "status": "supported",
+        "auto_collectable": true,
+        "reason": ""
+      },
+      "comment_count": {
+        "status": "supported",
+        "auto_collectable": true,
+        "reason": ""
+      },
+      "like_count": {
+        "status": "supported",
+        "auto_collectable": true,
+        "reason": ""
+      },
+      "share_count": {
+        "status": "supported",
+        "auto_collectable": true,
+        "reason": ""
+      },
+      "collect_count": {
+        "status": "supported",
+        "auto_collectable": true,
+        "reason": ""
+      }
+    },
+    "xiaohongshu": {
+      "view_count": {
+        "status": "not_applicable",
+        "auto_collectable": false,
+        "reason": "xiaohongshu_exposure_unsupported"
+      },
+      "comment_count": {
+        "status": "supported",
+        "auto_collectable": true,
+        "reason": ""
+      },
+      "like_count": {
+        "status": "supported",
+        "auto_collectable": true,
+        "reason": ""
+      },
+      "share_count": {
+        "status": "supported",
+        "auto_collectable": true,
+        "reason": ""
+      },
+      "collect_count": {
+        "status": "supported",
+        "auto_collectable": true,
+        "reason": ""
+      }
+    },
+    "kuaishou": {
+      "view_count": {
+        "status": "supported",
+        "auto_collectable": true,
+        "reason": ""
+      },
+      "comment_count": {
+        "status": "supported",
+        "auto_collectable": true,
+        "reason": ""
+      },
+      "like_count": {
+        "status": "supported",
+        "auto_collectable": true,
+        "reason": ""
+      },
+      "share_count": {
+        "status": "supported",
+        "auto_collectable": true,
+        "reason": ""
+      },
+      "collect_count": {
+        "status": "supported",
+        "auto_collectable": true,
+        "reason": ""
+      }
+    },
+    "wechat_channels": {
+      "view_count": {
+        "status": "unavailable",
+        "auto_collectable": false,
+        "reason": "no_trusted_view_source"
+      },
+      "comment_count": {
+        "status": "supported",
+        "auto_collectable": true,
+        "reason": ""
+      },
+      "like_count": {
+        "status": "supported",
+        "auto_collectable": true,
+        "reason": ""
+      },
+      "share_count": {
+        "status": "supported",
+        "auto_collectable": true,
+        "reason": ""
+      },
+      "collect_count": {
+        "status": "supported",
+        "auto_collectable": true,
+        "reason": ""
+      }
+    }
+  }
+}

@@ -576,6 +576,34 @@ def read_response_entity(connection: sqlite3.Connection, response_id: int) -> by
         expected_stored_size=response["byte_size"]).entity_bytes
 
 
+def response_entity_integrity(connection: sqlite3.Connection, response_id: int) -> dict[str, Any]:
+    """Read business entity evidence; never rewrite its transport history."""
+    raw = _row(connection, "provider_raw_responses", response_id)
+    receipt = connection.execute("SELECT * FROM fetch_transport_receipts WHERE id=? AND fetch_attempt_id=?",
+        (raw["transport_receipt_id"], raw["fetch_attempt_id"])).fetchone()
+    if receipt is None:
+        raise RawArchiveError("response has no exact transport evidence")
+    payload = json.loads(receipt["payload_json"])
+    if (_digest(raw_evidence.canonical_json_bytes(payload)) != receipt["receipt_sha256"]
+            or payload.get("fetch_attempt_id") != raw["fetch_attempt_id"]):
+        raise RawArchiveError("transport receipt digest or attempt changed")
+    transport = payload["transport"]
+    if transport.get("error_code") == "transport_incomplete_read":
+        from .capture_transport_recovery import verified_recovery_entity
+        return verified_recovery_entity(connection, response_id)
+    from .capture import _validate_usable_content_receipt, _validate_transport_entity_identity
+    if connection.in_transaction:
+        # The original store validated exact bytes. Business projections need
+        # its immutable identity, not another large blob decompression in lock.
+        blob = _row(connection, "provider_raw_blobs", raw["raw_blob_id"])
+        _validate_transport_entity_identity(transport, content_operation=raw["operation"],
+            entity_size=blob["entity_size"], entity_sha256=blob["entity_sha256"], http_status=raw["http_status"])
+    else:
+        _validate_usable_content_receipt(transport, operation=raw["operation"],
+            entity_bytes=read_response_entity(connection, response_id), http_status=raw["http_status"])
+    return dict(transport)
+
+
 def record_transport_receipt(connection: sqlite3.Connection, *, attempt_id: int,
                              receipt: dict[str, Any], raw_response_id: int | None = None) -> int:
     """Register actual transport evidence once, never synthesize missing times.

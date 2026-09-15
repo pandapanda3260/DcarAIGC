@@ -11,11 +11,12 @@ import json
 import math
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from functools import partial
+from itertools import count
 from pathlib import Path
 from typing import Any, Callable, Collection, Iterator, Mapping, Sequence
-from contextvars import copy_context
+from contextvars import ContextVar, copy_context
 from contextlib import contextmanager, nullcontext
 from threading import Event, Thread
 from zoneinfo import ZoneInfo
@@ -38,6 +39,17 @@ TASK_CAP_USD = 50.0
 RETRY_BACKOFF_BASE_SECONDS = 300
 RETRY_BACKOFF_MAX_SECONDS = 6 * 60 * 60
 RETRY_ALERT_FAILURES = 6
+
+# Selection preference only: all claims and paid checks remain in run_one.
+_WORK_SELECTION_LANE: ContextVar[str | None] = ContextVar("capture_work_selection_lane", default=None)
+_RUN_READY_LANES = ("ordinary", "douyin", "kuaishou", "xiaohongshu", "wechat_channels")
+_V23_RUN_READY_LANES = ("manual_media", "ordinary:douyin", "ordinary:xiaohongshu",
+    "ordinary:kuaishou", "ordinary:wechat_channels", "douyin", "xiaohongshu",
+    "kuaishou", "wechat_channels")
+# Only a fairness hint, not permission or durable business state. Each full
+# invocation visits every lane even when a process restart resets this counter.
+_V23_ROLLING_ROUNDS = count()
+_ROLLING_MAX_ITEMS = 16
 
 
 def retry_backoff(consecutive_failures: int) -> timedelta:
@@ -89,7 +101,7 @@ def _stamp(at: datetime) -> str:
 
 
 def _require20(connection: sqlite3.Connection) -> None:
-    if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
+    if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21, 22, 23, 24}:
         raise ValueError("capture runtime requires schema20")
 
 
@@ -103,19 +115,22 @@ def _bucket(at: str, interval: int, phase: int = 0) -> str:
 
 
 def _cohort_plan(connection: sqlite3.Connection, active: dict[str, Any], *, at: str,
-                 shadow: bool) -> dict[str, Any]:
+                 shadow: bool, prepared: Mapping[str, Any] | None = None) -> dict[str, Any]:
     local = _time(at).astimezone(BEIJING)
     plan_day = local.date() - timedelta(days=int((local.hour, local.minute) < (0, 10)))
     binding = {key: active[key] for key in ("activation_id", "profile_id", "activation_sha256",
                                            "roster_snapshot_id", "roster_members_sha256")}
     from . import account_catalog_capture as catalog
-    policy = catalog.installed_policy(connection, at=at)
-    snapshot = catalog.freeze_snapshot(connection, policy=policy) if policy is not None else None
+    policy = prepared["policy"] if prepared is not None else catalog.installed_policy(connection, at=at)
+    snapshot = prepared["snapshot"] if prepared is not None else catalog.freeze_snapshot(connection, policy=policy) if policy is not None else None
+    if prepared is not None:
+        binding["catalog_revision"] = prepared["key"]["catalog_revision"]
     if snapshot is not None:
         binding["catalog_snapshot_sha256"] = snapshot["snapshot_sha256"]
         binding["catalog_mode"] = "shadow" if shadow else "active"
         if not shadow:
-            catalog.synchronize_enabled(connection, snapshot, activation_id=active["activation_id"], at=at)
+            catalog.synchronize_enabled(connection, snapshot, activation_id=active["activation_id"], at=at,
+                verified_locators=prepared["locators"] if prepared is not None else None)
     binding_hash = planning.digest(binding)
     connection.execute("INSERT OR IGNORE INTO routing_input_changes(change_kind,roster_snapshot_id,payload_json,effective_at,recorded_at,change_sha256) VALUES('roster',?,?,?,?,?)",
                        (active["roster_snapshot_id"], planning.canonical(binding), planning.timestamp(at), planning.timestamp(at), binding_hash))
@@ -145,7 +160,7 @@ def _cohort_plan(connection: sqlite3.Connection, active: dict[str, Any], *, at: 
            JOIN accounts a ON a.id=i.account_id WHERE m.snapshot_id=? ORDER BY i.id""",
         (_stamp(start), _stamp(end), active["roster_snapshot_id"])).fetchall()
     inputs: list[Mapping[str, Any]] = [{**dict(row), "history_days": max(0, min(7, (end-_time(row["created_at"])).days))}
-              for row in members if row["platform"] in {"douyin", "xiaohongshu"} and row["uid"]]
+              for row in members if row["platform"] in providers.SUPPORTED_CONTENT_PLATFORMS and row["uid"]]
     cohort = planning.adaptive_cohorts(inputs, business_day=plan_day.isoformat())
     payload = {"contract_version": CONTRACT, **binding, "business_day": plan_day.isoformat(),
                "count_start": _stamp(start), "count_end_exclusive": _stamp(end),
@@ -183,6 +198,9 @@ def _record_readiness_block(connection: sqlite3.Connection, work: Mapping[str, A
 
 def _readiness(connection: sqlite3.Connection, envelope: dict[str, Any], *, at: str,
                readiness_pass: WorkReadinessPass | None = None) -> tuple[str, str]:
+    if envelope.get("stage") == "profile_prepare":
+        from .account_preparation import readiness
+        return readiness(connection, envelope, at=at)
     command_id = envelope.get("manual_command_run_id")
     if command_id is not None:
         from . import capture_manual
@@ -306,10 +324,91 @@ def _discovery_pending(connection: sqlite3.Connection, plan: Mapping[str, Any],
     return False
 
 
+def _account_metric_cycle_pending(connection: sqlite3.Connection, plan: Mapping[str, Any],
+                                  member: Mapping[str, Any], *, operation: str,
+                                  logical_due: str, at: str) -> bool:
+    """Isolate immutable profile HOLDs from a strictly later six-hour cycle.
+
+    This read-only check grants no send permission. The new work retains the
+    existing route, readiness, budget and paid-identity fences. An old request
+    is never retried, unlocked or rewritten, including uncertain paid usage.
+    """
+    from . import account_roster
+    from .capture_metric_cycles import _same_plan, _stored_plan
+
+    bindings = ("activation_id", "profile_id", "activation_sha256",
+                "roster_snapshot_id", "roster_members_sha256")
+    identity_keys = ("identity_id", "account_id", "platform", "uid")
+    try:
+        now = _time(at)
+        bucket = _time(_bucket(at, 6 * 3600))
+        current = _stored_plan(connection, plan["id"])
+        active = activation_at(connection, at)
+        local = now.astimezone(BEIJING)
+        day = local.date() - timedelta(days=int((local.hour, local.minute) < (0, 10)))
+        if (operation != providers.PROFILE_OPERATIONS.get(member["platform"])
+                or logical_due != "account-metrics:" + _stamp(bucket)
+                or not _same_plan(connection, current, plan)
+                or active is None or active["profile_id"] != "integrated_route_v1"
+                or any(current[key] != active[key] for key in bindings)
+                or current["business_day"] != day.isoformat()
+                or dict(member) not in current["cohort"]):
+            return True
+        if current.get("catalog_snapshot") is not None:
+            from .account_catalog_capture import validate_plan_member
+            admitted = validate_plan_member(connection, plan["id"], member["identity_id"], at=at)
+        else:
+            admitted = account_roster.require_active_member(connection, member["identity_id"],
+                current["roster_snapshot_id"], current["roster_members_sha256"])
+        if any(admitted[key] != member[key] for key in ("account_id", "platform", "uid")):
+            return True
+        identity = planning.digest({"provider": "tikhub", "operation": operation,
+            "subject": f"account:{member['identity_id']}", "logical_due": logical_due})
+        if connection.execute("SELECT 1 FROM capture_work_items WHERE work_identity=?", (identity,)).fetchone():
+            return True
+        pending = connection.execute("SELECT * FROM capture_work_items WHERE account_id=? "
+            "AND content_id IS NULL AND operation=? AND state!='terminal'",
+            (member["account_id"], operation)).fetchall()
+        for row in pending:
+            old = json.loads(row["envelope_json"])
+            if (row["state"] != "paid_identity_hold" or row["owner_token"] is not None
+                    or row["provider"] != "tikhub" or old.get("kind") is not None
+                    or old.get("manual_command_run_id") is not None or old.get("manual_command_run_ids")
+                    or "compensation" in old or old.get("request_batch_id") is not None
+                    or old.get("contract_version") != CONTRACT or old.get("content_id") is not None
+                    or old.get("stage") != "account_metrics" or old.get("capture_stage") != "discovery"
+                    or old.get("category") != "metrics" or old.get("source_stage") != "account_metrics"
+                    or old.get("operation") != operation or old.get("assignment_id") != row["assignment_id"]
+                    or old.get("source_plan_id") != row["source_plan_id"]
+                    or any(old[key] != member[key] for key in identity_keys)):
+                return True
+            previous = _stored_plan(connection, row["source_plan_id"])
+            if (any(old[key] != previous[key] for key in bindings if key != "activation_sha256")
+                    or not any(all(value[key] == old[key] for key in identity_keys)
+                               for value in previous["cohort"])
+                    or old.get("catalog_plan_id") != (
+                        row["source_plan_id"] if previous.get("catalog_snapshot") is not None else None)):
+                return True
+            old_due = old["logical_due"]
+            old_bucket = _time(old_due.removeprefix("account-metrics:"))
+            old_identity = planning.digest({"provider": "tikhub", "operation": operation,
+                "subject": f"account:{member['identity_id']}", "logical_due": old_due})
+            if (old_due != "account-metrics:" + _bucket(_stamp(old_bucket), 6 * 3600)
+                    or row["work_identity"] != old_identity or bucket <= old_bucket
+                    or bucket <= _time(row["updated_at"]) or _time(row["updated_at"]) > now
+                    or _time(row["created_at"]) > _time(row["updated_at"])
+                    or old_bucket > _time(row["created_at"])):
+                return True
+        return False
+    except (KeyError, TypeError, ValueError, AttributeError, OverflowError, RuntimeError, sqlite3.Error):
+        return True
+
+
 def _enqueue(connection: sqlite3.Connection, plan: dict[str, Any], member: dict[str, Any], *,
              stage: str, operation: str, logical_due: str, at: str, content: sqlite3.Row | None = None,
              source_stage: str | None = None, readiness_pass: WorkReadinessPass | None = None,
-             manual_command_run_id: int | None = None) -> bool:
+             manual_command_run_id: int | None = None,
+             discovery_scopes: dict[str, Any] | None = None) -> bool:
     specification = None
     if manual_command_run_id is not None:
         from . import capture_manual
@@ -356,70 +455,289 @@ def _enqueue(connection: sqlite3.Connection, plan: dict[str, Any], member: dict[
         if content is not None or _discovery_pending(connection, plan, member,
                 operation=operation, logical_due=logical_due, at=at):
             return False
+    elif stage == "account_metrics":
+        if (content is not None or manual_command_run_id is not None
+                or source_stage not in {None, "account_metrics"}
+                or _account_metric_cycle_pending(connection, plan, member,
+                    operation=operation, logical_due=logical_due, at=at)):
+            return False
     elif stage == "metrics" and manual_command_run_id is None:
         from .capture_metric_cycles import metric_cycle_pending
         if content is None or metric_cycle_pending(connection, plan, member, content,
                 operation, source_stage, logical_due, at):
             return False
-    elif not (specification is not None and specification["kind"] == "metrics_update") and connection.execute("SELECT 1 FROM capture_work_items WHERE account_id=? AND content_id IS ? AND operation=? AND state!='terminal' LIMIT 1",
+    elif not (specification is not None and specification["kind"] in {"metrics_update", "media_source_refresh"}) and connection.execute("SELECT 1 FROM capture_work_items WHERE account_id=? AND content_id IS ? AND operation=? AND state!='terminal' LIMIT 1",
                             (member["account_id"], envelope["content_id"], operation)).fetchone():
         return False
     if stage == "discovery":
-        old = connection.execute("SELECT complete_through FROM capture_watermarks WHERE provider='tikhub' AND operation=? AND scope_key=? ORDER BY complete_through DESC LIMIT 1",
-                                 (operation, f"{member['platform']}:{member['uid']}")).fetchone()
-        envelope["window_start"], envelope["window_end"] = planning.discovery_window(at=at, complete_through=old[0] if old else None, forward_only=True)
+        if connection.execute("PRAGMA user_version").fetchone()[0] >= 23:
+            from . import capture_discovery_recovery as recovery
+            # Reuse scope evidence only within this planning transaction. The
+            # new work owns its immutable intervals throughout retries/pages.
+            memo = discovery_scopes if discovery_scopes is not None else {}
+            if "scopes" not in memo:
+                memo["scopes"] = recovery.prepare_scopes(connection, plan, at=at)
+            window = recovery.freeze_window(connection, member, at=at,
+                scope=memo["scopes"][member["identity_id"]])
+            if not window["published_intervals"]:
+                return False
+            envelope.update(window)
+        else:
+            old = connection.execute("SELECT complete_through FROM capture_watermarks WHERE provider='tikhub' AND operation=? AND scope_key=? ORDER BY complete_through DESC LIMIT 1",
+                                     (operation, f"{member['platform']}:{member['uid']}")).fetchone()
+            envelope["window_start"], envelope["window_end"] = planning.discovery_window(at=at, complete_through=old[0] if old else None, forward_only=True)
     state, reason = _readiness(connection, envelope, at=at, readiness_pass=readiness_pass)
     cursor = connection.execute("""INSERT OR IGNORE INTO capture_work_items(work_identity,assignment_id,source_plan_id,
         account_id,content_id,provider,operation,due_at,data_business_day,state,reason,envelope_json,created_at,updated_at)
         VALUES(?,?,?,?,?,'tikhub',?,?,?,?,?,?,?,?)""",
         (identity, assignment["id"], plan["id"], member["account_id"], envelope["content_id"], operation,
          planning.timestamp(at), _business_day(at), state, reason, planning.canonical(envelope), planning.timestamp(at), planning.timestamp(at)))
+    if cursor.rowcount == 1 and envelope.get("recovery_contract"):
+        _record_discovery_scope(connection, work_id=int(cursor.lastrowid), envelope=envelope, at=at)
     return cursor.rowcount == 1
+
+
+def _record_discovery_scope(connection: sqlite3.Connection, *, work_id: int,
+                            envelope: Mapping[str, Any], at: str) -> None:
+    """Persist planned scope and out-of-bound debt without claiming coverage."""
+    evidence = {key: envelope[key] for key in ("recovery_contract", "discovery_mode",
+        "window_start", "window_end", "published_intervals", "scope_start",
+        "scope_evidence", "bounded_out_gaps", "identity_id", "account_id", "platform", "uid", "operation")}
+    evidence.update(work_id=work_id, complete=False, disposition="planned")
+    connection.execute("INSERT OR IGNORE INTO data_quality_receipts(scope_key,cutoff_at,payload_json,recorded_at,receipt_sha256) VALUES(?,?,?,?,?)",
+        (f"capture-discovery-scope:{work_id}", planning.timestamp(at), planning.canonical(evidence),
+         planning.timestamp(at), planning.digest(evidence)))
+    for start, end in envelope["bounded_out_gaps"]:
+        gap = {"identity_id": envelope["identity_id"], "account_id": envelope["account_id"],
+               "operation": envelope["operation"], "window_start": start, "window_end": end}
+        connection.execute("INSERT INTO operational_alerts(dedupe_key,severity,scope_json,evidence_json,owner,status,opened_at) VALUES(?,'P2',?,?,'capture-runtime','open',?) "
+            "ON CONFLICT(dedupe_key) WHERE status='open' DO UPDATE SET "
+            "scope_json=excluded.scope_json,evidence_json=excluded.evidence_json "
+            "WHERE julianday(json_extract(operational_alerts.scope_json,'$.window_end')) "
+            "< julianday(json_extract(excluded.scope_json,'$.window_end'))",
+            (f"capture-discovery-gap:{envelope['identity_id']}:{envelope['operation']}:{start}",
+             planning.canonical(gap), planning.canonical({"work_id": work_id, "complete": False,
+                 "reason": "outside_automatic_30d", "scope_receipt": f"capture-discovery-scope:{work_id}"}),
+             planning.timestamp(at)))
+
+
+def _plan_tick_v23(db_path: Path, *, at: str, shadow: bool) -> dict[str, Any]:
+    from . import capture_plan_reuse as reuse, account_catalog_capture as catalog
+    from .account_directory_reconciliation import reconcile_directory
+    from .account_preparation import enqueue_pending, prepare_profile_reuse
+    from .provider_budget import PaidScopeBlocked
+    from .runtime_evidence_context import inheritance_boundary, prepare_inheritance
+    from .storage import transaction_metrics_context
+    with connect(db_path) as connection, transaction(connection):
+        reconciliation = reconcile_directory(connection, at=at)
+        active = activation_at(connection, at)
+        if active is None:
+            return {"status":"no_activation","created":0,"provider_calls":0,"directory_reconciliation":reconciliation}
+        shadow = shadow or active["profile_id"] != "integrated_route_v1"
+    # Preparation policy verification also traverses the installed inheritance
+    # chain. Give this write phase its own closed read proof before taking the
+    # writer lock; the profile proof retains its exact logical-time binding.
+    with prepare_inheritance(db_path) as inherited:
+        at = now_utc() if inherited is not None else at
+        with connect(db_path) as connection:
+            connection.execute("BEGIN")
+            reuse_proof = prepare_profile_reuse(connection, active=active, at=at) if not shadow else None
+            connection.rollback()
+        with transaction_metrics_context(job_id="capture_planner_preparation"), \
+                connect(db_path) as connection, transaction(connection), inheritance_boundary(connection):
+            if activation_at(connection, at) != active:
+                return {"status":"deferred","reason":"activation_changed_during_preparation","created":0,
+                        "provider_calls":0,"directory_reconciliation":reconciliation}
+            try:
+                preparation = enqueue_pending(connection, active=active, at=at, shadow=shadow, reuse_proof=reuse_proof)
+            except PaidScopeBlocked as error:
+                if error.error_code != "preparation_reuse_proof_changed":
+                    raise
+                return {"status":"deferred","reason":error.error_code,"created":0,
+                        "provider_calls":0,"directory_reconciliation":reconciliation}
+    try:
+        prepared = reuse.ensure(db_path, at=at, shadow=shadow)
+    except reuse.PlanDeferred as error:
+        return {"status":"deferred","reason":str(error),"created":0,"provider_calls":0,
+                "preparation":preparation,"directory_reconciliation":reconciliation}
+    # Reconsideration verifies preparation policy even when the daily catalog
+    # plan is reused. It gets a new proof after the preceding commit, never a
+    # cross-transaction cache or a fallback full proof inside this write lock.
+    with prepare_inheritance(db_path) as inherited, \
+            transaction_metrics_context(job_id="capture_planner_due"), \
+            connect(db_path) as connection, transaction(connection), inheritance_boundary(connection):
+        at = now_utc() if inherited is not None else at
+        if not reuse.current(connection, prepared, at=at):
+            return {"status":"deferred","reason":"catalog_changed_during_enqueue","created":0,"provider_calls":0}
+        plan = prepared["plan"]
+        if shadow:
+            return {"status":"shadow","plan_id":plan["id"],"accounts":len(plan["cohort"]),
+                "created":0,"provider_calls":0,"preparation":preparation,"directory_reconciliation":reconciliation}
+        snapshot = plan.get("catalog_snapshot")
+        context = catalog.planning_validation(connection, prepared["policy"], snapshot, plan=plan) if snapshot is not None else nullcontext()
+        with context as comparison_plan:
+            comparison = {"comparison_plan": comparison_plan} if comparison_plan is not None else {}
+            return {**_plan_due(connection, plan, at=at, **comparison),"preparation":preparation,
+                    "directory_reconciliation":reconciliation,"plan_reused":prepared["reused"]}
 
 
 def plan_tick(db_path: Path = DEFAULT_DB, at: str | None = None, shadow: bool = False) -> dict[str, Any]:
     """Freeze one daily plan and idempotently enqueue currently due scopes."""
     at = at or now_utc()
+    with connect(db_path) as probe:
+        modern = probe.execute("PRAGMA user_version").fetchone()[0] >= 23
+    if modern:
+        return _plan_tick_v23(db_path, at=at, shadow=shadow)
     with connect(db_path) as connection, transaction(connection):
         _require20(connection)
+        from .account_directory_reconciliation import reconcile_directory
+        reconciliation = reconcile_directory(connection, at=at)
         active = activation_at(connection, at)
         if active is None:
-            return {"status": "no_activation", "created": 0, "provider_calls": 0}
+            return {"status": "no_activation", "created": 0, "provider_calls": 0, "directory_reconciliation": reconciliation}
         shadow = shadow or active["profile_id"] != "integrated_route_v1"
+        from .account_preparation import enqueue_pending
+        preparation = enqueue_pending(connection, active=active, at=at, shadow=shadow)
         plan = _cohort_plan(connection, active, at=at, shadow=shadow)
         if shadow:
-            return {"status": "shadow", "plan_id": plan["id"], "accounts": len(plan["cohort"]), "created": 0, "provider_calls": 0}
+            return {"status": "shadow", "plan_id": plan["id"], "accounts": len(plan["cohort"]), "created": 0, "provider_calls": 0, "preparation": preparation, "directory_reconciliation": reconciliation}
         from . import account_catalog_capture as catalog
         snapshot = plan.get("catalog_snapshot")
         policy = catalog.installed_policy(connection, at=at) if snapshot is not None else None
         context = catalog.planning_validation(connection, policy, snapshot) if policy is not None else nullcontext()
         with context:
-            return _plan_due(connection, plan, at=at)
+            return {**_plan_due(connection, plan, at=at), "preparation": preparation, "directory_reconciliation": reconciliation}
 
 
-def _plan_due(connection: sqlite3.Connection, plan: dict[str, Any], *, at: str) -> dict[str, Any]:
+
+
+
+
+def _enqueue_metric_groups(connection: sqlite3.Connection, plan: dict[str, Any],
+                           member: dict[str, Any], content: sqlite3.Row, *, at: str,
+                           business_active: bool, readiness_pass: WorkReadinessPass,
+                           missing_fields: Collection[str] | None = None,
+                           comparison_plan: Mapping[str, Any] | None = None) -> int:
+    interval = planning.refresh_interval(published_at=content["published_at"], at=at,
+        high_value=False, business_active=business_active)
+    if interval is None:
+        return 0
+    created = 0
+    for group in load_policy()["metric_supplement_groups"][member["platform"]]:
+        if missing_fields is not None and not set(group["fields"]).intersection(missing_fields):
+            continue
+        source_stage = str(group["stage"])
+        created += _enqueue(connection, comparison_plan if comparison_plan is not None else plan, member, stage="metrics",
+            operation=providers.STAGE_CONFIG[(member["platform"], source_stage)][2],
+            source_stage=source_stage,
+            logical_due="metrics:"+_bucket(at, interval[0])+":"+str(group["name"]),
+            at=at, content=content, readiness_pass=readiness_pass)
+    return created
+
+
+def enqueue_discovered_metrics(content_ids: Collection[int], *, db_path: Path = DEFAULT_DB,
+                               at: str | None = None) -> dict[str, Any]:
+    """Start missing-counter work as soon as links are saved, without paid calls.
+
+    Use the current planner's cohort, cycles and durable dedupe. Media, detail
+    and evaluation readiness are intentionally not prerequisites. A failed local
+    enqueue is replayable from the already-paid page's saved raw response.
+    """
+    ids = sorted(set(content_ids))
+    if any(type(cid) is not int or cid <= 0 for cid in ids):
+        raise ValueError("discovered metrics require positive content IDs")
+    result: dict[str, Any] = {"status": "planned", "content_count": len(ids),
+        "considered": 0, "created": 0, "missing_fields": {}, "provider_calls": 0}
+    if not ids:
+        return result
+    at = at or now_utc()
+    from . import account_catalog_capture as catalog
+    from .capture_metric_cycles import _business_active
+    from .provider_updates import missing_metric_fields
+    from . import capture_plan_reuse as reuse
+    prepared = None
+    with connect(db_path) as probe:
+        modern = probe.execute("PRAGMA user_version").fetchone()[0] >= 23
+    if modern:
+        try:
+            prepared = reuse.ensure(db_path, at=at)
+        except reuse.PlanDeferred as error:
+            return {**result, "status":"deferred", "reason":str(error)}
+    with connect(db_path) as connection, transaction(connection):
+        if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21, 22, 23, 24}:
+            return {**result, "status": "legacy_scheduler"}
+        active = activation_at(connection, at)
+        if not execution_profile_allowed(active):
+            return {**result, "status": "no_activation" if active is None else "legacy_scheduler"}
+        if prepared is not None and not reuse.current(connection, prepared, at=at):
+            return {**result, "status":"deferred", "reason":"catalog_changed_during_enqueue"}
+        plan = prepared["plan"] if prepared is not None else _cohort_plan(connection, active, at=at, shadow=False)
+        members = {(member["account_id"], member["platform"]): member for member in plan["cohort"]}
+        snapshot = plan.get("catalog_snapshot")
+        policy = prepared["policy"] if prepared is not None else catalog.installed_policy(connection, at=at) if snapshot is not None else None
+        context = catalog.planning_validation(connection, policy, snapshot, plan=plan) if policy is not None else nullcontext()
+        readiness_pass = WorkReadinessPass(connection, at=at)
+        with context as bound_plan:
+            if bound_plan is not None:
+                plan = bound_plan
+            for start in range(0, len(ids), 400):
+                batch = ids[start:start+400]
+                rows = connection.execute("SELECT c.* FROM content_items c WHERE c.id IN ("+
+                    ",".join("?" for _ in batch)+") AND "+canonical_content_predicate(connection, alias="c"), batch).fetchall()
+                for content in rows:
+                    member = members.get((content["account_id"], content["platform"]))
+                    if (member is None or not content["published_at"]
+                            or not within_automatic_scope(content["published_at"])):
+                        continue
+                    result["considered"] += 1
+                    missing = missing_metric_fields(connection, content["id"], at=at)
+                    if not missing:
+                        continue
+                    result["missing_fields"][str(content["id"])] = missing
+                    result["created"] += _enqueue_metric_groups(connection, plan, member, content,
+                        at=at, business_active=_business_active(connection, content["id"], _time(at)),
+                        readiness_pass=readiness_pass, missing_fields=missing)
+        return result
+
+
+def _plan_due(connection: sqlite3.Connection, plan: dict[str, Any], *, at: str,
+              comparison_plan: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    if comparison_plan is not None:
+        from .capture_metric_cycles import require_planning_comparison
+        require_planning_comparison(connection, plan, comparison_plan)
     # Planning writes no paid usage: reuse budget/unknown snapshots only
     # within this transaction. Execution and subsequent ticks recheck fresh.
     readiness_pass = WorkReadinessPass(connection, at=at)
+    discovery_scopes: dict[str, Any] = {}
     created = 0
+    # This loop only enqueues automatic work. Manual/report activity cannot
+    # change inside its writer transaction, so scan those sources once instead
+    # of rescanning both tables for every retained content row.
+    business_active_ids = set()
+    if plan["cohort"]:
+        day_start = _stamp(datetime.combine(_time(at).astimezone(BEIJING).date(), datetime.min.time(), BEIJING))
+        business_active_ids = {row[0] for row in connection.execute("""
+            SELECT tc.content_id FROM task_contents tc JOIN report_tasks t ON t.id=tc.task_id
+            WHERE t.task_status IN ('queued','running','cancel_requested')
+               OR julianday(t.completed_at)>=julianday(?)
+            UNION
+            SELECT w.content_id FROM capture_work_items w
+            WHERE json_extract(w.envelope_json,'$.kind')='manual_update'
+              AND (w.state!='terminal' OR julianday(w.completed_at)>=julianday(?))
+            """, (day_start, day_start))}
     for member in plan["cohort"]:
         platform = member["platform"]
         due = "discovery:" + _bucket(at, member["interval_minutes"]*60, member["phase_seconds"])
         if not _discovery_pending(connection, plan, member,
                 operation=platform+"_user_posts", logical_due=due, at=at):
             created += _enqueue(connection, plan, member, stage="discovery", operation=platform+"_user_posts", logical_due=due, at=at,
-                                readiness_pass=readiness_pass)
-        if platform == "douyin":
-            created += _enqueue(connection, plan, member, stage="account_metrics", operation="douyin_uid_profile",
+                                readiness_pass=readiness_pass, discovery_scopes=discovery_scopes)
+        if platform in providers.PROFILE_OPERATIONS:
+            created += _enqueue(connection, comparison_plan if comparison_plan is not None else plan, member,
+                                stage="account_metrics", operation=providers.PROFILE_OPERATIONS[platform],
                                 logical_due="account-metrics:"+_bucket(at, 6*3600), at=at, readiness_pass=readiness_pass)
-        day_start = _stamp(datetime.combine(_time(at).astimezone(BEIJING).date(), datetime.min.time(), BEIJING))
-        contents = connection.execute("""SELECT c.*,(EXISTS(SELECT 1 FROM task_contents tc JOIN report_tasks t ON t.id=tc.task_id
-            WHERE tc.content_id=c.id AND (t.task_status IN ('queued','running','cancel_requested')
-            OR julianday(t.completed_at)>=julianday(?))) OR EXISTS(SELECT 1 FROM capture_work_items w
-            WHERE w.content_id=c.id AND json_extract(w.envelope_json,'$.kind')='manual_update'
-            AND (w.state!='terminal' OR julianday(w.completed_at)>=julianday(?)))) business_active
-            FROM content_items c WHERE c.account_id=? AND c.platform=? AND """ + canonical_content_predicate(connection, alias="c"),
-            (day_start, day_start, member["account_id"], platform)).fetchall()
+        contents = connection.execute("SELECT c.* FROM content_items c WHERE c.account_id=? AND c.platform=? AND "
+            + canonical_content_predicate(connection, alias="c"), (member["account_id"], platform)).fetchall()
         for content in contents:
             if not within_automatic_scope(content["published_at"] or content["created_at"]):
                 continue
@@ -432,27 +750,31 @@ def _plan_due(connection: sqlite3.Connection, plan: dict[str, Any], *, at: str) 
             if not content["published_at"]:
                 continue
             interval = planning.refresh_interval(published_at=content["published_at"], at=at,
-                high_value=False, business_active=bool(content["business_active"]))
+                high_value=False, business_active=content["id"] in business_active_ids)
             if interval is not None:
-                for group in load_policy()["metric_supplement_groups"][platform]:
-                    source_stage = str(group["stage"])
-                    created += _enqueue(connection, plan, member, stage="metrics",
-                        operation=providers.STAGE_CONFIG[(platform,source_stage)][2], source_stage=source_stage,
-                        logical_due="metrics:"+_bucket(at, interval[0])+":"+str(group["name"]), at=at, content=content,
-                        readiness_pass=readiness_pass)
-                if content["business_active"]:
+                created += _enqueue_metric_groups(connection, plan, member, content, at=at,
+                    business_active=content["id"] in business_active_ids, readiness_pass=readiness_pass,
+                    comparison_plan=comparison_plan)
+                if content["id"] in business_active_ids and (platform, "comments") in providers.STAGE_CONFIG:
                     week = _time(at).astimezone(BEIJING).date().isocalendar()
                     created += _enqueue(connection, plan, member, stage="comments", operation=providers.STAGE_CONFIG[(platform,"comments")][2],
                         logical_due=f"{week.year}-W{week.week:02d}", at=at, content=content, readiness_pass=readiness_pass)
     reconsidered = 0
-    for row in connection.execute("SELECT id,state,reason,envelope_json,due_at FROM capture_work_items WHERE state IN ('provider_blocked','budget_deferred') AND due_at<=? ORDER BY due_at,id LIMIT 500", (planning.timestamp(at),)).fetchall():
-        state, reason = _readiness(connection, json.loads(row["envelope_json"]), at=at, readiness_pass=readiness_pass)
-        if state != "runnable":
-            _record_readiness_block(connection, dict(row), state=state, reason=reason, at=at)
-            reconsidered += 1
-        elif state != row["state"] or reason != row["reason"]:
-            connection.execute("UPDATE capture_work_items SET state=?,reason=?,updated_at=? WHERE id=?", (state, reason, planning.timestamp(at), row["id"]))
-            reconsidered += 1
+    reconsider_rows = [(row, json.loads(row["envelope_json"])) for row in connection.execute(
+        "SELECT id,state,reason,envelope_json,due_at FROM capture_work_items WHERE state IN ('provider_blocked','budget_deferred') AND due_at<=? ORDER BY due_at,id LIMIT 500",
+        (planning.timestamp(at),)).fetchall()]
+    from .account_preparation import planning_reconsideration
+    context = (planning_reconsideration(connection, at=at)
+        if any(envelope.get("stage") == "profile_prepare" for _, envelope in reconsider_rows) else nullcontext())
+    with context:
+        for row, envelope in reconsider_rows:
+            state, reason = _readiness(connection, envelope, at=at, readiness_pass=readiness_pass)
+            if state != "runnable":
+                _record_readiness_block(connection, dict(row), state=state, reason=reason, at=at)
+                reconsidered += 1
+            elif state != row["state"] or reason != row["reason"]:
+                connection.execute("UPDATE capture_work_items SET state=?,reason=?,updated_at=? WHERE id=?", (state, reason, planning.timestamp(at), row["id"]))
+                reconsidered += 1
     return {"status": "planned", "plan_id": plan["id"], "created": created,
             "reconsidered": reconsidered, "provider_calls": 0}
 
@@ -471,13 +793,15 @@ def _verify_raws(db_path: Path, raw_ids: list[int]) -> None:
 
 
 def _discovery_page(envelope: dict[str, Any], *, db_path: Path, at: str) -> dict[str, Any]:
+    scope_kwargs = ({"published_intervals": [(_time(start), _time(end))
+        for start, end in envelope["published_intervals"]]} if "published_intervals" in envelope else {})
     result = providers.discover_account_content(envelope["account_id"], envelope["platform"], envelope["uid"],
         as_of=_time(at).astimezone(BEIJING).date(), cursor=envelope["cursor"], window_key=_page_window(envelope),
         published_start=_time(envelope["window_start"]), published_end=_time(envelope["window_end"])-timedelta(microseconds=1),
         task_id="capture-v25:"+_business_day(at), task_max_amount=TASK_CAP_USD, db_path=db_path,
-        materialize_discovery_detail=False, materialize_existing_discovery_stages=True)
+        materialize_discovery_detail=False, materialize_existing_discovery_stages=True, **scope_kwargs)
     raw = _raw_for_page(envelope, db_path)
-    items, more, next_cursor, _ = tikhub_scan._page(raw, envelope["platform"])
+    items, more, next_cursor, _ = tikhub_scan._page(raw, envelope["platform"], expected_uid=envelope["uid"])
     counts = dict(envelope["counts"])
     inventory = dict(envelope.get("video_inventory", {}))
     repeated = int(envelope.get("repeated_video_appearances", 0))
@@ -487,7 +811,9 @@ def _discovery_page(envelope: dict[str, Any], *, db_path: Path, at: str) -> dict
         counts["invalid" if proof["event_tuple"] is None else "valid"] += 1
         if proof["event_tuple"] is not None and tikhub_scan._item(envelope["platform"], item)["content_type"] == "video":
             published = proof["published_at"]
-            if _time(envelope["window_start"]) <= _time(published) < _time(envelope["window_end"]):
+            if (_time(envelope["window_start"]) <= _time(published) < _time(envelope["window_end"])
+                    and (not scope_kwargs or any(start <= _time(published) < end
+                         for start, end in scope_kwargs["published_intervals"]))):
                 identifier = proof["platform_content_id"]
                 if identifier in inventory:
                     repeated += 1
@@ -511,6 +837,9 @@ def _discovery_page(envelope: dict[str, Any], *, db_path: Path, at: str) -> dict
                 "identity_id": envelope["identity_id"], "operation": envelope["operation"],
                 "video_inventory": inventory, "repeated_video_appearances": repeated,
                 "inventory_contract": "verified-provider-scan-inventory-v1"}
+    if envelope.get("recovery_contract"):
+        evidence.update({key: envelope[key] for key in ("recovery_contract", "discovery_mode",
+            "published_intervals", "scope_start", "scope_evidence", "bounded_out_gaps")})
     reason = "cursor_loop" if loop else "page_cap_hit" if cap_hit else "invalid_items" if counts["invalid"] else ""
     terminal_partial = bool((loop or cap_hit) and counts["invalid"] == 0
                             and result["status"] in {"succeeded", "already_succeeded"})
@@ -519,16 +848,93 @@ def _discovery_page(envelope: dict[str, Any], *, db_path: Path, at: str) -> dict
             "envelope": new, "evidence": evidence, "reason": reason, "provider_cost": result["provider_cost"]}
 
 
+def _fresh_metric_work_result(connection: sqlite3.Connection, envelope: Mapping[str, Any], *, at: str) -> dict[str, Any] | None:
+    """Queued counters may have been supplied by an intervening discovery/detail.
+
+    The current field policy decides sufficiency; a valid zero is complete and
+    unsupported fields never cause another purchase. Raw bytes are still checked.
+    """
+    if envelope["stage"] != "metrics" or connection.execute("PRAGMA user_version").fetchone()[0] < 23:
+        return None
+    from .source_routing import select_current_content_metrics
+    from .metric_source_policy import auto_collectable_fields
+    groups = load_policy()["metric_supplement_groups"][envelope["platform"]]
+    fields = {field for group in groups if group["stage"] == envelope.get("source_stage", "metrics")
+        and envelope["logical_due"].endswith(":" + group["name"]) for field in group["fields"]}
+    fields &= set(auto_collectable_fields(envelope["platform"]))
+    if not fields:
+        return None
+    selected = select_current_content_metrics(connection, [envelope["content_id"]], cutoff_at=at).get(envelope["content_id"], {}).get("fields", {})
+    if any(selected.get(field, {}).get("status") != "provided" or selected[field].get("freshness") != "fresh"
+           or not selected[field].get("raw_response_id") for field in fields):
+        return None
+    raw_ids = sorted({int(selected[field]["raw_response_id"]) for field in fields})
+    for raw_id in raw_ids:
+        raw_archive.read_response_entity(connection, raw_id)
+    return {"complete":True,"continuation":False,"envelope":dict(envelope),
+        "evidence":{"raw_response_ids":raw_ids,"all_raw_verified":True,"completion_kind":"fresh_fields_already_available"},
+        "reason":"","provider_cost":0.0}
+
+
+def _shared_detail_outcome(connection: sqlite3.Connection, envelope: Mapping[str, Any], content: Mapping[str, Any]) -> capture.CaptureOutcome | None:
+    """Reuse a detail-bearing result written after this work was queued.
+
+    A previous cycle's lifetime response cannot satisfy an explicit source
+    refresh. The byte archive and author are checked again before reuse.
+    """
+    if (envelope["stage"] != "detail" or envelope["platform"] not in {"kuaishou", "wechat_channels"}
+            or envelope.get("kind") == "media_source_refresh"
+            or connection.execute("PRAGMA user_version").fetchone()[0] < 23):
+        return None
+    identity = planning.digest({"provider":"tikhub", "operation":envelope["operation"],
+        "subject":f"content:{content['id']}", "logical_due":envelope["logical_due"]})
+    work = connection.execute("SELECT created_at FROM capture_work_items WHERE work_identity=?", (identity,)).fetchone()
+    if work is None:
+        return None
+    operations = tuple(providers.STAGE_CONFIG[(envelope["platform"], stage)][2] for stage in ("detail", "metrics"))
+    raws = connection.execute("SELECT * FROM provider_raw_responses WHERE content_id=? AND provider='TikHub' "
+        "AND operation IN (?,?) AND source IN ('live_applied','derived_applied') AND http_status=200 "
+        "AND julianday(captured_at)>=julianday(?) ORDER BY captured_at DESC,id DESC LIMIT 10",
+        (content["id"], *operations, work["created_at"])).fetchall()
+    for raw in raws:
+        _path, payload = capture._read_verified_raw_response(raw, connection=connection)
+        # Only a physical response can satisfy the opposite consumer; derived
+        # metric archives deliberately contain no detail or decryption material.
+        if isinstance(payload, Mapping) and payload.get("derived_from_operation"):
+            continue
+        result = providers._parse_content_payload(envelope["platform"], "detail", content["platform_content_id"],
+            content["content_type"], payload, status=200, expected_uid=envelope["uid"])
+        return capture.CaptureOutcome(0, 0, int(raw["id"]),
+            {**dict(result.data),"_evidence_captured_at":raw["captured_at"]}, False, 0.0, "USD")
+    return None
+
+
 def _content_request(envelope: dict[str, Any], *, db_path: Path, at: str) -> dict[str, Any]:
+    from . import capture_shared_requests
     with connect(db_path) as connection:
         content = dict(connection.execute("SELECT * FROM content_items WHERE id=?", (envelope["content_id"],)).fetchone())
+        satisfied = _fresh_metric_work_result(connection, envelope, at=at)
+    if satisfied is not None:
+        return satisfied
+    relationship = capture_shared_requests.bind(envelope, db_path=db_path)
+    if relationship is not None:
+        shared_result = capture_shared_requests.consume(envelope, relationship, db_path=db_path)
+        if shared_result is not None:
+            return shared_result
+    with connect(db_path) as connection:
+        shared = _shared_detail_outcome(connection, envelope, content) if relationship is None else None
+    if shared is not None:
+        providers._store_stage_result(content, "detail", _page_window(envelope), shared,
+            db_path=db_path, preserve_existing_content_fields=True)
+        return {"complete":True,"continuation":False,"envelope":dict(envelope),
+            "evidence":{"raw_response_ids":[shared.raw_response_id],"all_raw_verified":True,
+                        "completion_kind":"shared_detail_response"},"reason":"","provider_cost":0.0}
     platform, stage = envelope["platform"], envelope["stage"]
     source_stage = envelope.get("source_stage", stage)
     if platform == "xiaohongshu" and content["content_type"] not in {"video", "image"}:
         raise capture.CaptureError("XHS type requires separately assigned discovery evidence", retryable=False, error_code="content_type_unverified", billed=False)
     cursor = (dict(envelope["cursor"]) if isinstance(envelope["cursor"], dict) else {"cursor": envelope["cursor"]}) if stage == "comments" else None
-    request = providers._douyin_request(source_stage, content["platform_content_id"], cursor) if platform == "douyin" else providers._xhs_request(source_stage, content["platform_content_id"], content["content_type"], cursor=cursor)
-    params = request[1]
+    params = providers._content_request_params(platform, source_stage, providers._content_subject(content), content["content_type"], cursor)
     window = _page_window(envelope)
     price = providers.STAGE_CONFIG[(platform,source_stage)][3]
     def normalize(parsed: capture.ProviderResult) -> capture.ProviderResult:
@@ -543,18 +949,19 @@ def _content_request(envelope: dict[str, Any], *, db_path: Path, at: str) -> dic
                 raise capture.CaptureError("counter detail omitted metrics", retryable=False,
                     error_code="invalid_response", billed=parsed.billed, http_status=parsed.http_status,
                     raw_response=parsed.raw_response, entity_bytes=parsed.entity_bytes, transport_receipt=parsed.transport_receipt)
-            return capture.ProviderResult(dict(values), parsed.raw_response, parsed.http_status,
+            return capture.ProviderResult({**dict(values), "_detail_projection": dict(parsed.data)}, parsed.raw_response, parsed.http_status,
                                           parsed.billed, parsed.entity_bytes, parsed.transport_receipt)
         return parsed
     task_id = envelope.get("task_id", "capture-v25:"+_business_day(at))
     task_cap = envelope.get("task_max_amount", TASK_CAP_USD)
+    capture_shared_requests.verify_execution(envelope, content, relationship, db_path=db_path)
     budget = providers._budget_for_call(provider="TikHub", operation=envelope["operation"], price=price,
         task_id=task_id, task_max_amount=task_cap, db_path=db_path)
     try:
         stored = capture.load_succeeded_raw_response(db_path=db_path, content_id=content["id"], stage=stage, window_key=window, operation=envelope["operation"])
     except capture.SlotUnavailable:
         key = providers._load_key(providers.TIKHUB_KEY_FILE, "TIKHUB_API_KEY")
-        raw_call = partial(providers._douyin_call, source_stage, content["platform_content_id"], key, cursor=cursor) if platform == "douyin" else partial(providers._xhs_call, source_stage, content["platform_content_id"], key, content["content_type"], cursor=cursor)
+        raw_call = partial(providers._content_call, platform, source_stage, providers._content_subject(content), key, content["content_type"], cursor=cursor, expected_uid=envelope["uid"])
         def call() -> capture.ProviderResult:
             return normalize(raw_call())
         outcome = capture.execute_content_fetch(content_id=content["id"], stage=stage, window_key=window,
@@ -564,13 +971,14 @@ def _content_request(envelope: dict[str, Any], *, db_path: Path, at: str) -> dic
             paid_request_identity=providers._paid_request_identity(operation=envelope["operation"], platform=platform,
                 subject=content["platform_content_id"], params=params, cursor=cursor, due_bucket=window))
     else:
-        parsed = normalize(providers._parse_douyin_stage_payload(source_stage, content["platform_content_id"], stored.value, status=stored.http_status or 200) if platform == "douyin" else providers._parse_xhs_stage_payload(source_stage, content["platform_content_id"], content["content_type"], stored.value, status=stored.http_status or 200))
+        parsed = normalize(providers._parse_content_payload(platform, source_stage, content["platform_content_id"], content["content_type"], stored.value, status=stored.http_status or 200, expected_uid=envelope["uid"]))
         outcome = capture.CaptureOutcome(stored.slot_id, 0, stored.raw_response_id, parsed.data, False, 0.0, "USD")
     providers._store_stage_result(content, stage, window, outcome, db_path=db_path)
     with connect(db_path) as connection:
         raw_archive.read_response_entity(connection, outcome.raw_response_id)
+    capture_shared_requests.wake_consumers(relationship, db_path=db_path, at=now_utc())
     more = stage == "comments" and bool(outcome.data.get("has_more"))
-    next_cursor = outcome.data.get("next_cursor_params") if platform == "xiaohongshu" else outcome.data.get("next_cursor")
+    next_cursor = outcome.data.get("next_cursor_params") or outcome.data.get("next_cursor")
     seen = [*envelope["seen_cursors"], planning.canonical(envelope["cursor"])]
     loop = more and (next_cursor is None or planning.canonical(next_cursor) in seen)
     cap_hit = more and envelope["page_count"]+1 >= MAX_PAGES
@@ -582,11 +990,12 @@ def _content_request(envelope: dict[str, Any], *, db_path: Path, at: str) -> dic
 
 
 def _account_request(envelope: dict[str, Any], *, db_path: Path, at: str) -> dict[str, Any]:
-    # The existing verified Douyin profile operation supplies both a reference
-    # and follower statistics; no XHS profile contract is enabled implicitly.
-    operation = "douyin_uid_profile"
+    # Every platform has an explicit profile contract; no implicit XHS fallback.
+    platform = envelope["platform"]
+    operation = providers.PROFILE_OPERATIONS[platform]
+    params = {"uid": envelope["uid"]} if platform == "douyin" else providers._content_request_params(platform, "profile", envelope["uid"], "")
     window = envelope["logical_due"]
-    budget = providers._budget_for_call(provider="TikHub", operation=operation, price=providers.TIKHUB_PRICE,
+    budget = providers._budget_for_call(provider="TikHub", operation=operation, price=providers._platform_price(platform),
         task_id="capture-v25:"+_business_day(at), task_max_amount=TASK_CAP_USD, db_path=db_path)
     try:
         raw = capture.load_succeeded_raw_response(db_path=db_path, account_id=envelope["account_id"], stage="discovery", window_key=window, operation=operation)
@@ -595,31 +1004,37 @@ def _account_request(envelope: dict[str, Any], *, db_path: Path, at: str) -> dic
         key = providers._load_key(providers.TIKHUB_KEY_FILE, "TIKHUB_API_KEY")
         outcome = capture.execute_account_fetch(account_id=envelope["account_id"], stage="discovery", window_key=window,
             provider="TikHub", adapter_version="tikhub-profile-v25", operation=operation,
-            call=partial(providers._douyin_reference_call, envelope["uid"], key),
+            call=partial(providers._douyin_reference_call, envelope["uid"], key) if platform == "douyin" else partial(providers._extra_call, platform, "profile", envelope["uid"], key),
             request_transport=providers._freeze_tikhub_transport(), db_path=db_path, budget_id=budget,
             task_id="capture-v25:"+_business_day(at), task_max_amount=TASK_CAP_USD,
-            paid_request_identity=providers._paid_request_identity(operation=operation, platform="douyin", subject=envelope["uid"],
-                params={"uid": envelope["uid"]}, cursor=None, due_bucket=window))
+            paid_request_identity=providers._paid_request_identity(operation=operation, platform=platform, subject=envelope["uid"],
+                params=params, cursor=None, due_bucket=window))
         raw_id, cost = outcome.raw_response_id, outcome.amount
         with connect(db_path) as connection:
             value = json.loads(raw_archive.read_response_entity(connection, raw_id))
             captured_at = connection.execute("SELECT captured_at FROM provider_raw_responses WHERE id=?", (raw_id,)).fetchone()[0]
-    normalized = account_metrics.parse_tikhub_profile(value, platform="douyin", uid=envelope["uid"])
+    normalized = account_metrics.parse_tikhub_profile(value, platform=platform, uid=envelope["uid"])
     follower_status = normalized["field_status"]["follower_count"]["status"]
     if follower_status != "provided":
         raise account_metrics.AccountMetricError("profile_follower_count_" + follower_status)
-    reference = providers._parse_douyin_reference_payload(value, status=200).data.get("reference")
+    reference = providers._parse_douyin_reference_payload(value, status=200).data.get("reference") if platform == "douyin" else None
     with connect(db_path) as connection, transaction(connection):
         account_metrics.persist_account_metric_observation(connection, account_identity_id=envelope["identity_id"],
             provider="tikhub", raw_response_id=raw_id, normalized=normalized, captured_at=captured_at)
         if providers._valid_douyin_sec_user_id(str(reference or "")):
-            connection.execute("INSERT INTO account_provider_references(account_identity_id,provider,reference_kind,reference_value,source_raw_response_id,created_at,updated_at) VALUES(?,'TikHub','sec_user_id',?,?,?,?) ON CONFLICT(account_identity_id,provider,reference_kind) DO UPDATE SET reference_value=excluded.reference_value,source_raw_response_id=excluded.source_raw_response_id,updated_at=excluded.updated_at",
-                               (envelope["identity_id"], reference, raw_id, captured_at, captured_at))
+            from .account_reference_storage import store_reference
+            store_reference(connection, account_identity_id=envelope["identity_id"], platform=platform,
+                provider="TikHub", reference_kind="sec_user_id", reference_value=reference,
+                source_raw_response_id=raw_id, created_at=captured_at, updated_at=captured_at,
+                update_existing=True)
     return {"complete": True, "continuation": False, "envelope": envelope,
             "evidence": {"raw_response_ids": [raw_id], "all_raw_verified": True}, "reason": "", "provider_cost": cost}
 
 
 def _execute_one(envelope: dict[str, Any], *, db_path: Path, at: str) -> dict[str, Any]:
+    if envelope["stage"] == "profile_prepare":
+        from .account_preparation import execute_step
+        return execute_step(envelope, db_path=db_path, at=at)
     if envelope["stage"] == "discovery":
         return _discovery_page(envelope, db_path=db_path, at=at)
     if envelope["stage"] == "account_metrics":
@@ -634,7 +1049,7 @@ def recover_capture_leases(connection: sqlite3.Connection, *, at: str) -> int:
     children. Do not require the work's mutable owner token: a crash may occur
     after the durable claim and before that token is written to the work row.
     """
-    if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
+    if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21, 22, 23, 24}:
         return 0
     owned = [int(row[0]) for row in connection.execute(
         "SELECT r.id FROM scheduler_runs r JOIN capture_work_items w "
@@ -713,6 +1128,10 @@ def _maintain_work_lease(db_path: Path, work_id: int | Sequence[int],
 
 def _claim_work(connection: sqlite3.Connection, work: dict[str, Any], *, at: str) -> durable_runs.DurableClaim | None:
     identity = {"work_identity": work["work_identity"], "business_day": work["data_business_day"]}
+    envelope = json.loads(work["envelope_json"])
+    if envelope.get("stage") == "profile_prepare":
+        from .account_preparation import SCOPE_FIELDS
+        identity.update({key: envelope[key] for key in SCOPE_FIELDS})
     catalog_plan_id = json.loads(work["envelope_json"]).get("catalog_plan_id")
     if catalog_plan_id is not None:
         identity["catalog_plan_id"] = catalog_plan_id
@@ -720,6 +1139,19 @@ def _claim_work(connection: sqlite3.Connection, work: dict[str, Any], *, at: str
     root = connection.execute("SELECT id FROM scheduler_runs WHERE job_id=? AND scheduled_for=? AND root_run_id IS NULL",
                               (JOB, scheduled)).fetchone()
     today = _business_day(at)
+    if (root is None and today != work["data_business_day"]
+            and connection.execute("PRAGMA user_version").fetchone()[0] >= 23):
+        # Old queued work can reach its first claim only after midnight. Keep
+        # its exact historical root/scan identity; the root yields without any
+        # execution or paid send, then the normal child owns today's charges.
+        anchor = durable_runs.claim_run_in_transaction(connection, JOB, identity, now=at,
+            initial_checkpoint={"complete": False, "work_id": work["id"]})
+        if anchor is None:
+            return None
+        durable_runs.finish_run_in_transaction(connection, anchor, status="partial",
+            summary={"work_id": work["id"], "reason": "charge_day_continuation_required",
+                     "provider_calls": 0}, next_resume_at=at, now=at)
+        root = (anchor.scheduler_run_id,)
     if root is not None and today != work["data_business_day"]:
         child = connection.execute("SELECT continuation_sequence FROM scheduler_runs WHERE root_run_id=? AND charge_business_day=? ORDER BY continuation_sequence DESC LIMIT 1",
                                    (root[0], today)).fetchone()
@@ -737,14 +1169,84 @@ def _attempt_usage(connection: sqlite3.Connection, attempt_id: int) -> tuple[flo
     return float(row[0]), int(row[1])
 
 
+def _select_runnable_work(connection: sqlite3.Connection, at: str, *,
+                          filters: str = "", parameters: tuple[int, ...] = ()) -> sqlite3.Row | None:
+    """Prefer one lane, retaining FIFO within it and falling back if empty.
+
+    The claim caller invokes this inside its existing write transaction. The
+    outer dispatcher uses the same preference to retain statistics batching
+    and compensation routing; neither query grants execution authority.
+    """
+    query = "SELECT * FROM capture_work_items WHERE state='runnable' AND due_at<=?" + filters
+    args = (planning.timestamp(at), *parameters)
+    lane = _WORK_SELECTION_LANE.get()
+    if lane is not None and connection.execute("PRAGMA user_version").fetchone()[0] >= 23:
+        # Only an explicitly accepted proposal gets the bounded manual lane.
+        # No raw reads here: the existing readiness/send boundary verifies the
+        # command, quote, identity, usage ledger and any replay evidence again.
+        manual = """COALESCE(json_extract(envelope_json,'$.kind'),'')='media_source_refresh'
+            AND EXISTS (SELECT 1 FROM media_source_refresh_proposals p
+              JOIN scheduler_runs s ON s.id=CAST(p.command_id AS INTEGER)
+              WHERE p.id=json_extract(envelope_json,'$.task_id')
+                AND p.status IN ('queued','expired') AND s.job_id='capture_manual_command'
+                AND s.status<>'failed'
+                AND json_type(envelope_json,'$.manual_command_run_id')='integer'
+                AND CAST(p.command_id AS INTEGER)=json_extract(envelope_json,'$.manual_command_run_id')
+                AND EXISTS (SELECT 1 FROM json_each(envelope_json,'$.manual_command_run_ids') j
+                            WHERE j.type='integer' AND j.value=s.id)
+                AND p.content_id=capture_work_items.content_id
+                AND p.content_id=json_extract(envelope_json,'$.content_id')
+                AND p.platform=json_extract(envelope_json,'$.platform')
+                AND p.detail_operation=capture_work_items.operation
+                AND p.detail_operation=json_extract(envelope_json,'$.operation')
+                AND json_extract(envelope_json,'$.logical_due')=
+                    'media-source-refresh:' || p.id || ':' || p.source_generation)"""
+        if lane == "manual_media":
+            # An expired confirmed item still needs zero-send finalization or
+            # verified-raw local replay, within the same two-slot maximum.
+            row = connection.execute(query + " AND (" + manual + ") ORDER BY "
+                "CASE WHEN EXISTS (SELECT 1 FROM media_source_refresh_proposals p "
+                "WHERE p.id=json_extract(envelope_json,'$.task_id') AND p.status='queued' "
+                "AND julianday(p.expires_at)>julianday(?)) THEN 0 ELSE 1 END,due_at,id LIMIT 1",
+                (*args, at)).fetchone()
+            if row is not None:
+                return row
+        # Empty lanes may borrow other normal work, but never another manual
+        # priority slot. This keeps a manual backlog from consuming all 16.
+        query += " AND NOT (" + manual + ")"
+        if lane.startswith("ordinary:"):
+            platform = lane.partition(":")[2]
+            if platform not in providers.SUPPORTED_CONTENT_PLATFORMS:
+                raise ValueError("unknown capture selection lane")
+            preferred = (" AND COALESCE(json_extract(envelope_json,'$.stage'),'')<>'profile_prepare'"
+                         " AND json_extract(envelope_json,'$.platform')=?")
+            row = connection.execute(query + preferred + " ORDER BY due_at,id LIMIT 1", (*args, platform)).fetchone()
+            return row if row is not None else connection.execute(query + " ORDER BY due_at,id LIMIT 1", args).fetchone()
+        if lane == "manual_media":
+            return connection.execute(query + " ORDER BY due_at,id LIMIT 1", args).fetchone()
+    if lane is not None:
+        if lane == "ordinary":
+            preferred = " AND COALESCE(json_extract(envelope_json,'$.stage'),'')<>'profile_prepare'"
+            lane_args: tuple[str, ...] = ()
+        elif lane in _RUN_READY_LANES:
+            preferred = (" AND json_extract(envelope_json,'$.stage')='profile_prepare'"
+                         " AND json_extract(envelope_json,'$.platform')=?")
+            lane_args = (lane,)
+        else:
+            raise ValueError("unknown capture selection lane")
+        row = connection.execute(query + preferred + " ORDER BY due_at,id LIMIT 1", (*args, *lane_args)).fetchone()
+        if row is not None:
+            return row
+    return connection.execute(query + " ORDER BY due_at,id LIMIT 1", args).fetchone()
+
+
 def run_one(db_path: Path = DEFAULT_DB, at: str | None = None) -> dict[str, Any]:
     """Dispatch statistics through its shared two-member request boundary."""
     from . import capture_batches
     at = at or now_utc()
     with connect(db_path) as connection:
         _require20(connection)
-        row = connection.execute("""SELECT id,operation,envelope_json FROM capture_work_items WHERE state='runnable'
-            AND due_at<=? ORDER BY due_at,id LIMIT 1""", (planning.timestamp(at),)).fetchone()
+        row = _select_runnable_work(connection, at)
     if row is not None and json.loads(row["envelope_json"]).get("compensation"):
         from .capture_compensation import run_authorized_work
 
@@ -756,18 +1258,41 @@ def run_one(db_path: Path = DEFAULT_DB, at: str | None = None) -> dict[str, Any]
 
 
 def _run_single(db_path: Path, at: str, *, compensation_work_id: int | None = None,
-                manual_work_id: int | None = None) -> dict[str, Any]:
+                manual_work_id: int | None = None, repair_work_id: int | None = None) -> dict[str, Any]:
+    """Keep one closed inheritance proof through this work's claim and A/B."""
+    if manual_work_id is not None and (type(manual_work_id) is not int or manual_work_id < 1
+            or compensation_work_id is not None):
+        raise ValueError("manual work ID must be positive and cannot select compensation work")
+    if repair_work_id is not None and (type(repair_work_id) is not int or repair_work_id < 1
+            or compensation_work_id is not None or manual_work_id is not None):
+        raise ValueError("repair work ID must be positive and select only its own execution context")
+    from .runtime_evidence_context import prepare_inheritance
+    with prepare_inheritance(db_path):
+        return _run_single_prepared(db_path, at, compensation_work_id=compensation_work_id,
+                                    manual_work_id=manual_work_id, repair_work_id=repair_work_id)
+
+
+def _run_single_prepared(db_path: Path, at: str, *, compensation_work_id: int | None = None,
+                         manual_work_id: int | None = None, repair_work_id: int | None = None) -> dict[str, Any]:
     """Claim and process one runnable work; blocked work never enters HTTP."""
     if manual_work_id is not None and (type(manual_work_id) is not int or manual_work_id < 1
             or compensation_work_id is not None):
         raise ValueError("manual work ID must be positive and cannot select compensation work")
+    if repair_work_id is not None and (type(repair_work_id) is not int or repair_work_id < 1
+            or compensation_work_id is not None or manual_work_id is not None):
+        raise ValueError("repair work ID must be positive and select only its own execution context")
+    from .runtime_evidence_context import inheritance_boundary, prepare_inheritance
     at = at or now_utc()
-    with connect(db_path) as connection, transaction(connection):
+    # Installed catalog/readiness proofs are prepared before the Writer lock.
+    # The transaction fences that proof again before committing any claim.
+    with prepare_inheritance(db_path) as inherited, connect(db_path) as connection, \
+            transaction(connection), inheritance_boundary(connection):
+        at = now_utc() if inherited is not None else at
         _require20(connection)
         active = activation_at(connection, at)
         if not execution_profile_allowed(active):
             return {"status": "shadow", "provider_calls": 0}
-        if manual_work_id is None:
+        if manual_work_id is None and repair_work_id is None:
             _recover_work(connection, at=at)
         only = ""
         ids: tuple[int, ...] = ()
@@ -779,14 +1304,19 @@ def _run_single(db_path: Path, at: str, *, compensation_work_id: int | None = No
                     " AND json_extract(envelope_json,'$.kind')='metrics_update'"
                     " AND json_type(envelope_json,'$.compensation') IS NULL")
             ids = (manual_work_id,)
+        elif repair_work_id is not None:
+            only = " AND id=?"
+            ids = (repair_work_id,)
         normal_operation = "" if compensation_work_id is not None else (
             " AND (operation<>'douyin_video_statistics' OR json_type(envelope_json,'$.manual_command_run_id')='integer')")
-        row = connection.execute("""SELECT * FROM capture_work_items WHERE state='runnable' AND due_at<=?
-            """ + normal_operation + only + " ORDER BY due_at,id LIMIT 1", (planning.timestamp(at), *ids)).fetchone()
+        row = _select_runnable_work(connection, at, filters=normal_operation + only, parameters=ids)
         if row is None:
             return {"status": "idle", "provider_calls": 0}
         work = dict(row)
         envelope = json.loads(work["envelope_json"])
+        if repair_work_id is not None:
+            from .capture_repair import assert_exact_work
+            assert_exact_work(connection, work, at=at)
         if manual_work_id is not None:
             from . import capture_manual
             specification = capture_manual.validate_command(connection, envelope["manual_command_run_id"],
@@ -800,6 +1330,14 @@ def _run_single(db_path: Path, at: str, *, compensation_work_id: int | None = No
                 raise ValueError("manual execution target differs from its frozen metrics command")
         state, reason = _readiness(connection, envelope, at=at)
         if state != "runnable":
+            if (envelope.get("kind") == "media_source_refresh"
+                    and reason.split(":", 1)[-1] == "media_source_refresh_expired"):
+                # The quote expired before this work acquired a request claim.
+                # Readiness already rejected it; never create a paid retry.
+                connection.execute("UPDATE capture_work_items SET state='terminal',reason=?,completed_at=?,updated_at=? WHERE id=?",
+                    ("media_source_refresh_expired", planning.timestamp(at), planning.timestamp(at), work["id"]))
+                return {"status": "terminal", "reason": "media_source_refresh_expired",
+                        "work_id": work["id"], "provider_calls": 0}
             _record_readiness_block(connection, work, state=state, reason=reason, at=now_utc())
             return {"status": state, "reason": reason, "work_id": work["id"], "provider_calls": 0}
         claim_at = now_utc()
@@ -819,7 +1357,11 @@ def _run_single(db_path: Path, at: str, *, compensation_work_id: int | None = No
                     roster_snapshot_hash=envelope["roster_members_sha256"], scheduler_run_id=claim.scheduler_run_id,
                     scheduler_attempt_id=claim.attempt_id, business_day=_business_day(claim_at),
                     manual_command_run_id=envelope.get("manual_command_run_id"),
-                    catalog_plan_id=envelope.get("catalog_plan_id")):
+                    catalog_plan_id=envelope.get("catalog_plan_id"),
+                    intake_request_id=envelope.get("intake_request_id"),
+                    preparation_plan_id=envelope.get("preparation_plan_id"),
+                    preparation_key=envelope.get("preparation_key"),
+                    preparation_subject=envelope.get("preparation_subject")):
                 check_lease()
                 result = _execute_one(envelope, db_path=db_path, at=claim_at)
             if result["complete"] or result["continuation"]:
@@ -844,7 +1386,9 @@ def _run_single(db_path: Path, at: str, *, compensation_work_id: int | None = No
             connection.execute("INSERT OR IGNORE INTO data_quality_receipts(scope_key,cutoff_at,payload_json,recorded_at,receipt_sha256) VALUES(?,?,?,?,?)",
                 (f"capture-scan:{work['id']}", planning.timestamp(finished_at), planning.canonical(evidence), planning.timestamp(finished_at), planning.digest(evidence)))
             terminal_partial = bool(result.get("terminal_partial")) and envelope["stage"] == "discovery"
-            final_state = "terminal" if result["complete"] or terminal_partial else "runnable" if result["continuation"] else _reason_state(result["reason"])
+            expired_manual = (envelope.get("kind") == "media_source_refresh"
+                              and result["reason"] == "media_source_refresh_expired")
+            final_state = "terminal" if result["complete"] or terminal_partial or expired_manual else "runnable" if result["continuation"] else _reason_state(result["reason"])
             if final_state == "paid_identity_hold" or terminal_partial:
                 if final_state == "paid_identity_hold":
                     connection.execute("INSERT OR IGNORE INTO fetch_dead_letters(work_id,reason,envelope_json,attempts,created_at) VALUES(?,?,?,?,?)",
@@ -871,7 +1415,7 @@ def _run_single(db_path: Path, at: str, *, compensation_work_id: int | None = No
             # A durable "partial" means resumable. A bounded incomplete scan
             # must instead finish unsuccessfully, without another paid retry.
             durable_runs.finish_run_in_transaction(connection, claim,
-                status="succeeded" if result["complete"] else "failed" if terminal_partial else "partial",
+                status="succeeded" if result["complete"] else "failed" if terminal_partial or expired_manual else "partial",
                 summary={"work_id": work["id"], "reason": result["reason"],
                          "disposition": "complete" if result["complete"] else "partial"},
                 next_resume_at=resume_at if final_state != "terminal" else None, now=finished_at)
@@ -885,6 +1429,9 @@ def manual_work_spec(connection: sqlite3.Connection, *, content_id: int,
                      cycle_key: str | None = None, retry_transport_fault: bool = False) -> dict[str, Any]:
     """Freeze the existing logical capture buckets; no work, claims or HTTP."""
     _require20(connection)
+    if kind == "media_source_refresh":
+        from .media_source_refresh import manual_spec
+        return manual_spec(connection, content_id=content_id, task_id=task_id, at=at)
     if kind not in {"manual_update", "media_retry", "metrics_update"}:
         raise ValueError("unsupported manual capture command")
     if type(retry_transport_fault) is not bool or (retry_transport_fault and kind != "metrics_update"):
@@ -894,7 +1441,7 @@ def manual_work_spec(connection: sqlite3.Connection, *, content_id: int,
     if content is None:
         raise LookupError("content_not_found")
     platform = content["platform"]
-    if platform not in {"douyin", "xiaohongshu"}:
+    if platform not in providers.SUPPORTED_CONTENT_PLATFORMS:
         raise ValueError("unsupported content platform")
     from .capture_manual import freeze_target
     from .source_routing import metric_cycle_key
@@ -943,12 +1490,20 @@ def manual_work_spec(connection: sqlite3.Connection, *, content_id: int,
                     "source_stage": stage, "group": group["name"],
                     "logical_due": (cycle_key or "metrics:" + _bucket(at, interval[0])) + ":" + str(group["name"])})
             week = _time(at).astimezone(BEIJING).date().isocalendar()
-            targets.append({"stage": "comments", "operation": providers.STAGE_CONFIG[(platform, "comments")][2],
-                "source_stage": "comments", "logical_due": f"{week.year}-W{week.week:02d}"})
+            if (platform, "comments") in providers.STAGE_CONFIG:
+                targets.append({"stage": "comments", "operation": providers.STAGE_CONFIG[(platform, "comments")][2],
+                    "source_stage": "comments", "logical_due": f"{week.year}-W{week.week:02d}"})
     specification = {"content_id": content_id, "account_id": content["account_id"], "platform": platform,
             "kind": kind, "targets": targets, "frozen_target": frozen_target,
             "allowed_groups": allowed, "cycle_key": cycle_key,
             "task_id": task_id or f"manual-content:{_business_day(at)}:{content_id}", "task_max_amount": float(cap)}
+    if (kind == "manual_update" and connection.execute("PRAGMA user_version").fetchone()[0] >= 23
+            and (platform, "comments") not in providers.STAGE_CONFIG):
+        # Freeze an unavailable stage as a result limitation, never as an
+        # executable target or an implied grant to a new provider operation.
+        specification["limited_stages"] = [{"stage": "comments",
+            "reason": "comments_contract_unverified",
+            "reason_label": "该平台评论正文能力尚未核验，本次未执行评论采集。"}]
     if retry_transport_fault:
         from .capture_manual import freeze_transport_retry
         specification["retry_transport_fault"] = True
@@ -987,7 +1542,7 @@ def enqueue_manual_work(connection: sqlite3.Connection, *, specification: Mappin
         operation = target["operation"]
         identity = planning.digest({"provider": "tikhub", "operation": operation,
             "subject": f"content:{content['id']}", "logical_due": target["logical_due"]})
-        work = None if specification["kind"] == "metrics_update" else connection.execute("""SELECT * FROM capture_work_items
+        work = None if specification["kind"] in {"metrics_update", "media_source_refresh"} else connection.execute("""SELECT * FROM capture_work_items
             WHERE account_id=? AND content_id=? AND operation=? AND state!='terminal'
             ORDER BY id LIMIT 1""", (content["account_id"], content["id"], operation)).fetchone()
         if work is None:
@@ -1036,17 +1591,97 @@ def preserve_manual_work_context(connection: sqlite3.Connection, *, work_id: int
     if row is None:
         raise ValueError("capture work is missing")
     current = json.loads(row[0])
-    result = dict(envelope)
+    from .capture_shared_requests import preserve
+    result = preserve(current, envelope)
     if current.get("manual_command_run_ids"):
         result["manual_command_run_ids"] = sorted(set(result.get("manual_command_run_ids", [])) |
                                                   set(current.get("manual_command_run_ids", [])))
     return result
 
 
-def run_ready(db_path: Path = DEFAULT_DB, at: str | None = None, *, max_items: int = TIKHUB_NETWORK_CONCURRENCY) -> dict[str, Any]:
-    """One bounded worker batch; the existing provider limiter remains final."""
+def _run_ready_one(db_path: Path, lane: str) -> dict[str, Any]:
+    """Carry only an ordering hint; each dispatch obtains a fresh clock."""
+    token = _WORK_SELECTION_LANE.set(lane)
+    try:
+        return run_one(db_path)
+    finally:
+        _WORK_SELECTION_LANE.reset(token)
+
+
+def _has_due_runnable_work(db_path: Path) -> bool:
+    """A lane or statistics batch returning idle does not prove queue exhaustion."""
+    with connect(db_path) as connection:
+        return connection.execute("SELECT 1 FROM capture_work_items WHERE state='runnable' AND due_at<=? LIMIT 1",
+                                  (planning.timestamp(now_utc()),)).fetchone() is not None
+
+
+def _run_ready_rolling(db_path: Path, *, max_items: int) -> dict[str, Any]:
+    """Refill completed slots, with a fixed per-invocation dispatch ceiling.
+
+    Schema23 cycles one bounded manual slot, four ordinary platform lanes and
+    four preparation platform lanes. Each sixteen-submission invocation visits
+    all nine lanes and contains at most two manual slots; the next invocation
+    continues the cycle. Older schemas retain their original five-lane cycle.
+    No selection hint changes a paid identity, due time or eligibility check.
+    """
+    results: dict[int, dict[str, Any]] = {}
+    with connect(db_path) as connection:
+        schema23 = connection.execute("PRAGMA user_version").fetchone()[0] >= 23
+    lanes = _V23_RUN_READY_LANES if schema23 else _RUN_READY_LANES
+    offset = (next(_V23_ROLLING_ROUNDS) * _ROLLING_MAX_ITEMS) % len(lanes) if schema23 else 0
+    with ThreadPoolExecutor(max_workers=max_items) as pool:
+        pending = {pool.submit(copy_context().run, _run_ready_one, db_path, lanes[(offset+index) % len(lanes)]): index
+                   for index in range(max_items)}
+        submitted = max_items
+        exhausted = False
+        while pending:
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            # A fenced-out worker must not stop unrelated slots from making
+            # progress. Its durable work and paid ledger remain the owner's
+            # responsibility; the rolling collector must never reset them.
+            completed = []
+            for future in sorted(done, key=pending.__getitem__):
+                index = pending[future]
+                try:
+                    row = future.result()
+                except Exception as error:
+                    row = {"status": "worker_failed", "error_type": type(error).__name__,
+                           "reason": str(error), "dispatch_index": index,
+                           "lane": lanes[(offset+index) % len(lanes)]}
+                completed.append((index, row))
+            for future in done:
+                del pending[future]
+            results.update(completed)
+            exhausted = (exhausted or any(row.get("status") == "shadow" for _, row in completed)
+                         or (any(row.get("status") == "idle" for _, row in completed)
+                             and not _has_due_runnable_work(db_path)))
+            if not exhausted:
+                for _ in completed:
+                    if submitted >= _ROLLING_MAX_ITEMS:
+                        break
+                    future = pool.submit(copy_context().run, _run_ready_one, db_path,
+                                         lanes[(offset+submitted) % len(lanes)])
+                    pending[future] = submitted
+                    submitted += 1
+    ordered = [results[index] for index in sorted(results)]
+    failed_count = sum(row.get("status") == "worker_failed" for row in ordered)
+    return {"status": "rolling_partial" if failed_count else "rolling_complete",
+            "failed_count": failed_count, "max_requests": _ROLLING_MAX_ITEMS, "max_concurrency": max_items,
+            "results": ordered, "provider_cost": sum(float(row.get("provider_cost", 0.0)) for row in ordered),
+            # Failed workers may have sent a paid request before losing their
+            # owner. The subtotal above is not evidence of their actual cost.
+            "provider_cost_complete": failed_count == 0}
+
+
+def run_ready(db_path: Path = DEFAULT_DB, at: str | None = None, *, max_items: int = TIKHUB_NETWORK_CONCURRENCY,
+              rolling: bool = False) -> dict[str, Any]:
+    """Run one batch, or a bounded rolling window using a fresh dispatch clock."""
     if type(max_items) is not int or not 1 <= max_items <= TIKHUB_NETWORK_CONCURRENCY:
         raise ValueError(f"one worker batch must contain 1..{TIKHUB_NETWORK_CONCURRENCY} requests")
+    if type(rolling) is not bool:
+        raise ValueError("rolling must be boolean")
+    if rolling:
+        return _run_ready_rolling(db_path, max_items=max_items)
     with ThreadPoolExecutor(max_workers=max_items) as pool:
         futures = [pool.submit(copy_context().run, run_one, db_path, at) for _ in range(max_items)]
         results = [future.result() for future in futures]

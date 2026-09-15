@@ -260,7 +260,9 @@ def _record_one_shot(
     frozen_scope = json.loads(_json(dict(scope)))
     scheduled_for = "receipt:" + _sha({"job_id": job_id, "scope": frozen_scope})
     timestamp = _time(recorded_at)
-    with connect(db_path) as connection, transaction(connection):
+    from .runtime_evidence_context import inheritance_boundary
+
+    with connect(db_path) as connection, transaction(connection), inheritance_boundary(connection):
         existing = _existing_one_shot(
             connection,
             job_id=job_id,
@@ -807,6 +809,7 @@ def _compact_coverage_source_revision(
     business_day: str,
     cutoff_at: str,
     frozen_binding: Mapping[str, Any] | None = None,
+    allow_appended_inputs: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     day = _coverage_day(coverage, business_day=business_day)
     if day.get("coverage_contract") == "catalog-day-coverage-v1":
@@ -814,7 +817,10 @@ def _compact_coverage_source_revision(
 
         try:
             binding = dict(day["source_binding"])
-            verified = validate_source_binding(connection, binding, at=cutoff_at)
+            verified = validate_source_binding(
+                connection, binding, at=cutoff_at,
+                **({"allow_appended_inputs": True} if allow_appended_inputs else {}),
+            )
             if verified.get("valid") is not True:
                 raise ValueError("catalog source validation did not succeed")
         except (KeyError, TypeError, ValueError, OSError, sqlite3.Error, RuntimeError) as error:
@@ -1072,6 +1078,8 @@ def _day_release_binding(
 def _validate_native_day_row(
     connection: sqlite3.Connection,
     row: sqlite3.Row | Mapping[str, Any],
+    *,
+    allow_appended_inputs: bool = False,
 ) -> dict[str, Any]:
     native = dict(row)
     bridge_row = connection.execute(
@@ -1140,6 +1148,7 @@ def _validate_native_day_row(
         business_day=str(native["business_day"]),
         cutoff_at=str(details["recorded_at"]),
         frozen_binding=scope.get("source_binding"),
+        allow_appended_inputs=allow_appended_inputs,
     )
     if (
         scope.get("source_revision") != revision
@@ -1212,101 +1221,128 @@ def record_profile_day_coverage_receipt(
 ) -> dict[str, Any]:
     """Compute deep coverage off the hot path and seal its lightweight summary."""
 
+    from .runtime_evidence_context import prepare_inheritance
+    from .storage import live_wal_read_only_connections
+
     timestamp = _time(cutoff_at)
-    business_day = _coverage_business_day(timestamp)
-    with connect(db_path) as connection:
-        connection.execute("BEGIN")
-        native = _has_native_receipts(connection)
-        active = _active_profile_for_day(
-            connection, business_day=business_day, at=timestamp
+    with live_wal_read_only_connections(), connect(db_path, read_only=True) as probe:
+        schema24 = probe.execute("PRAGMA user_version").fetchone()[0] == 24
+    if not schema24:
+        return _record_profile_day_coverage_receipt(
+            db_path=db_path, timestamp=timestamp, evidence_root=evidence_root, read_only=None,
         )
-        if native:
-            existing_row = _native_day_row(
-                connection,
-                activation_id=int(active["activation_id"]),
-                business_day=business_day,
-                at=timestamp,
-            )
-            if existing_row is not None and existing_row["sealed_at"] == timestamp:
-                existing = _validate_native_day_row(connection, existing_row)
-                existing_coverage = existing.get("summary", {}).get("coverage")
-                existing_scope = existing.get("scope", {})
-                if isinstance(existing_coverage, dict) and isinstance(
-                    existing_scope, dict
-                ):
-                    current_revision, _binding = _compact_coverage_source_revision(
+    # The original coverage cutoff is a logical scope, not the preparation clock.
+    # Freeze its inheritance before opening either the read snapshot or writer.
+    with prepare_inheritance(db_path, logical_at=timestamp), live_wal_read_only_connections():
+        return _record_profile_day_coverage_receipt(
+            db_path=db_path, timestamp=timestamp, evidence_root=evidence_root, read_only=True,
+        )
+
+
+def _record_profile_day_coverage_receipt(
+    *, db_path: Path, timestamp: str, evidence_root: Path | None, read_only: bool | None,
+) -> dict[str, Any]:
+    from .runtime_evidence_context import inheritance_boundary
+
+    business_day = _coverage_business_day(timestamp)
+    with connect(db_path, read_only=read_only) as connection:
+        connection.execute("BEGIN")
+        try:
+            with inheritance_boundary(connection):
+                native = _has_native_receipts(connection)
+                active = _active_profile_for_day(
+                    connection, business_day=business_day, at=timestamp
+                )
+                if native:
+                    existing_row = _native_day_row(
                         connection,
-                        coverage=existing_coverage,
+                        activation_id=int(active["activation_id"]),
+                        business_day=business_day,
+                        at=timestamp,
+                    )
+                    if existing_row is not None and existing_row["sealed_at"] == timestamp:
+                        existing = _validate_native_day_row(connection, existing_row)
+                        existing_coverage = existing.get("summary", {}).get("coverage")
+                        existing_scope = existing.get("scope", {})
+                        if isinstance(existing_coverage, dict) and isinstance(
+                            existing_scope, dict
+                        ):
+                            current_revision, _binding = _compact_coverage_source_revision(
+                                connection,
+                                coverage=existing_coverage,
+                                active=active,
+                                business_day=business_day,
+                                cutoff_at=timestamp,
+                            )
+                            if (
+                                current_revision == existing_scope.get("source_revision")
+                                and _sha(existing_coverage)
+                                == existing_scope.get("coverage_sha256")
+                            ):
+                                return existing
+                from .scan_receipts import runtime_coverage
+
+                coverage = runtime_coverage(connection, at=timestamp)
+                if native and coverage.get("contract_version") != PROFILE_DAY_CONTRACT:
+                    raise RuntimeReceiptError("profile-day coverage contract is unsupported")
+                if native:
+                    day = _coverage_day(coverage, business_day=business_day)
+                    if any(
+                        day.get(key) != active[key]
+                        for key in (
+                            "activation_id",
+                            "profile_id",
+                            "activation_sha256",
+                            "source_family",
+                            "roster_snapshot_id",
+                            "roster_snapshot_hash",
+                        )
+                    ):
+                        raise RuntimeReceiptError("coverage activation or roster does not match")
+                if not native and (
+                    coverage.get("roster_snapshot_id") is not None
+                    and coverage.get("roster_snapshot_id") != active["roster_snapshot_id"]
+                ):
+                    raise RuntimeReceiptError(
+                        "coverage roster does not match the active schema18 profile"
+                    )
+                if native:
+                    source_revision, source_binding = _compact_coverage_source_revision(
+                        connection,
+                        coverage=coverage,
                         active=active,
                         business_day=business_day,
                         cutoff_at=timestamp,
                     )
-                    if (
-                        current_revision == existing_scope.get("source_revision")
-                        and _sha(existing_coverage)
-                        == existing_scope.get("coverage_sha256")
-                    ):
-                        return existing
-        from .scan_receipts import runtime_coverage
-
-        coverage = runtime_coverage(connection, at=timestamp)
-        if native and coverage.get("contract_version") != PROFILE_DAY_CONTRACT:
-            raise RuntimeReceiptError("profile-day coverage contract is unsupported")
-        if native:
-            day = _coverage_day(coverage, business_day=business_day)
-            if any(
-                day.get(key) != active[key]
-                for key in (
-                    "activation_id",
-                    "profile_id",
-                    "activation_sha256",
-                    "source_family",
-                    "roster_snapshot_id",
-                    "roster_snapshot_hash",
-                )
-            ):
-                raise RuntimeReceiptError("coverage activation or roster does not match")
-        if not native and (
-            coverage.get("roster_snapshot_id") is not None
-            and coverage.get("roster_snapshot_id") != active["roster_snapshot_id"]
-        ):
-            raise RuntimeReceiptError(
-                "coverage roster does not match the active schema18 profile"
-            )
-        if native:
-            source_revision, source_binding = _compact_coverage_source_revision(
-                connection,
-                coverage=coverage,
-                active=active,
-                business_day=business_day,
-                cutoff_at=timestamp,
-            )
-        else:
-            source_revision = _legacy_coverage_source_revision(
-                connection, cutoff_at=timestamp
-            )
-            source_binding = None
-        scope = {
-            "contract_version": (
-                PROFILE_DAY_SCOPE_CONTRACT if native else "profile-day-scope-v2"
-            ),
-            **active,
-            "business_day": business_day,
-            "source_revision": source_revision,
-            "coverage_sha256": _sha(coverage),
-            **({"source_binding": source_binding} if source_binding else {}),
-            **(
-                _day_release_binding(
-                    connection,
-                    activation_id=int(active["activation_id"]),
-                    business_day=business_day,
-                    at=timestamp,
-                )
-                if native
-                else {}
-            ),
-        }
-        connection.commit()
+                else:
+                    source_revision = _legacy_coverage_source_revision(
+                        connection, cutoff_at=timestamp
+                    )
+                    source_binding = None
+                scope = {
+                    "contract_version": (
+                        PROFILE_DAY_SCOPE_CONTRACT if native else "profile-day-scope-v2"
+                    ),
+                    **active,
+                    "business_day": business_day,
+                    "source_revision": source_revision,
+                    "coverage_sha256": _sha(coverage),
+                    **({"source_binding": source_binding} if source_binding else {}),
+                    **(
+                        _day_release_binding(
+                            connection,
+                            activation_id=int(active["activation_id"]),
+                            business_day=business_day,
+                            at=timestamp,
+                        )
+                        if native
+                        else {}
+                    ),
+                }
+        finally:
+            # Complete the exit fence before releasing a successful snapshot,
+            # including an existing-receipt return; always close on errors.
+            connection.rollback()
     full_evidence = {
         "contract_version": "profile-day-coverage-evidence-v3",
         "sealed_at": timestamp,
@@ -1661,8 +1697,7 @@ def _current_hold_control_valid(
     if type(event_id) is not int:
         return False
     row = connection.execute(
-        "SELECT target_activation_id,payload_json,event_type,contract_version "
-        "FROM pipeline_paid_drain_events WHERE id=?",
+        "SELECT target_activation_id,payload_json FROM pipeline_paid_drain_events WHERE id=?",
         (event_id,),
     ).fetchone()
     if row is None or int(row["target_activation_id"]) != int(active["activation_id"]):
@@ -1672,22 +1707,6 @@ def _current_hold_control_valid(
     except (TypeError, ValueError):
         return False
     control = payload.get("control") if isinstance(payload, dict) else None
-    if (
-        active.get("profile_id") == "integrated_route_v1"
-        and isinstance(payload, dict)
-        and "control" not in payload
-    ):
-        # dispatch_state has already validated the native chain and selected
-        # this activation's RELEASE. This is control readiness only: it does
-        # not qualify a provider, grant paid authority or assert data coverage.
-        from .paid_drain import PROFILE_CONTRACT_VERSION
-
-        return bool(
-            drain_state.state == "open"
-            and drain_state.activation_id == int(active["activation_id"])
-            and row["event_type"] == "release"
-            and row["contract_version"] == PROFILE_CONTRACT_VERSION
-        )
     if isinstance(control, dict) and control.get("contract") == "account-cleanup-release-control-v1":
         # Cleanup releases inherit a sealed operator decision. Their control
         # has a nested activation binding, not the older flat hold contract.
@@ -1947,7 +1966,37 @@ def current_activation_readiness(
 
 
 def latest_runtime_coverage(connection: sqlite3.Connection, *, at: str) -> dict[str, Any]:
-    receipt = read_profile_day_coverage_receipt(connection, at=at)
+    reason = "profile_day_receipt_missing"
+    try:
+        receipt = read_profile_day_coverage_receipt(connection, at=at)
+    except RuntimeReceiptError as error:
+        if connection.execute("PRAGMA user_version").fetchone()[0] not in {23, 24}:
+            raise
+        # This is the status projection only. Strict receipt readers, reports
+        # and paid readiness continue to reject stale or damaged evidence.
+        receipt = None
+        reason = "profile_day_receipt_invalid"
+        if (
+            str(error) == "catalog profile-day source evidence is invalid"
+            and str(error.__cause__) == "catalog_source_plan_inputs_changed"
+        ):
+            try:
+                day = _coverage_business_day(at)
+                active = _active_schema19_profile(connection, business_day=day)
+                row = _native_day_row(
+                    connection, activation_id=int(active["activation_id"]),
+                    business_day=day, at=_time(at),
+                )
+                if row is not None and connection.execute(
+                    "SELECT 1 FROM runtime_receipt_revocations WHERE day_receipt_id=?",
+                    (row["id"],),
+                ).fetchone() is None:
+                    # No early downgrade: bridge/native/self hashes, frozen
+                    # source revision and all downstream lineage still verify.
+                    _validate_native_day_row(connection, row, allow_appended_inputs=True)
+                    reason = "profile_day_receipt_stale"
+            except (RuntimeReceiptError, KeyError, TypeError, ValueError, OSError, sqlite3.Error):
+                pass
     if receipt is None:
         active = None
         try:
@@ -1959,7 +2008,7 @@ def latest_runtime_coverage(connection: sqlite3.Connection, *, at: str) -> dict[
         except RuntimeReceiptError:
             pass
         return unknown_runtime_coverage(
-            at=at, reason="profile_day_receipt_missing", active=active
+            at=at, reason=reason, active=active
         )
     coverage = receipt.get("summary", {}).get("coverage")
     if not isinstance(coverage, dict):
@@ -2023,6 +2072,10 @@ def period_coverage_from_receipts(
             raise RuntimeReceiptError("profile-day coverage summary is invalid")
         day = _coverage_day(coverage, business_day=day_text)
         days.append(day)
+        # A valid receipt can seal an unknown scope (for example a switch day).
+        # Preserve its reference below, but do not count it as observed coverage.
+        if day.get("known") is not True:
+            missing.append(day_text)
         errors = coverage.get("scan_errors", {})
         if isinstance(errors, dict):
             scan_errors.update({str(key): str(value) for key, value in errors.items()})

@@ -10,10 +10,13 @@ type AccountsPaginationProps = {
   pageSize: number;
   total: number;
   busy?: boolean;
+  status?: string;
   onChange: (next: { page: number; pageSize?: number }) => void;
+  onPrefetch?: (page: number) => void;
+  onCancelPrefetch?: () => void;
 };
 
-export function AccountsPagination({ page, pageSize, total, busy = false, onChange }: AccountsPaginationProps) {
+export function AccountsPagination({ page, pageSize, total, busy = false, status, onChange, onPrefetch, onCancelPrefetch }: AccountsPaginationProps) {
   const [jumpValue, setJumpValue] = useState<string | null>(null);
   const jumpDraft = useRef<string | null>(null);
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
@@ -29,6 +32,11 @@ export function AccountsPagination({ page, pageSize, total, busy = false, onChan
     onChange({ page: target });
   }
 
+  function prefetchEvents(target: number) {
+    const enter = () => { if (!busy && target >= 1 && target <= totalPages && target !== page) onPrefetch?.(target); };
+    return { onPointerEnter: enter, onFocus: enter, onPointerLeave: onCancelPrefetch, onBlur: onCancelPrefetch };
+  }
+
   function commitJump() {
     const draft = jumpDraft.current;
     if (draft === null) return;
@@ -40,7 +48,7 @@ export function AccountsPagination({ page, pageSize, total, busy = false, onChan
 
   return <footer className={styles.pagination}>
     <div className={styles.summary}>
-      <span>共 {total} 个账号</span>
+      <span role="status" aria-live="polite">{status ?? `共 ${total} 个账号`}</span>
       <span className={styles.legend}>— 表示尚未采集</span>
     </div>
     <div className={styles.controls}>
@@ -58,11 +66,11 @@ export function AccountsPagination({ page, pageSize, total, busy = false, onChan
         {PAGE_SIZE_OPTIONS.map((option) => <option key={option} value={option}>{option} 条/页</option>)}
       </select>
       <nav className={styles.pages} aria-label="账号列表分页">
-        <button type="button" className={styles.pageButton} data-pagination-action="true" aria-label="上一页" disabled={busy || page <= 1} onClick={() => goToPage(page - 1)}><CaretLeftIcon size={15} aria-hidden="true" /></button>
+        <button type="button" className={styles.pageButton} data-pagination-action="true" aria-label="上一页" disabled={busy || page <= 1} {...prefetchEvents(page - 1)} onClick={() => goToPage(page - 1)}><CaretLeftIcon size={15} aria-hidden="true" /></button>
         {pageWindow(page, totalPages).map((slot) => typeof slot === "number"
-          ? <button type="button" key={slot} className={`${styles.pageButton}${slot === page ? ` ${styles.current}` : ""}`} data-pagination-action="true" aria-label={`第 ${slot} 页`} aria-current={slot === page ? "page" : undefined} disabled={busy} onClick={() => goToPage(slot)}>{slot}</button>
+          ? <button type="button" key={slot} className={`${styles.pageButton}${slot === page ? ` ${styles.current}` : ""}`} data-pagination-action="true" aria-label={`第 ${slot} 页`} aria-current={slot === page ? "page" : undefined} disabled={busy} {...prefetchEvents(slot)} onClick={() => goToPage(slot)}>{slot}</button>
           : <span key={slot} className={styles.ellipsis} aria-hidden="true">…</span>)}
-        <button type="button" className={styles.pageButton} data-pagination-action="true" aria-label="下一页" disabled={busy || page >= totalPages} onClick={() => goToPage(page + 1)}><CaretRightIcon size={15} aria-hidden="true" /></button>
+        <button type="button" className={styles.pageButton} data-pagination-action="true" aria-label="下一页" disabled={busy || page >= totalPages} {...prefetchEvents(page + 1)} onClick={() => goToPage(page + 1)}><CaretRightIcon size={15} aria-hidden="true" /></button>
       </nav>
       <label className={styles.jump}>跳至
         <input

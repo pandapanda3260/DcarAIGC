@@ -155,7 +155,13 @@ if (not isinstance(payload, dict) or envelope.get("contract_version") != "sealed
     reject("build envelope differs")
 cleanup = isinstance(payload.get("account_cleanup_generation"), dict)
 schema_contract = payload.get("schema_contract", {})
-if schema_contract.get("formal_schema") == 21 or schema_contract.get("code_schema") == 21:
+if schema_contract.get("formal_schema") == 22 or schema_contract.get("code_schema") == 22:
+    successor = payload.get("account_intake_successor")
+    if (schema_contract.get("formal_schema") != 22 or schema_contract.get("code_schema") != 22
+            or not cleanup or not isinstance(successor, dict)
+            or successor.get("contract") != "account-intake-schema-successor-v1"):
+        reject("schema22 intake successor is missing or mismatched")
+elif schema_contract.get("formal_schema") == 21 or schema_contract.get("code_schema") == 21:
     successor = payload.get("account_classification_successor")
     if (schema_contract.get("formal_schema") != 21 or schema_contract.get("code_schema") != 21
             or not cleanup or not isinstance(successor, dict)

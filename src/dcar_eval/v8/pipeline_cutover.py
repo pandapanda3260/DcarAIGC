@@ -26,7 +26,7 @@ from . import (
     scan_receipts,
     scan_terminals,
 )
-from .contracts import CURRENT_REPORT_VERSION, validate_report
+from .contracts import CURRENT_REPORT_VERSIONS, FOUR_PLATFORM_REPORT_VERSION, validate_report
 from .snapshot_contract import descriptor, validate_descriptor
 from .source_routing import load_policy, parse_time
 from .runtime_database import (
@@ -69,6 +69,9 @@ def verify_frozen_source_policy(value: Any, expected_sha256: Any) -> None:
     supported = {
         "source-routing-matrix-first-v1": "source_routing_matrix_first_v1.json",
         "source-routing-matrix-first-v2": "source_routing_matrix_first_v2.json",
+        "source-routing-matrix-first-v3": "source_routing_matrix_first_v3.json",
+        "source-routing-operation-field-v3": "source_routing_operation_field_v3.json",
+        "source-routing-operation-field-v4": "source_routing_operation_field_v4.json",
     }
     version = value.get("policy_version") if isinstance(value, dict) else None
     filename = supported.get(version) if isinstance(version, str) else None
@@ -943,20 +946,38 @@ def report_dependency(connection: sqlite3.Connection, task_id: str, *, at: str,
         query += " AND revision=?"
         args += (revision,)
     record = connection.execute(query + " ORDER BY revision DESC LIMIT 1", args).fetchone()
-    schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    expected_report_version = (
-        LEGACY_REPORT_VERSION if schema_version == 18 else CURRENT_REPORT_VERSION
-    )
-    if record is None or record["contract_version"] != expected_report_version:
+    supported_versions = CURRENT_REPORT_VERSIONS | {LEGACY_REPORT_VERSION}
+    if record is None or record["contract_version"] not in supported_versions:
         raise PublicationEvidenceError("publication_report_contract_mismatch")
     rev = dict(record)
     report_file = verify_file({"path": rev["report_json_path"], "sha256": rev["report_sha256"]}, project_root=project_root)
     report = json.loads(Path(report_file["path"]).read_bytes())
-    validate_report(report)
     inputs = report_inputs.load_event(connection, task_id, report_inputs.INPUT_EVENT)
     scope = report_inputs.load_event(connection, task_id, report_inputs.SCOPE_EVENT)
     if inputs is None or scope is None:
         raise PublicationEvidenceError("publication_report_freeze_missing")
+    if "source_frozen_inputs" in report:
+        # The file hash above belongs to the presentation actually published.
+        # Validate its exact deterministic projection against this task's
+        # immutable event before reusing the original evidence checks below.
+        try:
+            report = report_inputs.validate_account_classification_projection(report, inputs)
+        except (report_inputs.FrozenInputError, ValueError) as error:
+            raise PublicationEvidenceError("publication_report_classification_projection_invalid") from error
+    else:
+        validate_report(report)
+    # A database migration cannot change an existing task's report contract.
+    # Older scopes did not carry a report version; their immutable full input
+    # supplies it. The four-platform contract requires its explicit scope bind.
+    expected_report_version = inputs["payload"].get("report_version")
+    scope_report_version = scope["payload"].get("report_version")
+    if (expected_report_version not in supported_versions
+            or rev["contract_version"] != expected_report_version
+            or report.get("report_version") != expected_report_version
+            or (scope_report_version is not None and scope_report_version != expected_report_version)
+            or (expected_report_version == FOUR_PLATFORM_REPORT_VERSION
+                and scope_report_version != expected_report_version)):
+        raise PublicationEvidenceError("publication_report_contract_mismatch")
     frozen = report.get("frozen_inputs")
     expected_frozen = {"contract_version": report_inputs.CONTRACT_VERSION, "event_id": inputs["event_id"], "sha256": inputs["sha256"]}
     refs = inputs["payload"]["input_references"]

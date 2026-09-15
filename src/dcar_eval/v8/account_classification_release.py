@@ -141,6 +141,41 @@ def verify_inheritance(*, build: Mapping[str, Any], build_ref: Mapping[str, Any]
     update activation, or claim a new business/transport qualification.
     The bootstrap calls this after verifying every actual source file.
     """
+    if build.get("four_platform_flow_successor") is not None:
+        from v8.four_platform_flow_release import verify_inheritance as verify_flow
+        return verify_flow(build=build, build_ref=build_ref, install_path=install_path,
+                           database=database, source=source, at=at)
+    if build.get("account_intake_successor") is not None:
+        from v8.account_intake_release import verify_inheritance as verify_intake
+        return verify_intake(build=build, build_ref=build_ref, install_path=install_path,
+                             database=database, source=source, at=at)
+    if build.get("discovery_metrics_successor") is not None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("verified_discovery_metrics_release",
+            source / "src/dcar_eval/v8/discovery_metrics_release.py")
+        require(spec is not None and spec.loader is not None, "discovery metrics successor verifier is missing")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.verify_inheritance(build=build, build_ref=build_ref,
+            install_path=install_path, database=database, source=source, at=at)
+    if build.get("overview_successor") is not None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("verified_overview_release",
+            source / "src/dcar_eval/v8/overview_release.py")
+        require(spec is not None and spec.loader is not None, "overview successor verifier is missing")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.verify_inheritance(build=build, build_ref=build_ref,
+            install_path=install_path, database=database, source=source, at=at)
+    if build.get("daily_pipeline_successor") is not None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("verified_daily_pipeline_release",
+            source / "src/dcar_eval/v8/daily_pipeline_release.py")
+        require(spec is not None and spec.loader is not None, "daily pipeline successor verifier is missing")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.verify_inheritance(build=build, build_ref=build_ref,
+            install_path=install_path, database=database, source=source, at=at)
     if build.get("account_profile_recovery_successor") is not None:
         import importlib.util
         spec = importlib.util.spec_from_file_location("verified_account_profile_recovery_release",

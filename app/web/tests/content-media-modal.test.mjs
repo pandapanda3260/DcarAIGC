@@ -23,7 +23,8 @@ test("content media modal is read-only, requests evidence once and embeds the of
 
   // 抖音官方播放器：地址只来自 contentMedia 的纯函数；属性与官方 iframe 代码一致并委托自动播放。
   assert.doesNotMatch(modal, /open\.douyin\.com/);
-  assert.match(modal, /<iframe className="content-media-player" src=\{stage\.url\} title="抖音官方播放器" aria-describedby="content-media-player-help" allow="autoplay; fullscreen" referrerPolicy="unsafe-url" allowFullScreen \/>/);
+  assert.match(modal, /stage\.kind === "player" && <DouyinPlayer url=\{stage\.url\} \/>/);
+  assert.match(modal, /<iframe className="content-media-player" src=\{url\} title="抖音官方播放器" aria-describedby="content-media-player-help" allow="autoplay; fullscreen" referrerPolicy="unsafe-url" allowFullScreen \/>/);
   assert.doesNotMatch(modal, /sandbox=/);
 
   // 本地媒体：单舞台轮播 + 切换/关闭时停声停读 + 成员文件失败与不可用状态都有行内提示和原帖出口。
@@ -33,7 +34,7 @@ test("content media modal is read-only, requests evidence once and embeds the of
   assert.match(modal, /<strong>文件无法读取<\/strong>/);
   assert.match(modal, /<strong>正在读取已保存的资料<\/strong>/);
   assert.match(modal, /<strong>内容资料读取失败<\/strong>/);
-  assert.match(modal, /href=\{item\.canonical_url\} target="_blank" rel="noreferrer">打开原帖<\/a>/);
+  assert.match(modal, /href=\{originalUrl\} target="_blank" rel="noreferrer">打开原帖<\/a>/);
   assert.match(modal, /原件已归档或不可用，显示保留预览/);
 
   // 对话框语义与键盘约定走共享 hook（W3C APG dialog 模式）。
@@ -56,12 +57,16 @@ test("content media modal is read-only, requests evidence once and embeds the of
   assert.match(hook, /previouslyFocused\?\.focus\(\)/);
   assert.match(hook, /initialSelector = "\.modal-close"/);
 
-  // 尺寸跟内容走：舞台高度由视口决定，面板宽度 = 内容宽高比 × 舞台高 + 内边距；抖音播放器固定竖版且不小于其 324px 最小布局。
+  // 本地媒体尺寸仍跟内容走；抖音播放器独立使用固定逻辑视口整体缩放，标题占满一行。
   assert.match(styles, /\.modal-panel\.content-media-modal\s*\{[^}]*--media-stage-h:\s*clamp\(360px, calc\(100dvh - 164px\), 768px\);[^}]*--media-ratio:\s*0\.5625;[^}]*width:\s*clamp\(360px, calc\(var\(--media-w\) \+ 36px\), min\(960px, 100vw - 32px\)\);[^}]*grid-template-areas:\s*"head actions" "stage stage" "bar bar";/);
-  assert.match(styles, /\.modal-panel\.content-media-modal\[data-stage="player"\]\s*\{[^}]*--media-w:\s*clamp\(324px, calc\(\(var\(--media-stage-h\) - 48px\) \* 9 \/ 16\), 480px\);/);
+  assert.match(styles, /\.modal-panel\.content-media-modal\[data-stage="player"\]\s*\{[^}]*width:\s*min\(432px, 100%\);[^}]*grid-template-areas:\s*"label actions" "title title" "meta meta" "stage stage" "bar bar";[^}]*overflow-y:\s*auto;/);
+  assert.match(styles, /\.content-media-modal\[data-stage="player"\] \.content-media-head h3\s*\{[^}]*grid-area:\s*title;[^}]*overflow-wrap:\s*anywhere;/);
+  assert.match(styles, /\.content-media-modal\[data-stage="player"\] \.content-media-stage\s*\{[^}]*width:\s*min\(100%, calc\(var\(--media-stage-h\) \* 9 \/ 17\)\);[^}]*height:\s*auto;[^}]*aspect-ratio:\s*9 \/ 17;/);
   assert.match(styles, /\.content-media-head h3\s*\{[^}]*-webkit-line-clamp:\s*2;/);
   assert.match(styles, /\.button-link\s*\{[^}]*white-space:\s*nowrap;/);
   assert.match(styles, /\.content-media-stage\s*\{[^}]*place-items:\s*center;[^}]*background:\s*#0f2026;/);
-  assert.match(styles, /\.content-media-stage \.content-media-player\s*\{[^}]*width:\s*var\(--media-w\);[^}]*height:\s*100%;/);
+  assert.match(styles, /\.content-media-stage \.content-media-player\s*\{[^}]*width:\s*432px;[^}]*height:\s*816px;[^}]*max-width:\s*none;[^}]*transform:\s*scale\(var\(--douyin-player-scale, 0\)\);[^}]*transform-origin:\s*top left;/);
+  assert.match(modal, /viewport\.style\.setProperty\("--douyin-player-scale", String\(viewport\.getBoundingClientRect\(\)\.width \/ 432\)\)/);
+  assert.match(modal, /const observer = new ResizeObserver\(resize\);\s*observer\.observe\(viewport\);\s*return \(\) => observer\.disconnect\(\);/);
   assert.match(styles, /\.content-media-stage \.empty-state, \.content-media-stage \.empty-state strong, \.content-media-stage \.empty-state span\s*\{[^}]*color:\s*#c7d3d7;/);
 });

@@ -127,7 +127,7 @@ def enqueue_authorized_compensation(connection: sqlite3.Connection, *, work_id: 
     The caller first issues grants through usage_settlements.authorize_compensation
     with concrete gap/raw-replay evidence. No automatic grant is created here.
     """
-    _require(connection.in_transaction and connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21},
+    _require(connection.in_transaction and connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21, 22, 23, 24},
              "Compensation enqueue requires a schema20 writer transaction")
     require_current_process_writer_lock(connection)
     work, envelope = _work(connection, work_id)
@@ -152,22 +152,27 @@ def enqueue_authorized_compensation(connection: sqlite3.Connection, *, work_id: 
         # A metrics command may have just reconstructed its original due work
         # after a direct call. Only a complete failed statistics response with
         # known billing may enter here; leases and unknown sends retain a hold.
-        transport = details.get("transport", {})
-        _require(envelope.get("manual_command_run_id") is not None and not work["owner_token"]
-                 and details.get("state") == "failed" and original["request_attempts"] == 1
-                 and original["operation"] == "douyin_video_statistics"
-                 and original["billed_requests"] in {0, 1} and original["amount"] is not None
-                 and ((original["billed_requests"] == 0 and original["amount"] == 0 and transport.get("http_status") == 400)
-                      or (original["billed_requests"] == 1 and original["amount"] > 0 and transport.get("http_status") == 200))
-                 and details.get("error_code") in {"provider_retry_requested", "invalid_response", "upstream_error"}
-                 and transport.get("clean_eof") is True
-                 and transport.get("json_parse_ok") is True and transport.get("length_match") is not False
-                 and transport.get("gzip_crc_ok") is not False
-                 and transport.get("status") == "succeeded" and type(transport.get("raw_response_id")) is int,
-                 "Runnable compensation requires an unowned manual work and complete known-billing failure")
-        from .raw_archive import read_response_entity
+        if original["operation"] == "kuaishou_video_statistics":
+            from .capture_repair_fixed import validate_unbilled_retry_work
 
-        read_response_entity(connection, transport["raw_response_id"])
+            validate_unbilled_retry_work(connection, work, envelope, original, at=at)
+        else:
+            transport = details.get("transport", {})
+            _require(envelope.get("manual_command_run_id") is not None and not work["owner_token"]
+                     and details.get("state") == "failed" and original["request_attempts"] == 1
+                     and original["operation"] == "douyin_video_statistics"
+                     and original["billed_requests"] in {0, 1} and original["amount"] is not None
+                     and ((original["billed_requests"] == 0 and original["amount"] == 0 and transport.get("http_status") == 400)
+                          or (original["billed_requests"] == 1 and original["amount"] > 0 and transport.get("http_status") == 200))
+                     and details.get("error_code") in {"provider_retry_requested", "invalid_response", "upstream_error"}
+                     and transport.get("clean_eof") is True
+                     and transport.get("json_parse_ok") is True and transport.get("length_match") is not False
+                     and transport.get("gzip_crc_ok") is not False
+                     and transport.get("status") == "succeeded" and type(transport.get("raw_response_id")) is int,
+                     "Runnable compensation requires an unowned manual work and complete known-billing failure")
+            from .raw_archive import read_response_entity
+
+            read_response_entity(connection, transport["raw_response_id"])
     document = details.get("paid_identity")
     _require(isinstance(document, dict), "Original request document is absent; identity cannot be invented")
     document = dict(document)
@@ -250,12 +255,17 @@ def prepare_request(connection: sqlite3.Connection, request: PaidRequestIdentity
 
 
 def replay_sequence(connection: sqlite3.Connection, *, content_id: int | None, account_id: int | None,
-                    stage: str, window_key: str, operation: str | None) -> tuple[str, int] | None:
+                    stage: str, window_key: str, operation: str | None,
+                    intake_request_id: int | None = None) -> tuple[str, int] | None:
     """Read-only replay may use a consumed grant, but only its exact stored raw."""
     work_id = _WORK.get()
     if work_id is None:
         return None
     work, envelope = _work(connection, work_id)
+    if intake_request_id is not None or work.get("intake_request_id") is not None:
+        # The existing compensation contract has no preparation target proof.
+        # An old account/content grant must never authorize a new intake send.
+        raise PaidScopeBlocked("compensation_authorization_invalid", "Preparation requires its own explicit compensation contract")
     proof = envelope.get("compensation", {})
     _require(work["content_id"] == content_id and (content_id is not None or work["account_id"] == account_id)
              and envelope.get("capture_stage", envelope["stage"]) == stage

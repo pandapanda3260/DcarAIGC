@@ -66,18 +66,18 @@ class CatalogCapturePlannerTest(unittest.TestCase):
             self.assertEqual(connection.execute("SELECT count(*) FROM account_roster_members WHERE account_identity_id=?", (self.iid,)).fetchone()[0], 0)
         self.assertEqual(self.immutable_counts(), self.before)
 
-    def test_pause_changes_plan_immediately_and_preserves_previous_snapshot(self):
+    def test_pause_keeps_planned_member_and_preserves_previous_snapshot(self):
         first = self.plan()
         with connect(self.db) as connection, transaction(connection):
             frozen = connection.execute("SELECT payload_json FROM capture_source_plans WHERE id=?", (first["id"],)).fetchone()[0]
             connection.execute("UPDATE account_directory_rows SET account_status='paused'")
         second = self.plan(at="2026-09-02T12:06:00Z")
         self.assertNotEqual(first["id"], second["id"])
-        self.assertEqual(second["cohort"], [])
+        self.assertEqual([m["identity_id"] for m in second["cohort"]], [self.iid])
         with connect(self.db) as connection:
             self.assertEqual(connection.execute("SELECT payload_json FROM capture_source_plans WHERE id=?", (first["id"],)).fetchone()[0], frozen)
-            with self.assertRaisesRegex(RuntimeError, "暂停"):
-                catalog.validate_plan_member(connection, first["id"], self.iid, at=AT)
+            self.assertEqual(catalog.validate_plan_member(connection, first["id"], self.iid, at=AT)["identity_id"], self.iid)
+            self.assertEqual(connection.execute("SELECT enabled FROM accounts WHERE id=?", (self.aid,)).fetchone()[0], 1)
         self.assertEqual(self.immutable_counts(), self.before)
 
     def test_shadow_does_not_turn_on_legacy_projection(self):
@@ -115,6 +115,95 @@ class CatalogCapturePlannerTest(unittest.TestCase):
         self.plan(at="2026-09-02T12:06:00Z", shadow=True)
         with connect(self.db) as connection:
             self.assertEqual(catalog.public_statuses(connection), published)
+
+    def profile_work(self, at=AT, *, due=None):
+        plan = self.plan(at=at)
+        with connect(self.db) as connection, transaction(connection):
+            created = runtime._enqueue(connection, plan, plan["cohort"][0], stage="account_metrics",
+                operation="douyin_uid_profile", logical_due=due or "account-metrics:" + runtime._bucket(at, 6 * 3600),
+                at=at)
+            return created, [dict(row) for row in connection.execute(
+                "SELECT * FROM capture_work_items WHERE account_id=? AND operation='douyin_uid_profile' ORDER BY id",
+                (self.aid,))]
+
+    def held_profile(self):
+        created, rows = self.profile_work()
+        self.assertTrue(created)
+        with connect(self.db) as connection, transaction(connection):
+            connection.execute("UPDATE capture_work_items SET state='paid_identity_hold',reason='billing_unknown_retry_blocked' WHERE id=?",
+                (rows[0]["id"],))
+            return dict(connection.execute("SELECT * FROM capture_work_items WHERE id=?", (rows[0]["id"],)).fetchone())
+
+    def test_profile_next_six_hour_cycle_is_idempotent_and_preserves_old_hold(self):
+        old = self.held_profile()
+        created, rows = self.profile_work("2026-09-02T18:10:00Z")
+        self.assertTrue(created)
+        self.assertEqual(rows[0], old)
+        self.assertEqual(len(rows), 2)
+        self.assertNotEqual(rows[1]["work_identity"], old["work_identity"])
+        self.assertNotEqual(runtime._page_window(json.loads(rows[1]["envelope_json"])),
+            runtime._page_window(json.loads(old["envelope_json"])))
+        self.assertFalse(self.profile_work("2026-09-02T18:11:00Z")[0])
+        self.assertEqual(self.immutable_counts(), self.before)
+
+    def test_profile_same_cycle_and_invented_future_due_stay_blocked(self):
+        old = self.held_profile()
+        self.assertFalse(self.profile_work("2026-09-01T17:59:59Z")[0])
+        self.assertFalse(self.profile_work("2026-09-02T18:10:00Z",
+            due="account-metrics:2026-09-03T00:00:00Z")[0])
+        self.assertEqual(self.profile_work()[1], [old])
+
+    def test_profile_non_hold_work_still_owns_account(self):
+        old = self.held_profile()
+        for state in ("runnable", "provider_blocked", "budget_deferred", "leased", "running"):
+            with self.subTest(state=state), connect(self.db) as connection, transaction(connection):
+                connection.execute("UPDATE capture_work_items SET state=?,owner_token=? WHERE id=?",
+                    (state, "owned" if state in {"leased", "running"} else None, old["id"]))
+            self.assertFalse(self.profile_work("2026-09-02T18:10:00Z")[0])
+
+    def test_profile_old_manual_compensation_identity_or_timestamp_cannot_gain_exception(self):
+        old = self.held_profile()
+        envelope = json.loads(old["envelope_json"])
+        for fields in ({"kind": "metrics_update"}, {"manual_command_run_id": 9}, {"compensation": {}},
+                {"request_batch_id": 1}, {"stage": "discovery"}, {"uid": "another"},
+                {"source_plan_id": 999}, {"catalog_plan_id": 999}):
+            with self.subTest(fields=fields):
+                with connect(self.db) as connection, transaction(connection):
+                    connection.execute("UPDATE capture_work_items SET envelope_json=? WHERE id=?",
+                        (planning.canonical({**envelope, **fields}), old["id"]))
+                self.assertFalse(self.profile_work("2026-09-02T18:10:00Z")[0])
+        with connect(self.db) as connection, transaction(connection):
+            connection.execute("UPDATE capture_work_items SET envelope_json=?,updated_at=? WHERE id=?",
+                (old["envelope_json"], "2026-09-02T18:00:00Z", old["id"]))
+        self.assertFalse(self.profile_work("2026-09-02T18:10:00Z")[0])
+
+    def test_profile_cycle_check_is_read_only_and_requires_current_authority(self):
+        self.held_profile()
+        at = "2026-09-02T18:10:00Z"
+        plan = self.plan(at=at)
+        with connect(self.db) as connection:
+            connection.execute("PRAGMA query_only=ON")
+            before = connection.total_changes
+            self.assertFalse(runtime._account_metric_cycle_pending(connection, plan, plan["cohort"][0],
+                operation="douyin_uid_profile", logical_due="account-metrics:2026-09-02T18:00:00Z", at=at))
+            with patch.object(catalog, "validate_plan_member", side_effect=ValueError("identity changed")):
+                self.assertTrue(runtime._account_metric_cycle_pending(connection, plan, plan["cohort"][0],
+                    operation="douyin_uid_profile", logical_due="account-metrics:2026-09-02T18:00:00Z", at=at))
+            self.assertEqual(connection.total_changes, before)
+
+    def test_profile_new_cycle_still_obeys_transport_gate(self):
+        old = self.held_profile()
+        at = "2026-09-02T18:10:00Z"
+        with connect(self.db) as connection, transaction(connection):
+            body = {"provider": "tikhub", "operation": "douyin_uid_profile", "state": "closed",
+                "reason": "fixture hold", "evidence_json": "{}", "recorded_at": at}
+            connection.execute("INSERT INTO capture_paid_send_gate_events(provider,operation,state,reason,evidence_json,recorded_at,event_sha256) VALUES(?,?,?,?,?,?,?)",
+                (*body.values(), planning.digest(body)))
+        created, rows = self.profile_work(at)
+        self.assertTrue(created)
+        self.assertEqual(rows[0], old)
+        self.assertEqual((rows[1]["state"], rows[1]["reason"]), ("provider_blocked", "provider_transport_blocked"))
+        self.assertEqual(self.immutable_counts(), self.before)
 
 
 if __name__ == "__main__":

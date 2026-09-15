@@ -30,6 +30,9 @@ def _require(condition: bool, message: str) -> None:
 
 def _decision(evidence: Mapping[str, Any], operation: str, at: str) -> dict[str, Any] | None:
     from . import capture_release as release
+    if evidence.get("preparation_operation_authority") is not None:
+        from .account_preparation_authority import decision as preparation_decision
+        return preparation_decision(evidence, operation, at)
     from .account_profile_authority import OPERATIONS as PROFILE_OPERATIONS, decision as profile_decision
 
     if operation in PROFILE_OPERATIONS:

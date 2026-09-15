@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import test from "node:test";
 import ts from "typescript";
+import * as contentMedia from "../app/lib/contentMedia.ts";
 
 const require = createRequire(import.meta.url);
 const source = readFileSync(new URL("../app/contents/ContentTitle.tsx", import.meta.url), "utf8");
@@ -52,7 +53,7 @@ function harness() {
   }
   const compiled = { exports: {} };
   new Function("require", "module", "exports", "document", "window", "getComputedStyle", "ResizeObserver", "requestAnimationFrame", "cancelAnimationFrame", "setTimeout", "clearTimeout", code)(
-    (name) => name === "react" ? react : require(name), compiled, compiled.exports,
+    (name) => name === "react" ? react : name === "../lib/contentMedia" ? contentMedia : require(name), compiled, compiled.exports,
     document, window, getComputedStyle, ResizeObserver,
     (callback) => { const id = ++nextTimer; frames.set(id, callback); return id; }, (id) => frames.delete(id),
     (callback, delay) => { const id = ++nextTimer; timers.set(id, { callback, delay }); return id; }, (id) => timers.delete(id),

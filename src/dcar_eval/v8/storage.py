@@ -22,6 +22,7 @@ from types import TracebackType
 from typing import Iterator, Literal
 
 from .schema_v19 import PROFILE_SCHEMA_SQL
+from . import runtime_phase_timing as phase_timing
 
 
 from .runtime_paths import project_root as runtime_project_root
@@ -55,7 +56,7 @@ DEFAULT_DB = configured_default_database()
 SCHEMA_VERSION = 19
 # Keep the historical fixture/bootstrap schema stable. Production schema20 is
 # installed only through the explicit offline migration and paired release.
-LATEST_SCHEMA_VERSION = 21
+LATEST_SCHEMA_VERSION = 24
 CURRENT_SCHEMA_MIGRATION_NAME = "dual-acquisition-profile-roster-v1"
 SCHEMA_MIGRATION_NAMES = {
     11: "interaction-user-v1-fallback-keys",
@@ -69,6 +70,9 @@ SCHEMA_MIGRATION_NAMES = {
     19: "dual-acquisition-profile-roster-v1",
     20: "integrated-video-capture-v25",
     21: "account-classification-v1",
+    22: "unified-account-intake-v1",
+    23: "four-platform-forward-flow-v1",
+    24: "duplicate-fingerprint-index-v1",
 }
 RUNTIME_COMPATIBLE_SCHEMA_VERSIONS = frozenset(SCHEMA_MIGRATION_NAMES)
 _LIVE_WAL_READ_ONLY = ContextVar("dcar_live_wal_read_only", default=False)
@@ -95,7 +99,7 @@ LEGACY_MATCHER_RULE_SHA256 = (
 )
 
 
-_WritePriority = Literal["normal", "heartbeat"]
+_WritePriority = Literal["normal", "heartbeat", "send"]
 
 
 class _FairWriteLock:
@@ -108,6 +112,7 @@ class _FairWriteLock:
     """
 
     _MAX_HEARTBEAT_BURST = 8
+    _MAX_SEND_BURST = 4
 
     def __init__(self) -> None:
         self._condition = threading.Condition(threading.Lock())
@@ -115,13 +120,17 @@ class _FairWriteLock:
         self._depth = 0
         self._normal_waiters: deque[object] = deque()
         self._heartbeat_waiters: deque[object] = deque()
+        self._send_waiters: deque[object] = deque()
         self._heartbeat_streak = 0
+        self._send_streak = 0
+        self._deferred: list = []
+        self._owner_started_ns = 0
 
     def acquire(
         self, blocking: bool = True, timeout: float = -1,
         *, priority: _WritePriority = "normal",
     ) -> bool:
-        if priority not in {"normal", "heartbeat"}:
+        if priority not in {"normal", "heartbeat", "send"}:
             raise ValueError("Unknown SQLite write priority")
         if not blocking and timeout != -1:
             raise ValueError("Cannot specify timeout for a non-blocking acquire")
@@ -137,6 +146,7 @@ class _FairWriteLock:
                 return True
             queue = (
                 self._heartbeat_waiters if priority == "heartbeat"
+                else self._send_waiters if priority == "send"
                 else self._normal_waiters
             )
             ticket = object()
@@ -144,11 +154,15 @@ class _FairWriteLock:
             try:
                 while True:
                     heartbeat_next = bool(self._heartbeat_waiters) and (
-                        not self._normal_waiters
+                        not (self._normal_waiters or self._send_waiters)
                         or self._heartbeat_streak < self._MAX_HEARTBEAT_BURST
+                    )
+                    send_next = bool(self._send_waiters) and (
+                        not self._normal_waiters or self._send_streak < self._MAX_SEND_BURST
                     )
                     next_queue = (
                         self._heartbeat_waiters if heartbeat_next
+                        else self._send_waiters if send_next
                         else self._normal_waiters
                     )
                     if self._owner is None and next_queue[0] is ticket:
@@ -169,21 +183,42 @@ class _FairWriteLock:
                 raise
             queue.popleft()
             self._owner = owner
+            self._owner_started_ns = monotonic_time.monotonic_ns()
             self._depth = 1
             self._heartbeat_streak = (
                 min(self._heartbeat_streak + 1, self._MAX_HEARTBEAT_BURST)
-                if priority == "heartbeat" and self._normal_waiters else 0
+                if priority == "heartbeat" and (self._normal_waiters or self._send_waiters) else 0
             )
+            if priority != "heartbeat":
+                self._send_streak = (
+                    min(self._send_streak + 1, self._MAX_SEND_BURST)
+                    if priority == "send" and self._normal_waiters else 0
+                )
             return True
 
     def release(self) -> None:
+        deferred = []
+        acquired_at = 0
         with self._condition:
             if self._owner != threading.get_ident():
                 raise RuntimeError("Cannot release an unowned SQLite write lock")
             self._depth -= 1
             if self._depth == 0:
                 self._owner = None
+                deferred, self._deferred = self._deferred, []
+                acquired_at = self._owner_started_ns
                 self._condition.notify_all()
+        released_at = monotonic_time.monotonic_ns()
+        for callback in deferred:
+            callback(released_at, acquired_at)
+
+    def after_release(self, callback) -> None:
+        """Defer diagnostic I/O until this thread's outermost ownership ends."""
+        with self._condition:
+            if self._owner == threading.get_ident():
+                self._deferred.append(callback)
+                return
+        callback(monotonic_time.monotonic_ns(), 0)
 
     @contextmanager
     def hold(self, *, priority: _WritePriority = "normal") -> Iterator[None]:
@@ -530,7 +565,7 @@ def connect(
         if formal_database:
             _require_connection_database_identity(connection, path)
             require_schema_compatibility(
-                connection, supported_versions=frozenset({19, 20, 21})
+                connection, supported_versions=frozenset({19, 20, 21, 22, 23, 24})
             )
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA busy_timeout = 10000")
@@ -544,77 +579,89 @@ def connect(
 def transaction(
     connection: sqlite3.Connection, *, priority: _WritePriority = "normal"
 ) -> Iterator[sqlite3.Connection]:
+    # Validate configured telemetry before acquiring ownership. Encoding and
+    # append are deferred through any enclosing reentrant write_lock as well.
+    metrics_enabled = _transaction_metrics_path() is not None
+    transaction_id = uuid.uuid4().hex if metrics_enabled else None
     queued_at = monotonic_time.monotonic_ns()
-    with _SQLITE_WRITE_TRANSACTION_LOCK.hold(priority=priority):
-        began_at = monotonic_time.monotonic_ns()
-        outcome = "committed"
-        error: BaseException | None = None
-        journal_mode: str | None = None
-        metrics_enabled = _transaction_metrics_path() is not None
-        transaction_id = uuid.uuid4().hex if metrics_enabled else None
-        try:
-            if metrics_enabled:
-                journal_mode = str(
-                    connection.execute("PRAGMA journal_mode").fetchone()[0]
-                ).lower()
-                _emit_transaction_metric(
-                    {
-                        "schema": "sqlite-write-transaction-v1",
-                        "phase": "begin",
-                        "priority": priority,
-                        "transaction_id": transaction_id,
+    with phase_timing.recording(enabled=metrics_enabled) as phases:
+        with _SQLITE_WRITE_TRANSACTION_LOCK.hold(priority=priority):
+            began_at = monotonic_time.monotonic_ns()
+            outcome = "committed"
+            error: BaseException | None = None
+            journal_mode: str | None = None
+            records = []
+            try:
+                if metrics_enabled:
+                    journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+                    records.append({
+                        "schema": "sqlite-write-transaction-v1", "phase": "begin",
+                        "priority": priority, "transaction_id": transaction_id,
                         "recorded_at": now_utc(),
-                        "queue_wait_ms": round(
-                            (began_at - queued_at) / 1_000_000, 3
-                        ),
-                        "pid": os.getpid(),
-                        "thread_id": threading.get_ident(),
-                        "wal": journal_mode == "wal",
+                        "queue_wait_ms": round((began_at - queued_at) / 1_000_000, 3),
+                        "pid": os.getpid(), "thread_id": threading.get_ident(),
+                        "wal": journal_mode == "wal", **_SQLITE_TRANSACTION_METRICS_CONTEXT.get(),
+                    })
+                with phase_timing.phase("sqlite.begin"):
+                    connection.execute("BEGIN IMMEDIATE")
+                with phase_timing.phase("transaction.body"):
+                    yield connection
+                with phase_timing.phase("sqlite.commit"):
+                    connection.commit()
+            except Exception as caught:
+                error = caught
+                outcome = _sqlite_error_outcome(caught)
+                with phase_timing.phase("sqlite.rollback"):
+                    connection.rollback()
+                raise
+            except BaseException as caught:
+                # Preserve control-exception propagation and the caller's
+                # existing transaction cleanup contract, while recording it.
+                error, outcome = caught, "error"
+                raise
+            finally:
+                finished_at = monotonic_time.monotonic_ns()
+                if metrics_enabled:
+                    metric = {
+                        "schema": "sqlite-write-transaction-v1", "phase": "finish",
+                        "priority": priority, "transaction_id": transaction_id,
+                        "recorded_at": now_utc(),
+                        "queue_wait_ms": round((began_at - queued_at) / 1_000_000, 3),
+                        "hold_ms": round((finished_at - began_at) / 1_000_000, 3),
+                        "outcome": outcome, "pid": os.getpid(), "thread_id": threading.get_ident(),
+                        "wal": journal_mode == "wal" if journal_mode is not None else None,
                         **_SQLITE_TRANSACTION_METRICS_CONTEXT.get(),
                     }
-                )
-            connection.execute("BEGIN IMMEDIATE")
-            yield connection
-            connection.commit()
-        except Exception as caught:
-            error = caught
-            outcome = _sqlite_error_outcome(caught)
-            connection.rollback()
-            raise
-        finally:
-            finished_at = monotonic_time.monotonic_ns()
-            metric: dict[str, object] = {
-                "schema": "sqlite-write-transaction-v1",
-                "phase": "finish",
-                "priority": priority,
-                "transaction_id": transaction_id,
-                "recorded_at": now_utc(),
-                "queue_wait_ms": round((began_at - queued_at) / 1_000_000, 3),
-                "hold_ms": round((finished_at - began_at) / 1_000_000, 3),
-                "outcome": outcome,
-                "pid": os.getpid(),
-                "thread_id": threading.get_ident(),
-                "wal": journal_mode == "wal" if journal_mode is not None else None,
-                **_SQLITE_TRANSACTION_METRICS_CONTEXT.get(),
-            }
-            if error is not None:
-                metric["error_type"] = type(error).__name__
-                metric["error"] = str(error)[:500]
-                sqlite_errorcode = getattr(error, "sqlite_errorcode", None)
-                sqlite_errorname = getattr(error, "sqlite_errorname", None)
-                if sqlite_errorcode is not None:
-                    metric["sqlite_errorcode"] = sqlite_errorcode
-                if sqlite_errorname is not None:
-                    metric["sqlite_errorname"] = sqlite_errorname
-            if metrics_enabled:
-                try:
-                    _emit_transaction_metric(metric)
-                except TransactionMetricsError as metrics_error:
-                    # The BEGIN record is durable evidence of a missing finish
-                    # record. Never turn a committed DB mutation into an
-                    # apparent failure that a caller might replay.
                     if error is not None:
-                        error.add_note(str(metrics_error))
+                        metric.update(error_type=type(error).__name__, error=str(error)[:500])
+                        for name in ("sqlite_errorcode", "sqlite_errorname"):
+                            value = getattr(error, name, None)
+                            if value is not None:
+                                metric[name] = value
+                    records.append(metric)
+
+                    def flush(released_at, acquired_at):
+                        metric["lock_release_elapsed_ms"] = round((released_at - began_at) / 1_000_000, 3)
+                        metric["lock_hold_ms"] = round((released_at - acquired_at) / 1_000_000, 3) if acquired_at else None
+                        metric["lock_scope"] = "outermost"
+                        metric["stage_timing"] = phase_timing.snapshot(phases)
+                        started = monotonic_time.monotonic_ns()
+                        for record in records:
+                            if record is metric:
+                                # Elapsed flush work before this final append.
+                                metric["metrics_flush_before_finish_ms"] = round((monotonic_time.monotonic_ns() - started) / 1_000_000, 3)
+                            try:
+                                _emit_transaction_metric(record)
+                            except Exception as metrics_error:
+                                # A diagnostic failure after commit is never a
+                                # business retry. Report it only after release.
+                                if error is not None:
+                                    error.add_note(str(metrics_error))
+                                else:
+                                    import sys
+                                    print("SQLite transaction metrics flush failed: " + type(metrics_error).__name__, file=sys.stderr)
+
+                    _SQLITE_WRITE_TRANSACTION_LOCK.after_release(flush)
 
 
 @contextmanager
@@ -1773,7 +1820,25 @@ def schema_compatibility_state(
         and actual_name == expected_name
         and max_migration_version == user_version
     )
-    if compatible and user_version == 21:
+    if compatible and user_version == 24:
+        try:
+            from .schema_v24 import migration_proof
+            migration_proof(connection)
+        except (ValueError, sqlite3.DatabaseError):
+            compatible = False
+    elif compatible and user_version == 23:
+        try:
+            from .schema_v23 import migration_proof
+            migration_proof(connection)
+        except (ValueError, sqlite3.DatabaseError):
+            compatible = False
+    elif compatible and user_version == 22:
+        try:
+            from .schema_v22 import migration_proof
+            migration_proof(connection)
+        except (ValueError, sqlite3.DatabaseError):
+            compatible = False
+    elif compatible and user_version == 21:
         try:
             from .schema_v21 import validate_structure
             validate_structure(connection)
@@ -4393,6 +4458,24 @@ def _migrate_v20_to_v21(connection: sqlite3.Connection) -> dict[str, object]:
     return migrate(connection)
 
 
+def _migrate_v21_to_v22(connection: sqlite3.Connection) -> dict[str, object]:
+    from .schema_v22 import migrate
+
+    return migrate(connection)
+
+
+def _migrate_v22_to_v23(connection: sqlite3.Connection) -> dict[str, object]:
+    from .schema_v23 import migrate
+
+    return migrate(connection)
+
+
+def _migrate_v23_to_v24(connection: sqlite3.Connection) -> dict[str, object]:
+    from .schema_v24 import migrate
+
+    return migrate(connection)
+
+
 def validate_v17_v18_lineage(
     source_connection: sqlite3.Connection, candidate_connection: sqlite3.Connection
 ) -> dict[str, object]:
@@ -4451,6 +4534,9 @@ def migrate_database(
         19: _migrate_v18_to_v19,
         20: _migrate_v19_to_v20,
         21: _migrate_v20_to_v21,
+        22: _migrate_v21_to_v22,
+        23: _migrate_v22_to_v23,
+        24: _migrate_v23_to_v24,
     }
     if (
         from_version < 8
@@ -4488,7 +4574,7 @@ def initialize_database(
 
     _require_initialization_safety(connection)
     requested_version = target_version or SCHEMA_VERSION
-    if requested_version not in {SCHEMA_VERSION, 20, LATEST_SCHEMA_VERSION}:
+    if requested_version not in {SCHEMA_VERSION, 20, 21, 22, 23, LATEST_SCHEMA_VERSION}:
         raise SchemaMigrationError("unsupported initialization target")
     if not _table_names(connection):
         if int(connection.execute("PRAGMA user_version").fetchone()[0]) != 0:
@@ -4498,7 +4584,7 @@ def initialize_database(
             migrate_database(connection, from_version=SCHEMA_VERSION, to_version=requested_version)
     else:
         version = _schema_manifest_version(connection)
-        if target_version is None and version == LATEST_SCHEMA_VERSION:
+        if target_version is None and version in {21, 22, 23, LATEST_SCHEMA_VERSION}:
             requested_version = version
         if version != requested_version:
             if not allow_migrations:

@@ -64,7 +64,8 @@
 .table tbody tr:hover > *,
 .table tbody tr:focus-within > * { background: #f7f9f9; }
 
-.username { color: var(--ink); font-size: 13px; font-weight: 600; }
+.username { color: var(--ink); font-size: 13px; font-weight: 600; white-space: pre-wrap; overflow-wrap: anywhere; unicode-bidi: plaintext; }
+.loginAccount { display: block; margin-top: 3px; color: var(--users-muted); font-size: 11px; font-weight: 400; white-space: pre-wrap; overflow-wrap: anywhere; unicode-bidi: plaintext; }
 .table :global(.muted-cell) { margin-left: 1px; color: var(--users-muted); font-size: 11px; font-weight: 400; white-space: nowrap; }
 .table .phone,
 .registrationTime { font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
@@ -95,6 +96,71 @@
 .table :global(.text-button.danger) { padding-inline: 5px; border-color: transparent; background: transparent; color: #b45858; font-weight: 400; }
 .table :global(.text-button.danger):not(:disabled):hover { background: #fff3f3; }
 .table :global(.text-button):focus-visible { outline: 2px solid var(--dcd-brand); outline-offset: 2px; }
+
+.editBackdrop:global(.modal-backdrop) { padding: 24px; background: rgba(15, 36, 42, .38); backdrop-filter: blur(3px); }
+.editModal:global(.modal-panel) { display: flex; flex-direction: column; width: min(560px, 100%); max-height: calc(100dvh - 48px); padding: 0; overflow: hidden; border: 1px solid rgba(255, 255, 255, .8); border-radius: 20px; background: #fff; color: #173139; box-shadow: 0 20px 64px rgba(13, 36, 43, .18); }
+.editHeader { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex: none; padding: 30px 32px 22px; }
+.editHeader h3 { margin: 0; color: #173139; font-size: 22px; font-weight: 500; line-height: 30px; letter-spacing: -.3px; }
+.editHeader p { margin: 7px 0 0; color: #728087; font-size: 12px; font-weight: 400; line-height: 19px; }
+.editModal svg { width: 16px; height: 16px; flex: none; }
+.editModal .iconButton { display: grid; place-items: center; flex: none; width: 30px; height: 30px; padding: 0; border: 0; border-radius: 7px; background: transparent; color: #728087; cursor: pointer; }
+.editModal .iconButton:not(:disabled):hover { background: #f1f5f5; color: #173139; }
+.editBody { min-height: 0; padding: 0 32px 26px; overflow-y: auto; overscroll-behavior: contain; }
+.identityStrip { display: flex; align-items: center; gap: 14px; padding: 17px 18px; margin-bottom: 22px; border-radius: 12px; background: #f5f8f8; }
+.avatar { display: grid; place-items: center; width: 40px; height: 40px; flex: 0 0 40px; border: 1px solid #d8e4e4; border-radius: 50%; background: #fff; color: #173d45; font-size: 17px; font-weight: 500; }
+.identityText { flex: 1; min-width: 0; }
+.identityLabel { display: block; margin-bottom: 3px; color: #728087; font-size: 11px; line-height: 17px; }
+.identityName { color: #173139; font-size: 16px; font-weight: 500; line-height: 23px; white-space: pre-wrap; overflow-wrap: anywhere; unicode-bidi: plaintext; user-select: text; }
+.readonlyMark { display: inline-flex; align-items: center; gap: 5px; flex: none; color: #728087; font-size: 11px; line-height: 18px; white-space: nowrap; }
+.readonlyMark svg { width: 12px; height: 12px; }
+.editFields { display: grid; gap: 19px; }
+.editField { display: grid; gap: 8px; min-width: 0; }
+.editField label { color: #173139; font-size: 12px; font-weight: 500; line-height: 18px; }
+.editField .editInput { display: block; width: 100%; min-width: 0; height: 44px; padding: 0 12px; border: 1px solid #e0e8e9; border-radius: 8px; background: #fff; color: #173139; font-family: inherit; font-size: 14px; font-weight: 400; line-height: 20px; box-shadow: none; }
+.editInput::placeholder { color: #849097; font-size: 12px; }
+.editField .editInput:focus-visible { outline: 2px solid #7da0a8; outline-offset: 2px; border-color: #91afb5; }
+.editField .editInput:disabled { background: #f5f7f7; color: #728087; opacity: 1; cursor: not-allowed; }
+.editInput[type="tel"] { font-variant-numeric: tabular-nums; }
+.passwordLabel { display: flex; align-items: center; gap: 8px; }
+.passwordLabel > span { color: #849097; font-size: 11px; line-height: 18px; }
+.trailingControl { position: relative; min-width: 0; }
+.trailingControl .editInput { padding-right: 44px; }
+.trailingControl select { appearance: none; -webkit-appearance: none; background-image: none; }
+.fieldAdornment, .editModal .fieldAction { position: absolute; top: 0; right: 0; display: grid; place-items: center; width: 44px; height: 44px; color: #728087; }
+.fieldAdornment { pointer-events: none; }
+.editInput:disabled + .fieldAdornment { opacity: .5; }
+.editFooter { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex: none; padding: 18px 32px; border-top: 1px solid #e5ebec; background: #fff; }
+.footerHint { display: inline-flex; align-items: center; gap: 6px; color: #728087; font-size: 11px; line-height: 18px; }
+.footerHint svg { width: 13px; height: 13px; }
+.editActions { display: flex; align-items: center; gap: 10px; }
+.editModal .cancelButton, .editModal .saveButton { display: inline-flex; align-items: center; justify-content: center; min-height: 40px; padding: 0 18px; border: 1px solid transparent; border-radius: 7px; font-family: inherit; font-size: 13px; font-weight: 500; line-height: 20px; white-space: nowrap; cursor: pointer; box-shadow: none; }
+.editModal .cancelButton { background: transparent; color: #728087; }
+.editModal .cancelButton:not(:disabled):hover { background: #f1f5f5; }
+.editModal .saveButton { background: #173d45; color: #fff; }
+.editModal .saveButton:not(:disabled):hover { background: #244e57; }
+.editModal button:focus-visible { outline: 2px solid #7da0a8; outline-offset: 2px; }
+.editModal button:disabled { opacity: .5; cursor: not-allowed; }
+.formError { margin: 18px 0 0; color: #b33d3d; font-size: 12px; line-height: 20px; overflow-wrap: anywhere; }
+
+@media (max-width: 600px) {
+  .editBackdrop:global(.modal-backdrop) { padding: 16px; }
+  .editModal:global(.modal-panel) { max-height: calc(100dvh - 32px); border-radius: 16px; }
+  .editHeader { padding: 24px 22px 20px; }
+  .editBody { padding: 0 22px 24px; }
+  .editFooter { padding: 16px 22px; }
+}
+@media (max-width: 380px) {
+  .editHeader { padding: 22px 18px 18px; }
+  .editBody { padding: 0 18px 22px; }
+  .identityStrip { gap: 10px; padding: 15px 12px; }
+  .editFooter { justify-content: flex-end; padding: 16px 18px; }
+  .footerHint { display: none; }
+}
+@media (pointer: coarse) {
+  .editModal .editInput { font-size: 16px; }
+  .editModal .iconButton, .editModal .cancelButton, .editModal .saveButton { min-width: 44px; min-height: 44px; }
+  .editHeader > .iconButton { margin: -7px -7px 0 0; }
+}
 
 @media (min-width: 1800px) {
   .table tbody th, .table tbody td { height: 72px; padding-top: 14px; padding-bottom: 14px; }

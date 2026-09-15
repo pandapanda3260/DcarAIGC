@@ -1,14 +1,15 @@
-"""Read existing thumbnail candidates. No network, capture, migration or disk cache.
+"""Read saved online cover URLs. No network, media reads, capture or disk cache.
 
-Legacy image files reuse the authenticated evidence/files endpoint. Video frame
-manifests have no such endpoint and deliberately fall back to saved cover URLs.
-Managed originals are not projected here: their lifecycle belongs to the API.
+Content details and account post pages share the existing bounded raw reader.
+CAS bytes use SQLite blob receipts; the isolated helper does not import the
+writer's storage/provider modules or restore retired raw responses.
 """
 from __future__ import annotations
 
 import argparse
 import codecs
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -24,6 +25,13 @@ MAX_IDS = 100
 MAX_STORED = 16 * 1024 * 1024
 MAX_ENTITY = 64 * 1024 * 1024
 MAX_TOTAL = 64 * 1024 * 1024
+MAX_RAW_ROWS = 1000
+MAX_DETAIL_ROWS_PER_CONTENT = 4
+MAX_COVER_URLS = 3
+MAX_COVER_URL_LENGTH = 4096
+DETAIL_OPERATIONS = {"douyin": "douyin_video_detail", "xiaohongshu": "xiaohongshu_note_detail",
+                     "kuaishou": "kuaishou_video_detail", "wechat_channels": "wechat_channels_video_detail"}
+POST_OPERATIONS = {platform: platform + "_user_posts" for platform in DETAIL_OPERATIONS}
 
 
 class ReadError(ValueError):
@@ -223,13 +231,14 @@ def _checked(body: bytes, sha: object, size: object) -> None:
 
 class Reader:
     """Each file is decoded once per invocation, including failures."""
-    def __init__(self, project_root: Path | None = None) -> None:
+    def __init__(self, project_root: Path | None = None, *, blobs: dict[int, dict] | None = None) -> None:
         self.root = (project_root or Path.cwd()).resolve()
         self.cache: dict[tuple, object] = {}
         self.used = 0
         self.replica = None
         self.receipts: dict[Path, dict] = {}
         self.files: dict[Path, bytes] = {}
+        self.blobs = blobs if blobs is not None else {}
         if os.environ.get("DCAR_READ_ONLY", "0").strip() == "1":
             self.replica = _replica_context(self.root)
 
@@ -273,34 +282,77 @@ class Reader:
         self.files[path] = body
         return body
 
+    def compressed_entity(self, body: bytes, receipt: dict) -> bytes:
+        import io
+        import zstandard
+        size = receipt.get("entity_size")
+        if type(size) is not int or not 0 < size <= min(MAX_ENTITY, MAX_TOTAL - self.used):
+            raise ReadError("raw entity exceeds limit")
+        self.used += size
+        # Streaming reads bound decompression even for forged frame sizes.
+        with zstandard.ZstdDecompressor().stream_reader(io.BytesIO(body)) as stream:
+            entity = stream.read(size + 1)
+        _checked(entity, receipt.get("entity_sha256"), size)
+        return entity
+
+    def blob_entity(self, row: dict) -> bytes:
+        blob = self.blobs.get(row["raw_blob_id"])
+        # Thumbnails never restore archives or fall back around retirement.
+        if not blob or blob.get("hot_state") != "present":
+            raise ReadError("raw blob unavailable")
+        if (row["sha256"], row["byte_size"]) != (blob.get("stored_sha256"), blob.get("stored_size")):
+            raise ReadError("raw response differs from blob receipt")
+        codec = blob.get("codec")
+        if codec not in ("identity", "zstd"):
+            raise ReadError("unsupported blob codec")
+        location = blob["hot_path"]
+        if (str(blob.get("codec_version", "")).startswith("legacy-")
+                and isinstance(row["local_path"], str)
+                and row["local_path"].endswith((".json", ".json.zst"))):
+            # Legacy inventory may reference an external migration copy in
+            # hot_path. Keep its original, snapshot-authorized file namespace.
+            location = row["local_path"]
+        path = self.path(location)
+        body = self.read(path, MAX_STORED)
+        _checked(body, blob.get("stored_sha256"), blob.get("stored_size"))
+        if codec == "zstd":
+            # CAS receipts live in SQLite, not a legacy .metadata.json sidecar.
+            return self.compressed_entity(body, blob)
+        size = blob.get("entity_size")
+        if type(size) is not int or not 0 < size <= MAX_ENTITY:
+            raise ReadError("raw entity exceeds limit")
+        _checked(body, blob.get("entity_sha256"), size)
+        return body
+
     def json(self, row: dict, *, raw: bool = False) -> object:
-        key = (row["local_path"], row["sha256"], row["byte_size"])
+        blob_id = row.get("raw_blob_id") if raw else None
+        if blob_id is not None:
+            blob = self.blobs.get(blob_id, {})
+            key = ("blob", blob_id, row["local_path"], row["sha256"], row["byte_size"],
+                   *(blob.get(name) for name in ("hot_path", "hot_state", "codec", "codec_version",
+                     "stored_sha256", "stored_size", "entity_sha256", "entity_size")))
+        else:
+            key = ("file", raw, row["local_path"], row["sha256"], row["byte_size"])
         if key in self.cache:
             return self.cache[key]
         self.cache[key] = None
         if self.used >= MAX_TOTAL:
             return None
         try:
+            if blob_id is not None:
+                self.cache[key] = json.loads(self.blob_entity(row))
+                return self.cache[key]
             path = self.path(row["local_path"])
             body = self.read(path, MAX_STORED)
             _checked(body, row["sha256"], row["byte_size"])
             if raw and path.name.endswith(".json.zst"):
-                import zstandard
                 sidecar_path = self.path(str(path.with_name(path.name + ".metadata.json")))
                 sidecar = json.loads(self.read(sidecar_path, 64 * 1024))
                 if (not isinstance(sidecar, dict) or sidecar.get("schema") != "provider-raw-sidecar-v1"
                         or sidecar.get("codec") != "zstd" or sidecar.get("raw_filename") != path.name):
                     raise ReadError("invalid compressed receipt")
                 _checked(body, sidecar.get("stored_sha256"), sidecar.get("stored_size"))
-                size = sidecar.get("entity_size")
-                if type(size) is not int or not 0 < size <= min(MAX_ENTITY, MAX_TOTAL - self.used):
-                    raise ReadError("raw entity exceeds limit")
-                self.used += size
-                # Streaming reads bound decompression even for forged frame sizes.
-                import io
-                with zstandard.ZstdDecompressor().stream_reader(io.BytesIO(body)) as stream:
-                    body = stream.read(size + 1)
-                _checked(body, sidecar.get("entity_sha256"), size)
+                body = self.compressed_entity(body, sidecar)
             elif path.suffix != ".json":
                 raise ReadError("unsupported evidence format")
             self.cache[key] = json.loads(body)
@@ -325,102 +377,89 @@ def _object(value: object) -> dict:
     return {}
 
 
-def _image(path: Path, reader: Reader) -> bool:
-    if "contact-sheet" in path.name.lower():
-        return False
-    try:
-        # No image decode, transformed file, or whole video read is needed.
-        if reader.replica is not None:
-            header = reader.read(path, MAX_STORED)[:16]
-            regular = True
-        else:
-            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-            with os.fdopen(descriptor, "rb") as handle:
-                info = os.fstat(handle.fileno())
-                header = handle.read(16)
-            regular = stat.S_ISREG(info.st_mode) and info.st_size > 0
-        return regular and (
-            header.startswith((b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n", b"GIF87a", b"GIF89a"))
-            or (header.startswith(b"RIFF") and header[8:12] == b"WEBP")
-        )
-    except (OSError, ValueError, TypeError):
-        return False
-
-
-def local_url(content: dict, artifacts: list[dict], reader: Reader) -> str | None:
-    # Do not let a legacy record bypass a managed source's expiry or replacement.
-    if any(r["artifact_type"] == "media_lifecycle_manifest" or
-           _object(r["metadata_json"]).get("media_lifecycle") for r in artifacts):
-        return None
-    latest: dict[str, dict] = {}
-    for row in artifacts:
-        latest.setdefault(row["artifact_type"], row)
-    source = latest.get("media_source")
-    source_sha = _object(source["metadata_json"]).get("source_sha256") if source else None
-    for kind in ("media_manifest", "media"):
-        row = latest.get(kind)
-        if not row or row["status"] != "available":
-            continue
-        if source and (source["status"] != "available" or not source_sha or
-                       _object(row["metadata_json"]).get("source_sha256") != source_sha):
-            continue
-        path = reader.path(row["local_path"])
-        if path.suffix.lower() != ".json":
-            if kind == "media" and _image(path, reader):
-                return f"/api/v8/contents/{content['id']}/evidence/files/{row['id']}/0"
-            continue
-        if reader.replica is not None:
-            # The read-only API rejects legacy JSON bundles without a
-            # per-child SQLite receipt. An otherwise valid local image would
-            # still return HTTP 410; retain the saved remote cover instead.
-            continue
-        body = _object(reader.json(row))
-        image_paths = body.get("image_paths", [])
-        if not isinstance(image_paths, list):
-            continue
-        offset = 1 if body.get("video_path") else 0
-        for index, candidate in enumerate(p for p in image_paths if isinstance(p, str)):
-            child = reader.path(candidate)
-            # A registered manifest cannot redirect this projection elsewhere.
-            try:
-                child.resolve().relative_to(path.parent.resolve())
-            except (ValueError, OSError):
-                continue
-            if _image(child, reader):
-                return f"/api/v8/contents/{content['id']}/evidence/files/{row['id']}/{index + offset}"
-    return None
-
-
 def _at(value: dict, *keys: str) -> object:
     for key in keys:
         value = value.get(key) if isinstance(value, dict) else None
     return value
 
 
-def _https(value: object) -> str | None:
-    if isinstance(value, list):
-        urls = [url for entry in value if (url := _https(entry))]
-        # Providers may list HEIC before a separately signed JPEG. Select an
-        # existing browser-friendly URL verbatim; never rewrite its signature.
-        return next((url for url in urls if re.search(
-            r"\.(?:jpe?g|png|webp|gif|avif)(?:$|[!~])", urlsplit(url).path.lower()
-        )), urls[0] if urls else None)
-    if not isinstance(value, str) or len(value) > 8192:
-        return None
+def _cover_candidate(value: object, *, upgrade_http: bool = False) -> tuple[str | None, str]:
+    if not isinstance(value, str) or not value:
+        return None, "not_found"
+    if len(value) > MAX_COVER_URL_LENGTH or re.search(r"[\s\x00-\x20\x7f\\]", value):
+        return None, "source_unavailable"
     try:
+        if len(value.encode("utf-8")) > MAX_COVER_URL_LENGTH:
+            return None, "source_unavailable"
         parsed = urlsplit(value)
-        if (parsed.scheme == "https" and parsed.hostname and not parsed.username and not parsed.password
-                and not re.search(r"\.(?:heic|heif)(?:$|[!~])", parsed.path.lower())):
-            return value
-    except ValueError:
-        pass
-    return None
+        host = parsed.hostname
+        if not host or "@" in parsed.netloc:
+            return None, "source_unavailable"
+        if ":" in host:
+            ipaddress.IPv6Address(host)
+        elif len(host) > 253 or not all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                                      for label in host.rstrip(".").split(".")):
+            return None, "source_unavailable"
+        # A trailing colon is an explicit empty port, which urlsplit treats as None.
+        explicit_port = parsed.netloc.endswith(":") or parsed.port is not None
+        if parsed.scheme == "http" and upgrade_http and not explicit_port:
+            # Saved, identity-checked cover fields already permit arbitrary HTTPS
+            # hosts. Try the same URL over TLS without a CDN inventory or network
+            # request here; the browser can try another saved candidate on failure.
+            value = "https:" + value[len("http:"):]
+            if len(value.encode("utf-8")) > MAX_COVER_URL_LENGTH:
+                return None, "source_unavailable"
+        elif parsed.scheme != "https" or parsed.port not in (None, 443) or parsed.netloc.endswith(":"):
+            return None, "source_unavailable"
+        suffixes = "heic|heif|kvif|kpg" if upgrade_http else "heic|heif"
+        if re.search(rf"\.(?:{suffixes})(?:$|[!~])", parsed.path.lower()):
+            return None, "unsupported_format"
+        return value, ""
+    except (ValueError, UnicodeError):
+        return None, "source_unavailable"
+
+
+def _url_values(value: object):
+    if isinstance(value, list):
+        for child in value:
+            yield from _url_values(child)
+    else:
+        yield value
+
+
+def _cover_candidates(values: object, *, upgrade_http: bool = False) -> tuple[list[str], str | None]:
+    known, opaque = [], []
+    reasons = set()
+    for value in _url_values(values):
+        url, reason = _cover_candidate(value, upgrade_http=upgrade_http)
+        if not url:
+            reasons.add(reason)
+            continue
+        if url in known or url in opaque:
+            continue
+        group = known if re.search(r"\.(?:jpe?g|png|webp|gif|avif)(?:$|[!~])", urlsplit(url).path.lower()) else opaque
+        if len(group) < MAX_COVER_URLS:
+            group.append(url)
+        if len(known) == MAX_COVER_URLS:
+            break
+    # Keep existing browser-format preference, retaining opaque URLs as fallbacks.
+    urls = (known + opaque)[:MAX_COVER_URLS]
+    reason = None if urls else ("unsupported_format" if "unsupported_format" in reasons else
+                               "source_unavailable" if "source_unavailable" in reasons else "not_found")
+    return urls, reason
+
+
+def _https(value: object) -> str | None:
+    urls, _ = _cover_candidates(value)
+    return urls[0] if urls else None
 
 
 def _matching(value: object, identity: str, platform: str):
     if isinstance(value, dict):
-        keys = ("aweme_id",) if platform == "douyin" else ("note_id", "id")
-        if any(str(value.get(key, "")) == identity for key in keys):
+        keys = {"douyin": ("aweme_id",), "xiaohongshu": ("note_id", "id"),
+                "kuaishou": ("photo_id",), "wechat_channels": ("id", "objectId", "object_id")}.get(platform, ())
+        identities = [str(value[key]) for key in keys if value.get(key) not in (None, "")]
+        if identity in identities and (platform != "wechat_channels" or len(set(identities)) == 1):
             yield value
             return
         for child in value.values():
@@ -430,8 +469,11 @@ def _matching(value: object, identity: str, platform: str):
             yield from _matching(child, identity, platform)
 
 
-def cover_url(body: object, content: dict) -> str | None:
+def _cover_result(body: object, content: dict) -> tuple[list[str], str | None, bool]:
+    reasons = set()
+    matched = False
     for item in _matching(body, str(content["platform_content_id"]), content["platform"]):
+        matched = True
         if content["platform"] == "douyin":
             candidates = [_at(item, "video", "cover", "url_list"), _at(item, "video", "origin_cover", "url_list")]
             images = item.get("images")
@@ -445,11 +487,152 @@ def cover_url(body: object, content: dict) -> str | None:
             images = card.get("image_list") or card.get("images_list")
             if isinstance(images, list) and images:
                 candidates.extend([_at(images[0], "url_default"), _at(images[0], "url")])
+        elif content["platform"] == "kuaishou":
+            candidates = []
+            for name in ("cover_thumbnail_urls", "override_cover_thumbnail_urls", "ff_cover_thumbnail_urls"):
+                values = item.get(name)
+                for entry in values if isinstance(values, list) else []:
+                    candidates.append(_at(entry, "url"))
+        elif content["platform"] == "wechat_channels":
+            media = _at(item, "objectDesc", "media")
+            first = media[0] if isinstance(media, list) and media else {}
+            candidates = [_at(first, "fullCoverUrl"), _at(first, "coverUrl")]
         else:
-            return None
-        if result := _https(candidates):
-            return result
-    return None
+            return [], "not_found", matched
+        urls, reason = _cover_candidates(candidates, upgrade_http=content["platform"] == "kuaishou")
+        if urls:
+            return urls, None, matched
+        reasons.add(reason)
+    return [], ("unsupported_format" if "unsupported_format" in reasons else
+                "source_unavailable" if "source_unavailable" in reasons else "not_found"), matched
+
+
+def cover_candidates(body: object, content: dict) -> tuple[list[str], str | None]:
+    urls, reason, _ = _cover_result(body, content)
+    return urls, reason
+
+
+def cover_url(body: object, content: dict) -> str | None:
+    """Compatibility for callers that only need the first saved cover."""
+    urls, _ = cover_candidates(body, content)
+    return urls[0] if urls else None
+
+
+def _raw_blobs(connection: sqlite3.Connection, rows) -> dict[int, dict]:
+    ids = {row["raw_blob_id"] for row in rows if row.get("raw_blob_id") is not None}
+    if not ids:
+        return {}
+    marks = ",".join("?" for _ in ids)
+    return {row["id"]: dict(row) for row in connection.execute(
+        f"SELECT id,hot_path,hot_state,codec,codec_version,stored_sha256,stored_size,entity_sha256,entity_size "
+        f"FROM provider_raw_blobs WHERE id IN ({marks})", list(ids))}
+
+
+def _raw_order(row: dict) -> tuple:
+    return (row.get("capture_order") or 0, row["id"])
+
+
+def _online_covers(connection: sqlite3.Connection, contents: list[dict], reader: Reader) -> dict:
+    ids = [content["id"] for content in contents]
+    accounts = list({content["account_id"] for content in contents if content["account_id"] is not None}) or [None]
+    id_marks, account_marks = ",".join("?" for _ in ids), ",".join("?" for _ in accounts)
+    # Read a bounded history, not just an account's newest page: a later page
+    # may omit the requested work. Exact account and work identities are
+    # checked below before projecting a URL. No media artifacts are consulted.
+    details = [dict(row) for row in connection.execute(f"""
+        SELECT * FROM (
+            SELECT r.*,julianday(r.captured_at) AS capture_order,
+                ROW_NUMBER() OVER (PARTITION BY r.content_id
+                    ORDER BY julianday(r.captured_at) DESC,r.id DESC) AS content_position
+            FROM provider_raw_responses r WHERE r.content_id IN ({id_marks})
+                AND r.operation IN ('douyin_video_detail','xiaohongshu_note_detail',
+                                    'kuaishou_video_detail','wechat_channels_video_detail'))
+        WHERE content_position<=? ORDER BY capture_order DESC,id DESC""",
+        [*ids, MAX_DETAIL_ROWS_PER_CONTENT])]
+    pages = [dict(row) for row in connection.execute(f"""
+        SELECT r.*,julianday(r.captured_at) AS capture_order FROM provider_raw_responses r
+        WHERE r.content_id IS NULL AND r.account_id IN ({account_marks})
+            AND r.operation IN ('douyin_user_posts','xiaohongshu_user_posts',
+                                'kuaishou_user_posts','wechat_channels_user_posts')
+        ORDER BY capture_order DESC,r.id DESC LIMIT ?""", [*accounts, MAX_RAW_ROWS])]
+    # Preserve the existing detail coverage before spending the raw byte budget
+    # on account history. A newer page can still replace its older detail URL.
+    rows = [*details, *pages]
+    reader.blobs.update(_raw_blobs(connection, rows))
+    parents: dict[int, dict | None] = {}
+    selected: dict[int, tuple[tuple, list[str]]] = {}
+    observations: dict[int, set[str]] = {}
+
+    def unavailable(targets):
+        for content in targets:
+            observations.setdefault(content["id"], set()).add("source_unavailable")
+
+    for row in rows:
+        targets = [content for content in contents
+                   if ((row["content_id"] == content["id"]
+                         and row["account_id"] in (None, content["account_id"])
+                         and row["operation"] == DETAIL_OPERATIONS.get(content["platform"]))
+                        or (row["content_id"] is None
+                            and row["account_id"] == content["account_id"]
+                            and row["operation"] == POST_OPERATIONS.get(content["platform"])))
+                   and (content["id"] not in selected or selected[content["id"]][0] < _raw_order(row))]
+        if not targets:
+            continue
+        body = reader.json(row, raw=True)
+        if not isinstance(body, (dict, list)):
+            unavailable(targets)
+            continue
+        source = row
+        if isinstance(body, dict) and "source_raw_response_id" in body:
+            parent_id = body["source_raw_response_id"]
+            if type(parent_id) is not int or parent_id <= 0:
+                unavailable(targets)
+                continue
+            if parent_id not in parents:
+                parent = connection.execute(
+                    "SELECT *,julianday(captured_at) AS capture_order FROM provider_raw_responses WHERE id=?",
+                    (parent_id,)).fetchone()
+                parents[parent_id] = dict(parent) if parent else None
+                if parent:
+                    reader.blobs.update(_raw_blobs(connection, [parents[parent_id]]))
+            source = parents[parent_id]
+            if (source is None or source["content_id"] is not None
+                    or source["account_id"] != targets[0]["account_id"]
+                    or source["operation"] != POST_OPERATIONS.get(targets[0]["platform"])
+                    or source["sha256"] != body.get("source_sha256")
+                    or source["captured_at"] != body.get("source_captured_at")
+                    or _raw_order(source) > _raw_order(row)):
+                unavailable(targets)
+                continue
+            body = reader.json(source, raw=True)
+            if not isinstance(body, (dict, list)):
+                unavailable(targets)
+                continue
+        for content in targets:
+            try:
+                urls, reason, matched = _cover_result(body, content)
+            except (ValueError, TypeError, RecursionError):
+                unavailable((content,))
+                continue
+            cid, order = content["id"], _raw_order(source)
+            if urls and (cid not in selected or selected[cid][0] < order):
+                selected[cid] = (order, urls)
+            elif reason and matched:
+                # Another work on an account page cannot prove this work has no
+                # cover, or mask its unreadable detail with a not_found result.
+                observations.setdefault(cid, set()).add(reason)
+    # Keep local_url null for older clients during a frontend rollout.
+    result = {}
+    for content in contents:
+        cid = content["id"]
+        urls = selected.get(cid, (None, []))[1]
+        reasons = observations.get(cid, set())
+        # A damaged response must not hide what another readable response proves.
+        reason = None if urls else ("unsupported_format" if "unsupported_format" in reasons else
+                                   "not_found" if not reasons or "not_found" in reasons else "source_unavailable")
+        result[str(cid)] = {"local_url": None, "remote_url": urls[0] if urls else None,
+                            "remote_urls": urls, "reason": reason}
+    return result
 
 
 def project(db_path: Path, ids: list[int], *, project_root: Path | None = None) -> dict:
@@ -460,58 +643,17 @@ def project(db_path: Path, ids: list[int], *, project_root: Path | None = None) 
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA query_only=ON")
         schema = connection.execute("PRAGMA user_version").fetchone()[0]
-        if schema not in (19, 20, 21):
+        if schema not in (19, 20, 21, 22, 23):
             raise ReadError("unsupported content database schema")
         placeholders = ",".join("?" for _ in ids)
         canonical = ("AND NOT EXISTS (SELECT 1 FROM content_identity_merge_events m WHERE m.loser_content_id=c.id)"
-                     if schema in (20, 21) else "")
+                     if schema >= 20 else "")
         contents = [dict(r) for r in connection.execute(f"""SELECT c.id,c.platform,c.platform_content_id,c.account_id
             FROM content_items c WHERE c.id IN ({placeholders})
             AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.id=c.account_id AND a.enabled=0) {canonical}""", ids)]
-        allowed = [c["id"] for c in contents]
-        if not allowed:
+        if not contents:
             return {"items": {}}
-        placeholders = ",".join("?" for _ in allowed)
-        rows = connection.execute(f"SELECT * FROM evidence_artifacts WHERE content_id IN ({placeholders}) ORDER BY id DESC", allowed)
-        artifacts = {cid: [] for cid in allowed}
-        for row in rows:
-            artifacts[row["content_id"]].append(dict(row))
-        raw_rows = connection.execute(f"""SELECT * FROM (
-            SELECT r.*,ROW_NUMBER() OVER(PARTITION BY content_id ORDER BY id DESC) AS n
-            FROM provider_raw_responses r WHERE content_id IN ({placeholders})
-            AND operation IN ('douyin_video_detail','xiaohongshu_note_detail')) WHERE n=1""", allowed)
-        raws = {row["content_id"]: dict(row) for row in raw_rows}
-        reader = Reader(project_root)
-        decoded = {cid: reader.json(row, raw=True) for cid, row in raws.items()}
-        parent_ids = {b["source_raw_response_id"] for b in decoded.values()
-                      if isinstance(b, dict) and type(b.get("source_raw_response_id")) is int and b["source_raw_response_id"] > 0}
-        parents = {}
-        if parent_ids:
-            marks = ",".join("?" for _ in parent_ids)
-            parents = {row["id"]: dict(row) for row in connection.execute(
-                f"SELECT * FROM provider_raw_responses WHERE id IN ({marks})", list(parent_ids))}
-        items = {}
-        for content in contents:
-            cid = content["id"]
-            body = decoded.get(cid)
-            if isinstance(body, dict) and body.get("source_raw_response_id"):
-                parent = parents.get(body["source_raw_response_id"])
-                if (parent and parent["account_id"] == content["account_id"] and
-                        parent["sha256"] == body.get("source_sha256") and
-                        parent["captured_at"] == body.get("source_captured_at")):
-                    body = reader.json(parent, raw=True)
-                else:
-                    body = None
-            try:
-                local = local_url(content, artifacts[cid], reader)
-            except (OSError, ValueError, TypeError, RecursionError):
-                local = None
-            try:
-                remote = cover_url(body, content)
-            except (ValueError, TypeError, RecursionError):
-                remote = None
-            items[str(cid)] = {"local_url": local, "remote_url": remote}
-        return {"items": items}
+        return {"items": _online_covers(connection, contents, Reader(project_root))}
 
 
 def main() -> int:

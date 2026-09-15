@@ -19,7 +19,7 @@ import threading
 from collections import OrderedDict
 from copy import deepcopy
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from functools import lru_cache
@@ -39,6 +39,7 @@ from starlette.datastructures import Headers
 from starlette.middleware.gzip import GZipResponder
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from .duplicate_readiness import relation_coverage, relation_states, valid_relation_sql, indexed_duplicates, current_fingerprint_sql
 from . import media_api, media_consumer_proofs, media_retention
 from .media_lifecycle import LifecycleError
 from .account_roster import (
@@ -80,6 +81,7 @@ from .capture import (
 )
 from .contracts import (
     CURRENT_REPORT_VERSION,
+    FOUR_PLATFORM_REPORT_VERSION,
     load_contract,
     quantity_metric,
     ratio_metric,
@@ -113,9 +115,14 @@ from .spu_audience import (
     start_association_run,
     upsert_spu,
 )
-from .insights import CHANNELS, SCENES, build_channel_conclusions
+from .insights import (
+    EXPOSURE_SOURCE_GAPS,
+    OVERVIEW_CHANNELS,
+    SCENES,
+    build_channel_conclusions,
+)
 from .overview_selling_points import build_overview_selling_points
-from .source_routing import select_content_metrics
+from .source_routing import select_current_content_metrics, select_content_metrics as select_legacy_content_metrics
 from .media import (
     MediaProcessingError,
     processor_versions,
@@ -125,7 +132,6 @@ from .operations import (
     account_read_model,
     account_status_predicate,
     OperationError,
-    content_identity,
     export_accounts_xlsx,
     export_contents_csv,
     import_contents,
@@ -142,9 +148,11 @@ from .report_export import (
     build_report_detail_workbook,
     build_report_download_bundle,
     platform_content_id_from_url,
+    project_content_csv,
     report_bundle_filename,
     report_file_filename,
 )
+from .report_inputs import project_account_classification
 from .runtime_database import (
     DatabaseAccessMode,
     FileIdentity,
@@ -163,6 +171,7 @@ from .reports import (
     REPORTS_ROOT,
     ReportTaskError,
     TaskCancelled,
+    _markdown,
     assert_report_runtime_ready,
     create_task,
     get_task,
@@ -183,6 +192,7 @@ from .scheduler import (
 from .storage import (
     DEFAULT_DB,
     INSTALLED_LEGACY_DB,
+    LATEST_SCHEMA_VERSION,
     PROJECT_ROOT,
     connect,
     initialize_database,
@@ -298,6 +308,8 @@ class ApiConfig:
     runtime_access_mode: DatabaseAccessMode | None = None
     project_root: Path = PROJECT_ROOT
     runtime_from_environment: bool = False
+    # Explicit local evidence preview only. Replicas keep published plan reads.
+    account_capture_live_status: bool = False
 
     @classmethod
     def from_env(cls) -> "ApiConfig":
@@ -420,8 +432,13 @@ class AccountSearchRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def reject_obsolete_classification(cls, value: Any) -> Any:
-        if isinstance(value, dict) and {"account_type", "content_direction"} & value.keys():
-            raise ValueError("账号分类已更新，请刷新页面后重新筛选。")
+        from .operations import reject_obsolete_account_classification
+
+        if isinstance(value, dict):
+            try:
+                reject_obsolete_account_classification(value, account=True)
+            except OperationError as error:
+                raise ValueError("账号分类已更新，请刷新页面后重新筛选。") from error
         return value
 
 
@@ -473,6 +490,46 @@ class ContentSearchRequest(BaseModel):
     scene: Optional[str] = Field(default=None, max_length=16)
     page: int = Field(default=1, ge=1)
     page_size: int = Field(default=50, ge=1, le=100)
+    published_from: Optional[str] = Field(default=None, max_length=10, pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+    published_to: Optional[str] = Field(default=None, max_length=10, pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_publication_dates(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            for key in ("published_from", "published_to"):
+                candidate = value.get(key)
+                if candidate is not None and (not isinstance(candidate, str) or
+                        re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", candidate) is None):
+                    raise ValueError("发布时间日期无效，请使用 YYYY-MM-DD 格式的有效日期。")
+        return value
+
+    def publication_bounds(self) -> tuple[Optional[str], Optional[str]]:
+        """Shanghai calendar days; the selected end day is fully included.
+
+        Persisted publication timestamps are normalized UTC text, with optional
+        fractions. A seconds prefix (without Z) includes the entire boundary
+        second at the start and excludes it at the following day's boundary.
+        This keeps direct indexed comparisons valid for both stored formats.
+        """
+        try:
+            start = date.fromisoformat(self.published_from) if self.published_from else None
+            end = date.fromisoformat(self.published_to) if self.published_to else None
+        except ValueError as error:
+            raise ValueError("发布时间日期无效，请使用 YYYY-MM-DD 格式的有效日期。") from error
+        if start and end and start > end:
+            raise ValueError("开始日期不能晚于结束日期。")
+        try:
+            lower = _utc_text(datetime.combine(start, time.min, tzinfo=SHANGHAI))[:-1] if start else None
+            upper = _utc_text(datetime.combine(end + timedelta(days=1), time.min, tzinfo=SHANGHAI))[:-1] if end else None
+        except (OverflowError, ValueError) as error:
+            raise ValueError("发布时间日期超出可查询范围。") from error
+        return lower, upper
+
+    @model_validator(mode="after")
+    def validate_publication_range(self) -> "ContentSearchRequest":
+        self.publication_bounds()
+        return self
 
 
 class SellingPointMutationRequest(BaseModel):
@@ -539,11 +596,25 @@ class ProfileAccountCreateRequest(BaseModel):
 
     account_group: AccountGroup = "unknown"
     business_direction: BusinessDirection = "unknown"
-    profile_url: str = Field(min_length=1, max_length=3000)
+    profile_url: str = Field(default="", max_length=3000)
+    platform: Optional[Literal["douyin", "xiaohongshu", "kuaishou", "wechat_channels"]] = None
+    uid: str = Field(default="", max_length=128, strict=True)
+    display_account_id: str = Field(default="", max_length=128, strict=True)
     phone: Optional[str] = Field(default=None, max_length=50)
     operator_name: Optional[str] = Field(default=None, max_length=100)
     account_status: Literal["daily", "weekly", "paused"]
     request_id: str = Field(min_length=36, max_length=36)
+
+
+class DirectoryIdentityRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    request_id: str = Field(min_length=1, max_length=128)
+    expected_locator_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    platform: Literal["douyin", "xiaohongshu", "kuaishou", "wechat_channels"]
+    uid: str = Field(default="", max_length=256, strict=True)
+    display_account_id: str = Field(default="", max_length=128, strict=True)
+    profile_url: str = Field(default="", max_length=3000)
+    references: Dict[str, Any] = Field(default_factory=dict)
 
 
 class SystemRosterBootstrapRequest(BaseModel):
@@ -597,6 +668,18 @@ class ContentPatchRequest(BaseModel):
 class BulkImportRequest(BaseModel):
     source_name: str = Field(min_length=1, max_length=300)
     rows: List[Dict[str, Any]] = Field(max_length=10000)
+
+
+class MediaSourceRefreshPrepareRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    request_id: str = Field(min_length=1, max_length=200)
+    source_generation: str = Field(pattern=r"^(missing|[0-9a-f]{64})$")
+
+
+class MediaSourceRefreshExecuteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    task_id: str = Field(min_length=1, max_length=200)
+    source_generation: str = Field(pattern=r"^(missing|[0-9a-f]{64})$")
 
 
 class MediaRetryRequest(BaseModel):
@@ -710,9 +793,9 @@ def _legacy_formal_report_path(legacy_db_path: Path) -> Path:
 
 
 def _legacy_report(legacy_db_path: Path) -> Dict[str, Any]:
-    return json.loads(
+    return project_account_classification(json.loads(
         _legacy_formal_report_path(legacy_db_path).read_text(encoding="utf-8")
-    )
+    ))
 
 
 def _legacy_runs(legacy_db_path: Path, limit: int = 20) -> List[Dict[str, Any]]:
@@ -894,6 +977,14 @@ def _overview_facts(
     return _OverviewFacts(evaluations, metrics)
 
 
+def select_content_metrics(connection: sqlite3.Connection, *args, **kwargs):
+    """Keep schema19 archive reads explicit; every field-fact schema uses v4."""
+    if connection.execute("PRAGMA user_version").fetchone()[0] == 19:
+        from .source_routing import LEGACY_POLICY_VERSION
+        return select_legacy_content_metrics(connection, *args, policy_version=LEGACY_POLICY_VERSION, **kwargs)
+    return select_current_content_metrics(connection, *args, **kwargs)
+
+
 def _window_summary(
     connection: sqlite3.Connection,
     start: datetime,
@@ -904,7 +995,7 @@ def _window_summary(
     facts: Optional[_OverviewFacts] = None,
     timings: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    contract = load_contract(report_version=CURRENT_REPORT_VERSION)
+    contract = load_contract(report_version=FOUR_PLATFORM_REPORT_VERSION if connection.execute("PRAGMA user_version").fetchone()[0] >= 23 else CURRENT_REPORT_VERSION)
     coverage_thresholds = contract["required_coverage_thresholds"]
     metric_display_thresholds = contract["metric_display_coverage_thresholds"]
     evaluation_minimum = float(coverage_thresholds["evaluation_coverage"])
@@ -939,8 +1030,9 @@ def _window_summary(
         duplicate_count = int(
             connection.execute(
                 f"""
-                SELECT COUNT(DISTINCT duplicate_content_id) FROM duplicate_relations
-                WHERE status='confirmed' AND duplicate_content_id IN ({placeholders})
+                SELECT COUNT(DISTINCT d.duplicate_content_id) FROM duplicate_relations d
+                WHERE d.status='confirmed' AND d.duplicate_content_id IN ({placeholders})
+                  AND {valid_relation_sql(connection, "d")}
                 """,
                 content_ids,
             ).fetchone()[0]
@@ -948,8 +1040,9 @@ def _window_summary(
         fingerprint_count = int(
             connection.execute(
                 f"""
-                SELECT COUNT(DISTINCT content_id) FROM duplicate_fingerprints
-                WHERE fingerprint_version=? AND content_id IN ({placeholders})
+                SELECT COUNT(DISTINCT f.content_id) FROM duplicate_fingerprints f
+                WHERE f.fingerprint_version=? AND f.content_id IN ({placeholders})
+                  AND {current_fingerprint_sql(connection, "f.content_id")}
                 """,
                 [FINGERPRINT_VERSION, *content_ids],
             ).fetchone()[0]
@@ -1033,7 +1126,9 @@ def _window_summary(
         for row in metric_values
         if row["comment_count"] is not None
     ]
-    view_eligible = sum(str(row["platform"]) == "douyin" for row in content_rows)
+    view_eligible = sum(
+        str(row["platform"]) not in EXPOSURE_SOURCE_GAPS for row in content_rows
+    )
     view_coverage = round(len(view_values) * 100 / view_eligible, 2) if view_eligible else None
     comment_coverage = round(len(comment_values) * 100 / total, 2) if total else None
     views = sum(view_values)
@@ -1052,9 +1147,11 @@ def _window_summary(
         if ratio_status == "below_threshold" and evaluation_coverage is not None
         else ""
     )
+    relation_quality = relation_coverage(connection, content_ids)
+    duplicate_ready = relation_quality.get("duplicate_relation_ready", fingerprint_count)
     duplicate_status, duplicate_coverage, duplicate_reason = duplicate_metric_decision(
         total,
-        fingerprint_count,
+        duplicate_ready,
         duplicate_calibrated,
         threshold=fingerprint_minimum,
     )
@@ -1063,13 +1160,16 @@ def _window_summary(
         connection, conclusion_rows, end, report_cutoff_at=report_cutoff_at
     )
     _overview_stage(timings, "audience", started_at)
-    channels = build_channel_conclusions(conclusion_rows, audience_rates=audience_rates)
+    channels = build_channel_conclusions(
+        conclusion_rows, audience_rates=audience_rates, channels=OVERVIEW_CHANNELS
+    )
     point_details = build_overview_selling_points(
         conclusion_rows, channels, minimum_view_coverage=view_minimum
     )
     for platform, channel in channels.items():
         channel["selling_points"] = point_details[platform]
     return {
+        **relation_quality,
         "period_start": start.isoformat(),
         "period_end": end.isoformat(),
         "eligible_count": eligible,
@@ -1139,7 +1239,7 @@ def _window_summary(
                 duplicate_count if total else None,
                 total,
                 status=duplicate_status,
-                eligible_count=fingerprint_count,
+                eligible_count=duplicate_ready,
                 coverage_percentage=duplicate_coverage,
                 reason=duplicate_reason,
             ),
@@ -1184,12 +1284,12 @@ def _audience_rates(
     return build_channel_audience_rates(
         connection,
         conclusion_rows,
-        classifier_state=_active_classifier_state(connection),
+        classifier_state={platform: active_classifier_state(connection, platform=platform) for platform, _ in OVERVIEW_CHANNELS},
         evidence_window_start=evidence_window_start,
         evidence_window_end=evidence_window_end,
         report_cutoff_at=report_cutoff_at or now_utc(),
         warm_up=True,
-        channels=CHANNELS,
+        channels=OVERVIEW_CHANNELS,
         scenes=SCENES,
     )
 
@@ -1252,10 +1352,13 @@ def _data_freshness(
         "local_evaluation": "SELECT MAX(evaluated_at) FROM evaluation_versions WHERE evaluation_source='automatic' AND evaluation_status='evaluated' AND invalidated_at IS NULL AND julianday(evaluated_at)<=julianday(?) AND julianday(evaluated_at)<=julianday(?)",
     }
     stage_data = {name: connection.execute(sql, (timestamp, timestamp)).fetchone()[0] for name, sql in stage_queries.items()}
+    overview_platforms = [platform for platform, _label in OVERVIEW_CHANNELS]
     latest_published = connection.execute(
         f"SELECT MAX(c.published_at) FROM content_items c "
-        f"WHERE c.platform IN ('douyin','xiaohongshu') AND {content_statistics_scope_sql('c', connection=connection)} "
-        f"AND {canonical_content_predicate(connection)}"
+        f"WHERE c.platform IN ({','.join('?' for _ in overview_platforms)}) "
+        f"AND {content_statistics_scope_sql('c', connection=connection)} "
+        f"AND {canonical_content_predicate(connection)}",
+        overview_platforms,
     ).fetchone()[0]
     return {
         "status": (
@@ -1456,7 +1559,7 @@ def _database_state(connection: sqlite3.Connection) -> Dict[str, Any]:
     release = release_rows[0]
     runtime_identity = {
         "schema": RUNTIME_IDENTITY_SCHEMA,
-        "report_version": CURRENT_REPORT_VERSION,
+        "report_version": FOUR_PLATFORM_REPORT_VERSION if user_version >= 23 else CURRENT_REPORT_VERSION,
         "database_schema_version": user_version,
         "database_schema_migration": compatibility["actual_migration_name"],
         "active_release_id": str(release["id"]),
@@ -1507,6 +1610,7 @@ def v8_overview(
         _overview_stage(timings, "connect", started_at)
         # All three windows observe the same committed database snapshot.
         connection.execute("BEGIN")
+        report_version = FOUR_PLATFORM_REPORT_VERSION if connection.execute("PRAGMA user_version").fetchone()[0] >= 23 else CURRENT_REPORT_VERSION
         window_bounds = _windows(overview_now)
         started_at = monotonic()
         window_rows = {
@@ -1545,6 +1649,7 @@ def v8_overview(
                     connection.execute(
                         "SELECT COUNT(DISTINCT f.content_id) FROM duplicate_fingerprints f "
                         "JOIN content_items c ON c.id=f.content_id WHERE fingerprint_version=? "
+                        f"AND {current_fingerprint_sql(connection, 'f.content_id')} "
                         f"AND {canonical_content_predicate(connection)} AND {content_statistics_scope_sql('c', connection=connection)}",
                         (FINGERPRINT_VERSION,),
                     ).fetchone()[0]
@@ -1581,10 +1686,14 @@ def v8_overview(
                 connection.execute(
                     "SELECT COUNT(DISTINCT d.duplicate_content_id) FROM duplicate_relations d "
                     "JOIN content_items c ON c.id=d.duplicate_content_id WHERE d.status='confirmed' "
+                    f"AND {valid_relation_sql(connection, 'd')} "
                     f"AND {canonical_content_predicate(connection)} AND {content_statistics_scope_sql('c', connection=connection)}"
                 ).fetchone()[0]
             ),
         }
+        quality.update(relation_coverage(connection, [int(row[0]) for row in connection.execute(
+            f"SELECT c.id FROM content_items c WHERE {canonical_content_predicate(connection)} "
+            f"AND {content_statistics_scope_sql('c', connection=connection)}")]))
         freshness = (
             deepcopy(dict(data_freshness))
             if data_freshness is not None
@@ -1593,7 +1702,7 @@ def v8_overview(
         _overview_stage(timings, "quality", started_at)
     return {
         "status": "ready",
-        "report_version": CURRENT_REPORT_VERSION,
+        "report_version": report_version,
         "generated_at": report_cutoff_at,
         "timezone": "Asia/Shanghai",
         "windows": windows,
@@ -1603,7 +1712,8 @@ def v8_overview(
 
 
 def _account_search(
-    payload: AccountSearchRequest, *, db_path: Path, read_only: bool = False
+    payload: AccountSearchRequest, *, db_path: Path, read_only: bool = False,
+    live_capture_status: bool = False,
 ) -> Dict[str, Any]:
     where: List[str] = []
     parameters: List[Any] = []
@@ -1639,9 +1749,14 @@ def _account_search(
         parameters.append(payload.platform)
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
     offset = (payload.page - 1) * payload.page_size
-    with connect(db_path, read_only=read_only) as connection:
+    from .storage import live_wal_read_only_connections
+    # The explicit local evidence preview reads an evolving candidate, whose
+    # committed evidence may still be in WAL. Sealed replicas stay immutable.
+    with (live_wal_read_only_connections() if live_capture_status else nullcontext()), connect(db_path, read_only=read_only) as connection:
         active_release(connection)
         roster = runtime_account_summary(connection)
+        from .account_intake import has_account_intake
+        management_version = 3 if has_account_intake(connection) else 2
         try:
             frequencies = load_update_frequencies(connection)
             admissions = load_admission_members(connection)
@@ -1655,9 +1770,11 @@ def _account_search(
                 account_group=payload.account_group, business_direction=payload.business_direction,
             )
             from .account_catalog_capture import annotate_accounts
-            annotate_accounts(connection, directory_items)
+            annotate_accounts(connection, directory_items, live=live_capture_status)
+            from .account_intake import annotate_account_preparation
+            annotate_account_preparation(connection, directory_items)
             return {"items": directory_items[offset:offset + payload.page_size], "total": len(directory_items),
-                    "page": payload.page, "page_size": payload.page_size, "account_management_version": 2,
+                    "page": payload.page, "page_size": payload.page_size, "account_management_version": management_version,
                     "account_directory_version": 2, "roster": roster}
         if admission_query_index is not None:
             parameters[admission_query_index] = json.dumps([
@@ -1696,7 +1813,7 @@ def _account_search(
         "total": total,
         "page": payload.page,
         "page_size": payload.page_size,
-        "account_management_version": 2,
+        "account_management_version": management_version,
         "roster": roster,
     }
 
@@ -1784,11 +1901,22 @@ def _content_local_media_flags(
 
 
 def _content_search(
-    payload: ContentSearchRequest, *, db_path: Path, read_only: bool = False
+    payload: ContentSearchRequest, *, db_path: Path, read_only: bool = False,
+    local_media_read_only: Optional[bool] = None,
+    query_timeout_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
     where: List[str] = []
     parameters: List[Any] = []
     direction_sql = effective_direction_sql()
+    published_from, published_until = payload.publication_bounds()
+    if published_from is not None or published_until is not None:
+        where.append("c.published_at != ''")
+    if published_from is not None:
+        where.append("c.published_at >= ?")
+        parameters.append(published_from)
+    if published_until is not None:
+        where.append("c.published_at < ?")
+        parameters.append(published_until)
     if payload.query:
         where.append(
             "(c.link_id LIKE ? OR c.title LIKE ? OR c.raw_account_uid LIKE ? "
@@ -1871,6 +1999,15 @@ def _content_search(
     )
     offset = (payload.page - 1) * payload.page_size
     with connect(db_path, read_only=read_only) as connection:
+        from_sql = from_sql.replace("WHERE d2.duplicate_content_id=c.id AND d2.status='confirmed'",
+            "WHERE d2.duplicate_content_id=c.id AND d2.status='confirmed' AND " + valid_relation_sql(connection, "d2"))
+        if query_timeout_seconds is not None:
+            deadline = monotonic() + query_timeout_seconds
+            connection.set_progress_handler(lambda: int(monotonic() >= deadline), 1000)
+            connection.execute(f"PRAGMA busy_timeout = {int(query_timeout_seconds * 1000)}")
+        if read_only:
+            # Count, page, metrics and media share one committed WAL snapshot.
+            connection.execute("BEGIN")
         from .account_classification import classification_sql
         group_sql = classification_sql(connection, "account_group")
         business_sql = classification_sql(connection, "business_direction")
@@ -1940,6 +2077,7 @@ def _content_search(
                 LEFT JOIN duplicate_relations duplicate ON duplicate.id=(
                     SELECT d2.id FROM duplicate_relations d2
                     WHERE d2.duplicate_content_id=c.id AND d2.status='confirmed'
+                      AND {valid_relation_sql(connection, 'd2')}
                     ORDER BY d2.id LIMIT 1
                 )
                 LEFT JOIN content_items original ON original.id=duplicate.original_content_id
@@ -1948,6 +2086,10 @@ def _content_search(
                 [*parameters, payload.page_size, offset],
             ).fetchall()
         items = [dict(row) for row in rows]
+        readiness = relation_states(connection, [int(item["id"]) for item in items])
+        if indexed_duplicates(connection):
+            for item in items:
+                item.update(readiness[int(item["id"])])
         metrics = select_content_metrics(connection, [int(item["id"]) for item in items])
         for item in items:
             selected = metrics.get(int(item["id"]), {})
@@ -1961,7 +2103,8 @@ def _content_search(
             else {}
         )
         media_flags = _content_local_media_flags(
-            connection, [int(item["id"]) for item in items], read_only=read_only
+            connection, [int(item["id"]) for item in items],
+            read_only=read_only if local_media_read_only is None else local_media_read_only,
         )
     for item in items:
         item["local_media_available"] = int(item["id"]) in media_flags
@@ -2676,6 +2819,28 @@ def _runtime_writer_lock(
         yield lease
 
 
+@contextmanager
+def _runtime_proof_worker_pool(config: ApiConfig, *, enabled: bool):
+    """Keep readonly proof children inside the installed Writer lease lifetime."""
+    if not enabled or config.read_only or not os.environ.get("DCAR_LOADED_BUILD_ID"):
+        yield
+        return
+    from .storage import live_wal_read_only_connections
+
+    with live_wal_read_only_connections(), connect(config.db_path, read_only=True) as connection:
+        indexed_runtime = connection.execute("PRAGMA user_version").fetchone()[0] == 24
+    if not indexed_runtime:
+        yield
+        return
+    from . import runtime_proof_workers
+
+    runtime_proof_workers.start(config.db_path)
+    try:
+        yield
+    finally:
+        runtime_proof_workers.stop()
+
+
 @asynccontextmanager
 async def _lifespan_runtime(app: FastAPI):
     config = getattr(app.state, "config", None)
@@ -2694,7 +2859,7 @@ async def _lifespan_runtime(app: FastAPI):
             )
         with connect(config.db_path, read_only=True) as connection:
             require_schema_compatibility(
-                connection, supported_versions=frozenset({19, 20, 21})
+                connection, supported_versions=frozenset({19, 20, 21, 22, 23, 24})
             )
             connection.execute("SELECT 1 FROM content_items LIMIT 1").fetchone()
         from .reader_readiness import database_version
@@ -2746,7 +2911,7 @@ async def _lifespan_runtime(app: FastAPI):
                 try:
                     require_schema_compatibility(
                         connection,
-                        supported_versions=frozenset({19, 20, 21}),
+                        supported_versions=frozenset({19, 20, 21, 22, 23, 24}),
                     )
                 except RuntimeError as exc:
                     raise RuntimeError(
@@ -2767,7 +2932,7 @@ async def _lifespan_runtime(app: FastAPI):
                         try:
                             require_schema_compatibility(
                                 connection,
-                                supported_versions=frozenset({19, 20, 21}),
+                                supported_versions=frozenset({19, 20, 21, 22, 23, 24}),
                             )
                         except RuntimeError as exc:
                             raise RuntimeError(
@@ -2776,7 +2941,25 @@ async def _lifespan_runtime(app: FastAPI):
                                 f"{exc}"
                             ) from exc
             with connect(config.db_path) as connection:
-                initialize_database(connection, allow_migrations=False)
+                existing = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1").fetchone()
+                initialize_database(connection, allow_migrations=False,
+                                    target_version=LATEST_SCHEMA_VERSION if existing is None else None)
+                if existing is None and connection.execute("PRAGMA user_version").fetchone()[0] == 24:
+                    # Only a brand-new, non-formal empty fixture may bootstrap
+                    # an empty index. Existing Writer databases must already
+                    # carry the offline-built generation; calibration remains
+                    # unpassed until real evidence is supplied.
+                    from .duplicate_index import create_generation
+                    with transaction(connection):
+                        generation = create_generation(connection)
+                        connection.execute("UPDATE duplicate_index_generations SET state='ready',activated_at=? "
+                            "WHERE generation_id=?", (now_utc(), generation["generation_id"]))
+        # Close the pre-traffic restore path before recovery or scheduled work
+        # can write business data. Read-only replicas never enter this branch.
+        with connect(config.db_path) as connection:
+            if connection.execute("PRAGMA user_version").fetchone()[0] == 24:
+                from .duplicate_index_release import mark_traffic_started
+                mark_traffic_started(connection)
         app.state.sqlite_runtime_anchor = _open_sqlite_runtime_anchor(
             config.db_path
         )
@@ -2829,6 +3012,7 @@ async def _lifespan_runtime(app: FastAPI):
                 "control": {"type": "threadpool", "max_workers": 8},
                 "report": {"type": "threadpool", "max_workers": 1},
                 "reconcile": {"type": "threadpool", "max_workers": 1},
+                "duplicate": {"type": "threadpool", "max_workers": 1},
             },
         )
         install_jobs(
@@ -3029,7 +3213,9 @@ async def lifespan(app: FastAPI):
     app.state.runtime_database_identity = (
         access.health_identity() if access is not None else None
     )
-    with _runtime_writer_lock(config, access) as writer_lease:
+    with _runtime_writer_lock(config, access) as writer_lease, _runtime_proof_worker_pool(
+        config, enabled=formal_runtime and writer_lease is not None
+    ):
         control_executor: ThreadPoolExecutor | None = None
         app.state.current_hold_control_executor = None
         app.state.current_hold_control_future = None
@@ -3154,7 +3340,7 @@ async def read_only_replica_guard(request: Request, call_next):
 
 
 def create_app(config: Optional[ApiConfig] = None) -> FastAPI:
-    application = FastAPI(title="DCar Insight API", version=CURRENT_REPORT_VERSION, lifespan=lifespan)
+    application = FastAPI(title="DCar Insight API", version=FOUR_PLATFORM_REPORT_VERSION, lifespan=lifespan)
     application_config = config or ApiConfig.from_env()
     application.state.config = application_config
     # Each app/database pair shares one verified receipt scan per TTL.
@@ -3223,7 +3409,7 @@ def v8_health(request: Request) -> Dict[str, Any]:
         },
         "mode": "read_only_replica" if config.read_only else "local_v8",
         "read_only": config.read_only,
-        "report_version": CURRENT_REPORT_VERSION,
+        "report_version": database_state["runtime_identity"]["report_version"],
         "database": config.db_path.name,
         "database_path": str(config.db_path.resolve()),
         "runtime_database_identity": getattr(
@@ -3375,8 +3561,7 @@ def v8_readyz(request: Request):
                     "conditions": {"database": bool(compatibility["compatible"]),
                                    "verified_snapshot": ready},
                     "snapshot_readiness": snapshot,
-                    # These are Writer/data qualification claims, not the
-                    # readiness of a server to serve its verified snapshot.
+                    # Writer qualification is independent of snapshot-serving readiness.
                     "control_readiness": None, "data_readiness": None,
                 }
                 return payload if ready else JSONResponse(status_code=503, content=payload)
@@ -3544,7 +3729,7 @@ def get_v8_tasks(request: Request) -> Dict[str, Any]:
 
 
 @router.get("/api/v8/scheduler")
-def get_v8_scheduler_status(request: Request) -> Dict[str, Any]:
+def get_v8_scheduler_status(request: Request, include_runtime_threads: bool = False) -> Dict[str, Any]:
     config = _request_config(request)
     scheduler = getattr(request.app.state, "scheduler", None)
     scheduler_state = _scheduler_execution_state(config, scheduler)
@@ -3578,7 +3763,7 @@ def get_v8_scheduler_status(request: Request) -> Dict[str, Any]:
             (ACCOUNT_STATUS_JOB,),
         ).fetchall()
     data_freshness = _request_data_freshness(request)
-    return {
+    payload = {
         "read_only": config.read_only,
         "requested": bool(getattr(request.app.state, "scheduler_requested", False)),
         "enabled": scheduler_state == "running",
@@ -3655,6 +3840,18 @@ def get_v8_scheduler_status(request: Request) -> Dict[str, Any]:
             {"stale_candidates": 0, "recovered": 0},
         ),
     }
+    if include_runtime_threads and not config.read_only and request.client is not None:
+        from ipaddress import ip_address
+
+        try:
+            loopback = ip_address(request.client.host).is_loopback
+        except ValueError:
+            loopback = False
+        if loopback:
+            from .runtime_thread_diagnostics import snapshot
+
+            payload["runtime_threads"] = snapshot()
+    return payload
 
 
 def _run_task_in_background(
@@ -3814,34 +4011,29 @@ def get_v8_task_report(request: Request, task_id: str, revision: int) -> Dict[st
         raise HTTPException(
             status_code=410, detail="这份报告的文件丢失了，请重新生成报告。"
         )
-    return json.loads(path.read_text(encoding="utf-8"))
+    return project_account_classification(json.loads(path.read_text(encoding="utf-8")))
 
 
 @router.get("/api/v8/tasks/{task_id}/revisions/{revision}/files/{file_kind}")
 def download_v8_task_file(
     request: Request, task_id: str, revision: int, file_kind: str
-) -> FileResponse:
+) -> Response:
     kinds = (
         ["summary-png", "summary-svg"] if file_kind == "summary-image" else [file_kind]
     )
-    placeholders = ",".join("?" for _ in kinds)
     with _connect_for_request(request) as connection:
         rows = connection.execute(
-            f"""
+            """
             SELECT * FROM report_files
-            WHERE task_id=? AND revision=? AND file_kind IN ({placeholders}) AND status='available'
+            WHERE task_id=? AND revision=? AND status='available'
             """,
-            (task_id, revision, *kinds),
+            (task_id, revision),
         ).fetchall()
     by_kind = {str(row["file_kind"]): row for row in rows}
     row = next((by_kind[kind] for kind in kinds if kind in by_kind), None)
     if row is None:
         raise HTTPException(status_code=404, detail="找不到这份报告文件。")
-    path = _safe_project_path(str(row["local_path"]))
-    if not path.is_file():
-        raise HTTPException(
-            status_code=410, detail="这份报告的文件丢失了，请重新生成报告。"
-        )
+    path, payload = _verified_report_file(row)
     media_types = {
         "report-json": "application/json",
         "report-markdown": "text/markdown",
@@ -3850,11 +4042,49 @@ def download_v8_task_file(
         "summary-svg": "image/svg+xml",
         "summary-png": "image/png",
     }
-    return FileResponse(
-        path,
-        media_type=media_types.get(str(row["file_kind"]), "application/octet-stream"),
-        filename=path.name,
-    )
+    kind = str(row["file_kind"])
+    if kind == "content-csv":
+        payload = _project_content_csv_for_download(payload, by_kind)
+    elif kind in {"report-json", "report-markdown", "summary-svg", "summary-png"}:
+        report = _projected_download_report(by_kind)
+        if report is None:
+            raise HTTPException(status_code=409, detail="这份历史报告缺少新版账号分类展示所需的原始报告，请重新生成。")
+        if kind == "report-json":
+            payload = json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8")
+        elif kind == "report-markdown":
+            try:
+                payload = _markdown(report).encode("utf-8")
+            except (KeyError, TypeError, ValueError) as error:
+                raise HTTPException(status_code=409, detail="这份历史报告无法使用新版账号分类模板，请重新生成。") from error
+        elif kind == "summary-svg":
+            payload = render_summary_svg(report).encode("utf-8")
+        else:
+            extension, payload = _report_download_image(by_kind, task_id=task_id, revision=revision)
+            kind = "summary-" + extension
+            path = path.with_suffix("." + extension)
+    return _report_download_response(payload, filename=path.name,
+                                     media_type=media_types.get(kind, "application/octet-stream"),
+                                     extension=path.suffix.lstrip("."))
+
+
+def _projected_download_report(by_kind: Mapping[str, Mapping[str, Any]]) -> dict[str, Any] | None:
+    row = by_kind.get("report-json")
+    if row is None:
+        return None
+    _, payload = _verified_report_file(row)
+    try:
+        value = json.loads(payload.decode("utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError("report is not an object")
+        return project_account_classification(value)
+    except (UnicodeDecodeError, ValueError) as error:
+        raise HTTPException(status_code=409, detail="报告文件无法读取，请重新生成报告。") from error
+
+
+def _project_content_csv_for_download(payload: bytes, by_kind: Mapping[str, Mapping[str, Any]]) -> bytes:
+    fields = csv.DictReader(io.StringIO(payload.decode("utf-8-sig"))).fieldnames or []
+    report = None if {"account_group", "business_direction"} <= set(fields) else _projected_download_report(by_kind)
+    return project_content_csv(payload, content_rows=report.get("content_details") if report else None)
 
 
 def _verified_report_file(row: Mapping[str, Any]) -> tuple[Path, bytes]:
@@ -3884,7 +4114,7 @@ def _report_export_context(
     task_id: str,
     taxonomy_version: str,
     content_csv: bytes,
-) -> tuple[dict[str, dict[str, str]], dict[str, str]]:
+) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
     """Read-only compatibility projection for fields absent from old revisions."""
 
     try:
@@ -3919,7 +4149,7 @@ def _report_export_context(
             (taxonomy_version,),
         ).fetchall()
     current_by_id = {str(row["id"]): row for row in current_rows}
-    enrichment: dict[str, dict[str, str]] = {}
+    enrichment: dict[str, dict[str, Any]] = {}
     required_codes: set[str] = set()
     for source in source_rows:
         internal_content_id = str(source.get("content_id") or "").strip()
@@ -3949,9 +4179,19 @@ def _report_export_context(
                 current["platform_content_id"] or ""
             )
             content_type = content_type or str(current["content_type"] or "")
+        aliases = []
+        encoded_aliases = source.get("platform_content_id_aliases")
+        if encoded_aliases:
+            try:
+                aliases = json.loads(encoded_aliases)
+                if not isinstance(aliases, list) or any(not isinstance(value, str) for value in aliases):
+                    raise ValueError("invalid frozen aliases")
+            except (ValueError, TypeError) as error:
+                raise HTTPException(status_code=409, detail="报告作品身份凭据无效，请重新生成报告。") from error
         url_content_id = platform_content_id_from_url(platform, canonical_url)
         if not url_content_id or (
             platform_content_id and platform_content_id != url_content_id
+            and not (platform_content_id in aliases and url_content_id in aliases)
         ):
             raise HTTPException(
                 status_code=409,
@@ -3966,6 +4206,7 @@ def _report_export_context(
         enrichment[internal_content_id] = {
             "platform_content_id": platform_content_id,
             "content_type": content_type,
+            "platform_content_id_aliases": aliases,
         }
         code = str(source.get("primary_selling_point_code") or "").strip()
         label = str(source.get("primary_selling_point_label") or "").strip()
@@ -4007,8 +4248,6 @@ def _report_download_image(
         try:
             derived_svg = render_summary_svg(frozen_report).encode("utf-8")
         except ValueError:
-            # v8.0/v8.1 predate the registered contract files needed by the
-            # current template. Their archived SVG remains the safe fallback.
             LOGGER.warning(
                 "current image template unsupported for historical report: "
                 "task=%s revision=%s report_version=%s",
@@ -4016,6 +4255,7 @@ def _report_download_image(
                 revision,
                 frozen_report.get("report_version"),
             )
+            raise HTTPException(status_code=409, detail="这份历史报告无法使用新版账号分类模板，请重新生成。")
 
     if derived_svg is not None:
         with tempfile.TemporaryDirectory(prefix="dcar-report-download-") as directory:
@@ -4028,19 +4268,8 @@ def _report_download_image(
             else:
                 image_extension = "svg"
                 image_bytes = derived_svg
-    elif svg_row := by_kind.get("summary-svg"):
-        svg_path, svg_bytes = _verified_report_file(svg_row)
-        with tempfile.TemporaryDirectory(prefix="dcar-report-download-") as directory:
-            rendered = Path(directory) / "core_summary.png"
-            if render_summary_png(svg_path, rendered):
-                image_extension = "png"
-                image_bytes = rendered.read_bytes()
-            else:
-                image_extension = "svg"
-                image_bytes = svg_bytes
-    elif png_row := by_kind.get("summary-png"):
-        _, image_bytes = _verified_report_file(png_row)
-        image_extension = "png"
+    elif by_kind.get("summary-svg") or by_kind.get("summary-png"):
+        raise HTTPException(status_code=409, detail="这份历史报告缺少新版账号分类展示所需的原始报告，请重新生成。")
     else:
         raise HTTPException(
             status_code=404, detail="这份报告的图片丢失了，请重新生成报告。"
@@ -4122,6 +4351,7 @@ def download_v8_task_report(
             status_code=404, detail="这份报告的内容明细丢失了，请重新生成报告。"
         )
     _, content_csv = _verified_report_file(content_row)
+    content_csv = _project_content_csv_for_download(content_csv, by_kind)
 
     channel_csv = None
     if channel_row := by_kind.get("channel-csv"):
@@ -4226,7 +4456,7 @@ def _schedule_writer_roster_activation(
     ):
         return value
     try:
-        if int(connection.execute("PRAGMA user_version").fetchone()[0]) in {20, 21}:
+        if int(connection.execute("PRAGMA user_version").fetchone()[0]) in {20, 21, 22, 23, 24}:
             from .account_roster_capture import (
                 AccountRosterCaptureError,
                 schedule_account_roster_capture_in_transaction,
@@ -4406,6 +4636,7 @@ def search_v8_accounts(
         payload,
         db_path=config.db_path,
         read_only=config.read_only,
+        live_capture_status=config.account_capture_live_status,
     )
 
 
@@ -4451,7 +4682,7 @@ def _require_system_account_creation(runtime: Mapping[str, Any]) -> None:
 
 def _validate_active_account_capture(connection: sqlite3.Connection, account_id: int) -> None:
     """A restored existing member must also have a usable current capture route."""
-    if int(connection.execute("PRAGMA user_version").fetchone()[0]) not in {20, 21}:
+    if int(connection.execute("PRAGMA user_version").fetchone()[0]) not in {20, 21, 22, 23, 24}:
         return
     from .account_catalog_capture import installed_policy
     if installed_policy(connection, at=now_utc()) is not None:
@@ -4467,6 +4698,121 @@ def _validate_active_account_capture(connection: sqlite3.Connection, account_id:
                             headers={"X-DCAR-Account-Error": error.code}) from error
 
 
+@router.post("/api/v8/account-directory/{directory_row_id}/identity", status_code=202)
+def repair_v8_directory_identity(request: Request, directory_row_id: int, payload: DirectoryIdentityRequest) -> Dict[str, Any]:
+    from .account_intake import update_directory_identity, DirectoryIdentityConflict
+    from .platform_adapters import normalize_submission_input
+    config = _request_config(request)
+    if config.read_only:
+        raise HTTPException(status_code=403, detail="只读副本不能补充账号身份。")
+    submitted = payload.model_dump(exclude={"request_id", "expected_locator_sha256"})
+    try:
+        # Match the operator's original submission before resolving an expiring
+        # share URL again. Request replay must not depend on current redirects.
+        with _connect_for_request(request) as connection:
+            if connection.execute("PRAGMA user_version").fetchone()[0] < 23:
+                raise HTTPException(status_code=409, detail="账号身份补充需要安装新版服务。")
+            previous = connection.execute("SELECT * FROM account_intake_requests WHERE request_key=?",
+                                          (payload.request_id,)).fetchone()
+            if previous is not None:
+                saved = json.loads(previous["source_json"]).get("identity_submission", {})
+                if (saved.get("directory_row_id") != directory_row_id
+                        or saved.get("expected_locator_sha256") != payload.expected_locator_sha256
+                        or saved.get("source", {}).get("submission") != submitted):
+                    raise DirectoryIdentityConflict("directory_request_conflict", "同一请求编号不能用于不同身份修改。")
+                from .account_intake import _intake_result
+                return _intake_result(connection, dict(previous), replayed=True)
+        normalized = normalize_submission_input(submitted)
+        with _connect_for_request(request) as connection, transaction(connection):
+            if connection.execute("PRAGMA user_version").fetchone()[0] < 23:
+                raise HTTPException(status_code=409, detail="账号身份补充需要安装新版服务。")
+            return update_directory_identity(connection, directory_row_id=directory_row_id,
+                request_key=payload.request_id, expected_locator_sha256=payload.expected_locator_sha256,
+                value=normalized, source={"kind":"directory_identity","actor":"api-operator","submission":submitted}, at=now_utc())
+    except DirectoryIdentityConflict as error:
+        raise HTTPException(status_code=409, detail=str(error), headers={"X-DCAR-Account-Error":error.code}) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+def _media_source_refresh_request(request: Request, content_id: int, value: dict, *, execute: bool) -> Dict[str, Any]:
+    from .media_source_refresh import (prepare_media_source_refresh, execute_media_source_refresh,
+                                       MediaSourceRefreshError)
+    if _request_config(request).read_only:
+        raise HTTPException(status_code=403, detail="只读副本不能提交媒体更新。")
+    try:
+        with _connect_for_request(request) as connection:
+            handler = execute_media_source_refresh if execute else prepare_media_source_refresh
+            return handler(connection, content_id=content_id, **value, at=now_utc())
+    except MediaSourceRefreshError as error:
+        raise HTTPException(status_code=409, detail=str(error),
+            headers={"X-DCAR-Media-Error": error.error_code}) from error
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail="内容不存在。") from error
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.post("/api/v8/contents/{content_id}/media/source-refresh/prepare")
+def prepare_v8_media_source_refresh(request: Request, content_id: int,
+                                    payload: MediaSourceRefreshPrepareRequest) -> Dict[str, Any]:
+    return _media_source_refresh_request(request, content_id, payload.model_dump(), execute=False)
+
+
+@router.post("/api/v8/contents/{content_id}/media/source-refresh/execute", status_code=202)
+def execute_v8_media_source_refresh(request: Request, content_id: int,
+                                    payload: MediaSourceRefreshExecuteRequest) -> Dict[str, Any]:
+    return _media_source_refresh_request(request, content_id, payload.model_dump(), execute=True)
+
+
+@router.get("/api/v8/media/pending-work")
+def get_v8_media_pending_work(request: Request, limit: int = 100, offset: int = 0,
+                              platform: str | None = None, reason: str | None = None,
+                              account_query: str | None = None, stage: str | None = None) -> Dict[str, Any]:
+    from .media_work_queue import list_pending_media_work
+    with _connect_for_request(request) as connection:
+        try:
+            return list_pending_media_work(connection, limit=max(1,min(limit,200)), offset=max(offset,0), platform=platform, reason=reason, account_query=account_query, stage=stage)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+class PendingContentResolutionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    canonical_url: str | None = Field(default=None, max_length=8192)
+    platform_content_id: str | None = Field(default=None, max_length=128)
+
+
+@router.post("/api/v8/contents/pending-links/{intake_id}/resolve")
+def resolve_v8_pending_content_link(request: Request, intake_id: int,
+                                    payload: PendingContentResolutionRequest | None = None) -> Dict[str, Any]:
+    from .content_identity import prepare_pending_resolution, apply_pending_resolution, ContentIdentityError
+    if _request_config(request).read_only:
+        raise HTTPException(status_code=403, detail="只读副本不能补充作品身份。")
+    try:
+        with _connect_for_request(request) as connection:
+            if connection.execute("PRAGMA user_version").fetchone()[0] < 23:
+                raise HTTPException(status_code=409, detail="请先安装新版作品身份服务。")
+            prepared = prepare_pending_resolution(connection, intake_id,
+                payload.model_dump(exclude_none=True) if payload is not None else None)
+        with _connect_for_request(request) as connection, transaction(connection):
+            return apply_pending_resolution(connection, prepared, at=now_utc())
+    except ContentIdentityError as error:
+        raise HTTPException(status_code=404 if error.code == "intake_missing" else 409,
+            detail=str(error), headers={"X-DCAR-Content-Error": error.code}) from error
+    except OperationError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.get("/api/v8/contents/pending-links")
+def get_v8_pending_content_links(request: Request, limit: int = 100, offset: int = 0) -> Dict[str, Any]:
+    with _connect_for_request(request) as connection:
+        if connection.execute("PRAGMA user_version").fetchone()[0] < 23:
+            return {"items":[],"total":0}
+        rows = connection.execute("SELECT id,platform,original_url,status,reason,content_id,created_at,updated_at FROM content_link_intakes WHERE status!='resolved' ORDER BY id DESC LIMIT ? OFFSET ?",(max(1,min(limit,200)),max(0,offset))).fetchall()
+        return {"items":[dict(r) for r in rows],"total":connection.execute("SELECT count(*) FROM content_link_intakes WHERE status!='resolved'").fetchone()[0]}
+
+
 @router.post("/api/v8/accounts")
 def create_v8_account(
     request: Request, payload: Dict[str, Any]
@@ -4479,11 +4825,39 @@ def create_v8_account(
         except (ValueError, TypeError) as error:
             raise HTTPException(
                 status_code=422,
-                detail="新增方式已更新，请刷新账号页后使用主页链接，并选择日更、周更或暂停。",
+                detail="请刷新账号页后使用主页链接或平台定位信息，并选择日更、周更或暂停。",
             ) from error
         context = dict(parsed)
         with _connect_for_request(request) as connection:
             _require_system_account_creation(runtime_account_summary(connection))
+            from .account_intake import has_account_intake, submit_account_intake
+            if has_account_intake(connection):
+                from .account_intake import _intake_result
+                from .platform_adapters import normalize_submission_input
+                submitted = {key: value for key, value in parsed.items() if key != "request_id"}
+                previous = connection.execute("SELECT * FROM account_intake_requests WHERE request_key=?", (parsed["request_id"],)).fetchone()
+                if previous is not None:
+                    saved = dict(previous)
+                    if json.loads(saved["source_json"]).get("submission") != submitted:
+                        raise HTTPException(status_code=409, detail="同一接入请求编号不能用于不同内容。")
+                    return _intake_result(connection, saved, replayed=True)
+                try:
+                    # Short-link resolution uses the existing bounded public
+                    # transport and runs before the SQLite write transaction.
+                    normalized = normalize_submission_input(submitted)
+                except ValueError as error:
+                    raise HTTPException(status_code=422, detail=str(error)) from error
+                with transaction(connection):
+                    try:
+                        return submit_account_intake(connection, request_key=parsed["request_id"],
+                            value=normalized,
+                            source={"kind":"web","actor":"api-operator","submission":submitted}, at=now_utc())
+                    except ValueError as error:
+                        raise HTTPException(status_code=422,detail=str(error)) from error
+            if not parsed["profile_url"] or parsed["uid"] or parsed["display_account_id"] or parsed["platform"]:
+                raise HTTPException(status_code=422,detail="账号接入尚未完成数据库升级，请刷新账号页后使用主页链接。")
+            # Historical requests retain their exact pre-schema-22 replay input.
+            context = {key: value for key,value in parsed.items() if key not in {"platform","uid","display_account_id"}}
             replay = replay_account_creation(connection, request_id=parsed["request_id"], request_context=context)
             if replay is not None:
                 return replay
@@ -4525,6 +4899,20 @@ def create_v8_account(
         raise _roster_http_error(error) from error
     except OperationError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.get("/api/v8/accounts/intake/{intake_id}")
+def get_v8_account_intake(request: Request, intake_id: int) -> Dict[str, Any]:
+    from .account_intake import has_account_intake, _rows, _intake_result
+    with _connect_for_request(request) as connection:
+        if not has_account_intake(connection):
+            raise HTTPException(status_code=404,detail="接入请求不存在")
+        rows = _rows(connection,"SELECT * FROM account_intake_requests WHERE id=?",(intake_id,))
+        if not rows:
+            raise HTTPException(status_code=404,detail="接入请求不存在")
+        result = _intake_result(connection,rows[0])
+        result.pop("profile",None)
+        return result
 
 
 @router.patch("/api/v8/accounts/{account_id}")
@@ -4633,7 +5021,7 @@ def import_v8_accounts() -> Dict[str, Any]:
 def remove_v8_account(account_id: int) -> Dict[str, Any]:
     raise HTTPException(
         status_code=410,
-        detail="移出名单已停用，请将账号状态改为暂停；账号和历史数据会保留。",
+        detail="移出名单已停用；当前账号状态仅为人工标记，所有状态均按采集条件参与自动采集。",
     )
 
 
@@ -4685,36 +5073,47 @@ def search_v8_contents(
 
 
 @router.post("/api/v8/contents/validate")
-def validate_v8_contents(payload: BulkImportRequest) -> Dict[str, Any]:
+def validate_v8_contents(request: Request, payload: BulkImportRequest) -> Dict[str, Any]:
+    from .content_identity import normalize_submission, ContentIdentityError
+    from .operations import reject_obsolete_account_classification
     items: List[Dict[str, Any]] = []
-    valid = 0
-    for index, row in enumerate(payload.rows, start=1):
-        try:
-            identity = content_identity(
-                str(row.get("platform") or ""),
-                str(row.get("canonical_url") or row.get("url") or ""),
-                row.get("platform_content_id"),
-            )
-            items.append({"row": index, "status": "valid", **identity})
-            valid += 1
-        except OperationError as exc:
-            items.append({"row": index, "status": "rejected", "reason": str(exc)})
-    return {
-        "total": len(payload.rows),
-        "valid": valid,
-        "rejected": len(payload.rows) - valid,
-        "items": items,
-    }
+    valid = pending = 0
+    with _connect_for_request(request) as connection:
+        for index, row in enumerate(payload.rows, start=1):
+            try:
+                reject_obsolete_account_classification(row, account=False)
+                identity = normalize_submission(row, connection=connection)
+                items.append({"row": index, "status": "valid", **identity})
+                valid += 1
+            except (ContentIdentityError, OperationError) as error:
+                reason_code = error.code if isinstance(error, ContentIdentityError) else "obsolete_account_classification"
+                status = "pending_identity" if reason_code == "identity_unresolved" else "rejected"
+                pending += int(status == "pending_identity")
+                items.append({"row": index, "status": status, "reason": str(error), "reason_code": reason_code})
+    return {"total":len(payload.rows),"valid":valid,"pending_identity":pending,
+            "rejected":len(payload.rows)-valid-pending,"items":items}
 
 
 @router.post("/api/v8/contents")
 def create_v8_content(
     request: Request, payload: ContentMutationRequest
 ) -> Dict[str, Any]:
+    from .content_identity import normalize_submission, enqueue_pending_link, ContentIdentityError
+    submitted = payload.model_dump()
     try:
-        return upsert_content(
-            payload.model_dump(), db_path=_request_config(request).db_path
-        )
+        try:
+            with _connect_for_request(request) as connection:
+                normalized = normalize_submission(submitted, connection=connection)
+        except ContentIdentityError as error:
+            if error.code != "identity_unresolved":
+                raise OperationError(str(error)) from error
+            with _connect_for_request(request) as connection, transaction(connection):
+                if connection.execute("PRAGMA user_version").fetchone()[0] < 23:
+                    raise OperationError(str(error)) from error
+                pending = enqueue_pending_link(connection, submitted, reason=str(error), at=now_utc())
+                return JSONResponse(pending, status_code=202)
+
+        return upsert_content(normalized, db_path=_request_config(request).db_path)
     except OperationError as exc:
         raise _user_facing_http_error(
             exc,
@@ -4731,6 +5130,18 @@ def patch_v8_content(
     if not updates:
         raise HTTPException(status_code=422, detail="请至少修改一项内容。")
     try:
+        if {"platform", "platform_content_id", "canonical_url"} & updates.keys():
+            from .content_identity import normalize_submission, ContentIdentityError
+            try:
+                with _connect_for_request(request) as connection:
+                    row = connection.execute("SELECT platform,platform_content_id,canonical_url FROM content_items WHERE id=?",(content_id,)).fetchone()
+                    if row is None:
+                        raise OperationError("内容不存在")
+                    resolved = normalize_submission({**dict(row),**updates}, connection=connection)
+            except ContentIdentityError as error:
+                raise OperationError(str(error)) from error
+            updates.update({k:resolved[k] for k in ("platform", "platform_content_id", "canonical_url")})
+            updates.update({k:resolved[k] for k in ("_content_alias_urls", "_locator_references") if k in resolved})
         return update_content(
             content_id,
             updates,
@@ -4757,7 +5168,7 @@ def import_v8_contents(request: Request, payload: BulkImportRequest) -> Dict[str
 def update_v8_content_data(request: Request, content_id: int) -> Any:
     db_path = _request_config(request).db_path
     with _connect_for_request(request) as connection:
-        schema20 = connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}
+        schema20 = connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21, 22, 23, 24}
     if schema20:
         return _submit_capture_command(request, content_id=content_id, kind="manual_update")
     try:
@@ -4786,7 +5197,7 @@ def refresh_v8_content_metrics(request: Request, content_id: int,
                                payload: MetricsRefreshRequest | None = None) -> JSONResponse:
     """Persist an explicit metrics-only command; POST never calls providers."""
     with _connect_for_request(request) as connection:
-        if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21}:
+        if connection.execute("PRAGMA user_version").fetchone()[0] not in {20, 21, 22, 23, 24}:
             raise HTTPException(status_code=409, detail="manual_metrics_requires_schema20")
     return _submit_capture_command(request, content_id=content_id, kind="metrics_update",
         options=payload.model_dump(exclude_none=True) if payload is not None else {})
@@ -4911,7 +5322,7 @@ def retry_v8_content_media(
 ) -> Any:
     if payload.allow_paid_refresh:
         with _connect_for_request(request) as connection:
-            schema20 = connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21}
+            schema20 = connection.execute("PRAGMA user_version").fetchone()[0] in {20, 21, 22, 23, 24}
         if schema20:
             return _submit_capture_command(request, content_id=content_id, kind="media_retry")
     try:
@@ -5300,9 +5711,9 @@ def v7_history_report(request: Request, run_id: str, revision: int) -> Dict[str,
         ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="历史报告不存在")
-    return json.loads(
+    return project_account_classification(json.loads(
         _safe_project_path(str(row["report_json_path"])).read_text(encoding="utf-8")
-    )
+    ))
 
 
 # Temporary read compatibility for the existing v7 frontend. These routes are removed at cutover.
@@ -5343,14 +5754,15 @@ def legacy_run_report(request: Request, run_id: str) -> Dict[str, Any]:
     value = _legacy_run(_request_config(request).legacy_db_path, run_id)
     if value is None or not value.get("output_path"):
         raise HTTPException(status_code=404, detail="任务报告不存在")
-    return json.loads(
+    return project_account_classification(json.loads(
         _safe_project_path(str(value["output_path"])).read_text(encoding="utf-8")
-    )
+    ))
 
 
 @router.get("/api/files/{file_key}")
 def legacy_file(request: Request, file_key: str):
-    filename = LEGACY_EXPORTS.get(unquote(file_key))
+    kind = unquote(file_key)
+    filename = LEGACY_EXPORTS.get(kind)
     if filename is None:
         raise HTTPException(status_code=404, detail="导出文件不存在")
     path = (
@@ -5359,7 +5771,26 @@ def legacy_file(request: Request, file_key: str):
     )
     if not path.exists():
         raise HTTPException(status_code=404, detail="导出文件不存在")
-    return FileResponse(path, filename=path.name)
+    report = _legacy_report(_request_config(request).legacy_db_path)
+    if kind == "report-json":
+        payload, extension, media_type = json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8"), "json", "application/json"
+    elif kind == "report-markdown":
+        try:
+            payload = _markdown(report).encode("utf-8")
+        except (KeyError, TypeError, ValueError) as error:
+            raise HTTPException(status_code=409, detail="这份历史报告无法使用新版账号分类模板，请重新生成。") from error
+        extension, media_type = "md", "text/markdown"
+    elif kind.endswith("-csv"):
+        payload = project_content_csv(path.read_bytes(), content_rows=report.get("content_details"))
+        extension, media_type = "csv", "text/csv"
+    else:
+        try:
+            payload = render_summary_svg(report).encode("utf-8")
+        except (KeyError, TypeError, ValueError) as error:
+            raise HTTPException(status_code=409, detail="这份历史报告无法使用新版账号分类模板，请重新生成。") from error
+        extension, media_type = "svg", "image/svg+xml"
+        path = path.with_suffix(".svg")
+    return _report_download_response(payload, filename=path.name, media_type=media_type, extension=extension)
 
 
 @router.post("/api/inputs/validate")

@@ -115,6 +115,15 @@ class AccountCatalogCaptureReleaseTest(unittest.TestCase):
         self.assertEqual(result['catalog_capture_policy'], self.module.ACCOUNT_CATALOG_POLICY)
         self.assertEqual(result['catalog_capture_policy_sha256'], self.module.digest(self.module.ACCOUNT_CATALOG_POLICY))
         self.assertEqual(result['catalog_capture_proof']['business_scope_change'], 'approved_by_user')
+        policy = result['catalog_capture_policy']
+        self.assertEqual(policy['contract'], 'account-catalog-automatic-capture-policy-v3')
+        self.assertEqual(policy['account_preparation'], 'account-preparation-plan-v1')
+        self.assertEqual(self.module.ACCOUNT_CATALOG_POLICY_V2['contract'], 'account-catalog-automatic-capture-policy-v2')
+        self.assertNotIn('account_preparation', self.module.ACCOUNT_CATALOG_POLICY_V2)
+        self.assertEqual(policy['statuses'], ['daily', 'weekly', 'paused', 'unmarked'])
+        self.assertEqual(policy['operating_status_filter'], 'ignored')
+        self.assertEqual(policy['identity'], 'unique_identity_with_verified_capture_evidence')
+        self.assertEqual(policy['pending_labels'], 'metadata_only')
         self.assertEqual(self.fixture.snapshots(), self.before)
 
     def test_policy_and_explicit_approval_cannot_be_removed_or_broadened(self):
@@ -123,7 +132,7 @@ class AccountCatalogCaptureReleaseTest(unittest.TestCase):
             self.build = copy.deepcopy(original)
             plan = self.build['account_catalog_capture_successor']
             if change == 'policy':
-                plan['account_catalog_policy']['statuses'].append('paused')
+                plan['account_catalog_policy']['operating_status_filter'] = 'required'
                 plan['account_catalog_policy_sha256'] = self.module.digest(plan['account_catalog_policy'])
             elif change == 'digest':
                 plan['account_catalog_policy_sha256'] = '0' * 64
@@ -134,6 +143,21 @@ class AccountCatalogCaptureReleaseTest(unittest.TestCase):
             self.seal()
             with self.assertRaisesRegex(ValueError, 'policy or approval'):
                 self.verify()
+
+    def test_previous_policy_cannot_be_relabelled_as_the_new_release(self):
+        legacy = {
+            'contract': 'account-catalog-automatic-capture-policy-v1',
+            'statuses': ['daily', 'weekly'], 'identity': 'existing_verified',
+            'locator_required': True, 'legacy_enabled_ignored': True,
+            'legacy_membership_ignored': True, 'pending_labels': 'blocked_with_reason',
+        }
+        plan = self.build['account_catalog_capture_successor']
+        plan['account_catalog_policy'] = legacy
+        plan['account_catalog_policy_sha256'] = self.module.digest(legacy)
+        self.seal()
+        with self.assertRaisesRegex(ValueError, 'policy or approval'):
+            self.verify()
+        self.assertEqual(self.fixture.snapshots(), self.before)
 
     def test_cannot_modify_legacy_roster_budget_provider_or_migration_evidence(self):
         original = copy.deepcopy(self.build)

@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { CaretLeftIcon, CaretRightIcon } from "@phosphor-icons/react";
 import { apiUrl, readQueryJson } from "../lib/api";
-import { douyinPlayerEligible, douyinPlayerUrl, type MediaAction } from "../lib/contentMedia";
+import { douyinPlayerEligible, douyinPlayerUrl, originalPostUrl, ORIGINAL_POST_UNAVAILABLE, type MediaAction } from "../lib/contentMedia";
 import { formatDate, label } from "../lib/format";
 import { mediaMemberKey, mediaMemberLabel, mediaPlaybackPresentation } from "../lib/mediaLifecycle";
 import type { ContentItem, EvidenceBundle, EvidenceMedia } from "../lib/types";
@@ -13,7 +13,7 @@ import { useDialogFocus } from "../lib/useDialogFocus";
 // 没有本地媒体的抖音视频直接内嵌官方播放器（0 个本站请求）。这里没有恢复、重处理、付费等写操作，
 // 全部状态提示都是弹窗内的行内提示，不发 toast。
 // 弹窗尺寸跟内容走：本地媒体在 loadedmetadata / load 后把宽高比写进 --media-ratio，面板宽度随之变化
-// （加载前默认 9:16，库里绝大多数是竖屏）；抖音播放器固定竖版，尺寸规则在 globals.css 的 [data-stage="player"]。
+// （加载前默认 9:16，库里绝大多数是竖屏）；抖音播放器按固定逻辑视口整体缩放，避免只压缩高度而放大控件占比。
 // DOM 顺序是 标题 → 舞台 → 工具栏 → 操作区（打开原帖、关闭），操作区靠 CSS grid 钉在右上角：
 // 跨源 iframe 里的键盘事件到不了父文档，Tab 从播放器出来必须先落到父文档自己的控件上。
 
@@ -30,8 +30,25 @@ function mediaRatio(width: number, height: number) {
   return width > 0 && height > 0 ? width / height : DEFAULT_RATIO;
 }
 
-function MediaFailure() {
-  return <div className="empty-state"><strong>文件无法读取</strong><span>请打开原帖查看。</span></div>;
+function MediaFailure({ originalUrl }: { originalUrl: string | null }) {
+  return <div className="empty-state"><strong>文件无法读取</strong><span>{originalUrl ? "请打开原帖查看。" : ORIGINAL_POST_UNAVAILABLE}</span></div>;
+}
+
+function DouyinPlayer({ url }: { url: string }) {
+  const viewportRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    // 432 × 768 视频区 + 48px 官方底条。缩放整个跨源页面，图标、标题和点击区域同步缩放。
+    const resize = () => viewport.style.setProperty("--douyin-player-scale", String(viewport.getBoundingClientRect().width / 432));
+    resize();
+    const observer = new ResizeObserver(resize);
+    observer.observe(viewport);
+    return () => observer.disconnect();
+  }, []);
+  return <div ref={viewportRef} className="content-media-player-viewport">
+    <iframe className="content-media-player" src={url} title="抖音官方播放器" aria-describedby="content-media-player-help" allow="autoplay; fullscreen" referrerPolicy="unsafe-url" allowFullScreen />
+  </div>;
 }
 
 // 视频成员按 key 挂载/卸载：切换或关闭时先暂停并卸掉 src，确保停声、停止网络读取。
@@ -51,6 +68,8 @@ function VideoMember({ src, alt, onError, onMeasure }: { src: string; alt: strin
 }
 
 export default function ContentMediaModal({ item, action, onClose }: { item: ContentItem; action: MediaAction; onClose: () => void }) {
+  const originalUrl = originalPostUrl(item.canonical_url);
+  const unavailableMessage = originalUrl ? "可打开原帖查看。" : ORIGINAL_POST_UNAVAILABLE;
   const panelRef = useRef<HTMLElement | null>(null);
   // 结果带上请求序号：点"重新读取"只需递增序号，旧结果自然失效，效果里不做同步 setState。
   const [result, setResult] = useState<{ token: number; bundle: EvidenceBundle | null; error: string } | null>(null);
@@ -77,7 +96,7 @@ export default function ContentMediaModal({ item, action, onClose }: { item: Con
   const playerUrl = action.playerUrl ?? (douyinPlayerEligible(item) ? douyinPlayerUrl(item.platform_content_id) : null);
   let stage: Stage;
   if (!needsEvidence) {
-    stage = playerUrl ? { kind: "player", url: playerUrl } : { kind: "unavailable", title: "暂无可查看的媒体", message: "可打开原帖查看。" };
+    stage = playerUrl ? { kind: "player", url: playerUrl } : { kind: "unavailable", title: "暂无可查看的媒体", message: unavailableMessage };
   } else if (error) {
     stage = { kind: "error", message: error };
   } else if (!bundle) {
@@ -86,7 +105,7 @@ export default function ContentMediaModal({ item, action, onClose }: { item: Con
     const presentation = mediaPlaybackPresentation(bundle);
     if (presentation.gallery.length > 0) stage = { kind: "local", gallery: presentation.gallery, isPreview: presentation.isPreview };
     else if (playerUrl) stage = { kind: "player", url: playerUrl };
-    else stage = { kind: "unavailable", title: presentation.title, message: presentation.message || "可打开原帖查看。" };
+    else stage = { kind: "unavailable", title: presentation.title, message: presentation.message || unavailableMessage };
   }
 
   const gallery = stage.kind === "local" ? stage.gallery : [];
@@ -123,16 +142,16 @@ export default function ContentMediaModal({ item, action, onClose }: { item: Con
       <div className="content-media-stage" data-stage={stage.kind}>
         {stage.kind === "loading" && <div className="empty-state"><strong>正在读取已保存的资料</strong><span>这一步不会产生外部服务费用。</span></div>}
         {stage.kind === "error" && <div className="empty-state"><strong>内容资料读取失败</strong><span>{stage.message}</span><button type="button" className="secondary read-error-retry" onClick={() => setReloadToken((value) => value + 1)}>重新读取</button></div>}
-        {stage.kind === "unavailable" && <div className="empty-state"><strong>{stage.title}</strong><span>{stage.message}</span><span>可打开原帖查看。</span></div>}
-        {stage.kind === "player" && <iframe className="content-media-player" src={stage.url} title="抖音官方播放器" aria-describedby="content-media-player-help" allow="autoplay; fullscreen" referrerPolicy="unsafe-url" allowFullScreen />}
-        {stage.kind === "local" && current && (failedMembers.includes(mediaMemberKey(current)) ? <MediaFailure /> : current.kind === "video"
+        {stage.kind === "unavailable" && <div className="empty-state"><strong>{stage.title}</strong><span>{stage.message}</span><span>{unavailableMessage}</span></div>}
+        {stage.kind === "player" && <DouyinPlayer url={stage.url} />}
+        {stage.kind === "local" && current && (failedMembers.includes(mediaMemberKey(current)) ? <MediaFailure originalUrl={originalUrl} /> : current.kind === "video"
           ? <VideoMember key={mediaMemberKey(current)} src={apiUrl(current.url)} alt={mediaMemberLabel(current, stage.isPreview)} onError={() => markFailed(current)} onMeasure={(value) => measure(current, value)} />
           // Evidence is served by the API, not Next image optimization.
           // eslint-disable-next-line @next/next/no-img-element
           : <img key={mediaMemberKey(current)} className="content-media-image" src={apiUrl(current.url)} alt={mediaMemberLabel(current, stage.isPreview)} onError={() => markFailed(current)}
             onLoad={(event) => measure(current, mediaRatio(event.currentTarget.naturalWidth, event.currentTarget.naturalHeight))} />)}
       </div>
-      {stage.kind === "player" && <p id="content-media-player-help" className="content-media-player-help">抖音可能限制站外播放。若播放器空白或无法播放，请<a href={item.canonical_url} target="_blank" rel="noreferrer">打开原帖观看</a>。<span className="visually-hidden">播放器内的键盘操作由抖音播放器处理；按 Tab 回到弹窗后，可按 Esc 关闭。</span></p>}
+      {stage.kind === "player" && <p id="content-media-player-help" className="content-media-player-help">抖音可能限制站外播放。若播放器空白或无法播放，{originalUrl ? <>请<a href={originalUrl} target="_blank" rel="noreferrer">打开原帖观看</a>。</> : ORIGINAL_POST_UNAVAILABLE}<span className="visually-hidden">播放器内的键盘操作由抖音播放器处理；按 Tab 回到弹窗后，可按 Esc 关闭。</span></p>}
       {localStage && current && (canNavigate || localStage.isPreview) && <div className="content-media-toolbar">
         <span aria-live="polite">{mediaMemberLabel(current, localStage.isPreview)}{canNavigate && ` · 第 ${currentIndex + 1} 个 / 共 ${gallery.length} 个`}{localStage.isPreview && " · 原件已归档或不可用，显示保留预览"}</span>
         {canNavigate && <span className="content-media-nav">
@@ -141,7 +160,7 @@ export default function ContentMediaModal({ item, action, onClose }: { item: Con
         </span>}
       </div>}
       <div className="content-media-actions">
-        <a className="secondary button-link" href={item.canonical_url} target="_blank" rel="noreferrer">打开原帖</a>
+        {originalUrl ? <a className="secondary button-link" href={originalUrl} target="_blank" rel="noreferrer">打开原帖</a> : <span>{ORIGINAL_POST_UNAVAILABLE}</span>}
         <button type="button" className="modal-close" onClick={onClose} aria-label="关闭">×</button>
       </div>
     </section>

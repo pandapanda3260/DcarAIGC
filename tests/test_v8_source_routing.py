@@ -155,7 +155,7 @@ class SourceRoutingTest(unittest.TestCase):
 
     def test_fixed_policy_and_mutation_safe_copy(self):
         policy = load_policy()
-        self.assertEqual(policy["policy_version"], "source-routing-matrix-first-v2")
+        self.assertEqual(policy["policy_version"], "source-routing-matrix-first-v3")
         self.assertEqual(policy["account_freshness_seconds"], 86400)
         self.assertEqual(policy["routes"]["douyin_metrics"]["batch_size"], 1)
         self.assertEqual(policy["routes"]["xiaohongshu_profile"]["enabled_fields"], [])
