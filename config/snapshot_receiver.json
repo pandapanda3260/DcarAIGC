@@ -1,7 +1,7 @@
 {
   "schema": "dcar-snapshot-receiver-binding-v1",
-  "source_root": "/var/www/dcar-aigc/receiver-releases/20260915-data-media-sync-v3/source",
-  "manifest_path": "/var/www/dcar-aigc/receiver-releases/20260915-data-media-sync-v3/source-manifest.json",
-  "manifest_sha256": "ff41a73d7d3d9a453a93dbb67054d19972e78236069aeecf67dd2151c6acd95c",
-  "entrypoint_sha256": "ed3ecaf3134b5b5098919b3947b14a61afcf7d5f6767a196a7fa2331fdbc69ea"
+  "source_root": "/var/www/dcar-aigc/receiver-releases/20260915-data-media-sync-v4/source",
+  "manifest_path": "/var/www/dcar-aigc/receiver-releases/20260915-data-media-sync-v4/source-manifest.json",
+  "manifest_sha256": "1c9151cd1384ab058a08d828f7cb3e232770c6d37ccae80b94bdaf3a8b1f5e13",
+  "entrypoint_sha256": "61b8044203cbe16b2138a5818fbde3783cc042abe01c2a3cf47de98cc4a73214"
 }
