@@ -39,7 +39,8 @@ SPAM_RE = re.compile(
     re.I,
 )
 PRINT_LOCK = threading.Lock()
-COMMENT_HASHER = CommentHasher()
+COMMENT_HASHER: CommentHasher | None = None
+COMMENT_HASHER_LOCK = threading.Lock()
 
 
 def read_rows(path: Path = INPUT) -> list[dict[str, Any]]:
@@ -62,7 +63,14 @@ def anon_user_key(aweme_id: str, user: Any) -> str:
     raw = str(user.get("sec_uid") or user.get("uid") or user.get("unique_id") or "")
     if not raw:
         return ""
-    return COMMENT_HASHER.user_key("douyin", aweme_id, raw)
+    # Snapshot validation imports these pure parsing helpers. Initialize the
+    # persistent salt only when a comment identity is actually requested.
+    global COMMENT_HASHER
+    with COMMENT_HASHER_LOCK:
+        if COMMENT_HASHER is None:
+            COMMENT_HASHER = CommentHasher()
+        hasher = COMMENT_HASHER
+    return hasher.user_key("douyin", aweme_id, raw)
 
 
 def is_author(user: Any, author_uid: str) -> bool:

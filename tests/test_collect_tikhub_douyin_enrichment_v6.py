@@ -1,11 +1,37 @@
 #!/usr/bin/env python3
 
 import unittest
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 
 import collect_tikhub_douyin_enrichment_v6 as v6
 
 
 class TikHubDouyinEnrichmentV6Test(unittest.TestCase):
+    def test_import_is_read_only_and_concurrent_first_hash_keeps_one_salt(self) -> None:
+        source = Path(v6.__file__).parent
+        script = '''
+import concurrent.futures
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from workflow import contracts
+contracts.PROJECT_ROOT = Path(sys.argv[2])
+import collect_tikhub_douyin_enrichment_v6 as module
+salt = contracts.PROJECT_ROOT / 'data/cache/.comment_hash_salt'
+assert not salt.exists(), 'import created a persistent salt'
+assert module.anon_user_key('999', {}) == ''
+assert not salt.exists(), 'empty identity created a persistent salt'
+with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+    keys = list(pool.map(lambda _: module.anon_user_key('999', {'uid': '123'}), range(32)))
+assert len(set(keys)) == 1 and keys[0].startswith('U')
+assert salt.is_file() and len(salt.read_bytes()) == 32
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            subprocess.run([sys.executable, "-I", "-B", "-c", script, str(source), temporary], check=True)
+
     def test_historical_network_entry_is_retired(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "v8 writer capture path"):
             v6.api_call(v6.STATS_ENDPOINT, {"aweme_ids": "1"}, "fixture-key")
