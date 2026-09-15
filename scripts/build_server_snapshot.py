@@ -931,6 +931,11 @@ def _collect_artifacts(
             relative_path=relative_path,
         )
     with _connect_read_only(snapshot_db) as connection:
+        from v8.capture_transport_recovery import required_recovery_quarantines
+        for row in required_recovery_quarantines(connection):
+            _add_artifact(files, pending_json, project_root=project_root,
+                relative_path=_project_reference(row["path"], project_root=project_root),
+                expected_sha256=row["sha256"], expected_byte_size=row["byte_size"])
         managed, managed_members, evidence_roots = _managed_originals(
             connection, project_root=project_root, files=files, pending_json=pending_json,
             imported_aliases=imported_aliases)

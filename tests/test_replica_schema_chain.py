@@ -111,6 +111,26 @@ class ReplicaChainTest(unittest.TestCase):
             self.run_upgrade(checkpoint_hook=fail)
         self.assertEqual(self.f._protected_state(),self.baseline)
 
+    def test_new_sealed_snapshot_can_follow_a_verified_rollback(self):
+        def fail(point):
+            if point=='databases_applied':raise RuntimeError('injected failure')
+        with self.assertRaisesRegex(installer.SnapshotInstallError,'previous replica restored'):
+            self.run_upgrade(checkpoint_hook=fail)
+        previous=installer._read_object(self.f.config.transition_path)
+        self.assertEqual(previous['status'],'rolled_back')
+        # Preserve the failed bundle/history; the retry has a new snapshot ID.
+        prior_bundle=self.f.bundle
+        self.f.bundle=prior_bundle.parent/'retry-bundle'
+        shutil.copytree(prior_bundle,self.f.bundle)
+        (self.f.bundle/'replica-upgrade-seal.json').unlink()
+        self.f.manifest['snapshot_id']='20260915T000000Z-000000000024'
+        deployment._write_bundle_manifest(self.f.bundle,self.f.manifest)
+        self.sealed=upgrade.seal(self.f.bundle,self.f.config,installer)
+        self.assertEqual(self.sealed['seal']['old_transition'],previous)
+        result=self.run_upgrade()
+        self.assertEqual(result['status'],'succeeded')
+        self.assertEqual(result['old_transition'],previous)
+
     def test_changed_configuration_refuses_before_service_stop(self):
         path=next(iter(installer._config_targets(self.f.config).values()))
         path.write_text('concurrent admin edit')

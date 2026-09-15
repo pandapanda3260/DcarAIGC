@@ -244,7 +244,7 @@ def recovery_storage_identity(connection: sqlite3.Connection, *, key: str, claim
     return proof["source_captured_at"]
 
 
-def _verified_pending(connection: sqlite3.Connection, raw_response_id: int) -> tuple[dict, dict]:
+def _pending_metadata(connection: sqlite3.Connection, raw_response_id: int) -> tuple[dict, dict]:
     raw = _row(connection, "provider_raw_responses", raw_response_id)
     receipt = _row(connection, "fetch_transport_receipts", raw["transport_receipt_id"])
     pending = _read_phase(connection, _key(raw["fetch_attempt_id"], receipt), "pending")
@@ -256,12 +256,52 @@ def _verified_pending(connection: sqlite3.Connection, raw_response_id: int) -> t
         and proof["transport_receipt_id"] == raw["transport_receipt_id"]
         and proof["paid_scope_identity"] == raw["paid_scope_identity"] and proof["sequence"] == raw["sequence"]
         and proof["operation"] == raw["operation"] and proof["content_id"] == raw["content_id"]
-        and proof["business_identity_verified"] is True and proof["entity_integrity_basis"] == "gzip_single_member_crc"
-        and list(_file_identity(Path(source["quarantine"]["path"]))) == proof["quarantine_file_identity"],
-        "recovery raw, file generation or original binding changed")
+        and proof["business_identity_verified"] is True and proof["entity_integrity_basis"] == "gzip_single_member_crc",
+        "recovery raw or original binding changed")
     blob = _row(connection, "provider_raw_blobs", raw["raw_blob_id"])
     _require(blob["entity_sha256"] == proof["entity_sha256"] and blob["entity_size"] == proof["entity_bytes"],
              "recovery blob registration changed")
+    return pending, source
+
+
+def required_recovery_quarantines(connection: sqlite3.Connection) -> list[dict]:
+    """Return exact original files needed to read already recovered content."""
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE name='data_quality_receipts'").fetchone() is None:
+        return []
+    members = {}
+    for row in connection.execute("SELECT payload_json FROM data_quality_receipts WHERE scope_key LIKE ?",
+                                  (CONTRACT + ":%:pending",)):
+        payload = json.loads(row[0])
+        pending, source = _pending_metadata(connection, payload["raw_response_id"])
+        _require(pending["payload"] == payload, "recovery pending receipt changed")
+        member = source["quarantine"]
+        _require(member["id"] not in members or members[member["id"]] == member,
+                 "recovery quarantine registration conflicts")
+        members[member["id"]] = member
+    return list(members.values())
+
+
+def _verified_pending(connection: sqlite3.Connection, raw_response_id: int) -> tuple[dict, dict]:
+    pending, source = _pending_metadata(connection, raw_response_id)
+    from . import artifact_paths
+    original = Path(source["quarantine"]["path"])
+    path = artifact_paths.resolve(original)
+    registered = artifact_paths.replica_file(path)
+    if registered is None:
+        # Writer evidence retains its original inode and timestamps.
+        _require(path == original and list(_file_identity(path)) == pending["payload"]["quarantine_file_identity"],
+                 "recovery quarantine file generation changed")
+    else:
+        # A replica has different filesystem identities. Its sealed manifest
+        # and original DB registration must bind the same encoded bytes.
+        member = source["quarantine"]
+        _require(all(registered.get(k) == member[k] for k in ("sha256", "byte_size")),
+                 "replica recovery quarantine is not hash-bound")
+        before = _file_identity(path)
+        body = raw_archive._read_bytes(path, provider_transport.DEFAULT_MAX_ENCODED_BYTES)
+        _require(before == _file_identity(path) and len(body) == member["byte_size"]
+                 and hashlib.sha256(body).hexdigest() == member["sha256"],
+                 "replica recovery quarantine bytes changed")
     return pending, source
 
 

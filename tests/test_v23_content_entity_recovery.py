@@ -3,6 +3,7 @@ import gzip
 import hashlib
 import http.client
 import json
+import shutil
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -57,7 +58,7 @@ class ContentEntityRecoveryTest(unittest.TestCase):
             with self.assertRaises(provider_transport.ProviderTransportError) as failed:
                 provider_transport.request_json(urllib.request.Request(URL),route_id='fixture',timeout=45,opener=FakeOpener(response),clock=clock((at,at,at)))
             claim=capture.SlotClaim(slot_id=self.slot,attempt_id=self.attempt,attempt_number=1,content_id=1,stage='media_source_refresh',window_key='lifetime',provider='TikHub',adapter_version='fixture',paid_scope_identity=identity.scope_identity,request_batch_id=self.batch,singleton_batch=True)
-            receipt=capture._quarantine_transport_evidence(claim=claim,operation=op,raw_root=self.root/'raw',partial=encoded,complete_entity=None,transport_receipt=failed.exception.receipt)
+            receipt=capture._quarantine_transport_evidence(claim=claim,operation=op,raw_root=self.root/'data/cache/raw',partial=encoded,complete_entity=None,transport_receipt=failed.exception.receipt)
             self.transport=raw_archive.record_transport_receipt(c,attempt_id=self.attempt,receipt=receipt)
 
     def snapshot(self):
@@ -102,6 +103,34 @@ class ContentEntityRecoveryTest(unittest.TestCase):
             self.assertEqual(len(sources),1)
             self.assertEqual(json.loads(sources[0]['metadata_json'])['raw_response_id'],result['raw_response_id'])
             self.assertNotIn('video',[r['artifact_type'] for r in artifacts])
+
+    def test_replica_recovery_requires_registered_unchanged_original_bytes(self):
+        from v8 import artifact_paths
+        result=self.recover()
+        with storage.connect(self.db) as c:
+            members=recovery.required_recovery_quarantines(c)
+            self.assertEqual(len(members),1)
+            member=members[0];original=Path(member['path'])
+            replica=self.root/'replica';relative=original.relative_to(self.root)
+            target=replica/relative;target.parent.mkdir(parents=True)
+            shutil.copyfile(original,target)
+            row={'sha256':member['sha256'],'byte_size':member['byte_size']}
+            context={'writer_root':self.root,'runtime_evidence_aliases':{},'imported_evidence_aliases':{},
+                     'files':{relative.as_posix():row},'members':{},'directories':set()}
+            self.assertNotEqual(recovery._file_identity(target),recovery._file_identity(original))
+            with patch.object(artifact_paths,'PROJECT_ROOT',replica), patch.object(artifact_paths,'installed_snapshot',return_value=context):
+                self.assertTrue(recovery.recovered_member(c,member_id=self.member,raw_response_id=result['raw_response_id']))
+                body=target.read_bytes();target.write_bytes(body[:-1]+bytes([body[-1]^1]))
+                with self.assertRaisesRegex(recovery.EntityRecoveryError,'bytes changed'):
+                    recovery.recovered_member(c,member_id=self.member,raw_response_id=result['raw_response_id'])
+                target.write_bytes(body);context['files'].clear()
+                with self.assertRaisesRegex(artifact_paths.ArtifactPathError,'unlisted'):
+                    recovery.recovered_member(c,member_id=self.member,raw_response_id=result['raw_response_id'])
+            # Without an installed replica manifest, replacing the Writer
+            # file with byte-identical data must still fail its generation check.
+            body=original.read_bytes();original.unlink();original.write_bytes(body)
+            with self.assertRaisesRegex(recovery.EntityRecoveryError,'generation changed'):
+                recovery.recovered_member(c,member_id=self.member,raw_response_id=result['raw_response_id'])
 
     def test_orphan_blob_before_pending_is_reused_on_resume(self):
         append=recovery._append_phase

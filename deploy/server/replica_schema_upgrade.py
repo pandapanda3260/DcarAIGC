@@ -227,7 +227,8 @@ def execute(bundle, config, seal_sha256, impl, *, service_action=None, checkpoin
     with impl._install_lock(config):
         value = verify_seal(bundle, config, seal_sha256, impl)
         prior = impl._read_object(config.transition_path) if config.transition_path.exists() else None
-        if isinstance(prior, dict) and prior.get("schema") == CONTRACT:
+        if (isinstance(prior, dict) and prior.get("schema") == CONTRACT
+                and prior.get("status") != "rolled_back"):
             require(prior.get("sealed_manifest_sha256") == seal_sha256, "another data upgrade owns the transition", impl)
             if prior.get("status") == "succeeded":
                 manifest = impl.verify_bundle(bundle, config, expected_schema=24)

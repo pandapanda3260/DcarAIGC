@@ -1533,6 +1533,9 @@ def _verify_managed_originals(
     connection = sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
     try:
+        from v8.capture_transport_recovery import required_recovery_quarantines
+        for row in required_recovery_quarantines(connection):
+            required(_project_path(row["path"], writer_root), row["sha256"], row["byte_size"])
         controls = {row["id"]: dict(row) for row in connection.execute(
             "SELECT * FROM evidence_artifacts WHERE artifact_type='media_lifecycle_manifest'"
         )}
